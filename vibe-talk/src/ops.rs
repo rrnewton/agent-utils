@@ -444,16 +444,34 @@ pub fn window_limit(state: &AppState, limit: Option<u16>) -> u16 {
 
 /// One message in full, by id, within the recent window. Read scope.
 ///
+/// On a provider that looks messages up by id itself ([`looks_up_by_ids`]), anywhere in the
+/// channel: one lookup, and the window only when the lookup did not see the id.
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::UnknownMessage`] when the id is not in the fetched
-/// window, or [`OpError::Chat`].
+/// window (or the provider proved it absent), or [`OpError::Chat`].
 pub async fn message_by_id(
     state: &AppState,
     channel_id: &str,
     message_id: &str,
     limit: Option<u16>,
 ) -> Result<(ChannelInfo, Message), OpError> {
+    // remote-ops-audit W11 `#287 bulk-reads`. A provider that looks messages up by id itself
+    // answers for this one exactly, wherever it is in the channel; any other is read for the recent
+    // window, as before.
+    if configured(state, channel_id).is_ok_and(|channel| looks_up_by_ids(state, &channel.id)) {
+        let channel = allowed(state, channel_id).await?;
+        let looked =
+            lookup_messages(state, &channel, None, &[message_id.to_owned()], limit).await?;
+        let message = looked
+            .messages
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(OpError::UnknownMessage)?;
+        return Ok((channel, message));
+    }
     let window = messages(state, channel_id, limit).await?;
     let wanted = MessageId(message_id.to_owned());
     let message = window
@@ -479,6 +497,23 @@ pub async fn message_by_id_scoped(
     };
     let channel = allowed(state, channel_id).await?;
     validate_thread_id(thread_id)?;
+    if looks_up_by_ids(state, &channel.id) {
+        let looked = lookup_messages(
+            state,
+            &channel,
+            Some(thread_id),
+            &[message_id.to_owned()],
+            limit,
+        )
+        .await?;
+        let message = looked
+            .messages
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(OpError::UnknownMessage)?;
+        return Ok((channel, message));
+    }
     let mut message = state
         .chat
         .fetch_thread_message(&channel.id, thread_id, &MessageId(message_id.to_owned()))
@@ -488,6 +523,127 @@ pub async fn message_by_id_scoped(
         .await
         .mark(std::slice::from_mut(&mut message));
     Ok((channel, message))
+}
+
+/// Whether `channel`'s provider looks several of its messages up by id itself. remote-ops-audit
+/// W11 `#287 bulk-reads`.
+///
+/// A provider that does not is asked exactly what it was asked before lookups by id existed: one
+/// `fetch_thread_message` per id, or the recent window. Each caller keeps its own way of making
+/// those reads for it, because each has something the trait's default cannot know about: speech
+/// preparation's bound on thread lookups in flight across every preparation, a summary's parts
+/// read one after another, and a window that is shared, recorded and remembered for the next read.
+#[must_use]
+pub fn looks_up_by_ids(state: &AppState, channel: &ChannelId) -> bool {
+    state.chat.read_caps(channel).by_ids == crate::chat::Support::Native
+}
+
+/// What [`lookup_messages`] found, and what finding it took.
+#[derive(Debug)]
+pub struct Looked {
+    /// One answer per id asked for, in the order asked: the message, prepared as every read is
+    /// (stamped, and marked for noise), or `None` where it is not.
+    pub messages: Vec<Option<Message>>,
+    /// Upstream reads made: the lookup itself, and one for each id it did not see.
+    pub reads: usize,
+}
+
+/// `ids` of `channel`, or of one `thread` of it, in one [`crate::chat::ChatClient::fetch_messages`]
+/// call. remote-ops-audit W11 `#287 bulk-reads`.
+///
+/// For a provider that [`looks_up_by_ids`]; the caller has checked `channel` against the
+/// allowlist. An id the provider PROVED absent answers `None`. An id it did not see
+/// ([`crate::chat::Lookup::Unseen`]) is looked up the way it was before this lookup existed: in a
+/// thread with `fetch_thread_message`, whose failure fails the lookup as it always did, and among
+/// the channel's own messages in the recent window ([`messages`]), where it may be `None` as it
+/// always could be. So no answer is less than it was before, and none older.
+///
+/// # Errors
+///
+/// [`OpError::Chat`] for an invalid thread id, a failed read, or a lookup that answered for ids it
+/// was not asked; the errors of [`messages`].
+pub async fn lookup_messages(
+    state: &AppState,
+    channel: &ChannelInfo,
+    thread: Option<&str>,
+    ids: &[String],
+    limit: Option<u16>,
+) -> Result<Looked, OpError> {
+    use crate::chat::Lookup;
+
+    if let Some(thread) = thread {
+        validate_thread_id(thread)?;
+    }
+    let wanted: Vec<MessageId> = ids.iter().map(|id| MessageId(id.clone())).collect();
+    let answers = state
+        .chat
+        .fetch_messages(&channel.id, thread, &wanted)
+        .await?;
+    if answers.len() != wanted.len() {
+        return Err(ChatError::Shape(format!(
+            "a lookup of {} messages by id answered {}",
+            wanted.len(),
+            answers.len()
+        ))
+        .into());
+    }
+    let mut reads = 1;
+    let mut window: Option<Vec<Message>> = None;
+    let mut answered = Vec::with_capacity(wanted.len());
+    // Which answers came from the lookup or a thread read, and so still need preparing: the
+    // window's were prepared by `messages`.
+    let mut unprepared = Vec::new();
+    for (id, answer) in wanted.iter().zip(answers) {
+        let message = match answer {
+            Lookup::Found(message) => {
+                if message.id != *id {
+                    return Err(ChatError::Shape(
+                        "a lookup by id answered with a different message".to_owned(),
+                    )
+                    .into());
+                }
+                unprepared.push(answered.len());
+                Some(*message)
+            }
+            Lookup::Absent => None,
+            Lookup::Unseen => match thread {
+                Some(thread) => {
+                    reads += 1;
+                    unprepared.push(answered.len());
+                    Some(
+                        state
+                            .chat
+                            .fetch_thread_message(&channel.id, thread, id)
+                            .await?,
+                    )
+                }
+                None => {
+                    if window.is_none() {
+                        reads += 1;
+                        window = Some(messages(state, channel.id.as_str(), limit).await?.messages);
+                    }
+                    window
+                        .as_ref()
+                        .and_then(|window| window.iter().find(|m| m.id == *id))
+                        .cloned()
+                }
+            },
+        };
+        answered.push(message);
+    }
+    if !unprepared.is_empty() {
+        let filter = crate::noise::filter_for(state, &channel.id).await;
+        for index in unprepared {
+            if let Some(message) = answered[index].as_mut() {
+                stamp(state, std::slice::from_mut(message));
+                filter.mark(std::slice::from_mut(message));
+            }
+        }
+    }
+    Ok(Looked {
+        messages: answered,
+        reads,
+    })
 }
 
 /// Browse a channel or its threads through the provider's own pagination contract.
@@ -2831,12 +2987,24 @@ pub async fn summarize_message_scoped(
     // UPSTREAM: the existing path, with the channel window shared between requests.
     let window = if let Some(thread_id) = thread_id {
         let fetching = std::time::Instant::now();
-        let mut messages = Vec::with_capacity(ids.len());
-        for id in &ids {
-            let (_, message) =
-                message_by_id_scoped(state, channel_id, id, limit, Some(thread_id)).await?;
-            messages.push(message);
-        }
+        let messages = if looks_up_by_ids(state, &channel.id) {
+            // remote-ops-audit W11 `#287 bulk-reads`: every part of the row in one lookup. A part
+            // the provider proved absent is a message this server cannot see.
+            lookup_messages(state, &channel, Some(thread_id), &ids, limit)
+                .await?
+                .messages
+                .into_iter()
+                .collect::<Option<Vec<Message>>>()
+                .ok_or(OpError::UnknownMessage)?
+        } else {
+            let mut messages = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let (_, message) =
+                    message_by_id_scoped(state, channel_id, id, limit, Some(thread_id)).await?;
+                messages.push(message);
+            }
+            messages
+        };
         state.summary_counters.fetched(messages.len());
         // As speech preparation does: the next request for these rows recalls them.
         state

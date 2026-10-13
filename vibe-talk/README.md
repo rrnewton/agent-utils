@@ -1415,6 +1415,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   live poll's first, still count as `fetch_recent`. A provider that reads a channel by time
   itself (Slack) counts `/page` through a span and `/count` since an instant as `fetch_range`;
   on any other those reads are one `fetch_page` each, and count as that, as they always did.
+  Likewise a provider that looks several messages up by id itself counts one such lookup (speech
+  preparation of a thread, a thread summary's parts, a message by id) as `fetch_messages`; on any
+  other it is the reads it was always made of, one `fetch_thread_message` per message or the
+  recent window, counted as those.
   Operations are timed around each provider's
   own client, so the live poller and this report's own token check count as well as the page and
   the voice agent. Questions a provider answers from memory, such as whether it supports threads,

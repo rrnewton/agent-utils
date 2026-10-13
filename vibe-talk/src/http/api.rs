@@ -1633,8 +1633,9 @@ pub struct MessageResponse {
 
 /// `GET /api/v1/channels/{channel_id}/messages/{message_id}`
 ///
-/// The lookup is within the recent window this server fetches, so a very old message answers 404
-/// rather than silently returning something else.
+/// On a provider that looks messages up by id itself the message is found wherever it is in the
+/// channel (remote-ops-audit W11). On any other the lookup is within the recent window this server
+/// fetches, so a very old message answers 404 rather than silently returning something else.
 pub async fn message_by_id(
     State(state): State<AppState>,
     _scope: ReadScope,

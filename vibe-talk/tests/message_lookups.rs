@@ -19,12 +19,12 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
-use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
+use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity, Lookup, ReadCaps, Support};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::providers::ChatRouter;
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
+use vibe_talk::testing::{CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
 use vibe_talk::threads::MessageThread;
 
 /// 2026-08-17T20:53:20Z, the first message of the fixture.
@@ -452,4 +452,376 @@ async fn a_provider_without_batch_lookups_gets_todays_answers_at_todays_cost() {
             assert_eq!(case["status"], 200, "{case}");
         }
     }
+}
+
+/// A provider that looks several messages up by id itself: [`Plain`]'s messages, one
+/// `fetch_messages` for any number of ids. An id it does not have is [`Lookup::Absent`]; one named
+/// in `unseen` it answers [`Lookup::Unseen`], as a lookup that could not reach it would.
+struct Native {
+    plain: Plain,
+    unseen: Vec<String>,
+}
+
+impl Native {
+    fn new(inner: Arc<FakeDiscord>, unseen: &[&str]) -> Self {
+        Self {
+            plain: Plain::new(inner),
+            unseen: unseen.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatClient for Native {
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    fn supports_upstream_read_mark(&self) -> bool {
+        true
+    }
+
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            by_ids: Support::Native,
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn fetch_messages(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<Lookup>, ChatError> {
+        let held = match thread {
+            Some(thread) => self.plain.threads.get(thread).cloned().unwrap_or_default(),
+            None => {
+                self.plain
+                    .inner
+                    .fetch_page(channel, 100, None, None)
+                    .await?
+            }
+        };
+        Ok(ids
+            .iter()
+            .map(|id| {
+                if self.unseen.iter().any(|unseen| unseen == id.as_str()) {
+                    return Lookup::Unseen;
+                }
+                held.iter()
+                    .find(|m| m.id == *id)
+                    .map_or(Lookup::Absent, |m| Lookup::Found(Box::new(m.clone())))
+            })
+            .collect())
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.plain.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.plain.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_thread_message(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        message_id: &MessageId,
+    ) -> Result<Message, ChatError> {
+        self.plain
+            .fetch_thread_message(channel, thread_id, message_id)
+            .await
+    }
+
+    async fn mark_read_upstream(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+    ) -> Result<(), ChatError> {
+        self.plain.mark_read_upstream(channel, through).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.plain.post_message(channel, content, reply_to).await
+    }
+}
+
+/// A server reading through `provider`, every upstream call it makes counted.
+fn counted(provider: Arc<dyn ChatClient>) -> (Arc<CountingChat>, axum::Router) {
+    let counting = Arc::new(CountingChat::new(provider));
+    let (_state, router) = server(Arc::clone(&counting) as Arc<dyn ChatClient>);
+    (counting, router)
+}
+
+/// The channel's messages, seeded, and a FakeDiscord holding them.
+fn seeded() -> (Arc<FakeDiscord>, Vec<MessageId>) {
+    let discord = Arc::new(FakeDiscord::new());
+    discord.register_channel(&ChannelId(READ_CHANNEL.to_owned()));
+    let main = seed(&discord);
+    (discord, main)
+}
+
+fn prepared_ids(body: &Value) -> Vec<String> {
+    body["prepared"]
+        .as_array()
+        .expect("prepared")
+        .iter()
+        .map(|entry| entry["message_id"].as_str().expect("an id").to_owned())
+        .collect()
+}
+
+/// remote-ops-audit W11's proof: preparing eight thread messages for speech is ONE lookup on a
+/// provider that has one, and eight `fetch_thread_message` calls, as today, on one that has not.
+#[tokio::test]
+async fn preparing_eight_thread_messages_is_one_lookup_where_the_provider_has_one() {
+    let eight: Vec<String> = (4..12).map(|n| format!("t{n}")).collect();
+    let body = json!({ "ids": eight, "thread_id": THREAD });
+    let uri = format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare");
+
+    let (discord, _) = seeded();
+    let (native, router) = counted(Arc::new(Native::new(discord, &[])));
+    let (status, answer) = call(&router, READ_TOKEN, "POST", &uri, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(prepared_ids(&answer), eight);
+    assert_eq!(native.count("fetch_messages"), 1, "{:?}", native.calls());
+    assert_eq!(native.count("fetch_thread_message"), 0);
+    assert_eq!(native.calls()[0].thread.as_deref(), Some(THREAD));
+
+    let (discord, _) = seeded();
+    let (plain, router) = counted(Arc::new(Plain::new(discord)));
+    let (status, answer) = call(&router, READ_TOKEN, "POST", &uri, Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(prepared_ids(&answer), eight, "the same answer");
+    assert_eq!(
+        plain.count("fetch_thread_message"),
+        8,
+        "{:?}",
+        plain.calls()
+    );
+    assert_eq!(plain.count("fetch_messages"), 0);
+}
+
+/// An id the provider proves absent is left out of a speech preparation, as one outside the window
+/// always was, and is a 404 on its own; one it did not see is looked up on its own, as before.
+#[tokio::test]
+async fn an_absent_message_is_left_out_and_an_unseen_one_is_looked_up_as_before() {
+    let (discord, _) = seeded();
+    let (native, router) = counted(Arc::new(Native::new(discord, &["t5"])));
+    let base = format!("/api/v1/channels/{READ_CHANNEL}");
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "POST",
+        &format!("{base}/speech/prepare"),
+        Some(json!({ "ids": ["t4", "t99", "t5"], "thread_id": THREAD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(prepared_ids(&answer), ["t4", "t5"]);
+    assert_eq!(native.count("fetch_messages"), 1);
+    assert_eq!(
+        native.count("fetch_thread_message"),
+        1,
+        "only the unseen one, on its own: {:?}",
+        native.calls()
+    );
+
+    let thread = THREAD.replace('/', "%2F");
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("{base}/messages/t99?thread_id={thread}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(answer["error"], "unknown_message");
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("{base}/messages/t5?thread_id={thread}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["message"]["content"], "reply 5");
+    assert_eq!(
+        native.count("fetch_thread_message"),
+        2,
+        "{:?}",
+        native.calls()
+    );
+}
+
+/// Every caller of a lookup by id reads through one lookup on a provider that has one: the
+/// message route (in a thread and on the channel's own messages, where it finds a message older
+/// than the window), a thread summary of a row in three parts, the upstream read mark's check,
+/// and MCP `read_message`. None of them reads a window or looks a message up on its own.
+#[tokio::test]
+async fn every_caller_reads_through_one_lookup() {
+    let (discord, main) = seeded();
+    // Twenty more, so the first message of the channel is older than the window.
+    for i in 0..20 {
+        discord.seed_at(
+            &ChannelId(READ_CHANNEL.to_owned()),
+            "ada",
+            &format!("later {i}"),
+            BASE_MS + 60 * MINUTE_MS + i * MINUTE_MS,
+        );
+    }
+    let (native, router) = counted(Arc::new(Native::new(discord, &[])));
+    let base = format!("/api/v1/channels/{READ_CHANNEL}");
+    let thread = THREAD.replace('/', "%2F");
+    let lookups = || native.count("fetch_messages");
+    let others = || native.calls().len() - native.count("fetch_messages");
+
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("{base}/messages/{}", main[0].as_str()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["message"]["content"], "main message 0");
+    assert!(
+        !answer["message"]["spoken_time"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "prepared as every read is: {answer}"
+    );
+    assert_eq!((lookups(), others()), (1, 0), "{:?}", native.calls());
+
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("{base}/messages/t7?thread_id={thread}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!((lookups(), others()), (2, 0));
+
+    let (status, answer) = call(
+        &router,
+        WRITE_TOKEN,
+        "GET",
+        &format!("{base}/messages/t1/summary?thread_id={thread}&with=t2,t3"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["state"], "generated", "{answer}");
+    assert_eq!((lookups(), others()), (3, 0), "three parts, one lookup");
+
+    let (status, answer) = call(
+        &router,
+        WRITE_TOKEN,
+        "POST",
+        &format!("{base}/upstream-read"),
+        Some(json!({ "message_id": "t6", "thread_id": THREAD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(lookups(), 4);
+    assert_eq!(native.count("mark_read_upstream"), 1);
+    let (status, _) = call(
+        &router,
+        WRITE_TOKEN,
+        "POST",
+        &format!("{base}/upstream-read"),
+        Some(json!({ "message_id": "t99", "thread_id": THREAD })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an absent message is never marked"
+    );
+    assert_eq!(native.count("mark_read_upstream"), 1);
+
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "POST",
+        "/mcp",
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "read_message",
+                "arguments": { "channel_id": READ_CHANNEL, "message_id": main[2].as_str() },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(
+        answer["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("main message 2")),
+        "{answer}"
+    );
+    assert_eq!(lookups(), 6);
+    assert_eq!(
+        others(),
+        1,
+        "nothing but the one mark: {:?}",
+        native.calls()
+    );
+}
+
+/// A message of the channel's own the lookup did not see is found in the recent window, as before;
+/// and a channel outside the allowlist is refused before anything is asked of the provider.
+#[tokio::test]
+async fn an_unseen_message_of_the_channel_is_found_in_the_window_and_the_allowlist_comes_first() {
+    let (discord, main) = seeded();
+    let unseen = main[4].as_str().to_owned();
+    let (native, router) = counted(Arc::new(Native::new(discord, &[unseen.as_str()])));
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/messages/{unseen}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["message"]["content"], "main message 4");
+    assert_eq!(native.count("fetch_messages"), 1);
+    assert_eq!(
+        native.count("fetch_recent_dated"),
+        1,
+        "the window: {:?}",
+        native.calls()
+    );
+
+    let before = native.calls().len();
+    for uri in [
+        "/api/v1/channels/999999/messages/1".to_owned(),
+        format!("/api/v1/channels/999999/messages/1?thread_id={THREAD}"),
+    ] {
+        let (status, _) = call(&router, READ_TOKEN, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(native.calls().len(), before, "nothing was asked upstream");
 }

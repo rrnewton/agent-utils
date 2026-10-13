@@ -502,7 +502,8 @@ pub struct Found {
     pub messages: HashMap<String, Message>,
     /// How many distinct ids were answered from [`ReadAhead`] without a fetch.
     pub hits: usize,
-    /// How many chat fetches this preparation made: one per window, one per thread message.
+    /// How many chat fetches this preparation made: one per window, one per thread message, or
+    /// one per lookup of several and one per message it did not see.
     pub fetches: usize,
     /// Whether this preparation waited for another one's window fetch instead of making its own.
     pub joined: bool,
@@ -519,7 +520,9 @@ pub struct Found {
 /// the same channel that has just made one at least as wide. An id that is not in the window is
 /// simply absent, as it always was. In a thread, each missing id is fetched on its own, up to
 /// [`THREAD_FETCH_CONCURRENCY`] at once for this preparation and [`THREAD_FETCHES_IN_FLIGHT`] for
-/// all of them, and the first failure fails the batch, as it did when they were fetched in series.
+/// all of them, and the first failure fails the batch, as it did when they were fetched in series;
+/// unless the provider looks several messages up by id itself ([`ops::looks_up_by_ids`]), when
+/// every missing id is one lookup ([`ops::lookup_messages`], remote-ops-audit W11).
 ///
 /// `began` is when the preparation started. A window fetch that finished after it is fresh
 /// enough to answer this one.
@@ -580,6 +583,23 @@ pub async fn messages_for_speech(
                         found.messages.insert(message.id.0.clone(), message);
                     }
                 }
+            }
+        }
+        Some(thread) if ops::looks_up_by_ids(state, &channel.id) => {
+            // remote-ops-audit W11 `#287 bulk-reads`: every missing id in one lookup, holding one
+            // of the permits a lookup of one message would. An id the provider proved absent is
+            // simply absent, as one outside the window is.
+            let looked = {
+                let _slot = state.read_ahead.lookups.acquire().await;
+                ops::lookup_messages(state, channel, Some(thread), &missing, limit).await?
+            };
+            found.fetches = looked.reads;
+            let fetched: Vec<Message> = looked.messages.into_iter().flatten().collect();
+            state
+                .read_ahead
+                .remember(&channel.id, Some(thread), &fetched, fetching);
+            for message in fetched {
+                found.messages.insert(message.id.0.clone(), message);
             }
         }
         Some(thread) => {
