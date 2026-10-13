@@ -4068,6 +4068,9 @@ SCENES: tuple[Scene, ...] = (
                 # `min-width: 0` for exactly this, because a flex item's default minimum is its
                 # content width and a long query would otherwise shove the glass off a 375px
                 # screen. The header is not up at all: opening the search costs no row either.
+                # "Over the list" is over the list's place: its box less its top margin, which on a
+                # narrow phone is the room under the author filter hanging below the bar, where the
+                # list starts (`#251 author-filter`).
                 "field, count, Links, Pinned and glass are one row, in that order, on the bar over "
                 "the list",
                 "(() => { const f = document.getElementById('search-field').getBoundingClientRect(); "
@@ -4076,11 +4079,13 @@ SCENES: tuple[Scene, ...] = (
                 "const p = document.getElementById('pinned-filter').getBoundingClientRect(); "
                 "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
                 "const bar = document.getElementById('search-float').getBoundingClientRect(); "
-                "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "const area = document.getElementById('scroll-area'); "
+                "const s = area.getBoundingClientRect(); "
+                "const head = s.top - (parseFloat(getComputedStyle(area).marginTop) || 0); "
                 "return f.width > 80 && c.width > 0 && g.width > 0 && l.width >= 44 && p.width >= 44 "
                 "&& f.right <= c.left + 1 && c.right <= l.left + 1 && l.right <= p.left + 1 "
                 "&& p.right <= g.left + 1 && g.right <= bar.right + 1 "
-                "&& bar.top >= s.top - 1 && bar.right <= s.right + 1 "
+                "&& bar.top >= head - 1 && bar.right <= s.right + 1 "
                 "&& !window.__visible('topbar') "
                 "&& f.top < c.bottom && c.top < f.bottom "
                 "&& f.top < g.bottom && g.top < f.bottom; })()",

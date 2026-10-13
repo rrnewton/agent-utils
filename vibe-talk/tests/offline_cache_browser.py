@@ -961,7 +961,10 @@ GLASS_ALONE_JS = """() => {""" + FLOAT_HELPERS_JS + """
 # The search open over the channel: a bar across the top of the list, no wider than it and not
 # hanging over whatever is above it, with the field focused and 140px wide or more, the pill given
 # way, and the first thing the list shows clear of the bar. `query`, when given, has just been typed;
-# `rows` is what is left on screen and `count` what the bar says about it.
+# `rows` is what is left on screen and `count` what the bar says about it. The list's place starts
+# above its box by its top margin: on a narrow phone the list starts below the author filter hanging
+# under the bar (`#251 author-filter`), and the bar and the filter stand in that margin, over the list's
+# own place and nothing above it.
 SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
     const area = document.getElementById('scroll-area');
     area.scrollTop = 0;
@@ -971,7 +974,8 @@ SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
     if (glass.getAttribute('aria-pressed') !== 'true') problems.push('the glass does not read as open');
     if (!shown(field)) return {problems: [...problems, 'the field is not open'], rows: [], count: ''};
     const list = box(area), b = box(bar), f = box(field), g = box(glass);
-    if (b.top < list.top - 0.5) problems.push(`the bar hangs ${(list.top - b.top).toFixed(1)}px over what is above the list`);
+    const head = list.top - (parseFloat(getComputedStyle(area).marginTop) || 0);
+    if (b.top < head - 0.5) problems.push(`the bar hangs ${(head - b.top).toFixed(1)}px over what is above the list`);
     if (b.left < list.left - 0.5 || b.right > list.right + 0.5) problems.push('the bar is wider than the list');
     // 140 since `#211 link-filter` put Links beside Pinned on the same line.
     if (f.width < 140) problems.push(`the field is ${Math.round(f.width)}px wide`);
