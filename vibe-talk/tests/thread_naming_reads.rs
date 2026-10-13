@@ -97,7 +97,7 @@ impl Forum {
         let base: u64 = if channel.as_str() == WRITE_CHANNEL {
             1_000_000
         } else {
-            2_000_000
+            100_000_000
         };
         let threads = (0..count)
             .map(|n| {
@@ -844,16 +844,22 @@ async fn a_channel_taken_off_the_list_during_a_naming_keeps_no_sentence_from_it(
 }
 
 #[tokio::test(start_paused = true)]
-async fn one_channel_with_hundreds_of_due_threads_leaves_room_in_the_queue_for_another() {
-    // Three hundred due threads in one channel take two hours to read at two a minute. They must
-    // not hold the queue against another channel's three for those two hours.
+async fn one_channel_with_more_due_threads_than_the_whole_queue_holds_leaves_room_for_another() {
+    // More due threads in one channel than the queue holds across every channel (1,024): nine
+    // hours of reads at two a minute. They must not hold the queue against another channel's three
+    // for those hours, so at most 64 of one channel's threads wait at once.
     let h = harness(
         Forum::default()
-            .with(WRITE_CHANNEL, 300, 1)
+            .with(WRITE_CHANNEL, 1_100, 1)
             .with(READ_CHANNEL, 3, 1),
     );
     thread_list(&h, WRITE_CHANNEL).await;
     thread_list(&h, READ_CHANNEL).await;
+    assert_eq!(
+        h.names.pending(),
+        64 + 3,
+        "64 of the first channel's threads wait, and all three of the other's"
+    );
     run_for(59).await;
     assert_eq!(
         thread_reads(&h, &read_channel()),
