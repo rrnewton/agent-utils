@@ -118,6 +118,10 @@ pub struct AppState {
     /// voice-chat-write-confirm`: over MCP, `post_reply` records a proposal here and posts nothing;
     /// only the commit route, which no tool reaches, can spend it. See [`crate::post_gate`].
     pub post_gate: Arc<crate::post_gate::PostGate>,
+    /// One post at a time to each destination, in the order the posts arrived. `#277 send-order`;
+    /// see [`crate::post_lanes`]. Every post goes through [`crate::ops::reply_scoped`], which takes
+    /// its destination's turn here.
+    pub post_lanes: Arc<crate::post_lanes::PostLanes>,
     /// Caps the lines `POST /api/v1/voice-health` writes, across every caller. Per process rather
     /// than per call because the server has no call id to count by, by design.
     pub voice_health_budget: Arc<crate::voice_health::LogBudget>,
