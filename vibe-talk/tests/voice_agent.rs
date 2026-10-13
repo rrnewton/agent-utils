@@ -419,6 +419,167 @@ async fn an_oversized_health_body_is_not_read() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+// --- #268 voice-call-drops: how a call ended ------------------------------------------------------
+
+/// The record the page sends when a call's connection is reset twenty-two seconds in.
+fn end_report() -> Value {
+    json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "ended_by": "connection_lost",
+        "close_code": 1006,
+        "since_open_ms": 22_000,
+        "turns": 2,
+    })
+}
+
+#[tokio::test]
+async fn a_call_end_record_is_accepted_from_the_write_token_only_for_every_documented_cause() {
+    let router = app();
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-end",
+        None,
+        Some(end_report()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-end",
+        Some(READ_TOKEN),
+        Some(end_report()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read token wrote to the log"
+    );
+    for ended_by in [
+        "hang_up",
+        "error_frame",
+        "server_closed",
+        "connection_lost",
+        "suspended",
+    ] {
+        let mut report = end_report();
+        report["ended_by"] = ended_by.into();
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(report),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{ended_by}: {body}");
+    }
+    // A page that closed the socket itself has no close code to give.
+    let mut report = end_report();
+    report["ended_by"] = "hang_up".into();
+    report.as_object_mut().expect("object").remove("close_code");
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-end",
+        Some(WRITE_TOKEN),
+        Some(report),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+async fn anything_but_the_closed_call_end_record_is_refused_rather_than_logged() {
+    let router = app();
+    let with = |key: &str, value: Value| {
+        let mut report = end_report();
+        report[key] = value;
+        report
+    };
+    let without = |key: &str| {
+        let mut report = end_report();
+        report.as_object_mut().expect("object").remove(key);
+        report
+    };
+    for (why, report) in [
+        (
+            "a close reason is free text",
+            with(
+                "reason",
+                json!("Connection reset without closing handshake"),
+            ),
+        ),
+        (
+            "an unknown cause is refused, not echoed",
+            with("ended_by", json!("timer")),
+        ),
+        (
+            "an unknown protocol is refused, not echoed",
+            with("protocol", json!("some-vendor")),
+        ),
+        (
+            "a close code outside the WebSocket range",
+            with("close_code", json!(999)),
+        ),
+        (
+            "a call longer than a day is not a measurement",
+            with("since_open_ms", json!(86_400_001)),
+        ),
+        ("a missing cause is not a hang-up", without("ended_by")),
+    ] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(report),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert_eq!(body["error"], "invalid_end", "{why}");
+    }
+}
+
+#[tokio::test]
+async fn one_caller_cannot_flood_the_log_with_call_end_records() {
+    let router = app();
+    for n in 0..vibe_talk::voice_health::MAX_LINES_PER_WINDOW {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(end_report()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "record {n}: {body}");
+    }
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-end",
+        Some(WRITE_TOKEN),
+        Some(end_report()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"], "voice_end_throttled");
+    // Its own budget: the health record is not silenced by a flood of these.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-health",
+        Some(WRITE_TOKEN),
+        Some(silent_report()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
 #[tokio::test]
 async fn one_caller_cannot_flood_the_log_with_health_records() {
     let router = app();

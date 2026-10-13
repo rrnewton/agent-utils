@@ -282,6 +282,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#268 voice-call-drops` in the browser engine: a spoken call on Chromium's fake microphone against
+  # a mock `vibe-talk-v1` bridge — no microphone frame inside the greeting's hand-off; a "Yes." whose
+  # final transcript arrives after the agent's "One moment." commits the card once; the page's notice
+  # waits for that turn to complete before closing the segment; the server's close is said and
+  # recorded; a hang-up sends one goodbye. Measured on 2026-10-13: about 8s wall.
+  - group: check
+    job: voice-call-drops-browser
+    desc: a spoken call replaying the bridge's event order — the greeting hand-off, a yes answered before its final transcript, the notice's wait, and how the call ended — in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/voice_call_drops_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#241 voice-composer` in the browser engine: the message box under the call's transcript and the
   # Voice/Channel switch on screen and uncovered at idle, focused, in a typed conversation and in a
   # call, at 412x915 (and with the on-screen keyboard's share of the screen taken away, as the

@@ -130,6 +130,12 @@ fn inventory() -> Vec<Route> {
             Write,
             Bytes("{}", vibe_talk::voice_health::MAX_BODY_BYTES),
         ),
+        route(
+            "POST",
+            "/api/v1/voice-end",
+            Write,
+            Bytes("{}", vibe_talk::voice_health::MAX_BODY_BYTES),
+        ),
         route("GET", "/api/v1/channels/{channel_id}/messages", Read, limit),
         route(
             "GET",

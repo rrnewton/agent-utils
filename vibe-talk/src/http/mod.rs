@@ -188,6 +188,13 @@ fn routes(state: AppState) -> Router {
             post(api::voice_health)
                 .layer(DefaultBodyLimit::max(crate::voice_health::MAX_BODY_BYTES)),
         )
+        // `#268 voice-call-drops`. How a call that opened ended — hang-up, the service's error,
+        // the service closing it, a lost connection, the background — one content-free line per
+        // call. WRITE scope, like the timing and health records.
+        .route(
+            "/api/v1/voice-end",
+            post(api::voice_end).layer(DefaultBodyLimit::max(crate::voice_health::MAX_BODY_BYTES)),
+        )
         .route("/api/v1/channels/{channel_id}/messages", get(api::messages))
         .route(
             "/api/v1/channels/{channel_id}/messages/{message_id}",

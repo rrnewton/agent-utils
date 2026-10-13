@@ -360,7 +360,14 @@ function redact(text) {
 // three screens so it is visible on whichever one is up.
 let errorTimer = null;
 
-function showError(text) {
+/**
+ * @param {string} text
+ * @param {{stay?: boolean}} [options] `stay` keeps the panel until the reader acts — a new call, or
+ *   its dismiss — instead of taking it away after twelve seconds. `#268 voice-call-drops`: the reason
+ *   a call ended that the reader did not end stays, because a driver glances back at the screen a
+ *   minute later, not within twelve seconds.
+ */
+function showError(text, options) {
   const box = el("error-wrap");
   // Try again is offered by one error only, and it shows it after this; see `reportUnreachable`.
   el("retry-start").hidden = true;
@@ -371,7 +378,7 @@ function showError(text) {
   });
   setState("error");
   if (errorTimer !== null) clearTimeout(errorTimer);
-  errorTimer = setTimeout(clearError, 12000);
+  errorTimer = options && options.stay ? null : setTimeout(clearError, 12000);
 }
 
 function clearError() {
@@ -444,6 +451,15 @@ const session = {
   // Assistant output has arrived since the last `turn_complete`: a turn is being answered, whether
   // or not the page asked for it. A typed call holds its next prompt behind it.
   replyArriving: false,
+  // `#268 voice-call-drops`. Anything of a spoken turn — the owner's words or the assistant's —
+  // has arrived since the last `turn_complete`, so the turn is still open: a spoken call holds its
+  // next text turn behind it rather than closing the microphone's segment in the middle of it.
+  spokenTurnOpen: false,
+  // Bounds that hold: a turn that stops sending anything without completing is let go.
+  spokenTurnTimer: null,
+  // The highest turn number a `turn_complete` has named, so a late frame of it opens no new turn.
+  /** @type {number | null} */
+  lastCompletedTurn: null,
   pendingPrompts: [],
   // `#15 transcript-dedup`. One row per (turn, role) for the life of the call; see `upsertSpoken`.
   liveTurns: new Map(),
@@ -5151,6 +5167,13 @@ const SEAM_DETAILS = {
   failed:
     "The connection dropped. Anything below this line goes to an agent that has never seen " +
     "anything above it.",
+  // `#268 voice-call-drops`. A call the reader did not end says who did.
+  closed:
+    "The voice service ended this call; you did not hang up. Anything below this line goes to an " +
+    "agent that has never seen anything above it.",
+  error:
+    "The voice service reported an error and the call ended. Anything below this line goes to an " +
+    "agent that has never seen anything above it.",
 };
 
 // ...and what it says when resuming is armed, because every sentence above asserts that the agent
@@ -5167,6 +5190,12 @@ const RESUME_SEAM_DETAILS = {
   failed:
     "The connection dropped. The next call is a NEW one, and this server will read the lines " +
     "above back to it so it can carry on.",
+  closed:
+    "The voice service ended this call, not you. Next call is NEW; this server will read the " +
+    "lines above back to it: a reconstruction, not the same conversation.",
+  error:
+    "The voice service reported an error, ending the call. This server will read the lines above " +
+    "back to the next one: a reconstruction, not the same conversation.",
 };
 
 function seamDetailFor(cause) {
@@ -5358,6 +5387,18 @@ function advanceVibeTalkInput() {
     return;
   }
   if (!session.chat && session.audioSegmentActive) {
+    if (session.spokenTurnOpen) {
+      // `#268 voice-call-drops`. A spoken turn is still open — the owner is speaking, or the
+      // assistant is answering — so its own `turn_complete` is still to come. Closing the segment
+      // now would leave two of them in flight, and the page would take the turn's for the
+      // segment's: it sent the prompt into a turn that was still running, then took the segment's
+      // late `turn_complete` for the prompt's and opened the microphone over the answer. The
+      // backend is built for one turn at a time. So the text waits for this turn to end; that
+      // `turn_complete` sends it (`vibeTalkTurnComplete`), and a turn that goes quiet without one
+      // is let go after SPOKEN_TURN_HOLD_MS (`holdBehindSpokenTurn`).
+      holdBehindSpokenTurn();
+      return;
+    }
     session.capturePaused = true;
     session.waitingForAudioEnd = true;
     session.audioSegmentActive = false;
@@ -5373,15 +5414,74 @@ function advanceVibeTalkInput() {
 }
 
 /**
+ * How long a spoken turn that has stopped sending anything, without completing, may hold the page's
+ * next text turn. `#268 voice-call-drops`. Restarted by every piece of the turn that arrives, so an
+ * answer that is still talking is never cut off; this only bounds one that went quiet.
+ */
+const SPOKEN_TURN_HOLD_MS = 8000;
+
+/** Wait for the open spoken turn to end before closing the segment; see `advanceVibeTalkInput`. */
+function holdBehindSpokenTurn() {
+  if (session.spokenTurnTimer === null) armSpokenTurnHold();
+}
+
+function armSpokenTurnHold() {
+  if (session.spokenTurnTimer !== null) clearTimeout(session.spokenTurnTimer);
+  const socket = session.socket;
+  session.spokenTurnTimer = setTimeout(() => {
+    session.spokenTurnTimer = null;
+    if (session.socket !== socket || !session.spokenTurnOpen) return;
+    // Nothing more of it, and no end: let the text go as it went before the page waited, and say
+    // so where the call's other mechanics are recorded.
+    session.spokenTurnOpen = false;
+    addDetail(
+      `a spoken turn went quiet for ${Math.round(SPOKEN_TURN_HOLD_MS / 1000)} s without completing; ` +
+        "the page's next message went anyway"
+    );
+    advanceVibeTalkInput();
+  }, SPOKEN_TURN_HOLD_MS);
+}
+
+/**
+ * Something of a spoken turn arrived — the owner's words, the assistant's, or its audio — so the turn
+ * is open until its `turn_complete`. A frame of a turn that has ALREADY completed (a late final
+ * transcript) opens nothing.
+ *
+ * @param {number | null} [turn] the frame's turn number, when it has one
+ */
+function noteSpokenTurnActivity(turn = null) {
+  if (session.chat || session.protocol !== "vibe-talk-v1") return;
+  if (turn !== null && session.lastCompletedTurn !== null && turn <= session.lastCompletedTurn) return;
+  session.spokenTurnOpen = true;
+  // A text turn is waiting on this one, which is still talking: give it the whole bound again.
+  if (session.spokenTurnTimer !== null) armSpokenTurnHold();
+}
+
+/** A `turn_complete`: no spoken turn is open, and nothing is waiting on one. */
+function closeSpokenTurn(turn = null) {
+  session.spokenTurnOpen = false;
+  if (turn !== null) {
+    session.lastCompletedTurn = Math.max(session.lastCompletedTurn ?? turn, turn);
+  }
+  if (session.spokenTurnTimer !== null) {
+    clearTimeout(session.spokenTurnTimer);
+    session.spokenTurnTimer = null;
+  }
+}
+
+/**
  * Output of a turn in progress arrived: PCM, or assistant text.
  *
  * While a typed call holds a prompt behind that turn, each piece restarts the no-reply bound, so
  * the bound measures the turn going quiet without completing. A typed call plays none of the PCM
  * and so never judges it as heard; without the restart, a greeting still speaking after the bound
  * would be reported as no reply, and one that stalled after its next transcript never would.
+ *
+ * @param {number | null} [turn] the turn the output belongs to, when the frame says
  */
-function noteReplyArriving() {
+function noteReplyArriving(turn = null) {
   session.replyArriving = true;
+  noteSpokenTurnActivity(turn);
   if (session.chat && !session.typedTurnInFlight && session.pendingPrompts.length > 0) {
     armNoReply();
   }
@@ -8695,27 +8795,53 @@ const SPOKEN_COMMIT_REFUSALS = {
   proposal_unknown: "the server no longer holds it",
 };
 
+/**
+ * One assistant turn, as a spoken yes holds it up against the card.
+ *
+ * @typedef {{text: string, card: string | null, turn: number | null, at: number,
+ *   cardFrom: {handle: string, words: number} | null}} SpokenYesTurn
+ */
+/**
+ * What an answer is judged against: the assistant's turns before it, what it said since the user
+ * last spoke, whether a page text turn came between, whether the read-back was cut off or completed,
+ * when the answer began, and when the read-back's audio finished playing.
+ *
+ * @typedef {{turns: SpokenYesTurn[], sinceUser: {text: string}[], interposed: boolean, cut: boolean,
+ *   done: boolean, answerAt: number, playEnd: number}} SpokenYesHeard
+ */
+
 const spokenYes = {
   // Bumped by every reset, so a timer or a commit from before it drops its result.
   epoch: 0,
   // What the assistant has said since the last turn of anyone's — the user's, spoken or typed, or a
   // text turn this page sent (a relayed message, a notice) — per turn, in order, each with the handle
-  // that was on the card when the turn began: the read-back, held up against the card.
-  /** @type {Map<string, {text: string, card: string | null}>} */
+  // that was on the card when the turn began, its number on the neutral protocol, when its first
+  // frame arrived, and how many of its words were said before a newer draft reached the card: the
+  // read-back, held up against the card.
+  /** @type {Map<string, SpokenYesTurn>} */
   said: new Map(),
   // What the assistant has said since the USER's last turn, page text turns included: what decides
   // whether an answer is one about sending (`askedAboutSending`), since a relayed message read out
   // after "Send it?" does not stop the owner's yes from being an answer to it.
-  /** @type {Map<string, {text: string}>} */
+  /** @type {Map<string, {text: string, turn: number | null, at: number}>} */
   sinceUser: new Map(),
   // A text turn of this page's went since the user's last turn.
   interposed: false,
-  // Something cut the assistant off since the user last spoke.
+  // Something cut the assistant off since the user last spoke: the hosted protocol's interruption,
+  // or an interrupted `turn_complete` that carried no turn number.
   cut: false,
-  // The neutral protocol said the assistant's turn completed, not interrupted.
+  // The neutral protocol said the assistant's turn completed, not interrupted. Used only where the
+  // turns carry no numbers; numbered turns are judged by `completed`.
   done: false,
-  // When the first user frame after the assistant last spoke arrived; 0 when none has.
-  answerAt: 0,
+  // `#268 voice-call-drops`. The neutral protocol's numbered turns completed since the user last
+  // spoke: whether each was cut short, and when the audio queued by its end finishes playing.
+  /** @type {Map<number, {interrupted: boolean, playEnd: number}>} */
+  completed: new Map(),
+  // `#268 voice-call-drops`. The user's turn the page has begun to hear and not yet judged: its key,
+  // its number, its best words so far, and when the answer began — put back to 0 while the
+  // assistant is still saying what the answer answers, and set again by the answer's next frame.
+  /** @type {{key: string, turn: number | null, text: string, startedAt: number} | null} */
+  answer: null,
   // The user turn already judged, so more frames of it are not judged again.
   /** @type {string | null} */
   answered: null,
@@ -8861,14 +8987,22 @@ function unsayableDraft(text) {
  * one's words before it, the first so a read-back whose transcript beat the card to this page still
  * counts.
  *
+ * "The part said once this draft was on the card" is counted in words, not only in turns: the
+ * neutral protocol keeps one row per numbered turn, so a sentence the agent said before it proposed
+ * ("Sure, let me draft that.") and the read-back after it can be one turn, and that turn began
+ * before the card did. `#268 voice-call-drops`.
+ *
  * @param {VibeTalk.PendingPost} shown
- * @param {{text: string, card: string | null}[]} turns
+ * @param {{text: string, card: string | null, cardFrom?: {handle: string, words: number} | null}[]} turns
  */
 function readBackRefusal(shown, turns) {
   const all = answerWords(turns.map((turn) => turn.text).join(" "));
-  const since = answerWords(
-    turns.filter((turn) => turn.card === shown.handle).map((turn) => turn.text).join(" ")
-  );
+  const sinceCard = (turn) => {
+    if (turn.card === shown.handle) return answerWords(turn.text);
+    const from = turn.cardFrom;
+    return from && from.handle === shown.handle ? answerWords(turn.text).slice(from.words) : [];
+  };
+  const since = turns.flatMap(sinceCard);
   if (isExactReadBack(all, shown) || isExactReadBack(since, shown)) return null;
   return all.slice(-2).join(" ") === "send it" ? "mismatch" : "no_question";
 }
@@ -8933,7 +9067,8 @@ function resetSpokenYes(why = "earlier_draft") {
   spokenYes.interposed = false;
   spokenYes.cut = false;
   spokenYes.done = false;
-  spokenYes.answerAt = 0;
+  spokenYes.completed = new Map();
+  spokenYes.answer = null;
   spokenYes.answered = null;
   spokenYes.eligible = null;
   spokenYes.lastShown = null;
@@ -8983,6 +9118,9 @@ function noteProposalsAtCallOpen(proposal) {
  * as to everything since the user last spoke. A draft replaced by a shorter one — "don't merge the
  * PR" by "merge the PR" — is not confirmed by the first one's read-back, since neither is word for
  * word the second's.
+ *
+ * A turn already under way when a new draft appears remembers how many of its words came before
+ * it, so the words it goes on to say count as said once the draft was up (`readBackRefusal`).
  */
 function noteCardForSpokenYes(proposal, previous) {
   const handle = proposal ? proposal.handle : null;
@@ -8990,33 +9128,109 @@ function noteCardForSpokenYes(proposal, previous) {
   if (spokenYes.settling && spokenYes.settling.handle !== handle) abortSpokenYes("changed");
   spokenYes.eligible = handle !== null && handle !== spokenYes.ineligible ? handle : null;
   if (proposal) spokenYes.lastShown = proposal;
+  if (handle === null) return;
+  for (const turn of spokenYes.said.values()) {
+    if (turn.card !== handle) turn.cardFrom = { handle, words: answerWords(turn.text).length };
+  }
 }
 
-/** The assistant said `text` in the turn named `key` (its whole text so far). */
-function hearAssistantForSpokenYes(key, text) {
+/**
+ * Is `turn` the assistant's reply to `answer`, rather than something said before it? `#268
+ * voice-call-drops`.
+ *
+ * The neutral protocol numbers a turn for the user's words and the assistant's answer to them alike,
+ * so an assistant turn numbered at or after the answer's is its reply. A bridge relays the user's
+ * transcript and the assistant's answer as two streams, and the answer's FINAL transcript can arrive
+ * after the reply has begun — "One moment." on the page before the "Yes." it answers — so the
+ * number, not the order of arrival, says which came first.
+ *
+ * Without numbers nothing does: the order of arrival is exactly what cannot be trusted, and a
+ * hypothesis of background noise before the read-back would make the read-back look like a reply.
+ * So an unnumbered turn is never taken for a reply, and is judged as it always was.
+ *
+ * @param {{turn: number | null}} answer
+ * @param {{turn: number | null}} turn
+ */
+function isReplyTo(answer, turn) {
+  return answer.turn !== null && turn.turn !== null && turn.turn >= answer.turn;
+}
+
+/**
+ * The assistant said `text` in the turn named `key` (its whole text so far), numbered `turn` on the
+ * neutral protocol.
+ *
+ * @param {string} key
+ * @param {string} text
+ * @param {number | null} [turn]
+ */
+function hearAssistantForSpokenYes(key, text, turn = null) {
   if (!String(text).trim()) return;
   const before = spokenYes.said.get(key);
   const card = before ? before.card : postWatch.shown ? postWatch.shown.handle : null;
-  spokenYes.said.set(key, { text: String(text), card });
-  spokenYes.sinceUser.set(key, { text: String(text) });
+  const at = before ? before.at : Date.now();
+  /** @type {SpokenYesTurn} */
+  const entry = { text: String(text), card, turn, at, cardFrom: before ? before.cardFrom : null };
+  spokenYes.said.set(key, entry);
+  const since = spokenYes.sinceUser.get(key);
+  spokenYes.sinceUser.set(key, { text: String(text), turn, at: since ? since.at : at });
+  // The reply to an answer the page has begun to hear says nothing about what that answer answers:
+  // it neither reopens the read-back nor moves the moment the answer began.
+  const answer = spokenYes.answer;
+  if (answer && isReplyTo(answer, entry)) return;
   spokenYes.done = false;
-  spokenYes.answerAt = 0;
+  if (answer) answer.startedAt = 0;
 }
 
-/** Something cut the assistant off: an interruption, or an interrupted turn. */
-function noteCutForSpokenYes() {
-  spokenYes.cut = true;
+/**
+ * Something cut the assistant off: an interruption, or an interrupted turn.
+ *
+ * @param {boolean} [numbered] whether it was a numbered turn, which `completed` holds instead: the
+ *   reply to an answer being cut off must not count against the read-back before it
+ */
+function noteCutForSpokenYes(numbered = false) {
+  if (!numbered) spokenYes.cut = true;
   // During the settle window that is the user speaking again: more than a yes.
   abortSpokenYes("heard_more");
 }
 
-/** The neutral protocol's `turn_complete`. */
-function noteTurnCompleteForSpokenYes(interrupted) {
+/**
+ * The neutral protocol's `turn_complete` for `turn`.
+ *
+ * Each numbered completion is kept until the user's next turn is judged, with the moment the audio
+ * queued so far finishes playing: the server sends a turn's `turn_complete` after the last of its
+ * audio, so that is when the owner heard the end of that turn. `#268 voice-call-drops`.
+ *
+ * @param {boolean} interrupted
+ * @param {number | null} [turn]
+ */
+function noteTurnCompleteForSpokenYes(interrupted, turn = null) {
+  if (turn !== null) {
+    spokenYes.completed.set(turn, { interrupted, playEnd: session.playEndMs || 0 });
+  }
   if (interrupted) {
-    noteCutForSpokenYes();
+    noteCutForSpokenYes(turn !== null);
   } else if (spokenYes.said.size > 0) {
     spokenYes.done = true;
   }
+}
+
+/**
+ * An answer that never got a final transcript, judged once its turn has completed. `#268
+ * voice-call-drops`.
+ *
+ * A bridge may stream the owner's words only as hypotheses and complete the turn without ever
+ * marking one final. The page stores the row at that `turn_complete`, because that is when its
+ * words are as good as they are going to get, and the same is true of the answer. Called after the
+ * page has finished with the `turn_complete` itself, so a notice this judgement sends to the agent
+ * queues behind a turn that is over rather than inside one that is closing. The settle window
+ * follows, as for any yes.
+ *
+ * @param {number | null} turn the turn that completed
+ */
+function judgeAnswerAtTurnEnd(turn) {
+  const answer = spokenYes.answer;
+  if (!answer || answer.turn === null || turn === null || turn < answer.turn) return;
+  hearUserForSpokenYes(answer.key, answer.text, true, answer.turn);
 }
 
 /**
@@ -9031,7 +9245,8 @@ function noteTypedForSpokenYes() {
   spokenYes.interposed = true;
   spokenYes.cut = false;
   spokenYes.done = false;
-  spokenYes.answerAt = 0;
+  spokenYes.completed = new Map();
+  if (spokenYes.answer) spokenYes.answer.startedAt = 0;
 }
 
 /** The user typed or pressed a message to the agent: their turn, so the question before it is answered. */
@@ -9041,36 +9256,94 @@ function noteUserTextForSpokenYes() {
 }
 
 /**
- * The user said `text` in the turn named `key` — its whole text so far — and whether that is final.
+ * The user said `text` in the turn named `key` — its whole text so far, numbered `turn` on the
+ * neutral protocol — and whether that is final.
  *
  * Any frame times the answer and can stop a yes that is settling; the FIRST final of a turn is
- * judged, once, against what the assistant said since the user last spoke.
+ * judged, once, against what the assistant said BEFORE it since the user last spoke
+ * (`heardBefore`). What the assistant says in reply, which can reach this page before the answer's
+ * own final transcript does, is no part of that; it is kept, as the first thing said since.
+ *
+ * @param {string} key
+ * @param {string} text
+ * @param {boolean} final
+ * @param {number | null} [turn]
  */
-function hearUserForSpokenYes(key, text, final) {
-  if (!spokenYes.answerAt) spokenYes.answerAt = Date.now();
+function hearUserForSpokenYes(key, text, final, turn = null) {
+  const now = Date.now();
+  if (key !== spokenYes.answered) {
+    const current = spokenYes.answer;
+    if (!current || current.key !== key) {
+      spokenYes.answer = { key, turn, text: String(text), startedAt: now };
+    } else {
+      current.text = String(text);
+      if (!current.startedAt) current.startedAt = now;
+    }
+  }
   const settling = spokenYes.settling;
   if (settling && answerWords(text).join(" ") !== settling.words) abortSpokenYes("heard_more");
   if (!final || key === spokenYes.answered) return;
   spokenYes.answered = key;
+  const answer = spokenYes.answer || { key, turn, text: String(text), startedAt: now };
+  spokenYes.answer = null;
   // What this answer is judged against, taken before it is forgotten: the read-back belongs to the
   // answer right after it and to no later one.
-  const heard = {
-    turns: [...spokenYes.said.values()],
-    sinceUser: [...spokenYes.sinceUser.values()],
-    interposed: spokenYes.interposed,
-    cut: spokenYes.cut,
-    done: spokenYes.done,
-    answerAt: spokenYes.answerAt,
-  };
-  spokenYes.said = new Map();
-  spokenYes.sinceUser = new Map();
+  const heard = heardBefore(answer);
+  const reply = (entry) => isReplyTo(answer, entry);
+  spokenYes.said = new Map([...spokenYes.said].filter(([, entry]) => reply(entry)));
+  spokenYes.sinceUser = new Map([...spokenYes.sinceUser].filter(([, entry]) => reply(entry)));
+  spokenYes.completed = new Map(
+    [...spokenYes.completed].filter(([number]) => answer.turn !== null && number >= answer.turn)
+  );
   spokenYes.interposed = false;
   spokenYes.cut = false;
   spokenYes.done = false;
-  spokenYes.answerAt = 0;
   // The same yes again while one is already settling or committing is not a second answer.
   if (spokenYes.settling || postWatch.busy) return;
   judgeSpokenAnswer(text, heard);
+}
+
+/**
+ * Everything `answer` is judged against: what the assistant said before it since the user last
+ * spoke, and the facts about that read-back. `#268 voice-call-drops`.
+ *
+ * On the neutral protocol with numbered turns, "completed, not interrupted, before the answer" and
+ * "heard to the end" are asked of the read-back's OWN turn — its `turn_complete`, and the moment the
+ * audio queued by then finished playing — not of whatever the assistant is saying now, which may
+ * already be its reply. The answer began at its first frame, or at its reply's first frame if that
+ * came sooner: a reply cannot start before the words it answers, so the earlier of the two is still
+ * no earlier than the answer began, and judging from it is never more lenient.
+ *
+ * @param {{key: string, turn: number | null, startedAt: number}} answer
+ * @returns {SpokenYesHeard}
+ */
+function heardBefore(answer) {
+  const said = [...spokenYes.said.values()];
+  const turns = said.filter((entry) => !isReplyTo(answer, entry));
+  const sinceUser = [...spokenYes.sinceUser.values()].filter((entry) => !isReplyTo(answer, entry));
+  let answerAt = answer.startedAt || Date.now();
+  for (const entry of said) {
+    if (isReplyTo(answer, entry)) answerAt = Math.min(answerAt, entry.at);
+  }
+  const before = (number) => answer.turn === null || number < answer.turn;
+  const cutBefore = [...spokenYes.completed].some(([number, end]) => end.interrupted && before(number));
+  let done = spokenYes.done;
+  let playEnd = session.playEndMs || 0;
+  const numbered = turns.length > 0 && turns.every((entry) => entry.turn !== null);
+  if (session.protocol === "vibe-talk-v1" && numbered) {
+    const end = spokenYes.completed.get(Math.max(...turns.map((entry) => entry.turn)));
+    done = Boolean(end && !end.interrupted);
+    if (end) playEnd = end.playEnd;
+  }
+  return {
+    turns,
+    sinceUser,
+    interposed: spokenYes.interposed,
+    cut: spokenYes.cut || cutBefore,
+    done,
+    answerAt,
+    playEnd,
+  };
 }
 
 /**
@@ -9078,7 +9351,7 @@ function hearUserForSpokenYes(key, text, final) {
  * an agent could take for a yes that does not pass sent nothing.
  *
  * @param {string} text
- * @param {{turns: {text: string, card: string | null}[], sinceUser: {text: string}[], interposed: boolean, cut: boolean, done: boolean, answerAt: number}} heard
+ * @param {SpokenYesHeard} heard
  */
 function judgeSpokenAnswer(text, heard) {
   if (!session.connected || !spokenYes.askFirst) return;
@@ -9166,7 +9439,7 @@ function typedAnswerToCard(text) {
  *
  * @param {VibeTalk.PendingPost} shown
  * @param {string} answer
- * @param {{turns: {text: string, card: string | null}[], sinceUser: {text: string}[], interposed: boolean, cut: boolean, done: boolean, answerAt: number}} heard
+ * @param {SpokenYesHeard} heard
  */
 function spokenYesRefusal(shown, answer, heard) {
   if (shown.handle !== spokenYes.eligible) return spokenYes.ineligibleWhy;
@@ -9186,7 +9459,9 @@ function spokenYesRefusal(shown, answer, heard) {
     return readBackBefore ? "interposed" : readBack;
   }
   const answeredAt = heard.answerAt || Date.now();
-  const playEnd = session.playEndMs || 0;
+  // When the READ-BACK finished playing, not whatever is queued now: the reply to this answer may
+  // already be playing. `#268 voice-call-drops`.
+  const playEnd = heard.playEnd || 0;
   if (answeredAt < playEnd) return "early";
   // The read-back ends "...Send it?", so its last words are the card's last two and "send it": an
   // answer made only of those, straight after, may be the agent's own voice coming back.
@@ -10515,12 +10790,6 @@ let openTimer = null;
 const VOICE_UNREACHABLE = "The voice service is not reachable.";
 
 /**
- * The socket the reader hung up on. Its close is the reader's act, not a failure, even when it
- * comes before the socket ever opened.
- */
-let hungUpSocket = null;
-
-/**
  * Whether the last start never reached the voice service, and how it was started, so Try again
  * can start the same kind of conversation. `#209 voice-socket-open`.
  */
@@ -10662,13 +10931,88 @@ function wasSuspended() {
   );
 }
 
+/**
+ * The connection of a call that HAD opened failed: lost without a closing handshake, or an error
+ * the browser reported on it. A start that never opened is `reportUnreachable`'s.
+ *
+ * `#268 voice-call-drops`. This used to say "this browser could not open its WebSocket" — for a
+ * call that had been open and talking for twenty seconds when its connection was reset. It says
+ * what happened, how far into the call, and that the reader did not end it.
+ */
 function reportFailure() {
   failureTimer = null;
+  const span = callSpan();
   showError(
-    `The connection to ${session.providerName} failed. vibe-talk accepted your token and ` +
-      "returned a voice session, but this browser could not open its WebSocket."
+    `The connection to ${session.providerName} failed${span ? ` ${span} into the call` : ""}: ` +
+      "it was cut without a goodbye — by the network, the phone or the voice service, not by " +
+      "Hang up. Start a new call to carry on.",
+    { stay: true }
   );
   setStatus("The connection to the voice agent failed.");
+}
+
+// --- how a call ended ----------------------------------------------------------------------------
+//
+// `#268 voice-call-drops`. Calls ended on their own and nothing on this side said why: the only
+// record was the voice bridge's log, which saw the page say goodbye and could not see what made it.
+// So every call that opened is recorded once, when it ends — by whom or what, the close code, how
+// long it had been open — as one content-free line in this app's log, and the screen says why
+// unless the reader ended it. A hang-up, a drop, the service closing the call and the page ending it
+// after the service's error are four different lines.
+
+/** How long this call has been open, in words — "22 s", "3 min 5 s" — or "" when it never opened. */
+function callSpan() {
+  const health = session.health;
+  if (!health || health.openedAt === null) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - health.openedAt) / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  return seconds % 60 ? `${minutes} min ${seconds % 60} s` : `${minutes} min`;
+}
+
+/**
+ * Record, once per call that opened, how it ended: `POST /api/v1/voice-end`. Names and numbers
+ * only, like the startup and health records; the server's allowlist refuses anything else. Sent
+ * before the call is torn down, which is what clears the record it reads.
+ *
+ * @param {"hang_up" | "error_frame" | "server_closed" | "connection_lost" | "suspended"} endedBy
+ * @param {number | null} code the close code the browser reported, when it reported one
+ */
+function postCallEnd(endedBy, code) {
+  const health = session.health;
+  if (!health || health.openedAt === null || health.endPosted) return;
+  health.endPosted = true;
+  if (session.protocol !== "vibe-talk-v1") return;
+  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number}} */
+  const body = {
+    protocol: session.protocol,
+    chat: health.chat,
+    ended_by: endedBy,
+    since_open_ms: Math.max(0, Math.round(Date.now() - health.openedAt)),
+    turns: health.turns,
+  };
+  if (typeof code === "number" && code >= 1000 && code <= 4999) body.close_code = code;
+  // Diagnostics, not the call: a failure here is not worth a word on the screen.
+  api("/api/v1/voice-end", { method: "POST", body }).catch(() => {});
+}
+
+/**
+ * The words for a call the voice service's side ended while the reader did not hang up, the page
+ * was in sight, and no error preceded the close.
+ *
+ * @param {string} span how long the call had been open, in words
+ * @param {boolean} lost whether the close came without a closing handshake
+ * @param {string} reason the reason the service gave with its close, if any
+ */
+function serviceEndedSentence(span, lost, reason) {
+  const into = span ? ` ${span} in` : "";
+  if (lost) {
+    return `The call dropped${into}: the connection to the voice service was cut without a ` +
+      "goodbye — by the network, the phone or the service, not by Hang up. Start a new call to carry on.";
+  }
+  const given = String(reason || "").slice(0, 120).replace(/[\s.]+$/u, "");
+  const said = given ? ` It said: ${given}.` : "";
+  return `The voice service ended the call${into} — you did not hang up.${said} Start a new call to carry on.`;
 }
 
 /**
@@ -10801,6 +11145,8 @@ async function openConversation(options) {
   session.waitingForAudioEnd = false;
   session.typedTurnInFlight = false;
   session.replyArriving = false;
+  closeSpokenTurn();
+  session.lastCompletedTurn = null;
   session.pendingPrompts = [];
   session.playEndMs = 0;
   session.echoCancellation = false;
@@ -10891,6 +11237,8 @@ async function openConversation(options) {
   openTimer = setTimeout(openDeadline, SOCKET_OPEN_TIMEOUT_MS);
 
   socket.onopen = () => {
+    // Hung up while it was connecting: it opened for nobody. `#268 voice-call-drops`.
+    if (session.socket !== socket) return;
     opened = true;
     clearOpenTimer();
     markStartup("socket_open");
@@ -10978,6 +11326,10 @@ async function openConversation(options) {
   };
 
   socket.onmessage = (event) => {
+    // `#268 voice-call-drops`. A socket this page has finished with speaks for no call. Whatever
+    // it still delivers is not the current call's: an `error` frame on it would reach `endCall`,
+    // which acts on `session.socket` — the NEXT call's, once there is one — and hang that call up.
+    if (session.socket !== socket) return;
     if (event.data instanceof ArrayBuffer) {
       if (session.protocol === "vibe-talk-v1") {
         noteReplyArriving();
@@ -11033,6 +11385,10 @@ async function openConversation(options) {
     // broken" and "you switched apps". So this records the fact and arms a short timer; the close
     // cancels it and classifies. An error with no close following still reaches the screen, which
     // is what the timer is for: silence would be the old bug in a new coat.
+    //
+    // Only for the call's own socket: one this page has finished with must not mark the next call
+    // failed, nor arm a report that lands on it. `#268 voice-call-drops`.
+    if (session.socket !== socket) return;
     session.failed = true;
     if (failureTimer !== null) {
       clearTimeout(failureTimer);
@@ -11053,6 +11409,16 @@ async function openConversation(options) {
     //   ended      the call is over, either because it was hung up or because it ran out
     //
     // The old code had two of these and reported the first as the second.
+    //
+    // `#268 voice-call-drops`. "Ended" here is never the reader's Hang up: that tears the call down
+    // itself (`endCall`), so its socket is no longer the call's by the time its close arrives, and
+    // that close — which can come seconds later, after a `quit` the service took its time over —
+    // changes nothing but the connection details. Tearing down from it used to end whatever call
+    // the reader had started since.
+    if (session.socket !== socket) {
+      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
+      return;
+    }
     if (failureTimer !== null) {
       clearTimeout(failureTimer);
       failureTimer = null;
@@ -11060,23 +11426,33 @@ async function openConversation(options) {
     clearOpenTimer();
     // `#209 voice-socket-open`. Closed before it ever opened, and not by the reader: the start
     // never reached the voice service, whether or not an error came first.
-    const neverOpened = !opened && hungUpSocket !== socket;
+    const neverOpened = !opened;
     const cause = wasSuspended()
       ? "suspended"
       : session.failed || neverOpened
         ? "failed"
         : "ended";
+    // Closed without a closing handshake: the browser's 1006, which it reports after an error.
+    const lost = session.failed || event.code === 1006;
     if (cause === "failed" && neverOpened) {
       noteSocketFailure(event.code, false);
       reportUnreachable("Its address did not accept the connection.", foreignSocketHint(socketUrl));
     } else if (cause === "failed") {
       reportFailure();
     } else {
+      // `#268 voice-call-drops`. The service's side ended a call the reader was in, and it does
+      // not stop silently: the panel says so and how far in, and the transcript's seam keeps it.
+      if (cause === "ended") {
+        showError(serviceEndedSentence(callSpan(), lost, redact(event.reason || "")), { stay: true });
+      }
       setState(cause);
       // A session-endpoint failure also shows up here as an immediate close, so the page has to say
       // something — but "code 1005" is not something. It says what happened in words; the number
       // goes where numbers belong, in the connection details on the settings screen.
       setStatus(cause === "suspended" ? SUSPENDED_STATUS : closeReason(event.code));
+    }
+    if (!neverOpened) {
+      postCallEnd(cause === "suspended" ? "suspended" : lost ? "connection_lost" : "server_closed", event.code);
     }
     // The banner is about a conversation that no longer exists, and the code is the one thing on
     // this page that must not be read as user-facing. Put the banner away FIRST, then record the
@@ -11084,7 +11460,7 @@ async function openConversation(options) {
     dismissBanner();
     addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
     teardown();
-    noteConversationEnded(cause);
+    noteConversationEnded(cause === "ended" && !lost ? "closed" : cause === "ended" ? "failed" : cause);
   };
 }
 
@@ -11448,6 +11824,8 @@ function beginHealth(chat) {
     episodeReported: false,
     reported: new Set(),
     noReplyTimer: null,
+    // `#268 voice-call-drops`. Whether how this call ended has been recorded (`postCallEnd`).
+    endPosted: false,
   };
 }
 
@@ -11634,6 +12012,10 @@ function handleVibeTalk(message) {
     case "session_started": {
       markStartup("provider_ready");
       noteSessionStartedForSpokenYes();
+      // A session, first or replacement, starts with no turn open, and numbers its turns afresh.
+      // `#268 voice-call-drops`.
+      closeSpokenTurn();
+      session.lastCompletedTurn = null;
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
       if (session.chat) {
@@ -11687,9 +12069,13 @@ function handleVibeTalk(message) {
       // A provider that predates the flag sends only finished text, so absent means final.
       const final = message.final !== false;
       const key = `${message.turn ?? ""}:${who}:${final}:${said}`;
+      const turnNumber = typeof message.turn === "number" ? message.turn : null;
       if (who === "assistant" && said.trim()) {
         noteAgentText();
-        noteReplyArriving();
+        noteReplyArriving(turnNumber);
+      } else if (said.trim()) {
+        // The owner is speaking: a spoken turn is open, whether or not anything answers it yet.
+        noteSpokenTurnActivity(turnNumber);
       }
       if (!said || key === session.lastTranscriptKey) {
         break;
@@ -11699,11 +12085,13 @@ function handleVibeTalk(message) {
         markStartup("greeting_text");
       }
       const spoken = upsertSpoken(who, message.turn, said, final);
-      // The turn's whole text so far, as the row shows it. `#264 voice-send-approval`.
+      // The turn's whole text so far, as the row shows it, and its number: the number, not the
+      // order the frames arrive in, says whether assistant words came before an answer or in reply
+      // to it. `#264 voice-send-approval`, `#268 voice-call-drops`.
       if (who === "assistant") {
-        hearAssistantForSpokenYes(spoken.key, spokenText(spoken.entry));
+        hearAssistantForSpokenYes(spoken.key, spokenText(spoken.entry), turnNumber);
       } else if (!spoken.entry.echo) {
-        hearUserForSpokenYes(spoken.key, spokenText(spoken.entry), final);
+        hearUserForSpokenYes(spoken.key, spokenText(spoken.entry), final, turnNumber);
       }
       break;
     }
@@ -11715,8 +12103,19 @@ function handleVibeTalk(message) {
       // what stops the page streaming the microphone into a session the server has already
       // closed: left open, every audio frame came back as another copy of this error and the
       // phone kept reporting the microphone in use until the reader found Hang up.
-      if (session.socket && session.protocol === "vibe-talk-v1") stop();
-      showError(`The voice session ended: ${said}. Tap Talk to start a new call.`);
+      //
+      // `#268 voice-call-drops`. It is the one way this page ends a call the reader did not, so it
+      // says so: that the voice service reported the error, how far into the call, and its words;
+      // and it is recorded as `error_frame`, not as a hang-up.
+      {
+        const span = callSpan();
+        if (session.socket && session.protocol === "vibe-talk-v1") endCall("error_frame");
+        showError(
+          `The voice service reported an error${span ? ` ${span} into the call` : ""}, and the ` +
+            `call has ended: ${said}. Tap Talk to start a new call.`,
+          { stay: true }
+        );
+      }
       break;
     }
     case "turn_complete": {
@@ -11726,9 +12125,12 @@ function handleVibeTalk(message) {
       // Cleared FIRST: completing this turn may send the next typed prompt, which arms its own.
       clearNoReply();
       session.replyArriving = false;
-      noteTurnCompleteForSpokenYes(message.interrupted === true);
+      const number = typeof message.turn === "number" ? message.turn : null;
+      closeSpokenTurn(number);
+      noteTurnCompleteForSpokenYes(message.interrupted === true, number);
       vibeTalkTurnComplete();
       judgeTurn(message, closingSegment);
+      judgeAnswerAtTurnEnd(number);
       break;
     }
     default:
@@ -11742,7 +12144,12 @@ function vibeTalkTurnComplete() {
   sendStartupTiming();
   if (session.waitingForGreeting) {
     session.waitingForGreeting = false;
-    session.capturePaused = false;
+    // `#268 voice-call-drops`. The greeting is a turn the backend answered like any other, and its
+    // next handler is no more ready in this event-loop turn than after any other: microphone frames
+    // sent at once — the next capture callback, a few milliseconds away — are what the hand-off
+    // below was measured to close the whole session on. Every other turn's end already waited; the
+    // greeting's opened the microphone straight away, a few seconds into every call that greets.
+    deferVoiceCaptureAcrossTurn();
     setStatus("Connected — say something.");
     advanceVibeTalkInput();
     return;
@@ -11855,6 +12262,11 @@ function startCapture(socket) {
 function teardown() {
   // A start torn down for any reason is no longer waiting for its socket to open.
   clearOpenTimer();
+  // ...nor for an error on its socket to be reported: what ended it has been said already.
+  if (failureTimer !== null) {
+    clearTimeout(failureTimer);
+    failureTimer = null;
+  }
   // Before anything is reset: the turn in progress is stored, and a call that ended before its
   // greeting still reports how far it got.
   settleSpoken();
@@ -11908,6 +12320,8 @@ function teardown() {
   session.waitingForAudioEnd = false;
   session.typedTurnInFlight = false;
   session.replyArriving = false;
+  closeSpokenTurn();
+  session.lastCompletedTurn = null;
   session.pendingPrompts = [];
   session.playEndMs = 0;
   session.echoCancellation = false;
@@ -11934,7 +12348,24 @@ function teardown() {
   renderControls();
 }
 
+/** Hang up: the reader's control, and the only way this page ends a call that is working. */
 function stop() {
+  endCall("hang_up");
+}
+
+/**
+ * End the call from this page: tell a `vibe-talk-v1` server goodbye (`audio_end`, `quit`), close the
+ * socket, and tear the call down.
+ *
+ * `#268 voice-call-drops`. There are exactly two reasons, and both are recorded (`postCallEnd`) and
+ * said: the reader pressed Hang up, or the server sent an `error`, which the protocol says ends its
+ * session — and the page then says so in red, with the server's words. Nothing else on this page
+ * sends `quit`. A bridge log that shows one, then, shows one of these two, and this app's log says
+ * which.
+ *
+ * @param {"hang_up" | "error_frame"} endedBy
+ */
+function endCall(endedBy) {
   // With no call there is no Hang up in the pane at all, so this is unreachable from the screen;
   // it stays as a guard rather than as a second way to end something that is already over.
   if (!session.socket) {
@@ -11944,12 +12375,26 @@ function stop() {
     sendVibeTalkFrame({ type: "audio_end" });
     sendVibeTalkFrame({ type: "quit" });
   }
-  hungUpSocket = session.socket;
-  session.socket.close();
+  const span = callSpan();
+  postCallEnd(endedBy, null);
+  if (span) {
+    addDetail(endedBy === "hang_up"
+      ? `hung up ${span} into the call`
+      : `ended by this page ${span} into the call, after the voice service's error`);
+  }
+  // From here the socket is no longer the call's: its other handlers ignore it once `teardown` has
+  // let it go, and its close — whenever it comes, which can be seconds after a `quit` — touches
+  // nothing but the connection details. Replaced BEFORE `close()`, which may report the close at once.
+  const socket = session.socket;
+  socket.onclose = (event) => {
+    addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
+  };
+  socket.close();
   setStatus("Call ended.");
   setState("ended");
+  dismissBanner();
   teardown();
-  noteConversationEnded();
+  noteConversationEnded(endedBy === "hang_up" ? "ended" : "error");
 }
 
 // --- the controls --------------------------------------------------------------------------------

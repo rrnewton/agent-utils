@@ -582,6 +582,91 @@ async fn a_voice_health_record_is_one_line_of_names_and_numbers_and_a_refused_on
     assert!(recoveries[0].contains("INFO") && recoveries[0].contains("cause=recovered"));
 }
 
+/// `#268 voice-call-drops`. How a call ended is one line of names and numbers: a hang-up at info,
+/// anything that ended the call for the reader at warn, and a refused record is no line at all.
+#[tokio::test]
+async fn a_call_end_record_is_one_line_and_says_who_ended_the_call() {
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let dropped = json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "ended_by": "connection_lost",
+        "close_code": 1006,
+        "since_open_ms": 22_000,
+        "turns": 2,
+    });
+    let mut smuggled = dropped.clone();
+    smuggled["reason"] = json!("Connection reset without closing handshake");
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(smuggled)
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(dropped)
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let hang_up = json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "ended_by": "hang_up",
+        "since_open_ms": 95_000,
+        "turns": 7,
+    });
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(hang_up)
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let text = capture.text();
+    assert!(
+        !text.contains("closing handshake"),
+        "refused free text reached the log: {text}"
+    );
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("voice_call_ended "))
+        .collect();
+    assert_eq!(lines.len(), 2, "expected one line per call: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert_eq!(
+        lines[0].split("voice_call_ended ").nth(1),
+        Some(
+            "protocol=vibe-talk-v1 chat=false ended_by=connection_lost close_code=1006 \
+             since_open_ms=22000 turns=2"
+        )
+    );
+    assert!(lines[1].contains("INFO"), "{}", lines[1]);
+    assert_eq!(
+        lines[1].split("voice_call_ended ").nth(1),
+        Some(
+            "protocol=vibe-talk-v1 chat=false ended_by=hang_up close_code=- since_open_ms=95000 \
+             turns=7"
+        )
+    );
+}
+
 /// A throttled route says so once per window, not once per refused record.
 #[tokio::test]
 async fn throttled_health_records_are_announced_once_per_window() {
