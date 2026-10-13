@@ -99,22 +99,25 @@
 <div class="section-head">
 <p class="eyebrow">Clips</p>
 <h2 id="clips-title">Five short clips</h2>
-<p>Each clip is a GIF of 9.6 to 19.1 seconds. If your system asks for reduced motion, you see a still from each clip instead, and its link opens the animation. Four clips are a phone screen 412 pixels wide. The last is a desktop browser.</p>
+<p>Each clip starts as a still from its last moment, so nothing on this page moves until you ask. <strong>Play the clip</strong> shows the GIF, 9.6 to 19.1 seconds long and looping, and <strong>Stop the clip</strong> puts the still back. Four clips are a phone screen 412 pixels wide. The last is a desktop browser; on a narrow screen it keeps its full size and scrolls sideways, or its link opens it on its own.</p>
 </div>
 
 <article class="clip" id="clip-summaries" aria-labelledby="clip-summaries-title">
 <h3 class="clip-title" id="clip-summaries-title">Summaries of long messages</h3>
 <figure class="clip-figure">
-<picture>
-<source media="(prefers-reduced-motion: reduce)" srcset="media/vibe-talk/channel-summaries-poster.png" width="412" height="915">
+<div class="clip-frame">
+<details class="clip-play">
+<summary><span class="clip-play-start">Play the clip</span><span class="clip-play-stop">Stop the clip</span><span class="vh">: Summaries of long messages,</span> <span class="clip-play-len">12.8 seconds</span></summary>
 <img src="media/vibe-talk/channel-summaries.gif" width="412" height="915" loading="lazy" decoding="async" alt="A phone showing the vibe-talk channel view in dark mode. Messages from a coordinator and three worker agents are folded to their first lines. After a tap on Summaries, each long message shows a tinted one-sentence summary instead, and the list scrolls down through them.">
-</picture>
+</details>
+<img class="clip-poster" src="media/vibe-talk/channel-summaries-poster.png" width="412" height="915" loading="lazy" decoding="async" alt="Still from the end of the clip: the vibe-talk channel view on a phone in dark mode, with tinted one-sentence summaries in place of worker-1's report on a flaky checkout test and worker-2's CSV export report.">
+</div>
 <figcaption>Long agent reports collapse to one-sentence summaries with one tap.</figcaption>
 </figure>
 <div class="clip-text">
 <p>The channel of a fictional Google Chat space, on a phone. Long agent messages are folded to their first three lines. Tapping <strong>Summaries</strong> replaces each folded message with a tinted, labeled one-sentence summary, and the view scrolls through the day's plan, a test fix, a feature report and an approval request.</p>
 <p>Each summary is one plain Messages API call with no tools, made once per message and then kept. The full message stays one tap away.</p>
-<p class="clip-meta">12.8 seconds, 1.4 MB · <a href="media/vibe-talk/channel-summaries.gif">Open the animation</a></p>
+<p class="clip-meta">12.8 seconds, 1.4 MB · <a href="media/vibe-talk/channel-summaries.gif">Open the animation<span class="vh">: summaries of long messages</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#a-long-message-can-be-read-as-a-summary-of-itself">a long message can be read as a summary of itself</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#summaries">summaries</a></p>
 </div>
 </article>
@@ -122,15 +125,18 @@
 <article class="clip" id="clip-report" aria-labelledby="clip-report-title">
 <h3 class="clip-title" id="clip-report-title">One message in full</h3>
 <figure class="clip-figure">
-<picture>
-<source media="(prefers-reduced-motion: reduce)" srcset="media/vibe-talk/long-report-poster.png" width="412" height="915">
+<div class="clip-frame">
+<details class="clip-play">
+<summary><span class="clip-play-start">Play the clip</span><span class="clip-play-stop">Stop the clip</span><span class="vh">: One message in full,</span> <span class="clip-play-len">9.6 seconds</span></summary>
 <img src="media/vibe-talk/long-report.gif" width="412" height="915" loading="lazy" decoding="async" alt="A phone showing a one-sentence summary of a report from worker-2. A tap opens the full report: bold headings, a bulleted list of changes, a table of test results, a numbered list of open questions and two links.">
-</picture>
+</details>
+<img class="clip-poster" src="media/vibe-talk/long-report-poster.png" width="412" height="915" loading="lazy" decoding="async" alt="Still from the end of the clip: worker-2's CSV export report open in full on a phone, with bold headings, a bulleted list of changes, a table of test results and a numbered list of open questions.">
+</div>
 <figcaption>One tap opens the full report, drawn as the agent wrote it.</figcaption>
 </figure>
 <div class="clip-text">
 <p>A worker's report on a CSV export feature starts as its one-sentence summary and opens with a tap. The server renders the message's markup: bold headings, bullets, a results table, a numbered list and labeled links. The agent's <code>[worker-2]</code> tag and its title sit in the row header.</p>
-<p class="clip-meta">9.6 seconds, 0.8 MB · <a href="media/vibe-talk/long-report.gif">Open the animation</a></p>
+<p class="clip-meta">9.6 seconds, 0.8 MB · <a href="media/vibe-talk/long-report.gif">Open the animation<span class="vh">: one message in full</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#how-message-text-is-drawn">how message text is drawn</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#rich-headers">rich headers</a></p>
 </div>
 </article>
@@ -138,16 +144,19 @@
 <article class="clip" id="clip-live" aria-labelledby="clip-live-title">
 <h3 class="clip-title" id="clip-live-title">New messages while you watch</h3>
 <figure class="clip-figure">
-<picture>
-<source media="(prefers-reduced-motion: reduce)" srcset="media/vibe-talk/live-message-poster.png" width="412" height="915">
+<div class="clip-frame">
+<details class="clip-play">
+<summary><span class="clip-play-start">Play the clip</span><span class="clip-play-stop">Stop the clip</span><span class="vh">: New messages while you watch,</span> <span class="clip-play-len">12.4 seconds</span></summary>
 <img src="media/vibe-talk/live-message.gif" width="412" height="915" loading="lazy" decoding="async" alt="A phone showing the newest messages in the channel. Two new messages appear one after the other without a reload: worker-1 reporting that a regression test was added, then the coordinator saying worker-1's work slot is back in the pool.">
-</picture>
+</details>
+<img class="clip-poster" src="media/vibe-talk/live-message-poster.png" width="412" height="915" loading="lazy" decoding="async" alt="Still from the end of the clip: the newest messages on a phone, ending with worker-1's Regression test added and the coordinator saying worker-1's slot is back in the pool.">
+</div>
 <figcaption>New agent messages arrive while the page is open.</figcaption>
 </figure>
 <div class="clip-text">
 <p>With the newest messages on screen, worker-1 reports a regression test, and six seconds later the coordinator returns that worker's slot to the pool. Both appear without a reload, through vibe-talk's live stream, and a <strong>new</strong> chip jumps to them.</p>
 <p>Here the mock bridge sends vibe-talk a content-free change hint for each message, so the server reads the bridge at once instead of waiting for its next poll. Live updates need a poll interval, which is off by default; a hint only brings the next read forward.</p>
-<p class="clip-meta">12.4 seconds, 0.1 MB · <a href="media/vibe-talk/live-message.gif">Open the animation</a></p>
+<p class="clip-meta">12.4 seconds, 0.1 MB · <a href="media/vibe-talk/live-message.gif">Open the animation<span class="vh">: new messages while you watch</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#live-push">live push</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#change-hint-acceleration">change-hint acceleration</a></p>
 </div>
 </article>
@@ -155,16 +164,19 @@
 <article class="clip" id="clip-reply" aria-labelledby="clip-reply-title">
 <h3 class="clip-title" id="clip-reply-title">Answer from your phone</h3>
 <figure class="clip-figure">
-<picture>
-<source media="(prefers-reduced-motion: reduce)" srcset="media/vibe-talk/reply-from-phone-poster.png" width="412" height="915">
+<div class="clip-frame">
+<details class="clip-play">
+<summary><span class="clip-play-start">Play the clip</span><span class="clip-play-stop">Stop the clip</span><span class="vh">: Answer from your phone,</span> <span class="clip-play-len">18.3 seconds</span></summary>
 <img src="media/vibe-talk/reply-from-phone.gif" width="412" height="915" loading="lazy" decoding="async" alt="A phone showing the reply screen for worker-3's request to land a toolchain bump. The owner types Yes, land it. Thanks! and sends it. Back in the channel the reply is linked to the request, worker-3 answers that the change landed, and the coordinator confirms the day's tasks are done.">
-</picture>
+</details>
+<img class="clip-poster" src="media/vibe-talk/reply-from-phone-poster.png" width="412" height="915" loading="lazy" decoding="async" alt="Still from the end of the clip: the channel on a phone after the owner's reply Yes, land it. Thanks!, with worker-3's Landed message linked to it and the coordinator confirming that the day's tasks are done.">
+</div>
 <figcaption>Approve an agent's request from your phone and watch the answer come back.</figcaption>
 </figure>
 <div class="clip-text">
 <p>The owner taps <strong>Reply</strong> on worker-3's request to land a toolchain bump, types "Yes, land it. Thanks!" and sends. The reply appears linked to the request, which is marked as dealt with. Worker-3's "Landed" message arrives pointing back at the reply, and then the coordinator confirms that the day's tasks are done.</p>
 <p>The post is vibe-talk's own and reaches the mock bridge. The agents' answers are scripted by the mock: no agent ran.</p>
-<p class="clip-meta">18.3 seconds, 0.3 MB · <a href="media/vibe-talk/reply-from-phone.gif">Open the animation</a></p>
+<p class="clip-meta">18.3 seconds, 0.3 MB · <a href="media/vibe-talk/reply-from-phone.gif">Open the animation<span class="vh">: answer from your phone</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#replying-from-the-page">replying from the page</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#two-ways-a-channel-row-can-already-have-been-dealt-with-and-only-one-of-them-hides-it">what "dealt with" means</a></p>
 </div>
 </article>
@@ -172,16 +184,19 @@
 <article class="clip clip-wide" id="clip-desktop" aria-labelledby="clip-desktop-title">
 <h3 class="clip-title" id="clip-desktop-title">Threads on a desktop</h3>
 <figure class="clip-figure">
-<picture>
-<source media="(prefers-reduced-motion: reduce)" srcset="media/vibe-talk/desktop-threads-poster.png" width="800" height="500">
+<div class="clip-frame">
+<details class="clip-play">
+<summary><span class="clip-play-start">Play the clip</span><span class="clip-play-stop">Stop the clip</span><span class="vh">: Threads on a desktop,</span> <span class="clip-play-len">19.1 seconds</span></summary>
 <img src="media/vibe-talk/desktop-threads.gif" width="800" height="500" loading="lazy" decoding="async" alt="A desktop browser with two columns. The right column lists threads as cards named todays-work-plan, checkout-clock-fix and csv-export-review. The csv-export-review thread opens, the owner types Ship it with tomorrow's release. and sends it, and worker-2 answers in the same thread.">
-</picture>
+</details>
+<img class="clip-poster" src="media/vibe-talk/desktop-threads-poster.png" width="800" height="500" loading="lazy" decoding="async" alt="Still from the end of the clip: a desktop browser with the main channel on the left and the csv-export-review thread on the right, where the owner's Ship it with tomorrow's release. is answered by worker-2.">
+</div>
 <figcaption>On a desktop, the main channel sits beside named threads.</figcaption>
 </figure>
 <div class="clip-text">
 <p>At desktop width the page can show two columns: Main on the left and, on the right, the threads as cards, each with a generated name, a one-sentence summary, its age and its unread count. Opening <code>csv-export-review</code> shows that thread. The owner replies from the box beside it, and worker-2's answer arrives in the same thread.</p>
 <p>A thread's name is chosen once and kept, so you can find it under the name you first learned, as long as vibe-talk has storage configured and the thread does not stay quiet or unread past the summary retention period. Without storage, names last only while the server runs. Its sentence is refreshed as the thread grows.</p>
-<p class="clip-meta">19.1 seconds, 1.0 MB · <a href="media/vibe-talk/desktop-threads.gif">Open the animation</a></p>
+<p class="clip-meta">19.1 seconds, 1.0 MB · <a href="media/vibe-talk/desktop-threads.gif">Open the animation<span class="vh">: threads on a desktop</span></a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#thread-names">thread names</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#the-page-has-two-compositions-and-a-capability-query-picks-between-them">the desktop layout</a></p>
 </div>
 </article>

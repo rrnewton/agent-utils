@@ -34,10 +34,13 @@ repository's own documents, which stay the authority.
   maturity the way its own documents do. This is a public page: never name a project that
   consumes agent-utils, and keep host- or organization-specific details out.
 - Every image has `alt`. GIFs stay at or under 3 MB.
-- A demo clip is a `<picture>`: the GIF in the `<img>`, with its own `width` and `height` so the
-  page does not shift when it loads, and `loading="lazy"`; and its still poster as a `<source>`
-  for `(prefers-reduced-motion: reduce)`, beside a plain link that opens the animation. Say what
-  the clip was recorded against. The vibe-talk clips ran against local mocks, and the page says so.
+- Nothing moves until the visitor asks. A demo clip shows its still poster (`<img
+  class="clip-poster">`) after a `<details class="clip-play">` whose `<summary>` says "Play the
+  clip" and whose body is the GIF; opening it hides the poster and closing it stops the animation,
+  which is what WCAG 2.2.2 requires of anything that moves for more than five seconds. Every
+  `<img>` has its own `width` and `height` so the page does not shift when it loads, and
+  `loading="lazy"`; a plain link beside the clip opens the animation. Say what the clip was
+  recorded against. The vibe-talk clips ran against local mocks, and the page says so.
 - `demos/` is repository source, never website. The checker does not treat its files as website
   files, refuses a page link into it, and leaves it out of what it stages for Pages. Link its
   files by their GitHub URL.

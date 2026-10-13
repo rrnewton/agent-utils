@@ -245,6 +245,22 @@ strong {
   font-size: 0.9rem;
 }
 
+/* Visually hidden, still read by screen readers: context for a link or control whose visible
+ * text alone ("README", "Play the clip") would not say what it belongs to. */
+.vh,
+.arch-node .vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ---------------------------------------------------------------- skip link and header */
 
 .skip-link {
@@ -1351,10 +1367,14 @@ caption {
 
 /* ---------------------------------------------------------------- demo clips (vibe-talk.html) */
 
-/* One clip: its heading, the GIF in a <picture> whose reduced-motion source is a still poster,
- * and the text. The <img> carries the GIF's own width and height, so the browser reserves the
- * right box before a lazily loaded GIF arrives; the CSS only lets it shrink to fit. The widths
- * below are the GIF's own plus its 1px borders, so a clip is never scaled where it fits. */
+/* One clip: its heading, a figure and the text. Nothing moves until the visitor asks: the figure
+ * shows a still poster, and a <details> whose <summary> reads "Play the clip" holds the GIF.
+ * Opening it hides the poster (the `[open] +` rule below) and shows the looping GIF; closing it
+ * stops and hides the animation again, which is what WCAG 2.2.2 asks of anything that moves for
+ * longer than five seconds. No script is involved. Each <img> carries the clip's own width and
+ * height, so the browser reserves the right box before a lazily loaded image arrives; the CSS
+ * only lets it shrink to fit. The widths below are the clip's own plus its 1px borders, so a
+ * clip is never scaled where it fits. */
 
 .page-head .badges {
   display: flex;
@@ -1367,6 +1387,7 @@ caption {
 
 .clip {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.6rem 2.2rem;
   padding: 2.2rem 0 1.2rem;
   border-top: 1px solid var(--border);
@@ -1399,6 +1420,81 @@ caption {
 .clip-wide .clip-figure img {
   max-width: 802px;
   border-radius: 10px;
+}
+
+.clip-play > summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.5rem;
+  margin: 0 0 0.6rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--accent-strong);
+  font-weight: 650;
+  cursor: pointer;
+  list-style: none;
+}
+
+.clip-play > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The play triangle and the stop square are drawn with borders, not characters, so a screen
+ * reader announces only the words. */
+.clip-play > summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-left: 0.62em solid currentColor;
+  border-top: 0.38em solid transparent;
+  border-bottom: 0.38em solid transparent;
+}
+
+.clip-play[open] > summary::before {
+  width: 0.66em;
+  height: 0.66em;
+  border: 0;
+  background: currentColor;
+}
+
+.clip-play > summary:hover {
+  background: var(--accent-soft);
+}
+
+.clip-play-len {
+  font-weight: 500;
+  font-size: 0.9em;
+  color: var(--muted);
+}
+
+.clip-play[open] .clip-play-start,
+.clip-play:not([open]) .clip-play-stop,
+.clip-play[open] + .clip-poster {
+  display: none;
+}
+
+/* The desktop clip is 800 pixels wide. Shrunk to a phone its text is about 5 pixels tall, so
+ * below the two-column width it keeps its full size and the frame scrolls sideways. */
+@media (max-width: 51.99rem) {
+  .clip-wide .clip-frame {
+    overflow-x: auto;
+  }
+
+  .clip-wide .clip-figure img {
+    width: 800px;
+    max-width: none;
+  }
+}
+
+/* A phone clip is 915 pixels tall, taller than most laptop windows. Beside its text, it shrinks
+ * to fit the window (the clips are 412 by 915, a ratio of 0.45) so the whole screen shows at once. */
+@media (min-width: 52rem) {
+  .clip:not(.clip-wide) .clip-figure img {
+    max-width: min(414px, calc((100vh - 7rem) * 0.45));
+  }
 }
 
 .clip-figure figcaption {
