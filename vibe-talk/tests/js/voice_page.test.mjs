@@ -31279,6 +31279,25 @@ test("`#264 voice-send-approval`: a read-back that left words out, or never aske
   }
 });
 
+test("`#264 voice-send-approval`: a draft replaced after its read-back needs a read-back of its own — a shorter one is not confirmed by the longer one's", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page, { pending: spokenDraft({ text: "don't merge the PR" }) });
+  const shorter = spokenDraft({ serial: 8, handle: "sHoRtEr-0123456789abcd", text: "merge the PR" });
+  page.propose(shorter);
+  await page.settle();
+  assert.equal(page.el("post-confirm-text").textContent, "merge the PR");
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a read-back of one draft confirmed another");
+  assert.match(page.el("status").textContent, /a yes counts only right after the read-back/);
+
+  // Read back as it now stands, it may be confirmed.
+  hostedSays(socket, "To lead team: merge the PR. Send it?");
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.text]), [[shorter.handle, "merge the PR"]]);
+});
+
 test("`#264 voice-send-approval`: a yes before the read-back finished playing, or a bare 'send it' in its echo, sends nothing — a plain yes then does", async () => {
   const early = newPage();
   const earlySocket = await readBackDuringACall(early);

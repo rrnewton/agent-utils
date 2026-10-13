@@ -8431,9 +8431,9 @@ function settlePostCard(proposal) {
 //   * AN UNINTERRUPTED READ-BACK. Nothing cut the assistant off since the user last spoke, and on
 //     the neutral protocol its turn completed, not interrupted, before the answer.
 //   * THE READ-BACK SAID THE CARD. Every word of the card's text, in order, and after it the word
-//     "send". So a model talked into a bad draft cannot read back something harmless and have the
-//     bad text sent on the strength of a yes to what it SAID. Mention tokens are left out, because
-//     the model says the person's name instead.
+//     "send", all said since this draft reached the card. So a model talked into a bad draft cannot
+//     read back something harmless and have the bad text sent on the strength of a yes to what it
+//     SAID. Mention tokens are left out, because the model says the person's name instead.
 //   * HEARD TO THE END. The answer began after the read-back's audio finished playing.
 //   * NOT AN ECHO. A bare "send it" straight after "...Send it?" may be the agent's own voice; a
 //     plain "yes" cannot be.
@@ -8626,12 +8626,23 @@ function noteProposalsAtCallOpen(proposal) {
   spokenYes.ineligible = proposal ? proposal.handle : null;
 }
 
-/** The card shows `proposal` where it showed `previous`. */
+/**
+ * The card shows `proposal` where it showed `previous`.
+ *
+ * A NEW draft makes everything said before it a read-back of something else, so it is forgotten:
+ * only what the assistant says once these words are on the card can be held up against them.
+ * Without that, a draft replaced by a shorter one — "don't merge the PR" by "merge the PR" — would
+ * pass on a read-back of the first, since every word of the second was in it, in order.
+ */
 function noteCardForSpokenYes(proposal, previous) {
   const handle = proposal ? proposal.handle : null;
   if (handle === (previous ? previous.handle : null)) return;
   if (spokenYes.settling && spokenYes.settling.handle !== handle) abortSpokenYes("changed");
   spokenYes.eligible = handle !== null && handle !== spokenYes.ineligible ? handle : null;
+  if (handle !== null) {
+    spokenYes.said = new Map();
+    spokenYes.done = false;
+  }
 }
 
 /** The assistant said `text` in the turn named `key` (its whole text so far). */

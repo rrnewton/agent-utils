@@ -4989,9 +4989,11 @@ for both wire protocols:
   `turn_complete{interrupted: true}`, and on `vibe-talk-v1` the read-back's own `turn_complete`
   arrived before the answer.
 * **The read-back said the card.** Every word of the card's text appears, in order, in what the
-  assistant said since the owner last spoke (mention tokens excepted, since the model says the
-  name), followed by the word "send". A model talked into a bad draft therefore cannot read back
-  something harmless and have the bad text sent on a yes to what it said.
+  assistant said since the owner last spoke and since this draft reached the card (mention tokens
+  excepted, since the model says the name), followed by the word "send". A model talked into a bad
+  draft therefore cannot read back something harmless and have the bad text sent on a yes to what
+  it said, and a draft replaced after its read-back — "don't merge the PR" by "merge the PR" — needs
+  a read-back of its own.
 * **It was heard to the end.** The answer began after the read-back's audio finished playing.
 * **It is not an echo.** A bare "send it" within 1.5 s of the end of "…Send it?" may be the
   agent's own voice and is refused; a plain "yes" is never taken for an echo.
