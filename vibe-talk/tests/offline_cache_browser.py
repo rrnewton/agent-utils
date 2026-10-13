@@ -1429,8 +1429,14 @@ COALESCE_LOOK_JS = """async ({png, check, id, parent, stack}) => {""" + FLOAT_HE
             let sx = 0, sw = 0;
             for (let Y = Math.ceil(p.bottom * scale); Y < Math.floor((p.bottom + 0.55 * rem) * scale); Y += 1) {
                 let w = 0;
+                // Each line against its own ground, its pixel at the gutter's left edge, far from the
+                // head. The first line can hold the last of the row above's edge, smoothed across a
+                // device pixel: where the list's content sits at half a device pixel (a 28px day rule
+                // above it at 2.625x), that edge greys the whole line, and counted against the page it
+                // would be a line of head as wide as the gutter, which bends the fit a pixel upward.
+                const lineGround = pixel(left, Y) || ground;
                 for (let X = left; X < right; X += 1) {
-                    const a = share(ground, pixel(X, Y));
+                    const a = share(lineGround, pixel(X, Y));
                     w += a;
                     sx += a * X;
                     sw += a;
