@@ -4619,6 +4619,34 @@ a.search-hit-link {
   opacity: 0.7;
 }
 
+/* `#262 search-load-older`. While a search chooses rows the step back is "Search before Oct 3", a thumb's
+   way to more matches on a phone, so it gets the 44px target the floating chips have, drawn as nothing
+   (`#jump-newest::after`): the chip stays its height, and a tap a few pixels off it still lands. */
+#side-older,
+#load-older {
+  position: relative;
+}
+
+#side-older::after,
+#load-older::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
+/* What the last walk found, directly under the control, in the hint's quiet type. */
+.search-older-note {
+  margin: 0 1rem 0.4rem;
+  text-align: center;
+}
+
+/* One column on Main, a search nothing loaded matches: All, which has the replies. Under the sentence
+   saying so. */
+#search-in-all {
+  display: block;
+  margin: 0 auto 0.6rem;
+}
+
 /* ------------------------------------------------------- one channel row at a time --------- */
 /*
  * `#56 message-hover-highlight`, then `#239 single-selection`. A long channel is a wall of blocks,

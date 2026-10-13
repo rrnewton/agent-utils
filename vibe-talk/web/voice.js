@@ -64,6 +64,7 @@ const COLUMN_IDS = {
   "inbox-note": "side-inbox-note",
   "clear-backlog": "side-clear-backlog",
   "load-older": "side-older",
+  "search-older-note": "side-search-older-note",
   "timeline-notice": "side-notice",
   "channel-loading": "side-loading",
   "thread-list": "side-thread-list",
@@ -87,13 +88,18 @@ const COLUMN_IDS = {
  * `searched` is what the column's last pass of the search counted (`applySearch`), for the count in
  * the bar, which speaks for every column on screen.
  *
+ * `searchWalk` is the column's walk back through older pages for the search while one is under way,
+ * and `searchNote` what the last one found, kept under its control until the search changes (`#262
+ * search-load-older`, `searchOlder`).
+ *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
- * @type {{main: {name: string, state: unknown[] | null, searched: SearchCount | null},
- *   side: {name: string, state: unknown[] | null, searched: SearchCount | null, mode: "list" | "thread"}}}
+ * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
+ *   searchWalk: any, searchNote: {key: string, text: string} | null}} ColumnFields
+ * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread"}}}
  */
 const columns = {
-  main: { name: "main", state: null, searched: null },
-  side: { name: "side", state: null, searched: null, mode: "list" },
+  main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null },
+  side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list" },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -152,7 +158,7 @@ let sideActive = false;
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
  *   | "save-token"
- *   | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
+ *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
  *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
@@ -1034,6 +1040,16 @@ function captureScroll() {
   // where the reader is, and the newest line is not followed: nothing but the reader moves it.
   const held = heldFilterRow();
   if (held) return { pinned: false, anchor: held, top: held.getBoundingClientRect().top };
+  // `#262 search-load-older`. While a walk for the search reads older pages, its control holds still and
+  // the matches open under it — never the newest line followed, on a list short enough to be at its
+  // foot — until the reader moves it, which lets it go. Measured only while a walk runs.
+  const walk = activeColumn.searchWalk;
+  if (walk && walk.anchored) {
+    const chip = el("load-older");
+    const top = chip.getBoundingClientRect().top;
+    if (!chip.hidden && Math.abs(top - walk.chipTop) <= 1) return { pinned: false, anchor: chip, top };
+    walk.anchored = false;
+  }
   const anchor = scrollAnchor(area);
   return {
     pinned: atBottom(area),
@@ -2753,6 +2769,16 @@ function applySearch() {
   const pinned = pinnedOnly && currentView === "discord";
   activeColumn.searched = { matched, loaded, tally, pinned };
   renderSearchCount(terms.length > 0, links, author !== "everyone");
+  // `#262 search-load-older`. The step back offers to search further back while a filter chooses rows,
+  // and a walk that the change of filter just made nobody's ends here, before anything below says what
+  // it found. And in one column on Main, a search nothing matches offers All, which has the replies.
+  if (currentView === "discord") renderOlderControl();
+  if (!sideActive) {
+    const all = leftEl("search-in-all");
+    const offered = !pinned && !links && author === "everyone" && terms.length > 0 && matched === 0 && loaded > 0 &&
+      currentView === "discord" && threadingSupported && !columnsShown && channelView === "main";
+    if (all.hidden === offered) all.hidden = !offered;
+  }
   if (pinned) {
     const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null, author);
     el("search-empty").textContent = sentence;
@@ -2778,8 +2804,35 @@ function applySearch() {
     el("search-empty").hidden = sentence === "";
     return;
   }
-  el("search-empty").textContent = SEARCH_EMPTY_LOADED;
-  el("search-empty").hidden = terms.length === 0 || matched > 0 || loaded === 0;
+  const empty = terms.length === 0 || matched > 0 || loaded === 0;
+  // `#262 search-load-older`. How far back the search has looked, and what it cannot see. Not rewritten
+  // while a walk reads older pages, so a status says it once, when the walk is over, and not per page.
+  if (!activeColumn.searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
+  el("search-empty").hidden = empty;
+}
+
+/**
+ * What `#search-empty` says over a channel's list whose loaded messages the search text matches none
+ * of: how many are loaded and back to which day, or that all of them are; on Main, that thread replies
+ * are not in it; and on a chat service without threads under Hide read, how to search what Hide read
+ * leaves out. `#262
+ * search-load-older`. Over the call's transcript, what it always said.
+ *
+ * @param {number} loaded How many messages are loaded in this column, as the count says it.
+ */
+function searchEmptySentence(loaded) {
+  if (currentView !== "discord" || channelView === "threads") return SEARCH_EMPTY_LOADED;
+  const view = channelViewWords();
+  const day = oldestLoadedDay();
+  const said = historyReadToStart()
+    ? `Nothing in ${view} matches that search — all of it is loaded.`
+    : `Nothing in the ${loaded} message${loaded === 1 ? "" : "s"} loaded so far` +
+      `${day === null ? "" : `, back to ${searchDayWords(day)},`} matches that search.`;
+  // Main holds a thread's first message and nothing of the rest, and the cards on the right, or All,
+  // are where a reply is found. Most of why a search on the left of two columns finds nothing.
+  if (threadingSupported && channelView === "main") return `${said} Thread replies are not in Main.`;
+  if (todoMode && !threadingSupported) return `${said} Hide read is on — press h for Show read to search older messages.`;
+  return said;
 }
 
 /**
@@ -4049,6 +4102,8 @@ function olderThanLoaded(anchor) {
  * scrolling while a page is read, ends the walk where it is: it never pulls them back.
  */
 async function walkToFilterAnchor(anchor) {
+  // `#262 search-load-older`. A walk for the search gives way to this one.
+  endSearchWalks();
   const walk = { context: channelContextKey() };
   filterWalk = walk;
   const area = el("scroll-area");
@@ -7326,6 +7381,12 @@ const KEYMAP = [
       "until now, goes to the message box",
     controls: ["search-toggle"],
     run: () => searchFromKeyboard(),
+  },
+  {
+    // `#262 search-load-older`. The field's own handler, which marks the hits and walks back.
+    group: KEYS_PAGE, by: "box", chords: [{ key: "Enter" }],
+    does: "In the search field: search older messages, a few pages at a time; the step back at the head " +
+      "of the list says Stop meanwhile",
   },
   {
     group: KEYS_PAGE, chords: [{ key: "," }, { key: ",", mod: true }],
@@ -16930,7 +16991,8 @@ async function readWalkCursor() {
   }
 }
 
-async function loadOlderTimeline() {
+/** @param {AbortSignal} [signal] Stops the read on the wire: see `loadOlder`. */
+async function loadOlderTimeline(signal) {
   if (!discordOlderCursor && discordMoreAbove && !olderFetchInFlight && walkCursorOwed()) {
     await readWalkCursor();
     return;
@@ -16947,7 +17009,7 @@ async function loadOlderTimeline() {
     steps.pause();
     let payload;
     try {
-      payload = await readTimeline(path);
+      payload = await readTimeline(path, signal ? { signal } : undefined);
     } finally {
       steps.resume();
     }
@@ -16958,6 +17020,8 @@ async function loadOlderTimeline() {
     renderScrollTools();
     requestVisibleSummaries();
   } catch (error) {
+    // Stopped by the walk that asked for it: no failure, and nothing to draw. `#262 search-load-older`.
+    if (signal && signal.aborted) return;
     if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
     if (/cursor.*expired|snapshot.*expired/i.test(error.detail || error.message)) {
       olderFetchInFlight = false;
@@ -20032,7 +20096,9 @@ async function seekMessage(target, arrive, openAll) {
   // given back before the walk's promise settles, whichever way it ends.
   const steps = columnSteps();
   // A walk back for a filter change gives way to this one, which takes the reader somewhere else. `#243`.
+  // So does a walk for the search. `#262 search-load-older`.
   endFilterWalk();
+  endSearchWalks();
   try {
     const ticket = ++replyJumpTicket;
     const channel = String(el("discord-channel").value);
@@ -23547,14 +23613,353 @@ function renderChannelSeam(label) {
 
 function renderOlderControl() {
   const button = el("load-older");
+  // `#262 search-load-older`. A walk for the search that a change has made nobody's ends first, so
+  // nothing below says it is still searching.
+  const running = activeColumn.searchWalk;
+  if (running && !searchWalkHolds(running, activeColumn)) endSearchWalk(activeColumn);
+  const walk = activeColumn.searchWalk;
   // Not over the Pinned filter: its list is every pin already, and older history adds none.
-  button.hidden = discordMoreAbove !== true || pinnedOnly;
-  button.disabled = olderFetchInFlight;
+  const hidden = discordMoreAbove !== true || pinnedOnly;
+  if (button.hidden !== hidden) button.hidden = hidden;
   // `#243 filter-keeps-selection`. A walk back to the message a filter change is keeping says what it
   // is doing, where the reader waits for it.
   const walking = filterWalk !== null && !sideActive;
-  button.textContent = olderFetchInFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…")
-    : "Older messages";
+  const offered = !walking && walk === null && searchOffered();
+  // A tap while a step of the scroll's is on the wire starts the search, which takes that step as its
+  // first page; and a walk under way is stopped by one, unless it is already stopping.
+  const disabled = walk ? walk.stopping : olderFetchInFlight && !offered;
+  if (button.disabled !== disabled) button.disabled = disabled;
+  let label = olderFetchInFlight ? (walking ? "Loading earlier messages…" : "Loading older messages…") : "Older messages";
+  if (walk) {
+    label = walk.stopping ? "Stopping…" : `Searching… ${Math.max(1, walk.pages)} of ${SEARCH_OLDER_PAGES} · Stop`;
+  } else if (offered) {
+    const day = oldestLoadedDay();
+    label = `Search ${channelView === "thread" ? "replies " : ""}${day === null ? "older messages" : `before ${searchDayWords(day)}`}`;
+  }
+  setTextIfChanged(button, label);
+  const name = offered ? `${label}: older pages, a few at a time. Enter in the search field does the same.` : "";
+  if ((button.getAttribute("aria-label") || "") !== name) {
+    if (name) button.setAttribute("aria-label", name);
+    else button.removeAttribute("aria-label");
+  }
+  renderSearchOlderNote();
+}
+
+// --- searching further back ------------------------------------------------------------------------
+//
+// `#262 search-load-older`. The owner, 2026-10-12: "searching for a term XYZ in two column view found
+// zero hits; in one column, scrolling up while searching loaded older pages and found 3 ... 2 column
+// view should not PRECLUDE loading hits". The search filters what is loaded, and a step back fired only
+// by scrolling near the top; a page that brought only rows the search hides added no height, and a list
+// the search had emptied sat at the top already, where scrolling up fires no scroll event at all. So
+// paging stalled under a filter, and the step back said "Older messages" and nothing about finding.
+//
+// WHILE A FILTER CHOOSES ROWS (a term, Links or whose messages), each column's step back says "Search
+// before Oct 3", the day that column reaches back to. A tap on it, or Enter in the search field, walks
+// back AT MOST `SEARCH_OLDER_PAGES` older pages within `SEARCH_OLDER_MS`, and stops at the end of the
+// page that brings `SEARCH_OLDER_HITS` new matches. Every tap is the reader's consent to that much and
+// no more: nothing chains pages on its own. Meanwhile the control says "Searching… 2 of 5 · Stop", and a
+// tap on it stops the read on the wire. Any change to the search ends the walk, and so do closing the
+// right column's thread, leaving two columns, another channel or view, a jump, and a filter change's
+// own walk back (`walkToFilterAnchor`). One walk at a time on the page.
+//
+// WHAT IT FOUND is counted only among messages older than where it started, so a message arriving
+// live, or a poll, can neither stop it nor be reported as found; and in messages, as the count is. It
+// is said once, under the control, until the search changes (`searchNote`). The matches appear under
+// the control, which holds still while the walk runs, with `#250 date-separators`' line saying how many
+// unmatched messages are between, and `#249 search-highlight`'s marks on them.
+//
+// THE PAGE ONLY. No route is new, and nothing reaches the server that a scroll up would not have sent.
+
+/** How many older pages one tap of "Search before …", or Enter in the search field, reads at most. */
+const SEARCH_OLDER_PAGES = 5;
+
+/**
+ * How long one walk may take, in milliseconds. PREDICTIVE: a page starts only if the time so far and
+ * the last page's time end within it, so a slow chat service reads fewer pages a tap rather than
+ * overrunning; the first page always starts.
+ */
+const SEARCH_OLDER_MS = 15000;
+
+/** How many new matches end a walk, at the end of the page that brings them: the owner's "found 3". */
+const SEARCH_OLDER_HITS = 3;
+
+/** How long after a walk starts a tap on its control is the same tap again, and not Stop, in milliseconds. */
+const SEARCH_OLDER_TAP_MS = 500;
+
+/** Everything a walk for the search depends on: a change in any of them ends it, and clears its note. */
+const searchKey = () => JSON.stringify([filterKey(), searchOpen ? searchTerms(searchQuery) : [], searchOpen && linksOnly,
+  [...hiddenLinkKinds], authorChoosing(), readMode]);
+
+/**
+ * Whether the step back of the column being worked on offers to search further back: a filter choosing
+ * rows over a list of the channel's messages with older history, and not over the Pinned list. Not on a
+ * chat service without threads under Hide read, whose list is a read of its own (`loadTodo`), where the
+ * empty sentence says how out instead.
+ */
+function searchOffered() {
+  return readRunsSuspended() && currentView === "discord" && channelView !== "threads" && !pinnedOnly &&
+    discordMoreAbove === true && !(todoMode && !threadingSupported) && (!sideActive || sideShowing());
+}
+
+/** The view a column shows, as a sentence names it. */
+function channelViewWords() {
+  if (!threadingSupported) return "this channel";
+  return channelView === "thread" ? "this thread" : channelView === "flat" ? "All" : "Main";
+}
+
+/** The day of the oldest message loaded in the column being worked on, as `dayKeyOf` says it, or null. */
+function oldestLoadedDay() {
+  for (const row of el("discord-log").children) {
+    if (!isMessageRow(row)) continue;
+    const day = rowDay(row);
+    if (day !== null) return day;
+  }
+  return null;
+}
+
+/** A day inside a sentence: "today", "yesterday", "Oct 3", or "Oct 3, 2025" for another year's. */
+function searchDayWords(key, clock = dayClock()) {
+  if (key === clock.today) return "today";
+  if (key === clock.yesterday) return "yesterday";
+  const { year, month, day } = dayParts(key);
+  return `${DAY_MONTHS[month]} ${day}${year !== clock.year ? `, ${year}` : ""}`;
+}
+
+/** What the last walk in the column being worked on found, under its control, until the search changes. */
+function renderSearchOlderNote() {
+  const note = el("search-older-note");
+  const held = activeColumn.searchNote;
+  if (held && held.key !== searchKey()) activeColumn.searchNote = null;
+  const said = activeColumn.searchNote ? activeColumn.searchNote.text : "";
+  setTextIfChanged(note, said);
+  if (note.hidden !== (said === "")) note.hidden = said === "";
+}
+
+/**
+ * Whether walk `walk` in `column` is still the reader's: the same search, the same list, no jump since,
+ * no filter change's walk back, and in the right column a thread still showing. Asked in that column.
+ */
+function searchWalkHolds(walk, column) {
+  return !walk.ended && column.searchWalk === walk && searchKey() === walk.key &&
+    channelContextKey() === walk.context && replyJumpTicket === walk.ticket && filterWalk === null &&
+    (column !== columns.side || sideShowing());
+}
+
+/**
+ * End `column`'s walk where it is, saying nothing of it: the read on the wire is aborted, and its
+ * control says what it says with no walk. The walk's promise, to wait for, or null with none.
+ *
+ * @param {typeof activeColumn} column
+ */
+function endSearchWalk(column) {
+  const walk = column.searchWalk;
+  if (!walk) return null;
+  walk.ended = true;
+  column.searchWalk = null;
+  if (walk.controller) walk.controller.abort();
+  inColumn(column, renderOlderControl);
+  return walk.promise;
+}
+
+/** End the walk in either column: something else is about to read older pages, or move the reader. */
+function endSearchWalks() {
+  endSearchWalk(columns.main);
+  endSearchWalk(columns.side);
+}
+
+/**
+ * Count what `walk` has found so far in the column being worked on: the messages, in shown rows, of the
+ * rows above every row that was loaded when it started — the rows it prepended — and how many messages
+ * those rows hold in all. A live arrival, or a poll, lands below them, and is never counted.
+ */
+function countSearchWalk(walk) {
+  const rows = [...el("discord-log").children].filter(isMessageRow);
+  let found = 0;
+  let arrived = 0;
+  for (const row of rows) {
+    const ids = idsOf(row);
+    if (ids.some((id) => walk.held.has(id))) break;
+    arrived += ids.length;
+    if (rowShown(row)) found += ids.length;
+  }
+  walk.found = found;
+  walk.arrived = arrived;
+}
+
+/** What a walk that has ended says under its control, or "" for nothing: see the head of this section. */
+function searchWalkNote(walk, reason) {
+  const pages = `${walk.pages} page${walk.pages === 1 ? "" : "s"}`;
+  const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
+  const day = oldestLoadedDay();
+  const back = day === null ? "" : `, back to ${searchDayWords(day)}`;
+  if (reason === "stopped") return walk.found > 0 ? `Stopped. Found ${walk.found} in ${pages} (${messages}).` : "";
+  // Nothing matching anywhere in the list: the empty sentence says how far back that is.
+  const emptied = listEmptied();
+  if (reason === "start") {
+    if (walk.found > 0) return `Reached the start of ${channelViewWords()}. Found ${walk.found}.`;
+    return emptied ? "" : `Reached the start of ${channelViewWords()}; nothing older matches.`;
+  }
+  if (walk.found === 0) return emptied ? "" : `Nothing more in ${pages} (${messages})${back}.`;
+  if (reason === "budget") {
+    const seconds = Math.round(SEARCH_OLDER_MS / 1000);
+    return `Found ${walk.found} in ${seconds} s (${pages}, ${messages})${back}.`;
+  }
+  return `Found ${walk.found} in ${pages} (${messages})${back}.`;
+}
+
+/**
+ * Search further back in the column being worked on: read older pages until the bounds at the head of
+ * this section stop it, and say what it found. Does nothing where the step back does not offer it.
+ */
+function searchOlder() {
+  if (!searchOffered() || activeColumn.searchWalk || (filterWalk !== null && !sideActive)) return Promise.resolve();
+  const column = activeColumn;
+  // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in.
+  const steps = columnSteps();
+  // One at a time on the page: a walk in the other column ends, and is waited for, so two reads never
+  // overlap. A filter change's walk back gives way, and the tap is the reader's act in the list.
+  const other = endSearchWalk(column === columns.main ? columns.side : columns.main);
+  endFilterWalk();
+  readerActed();
+  const area = el("scroll-area");
+  const chip = el("load-older");
+  // The walk starts with its control in view: older matches arrive under it, and that is where the
+  // reader should be looking — not far down a list of matches, nor still in the search field.
+  if (chip.getBoundingClientRect().top < area.getBoundingClientRect().top) area.scrollTop = 0;
+  const walk = {
+    key: searchKey(),
+    context: channelContextKey(),
+    ticket: replyJumpTicket,
+    held: new Set([...el("discord-log").children].flatMap(idsOf)),
+    pages: 0,
+    found: 0,
+    arrived: 0,
+    started: Date.now(),
+    controller: typeof AbortController === "function" ? new AbortController() : null,
+    stopping: false,
+    ended: false,
+    // The control holds still while the walk runs (`captureScroll`), until the reader moves it.
+    anchored: true,
+    chipTop: chip.getBoundingClientRect().top,
+    promise: /** @type {Promise<void> | null} */ (null),
+  };
+  column.searchWalk = walk;
+  activeColumn.searchNote = null;
+  renderOlderControl();
+  renderJumpNewest();
+  walk.promise = (async () => {
+    let reason = "done";
+    try {
+      if (other) {
+        steps.pause();
+        await other.catch(() => {});
+        steps.resume();
+      }
+      let last = 0;
+      while (walk.pages < SEARCH_OLDER_PAGES) {
+        if (!searchWalkHolds(walk, column) || walk.stopping) break;
+        if (discordMoreAbove !== true) {
+          reason = "start";
+          break;
+        }
+        if (!discordOlderCursor && !walkCursorOwed() && olderStep === null) break;
+        if (walk.pages > 0 && Date.now() - walk.started + last > SEARCH_OLDER_MS) {
+          reason = "budget";
+          break;
+        }
+        // A finger on the glass holds the next page, as it holds a step back (`maybeLoadOlder`).
+        while (pull !== null && searchWalkHolds(walk, column) && !walk.stopping) {
+          steps.pause();
+          await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
+          steps.resume();
+        }
+        if (!searchWalkHolds(walk, column) || walk.stopping) break;
+        walk.pages += 1;
+        renderOlderControl();
+        const began = Date.now();
+        const step = loadOlder(walk.controller ? walk.controller.signal : undefined);
+        steps.pause();
+        try {
+          await step;
+        } finally {
+          steps.resume();
+        }
+        last = Date.now() - began;
+        if (!searchWalkHolds(walk, column) || walk.stopping) break;
+        countSearchWalk(walk);
+        if (walk.found >= SEARCH_OLDER_HITS) break;
+      }
+      if (walk.stopping) reason = "stopped";
+      else if (reason !== "budget" && discordMoreAbove === false && walk.pages > 0) reason = "start";
+    } catch (error) {
+      if (walk.ended || walk.stopping || (walk.controller && walk.controller.signal.aborted)) {
+        reason = walk.stopping ? "stopped" : "done";
+      } else {
+        reason = "failed";
+        // The failure itself is reported where every failed read is; this says the search stopped.
+        setStatus("Could not search further back — try again.");
+        throw error;
+      }
+    } finally {
+      if (column.searchWalk === walk) {
+        // A page that landed as Stop was pressed is counted with the rest. A walk another list or
+        // another search has taken over from says nothing there.
+        const holds = reason !== "failed" && searchWalkHolds(walk, column);
+        if (holds) countSearchWalk(walk);
+        column.searchWalk = null;
+        const text = holds ? searchWalkNote(walk, reason) : "";
+        column.searchNote = text ? { key: walk.key, text } : null;
+        const write = () => {
+          renderOlderControl();
+          // The empty sentence's count and day, held while the walk read, now said once.
+          applySearch();
+        };
+        // Under a control that held still, the note simply opens under it; under a reader who moved
+        // away, their place is kept.
+        if (walk.anchored || area.scrollTop === 0) write();
+        else preservingScroll(write);
+      }
+      steps.pause();
+    }
+  })();
+  return walk.promise;
+}
+
+/** Stop `column`'s walk at the end of the read on the wire, which is aborted; its control says "Stopping…". */
+function stopSearchWalk(column) {
+  const walk = column.searchWalk;
+  if (!walk || walk.stopping) return;
+  walk.stopping = true;
+  if (walk.controller) walk.controller.abort();
+  inColumn(column, renderOlderControl);
+}
+
+/**
+ * The step back pressed, in the column being worked on: Stop while a walk for the search is under way
+ * (not in its first moments, which are the same tap again), the search further back while it offers
+ * that, and else one step back, as ever.
+ */
+function olderControlPressed() {
+  const walk = activeColumn.searchWalk;
+  if (walk) {
+    if (Date.now() - walk.started >= SEARCH_OLDER_TAP_MS) stopSearchWalk(activeColumn);
+    return undefined;
+  }
+  if (searchOffered() && !(filterWalk !== null && !sideActive)) return searchOlder();
+  return loadOlder();
+}
+
+/**
+ * Enter in the search field: search further back in the column holding the keys while the right
+ * column shows a thread, else the left; nothing where its step back does not offer that. Whether a
+ * walk began.
+ */
+function searchOlderFromField() {
+  const column = sideShowing() && lastPane === sidePane ? columns.side : columns.main;
+  if (!inColumn(column, () => searchOffered() && column.searchWalk === null)) return false;
+  guardQuietly(() => inColumn(column, searchOlder))();
+  return true;
 }
 
 /**
@@ -23612,19 +24017,31 @@ let olderStep = null;
  *
  * Guarded against re-entry rather than debounced: the automatic trigger fires on every scroll
  * event, and a phone produces a lot of those.
+ *
+ * `signal`, `#262 search-load-older`: the walk for the search stops its read on the wire with it. A
+ * step aborted that way ends quietly, as no failure. A scroll that asks while it is under way is handed
+ * the same step, and goes with it.
+ *
+ * @param {AbortSignal} [signal]
  */
-function loadOlder() {
+function loadOlder(signal) {
+  // A click's event is not a signal.
+  const abort = signal && typeof signal === "object" && "aborted" in signal ? signal : undefined;
   if (olderStep === null) {
     // The step is this column's, and so is forgetting it, in the task it ends in. `#229`.
-    olderStep = (threadingSupported ? loadOlderTimeline() : loadOlderPage()).finally(inThisColumn(() => {
+    olderStep = (threadingSupported ? loadOlderTimeline(abort) : loadOlderPage(abort)).finally(inThisColumn(() => {
       olderStep = null;
     }));
   }
   return olderStep;
 }
 
-/** `loadOlder` for a provider without threads: one step of the plain channel page. */
-async function loadOlderPage() {
+/**
+ * `loadOlder` for a provider without threads: one step of the plain channel page.
+ *
+ * @param {AbortSignal} [signal]
+ */
+async function loadOlderPage(signal) {
   if (discordMoreAbove !== true || !discordOlderCursor || olderFetchInFlight) {
     return;
   }
@@ -23636,10 +24053,18 @@ async function loadOlderPage() {
   olderFetchInFlight = true;
   renderOlderControl();
   try {
-    const payload = await api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/page` +
-        `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}&render=html`
-    );
+    let payload;
+    try {
+      payload = await api(
+        `/api/v1/channels/${encodeURIComponent(channel)}/page` +
+          `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}&render=html`,
+        signal ? { signal } : undefined
+      );
+    } catch (error) {
+      // Stopped by the walk that asked for it: no failure, and nothing to draw. `#262`.
+      if (signal && signal.aborted) return;
+      throw error;
+    }
     if (generation !== discordLoadGeneration || channel !== el("discord-channel").value) return;
     observeOutgoingMessages(payload.messages || []);
     const list = el("discord-log");
@@ -27737,6 +28162,8 @@ function enterColumns() {
  * held, so two columns come back to it at once.
  */
 function leaveColumns() {
+  // `#262 search-load-older`. The right column's walk for the search ends: its list is put aside, held.
+  endSearchWalk(columns.side);
   columnsShown = false;
   if (columns.side.mode === "thread") {
     inColumn(columns.side, () => {
@@ -27828,6 +28255,16 @@ function sideCardText(choice) {
   return first || threadName(choice, Infinity);
 }
 
+/**
+ * The words of a thread's first message, for the search over its card, when the card says something
+ * else — the summariser's name and summary — or "". `#262 search-load-older`: a summed-up thread is
+ * found by what its first message says too, not only by the summary of it.
+ */
+function sideCardRootText(choice) {
+  const first = choice.root ? messageText(choice.root).replace(/\s+/g, " ").trim() : "";
+  return first && first !== sideCardText(choice) ? first : "";
+}
+
 /** What a card says of its thread's unread replies, as a root on Main says it ("3 unread", "1 new"), or "". */
 function sideCardUnread(choice, tally) {
   const entry = tally.threads.get(choice.id);
@@ -27875,12 +28312,13 @@ function renderSideCards() {
   const cards = threadChoices().reverse().map((choice) => ({
     choice,
     text: sideCardText(choice),
+    root: sideCardRootText(choice),
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
     replies: sideCardReplies(choice, tally),
     unread: sideCardUnread(choice, tally),
   }));
-  const signature = JSON.stringify(cards.map(({ choice, text, age, replies, unread }) =>
-    [choice.id, text, age, replies, unread]));
+  const signature = JSON.stringify(cards.map(({ choice, text, root, age, replies, unread }) =>
+    [choice.id, text, root, age, replies, unread]));
   const more = olderThreadsOnServer();
   if (signature !== sideCardsDrawn) {
     sideCardsDrawn = signature;
@@ -28153,7 +28591,7 @@ function refilterSideCards() {
 }
 
 /** One card. Every string is text; nothing from the chat service is parsed as markup. */
-function sideCard({ choice, text, age, replies, unread }) {
+function sideCard({ choice, text, root, age, replies, unread }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
@@ -28183,8 +28621,9 @@ function sideCard({ choice, text, age, replies, unread }) {
   button.addEventListener("click", () => guardQuietly(() => selectSideThread(choice.id, choice.summary))());
   row.append(button);
   // `#129 message-search`. A card stands in this list where messages stand in the others, so the
-  // search reaches it, as it reaches the cards of the Threads list.
-  searchable(row, text, threadName(choice, Infinity));
+  // search reaches it, as it reaches the cards of the Threads list; and by its first message's words
+  // where the card says a summary of them. `#262 search-load-older`.
+  searchable(row, text, threadName(choice, Infinity), root);
   return row;
 }
 
@@ -28218,6 +28657,9 @@ function selectSideThread(id, summary = null) {
 
 /** The X: the thread goes, and the cards come back. Its rows are held, so selecting it again is instant. */
 function closeSideThread() {
+  // `#262 search-load-older`. The thread's walk for the search goes with it: nothing else it asks
+  // about changes when the cards come back.
+  endSearchWalk(columns.side);
   const channel = String(el("discord-channel").value);
   sideThreads.delete(channel);
   if (columns.side.mode === "thread") {
@@ -28238,6 +28680,8 @@ function closeSideThread() {
  * or its cards and the thread list read behind them.
  */
 function resetSideColumn(reopen = false) {
+  endSearchWalk(columns.side);
+  columns.side.searchNote = null;
   inColumn(columns.side, () => {
     dropReplyArrowTap();
     gathered = null;
@@ -31950,7 +32394,7 @@ inColumn(columns.side, () => {
   el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));
   el("channel-compose-text").addEventListener("keydown", inThisColumn((event) =>
     onComposerKey(event, guardQuietly(sendChannelMessage))));
-  el("load-older").addEventListener("click", inThisColumn(guardQuietly(loadOlder)));
+  el("load-older").addEventListener("click", inThisColumn(guardQuietly(olderControlPressed)));
   el("clear-backlog").addEventListener("click", inThisColumn(guardQuietly(clearBacklog)));
   el("jump-newest").addEventListener("click", inThisColumn(scrollToNewest));
   // What the left column's scroll listener does, for this list: the jump, the way back to a reply,
@@ -32189,7 +32633,9 @@ el("noise-rule-new").addEventListener("keydown", (event) => {
   if (event.key === "Enter") guardQuietly(addNoiseRule)();
 });
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
-el("load-older").addEventListener("click", guardQuietly(loadOlder));
+el("load-older").addEventListener("click", guardQuietly(olderControlPressed));
+// `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
+leftEl("search-in-all").addEventListener("click", guardQuietly(() => changeChannelView("flat")));
 el("load-older-turns").addEventListener("click", guardQuietly(loadOlderTurns));
 el("collapse-all").addEventListener("click", () => setAllFolded(true));
 el("expand-all").addEventListener("click", () => setAllFolded(false));
@@ -32243,7 +32689,11 @@ el("search-field").addEventListener("input", () => {
 el("search-field").addEventListener("keydown", (event) => {
   // `#249 search-highlight`. Enter — a phone keyboard's Search — is the reader saying the words are
   // typed: the hits are marked now rather than when the pause would have.
-  if (event.key === "Enter" && !event.isComposing) markSearchNow();
+  if (event.key === "Enter" && !event.isComposing) {
+    markSearchNow();
+    // `#262 search-load-older`. And it searches further back, where the step back offers that.
+    if (searchOlderFromField()) swallow(event);
+  }
   if (event.key === "Escape" && !event.isComposing) {
     setSearchOpen(false);
     settleFocus();

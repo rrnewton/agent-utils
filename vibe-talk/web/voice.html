@@ -244,8 +244,8 @@
                 type="search"
                 autocomplete="off"
                 placeholder="Search loaded messages"
-                aria-label="Search loaded messages"
-                title="Filters the messages already on screen. Quote a phrase to match it whole."
+                aria-label="Search loaded messages; Enter searches older messages"
+                title="Filters the messages already on screen. Quote a phrase to match it whole. Enter searches older messages, a few pages at a time."
                 hidden
               />
               <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
@@ -364,6 +364,11 @@
             <p id="search-empty" class="search-empty" role="status" hidden>
               Nothing in the messages loaded so far matches that search.
             </p>
+            <!--
+              `#262 search-load-older`. One column on Main, a search nothing loaded matches: Main holds a
+              thread's first message and none of its replies, and All has them. The search is kept.
+            -->
+            <button id="search-in-all" class="chip" type="button" hidden>Search All — thread replies too</button>
             <div id="pane-voice">
               <!-- At idle the transcript is the largest empty thing on the screen, so the
                    invitation belongs HERE, in the space that is doing nothing — not in the one
@@ -493,6 +498,13 @@
                 step is in flight.
               -->
               <button id="load-older" class="chip" type="button" hidden>Older messages</button>
+              <!--
+                `#262 search-load-older`. While a search, Links or whose messages chooses rows, the
+                control above says "Search before Oct 3" and walks a few older pages a tap; what the
+                last walk found is said here, under it, until the search changes. A status, written
+                once when a walk ends.
+              -->
+              <p id="search-older-note" class="hint search-older-note" role="status" hidden></p>
               <p id="timeline-notice" class="hint" hidden></p>
               <p id="channel-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
                 Loading messages…
@@ -590,6 +602,7 @@
                 <p id="side-inbox-note" class="hint" hidden></p>
                 <button id="side-clear-backlog" class="chip" type="button" hidden>Clear the backlog</button>
                 <button id="side-older" class="chip" type="button" hidden>Older messages</button>
+                <p id="side-search-older-note" class="hint search-older-note" role="status" hidden></p>
                 <p id="side-notice" class="hint" hidden></p>
                 <p id="side-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
                   Loading thread…

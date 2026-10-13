@@ -3639,6 +3639,22 @@ const TUNING_BANDS = {
     "under Pinned typically. Under three, a pin from earlier in the day is out of reach and the " +
     "reader is left at the oldest message loaded instead of the one they chose; past about twenty, " +
     "a thousand messages are read while the reader waits at the head of the list"],
+  // `#262 search-load-older`: one tap of "Search before …", or Enter in the search field.
+  SEARCH_OLDER_PAGES: [2, 10,
+    "older pages one walk for the search may read. Under two, a term a few pages back takes a tap per " +
+    "page, which is the stall the walk replaces; past about ten, one tap reads hundreds of messages into " +
+    "the page and the device's copy, and on a slow chat service holds its calls for a minute"],
+  SEARCH_OLDER_MS: [5000, 19000,
+    "how long one walk may take before it starts no further page. Under five seconds a slow chat " +
+    "service gets one page a tap; it must stay under the page's own twenty-second read timeout, or a " +
+    "walk could outlast a read the page has given up on"],
+  SEARCH_OLDER_HITS: [1, 10,
+    "new matches that end a walk. One stops before the reader sees whether the term is common; past " +
+    "about ten, a common term reads the whole budget where a few matches were what was asked for"],
+  SEARCH_OLDER_TAP_MS: [200, 1000,
+    "how long after a walk starts a tap on its control is still the tap that started it, not Stop. " +
+    "Under a fifth of a second a double tap stops the walk it started; past a second a reader who " +
+    "meant Stop finds it ignored"],
   REPLY_LANDED_MS: [800, 5000,
     "how long the row a jump lands on stays lit. Under most of a second the light is gone before " +
     "the eye has followed the scroll; past a few seconds it is still lit after the reader has moved " +
