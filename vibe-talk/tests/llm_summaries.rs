@@ -835,6 +835,89 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
     assert_eq!(h.names.pending() + h.names.named(), 0);
 }
 
+#[tokio::test]
+async fn an_active_thread_keeps_its_sentence_row_alive_with_its_name() {
+    // `#208 persistent-cache`. The age limit counts from a row's last use, for the sentence as for
+    // the name: the read that rewrites an active thread's old name row keeps its sentence row alive
+    // too, with no model call. Against a real SQLite store, so the sentence row can be aged by hand.
+    let h = harness();
+    let dir = testing::TempDir::new("llm-summaries-sentence-touch");
+    let file = dir.path().join("store.sqlite3");
+    let store = Arc::new(
+        vibe_talk::store::sqlite::SqliteStore::open(&file, Default::default()).expect("open"),
+    );
+    let deps = ThreadDeps {
+        store: store.clone(),
+        ..ThreadDeps::from_state(&h.state)
+    };
+    let now = jiff::Timestamp::now().as_second();
+    let old = now - 2 * 24 * 60 * 60;
+    *h.threads.updated.lock().unwrap() = Some(
+        jiff::Timestamp::from_second(now - 3_600)
+            .unwrap()
+            .to_string(),
+    );
+    for thread in THREADS {
+        store
+            .cache_summary(
+                &name_key(&channel(), thread),
+                &serde_json::to_string(&FiledName {
+                    name: "runner-wedged".to_owned(),
+                    touched: old,
+                })
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .cache_summary(
+                &sentence_key(&deps.version, &channel(), thread),
+                &serde_json::to_string(&FiledSentence {
+                    summary: "It is stuck.".to_owned(),
+                    at: 1,
+                })
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    rusqlite::Connection::open(&file)
+        .expect("open")
+        .execute("UPDATE summaries SET made_at_ms = ?1", [old * 1_000])
+        .expect("age");
+    let sentence_made = || async {
+        store
+            .cached_summary(&sentence_key(&deps.version, &channel(), THREADS[0]))
+            .await
+            .unwrap()
+            .expect("filed")
+            .made_at_ms
+    };
+    assert_eq!(sentence_made().await, old * 1_000);
+
+    let (request, mut page) = thread_page(&h.threads).await;
+    h.names
+        .annotate(&deps, &channel(), &request, &mut page, true)
+        .await;
+    for _ in 0..100 {
+        if sentence_made().await > old * 1_000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        sentence_made().await >= (now - 60) * 1_000,
+        "the sentence row of an active thread was left to age out"
+    );
+    assert!(
+        h.summarizer.thread_prompts().is_empty(),
+        "keeping a sentence alive asked the model"
+    );
+    assert_eq!(h.names.pending() + h.names.named(), 0);
+}
+
 /// Assert that every thread in `body` carries `sentence` cut at the cap in force: no longer than the
 /// cap, ending "…", and a prefix of the whole sentence at a word boundary.
 fn assert_shown_cut(body: &Value, sentence: &str) {

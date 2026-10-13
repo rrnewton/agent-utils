@@ -851,6 +851,84 @@ async fn a_thread_summary_recalls_only_from_that_thread() {
     assert_eq!(server.summarizer.calls(), 0);
 }
 
+#[tokio::test]
+async fn a_miss_that_needs_no_context_is_generated_from_memory_without_a_fetch() {
+    // `#208 persistent-cache`, milestone `summary-keep`. Configured for no context, or for a thread,
+    // the text the page just read is everything the summariser would be shown, so a store miss is
+    // generated from it with no read of the window. THE CONTROL: configured for context, the same
+    // miss reads the window once, for the neighbours.
+    for (context, fetches) in [(0, 0), (3, 1)] {
+        let server = new_server(400, 160, context);
+        server.seed(&long_text("deploy"));
+        let id = server.newest_id().await;
+        let fetched = server.discord.fetch_count();
+        let answer = summarise(&server, Scope::Write, &id).await;
+        assert!(
+            matches!(answer.outcome, SummaryOutcome::Generated(_)),
+            "{answer:?}"
+        );
+        assert_eq!(
+            server.discord.fetch_count(),
+            fetched + fetches,
+            "context_messages = {context}"
+        );
+        let asked = server.summarizer.requests();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].context, context);
+    }
+
+    // A thread: what the thread view read is recalled, and the miss is generated and filed with no
+    // lookup. This backend has no thread lookups, so one would have been refused.
+    let server = new_server(400, 160, 3);
+    let content = long_text("threaded");
+    let id = server
+        .discord
+        .seed(&server.channel, "codex-eng", &content)
+        .0;
+    let message = ops::messages(&server.state, READ_CHANNEL, None)
+        .await
+        .expect("reads")
+        .messages
+        .into_iter()
+        .find(|m| m.id.0 == id)
+        .expect("seeded");
+    server.state.read_ahead.clear();
+    server.state.read_ahead.remember(
+        &server.channel,
+        Some("opaque/thread-T"),
+        std::slice::from_ref(&message),
+        std::time::Instant::now(),
+    );
+    let fetched = server.discord.fetch_count();
+    let answer = ops::summarize_message_scoped(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &id,
+        &[],
+        None,
+        Some("opaque/thread-T"),
+    )
+    .await
+    .expect("generated from memory");
+    assert!(
+        matches!(answer.outcome, SummaryOutcome::Generated(_)),
+        "{answer:?}"
+    );
+    assert_eq!(
+        server.discord.fetch_count(),
+        fetched,
+        "a thread miss made a chat call"
+    );
+    assert_eq!(server.summarizer.requests()[0].context, 0);
+    assert!(server
+        .store
+        .cached_summary(&key_of(&server, &id, &content))
+        .await
+        .expect("read")
+        .is_some());
+}
+
 /// A real SQLite store for `server`, so a row can be aged by hand and a restart reopens the file.
 fn sqlite_store(
     dir: &testing::TempDir,

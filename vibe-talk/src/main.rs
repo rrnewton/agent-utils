@@ -891,6 +891,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_re_key_that_fails_skips_the_sweep_and_the_next_start_retries_it() {
+        // `#208 persistent-cache`, milestone `summary-keep`. The sweep after a failed re-key would
+        // delete exactly the rows that could not be moved, which is the full sweep this milestone
+        // exists to prevent. Skipped, they wait for the next start, which moves them.
+        use vibe_talk::model::{ChannelId, MessageId};
+        use vibe_talk::store::SummaryKey;
+        let config = vibe_talk::testing::config();
+        let summarizer = vibe_talk::summarize::fake::FakeSummarizer::new();
+        let current = vibe_talk::summarize::policy_version_for(&config.summaries, &summarizer);
+        let previous = vibe_talk::summarize::policy_version_v1_for(&config.summaries, &summarizer);
+        let unrelated = "v1-messages-api-w3-c160-0000000000000001";
+        assert_ne!(previous, unrelated);
+        let key = |version: &str| SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId("1000000000000000100".to_owned()),
+            content_hash: 7,
+            version: version.to_owned(),
+        };
+        let store = vibe_talk::store::fake::FakeStore::new();
+        for version in [previous.as_str(), unrelated] {
+            store
+                .cache_summary(&key(version), "somebody else's words, shortened", None)
+                .await
+                .expect("file");
+        }
+        let held = |version: String| {
+            let store = &store;
+            let key = key(&version);
+            async move { store.cached_summary(&key).await.expect("read").is_some() }
+        };
+
+        store.fail_next("the disk is busy");
+        keep_summaries_across_the_policy_change(&store, &config, &summarizer, &current).await;
+        assert!(
+            held(previous.clone()).await,
+            "a row that was not moved went"
+        );
+        assert!(
+            held(unrelated.to_owned()).await,
+            "the sweep ran after the re-key failed"
+        );
+        assert!(!held(current.clone()).await);
+
+        keep_summaries_across_the_policy_change(&store, &config, &summarizer, &current).await;
+        assert!(held(current.clone()).await, "the next start did not re-key");
+        assert!(!held(previous).await);
+        assert!(
+            !held(unrelated.to_owned()).await,
+            "the next start did not sweep"
+        );
+    }
+
+    #[tokio::test]
     async fn an_ordinary_server_exit_is_returned_without_waiting_for_shutdown() {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let stopped = run_with_shutdown_deadline(
