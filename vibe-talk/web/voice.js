@@ -2715,7 +2715,12 @@ function applySearch() {
       // `#249 search-highlight`. Where each term is, in the rows it lets through.
       markSearchHits(row, hit && text !== null ? marking : []);
       if (counts && text !== null) {
-        loaded += 1;
+        // `#262 search-load-older`. In messages, as the lines between the rows count them (`seamsFor`):
+        // a combined row is every message it holds, all of them on screen when it is, and a row with
+        // no message of the channel's own — a turn of the call, one still being sent — is one. So what
+        // is shown and the lines' counts add up to what is loaded.
+        const weight = Math.max(1, idsOf(row).length);
+        loaded += weight;
         const held = links ? heldLinks(row) : [];
         if (held.length > 0) {
           tally.linked += 1;
@@ -2732,7 +2737,7 @@ function applySearch() {
           if (said) tally.matching.set(link.kind, tally.matching.get(link.kind) + 1);
         }
         if (hit) {
-          matched += 1;
+          matched += weight;
         }
       }
     }
@@ -4021,7 +4026,7 @@ function filterHiddenSentence(anchor, walked) {
   if (walked && olderThanLoaded(anchor)) return `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`;
   // Under Hide read a channel without threads reads only what is left, so a message it hides is in
   // no list this page holds; with threads it is held, and drawn in none.
-  if (todoMode && (!threadingSupported || timelineMessages.some((message) => anchor.ids.includes(String(message.id))))) {
+  if (hidingRead() && (!threadingSupported || timelineMessages.some((message) => anchor.ids.includes(String(message.id))))) {
     return "Hide read hides it — nearest is here.";
   }
   return "Not in this view — nearest is here.";
@@ -4117,6 +4122,8 @@ function setSearchOpen(open) {
 
 /** `setSearchOpen`, without holding the reader's place. */
 function showSearchOpen(open) {
+  // `#262 search-load-older`. Closed over a filter choosing rows, Hide read comes back (`hidingRead`).
+  const wasHidingRead = hidingRead();
   searchOpen = open;
   if (!open) {
     searchQuery = "";
@@ -4146,6 +4153,7 @@ function showSearchOpen(open) {
   // The pill shares the line the bar grows along, and gives way to it.
   renderChannelFreshness();
   // Both columns: there is one search bar. `#229 desktop-two-column`.
+  if (hidingRead() !== wasHidingRead) eachColumn(renderCachedTimeline);
   eachColumn(renderScrollTools);
   if (columnsShown) refilterSideCards();
   if (open) {
@@ -4528,7 +4536,7 @@ const filterPlace = () =>
  */
 function setLinksOnly(on) {
   if (on === linksOnly) return;
-  keepingFilterPlace(() => {
+  keepingFilterPlace(() => liftingHideRead(() => {
     linksOnly = on;
     el("links-filter").setAttribute("aria-pressed", on ? "true" : "false");
     // `#212 link-filter`. The kinds of link come up under it, or go, and the room the list makes for
@@ -4538,7 +4546,7 @@ function setLinksOnly(on) {
     renderScrollTools();
     // The right column's rows too: Links filters both. `#229 desktop-two-column`.
     inOtherColumn(renderScrollTools);
-  });
+  }));
   // Off, the rows' text is back on screen, and summary mode asks about what is in view.
   requestVisibleSummaries();
 }
@@ -4631,12 +4639,12 @@ function renderAuthorFilter() {
 function setAuthorFilter(mode) {
   const next = AUTHOR_FILTERS.includes(mode) ? mode : "everyone";
   if (next === authorFilter) return;
-  keepingFilterPlace(() => {
+  keepingFilterPlace(() => liftingHideRead(() => {
     authorFilter = next;
     renderAuthorFilter();
     renderScrollTools();
     inOtherColumn(renderScrollTools);
-  });
+  }));
   requestVisibleSummaries();
 }
 
@@ -4652,7 +4660,7 @@ function cycleAuthorFilter() {
  * message of the owner's, so Mine under it is empty by design, and the sentence says how to see them.
  */
 function authorEmptySentence(author, searching, pinned) {
-  if (author === "mine" && !pinned && currentView === "discord" && todoMode && markOwnRead) {
+  if (author === "mine" && !pinned && currentView === "discord" && hidingRead() && markOwnRead) {
     return "Your own messages count as read, so Hide read leaves them out — press h for Show read.";
   }
   const whose = author === "mine" ? "yours" : "from anyone else";
@@ -14461,7 +14469,7 @@ function catchUpFromAll() {
   const position = channelReadPosition(area);
   if (catchUpHeldView()) {
     const keeps = readFilterKeeps();
-    settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
+    settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
       { keepPosition: true, area, ...position });
   }
   renderChannelFreshness();
@@ -15829,7 +15837,7 @@ function drawThreadChips(row, tally, inMain) {
  */
 function syncUnreadReplies() {
   if (!threadingSupported || channelView !== "main" || channelCanon.channel !== String(el("discord-channel").value)) return;
-  if (todoMode) {
+  if (hidingRead()) {
     const keeps = readFilterKeeps();
     const wanted = timelineMessages.filter(keeps).map((message) => String(message.id)).sort().join(" ");
     const drawn = [...el("discord-log").children].flatMap(idsOf).sort().join(" ");
@@ -16366,7 +16374,7 @@ function rowsAsDrawn(pages) {
   const projected = projectView();
   if (!projected) return false;
   const keeps = readFilterKeeps();
-  const groups = glom(projected.filter((message) => !todoMode || keeps(message)));
+  const groups = glom(projected.filter((message) => !hidingRead() || keeps(message)));
   const rows = el("discord-log").children;
   if (rows.length !== groups.length) return false;
   for (let i = 0; i < groups.length; i += 1) {
@@ -16415,7 +16423,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !delta && !older && merged.length <= incoming.length);
   const keeps = readFilterKeeps();
-  const shown = timelineMessages.filter((message) => !todoMode || keeps(message));
+  const shown = timelineMessages.filter((message) => !hidingRead() || keeps(message));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
     // those elements as its anchor, and recreating it would throw away the reader's position.
@@ -16475,7 +16483,7 @@ function holdingMessage(mutate) {
 function renderCachedTimeline() {
   if (!threadingSupported || channelView === "threads") return;
   const keeps = readFilterKeeps();
-  const shown = timelineMessages.filter((message) => !todoMode || keeps(message));
+  const shown = timelineMessages.filter((message) => !hidingRead() || keeps(message));
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     holdingReplyArrows(renderChannelRows);
@@ -20033,7 +20041,7 @@ async function seekMessage(target, arrive, openAll) {
     // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
     // list has just changed, because All, or an older page, may be what brings the message in.
     const hiddenAsRead = () => {
-      if (!(todoMode && threadingSupported && !rowHolding(target) &&
+      if (!(hidingRead() && threadingSupported && !rowHolding(target) &&
           timelineMessages.some((message) => String(message.id) === target))) {
         return false;
       }
@@ -20625,7 +20633,7 @@ function gatherReport(parent) {
   const group = replyGroup(parent, drawn);
   const gathered = [...group.replies].filter((id) => shown.has(id)).length;
   // Every reply not drawn is one the page holds of the view, and in All only Hide read leaves one out.
-  const hidden = todoMode ? group.replies.size - gathered : 0;
+  const hidden = hidingRead() ? group.replies.size - gathered : 0;
   let missing = 0;
   for (const [thread, head] of group.threads) {
     const said = threadReplies(thread, heldMessage(head) ||
@@ -21054,7 +21062,7 @@ function renderReplyCounts() {
     if (drawn.has(id)) return true;
     const message = held.get(id);
     return elsewhere && Boolean(message) && !inView(message, channelView, selectedThreadId) &&
-      !(todoMode && !stillToDo(message, channelCanon.dismissed));
+      !(hidingRead() && !stillToDo(message, channelCanon.dismissed));
   };
   // Drawn directly under the row it answers, at the head of its own row, with the arrow that meets it.
   const joined = (id) => {
@@ -24505,6 +24513,31 @@ function readRunsSuspended() {
 }
 
 /**
+ * Whether Hide read is leaving read messages out of the list now. `#262 search-load-older`: not while a
+ * filter chooses rows on a provider with threads, where Hide read steps aside as Collapse read does
+ * (`readRunsSuspended`) — an old match is read by definition, and a search that walks back under Hide
+ * read would draw almost nothing of what it read and say it had searched it. The read mode the reader
+ * chose is untouched, and closing the search brings it back. Without threads Hide read is a read of
+ * its own (`loadTodo`), and stays in force.
+ */
+const hidingRead = () => todoMode && !(threadingSupported && readRunsSuspended());
+
+/**
+ * Run `change`, a change of the filters, and draw each column again from what it holds when it made Hide
+ * read step aside or come back (`hidingRead`): once per such change, never per keystroke.
+ *
+ * @template T
+ * @param {() => T} change
+ * @returns {T}
+ */
+function liftingHideRead(change) {
+  const was = hidingRead();
+  const result = change();
+  if (hidingRead() !== was) eachColumn(renderCachedTimeline);
+  return result;
+}
+
+/**
  * The line a collapsed run is drawn as, on the run's first row: made once per row and kept on it.
  * The row's own content is hidden behind it by web/voice.css, so the row is still the message it
  * was — every act that finds a row by its ids still finds it — and the list holds only messages.
@@ -24803,7 +24836,7 @@ function renderTodoControls() {
   // would be the ambiguity every mute button in history has had, with a third state to be wrong
   // about. web/voice.css draws each mode off the same attribute a screen reader is told.
   renderReadModeControl();
-  el("inbox-note").hidden = !todoMode;
+  el("inbox-note").hidden = !hidingRead();
   const clear = el("clear-backlog");
   clear.hidden = threadingSupported || !todoMode || backlogSize === 0;
   clear.textContent = backlogIsArmed()
@@ -25005,7 +25038,7 @@ function appendChannelRow(arriving, live = false, folded = false) {
   }
   // `#196 auto-read-noise`. A placeholder arriving while Hide read is on is already read: it is
   // held with the rest of the channel, and the list — and its count — are not told about it.
-  if (todoMode && isNoise(message)) {
+  if (hidingRead() && isNoise(message)) {
     save();
     renderNoiseCount();
     return;
@@ -27586,7 +27619,7 @@ function followInOtherColumn() {
   inOtherColumn(() => {
     if (catchUpHeldView()) {
       const keeps = readFilterKeeps();
-      settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
+      settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
         { keepPosition: true, area: el("scroll-area"), ...channelReadPosition(el("scroll-area")) });
     } else {
       syncUnreadReplies();
@@ -28955,7 +28988,7 @@ function catchUpHiddenArrivals() {
     const position = channelReadPosition(area);
     if (catchUpHeldView()) {
       const keeps = readFilterKeeps();
-      settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
+      settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
         { keepPosition: true, area, ...position });
     } else {
       // Nothing of this view's own, but a reply on Main is one more on its root's chip.
@@ -28967,7 +29000,7 @@ function catchUpHiddenArrivals() {
       const place = channelReadPosition(there);
       if (catchUpHeldView()) {
         const keeps = readFilterKeeps();
-        settleAfterRead(timelineMessages.filter((message) => !todoMode || keeps(message)),
+        settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
           { keepPosition: true, area: there, ...place });
       }
     });
@@ -32190,14 +32223,16 @@ el("link-kinds").addEventListener("focusin", (event) => {
 // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence saying
 // so, and text that matches again puts back the message they were on before it.
 el("search-field").addEventListener("input", () => {
-  keepingFilterPlace(() => {
+  // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
+  // aside or come back (`liftingHideRead`).
+  keepingFilterPlace(() => liftingHideRead(() => {
     searchQuery = el("search-field").value;
     // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
     // one redraw; otherwise they follow once the typing pauses (`markedQuery`).
     if (searchTerms(searchQuery).length === 0) markedQuery = searchQuery;
     eachColumn(renderScrollTools);
     if (columnsShown) refilterSideCards();
-  });
+  }));
   markSearchSoon();
 });
 // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a

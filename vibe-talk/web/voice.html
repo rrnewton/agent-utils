@@ -1777,8 +1777,11 @@
                 each run of two or more into one line, <em>… 12 read messages …</em>, which a tap
                 opens, while keeping a thread's first message and the newest message in view;
                 <strong>Hide read</strong> takes them out of the list entirely, which is what turns
-                the channel from a log into a queue. A search or Links opens every collapsed run,
-                so nothing they match is behind a line.
+                the channel from a log into a queue. A search, Links or whose messages opens every
+                collapsed run, so nothing they match is behind a line; and while one is on, on a chat
+                service with threads, Hide read steps aside too, so a read message that matches is
+                shown, greyed — an old match is read by definition. Closing the search puts Hide read
+                back.
               </p>
               <p class="hint">
                 <strong>Searching.</strong> The magnifying glass filters the messages already loaded:
@@ -1805,8 +1808,10 @@
                 messages loaded — then only everyone else's, people and agents alike, then everyone's
                 again; <kbd>Shift</kbd>+<kbd>M</kbd> does the same. Your messages are the ones drawn as
                 yours, on the right. A message has to pass every filter in the bar: the search text,
-                Links, Pinned, whose it is, and the read mode — so with your own messages counted as
-                read, Hide read leaves none of yours to show.
+                Links, Pinned and whose it is. On a chat service with threads Hide read steps aside
+                while one of them is on, as Collapse read does, so your own messages show even when
+                they count as read; on one without, Hide read still applies, and with your own
+                messages counted as read it leaves none of yours to show.
               </p>
               <p class="hint">
                 <strong>A filter keeps your place.</strong> Typing or clearing a search, closing it,

@@ -36535,7 +36535,8 @@ test("a combined row shows the links of every message in it, once each", async (
   await showLinks(page);
   assert.deepStrictEqual(linkPairs(rows[0]), [["https://example.com/one", "https://example.com/one"],
     ["two", "https://example.com/two"]], "a combined row did not show both halves' links, once each");
-  assert.equal(page.el("search-count").textContent, "1 of 1 loaded");
+  // `#262 search-load-older`. Counted in messages: the one row holds two.
+  assert.equal(page.el("search-count").textContent, "2 of 2 loaded");
 });
 
 test("Links is ANDed with the search text and with Pinned, and the count speaks for all of them", async () => {
@@ -46317,8 +46318,8 @@ test("`#251 author-filter`: every change keeps the selected message where it is,
   keptAt(page, "24", y, "Mine on");
   assert.deepStrictEqual(litIds(page), ["24"]);
   // THE CONTROL: the same change, not placed, moves the message.
-  const unplaced = await run(brokenScript("  keepingFilterPlace(() => {\n    authorFilter = next;",
-    "  ((change) => change())(() => {\n    authorFilter = next;"));
+  const unplaced = await run(brokenScript("  keepingFilterPlace(() => liftingHideRead(() => {\n    authorFilter = next;",
+    "  ((change) => change())(() => liftingHideRead(() => {\n    authorFilter = next;"));
   assert.ok(Math.abs(yOf(unplaced.page, "24") - unplaced.y) > 1, "the test cannot see the message jump");
   // Theirs hides it: the nearest message shown stands where it stood, and the status line says so.
   await page.el("author-filter").click();
@@ -47996,4 +47997,81 @@ test("`#267 quote-reply`: after the mouse a selection's words as drawn are read 
   await touch.clearSelection();
   await replyButton(row).click();
   assert.equal(touch.el("reply-text").value, "> the first message\n\n", "the tap did not quote the last words selected");
+});
+
+// --- searching further back -------------------------------------------------------------------------
+//
+// `#262 search-load-older`. The owner, 2026-10-12: "searching for a term XYZ in two column view found
+// zero hits; in one column, scrolling up while searching loaded older pages and found 3 ... 2 column
+// view should not PRECLUDE loading hits". These check the page's half: Hide read stepping aside under a
+// filter, the count in messages, and the bounded walk the step-back control and Enter start.
+
+test("`#262 search-load-older`: Hide read steps aside while a filter chooses rows, and comes back when the search closes", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  // The announcement is read: Hide read leaves it out.
+  page.dealtWith = new Set(["200"]);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await chooseReadMode(page, "Hide read");
+  assert.ok(!shownIds(page).includes("200"), "Hide read drew a read message");
+  assert.equal(page.el("inbox-note").hidden, false, "Hide read's note is not up");
+  // A search for it: read, and found, greyed as read rows are.
+  await search(page, "announcement");
+  await page.settle();
+  const found = rowWithId(page, "200");
+  assert.ok(found && !found.hasClass("search-hidden"), "the read match was not drawn under the search");
+  assert.equal(found.getAttribute("data-archived"), "true", "the read match is not drawn as read");
+  assert.equal(page.el("inbox-note").hidden, true, "Hide read's note stayed up while it stood aside");
+  assert.equal(page.el("search-empty").hidden, true, "the list said nothing matched");
+  assert.equal(page.el("todo-filter-label").text(), "Hide read", "the read mode the reader chose changed");
+  assert.equal(savedUiState(page).read, "hide", "the read mode kept on this device changed");
+  // Another keystroke is no redraw: only the first term and the last flip it.
+  const drawn = rowWithId(page, "200");
+  await search(page, "announcement main");
+  await page.settle();
+  assert.equal(rowWithId(page, "200"), drawn, "a keystroke under the search drew the list again");
+  // Closed, Hide read is back.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.ok(!shownIds(page).includes("200"), "closing the search did not bring Hide read back");
+  assert.equal(page.el("inbox-note").hidden, false);
+  // Links and whose messages are filters choosing rows too.
+  await search(page, "");
+  await page.el("author-filter").click();
+  await page.settle();
+  await page.el("author-filter").click();
+  await page.settle();
+  assert.equal(authorState(page)[0], "theirs");
+  assert.ok(shownIds(page).includes("200"), "Theirs under Hide read left a read message of theirs out");
+});
+
+test("`#262 search-load-older`: without threads Hide read is a list of its own, and stays in force under a search", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.dealtWith = new Set(["8000000000000000000"]);
+  await showDiscord(page, backlog(3));
+  await turnTodoOn(page);
+  assert.ok(!shownIds(page).includes("8000000000000000000"));
+  await search(page, "message");
+  await page.settle();
+  assert.ok(!shownIds(page).includes("8000000000000000000"), "the search drew a message Hide read's own list left out");
+  assert.equal(page.el("inbox-note").hidden, false);
+});
+
+test("`#262 search-load-older`: the count is in messages, so what is shown and the gaps' lines add up to it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "8600000000000000001", content: "first half of a long post about the engine", timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8600000000000000002", content: "second half of it", timestamp: "2026-08-19T04:31:01.000Z" }),
+    message({ id: "8600000000000000003", content: "lunch", timestamp: "2026-08-19T05:31:00.000Z" }),
+    message({ id: "8600000000000000004", content: "dinner", timestamp: "2026-08-19T06:31:00.000Z" }),
+  ]);
+  assert.equal(page.el("discord-log").children.length, 3, "the fixture did not combine the post's halves");
+  await search(page, "engine");
+  await page.settle();
+  assert.equal(page.el("search-count").textContent, "2 of 4 loaded", "a combined row was counted as one");
 });
