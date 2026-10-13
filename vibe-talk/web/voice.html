@@ -130,25 +130,6 @@
         <button id="dismiss-status" class="chip" type="button" aria-label="Dismiss">×</button>
       </div>
 
-      <!--
-        `#34 voice-chat-write-confirm`. The voice agent's `post_reply` does not send: it PROPOSES,
-        and this card is one of the two ways the owner confirms. It shows exactly what the server
-        will post — channel, reply target, text — because that is what Send commits, and nothing
-        the agent says can change it once it is on screen. It appears only during a write-scope
-        call, and it is an overlay for the same reason #status-line is: appearing must not move the
-        transcript under the reader's thumb.
-      -->
-      <section id="post-confirm" class="panel" role="alertdialog" aria-labelledby="post-confirm-title" hidden>
-        <h2 id="post-confirm-title">Post this as your bot?</h2>
-        <p id="post-confirm-where"></p>
-        <p id="post-confirm-text"></p>
-        <p id="post-confirm-expiry" class="hint"></p>
-        <div class="row">
-          <button id="post-confirm-cancel" class="secondary" type="button">Don't send</button>
-          <button id="post-confirm-send" type="button">Send</button>
-        </div>
-      </section>
-
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
         <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in">
@@ -405,6 +386,34 @@
               -->
               <button id="load-older-turns" class="chip" type="button" hidden>Earlier turns</button>
               <ol id="transcript" class="messages"></ol>
+              <!--
+                `#34 voice-chat-write-confirm`. The voice agent's `post_reply` does not send: it
+                PROPOSES, and this card is one of the two ways the owner confirms. It shows exactly what
+                the server will post — channel, what it answers, text — because that is what Send
+                commits, and nothing the agent says can change it once it is on screen.
+
+                `#269 approval-card-inline`. It is the tentative next message, drawn as the owner's own
+                outgoing tile, at the foot of whatever he is looking at: here, under the call's
+                transcript; under the channel's messages on the channel; and docked at the foot of the
+                screen on Reply, Threads, Settings and Help. ONE element, every id kept, which
+                `placePostCard` in web/voice.js moves; outside the transcript's list, so nothing that
+                walks the turns ever meets it. The words come first and the buttons last, beside the
+                line saying where it goes, so the thumb lands on Send below what it confirms.
+              -->
+              <section id="post-confirm" role="group" aria-labelledby="post-confirm-title"
+                       aria-describedby="post-confirm-where post-confirm-text post-confirm-expiry" hidden>
+                <h2 id="post-confirm-title">Post this as your bot?</h2>
+                <p id="post-confirm-text"></p>
+                <button id="post-confirm-more" class="fold" type="button" aria-expanded="false" hidden>More</button>
+                <p id="post-confirm-where"></p>
+                <p id="post-confirm-expiry"></p>
+                <div class="row post-confirm-actions">
+                  <button id="post-confirm-cancel" class="secondary" type="button">Don't send</button>
+                  <button id="post-confirm-send" type="button">
+                    <span id="post-confirm-send-label">Send</span>
+                  </button>
+                </div>
+              </section>
               <!--
                 `#241 voice-composer`. The owner: "Type mode on voice agent takes away my
                 Voice/Channel toggle ... I'd actually like to move over to the same metaphor as the

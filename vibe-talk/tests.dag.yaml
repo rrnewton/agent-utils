@@ -339,6 +339,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#269 approval-card-inline` in the browser engine: the send card as the next message, in the list
+  # on the call's view and the channel and docked on Settings, Send's centre at least 0.62 of the way
+  # down a 393x852, 360x780 and 375x667 phone in every run (one and thirty rows, banner up or gone,
+  # short and long draft), uncovered and wholly on screen, and both buttons held when it appears.
+  # Measured on 2026-10-13: about 90s wall.
+  - group: check
+    job: approval-card-browser
+    desc: the send card's place, thumb reach and hold in current Chromium at 393x852, 360x780 and 375x667
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py
+    jobs_flag: ""
+    timeout: 300
+    cpu_timeout: 150
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#241 voice-composer` in the browser engine: the message box under the call's transcript and the
   # Voice/Channel switch on screen and uncovered at idle, focused, in a typed conversation and in a
   # call, at 412x915 (and with the on-screen keyboard's share of the screen taken away, as the
