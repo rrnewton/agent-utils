@@ -9236,7 +9236,9 @@ function isSpokenYesAcknowledgement(text, open) {
  * answer is judged against, so the yes is refused, whichever side of it they were said on; and an
  * interrupted turn of that kind counts as the read-back cut off (`heardBefore`). If the assumption
  * were wrong, the most it lets through is a yes whose exact, completed read-back was followed by
- * "One moment." before the owner answered.
+ * "One moment." before the owner answered — or by a streamed "One" whose turn was still open when
+ * the settle window ran out: such a turn that says more, or completes on "One", stops the yes only
+ * while it is settling (`hearAssistantForSpokenYes`, `noteTurnCompleteForSpokenYes`).
  *
  * Without numbers nothing tells a reply from more of the read-back, so an unnumbered turn is never
  * taken for a reply, and is judged as it always was.
@@ -9302,6 +9304,11 @@ function noteCutForSpokenYes(numbered = false) {
  * queued so far finishes playing: the server sends a turn's `turn_complete` after the last of its
  * audio, so that is when the owner heard the end of that turn. `#268 voice-call-drops`.
  *
+ * A turn the yes now settling was judged without, as its reply, may have been excused on a
+ * streamed "One" while it was open. If it completes there, it said "One", not the acknowledgement,
+ * and what it was may have come before the yes: the yes stops, as for a reply that says more. Run
+ * after `closeSpokenTurn`, which marks the turn completed.
+ *
  * @param {boolean} interrupted
  * @param {number | null} [turn]
  */
@@ -9313,6 +9320,13 @@ function noteTurnCompleteForSpokenYes(interrupted, turn = null) {
     noteCutForSpokenYes(turn !== null);
   } else if (spokenYes.said.size > 0) {
     spokenYes.done = true;
+  }
+  const settling = spokenYes.settling;
+  if (settling && [...settling.replies].some((key) => {
+    const entry = spokenYes.said.get(key);
+    return entry !== undefined && !isReplyTo({ turn: settling.turn }, entry);
+  })) {
+    abortSpokenYes("said_more");
   }
 }
 

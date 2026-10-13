@@ -49982,6 +49982,33 @@ test("`#268 voice-call-drops`: a turn numbered with the answer is left out as it
   assert.deepEqual(cutShort.proposalCommits, [], "a turn that completed on 'One' was left out");
 });
 
+test("`#268 voice-call-drops`: a reply excused on a streamed 'One' that then completes on it stops the yes still settling", async () => {
+  // The review's probe: an exact read-back in turn 1; the assistant's turn 2 streamed "One"; the
+  // owner's "Yes." final; turn 2 completed there, inside the settle window, without saying more.
+  // "One" was excused only while its turn was open, and that was asked only when the yes was
+  // judged, so the yes posted on a reply that turned out not to be the acknowledgement.
+  const page = newPage();
+  const socket = await neutralReadBack(page);
+  speech(socket, "assistant", 2, "One", false);
+  speech(socket, "user", 2, "Yes.", true);
+  assert.match(page.el("status").textContent, /Heard yes/);
+  turnDone(socket, 2);
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a reply that completed on 'One' did not stop the yes");
+  assert.match(page.el("status").textContent, /^Not sent — the assistant said more than One moment/);
+
+  // The same, with the acknowledgement completed before its turn did, still posts.
+  const whole = newPage();
+  const pending = spokenDraft();
+  const wholeSocket = await neutralReadBack(whole, { pending });
+  speech(wholeSocket, "assistant", 2, "One", false);
+  speech(wholeSocket, "user", 2, "Yes.", true);
+  speech(wholeSocket, "assistant", 2, "One moment.", true);
+  turnDone(wholeSocket, 2);
+  await settleSpokenYes(whole);
+  assert.deepEqual(whole.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
+});
+
 test("`#268 voice-call-drops`: the acknowledgement a spoken yes excuses is the one every prompt tells the agent to say", () => {
   // The page leaves "One moment." out of a read-back because the agent is told to say exactly that
   // on a yes. If the prompts said anything else, a cooperative agent's reply would refuse every yes
