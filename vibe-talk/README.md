@@ -3066,11 +3066,23 @@ thread, says what the provider titles it (Slack titles a thread by its root's fi
 whether it outlives its root. On the voice pane a live message is not read for at all; entering the
 channel reads it.
 
+A view the pushed stream has never vouched for is read the same way, as the forty-five-second poll
+read it before. While the stream is attached, a view drawn from the copy saved on the device —
+after a reload, or on coming back to a channel — is read behind its rows when it is shown. A gap
+owes every view a read: a stream reset, which also reads both columns at once, the right one
+included; and a stream that attaches with no event to resume from, whose replay of the server's
+bounded tail says nothing of what came before it. A resumed stream replays everything since the
+page's last event, and each replayed message the page did not hold, like each message of the
+adapter's catch-up, owes every view it may have changed, since the page takes it without what it
+did to its thread's counts; an edit or removal from that tail owes every view, since it does not
+say which thread its message is in.
+
 While an adapter's pushed stream is attached the poll waits fifteen minutes instead of forty-five
 seconds, since the stream carries every creation, edit and removal. It goes back to forty-five
 seconds when the stream drops; when the last read of either column failed, whether or not any rows
-were on screen; while a column shows a view a live event left something unsaid of and no read has
-answered yet (the list of threads, for one, is read at most once a minute); and when the stream
+were on screen; while a column shows a view that is owed a read and no read has answered yet — one
+a live event left something unsaid of, one of the gaps above, a copy saved on the device (the list
+of threads, for one, is read at most once a minute); and when the stream
 says nothing for forty seconds, not even the keep-alive the server sends every fifteen, which lets
 the stream go as a drop does. The stream coming back polls at once. Going back to fifteen minutes
 counts from when that wait began, so a column falling behind and catching up never puts the

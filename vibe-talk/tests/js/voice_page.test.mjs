@@ -51898,3 +51898,260 @@ test("`#278 page-live-reads`: a reply the stream does not place moves its thread
   await healthyWalk(page, 60000);
   assert.deepStrictEqual(cardIds(page), [second.id, first.id], "the card of the thread the reply moved did not go to the foot");
 });
+
+// --- `#278 page-live-reads`, third review: what the stream never vouched for is read as the 45 s
+// poll read it
+//
+// The fifteen-minute poll behind a pushed stream assumes every view the stream covers has been
+// current since it attached. Views it never covered — a copy saved on the device, a view read before
+// a gap, before a reset or before a reconnect, a view a replayed or catch-up event changed — and the
+// effects an event leaves unsaid — a removal of a reply the stream never placed, a thread's latest
+// activity taken away, the heading over an open thread — were left stale for up to fifteen minutes
+// where the page before #278 read them within forty-five seconds. Each test below is a reviewer's
+// probe and fails on 182f3b34's page.
+
+/**
+ * The answers to the reads sent from now, each cut when its read is sent and held until `open()`:
+ * a slow service whose snapshot is older than the events delivered while it is out.
+ */
+function holdCutAnswers(server) {
+  let open = null;
+  const opened = new Promise((resolve) => { open = resolve; });
+  const cut = [];
+  server.hold = {
+    respond: (path) => {
+      cut.push(path);
+      const answer = server.answer(path).then(async (response) => {
+        const text = await response.text();
+        return { ...response, text: async () => text };
+      });
+      return opened.then(() => answer);
+    },
+  };
+  return { cut, open: () => { server.hold = null; open(); } };
+}
+
+/**
+ * The channel of `threadData` read in Main and in its first thread in an earlier session, whose
+ * snapshot this device kept, then reopened in Main on a server with a change record, its adapter
+ * pushing. `meanwhile(data)` changes what the server holds before the reopen.
+ */
+async function savedSnapshotPage(meanwhile = null) {
+  const data = threadData();
+  const first = newPage(new Map());
+  first.threadingSupported = true;
+  first.threads = data.threads;
+  first.messages = data.messages;
+  await signIn(first);
+  await showDiscord(first, data.messages);
+  await pickThread(first, "main");
+  await pickThread(first, `thread:${data.threads[0].id}`);
+  await pollOnce(first);
+  await pickThread(first, "main");
+  await pollOnce(first);
+  const saved = JSON.parse(first.storage.get(MESSAGE_CACHE_KEY)).scopes[CHANNEL.id];
+  assert.ok(saved && saved.views[`thread:${data.threads[0].id}`], "the device did not keep the thread's cover, so this proves nothing");
+  if (meanwhile) meanwhile(data);
+  let server = null;
+  const page = newPage(first.storage, SCRIPT, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.messages = data.messages;
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+    server = forwardTimeline(p, {});
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  return { page, server, data };
+}
+
+test("`#278 page-live-reads`: behind a pushed stream, a thread drawn from the device's saved copy is read behind its rows, not left saved for fifteen minutes", async () => {
+  const { page, data } = await savedSnapshotPage((d) => {
+    d.messages.find((m) => m.id === "202").content = "edited while the page was closed";
+  });
+  assert.equal(page.streamOpens.length, 1, "the pushed stream did not attach, so this proves nothing");
+  assert.equal(page.el("thread-select").value, "main", "the reopen is not in Main, so this proves nothing");
+  const calls = page.timelineCalls.length;
+  await pickThread(page, `thread:${data.threads[0].id}`);
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["thread"], "the thread drawn from the saved copy was not read behind its rows");
+  await healthyWalk(page, 120000);
+  assert.match(page.el("discord-log").text(), /edited while the page was closed/, "the thread still shows the words from before the edit");
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh", "the thread is still drawn as saved");
+});
+
+test("`#278 page-live-reads`: behind a pushed stream, a thread saved on leaving its channel is read when the reader comes back to it", async () => {
+  const other = { id: "2220000000000000002", label: "build noise", writable: true, alias: null, added: false };
+  const { page, server } = await forwardPage({}, (p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+    p.channels = [{ ...CHANNEL }, other];
+  });
+  const thread = page.threads[0].id;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"], "the first thread is not open, so this proves nothing");
+  await pickThread(page, "main");
+  await readChannel(page, other.id);
+  // Edited while the reader is in the other channel, whose stream says nothing of this one.
+  server.edit("202", { content: "edited while the reader was elsewhere" });
+  await readChannel(page, CHANNEL.id);
+  await page.settle();
+  const calls = page.timelineCalls.length;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await page.settle();
+  assert.ok(readViewsSince(page, calls).includes("thread"), `coming back to the thread did not read it: ${readViewsSince(page, calls)}`);
+  await healthyWalk(page, 120000);
+  assert.match(page.el("discord-log").text(), /edited while the reader was elsewhere/, "the thread still shows the words from before the edit");
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh", "the thread is still drawn as saved");
+});
+
+test("`#278 page-live-reads`: a stream reset in two columns reads the thread on the right too, which shows the reply the gap lost", async () => {
+  const { page, server, data } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the first thread is not open on the right");
+  const root = data.messages[1];
+  server.post(message({ id: "560", content: "a reply the gap lost", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  page.setClock(page.clock() + 10000);
+  const calls = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseReset());
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["main", "thread"], "the reset did not read both columns");
+  await healthyWalk(page, 120000);
+  assert.deepStrictEqual(sideIds(page), ["201", "202", "560"], "the reply the gap lost is missing on the right");
+});
+
+test("`#278 page-live-reads`: after a reset, a view not on screen is read when it is next shown", async () => {
+  const { page, server } = await pushedPage();
+  const thread = page.threads[0].id;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await pickThread(page, "main");
+  await page.settle();
+  server.edit("202", { content: "edited in the gap" });
+  page.setClock(page.clock() + 10000);
+  await deliver(page, page.stream(), sseReset());
+  await page.settle();
+  await page.settle();
+  const calls = page.timelineCalls.length;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["thread"], "the thread the reset left unread was not read behind its rows");
+  assert.match(page.el("discord-log").text(), /edited in the gap/, "the thread shows the words from before the gap");
+});
+
+test("`#278 page-live-reads`: an edit replayed from the tail after a reconnect is read in the thread it was in when that thread is next shown", async () => {
+  const { page, server } = await pushedPage();
+  const thread = page.threads[0].id;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await pickThread(page, "main");
+  await page.settle();
+  // An event the stream will resume from.
+  server.edit("200", { content: "an edit before the drop" });
+  await deliver(page, page.stream(), sseUpdate("edit-200", page.messages.find((m) => m.id === "200")));
+  await page.settle();
+  page.stream().drop();
+  await page.settle();
+  server.edit("202", { content: "edited while the stream was down" });
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  await page.settle();
+  assert.equal(page.streamOpens.length, 2, "the stream did not reconnect");
+  assert.equal(page.streamOpens.at(-1).lastEventId, "edit-200", "the reconnect did not resume, so this proves nothing");
+  await deliver(page, page.stream(), sseUpdate("edit-202", page.messages.find((m) => m.id === "202"), { replayed: true, from_tail: true }));
+  await page.settle();
+  await page.settle();
+  const calls = page.timelineCalls.length;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["thread"], "the thread the replayed edit was in was not read behind its rows");
+  await healthyWalk(page, 120000);
+  assert.match(page.el("discord-log").text(), /edited while the stream was down/, "the thread shows the words from before the drop");
+});
+
+test("`#278 page-live-reads`: a reconnect with nothing to resume from leaves every view not on screen owed a read", async () => {
+  const { page, server } = await pushedPage();
+  const thread = page.threads[0].id;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await pickThread(page, "main");
+  await page.settle();
+  page.stream().drop();
+  await page.settle();
+  server.edit("202", { content: "edited while the stream was down" });
+  const calls = page.timelineCalls.length;
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  await page.settle();
+  assert.equal(page.streamOpens.length, 2, "the stream did not reconnect");
+  assert.equal(page.streamOpens.at(-1).lastEventId, null, "the reconnect resumed, so this proves nothing");
+  assert.deepStrictEqual(readViewsSince(page, calls), ["main"], "the reconnect did not poll the view on screen, once");
+  const back = page.timelineCalls.length;
+  await pickThread(page, `thread:${thread}`);
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, back), ["thread"], "a thread the drop may have changed was not read behind its rows");
+  assert.match(page.el("discord-log").text(), /edited while the stream was down/, "the thread shows the words from before the drop");
+});
+
+test("`#278 page-live-reads`: a reply replayed from the tail after a reconnect is counted on Main when the reader goes back to it", async () => {
+  const { page, server } = await pushedPage();
+  await pickThread(page, `thread:${page.threads[1].id}`);
+  await page.settle();
+  server.edit("204", { content: "an edit before the drop" });
+  await deliver(page, page.stream(), sseUpdate("edit-204", page.messages.find((m) => m.id === "204")));
+  await page.settle();
+  page.stream().drop();
+  await page.settle();
+  const root = page.messages.find((m) => m.id === "201");
+  const reply = server.post(message({ id: "565", content: "said while the stream was down", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  await page.settle();
+  await deliver(page, page.stream(), sseMessage(bareOf(reply), { replayed: true, from_tail: true }));
+  await page.settle();
+  await healthyWalk(page, 60000);
+  const calls = page.timelineCalls.length;
+  await pickThread(page, "main");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["main"], "going back to Main did not read it behind its rows");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)",
+    `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} on coming back`);
+});
+
+test("`#278 page-live-reads`: a catch-up reply the adapter replays after the reads is counted on Main when the reader goes back to it", async () => {
+  const { page, server } = await pushedPage();
+  await pickThread(page, `thread:${page.threads[1].id}`);
+  await page.settle();
+  const root = page.messages.find((m) => m.id === "201");
+  const reply = server.post(message({ id: "566", content: "the adapter caught this up", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  // History, not news, and newer than every read the page has made.
+  await deliver(page, page.stream(), sseMessage(bareOf(reply), { replayed: true, from_tail: false }));
+  await page.settle();
+  await healthyWalk(page, 60000);
+  const calls = page.timelineCalls.length;
+  await pickThread(page, "main");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["main"], "going back to Main did not read it behind its rows");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)",
+    `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} on coming back`);
+});

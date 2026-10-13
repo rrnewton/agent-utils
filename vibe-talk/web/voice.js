@@ -30721,7 +30721,7 @@ const SERVER_READ_BOUND_MS = 50000;
  * behind a pushed stream a change made on another device takes up to fifteen minutes to show here.
  */
 function pollInterval() {
-  const base = liveAttached && liveDelivery === "push" && !readsBehind() ? TIMELINE_RECONCILE_MS : DISCORD_POLL_MS;
+  const base = pushedStreamAttached() && !readsBehind() ? TIMELINE_RECONCILE_MS : DISCORD_POLL_MS;
   if (heldReadOwedAt === 0) return base;
   const owed = heldReadOwedAt - Date.now();
   if (owed <= 0) {
@@ -30729,6 +30729,15 @@ function pollInterval() {
     return base;
   }
   return Math.min(base, owed);
+}
+
+/**
+ * Whether an adapter's pushed stream is attached: what lets the poll wait fifteen minutes
+ * (`pollInterval`), and so what every view the stream has not vouched for is read for meanwhile
+ * (`liveOwes`). `#278 page-live-reads`.
+ */
+function pushedStreamAttached() {
+  return liveAttached && liveDelivery === "push";
 }
 
 /**
@@ -31761,6 +31770,8 @@ function liveRetryDelay(generation) {
  */
 async function readChannelStream(channelId, generation, reconnect = false) {
   const headers = { Authorization: `Bearer ${token()}` };
+  // `#278 page-live-reads`. Whether what this connection replays follows on from what the page saw.
+  const resumed = Boolean(liveLastEventId);
   if (liveLastEventId) {
     // The one thing that makes a reconnect neither duplicate nor drop: the server replays what
     // came after this id out of its own bounded tail, and anything it cannot replay arrives as an
@@ -31783,6 +31794,14 @@ async function readChannelStream(channelId, generation, reconnect = false) {
   // begun from here on will see.
   liveAttachReads = timelineReadsStarted;
   liveAttached = true;
+  // `#278 page-live-reads`. The same point by the count of live events, for the views it owes. A
+  // pushed stream that resumes replays everything since the page's last event, and each replayed
+  // event owes what it changed (`receiveLiveMessage`); one with nothing to resume from fills no gap,
+  // so every view read before now is owed a read, before the reads held for the attach go out.
+  liveAttachEpoch = ++liveEventEpoch;
+  if (!resumed && liveDelivery === "push" && String(el("discord-channel").value) === String(channelId)) {
+    markLiveOwed(null, false);
+  }
   renderLiveState();
   releaseLiveAttachWaiters();
   if (reconnect && liveDelivery === "push" && currentView === "discord" && !document.hidden &&
@@ -31868,7 +31887,10 @@ function onStreamFrame(frame) {
     // would ask the server to replay what it has already said it cannot.
     liveLastEventId = null;
     setStatus("the live feed fell behind — re-reading the channel.");
-    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
+    // `#278 page-live-reads`. The gap may be in any view: every one is owed a read, and both columns
+    // are read now, the right one too — behind a pushed stream the next poll is fifteen minutes away.
+    oweEveryView();
+    readColumnsAfterGap("reset");
     return;
   }
   if (!frame.data) {
@@ -31890,6 +31912,13 @@ function onStreamFrame(frame) {
       const id = frame.event === "message_update" ? message.id : payload.message_id;
       const channel = frame.event === "message_update" ? message.channel_id : payload.channel_id;
       awaitReplayRead(`${frame.event}:${id}`, String(channel), liveAttachReads);
+      // `#278 page-live-reads`. ...and that read is of the left column's view alone. Behind a pushed
+      // stream, every other view that may hold the message is owed a read sent after the attach: the
+      // event does not say which thread it is in, and each is otherwise drawn from the store, as it
+      // was before the gap, until the fifteen-minute reconcile.
+      if (liveDelivery === "push" && String(channel) === String(el("discord-channel").value)) {
+        markLiveOwed(null, false, liveAttachEpoch);
+      }
       return;
     }
     // `#278 page-live-reads`. On a threaded channel the rows are drawn from the store, so the edit or
@@ -31979,16 +32008,29 @@ function refreshAfterLiveMutation() {
 // read (`markLiveOwed`): a column showing one is read for it (`readOwedColumns`), and polled at forty-
 // five seconds until that read lands (`readsBehind`); any other is read behind its rows when it is
 // next shown (`changeChannelView`). A read answers for it only if it was sent after the event.
+//
+// NOR ONLY WHAT A LIVE EVENT LEAVES UNSAID. The fifteen-minute poll assumes every view the stream
+// covers has been current since it attached; a view it never covered is read as the forty-five-second
+// poll read it, by the same marks. A copy saved on the device is owed while the stream is attached
+// (`liveOwes`). A gap owes every view: a stream `reset`, and an attach with nothing to resume from,
+// which no replay fills (`oweEveryView`). And a replayed event the store took without what it did to
+// its thread — a message from the tail of a resumed stream, or the adapter's catch-up — owes the
+// views it may have changed, as a live one leaving that unsaid does (`receiveLiveMessage`).
 
 /**
- * Whether the live stream left something unsaid of view `key` — the current view by default — that
- * no read of the view sent since has answered (`markLiveOwed`, `noteViewAnswered`). `#278
- * page-live-reads`. Never for a view no page has covered: that one is read when it is shown anyway.
+ * Whether view `key` — the current view by default — is owed a read: the live stream left something
+ * unsaid of it that no read of the view sent since has answered (`markLiveOwed`, `noteViewAnswered`),
+ * or, while a pushed stream lets the poll wait fifteen minutes, its cover is a copy saved on the
+ * device (`loadCanon`), from before this page's stream, which no event of that stream vouches for.
+ * `#278 page-live-reads`. Never for a view no page has covered: that one is read when it is shown
+ * anyway.
  */
 function liveOwes(key = viewKey()) {
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return false;
   const cover = channelCanon.views.get(key);
-  return Boolean(cover) && Math.max(channelCanon.owedViews.get(key) || 0, channelCanon.owedAll) > (cover.seen || 0);
+  if (!cover) return false;
+  if (!cover.live && pushedStreamAttached()) return true;
+  return Math.max(channelCanon.owedViews.get(key) || 0, channelCanon.owedAll) > (cover.seen || 0);
 }
 
 /**
@@ -31998,15 +32040,50 @@ function liveOwes(key = viewKey()) {
  * those reads itself. Kept by view rather than on its cover, so that a view whose first page is on
  * the wire now, sent before the event, or whose cover a refresh starts afresh, is owed too.
  *
+ * `epoch` is the count of live events after which a read answers: by default the event just taken
+ * in; for an event from the tail a resumed stream replays, the attach (`liveAttachEpoch`), since
+ * every read sent after that has seen it. A mark never lowers one already made.
+ *
  * @param {string[] | null} [keys]
  * @param {boolean} [read]
+ * @param {number} [epoch]
  */
-function markLiveOwed(keys = null, read = true) {
+function markLiveOwed(keys = null, read = true, epoch = liveEventEpoch) {
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
-  if (keys === null) channelCanon.owedAll = liveEventEpoch;
-  else for (const key of keys) channelCanon.owedViews.set(key, liveEventEpoch);
+  if (keys === null) channelCanon.owedAll = Math.max(channelCanon.owedAll, epoch);
+  else for (const key of keys) channelCanon.owedViews.set(key, Math.max(channelCanon.owedViews.get(key) || 0, epoch));
   if (read) readOwedColumns(keys);
   fitPollToStream();
+}
+
+/**
+ * A gap the stream cannot fill: a `reset`, or an attach with no event to resume from (a fresh
+ * subscription replays only the server's bounded tail, which says nothing of what came before it).
+ * Every view of the selected channel is owed a read sent from now on. The caller reads the columns
+ * on screen; every other view is read behind its rows when it is next shown. `#278 page-live-reads`.
+ */
+function oweEveryView() {
+  liveEventEpoch += 1;
+  markLiveOwed(null, false);
+}
+
+/**
+ * Read both columns for a gap (`reason`, "reset"): the left column's view, then the right column's
+ * thread, or its list of threads once that list's own pace allows (`readOwedThreadList`). The right
+ * column is read even when the left one's read fails, as each column's poll is.
+ *
+ * @param {string} reason
+ */
+function readColumnsAfterGap(reason) {
+  refreshQuietly(async () => {
+    const since = timelineReadsStarted;
+    try {
+      await inColumn(columns.main, () => loadDiscord({ keepPosition: true, reason }));
+    } finally {
+      if (sideShowing()) await readSideColumn(reason, since);
+      else readOwedThreadList();
+    }
+  })();
 }
 
 /**
@@ -32032,15 +32109,21 @@ function noteViewAnswered(cover, payload) {
  * desktop-two-column`: a reply in the thread open on the right is read as that thread, which brings
  * its root's count with it, so Main is not read for it too.
  *
+ * `read` and `epoch` as for `markLiveOwed`: a replayed message's column on screen is read by the
+ * read it waits for (`awaitReplayRead`), and one from the tail is answered by any read sent after the
+ * attach.
+ *
  * @param {VibeTalk.Message} message
+ * @param {boolean} [read]
+ * @param {number} [epoch]
  */
-function markOwedByArrival(message) {
+function markOwedByArrival(message, read = true, epoch = liveEventEpoch) {
   const thread = threadOf(message);
   if (thread === null) {
-    markLiveOwed();
+    markLiveOwed(null, read, epoch);
     return;
   }
-  markLiveOwed([...(inSideThread(message) ? [] : ["main"]), "flat", "threads", viewKey("thread", thread)]);
+  markLiveOwed([...(inSideThread(message) ? [] : ["main"]), "flat", "threads", viewKey("thread", thread)], read, epoch);
 }
 
 /**
@@ -32324,8 +32407,16 @@ const livePatches = new Map();
  * @type {Map<string, {message: VibeTalk.Message, live: boolean, facts: VibeTalk.LiveThreadFacts | null, channel: string, epoch: number, at: number}>}
  */
 const liveArrivals = new Map();
-/** How many live creations, edits and removals this page has taken in, for `livePatches`. */
+/**
+ * How many live creations, edits and removals this page has taken in, for `livePatches`; and, for
+ * the reads they owe (`markLiveOwed`), how many gaps and attaches of the stream it has seen too.
+ */
 let liveEventEpoch = 0;
+/**
+ * `liveEventEpoch` as the stream last attached, counted as one of its own: a read sent from then on
+ * has seen everything the stream replays from its tail (`liveAttachReads` counts reads the same way).
+ */
+let liveAttachEpoch = 0;
 /** @type {WeakMap<object, number>} each read's `liveEventEpoch` when it was sent */
 const liveSentEpochs = new WeakMap();
 
@@ -32562,6 +32653,16 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = nul
     // What only a read can still say of it: where it sits, when nobody placed it; or its thread's
     // count, or its thread's card. A replayed copy is answered by the reads of `awaitReplayRead`.
     const owed = !replayed && liveFactsMissing(facts);
+    // ...in the column on screen. A replayed copy the store did not hold goes in without what it did
+    // to its thread (`foldLiveMessage` counts no replayed copy, and its facts are not applied), so
+    // behind a pushed stream every view that may show that is owed a read too, as for a live message
+    // that leaves it unsaid: one sent after the attach, for a copy from the tail of a resumed stream,
+    // which every such read has seen; one sent after it arrived, for the adapter's catch-up, which
+    // may be newer than every read. Not where the server polls its provider itself, whose page polls
+    // at forty-five seconds as it did before `#278 page-live-reads`.
+    const replayOwed = replayed && !held && liveDelivery === "push";
+    if (replayOwed && !fromTail) liveEventEpoch += 1;
+    const replayEpoch = fromTail ? liveAttachEpoch : liveEventEpoch;
     if (document.hidden) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
@@ -32575,6 +32676,9 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = nul
           liveReadOwedHidden = true;
           markOwedByArrival(kept);
         }
+        // ...and a replayed copy is read for on coming back, as every arrival was before `#278`.
+        if (replayed) liveReadOwedHidden = true;
+        if (replayOwed) markOwedByArrival(kept, false, replayEpoch);
         followReplyStore();
       }
       renderOutgoingEverywhere();
@@ -32616,6 +32720,8 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = nul
     } else if (replayed && !held) {
       awaitReplayRead(String(message.id), String(message.channel_id),
         fromTail ? liveAttachReads : timelineReadsStarted);
+      // Every other view it may have changed, once the read the column on screen waits for is out.
+      if (replayOwed) markOwedByArrival(heldMessage(String(message.id)) || placed, false, replayEpoch);
     }
     return;
   }
