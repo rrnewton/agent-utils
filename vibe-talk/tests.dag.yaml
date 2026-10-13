@@ -451,11 +451,13 @@ steps:
   # and ] on its own, move nothing; a reader on the newest line follows a live message to the foot; the
   # list of threads opens at its foot and stays there under the mouse and a moved thread; a thread with
   # nothing unread, and one whose newest reply alone is unread, open at their foot, and older replies
-  # coming in keep the row at the head; and after a reload the read behind the saved rows leaves the
-  # reader where they scrolled. Measured on 2026-10-13: about 57s wall, most of it the 2.5 s holds.
+  # coming in keep the row at the head; after a reload the read behind the saved rows leaves the
+  # reader where they scrolled; and, last, a card highlighted by a click with the mouse going on over
+  # another card to the dock moves nothing, while the mouse resting on it glides its root on screen
+  # (`#277 thread-card-focus`). Measured on 2026-10-13: about 62s wall, most of it the 2.5 s holds.
   - group: check
     job: scroll-stability-browser
-    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves and the mouse crossing the cards, follow only a reader on the newest line, and open threads at their foot, in current Chromium at 1280x800 and 412x915
+    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads at their foot, in current Chromium at 1280x800 and 412x915
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
     jobs_flag: ""

@@ -4025,8 +4025,8 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
 1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
 messages, a refresh, the read sent from the newest line and landing after a scroll, summaries and focus
 moves, and at the desk, sampled at every frame for 2.5 s, the mouse crossing the cards to the dock and to
-the top bar and ] on its own; a reader on the newest line following; the threads and their list opening
-at the foot.
+the top bar, ] on its own, and the mouse going on from a card it highlighted over another card to the
+dock; a reader on the newest line following; the threads and their list opening at the foot.
 
 ### A filter keeps your place
 

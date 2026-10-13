@@ -25,7 +25,8 @@ which must not move it by more than a pixel:
   on the wire, the reader scrolling up while it is out, and the read let go -- before, it threw them back
   to the bottom -> Summaries turned on, each long row's summary answering a moment later, and off again
   -> the focus moved: at the desk the mouse over Main's rows, ] and [ between the columns, Tab and
-  Shift+Tab, each held 2.5 s, and a card clicked, its thread opening on the right; on the phone Tab and
+  Shift+Tab, each held 2.5 s, and a card's replies button clicked, its thread opening on the right (a
+  click on the card itself only highlights it, `#277 thread-card-focus`); on the phone Tab and
   Shift+Tab -> at the desk, sampled at every frame for 2.5 s, longer than the 1.5 s wait before the glide
   between the columns (`#261 two-column-connectors`), with Main scrolled so the card's root is a screen
   off it: THE OWNER'S 19:08, the mouse crossing the cards with nothing pressed on its way to the dock and
@@ -41,6 +42,10 @@ and then, at each size:
   of older replies it reads in keeps the row the reader is on where it was -> the thread whose newest
   reply alone is unread opens at its foot too -> the page reloaded with its read held: the rows this
   device saved are up at once, the reader scrolls up, and the read let go leaves them where they are.
+
+and last, at the desk, sampled at every frame for 2.5 s: a card highlighted by a click, whose root is a
+screen off Main, and the mouse going on over another card to the dock leaves Main still; coming back to
+rest on the highlighted card, the card the glide follows, brings its root on screen.
 
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each stage;
 --web-root DIR to run the walk against another copy of the page.
@@ -488,6 +493,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 cards_walk(reader)
             thread_walk(reader)
             reload_walk(reader, f"http://127.0.0.1:{server.server_port}/voice")
+            if not touch:
+                highlight_walk(reader)
             reader.check(not errors, f"the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(reader.notes)
@@ -629,7 +636,9 @@ def main_walk(reader: Reader) -> None:
         reader.watch()
         page.keyboard.press(key)
         reader.held(before, f"{key}, held {GLIDE_HOLD_MS}ms")
-    card = page.locator(f"#side-cards > li[data-id='spaces/A/threads/t{SMALL_ROOTS[2]}'] .side-card")
+    # The card's own replies button is the way into its thread (`#277 thread-card-focus`): a click on the
+    # card itself only highlights it.
+    card = page.locator(f"#side-cards > li[data-id='spaces/A/threads/t{SMALL_ROOTS[2]}'] .side-card-open")
     card.click()
     reader.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length > 0",
                     "the card did not open its thread on the right")
@@ -728,6 +737,61 @@ def glide_walk(reader: Reader) -> None:
     reader.quiet(300)
 
 
+def highlight_walk(reader: Reader) -> None:
+    """At the desk, last: a card highlighted by a click (`#277 thread-card-focus`) is what the glide follows,
+    and still only while the mouse rests on it. The mouse going on over another card to the dock leaves Main
+    still, and coming back to rest on the highlighted card brings its root on screen. Last, because the
+    clicks leave the focus on a card and Main glided, which the walks before it do not expect."""
+    page = reader.page
+    reader.wait_for("() => !document.getElementById('side-list').hidden"
+                    " && document.querySelectorAll('#side-cards > li[data-id]').length >= 2",
+                    "the right column is not its cards")
+    size = page.viewport_size
+    assert size is not None
+    width, height = size["width"], size["height"]
+    cards = [str(card) for card in page.evaluate("() => [...document.querySelectorAll('#side-cards > li[data-id]')]"
+                                                 ".map((li) => li.getAttribute('data-id'))")]
+    lit_id, other_id = cards[-1], cards[-2]
+    side_to_foot(reader)
+    page.mouse.move(5, height - 5)
+    page.evaluate(ROOT_AWAY_JS, root_of(lit_id))
+    reader.quiet(250)
+    card = page.evaluate(CARD_AT_JS, lit_id)
+    other = page.evaluate(CARD_AT_JS, other_id)
+    reader.check(isinstance(card, dict) and float(card["shown"]) > 30, f"the card of {lit_id} is not on screen: {card}")
+    reader.check(isinstance(other, dict) and float(other["shown"]) > 30, f"the card of {other_id} is not on screen: {other}")
+    assert isinstance(card, dict) and isinstance(other, dict)
+    before = reader.first()
+    reader.watch()
+    page.mouse.move(float(card["x"]), float(card["y"]), steps=4)
+    page.mouse.down()
+    page.mouse.up()
+    highlighted = page.evaluate("() => [...document.querySelectorAll('#side-cards > li[data-highlighted]')]"
+                                ".map((li) => li.getAttribute('data-id'))")
+    reader.check(highlighted == [lit_id], f"the click highlighted {highlighted}, not {lit_id}, so this proves nothing")
+    other = page.evaluate(CARD_AT_JS, other_id)
+    assert isinstance(other, dict)
+    page.mouse.move(float(other["x"]), float(other["y"]), steps=4)
+    page.mouse.move(width - 180, height - 5, steps=4)
+    reader.held(before, "a card highlighted by a click, the mouse going on over another card to the dock")
+    reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(lit_id))), "the highlighted card's root came on screen")
+    reader.notes.append(f"a card highlighted by a click, the mouse going on over another card to the dock, "
+                        f"held {GLIDE_HOLD_MS}ms, left Main still")
+    # THE CONTROL: the mouse resting on the highlighted card glides its root on screen, so the case is one that can.
+    card = page.evaluate(CARD_AT_JS, lit_id)
+    assert isinstance(card, dict)
+    page.mouse.move(float(card["x"]), float(card["y"]), steps=4)
+    reader.quiet(GLIDE_HOLD_MS)
+    reader.check(not page.evaluate(ROW_AWAY_JS, root_of(lit_id)), "the mouse resting on the highlighted card did not "
+                 "bring its root on screen, so the step above proves nothing")
+    reader.notes.append("resting on the highlighted card brought its root on screen")
+    # Put out again, the same card pressed.
+    page.mouse.down()
+    page.mouse.up()
+    reader.check(page.evaluate("() => document.querySelectorAll('#side-cards > li[data-highlighted]').length") == 0,
+                 "pressing the highlighted card again did not put the highlight out")
+
+
 def follow_walk(reader: Reader) -> None:
     """A reader on the newest line follows a message arriving live, to the pixel."""
     page, api = reader.page, reader.api
@@ -783,7 +847,8 @@ def open_thread(reader: Reader, thread_id: str) -> tuple[str, str]:
     if page.is_visible("#side-close"):
         page.keyboard.press("Escape")
         reader.wait_for("() => document.getElementById('side-pane').hidden", "Esc did not go back to the cards")
-    page.locator(f"#side-cards > li[data-id='{thread_id}'] .side-card").click()
+    # Its replies button: a click on the card itself only highlights it (`#277 thread-card-focus`).
+    page.locator(f"#side-cards > li[data-id='{thread_id}'] .side-card-open").click()
     reader.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length > 0",
                     f"the card did not open {thread_id} on the right")
     return "side-log", "side-scroll"
