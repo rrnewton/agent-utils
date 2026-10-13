@@ -4310,7 +4310,7 @@ record ends with — reads "new conversation" with a chip beside the label:
 
 | What the call was sent | Chip | Its own sentence, inside the disclosure |
 |---|---|---|
-| a recap | "412-word recap sent" | how many words went, and how many older lines did not fit; on the start request, that the agent's own settings may ignore it |
+| a recap | "412-word recap sent" ("recap sent" when the server's replay does not say how many words, as one from before this does not) | how many words went, and how many older lines did not fit; on the start request, that the agent's own settings may ignore it |
 | nothing, though resuming is on | "no recap sent" | why: nothing said aloud to replay, not even the last line fitting the budget, the page unable to read the record, or a replacement voice session |
 | nothing, because the backend cannot take one | "recap unsupported" | the voice service has no way to take a recap, so the agent remembers nothing above |
 | resuming is off | none | none |
