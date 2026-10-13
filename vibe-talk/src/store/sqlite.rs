@@ -5710,6 +5710,48 @@ mod tests {
         said
     }
 
+    /// The first page of a walk without records, when the newest rows ARE records: the read must
+    /// leave them out itself, not hand back a page of them.
+    async fn newest_rows_are_records(store: &dyn StateStore) -> Vec<String> {
+        for row in [
+            Turn::now(Speaker::You, "ship it"),
+            sent(7, "ship it"),
+            marker(TurnDetail::NotSent {
+                why: NotSentWhy::Withdrawn,
+                serial: 8,
+            }),
+        ] {
+            store.append_turn(&id("conv"), &row).await.expect("append");
+        }
+        let first = store.transcript(1, None, false).await.expect("page");
+        let all = store.transcript(10, None, false).await.expect("page");
+        for page in [&first, &all] {
+            for entry in &page.turns {
+                assert!(!entry.turn.speaker.is_record(), "{entry:?}");
+                assert_eq!(entry.turn.detail, None);
+            }
+        }
+        assert!(
+            !first.has_more,
+            "a page of one spoken turn says more is held"
+        );
+        all.turns
+            .iter()
+            .map(|entry| entry.turn.text.clone())
+            .chain(first.turns.iter().map(|entry| entry.turn.text.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_walk_without_records_leaves_them_out_even_when_they_are_the_newest_rows() {
+        let dir = TempDir::new("sqlite-newest-records");
+        let real = store(&dir, Retention::default());
+        let fake = crate::store::fake::FakeStore::new();
+        let said = newest_rows_are_records(&real).await;
+        assert_eq!(said, ["ship it", "ship it"]);
+        assert_eq!(said, newest_rows_are_records(&fake).await);
+    }
+
     #[tokio::test]
     async fn record_rows_round_trip_stay_out_of_an_old_pages_walk_and_go_with_their_conversation() {
         let dir = TempDir::new("sqlite-record-rows");
