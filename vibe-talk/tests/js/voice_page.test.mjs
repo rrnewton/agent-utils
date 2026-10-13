@@ -1906,6 +1906,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** Set to answer every read with the whole send memory, whatever its cursor, as a retry might. */
     resendAll: false,
     /**
+     * What became of each draft the fake server remembers, `{serial, fate}`, as every long-poll answer
+     * carries it (`settled`). A commit, a withdrawal, a replacement and `page.lapseProposal` add one.
+     */
+    fates: [],
+    /**
      * What a commit answers. The default behaves like the server's gate: the handle must be the
      * pending one and the restated channel, text and reply target must match it, and a commit
      * spends the proposal whatever the answer.
@@ -1915,7 +1920,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (!pending || pending.handle !== body.handle) {
         return json(404, { error: "proposal_unknown", detail: "no such proposal" });
       }
-      page.settleProposal();
+      page.settleProposal("committed");
       if (body.channel_id !== pending.channel_id || body.text !== pending.text ||
           body.reply_to !== pending.reply_to) {
         return json(409, { error: "proposal_mismatch", detail: "restated binding differs" });
@@ -1937,7 +1942,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         if (!page.proposal || page.proposal.handle !== body.handle) {
           return json(404, { error: "proposal_unknown", detail: "no such proposal" });
         }
-        page.settleProposal();
+        page.settleProposal("cancelled");
         return json(204, null);
       }
       const url = new URL(path, "http://fixture.test");
@@ -1954,6 +1959,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           ? undefined
           : page.sendMemory.filter((send) => page.resendAll || send.detail.send_seq > Number(after)),
         sends_through: page.sendsThrough,
+        settled: page.fates.length ? page.fates.map((one) => ({ ...one })) : undefined,
         now_ms: page.serverNowMs === null ? page.clock() : page.serverNowMs,
       });
       const current = page.proposal ? String(page.proposal.serial) : null;
@@ -3459,7 +3465,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           // Appended when the request is ANSWERED, not when it is issued — the server assigns
           // `seq` on arrival, so the order that ends up stored is the order things landed in.
           const held = page.storedTurns.get(id) || [];
-          held.push({ speaker: body.speaker, text: body.text, at_ms: 1_700_000_000_000 });
+          // `#270 voice-transcript-markers`. A marker, and a spoken yes's `answer`, are kept as the
+          // server keeps them: in the row's detail, given back to a read that asks for records.
+          const detail = body.speaker === "marker" && body.marker
+            ? { ...body.marker }
+            : typeof body.answer === "number" ? { kind: "answer", serial: body.answer } : undefined;
+          held.push({ speaker: body.speaker, text: body.text, at_ms: 1_700_000_000_000, ...(detail ? { detail } : {}) });
           page.storedTurns.set(id, held);
           return json(200, { id, turn: held[held.length - 1] });
         }
@@ -3528,10 +3539,20 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   page.publishSend = (pending, how = "direct", overrides = {}) => page.fileSend(pending, how, overrides);
   /** Hold `proposal` for confirmation, superseding any other, and wake every parked watch. */
   page.propose = (proposal) => {
+    // A newer draft replaces the one held, as the server's gate records it. `#270`.
+    if (page.proposal && proposal && page.proposal.handle !== proposal.handle) {
+      page.fates.push({ serial: page.proposal.serial, fate: "superseded" });
+    }
     page.proposal = proposal;
     for (const wake of page.proposalWaiters.splice(0)) wake();
   };
-  page.settleProposal = () => page.propose(null);
+  /** Take the held draft off the server, saying what became of it when `fate` is given. */
+  page.settleProposal = (fate) => {
+    if (fate && page.proposal) page.fates.push({ serial: page.proposal.serial, fate });
+    page.propose(null);
+  };
+  /** The held draft outlived its time on the server. */
+  page.lapseProposal = () => page.settleProposal("expired");
   page.enableDeviceSpeech = (voices = [{ name: "Device English", lang: "en-US", localService: true, default: true }]) => {
     const listeners = new Map();
     const engine = {
@@ -4461,6 +4482,11 @@ const TUNING_BANDS = {
     "under five fails a slow start that would have worked; past fifteen the reader has given up " +
     "on a call that says Connecting and pressed something else"],
   // `#270 voice-transcript-markers`.
+  // `#269 approval-card-inline`.
+  POST_FATE_RECHECK_MS: [500, 5000,
+    "how long after a card kept through a dropped call lapses the page asks the server what became of " +
+    "it. Under half a second, the server may not have counted it lapsed yet and the draft leaves no " +
+    "'Not sent' line; past five, the line arrives long after the card went, below whatever came since"],
   SEND_MEMORY_RECHECK_MS: [1000, 10000,
     "how long after a commit whose answer was lost the page asks the send memory what it posted. " +
     "Under a second, a send still on its way to the chat service is not there yet and the card it " +
@@ -6998,6 +7024,18 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
         page.commitProposal = async () => { throw new TypeError("Failed to fetch"); };
         hostedHears(socket, "yes");
         await settleSpokenYes(page);
+        return page;
+      },
+    ],
+    // `#270 voice-transcript-markers`: a draft that was not sent leaves a line, live and restored.
+    // Every wording it can show is held to the band by its own test, from its table.
+    [
+      "Not sent",
+      async () => {
+        const page = newPage();
+        await proposedDuringACall(page);
+        await page.el("post-confirm-cancel").click();
+        await page.settle();
         return page;
       },
     ],
@@ -34418,9 +34456,15 @@ test("`#269 approval-card-inline`: a spoken yes settling says so on the card, wi
 });
 
 test("`#269 approval-card-inline`: the card going with the focus in it never puts the focus in the message box on a touch screen", async () => {
+  // A withdrawal the server refused leaves no line in the transcript to take the focus: the list
+  // takes it on a touch screen, and the box on a mouse or keys.
   for (const [kind, expected] of [["touch", "scroll-area"], ["mouse", "compose-text"]]) {
     const page = newPage();
     await proposedDuringACall(page);
+    const serving = page.postProposals;
+    page.postProposals = async (path, options) => path === "/api/v1/post-proposals/cancel"
+      ? json(409, { error: "proposal_used", detail: "already settled" })
+      : serving(path, options);
     const cancel = page.el("post-confirm-cancel");
     await page.documentEvent("pointerdown", { target: cancel, pointerType: kind });
     cancel.focus();
@@ -34432,6 +34476,21 @@ test("`#269 approval-card-inline`: the card going with the focus in it never put
       page.el(expected),
       `after a ${kind} tap the focus went to ${page.document.activeElement && page.document.activeElement.id}`
     );
+  }
+  // `#270 voice-transcript-markers`. One the server took leaves the draft's "Not sent" line where
+  // the card was, and the focus goes to it on either: never into the box on a touch screen.
+  for (const kind of ["touch", "mouse"]) {
+    const page = newPage();
+    await proposedDuringACall(page);
+    const cancel = page.el("post-confirm-cancel");
+    await page.documentEvent("pointerdown", { target: cancel, pointerType: kind });
+    cancel.focus();
+    await cancel.click();
+    await page.settle();
+    const line = notSentLines(page)[0];
+    assert.ok(line, `${kind}: Don't send left no line`);
+    assert.equal(page.document.activeElement, line,
+      `after a ${kind} tap the focus went to ${page.document.activeElement && page.document.activeElement.id}`);
   }
 });
 
@@ -34888,9 +34947,9 @@ test("`#270 voice-transcript-markers`: a restored record asks for records and dr
   assert.match(said, /replying to Alex: “is it green”/);
   assert.match(said, /Part 1 of 2 went; the rest \(40 characters\) was not sent\./);
   assert.ok(!said.includes("11"), "the reply's id reached the screen");
-  // The marker is not a turn: nothing is drawn for it, and the boundary says which call it ends.
-  assert.ok(!page.el("transcript").children.some((li) => wordsOf(li).includes("lapsed")));
-  const boundary = page.el("transcript").children.find((li) => li.className === "seam");
+  // The boundary says which call it ends. (The lapsed draft's marker is its "Not sent" line, which
+  // `#270`'s draft-fate tests pin.)
+  const boundary = page.el("transcript").children.find((li) => li.className === "seam" && !li.getAttribute("data-not-sent"));
   assert.equal(boundary.getAttribute("data-ends"), "conv_earlier");
 });
 
@@ -34912,6 +34971,269 @@ test("`#270 voice-transcript-markers`: Open in channel takes the owner to the me
   assert.equal(page.tab(), "discord", "Open in channel did not open the channel");
   const row = page.el("discord-log").children.find((li) => String(li.getAttribute("data-ids") || "").includes(id));
   assert.ok(row && row.getAttribute("data-landed") === "true", "the message was not brought into view");
+});
+
+// --- `#269 approval-card-inline` and `#270 voice-transcript-markers`: what becomes of a draft ---------
+
+/** The "Not sent" lines in the transcript, in order. */
+const notSentLines = (page) => page.el("transcript").children.filter((li) => li.getAttribute("data-not-sent"));
+
+/** Every marker the page kept, as `{id, marker}`, across conversations. */
+const keptMarkers = (page) => [...page.storedTurns].flatMap(([id, held]) =>
+  held.filter((turn) => turn.speaker === "marker").map((turn) => ({ id, marker: turn.detail })));
+
+/** Each row's shape, with a "Not sent" line's reason: `rowShapes`, for the draft-fate tests. */
+const fateShapes = (page) => page.el("transcript").children.map((li) => li.getAttribute("data-not-sent")
+  ? `NOT SENT ${li.getAttribute("data-not-sent")}`
+  : (li.hasClass("sent-card") ? "CARD" : li.className) + (li.getAttribute("data-ends") ? `[ends ${li.getAttribute("data-ends")}]` : ""));
+
+/** A draft of this call's on the card, past its hold. */
+async function draftUp(page, overrides = {}) {
+  const pending = proposal({ reply_to: null, ...overrides });
+  page.propose(pending);
+  await watchTurns(page);
+  page.expireTimers(2000);
+  return pending;
+}
+
+test("`#270 voice-transcript-markers`: Don't send leaves a kept 'Not sent' line once the server withdrew the draft, and none when it did not", async () => {
+  const page = newPage();
+  await recordingCall(page, "conv_withdrawn");
+  const pending = await draftUp(page);
+  await page.el("post-confirm-cancel").click();
+  await watchTurns(page);
+  const lines = notSentLines(page);
+  assert.equal(lines.length, 1, fateShapes(page).join(" | "));
+  assert.equal(seamLabel(lines[0]), "Not sent");
+  assert.match(seamDetail(lines[0]), /^You tapped Don't send, so the draft was withdrawn and nothing was posted\./);
+  assert.equal(page.el("transcript").children.at(-1), lines[0], "the line is not where the card was");
+  assert.deepEqual(keptMarkers(page), [{ id: "conv_withdrawn", marker: { kind: "not_sent", why: "withdrawn", serial: pending.serial } }]);
+
+  // Answered `proposal_used`: settled some other way before the tap arrived. What that was is the
+  // send memory's or the proposal's fate's to say, not this tap's.
+  const used = newPage();
+  await recordingCall(used, "conv_used");
+  await draftUp(used);
+  const serving = used.postProposals;
+  used.postProposals = async (path, options) => path === "/api/v1/post-proposals/cancel"
+    ? json(409, { error: "proposal_used", detail: "already settled" })
+    : serving(path, options);
+  await used.el("post-confirm-cancel").click();
+  await watchTurns(used);
+  assert.equal(used.el("post-confirm").hidden, true);
+  assert.deepEqual(notSentLines(used), [], "a withdrawal the server refused said the draft was withdrawn");
+  assert.deepEqual(keptMarkers(used), []);
+});
+
+test("`#270 voice-transcript-markers`: a draft the watch takes down says it lapsed only when the server says it expired", async () => {
+  for (const [what, fate] of [["lapsed", "expired"], ["replaced", "superseded"], ["committed elsewhere", "committed"], ["withdrawn elsewhere", "cancelled"]]) {
+    const page = newPage();
+    await recordingCall(page, "conv_fates");
+    const pending = await draftUp(page);
+    if (fate === "superseded") page.propose(proposal({ serial: 8, handle: "nEwEr-0123456789abcde", reply_to: null, text: "newer" }));
+    else page.settleProposal(fate);
+    await watchTurns(page);
+    const lines = notSentLines(page);
+    if (fate !== "expired") {
+      assert.deepEqual(lines, [], `${what}: ${fateShapes(page).join(" | ")}`);
+      assert.deepEqual(keptMarkers(page), [], what);
+      continue;
+    }
+    assert.equal(page.el("post-confirm").hidden, true);
+    assert.equal(lines.length, 1, fateShapes(page).join(" | "));
+    assert.match(seamDetail(lines[0]), /^The draft lapsed before anyone sent it, so nothing was posted\./);
+    assert.equal(page.el("status").textContent, "The draft to lead team lapsed; nothing was posted.");
+    assert.deepEqual(keptMarkers(page), [{ id: "conv_fates", marker: { kind: "not_sent", why: "lapsed", serial: pending.serial } }]);
+  }
+});
+
+test("`#269 approval-card-inline`: Hang up with a draft waiting retires it with a kept 'Not sent' line inside the call, but not while its send is on its way", async () => {
+  const page = newPage();
+  await recordingCall(page, "conv_hung");
+  const pending = await draftUp(page);
+  await page.el("hang-up").click();
+  await watchTurns(page);
+  assert.equal(page.el("post-confirm").hidden, true, "a Send button outlived the call it was hung up on");
+  assert.deepEqual(fateShapes(page).slice(-2), ["NOT SENT ended", "seam[ends conv_hung]"]);
+  const live = seamDetail(notSentLines(page)[0]);
+  assert.match(live, /^You hung up with a draft still waiting, so nothing was posted\./);
+  assert.deepEqual(keptMarkers(page), [{ id: "conv_hung", marker: { kind: "not_sent", why: "ended", serial: pending.serial } }]);
+
+  // A reload draws the same line, in the same words, in the same place.
+  const reloaded = newPage();
+  reloaded.transcriptRecordsSupported = true;
+  reloaded.storedTurns.set("conv_hung", page.storedTurns.get("conv_hung").map((turn) => ({ ...turn })));
+  await signIn(reloaded);
+  await reloaded.settle();
+  assert.ok(reloaded.transcriptCalls.some((read) => read.includes("records=1")));
+  assert.deepEqual(fateShapes(reloaded).slice(-2), ["NOT SENT ended", "seam[ends conv_hung]"]);
+  assert.equal(seamDetail(notSentLines(reloaded)[0]), live);
+  assert.equal(seamLabel(notSentLines(reloaded)[0]), "Not sent");
+
+  // A send on its way when he hung up is settled by its answer: the card it froze into, inside the
+  // call, and no line saying it was not sent.
+  const busy = newPage();
+  await recordingCall(busy, "conv_busy");
+  await draftUp(busy);
+  const answering = busy.commitProposal;
+  let release = null;
+  busy.commitProposal = async (body) => {
+    const answer = await answering(body);
+    await new Promise((resolve) => { release = resolve; });
+    return answer;
+  };
+  const tapped = busy.el("post-confirm-send").click();
+  await watchTurns(busy);
+  assert.ok(release, "the commit never reached the fixture");
+  await busy.el("hang-up").click();
+  await watchTurns(busy);
+  assert.deepEqual(notSentLines(busy), [], "a draft whose send was on its way was marked not sent");
+  release();
+  await tapped;
+  await watchTurns(busy, 6);
+  assert.deepEqual(fateShapes(busy).slice(-2), ["CARD", "seam[ends conv_busy]"]);
+  assert.deepEqual(keptMarkers(busy), []);
+  assert.equal(busy.el("post-confirm").hidden, true);
+});
+
+test("`#269 approval-card-inline`: a call that drops keeps its card, tap only, and Send still posts it, filed in the call that dropped", async () => {
+  for (const [how, drop] of [
+    ["closed by the service", (socket) => socket.close()],
+    ["lost", (socket) => { socket.readyState = 3; socket.onclose({ code: 1006, reason: "" }); }],
+  ]) {
+    const page = newPage();
+    const socket = await recordingCall(page, "conv_dropped");
+    const pending = await draftUp(page);
+    drop(socket);
+    await watchTurns(page);
+    assert.equal(page.el("post-confirm").hidden, false, `${how}: the drop took the draft away`);
+    assert.match(page.el("post-confirm-expiry").textContent, /^Call dropped · Send still posts · 120 s$/, how);
+    assert.equal(page.el("post-confirm-send").disabled, false, `${how}: the kept card cannot be sent`);
+    assert.deepEqual(notSentLines(page), [], `${how}: a kept draft was marked not sent`);
+    assert.equal(fateShapes(page).at(-1), "seam[ends conv_dropped]", how);
+    // The countdown keeps going, still saying the call dropped.
+    page.setClock(page.clock() + 1000);
+    page.expireTimers(1000);
+    assert.match(page.el("post-confirm-expiry").textContent, /^Call dropped · Send still posts · /, how);
+
+    await page.el("post-confirm-send").click();
+    await watchTurns(page, 6);
+    assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "ui"]], how);
+    assert.equal(page.el("post-confirm").hidden, true, how);
+    assert.deepEqual(fateShapes(page).slice(-2), ["CARD", "seam[ends conv_dropped]"], how);
+    assert.deepEqual(page.claims.map((claim) => claim.id), ["conv_dropped"], how);
+  }
+
+  // THE CONTROL: the card taken down at every end of a call, as it was before. The drop then loses
+  // the draft.
+  const control = newPage(new Map(), brokenScript(
+    "  if (postWatch.controller) postWatch.controller.abort();\n  postWatch.controller = null;\n",
+    "  if (postWatch.controller) postWatch.controller.abort();\n  postWatch.controller = null;\n  showPostProposal(null);\n"
+  ));
+  const socket = await recordingCall(control, "conv_dropped");
+  await draftUp(control);
+  socket.close();
+  await watchTurns(control);
+  assert.equal(control.el("post-confirm").hidden, true, "the control kept the card: this test cannot see the defect");
+});
+
+test("`#269 approval-card-inline`: a card kept through a drop goes at its lapse, and says it lapsed only on the server's word", async () => {
+  for (const expired of [true, false]) {
+    const page = newPage();
+    const socket = await recordingCall(page, "conv_kept");
+    const pending = await draftUp(page, { expires_in_ms: 3000 });
+    socket.close();
+    await watchTurns(page);
+    assert.equal(page.el("post-confirm").hidden, false);
+    if (expired) page.lapseProposal();
+    page.setClock(page.clock() + 3000);
+    page.expireTimers(1000);
+    await page.settle();
+    assert.equal(page.el("post-confirm").hidden, true, `expired ${expired}: a lapsed card stayed up with no call to take it down`);
+    assert.deepEqual(notSentLines(page), [], "the lapse was drawn before the server was asked");
+    const reads = proposalWatches(page).length;
+    page.expireTimers(1000);
+    await watchTurns(page);
+    assert.equal(proposalWatches(page).length, reads + 1, "the server was not asked what became of the draft");
+    if (!expired) {
+      assert.deepEqual(notSentLines(page), [], "a draft the server did not say expired was drawn as lapsed");
+      continue;
+    }
+    assert.deepEqual(fateShapes(page).slice(-2), ["NOT SENT lapsed", "seam[ends conv_kept]"]);
+    assert.deepEqual(keptMarkers(page), [{ id: "conv_kept", marker: { kind: "not_sent", why: "lapsed", serial: pending.serial } }]);
+  }
+});
+
+test("`#269 approval-card-inline`: a card kept through a drop and sent in the next call is filed in the call it was drafted in", async () => {
+  const page = newPage();
+  const socket = await recordingCall(page, "conv_one");
+  const pending = await draftUp(page);
+  socket.close();
+  await watchTurns(page);
+  await page.el("talk").click();
+  const next = page.sockets.at(-1);
+  next.onopen();
+  next.onmessage({ data: JSON.stringify({
+    type: "conversation_initiation_metadata",
+    conversation_initiation_metadata_event: { conversation_id: "conv_two", agent_output_audio_format: "pcm_16000" },
+  }) });
+  await watchTurns(page);
+  assert.equal(page.el("post-confirm").hidden, false, "the next call did not show the draft the drop kept");
+  assert.equal(page.el("post-confirm-text").textContent, pending.text);
+  assert.match(page.el("post-confirm-expiry").textContent, /^Waiting for you/, "a call that is up still says the last one dropped");
+  await page.el("post-confirm-send").click();
+  await watchTurns(page, 6);
+  assert.deepEqual(fateShapes(page).slice(-2), ["CARD", "seam[ends conv_one]"]);
+  assert.deepEqual(page.claims.map((claim) => claim.id), ["conv_one"]);
+});
+
+test("`#270 voice-transcript-markers`: a spoken no that withdrew the draft is its kept 'Not sent' line, after the no", async () => {
+  const page = newPage();
+  const socket = await recordingCall(page, "conv_no");
+  hostedHears(socket, "tell lead team I'm on it, rebasing now");
+  const pending = spokenDraft();
+  page.propose(pending);
+  await page.settle();
+  hostedSays(socket, `To lead team: ${pending.text}. Send it?`);
+  hostedHears(socket, "No.");
+  await watchTurns(page);
+  assert.deepEqual(page.proposalCancels, [{ handle: pending.handle }]);
+  const lines = notSentLines(page);
+  assert.equal(lines.length, 1, fateShapes(page).join(" | "));
+  assert.equal(lines[0].getAttribute("data-not-sent"), "declined");
+  assert.match(seamDetail(lines[0]), /^You said no to the read-back, so the draft was withdrawn and nothing was posted\./);
+  const rows = page.el("transcript").children;
+  assert.equal(rows.at(-1), lines[0]);
+  assert.match(wordsOf(rows.at(-2)), /No\./, "the line is not right after the no it answers");
+  // Kept after the no, in the order the screen shows them.
+  assert.deepEqual(page.storedTurns.get("conv_no").slice(-2).map((turn) => turn.speaker === "marker" ? turn.detail : turn.text),
+    ["No.", { kind: "not_sent", why: "declined", serial: pending.serial }]);
+
+  // A no whose withdrawal never reached the server withdrew nothing, and draws no line.
+  const lost = newPage();
+  const lostSocket = await recordingCall(lost, "conv_lost_no");
+  hostedHears(lostSocket, "tell lead team I'm on it, rebasing now");
+  lost.propose(spokenDraft());
+  await lost.settle();
+  hostedSays(lostSocket, `To lead team: ${spokenDraft().text}. Send it?`);
+  const serving = lost.postProposals;
+  lost.postProposals = async (path, options) => {
+    if (path === "/api/v1/post-proposals/cancel") throw new TypeError("Failed to fetch");
+    return serving(path, options);
+  };
+  hostedHears(lostSocket, "No.");
+  await watchTurns(lost);
+  assert.deepEqual(notSentLines(lost), [], "a no the server never heard was drawn as a withdrawal");
+  assert.deepEqual(keptMarkers(lost), []);
+});
+
+test("`#270 voice-transcript-markers`: every sentence a 'Not sent' line can show is inside the seam band", () => {
+  const table = sourceStringTable("NOT_SENT_SEAMS");
+  assert.deepEqual(Object.keys(table).sort(), ["ended", "lapsed", "withdrawn"]);
+  for (const [why, text] of Object.entries(table)) {
+    const spent = words(text);
+    assert.ok(spent >= SEAM_DETAIL_MIN_WORDS && spent <= SEAM_DETAIL_MAX_WORDS, `${why}: ${spent} words: "${text}"`);
+  }
 });
 
 test("a read-scope call never asks about proposals", async () => {
