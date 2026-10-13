@@ -53,7 +53,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel, SourceClaim};
+use crate::chat::{
+    ChatClient, ChatError, ChatIdentity, PostLimit, RecentRead, RegisteredChannel, SourceClaim,
+};
 use crate::model::{ChannelId, Message, MessageId};
 
 /// Equal steps each power of two is divided into.
@@ -861,6 +863,15 @@ impl Rows for crate::timeline_forward::GenericDelta {
     }
 }
 
+impl Rows for RecentRead {
+    fn rows(&self) -> usize {
+        self.messages.len()
+    }
+    fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+}
+
 impl Rows for crate::directory::DirectoryPage {
     fn rows(&self) -> usize {
         self.entries.len()
@@ -1109,6 +1120,19 @@ impl ChatClient for ProfiledClient {
         .await
     }
 
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<RecentRead, ChatError> {
+        self.timed(
+            "fetch_recent_dated",
+            Direction::Read,
+            self.inner.fetch_recent_dated(channel, limit),
+        )
+        .await
+    }
+
     async fn post_message(
         &self,
         channel: &ChannelId,
@@ -1158,6 +1182,14 @@ impl ChatClient for ProfiledClient {
                 .post_in_thread_keyed(channel, thread_id, content, reply_to, key),
         )
         .await
+    }
+
+    fn post_limit(&self, channel: &ChannelId) -> PostLimit {
+        self.inner.post_limit(channel)
+    }
+
+    fn continuation_thread(&self, channel: &ChannelId, first: &Message) -> Option<String> {
+        self.inner.continuation_thread(channel, first)
     }
 
     async fn mark_read_upstream(

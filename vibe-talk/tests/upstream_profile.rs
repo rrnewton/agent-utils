@@ -21,7 +21,8 @@ use serde_json::Value;
 use slack_fake::{profiled, ts, Fake, FakeState, METHODS, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
-    ChatClient, ChatError, ChatIdentity, RegisteredChannel, SourceClaim, UpstreamClearOutcome,
+    ChatClient, ChatError, ChatIdentity, PostLimit, RecentRead, RegisteredChannel, SourceClaim,
+    UpstreamClearOutcome,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -405,6 +406,18 @@ impl ChatClient for Recorder {
         self.note("fetch_recent");
         Ok(vec![self.message.clone()])
     }
+    async fn fetch_recent_dated(
+        &self,
+        _channel: &ChannelId,
+        _limit: u16,
+    ) -> Result<RecentRead, ChatError> {
+        self.note("fetch_recent_dated");
+        Ok(RecentRead {
+            messages: vec![self.message.clone()],
+            as_of: Some("2026-10-12T09:00:00Z".to_owned()),
+            exhausted: false,
+        })
+    }
     async fn post_message(
         &self,
         _channel: &ChannelId,
@@ -438,6 +451,14 @@ impl ChatClient for Recorder {
     ) -> Result<Message, ChatError> {
         self.note("post_in_thread_keyed");
         Ok(self.message.clone())
+    }
+    fn post_limit(&self, _channel: &ChannelId) -> PostLimit {
+        self.note("post_limit");
+        PostLimit::bytes(4321)
+    }
+    fn continuation_thread(&self, _channel: &ChannelId, _first: &Message) -> Option<String> {
+        self.note("continuation_thread");
+        Some("t-continued".to_owned())
     }
     async fn mark_read_upstream(
         &self,
@@ -565,6 +586,13 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("probe_channel");
     client.fetch_recent(&channel, 5).await.expect("recent");
     ran("fetch_recent");
+    let dated = client
+        .fetch_recent_dated(&channel, 5)
+        .await
+        .expect("dated recent");
+    assert_eq!(dated.as_of.as_deref(), Some("2026-10-12T09:00:00Z"));
+    assert_eq!(dated.messages.len(), 1);
+    ran("fetch_recent_dated");
     client
         .post_message(&channel, "hi", None)
         .await
@@ -582,6 +610,15 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         .await
         .expect("keyed thread post");
     ran("post_in_thread_keyed");
+    assert_eq!(client.post_limit(&channel), PostLimit::bytes(4321));
+    ran("post_limit");
+    assert_eq!(
+        client
+            .continuation_thread(&channel, &recorder.message)
+            .as_deref(),
+        Some("t-continued")
+    );
+    ran("continuation_thread");
     client
         .mark_read_upstream(&channel, &id)
         .await
@@ -626,15 +663,16 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
             .and_then(|row| row.rows)
     };
     assert_eq!(rows("fetch_recent"), Some(1));
+    assert_eq!(rows("fetch_recent_dated"), Some(1));
     assert_eq!(
         rows("discover_channels"),
         Some(0),
         "an empty directory page"
     );
-    // Six reads each return the one message; posts return ours and are not counted.
+    // Seven reads each return the one message; posts return ours and are not counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 6, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 6 * bytes);
+    assert_eq!(rec.content_bytes.messages, 7, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 7 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),
@@ -823,8 +861,10 @@ async fn slack_web_api_calls_are_counted_as_the_far_end_counts_them() {
             .map_or(0, |row| row.count)
     };
     let before = state.providers.profile().report();
+    // The page's read of a channel's newest messages asks for them dated, whether or not the
+    // provider dates them.
     assert!(
-        count(&before, false, "fetch_recent", Outcome::Ok) >= 1,
+        count(&before, false, "fetch_recent_dated", Outcome::Ok) >= 1,
         "{before:#?}"
     );
 

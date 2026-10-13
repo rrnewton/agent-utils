@@ -1339,10 +1339,13 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
 ```
 
 * **Operations** are the provider-neutral reads and posts the rest of the server asks for
-  (`fetch_timeline`, `fetch_recent`, `post_message`, …). They are timed around each provider's own
-  client, so the live poller and this report's own token check count as well as the page and the
-  voice agent. Questions a provider answers from memory, such as whether it supports threads, are
-  not counted. `rows` is what the operations returned, in total.
+  (`fetch_timeline`, `fetch_recent`, `post_message`, …). The page, the digest and the voice
+  catch-up read a channel's newest messages as `fetch_recent_dated`, the same read with the
+  provider's `as_of` (see "A bridge's recent read through Flat"); a few smaller reads, such as the
+  live poll's first, still count as `fetch_recent`. Operations are timed around each provider's
+  own client, so the live poller and this report's own token check count as well as the page and
+  the voice agent. Questions a provider answers from memory, such as whether it supports threads,
+  are not counted. `rows` is what the operations returned, in total.
 * **Shim calls** are the HTTP requests the Slack client sends, by Web API method. One operation can
   be several: a flat read is about eleven, and each author lookup is one more. A request answered
   with a 429 and then sent again counts twice, as the far end's own log counts it (a compatible
