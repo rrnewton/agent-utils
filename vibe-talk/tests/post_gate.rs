@@ -1169,6 +1169,42 @@ async fn a_claim_files_the_servers_own_copy_of_the_send_once() {
 }
 
 #[tokio::test]
+async fn a_claim_the_store_refuses_leaves_the_send_free_for_the_next_claim() {
+    // The send memory marks a send claimed before the row is written. When the store then fails,
+    // the claim must be undone: otherwise every later claim of that send is told it is already in
+    // a transcript, and it is in none.
+    let (state, discord, store) = vibe_talk::testing::state_with_store();
+    let harness = Harness {
+        router: router(state),
+        discord,
+    };
+    let proposal = propose(&harness, "on my way").await;
+    let (status, committed) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let send_seq = committed["send_seq"].clone();
+    store.fail_next("the disk is full");
+    let (status, body) = record(
+        &harness,
+        "conv_full",
+        json!({ "speaker": "sent", "send": send_seq }),
+    )
+    .await;
+    assert!(status.is_server_error(), "{status}: {body}");
+    let (status, body) = record(
+        &harness,
+        "conv_full",
+        json!({ "speaker": "sent", "send": send_seq }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the failed claim kept the send: {body}"
+    );
+    assert_eq!(body["turn"]["text"], "on my way");
+}
+
+#[tokio::test]
 async fn markers_and_answers_are_recorded_only_in_the_shapes_this_server_knows() {
     let harness = store_harness();
     let cases = [
@@ -1216,6 +1252,10 @@ async fn markers_and_answers_are_recorded_only_in_the_shapes_this_server_knows()
             json!({ "speaker": "marker", "marker": { "kind": "applause" } }),
             "an unknown kind",
         ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 1_000_001 } }),
+            "a draft's serial out of range",
+        ),
     ];
     for (body, case) in cases {
         let (status, answer) = record(&harness, "conv_m", body).await;
@@ -1242,12 +1282,13 @@ async fn markers_and_answers_are_recorded_only_in_the_shapes_this_server_knows()
         json!({ "speaker": "you", "text": "yes please", "answer": 7 }),
         json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "sent", "words": 412, "lines": 9, "dropped": 0, "transport": "client_data" }, "previous_end": "closed" } }),
         json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "withdrawn", "serial": 8 } }),
+        json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 1_000_000 } }),
     ] {
         let (status, answer) = record(&harness, "conv_m", body.clone()).await;
         assert_eq!(status, StatusCode::OK, "{body}: {answer}");
     }
     let with = stored(&harness, "conv_m", true).await;
-    assert_eq!(with.len(), 5);
+    assert_eq!(with.len(), 6);
     assert_eq!(with[0]["detail"]["recap"]["why"], "unsupported");
     assert_eq!(with[2]["detail"], json!({ "kind": "answer", "serial": 7 }));
     assert_eq!(with[3]["detail"]["previous_end"], "closed");
