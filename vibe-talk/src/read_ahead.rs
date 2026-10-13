@@ -229,6 +229,19 @@ impl Drop for WindowFetching<'_> {
     }
 }
 
+/// One send to a channel, counted as this server's post when it is dropped ([`ReadAhead::posting`]).
+#[must_use = "the post is counted when this is dropped, so hold it across the send"]
+pub struct Posting<'a> {
+    read_ahead: &'a ReadAhead,
+    channel: &'a ChannelId,
+}
+
+impl Drop for Posting<'_> {
+    fn drop(&mut self) {
+        self.read_ahead.posted(self.channel);
+    }
+}
+
 /// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, one read per
 /// identical timeline request, a bound on thread lookups, and the provider warm-up. See the module
 /// documentation.
@@ -463,14 +476,33 @@ impl ReadAhead {
 
     /// Note that this server has just sent a post to `channel`, whether or not it landed (a failure
     /// may have delivered): no shared read, window or timeline, that began before now answers a
-    /// request made after it. Call it when the provider has answered the post, not before, so a
-    /// read that began while the post was on its way is still one from before it. See [`Changes`].
+    /// request made after it. Call it when the send has ended, not before, so a read that began
+    /// while the post was on its way is still one from before it. See [`Changes`].
+    ///
+    /// A sender holds [`ReadAhead::posting`] across the send rather than calling this after it:
+    /// a send can end without returning.
     pub fn posted(&self, channel: &ChannelId) {
         let mut posts = self
             .posts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *posts.entry(channel.clone()).or_default() += 1;
+    }
+
+    /// Hold this across one send to `channel`: when it is dropped the post is counted
+    /// ([`ReadAhead::posted`]), however the send ended — answered, failed, or dropped with the
+    /// request while the provider had it. `#278 timeline-single-flight`.
+    ///
+    /// The last is why it is a guard. A request is dropped while its post is out when the page gives
+    /// up on it, the reader signs out, the client goes away or an MCP request is cancelled; the
+    /// provider may have delivered the post all the same, and the page then says to check the
+    /// history. Counted only once the provider answered, such a post was never counted, and the
+    /// read that checks joined, or took from the timeline memory, a read from before it.
+    pub fn posting<'a>(&'a self, channel: &'a ChannelId) -> Posting<'a> {
+        Posting {
+            read_ahead: self,
+            channel,
+        }
     }
 
     /// What `channel` has been through, for a read whose mark is `mark`: take the mark first, then
@@ -1061,6 +1093,33 @@ mod tests {
             Changes::default(),
             "a post changed another channel"
         );
+    }
+
+    #[test]
+    fn a_send_is_counted_when_it_ends_even_when_it_is_dropped_mid_way() {
+        // Review of #278: a post was counted only once the provider answered it, so a send dropped
+        // with its request while the provider had it — which may have delivered it — never was.
+        let read_ahead = ReadAhead::new();
+        let recent = crate::recent::RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let posts = || read_ahead.changes(&channel, recent.mark(&channel)).posts;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        // A send whose answer never comes, dropped while it waits.
+        let mut out = Box::pin(async {
+            let _posting = read_ahead.posting(&channel);
+            std::future::pending::<()>().await;
+        });
+        assert!(std::future::Future::poll(out.as_mut(), &mut context).is_pending());
+        assert_eq!(posts(), 0, "counted while the post was still on its way");
+        drop(out);
+        assert_eq!(posts(), 1, "a send dropped mid-way was never counted");
+
+        let mut answered = Box::pin(async {
+            let _posting = read_ahead.posting(&channel);
+        });
+        assert!(std::future::Future::poll(answered.as_mut(), &mut context).is_ready());
+        assert_eq!(posts(), 2, "a send that ended was not counted");
     }
 
     #[test]

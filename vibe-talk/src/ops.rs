@@ -1826,23 +1826,27 @@ pub async fn reply_scoped(
         let parent = if index == 0 { reply_to.as_ref() } else { None };
         let key = keys.as_ref().map(|keys| keys[index].as_str());
         let into = thread_id.or(continuation.as_deref());
-        let sent = match into {
-            Some(thread) => {
-                state
-                    .chat
-                    .post_in_thread_keyed(&info.id, thread, part, parent, key)
-                    .await
-            }
-            None => {
-                state
-                    .chat
-                    .post_message_keyed(&info.id, part, parent, key)
-                    .await
+        let sent = {
+            // Counted when the send ends, however it ends: landed or not (a failure may have
+            // delivered), and dropped with this request while the provider had it. No shared read,
+            // window or timeline, that began before this post then answers a request made after it.
+            // `#278 timeline-single-flight`.
+            let _posting = state.read_ahead.posting(&info.id);
+            match into {
+                Some(thread) => {
+                    state
+                        .chat
+                        .post_in_thread_keyed(&info.id, thread, part, parent, key)
+                        .await
+                }
+                None => {
+                    state
+                        .chat
+                        .post_message_keyed(&info.id, part, parent, key)
+                        .await
+                }
             }
         };
-        // Landed or not — a failure may have delivered — no shared read, window or timeline, that
-        // began before this post answers a request made after it. `#278 timeline-single-flight`.
-        state.read_ahead.posted(&info.id);
         match sent {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));

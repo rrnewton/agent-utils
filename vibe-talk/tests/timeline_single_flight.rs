@@ -59,6 +59,9 @@ struct Threaded {
     /// this long after, as a bridge's scan does, while a post lands at once. Unset, it answers at
     /// once (`CountingChat` adds the delay).
     scan: Option<Duration>,
+    /// How long after a post lands upstream its answer comes back: the window in which the request
+    /// that sent it can be dropped although the provider has delivered it.
+    post_answer: Duration,
 }
 
 impl Threaded {
@@ -66,6 +69,7 @@ impl Threaded {
         Self {
             messages: Mutex::new(vec![message(10, "root", true), message(11, "reply", true)]),
             scan: None,
+            post_answer: Duration::ZERO,
         }
     }
 
@@ -155,9 +159,15 @@ impl ChatClient for Threaded {
         content: &str,
         _reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        let mut messages = self.messages.lock().unwrap();
-        let posted = message(20 + messages.len() as u64, content, false);
-        messages.push(posted.clone());
+        let posted = {
+            let mut messages = self.messages.lock().unwrap();
+            let posted = message(20 + messages.len() as u64, content, false);
+            messages.push(posted.clone());
+            posted
+        };
+        if !self.post_answer.is_zero() {
+            tokio::time::sleep(self.post_answer).await;
+        }
         Ok(posted)
     }
 }
@@ -753,6 +763,97 @@ fn contents(body: &Value) -> Vec<String> {
         .iter()
         .map(|m| m["content"].as_str().unwrap_or_default().to_owned())
         .collect()
+}
+
+/// A read of `path` begun at 0 ms; this server's post at 50 ms, which lands upstream at once but
+/// whose request is dropped at 100 ms, before the provider's answer comes back (the page giving up
+/// on it, a client disconnect, sign-out, a cancelled MCP request); the same read again at 150 ms,
+/// while the first is still running. What the second answered.
+async fn cancelled_post_during_a_read(h: &Harness, path: &str) -> Vec<String> {
+    let first = tokio::spawn(call(
+        h.app.clone(),
+        "GET",
+        path.to_owned(),
+        READ_TOKEN,
+        None,
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let post = tokio::spawn(call(
+        h.app.clone(),
+        "POST",
+        format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        WRITE_TOKEN,
+        Some(json!({ "text": "mine" })),
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        h.upstream
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.content == "mine"),
+        "fixture: the post had not landed upstream"
+    );
+    post.abort();
+    assert!(
+        post.await.unwrap_err().is_cancelled(),
+        "fixture: the post's request was answered before it was dropped"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, body) = get(&h.app, path, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, early) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{early}");
+    assert!(
+        !contents(&early).contains(&"mine".to_owned()),
+        "the fixture's first read saw a post made after it was asked: {early}"
+    );
+    contents(&body)
+}
+
+/// The slow scan of [`scanning_harness`], with a post whose answer comes back a second after it
+/// lands.
+fn harness_with_slow_post_answers() -> Harness {
+    let upstream = Threaded {
+        post_answer: Duration::from_secs(1),
+        ..Threaded::scanning(READ)
+    };
+    harness_over(&testing::config_toml(), Arc::new(upstream), Duration::ZERO)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timeline_read_after_a_post_whose_request_was_dropped_shows_the_post() {
+    // Review of #278: the post was counted only once the provider answered it, so a post whose
+    // request was dropped while the provider had it — delivered, and the page saying "Delivery
+    // unconfirmed, check history" — was never counted, and the read after it joined one from
+    // before it. It is counted now however the send ends.
+    let h = harness_with_slow_post_answers();
+    let answered = cancelled_post_during_a_read(&h, &timeline("view=main")).await;
+    assert!(
+        answered.contains(&"mine".to_owned()),
+        "a timeline read after a delivered post whose request was dropped did not show it: \
+         {answered:?}"
+    );
+    assert_eq!(h.chat.count("fetch_timeline"), 2, "{:?}", h.chat.calls());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_window_read_after_a_post_whose_request_was_dropped_shows_the_post() {
+    let h = harness_with_slow_post_answers();
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
+    let answered = cancelled_post_during_a_read(&h, &path).await;
+    assert!(
+        answered.contains(&"mine".to_owned()),
+        "a window read after a delivered post whose request was dropped did not show it: \
+         {answered:?}"
+    );
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        2,
+        "{:?}",
+        h.chat.calls()
+    );
 }
 
 #[tokio::test(start_paused = true)]
