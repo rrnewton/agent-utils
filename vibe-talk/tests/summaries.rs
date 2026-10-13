@@ -66,7 +66,7 @@ fn long_text(tag: &str) -> String {
 }
 
 async fn newest_id(state: &AppState) -> String {
-    ops::messages(state, READ_CHANNEL, None)
+    ops::messages(state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads")
         .messages
@@ -790,7 +790,7 @@ async fn a_thread_summary_recalls_only_from_that_thread() {
         .seed(&server.channel, "codex-eng", &content)
         .0;
     // What a thread view read in thread T, and a summary of it filed.
-    let window = ops::messages(&server.state, READ_CHANNEL, None)
+    let window = ops::messages(&server.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     let message = window
@@ -885,7 +885,7 @@ async fn a_miss_that_needs_no_context_is_generated_from_memory_without_a_fetch()
         .discord
         .seed(&server.channel, "codex-eng", &content)
         .0;
-    let message = ops::messages(&server.state, READ_CHANNEL, None)
+    let message = ops::messages(&server.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads")
         .messages

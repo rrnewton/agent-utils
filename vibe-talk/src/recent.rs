@@ -91,6 +91,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::cache::{FillGrant, ServerFill};
 use crate::chat::ChatError;
 use crate::live::{LiveKind, LiveMessage};
 use crate::model::{ChannelId, Message};
@@ -608,8 +609,13 @@ impl RecentWindows {
     /// Join the refresh running for `channel`, or claim the right to start one.
     ///
     /// The receiver turns `true` when the refresh is over, however it ended. A claim is returned
-    /// only to the caller that must run the read; every other caller is handed the same receiver.
-    fn claim(self: &Arc<Self>, channel: &ChannelId) -> (watch::Receiver<bool>, Option<Claim>) {
+    /// only to the caller that must run the read, and carries that caller's `grant`; every other
+    /// caller is handed the same receiver, and its grant is dropped.
+    fn claim(
+        self: &Arc<Self>,
+        channel: &ChannelId,
+        grant: Option<FillGrant>,
+    ) -> (watch::Receiver<bool>, Option<Claim>) {
         let mut windows = self.windows();
         let slot = windows.slots.entry(channel.clone()).or_default();
         if let Some((_, running)) = &slot.refreshing {
@@ -625,6 +631,7 @@ impl RecentWindows {
             channel: channel.clone(),
             number,
             done: Some(done),
+            _grant: grant,
         };
         (running, Some(claim))
     }
@@ -651,6 +658,10 @@ struct Claim {
     channel: ChannelId,
     number: u64,
     done: Option<watch::Sender<bool>>,
+    /// The grant of whoever claimed the read: what it reads may be written to the message cache
+    /// under this and nothing else, so a write-scope caller who joins a read claimed at read scope
+    /// adds no authority to it. Carried, not yet read: nothing fills the cache.
+    _grant: Option<FillGrant>,
 }
 
 impl Drop for Claim {
@@ -785,9 +796,18 @@ pub fn reuse_for(state: &AppState, channel: &ChannelId) -> Duration {
 ///
 /// The read is a detached task: it ends, and records what it read, whatever happens to the
 /// caller. The receiver turns `true` when it is over.
-pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Receiver<bool> {
+///
+/// `grant` is the authority of whoever asked: a caller's from [`FillGrant::for_caller`], `None`
+/// at read scope, or the server's own. Only the grant of the caller that starts the read is kept;
+/// one that joins a read already running adds nothing to it.
+pub fn refresh(
+    state: &AppState,
+    channel: &ChannelId,
+    limit: u16,
+    grant: Option<FillGrant>,
+) -> watch::Receiver<bool> {
     let windows = Arc::clone(state.live.recent());
-    let (done, claim) = windows.claim(channel);
+    let (done, claim) = windows.claim(channel, grant);
     if let Some(claim) = claim {
         tokio::spawn(read_alone(state.clone(), claim, limit));
     }
@@ -865,10 +885,14 @@ fn keep(
 /// now, is then read on its own (see "Several channels in one read" in the module
 /// documentation). Every other channel is [`refresh`]ed on its own, in the order given, exactly as
 /// before, so a provider without a read of several channels is asked what it always was.
+///
+/// `grant` is the authority of whoever asked, as for [`refresh`]: each channel this claims carries
+/// it, and a channel whose read is already running keeps the grant of the caller that started it.
 pub fn refresh_all(
     state: &AppState,
     channels: &[ChannelId],
     limit: u16,
+    grant: Option<FillGrant>,
 ) -> BTreeMap<ChannelId, watch::Receiver<bool>> {
     let windows = Arc::clone(state.live.recent());
     let mut started = BTreeMap::new();
@@ -878,10 +902,10 @@ pub fn refresh_all(
             continue;
         }
         if state.chat.read_caps(channel).many_channels != crate::chat::Support::Native {
-            started.insert(channel.clone(), refresh(state, channel, limit));
+            started.insert(channel.clone(), refresh(state, channel, limit, grant));
             continue;
         }
-        let (done, claim) = windows.claim(channel);
+        let (done, claim) = windows.claim(channel, grant);
         if let Some(claim) = claim {
             // Begun when asked for, as a refresh's read is.
             let mark = windows.mark(channel);
@@ -994,11 +1018,13 @@ pub fn head_candidates(
 /// channels natively reads them in one call). remote-ops-audit W12 and W13 `#287 bulk-reads`.
 ///
 /// The heads are given [`HEADS_DEADLINE`]; past it, or for a channel whose head failed, the
-/// channel is read. Returns the refreshes started, by channel.
+/// channel is read, under `grant` as [`refresh_all`] reads it. Returns the refreshes started, by
+/// channel.
 pub async fn keep_or_refresh(
     state: &AppState,
     candidates: &[ChannelId],
     scan: u16,
+    grant: Option<FillGrant>,
 ) -> BTreeMap<ChannelId, watch::Receiver<bool>> {
     if candidates.is_empty() {
         return BTreeMap::new();
@@ -1036,7 +1062,7 @@ pub async fn keep_or_refresh(
         .filter(|channel| !kept.contains(*channel))
         .cloned()
         .collect();
-    let started = refresh_all(state, &unkept, scan);
+    let started = refresh_all(state, &unkept, scan, grant);
     tracing::info!(
         asked = candidates.len(),
         kept = kept.len(),
@@ -1057,9 +1083,13 @@ pub async fn keep_or_refresh(
 /// [`head_candidates`]) is checked in the background instead, all of them in one head read, and
 /// read only if its head does not prove it. The channels of a provider that reads several channels
 /// natively are read in one call ([`refresh_all`], remote-ops-audit W13).
+///
+/// The reads are the server's own ([`ServerFill::VoiceWarmup`]): only a write-scope session
+/// starts them.
 pub fn warm(state: &AppState) -> usize {
     let scan = crate::ops::activity_scan(state, crate::ops::DEFAULT_ACTIVITY_LINES);
     let recent = state.live.recent();
+    let grant = Some(FillGrant::server(ServerFill::VoiceWarmup));
     let due: Vec<ChannelId> = state
         .all_channels()
         .into_iter()
@@ -1068,11 +1098,11 @@ pub fn warm(state: &AppState) -> usize {
         .collect();
     let reading = due.len();
     let (candidates, now) = head_candidates(state, due, scan);
-    drop(refresh_all(state, &now, scan));
+    drop(refresh_all(state, &now, scan, grant));
     if !candidates.is_empty() {
         let state = state.clone();
         tokio::spawn(async move {
-            drop(keep_or_refresh(&state, &candidates, scan).await);
+            drop(keep_or_refresh(&state, &candidates, scan, grant).await);
         });
     }
     reading

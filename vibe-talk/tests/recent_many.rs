@@ -246,6 +246,7 @@ async fn get(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
 async fn catch_up(state: &AppState) -> Value {
     let activity = vibe_talk::ops::activity(
         state,
+        vibe_talk::auth::Scope::Read,
         vibe_talk::ops::ActivityRequest {
             hours: None,
             per_channel_limit: None,

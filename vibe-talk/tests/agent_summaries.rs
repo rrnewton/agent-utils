@@ -80,7 +80,7 @@ fn server(
 }
 
 async fn newest_ids(state: &vibe_talk::state::AppState) -> Vec<String> {
-    ops::messages(state, READ_CHANNEL, None)
+    ops::messages(state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads")
         .messages

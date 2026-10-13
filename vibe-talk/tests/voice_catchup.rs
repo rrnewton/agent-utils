@@ -93,6 +93,7 @@ fn channel(id: &str) -> ChannelId {
 async fn catch_up(state: &AppState) -> ops::Activity {
     ops::activity(
         state,
+        Scope::Read,
         ActivityRequest {
             hours: None,
             per_channel_limit: None,
@@ -549,7 +550,8 @@ async fn a_push_that_arrives_while_a_channel_read_runs_survives_the_read_landing
     let h = fed_harness();
     let lead = channel(WRITE_CHANNEL);
     let state = h.state.clone();
-    let reading = tokio::spawn(async move { ops::messages(&state, WRITE_CHANNEL, None).await });
+    let reading =
+        tokio::spawn(async move { ops::messages(&state, Scope::Read, WRITE_CHANNEL, None).await });
     tokio::time::sleep(READ / 2).await;
     let id = h
         .fake

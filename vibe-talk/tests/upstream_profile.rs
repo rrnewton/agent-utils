@@ -1228,7 +1228,7 @@ async fn diagnostics_count_each_read_under_the_reason_it_was_made_for() {
         get(&router, &format!("{messages}?limit=5")).await.0,
         StatusCode::OK
     );
-    let mut refreshed = vibe_talk::recent::refresh(&state, &channel, 10);
+    let mut refreshed = vibe_talk::recent::refresh(&state, &channel, 10, None);
     refreshed.wait_for(|over| *over).await.expect("finished");
     let channels = state.all_channels();
     vibe_talk::probe::probe_channels(state.chat.as_ref(), &channels).await;

@@ -387,12 +387,18 @@ impl Window {
 
 /// Recent messages of one channel, oldest first. Read scope.
 ///
+/// `_caller` is the scope of whoever asked, which decides whether what this read sees may be
+/// written to the message cache: never at read scope ([`crate::cache::grant`]). Every operation
+/// here that reads takes one and passes it on. Nothing fills the cache yet, so the reads it
+/// reaches do not use it.
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`] for a channel outside the allowlist; [`OpError::Chat`] when the
 /// fetch fails.
 pub async fn messages(
     state: &AppState,
+    _caller: crate::auth::Scope,
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
@@ -470,6 +476,7 @@ pub fn window_limit(state: &AppState, limit: Option<u16>) -> u16 {
 /// or [`OpError::Chat`].
 pub async fn message_by_id(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     message_id: &str,
     limit: Option<u16>,
@@ -480,14 +487,21 @@ pub async fn message_by_id(
     let channel =
         if configured(state, channel_id).is_ok_and(|channel| looks_up_by_ids(state, &channel.id)) {
             let channel = allowed(state, channel_id).await?;
-            let looked =
-                lookup_messages(state, &channel, None, &[message_id.to_owned()], limit).await?;
+            let looked = lookup_messages(
+                state,
+                caller,
+                &channel,
+                None,
+                &[message_id.to_owned()],
+                limit,
+            )
+            .await?;
             if let Some(message) = looked.messages.into_iter().next().flatten() {
                 return Ok((channel, message));
             }
             channel
         } else {
-            let window = messages(state, channel_id, limit).await?;
+            let window = messages(state, caller, channel_id, limit).await?;
             let wanted = MessageId(message_id.to_owned());
             if let Some(message) = window.messages.into_iter().find(|m| m.id == wanted) {
                 return Ok((window.channel, message));
@@ -500,7 +514,7 @@ pub async fn message_by_id(
     };
     // A thread this server was told of rather than one the caller chose: a read of it that finds
     // nothing there, or refuses the id for it, is the same answer the channel gave.
-    match message_in_thread(state, channel, message_id, limit, &thread).await {
+    match message_in_thread(state, caller, channel, message_id, limit, &thread).await {
         Err(OpError::Chat(error))
             if matches!(
                 error.cause(),
@@ -565,21 +579,23 @@ async fn known_thread(state: &AppState, channel: &ChannelId, id: &MessageId) -> 
 /// a thread, [`message_by_id`], which also finds a reply in a thread this server knows of.
 pub async fn message_by_id_scoped(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     message_id: &str,
     limit: Option<u16>,
     thread_id: Option<&str>,
 ) -> Result<(ChannelInfo, Message), OpError> {
     let Some(thread_id) = thread_id else {
-        return message_by_id(state, channel_id, message_id, limit).await;
+        return message_by_id(state, caller, channel_id, message_id, limit).await;
     };
     let channel = allowed(state, channel_id).await?;
-    message_in_thread(state, channel, message_id, limit, thread_id).await
+    message_in_thread(state, caller, channel, message_id, limit, thread_id).await
 }
 
 /// `message_id` in `thread_id` of `channel`, which the caller has checked against the allowlist.
 async fn message_in_thread(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: ChannelInfo,
     message_id: &str,
     limit: Option<u16>,
@@ -589,6 +605,7 @@ async fn message_in_thread(
     if looks_up_by_ids(state, &channel.id) {
         let looked = lookup_messages(
             state,
+            caller,
             &channel,
             Some(thread_id),
             &[message_id.to_owned()],
@@ -647,12 +664,15 @@ pub struct Looked {
 /// the channel's own messages in the recent window ([`messages`]), where it may be `None` as it
 /// always could be. So no answer is less than it was before, and none older.
 ///
+/// `caller` is the scope of whoever asked, as for [`messages`].
+///
 /// # Errors
 ///
 /// [`OpError::Chat`] for an invalid thread id, a failed read, or a lookup that answered for ids it
 /// was not asked; the errors of [`messages`].
 pub async fn lookup_messages(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: &ChannelInfo,
     thread: Option<&str>,
     ids: &[String],
@@ -709,7 +729,11 @@ pub async fn lookup_messages(
                 None => {
                     if window.is_none() {
                         reads += 1;
-                        window = Some(messages(state, channel.id.as_str(), limit).await?.messages);
+                        window = Some(
+                            messages(state, caller, channel.id.as_str(), limit)
+                                .await?
+                                .messages,
+                        );
                     }
                     window
                         .as_ref()
@@ -743,6 +767,8 @@ pub async fn lookup_messages(
 /// with a fresh envelope in `next_after`. A `before` page leaves without one: it says nothing about
 /// the newest end. `#203 incremental-refresh`.
 ///
+/// `_caller` is the scope of whoever asked, as for [`messages`].
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`]; [`OpError::CursorMismatch`] for a forward cursor issued for any
@@ -750,6 +776,7 @@ pub async fn lookup_messages(
 /// [`ChatError::CursorExpired`] for one the backend can no longer answer for.
 pub async fn timeline(
     state: &AppState,
+    _caller: crate::auth::Scope,
     channel_id: &str,
     request: &crate::threads::TimelineRequest,
 ) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
@@ -858,11 +885,12 @@ pub struct Digest {
 /// As [`messages`].
 pub async fn digest(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     limit: Option<u16>,
     width: Option<u16>,
 ) -> Result<Digest, OpError> {
-    let window = messages(state, channel_id, limit).await?;
+    let window = messages(state, caller, channel_id, limit).await?;
     let complete = window.is_whole_channel();
     let width = usize::from(width.unwrap_or(0));
     let width = if width == 0 {
@@ -1067,12 +1095,20 @@ pub fn activity_scan(state: &AppState, lines: u16) -> u16 {
 /// to [`crate::recent::Timing::cold_deadline`] and is then [`OpError::NotReadInTime`]. A window
 /// young enough to reuse ([`crate::recent::reuse_for`]) is served without a read at all.
 ///
+/// A read this starts runs under the caller's grant ([`crate::cache::FillGrant::for_caller`]):
+/// none for read scope. A parameter rather than a field of [`ActivityRequest`], which has a
+/// default, so no caller can leave it out.
+///
 /// # Errors
 ///
 /// The first channel's error when EVERY channel failed outright, since an answer made only of
 /// failures is a failure. A channel still being read does not count as failed, and an empty list is
 /// not an error: there is simply nothing to report.
-pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Activity, OpError> {
+pub async fn activity(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    request: ActivityRequest,
+) -> Result<Activity, OpError> {
     let asked = request.hours.unwrap_or(DEFAULT_ACTIVITY_HOURS);
     let hours = asked.clamp(1, MAX_WINDOW_HOURS);
     let since_ms = hours_before(hours, request.now_ms)?;
@@ -1094,10 +1130,12 @@ pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Acti
         .collect();
     // remote-ops-audit W12 `#287 bulk-reads`: a held window a native head proves unchanged is kept
     // rather than read again. Every other read is started first, so the head read never delays it,
-    // and the channels of a provider that reads several natively are one read (W13).
+    // and the channels of a provider that reads several natively are one read (W13). Every read
+    // runs under the caller's grant.
+    let grant = crate::cache::FillGrant::for_caller(caller);
     let (candidates, now) = crate::recent::head_candidates(state, due, scan);
-    let mut waits = crate::recent::refresh_all(state, &now, scan);
-    waits.extend(crate::recent::keep_or_refresh(state, &candidates, scan).await);
+    let mut waits = crate::recent::refresh_all(state, &now, scan, grant);
+    waits.extend(crate::recent::keep_or_refresh(state, &candidates, scan, grant).await);
     for channel in &channels {
         let Some(mut done) = waits.remove(&channel.id) else {
             continue;
@@ -1425,6 +1463,8 @@ fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
 
 /// One step of a walk: a page that knows it is a page. Read scope.
 ///
+/// `_caller` is the scope of whoever asked, as for [`messages`].
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::InvalidCursor`] for a cursor that is not a snowflake,
@@ -1432,6 +1472,7 @@ fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
 /// or [`OpError::HoursWithSpan`] for an unusable relative window, or [`OpError::Chat`].
 pub async fn page(
     state: &AppState,
+    _caller: crate::auth::Scope,
     channel_id: &str,
     request: PageRequest<'_>,
 ) -> Result<Page, OpError> {
@@ -1709,15 +1750,18 @@ pub struct MessageCount {
 /// [`OpError::Chat`].
 pub async fn count(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     since: Option<&str>,
     cap: Option<u32>,
 ) -> Result<MessageCount, OpError> {
-    count_within(state, channel_id, since, None, cap).await
+    count_within(state, caller, channel_id, since, None, cap).await
 }
 
 /// [`count`], optionally over the last `hours` on this server's clock instead of since an instant.
 /// Read scope. `#190 voice-agent-tools`.
+///
+/// `_caller` is the scope of whoever asked, as for [`messages`].
 ///
 /// # Errors
 ///
@@ -1725,6 +1769,7 @@ pub async fn count(
 /// [`OpError::HoursWithSpan`] when both `hours` and `since` are given.
 pub async fn count_within(
     state: &AppState,
+    _caller: crate::auth::Scope,
     channel_id: &str,
     since: Option<&str>,
     hours: Option<u64>,
@@ -1894,13 +1939,14 @@ async fn count_range(
 /// Semantic random access: describe a message, get that message. Read scope.
 ///
 /// Returns the resolution and how many messages were searched, so a caller can honestly say "I
-/// only looked at the last twenty".
+/// only looked at the last twenty". `_caller` is the scope of whoever asked, as for [`messages`].
 ///
 /// # Errors
 ///
 /// [`OpError::EmptyQuery`] for a blank query, plus the errors of [`messages`].
 pub async fn resolve(
     state: &AppState,
+    _caller: crate::auth::Scope,
     channel_id: &str,
     query: &str,
     limit: Option<u16>,
@@ -2654,10 +2700,11 @@ pub struct TodoView {
 /// [`OpError::Store`] when no store is configured or the read fails.
 pub async fn todo(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<TodoView, OpError> {
-    let window = messages(state, channel_id, limit).await?;
+    let window = messages(state, caller, channel_id, limit).await?;
     let complete = window.is_whole_channel();
     let dismissed = state.store.dismissals(&window.channel.id).await?;
     let dismissed: std::collections::HashSet<&str> =
@@ -2874,11 +2921,12 @@ pub async fn dismiss(
 /// As [`dismiss`]. `through` must itself be in the window `limit` describes.
 pub async fn declare_bankruptcy(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     through: &MessageId,
     limit: Option<u16>,
 ) -> Result<InboxChange, OpError> {
-    let window = messages(state, channel_id, limit).await?;
+    let window = messages(state, caller, channel_id, limit).await?;
     let boundary = window
         .messages
         .iter()
@@ -3288,7 +3336,7 @@ pub async fn summarize_message_scoped(
         let messages = if looks_up_by_ids(state, &channel.id) {
             // remote-ops-audit W11 `#287 bulk-reads`: every part of the row in one lookup. A part
             // the provider proved absent is a message this server cannot see.
-            lookup_messages(state, &channel, Some(thread_id), &ids, limit)
+            lookup_messages(state, caller, &channel, Some(thread_id), &ids, limit)
                 .await?
                 .messages
                 .into_iter()
@@ -3298,7 +3346,8 @@ pub async fn summarize_message_scoped(
             let mut messages = Vec::with_capacity(ids.len());
             for id in &ids {
                 let (_, message) =
-                    message_by_id_scoped(state, channel_id, id, limit, Some(thread_id)).await?;
+                    message_by_id_scoped(state, caller, channel_id, id, limit, Some(thread_id))
+                        .await?;
                 messages.push(message);
             }
             messages
@@ -3315,7 +3364,7 @@ pub async fn summarize_message_scoped(
             as_of: None,
         }
     } else {
-        shared_window(state, channel, limit, began).await?
+        shared_window(state, caller, channel, limit, began).await?
     };
     let position = window
         .messages
@@ -3480,6 +3529,7 @@ async fn stored_summary(
 /// been forgotten since — an edit or a delete was pushed — it reads the window itself.
 async fn shared_window(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: ChannelInfo,
     limit: Option<u16>,
     began: std::time::Instant,
@@ -3503,7 +3553,7 @@ async fn shared_window(
     // `messages` remembers the window for everyone else as well. `remote-ops-audit`: counted as a
     // summary's context, whoever asked for the summary.
     let window = crate::read_reason::ReadReason::SummaryWindow
-        .scope(messages(state, channel.id.as_str(), limit))
+        .scope(messages(state, caller, channel.id.as_str(), limit))
         .await?;
     state.summary_counters.fetched(1);
     *turn = Some(crate::read_ahead::WindowRead::of(&window));
@@ -3567,6 +3617,7 @@ async fn generate_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Scope;
     use crate::store::StateStore as _;
     use crate::testing::{self, READ_CHANNEL, WRITE_CHANNEL};
 
@@ -3588,7 +3639,7 @@ mod tests {
     #[tokio::test]
     async fn a_channel_outside_the_allowlist_is_refused_for_reads() {
         let (state, _fake) = testing::state();
-        let error = messages(&state, "9999999999", None)
+        let error = messages(&state, Scope::Read, "9999999999", None)
             .await
             .expect_err("an unconfigured channel must not be readable");
         assert!(matches!(error, OpError::UnknownChannel), "{error:?}");
@@ -3635,7 +3686,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_query_is_refused_before_anything_is_fetched() {
         let (state, _fake) = testing::state();
-        let error = resolve(&state, READ_CHANNEL, "   ", None, None)
+        let error = resolve(&state, Scope::Read, READ_CHANNEL, "   ", None, None)
             .await
             .expect_err("a blank query has nothing to resolve");
         assert!(matches!(error, OpError::EmptyQuery), "{error:?}");
@@ -3647,7 +3698,7 @@ mod tests {
         let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
         fake.seed(&channel, "agent", "first");
         fake.seed(&channel, "agent", "second");
-        let error = message_by_id(&state, READ_CHANNEL, "404040404040", None)
+        let error = message_by_id(&state, Scope::Read, READ_CHANNEL, "404040404040", None)
             .await
             .expect_err("an id outside the window must miss");
         assert!(matches!(error, OpError::UnknownMessage), "{error:?}");
@@ -3661,7 +3712,9 @@ mod tests {
         for i in 0..5 {
             fake.seed(&channel, "agent", &format!("line {i}"));
         }
-        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        let window = messages(&state, Scope::Read, READ_CHANNEL, None)
+            .await
+            .expect("reads");
         assert!(
             window.is_whole_channel(),
             "a fetch that came back short is Discord saying there is nothing older"
@@ -3670,7 +3723,9 @@ mod tests {
         for i in 0..40 {
             fake.seed(&channel, "agent", &format!("more {i}"));
         }
-        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        let window = messages(&state, Scope::Read, READ_CHANNEL, None)
+            .await
+            .expect("reads");
         assert_eq!(window.messages.len(), 20);
         assert!(
             !window.is_whole_channel(),
@@ -3691,7 +3746,9 @@ mod tests {
         for i in 0..120 {
             fake.seed(&channel, "agent", &format!("line {i}"));
         }
-        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        let window = messages(&state, Scope::Read, READ_CHANNEL, None)
+            .await
+            .expect("reads");
         assert_eq!(
             window.limit,
             crate::discord::http::DISCORD_MAX_LIMIT,
@@ -3714,6 +3771,7 @@ mod tests {
         let before = fake.fetch_count();
         let step = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(10),
@@ -3755,6 +3813,7 @@ mod tests {
         }
         let step = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(10),
@@ -3780,6 +3839,7 @@ mod tests {
         }
         let first = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(10),
@@ -3791,6 +3851,7 @@ mod tests {
         let cursor = first.next_before.clone().expect("more remain");
         let second = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(10),
@@ -3843,6 +3904,7 @@ mod tests {
         let until = crate::clock::iso_from_ms(base + 10_000);
         let step = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(10),
@@ -3875,6 +3937,7 @@ mod tests {
         let since = crate::clock::iso_from_ms(base);
         let first = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(2),
@@ -3897,6 +3960,7 @@ mod tests {
         let resume = first.next_since.clone().expect("a place to resume");
         let second = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 limit: Some(2),
@@ -3969,7 +4033,7 @@ mod tests {
             ),
         ];
         for (request, code) in cases {
-            let error = page(&state, READ_CHANNEL, request)
+            let error = page(&state, Scope::Read, READ_CHANNEL, request)
                 .await
                 .expect_err("must refuse");
             assert_eq!(error.code(), code, "{request:?} -> {error}");
@@ -3985,7 +4049,7 @@ mod tests {
         for i in 0..150 {
             fake.seed(&channel, "agent", &format!("m{i}"));
         }
-        let tally = count(&state, READ_CHANNEL, None, None)
+        let tally = count(&state, Scope::Read, READ_CHANNEL, None, None)
             .await
             .expect("counts");
         assert_eq!(tally.counted, 150);
@@ -4004,7 +4068,7 @@ mod tests {
         for i in 0..350 {
             fake.seed(&channel, "agent", &format!("m{i}"));
         }
-        let tally = count(&state, READ_CHANNEL, None, Some(120))
+        let tally = count(&state, Scope::Read, READ_CHANNEL, None, Some(120))
             .await
             .expect("counts");
         assert!(
@@ -4025,7 +4089,7 @@ mod tests {
             fake.seed_at(&channel, "agent", &format!("m{i}"), base + i * 1_000);
         }
         let since = crate::clock::iso_from_ms(base + 6_000);
-        let tally = count(&state, READ_CHANNEL, Some(&since), None)
+        let tally = count(&state, Scope::Read, READ_CHANNEL, Some(&since), None)
             .await
             .expect("counts");
         assert_eq!(
@@ -4076,7 +4140,9 @@ mod tests {
             "agent",
             "the arm64 job failed",
         );
-        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        let window = messages(&state, Scope::Read, READ_CHANNEL, None)
+            .await
+            .expect("reads");
         assert_eq!(
             window.channel.display_name(),
             "the build channel",
@@ -4212,7 +4278,7 @@ mod tests {
         let listed = channels(&state).await;
         assert_eq!(listed.len(), 2, "the configured channels are still listed");
         assert!(listed.iter().all(|c| c.alias.is_none()));
-        let window = messages(&state, READ_CHANNEL, None)
+        let window = messages(&state, Scope::Read, READ_CHANNEL, None)
             .await
             .expect("a channel must stay readable with no store at all");
         assert_eq!(window.channel.display_name(), "build noise");
@@ -4424,7 +4490,9 @@ mod tests {
         at(&fake, WRITE_CHANNEL, "twenty minutes ago", 20 * MINUTE);
         let before = fake.fetch_count();
 
-        let activity = activity(&state, request(None)).await.expect("reads");
+        let activity = activity(&state, Scope::Read, request(None))
+            .await
+            .expect("reads");
 
         assert_eq!(
             fake.fetch_count() - before,
@@ -4455,7 +4523,9 @@ mod tests {
         let (state, fake) = testing::state();
         at(&fake, READ_CHANNEL, "two days ago", 50 * HOUR_MS);
 
-        let day = activity(&state, request(None)).await.expect("reads");
+        let day = activity(&state, Scope::Read, request(None))
+            .await
+            .expect("reads");
         let read = part(&day, READ_CHANNEL);
         assert_eq!(read.counted, 0);
         assert!(read.entries.is_empty(), "{:?}", summaries(read));
@@ -4470,7 +4540,9 @@ mod tests {
             "it is outside the window, and must be reported as older"
         );
 
-        let three_days = activity(&state, request(Some(72))).await.expect("reads");
+        let three_days = activity(&state, Scope::Read, request(Some(72)))
+            .await
+            .expect("reads");
         assert_eq!(summaries(part(&three_days, READ_CHANNEL)), ["two days ago"]);
     }
 
@@ -4480,7 +4552,9 @@ mod tests {
         at(&fake, READ_CHANNEL, "the real answer", 2 * HOUR_MS);
         at(&fake, READ_CHANNEL, "Working…", HOUR_MS);
 
-        let activity = activity(&state, request(None)).await.expect("reads");
+        let activity = activity(&state, Scope::Read, request(None))
+            .await
+            .expect("reads");
         let read = part(&activity, READ_CHANNEL);
         assert_eq!(summaries(read), ["the real answer"]);
         assert_eq!((read.counted, read.noise), (1, 1));
@@ -4498,7 +4572,9 @@ mod tests {
         for i in 0..30 {
             at(&fake, READ_CHANNEL, &format!("m{i}"), (60 - i) * MINUTE);
         }
-        let activity = activity(&state, request(None)).await.expect("reads");
+        let activity = activity(&state, Scope::Read, request(None))
+            .await
+            .expect("reads");
         let read = part(&activity, READ_CHANNEL);
         assert!(
             !read.complete,
@@ -4524,7 +4600,9 @@ mod tests {
             (Some(24), 24, None),
             (None, DEFAULT_ACTIVITY_HOURS, None),
         ] {
-            let read = activity(&state, request(asked)).await.expect("reads");
+            let read = activity(&state, Scope::Read, request(asked))
+                .await
+                .expect("reads");
             assert_eq!(
                 (read.hours, read.asked_hours),
                 (hours, recorded),
@@ -4534,6 +4612,7 @@ mod tests {
         for (asked, lines) in [(Some(0), 1), (Some(500), MAX_ACTIVITY_LINES), (None, 8)] {
             let read = activity(
                 &state,
+                Scope::Read,
                 ActivityRequest {
                     per_channel_limit: asked,
                     ..request(None)
@@ -4558,7 +4637,7 @@ mod tests {
         );
         let (state, fake, _elevenlabs) = testing::state_from_toml(&toml);
         at(&fake, READ_CHANNEL, "still here", HOUR_MS);
-        let activity = activity(&state, request(None))
+        let activity = activity(&state, Scope::Read, request(None))
             .await
             .expect("two of three read");
         assert_eq!(activity.channels.len(), 3);
@@ -4574,7 +4653,7 @@ mod tests {
         // so: see `tests/voice_catchup.rs`. `#210 voice-catchup-speed`.
         let (state, fake, _elevenlabs) = testing::state_from_toml(&toml);
         fake.revoke_token();
-        let error = super::activity(&state, request(None))
+        let error = super::activity(&state, Scope::Read, request(None))
             .await
             .expect_err("an answer made only of failures is a failure");
         assert_eq!(error.code(), "chat_error", "{error}");
@@ -4587,7 +4666,7 @@ mod tests {
             hidden.insert(crate::model::ChannelId(READ_CHANNEL.to_owned()));
             hidden.insert(crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
         }
-        let activity = activity(&state, request(None))
+        let activity = activity(&state, Scope::Read, request(None))
             .await
             .expect("nothing to read");
         assert!(activity.channels.is_empty());
@@ -4603,6 +4682,7 @@ mod tests {
         fake.seed_at(&channel, "agent", "two hours ago", now - 2 * HOUR_MS);
         let step = page(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             PageRequest {
                 hours: Some(24),
@@ -4618,13 +4698,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["two hours ago"]
         );
-        let tally = count_within(&state, READ_CHANNEL, None, Some(24), None)
+        let tally = count_within(&state, Scope::Read, READ_CHANNEL, None, Some(24), None)
             .await
             .expect("counts");
         assert_eq!((tally.counted, tally.at_least), (1, false));
-        let tally = count_within(&state, READ_CHANNEL, Some("  "), Some(48), None)
-            .await
-            .expect("a blank since is absent, not a second window");
+        let tally = count_within(
+            &state,
+            Scope::Read,
+            READ_CHANNEL,
+            Some("  "),
+            Some(48),
+            None,
+        )
+        .await
+        .expect("a blank since is absent, not a second window");
         assert_eq!(tally.counted, 2);
     }
 
@@ -4679,13 +4766,14 @@ mod tests {
             ),
         ];
         for (request, code) in cases {
-            let error = page(&state, READ_CHANNEL, request)
+            let error = page(&state, Scope::Read, READ_CHANNEL, request)
                 .await
                 .expect_err("must refuse");
             assert_eq!(error.code(), code, "{request:?} -> {error}");
         }
         let error = count_within(
             &state,
+            Scope::Read,
             READ_CHANNEL,
             Some("2026-08-19T00:00:00Z"),
             Some(24),
@@ -4698,7 +4786,7 @@ mod tests {
             error.to_string().contains("give hours on its own"),
             "{error}"
         );
-        let error = count_within(&state, READ_CHANNEL, None, Some(169), None)
+        let error = count_within(&state, Scope::Read, READ_CHANNEL, None, Some(169), None)
             .await
             .expect_err("past a week");
         assert_eq!(

@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use vibe_talk::auth::Scope;
 use vibe_talk::model::{ChannelId, MessageId};
 use vibe_talk::ops;
 use vibe_talk::state::AppState;
@@ -49,7 +50,7 @@ impl Server {
     }
 
     async fn left(&self) -> Vec<String> {
-        ops::todo(&self.state, READ_CHANNEL, None)
+        ops::todo(&self.state, Scope::Read, READ_CHANNEL, None)
             .await
             .expect("reads")
             .messages
@@ -68,7 +69,7 @@ async fn everything_is_wanting_attention_until_somebody_says_otherwise() {
     // The floor. A to-do view that started empty would look like a working filter and would be a
     // view of nothing.
     let server = Server::with(4);
-    let view = ops::todo(&server.state, READ_CHANNEL, None)
+    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     assert_eq!(view.messages.len(), 4);
@@ -99,7 +100,7 @@ async fn dismissing_one_message_removes_exactly_that_one() {
     );
     // ...and the WINDOW still says how much there was, so an interface can say "3 of 4 left"
     // rather than implying the channel has three messages in it.
-    let view = ops::todo(&server.state, READ_CHANNEL, None)
+    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     assert_eq!(view.window, 4);
@@ -141,9 +142,15 @@ async fn bankruptcy_clears_everything_through_the_boundary_and_nothing_after_it(
     // row the reader pressed is part of what they are giving up on, and a version that excluded it
     // would leave one message behind on every single use, which reads as the feature not working.
     let server = Server::with(5);
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(2), None)
-        .await
-        .expect("declares");
+    let change = ops::declare_bankruptcy(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &server.id(2),
+        None,
+    )
+    .await
+    .expect("declares");
 
     assert_eq!(
         change.messages,
@@ -161,9 +168,15 @@ async fn bankruptcy_clears_everything_through_the_boundary_and_nothing_after_it(
 async fn bankruptcy_at_the_newest_message_clears_the_whole_backlog_and_undo_brings_it_all_back() {
     // The other edge, and the ordinary use: the reader gives up on everything they can see.
     let server = Server::with(5);
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(4), None)
-        .await
-        .expect("declares");
+    let change = ops::declare_bankruptcy(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &server.id(4),
+        None,
+    )
+    .await
+    .expect("declares");
     assert_eq!(change.messages.len(), 5);
     assert!(server.left().await.is_empty());
 
@@ -183,14 +196,20 @@ async fn bankruptcy_clears_only_the_window_the_reader_actually_read() {
     // the shipped configuration — and the rows above it are marked dealt with without ever having
     // been on screen. The undo would recover them, but only for a reader who noticed.
     let server = Server::with(10);
-    let read = ops::todo(&server.state, READ_CHANNEL, Some(3))
+    let read = ops::todo(&server.state, Scope::Read, READ_CHANNEL, Some(3))
         .await
         .expect("reads");
     assert_eq!(read.messages.len(), 3, "the narrowed read is the premise");
 
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(9), Some(3))
-        .await
-        .expect("declares");
+    let change = ops::declare_bankruptcy(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &server.id(9),
+        Some(3),
+    )
+    .await
+    .expect("declares");
     assert_eq!(
         change.messages,
         vec![server.id(7), server.id(8), server.id(9)],
@@ -207,18 +226,30 @@ async fn bankruptcy_clears_only_the_window_the_reader_actually_read() {
     // widening: naming the oldest message of the channel from a three-message page is either a bug
     // in the caller or an attempt to clear what it never showed.
     assert_eq!(
-        ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(0), Some(3))
-            .await
-            .expect_err("must refuse")
-            .code(),
+        ops::declare_bankruptcy(
+            &server.state,
+            Scope::Write,
+            READ_CHANNEL,
+            &server.id(0),
+            Some(3)
+        )
+        .await
+        .expect_err("must refuse")
+        .code(),
         "unknown_message"
     );
 
     // THE CONTROL: the same boundary with the same window the default read uses clears the lot, so
     // the assertion above is about the LIMIT and not about a bankruptcy that stopped working.
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(6), None)
-        .await
-        .expect("declares");
+    let change = ops::declare_bankruptcy(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &server.id(6),
+        None,
+    )
+    .await
+    .expect("declares");
     assert_eq!(change.messages.len(), 7);
     assert!(server.left().await.is_empty());
 }
@@ -234,9 +265,15 @@ async fn bankruptcy_reports_only_what_it_really_cleared_so_the_undo_cannot_resur
         .await
         .expect("dismisses");
 
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(3), None)
-        .await
-        .expect("declares");
+    let change = ops::declare_bankruptcy(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &server.id(3),
+        None,
+    )
+    .await
+    .expect("declares");
     assert_eq!(
         change.messages,
         vec![server.id(0), server.id(2), server.id(3)],
@@ -315,6 +352,7 @@ async fn an_unknown_channel_and_an_unbounded_batch_cannot_grow_the_store() {
     assert_eq!(
         ops::declare_bankruptcy(
             &server.state,
+            Scope::Write,
             READ_CHANNEL,
             &MessageId("1000000000000009999".to_owned()),
             None
@@ -375,12 +413,12 @@ async fn the_list_says_when_its_window_starts_even_once_that_message_is_dealt_wi
     // between it and the list is dealt with too. Older than the window, nothing is known. So the
     // list says when the window's oldest message was sent, whether or not that message is left.
     let server = Server::with(12);
-    let window = ops::messages(&server.state, READ_CHANNEL, Some(5))
+    let window = ops::messages(&server.state, Scope::Read, READ_CHANNEL, Some(5))
         .await
         .expect("reads");
     let oldest = window.messages.first().expect("a window of five");
     assert_eq!(oldest.id, server.id(7), "the window is the newest five");
-    let view = ops::todo(&server.state, READ_CHANNEL, Some(5))
+    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, Some(5))
         .await
         .expect("reads");
     assert!(!view.complete);
@@ -388,7 +426,7 @@ async fn the_list_says_when_its_window_starts_even_once_that_message_is_dealt_wi
     ops::dismiss(&server.state, READ_CHANNEL, &[server.id(7), server.id(8)])
         .await
         .expect("dismisses");
-    let view = ops::todo(&server.state, READ_CHANNEL, Some(5))
+    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, Some(5))
         .await
         .expect("reads");
     assert_eq!(
@@ -401,7 +439,7 @@ async fn the_list_says_when_its_window_starts_even_once_that_message_is_dealt_wi
         "the window's start moved with what was dealt with"
     );
     let empty = Server::with(0);
-    let view = ops::todo(&empty.state, READ_CHANNEL, None)
+    let view = ops::todo(&empty.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     assert_eq!(view.window_from, None);
@@ -473,7 +511,7 @@ async fn a_to_do_list_with_no_store_refuses_rather_than_showing_the_whole_channe
     // nowhere is the plain channel wearing a name that promises filtering.
     let (state, discord) = testing::state_with(Arc::new(vibe_talk::store::disabled::DisabledStore));
     discord.seed(&ChannelId(READ_CHANNEL.to_owned()), "codex-eng", "hello");
-    let error = ops::todo(&state, READ_CHANNEL, None)
+    let error = ops::todo(&state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect_err("must refuse");
     assert_eq!(error.code(), "storage_not_configured", "{error}");
@@ -482,7 +520,7 @@ async fn a_to_do_list_with_no_store_refuses_rather_than_showing_the_whole_channe
     let (state, discord) = testing::state_with(Arc::new(FakeStore::new()));
     discord.seed(&ChannelId(READ_CHANNEL.to_owned()), "codex-eng", "hello");
     assert_eq!(
-        ops::todo(&state, READ_CHANNEL, None)
+        ops::todo(&state, Scope::Read, READ_CHANNEL, None)
             .await
             .expect("reads")
             .messages

@@ -21,6 +21,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
+use vibe_talk::auth::Scope;
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::http::router;
 use vibe_talk::model::{ChannelId, MessageId};
@@ -119,7 +120,7 @@ impl Harness {
     }
 
     async fn todo_ids(&self) -> Vec<MessageId> {
-        ops::todo(&self.state, READ_CHANNEL, None)
+        ops::todo(&self.state, Scope::Read, READ_CHANNEL, None)
             .await
             .expect("reads")
             .messages
@@ -164,7 +165,7 @@ struct Conversation {
 async fn the_to_do_list_leaves_placeholders_out_and_says_how_many() {
     let harness = Harness::new();
     let c = harness.conversation();
-    let view = ops::todo(&harness.state, READ_CHANNEL, None)
+    let view = ops::todo(&harness.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     let ids: Vec<MessageId> = view.messages.iter().map(|m| m.id.clone()).collect();
@@ -659,7 +660,7 @@ async fn without_a_store_the_default_still_applies_and_an_edit_says_why_it_canno
         vibe_talk::testing::state_with(Arc::new(vibe_talk::store::disabled::DisabledStore));
     let channel = ChannelId(READ_CHANNEL.to_owned());
     discord.seed(&channel, AGENT, PLACEHOLDER);
-    let window = ops::messages(&state, READ_CHANNEL, None)
+    let window = ops::messages(&state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     assert!(window.messages[0].noise, "the default rule needs no store");
@@ -675,7 +676,7 @@ async fn a_store_that_fails_hides_nothing() {
     // than hide messages on the strength of a store that is not answering.
     let harness = Harness::new();
     harness.seed(AGENT, PLACEHOLDER);
-    let window = ops::messages(&harness.state, READ_CHANNEL, None)
+    let window = ops::messages(&harness.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     let placeholder = &window.messages[0];
@@ -734,7 +735,7 @@ async fn open_stream(harness: &Harness) -> Body {
 async fn the_live_stream_judges_a_message_on_its_way_out_not_when_it_was_published() {
     let harness = Harness::new();
     let id = harness.seed(AGENT, PLACEHOLDER);
-    let window = ops::messages(&harness.state, READ_CHANNEL, None)
+    let window = ops::messages(&harness.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("reads");
     let mut published = window.messages[0].clone();

@@ -527,13 +527,15 @@ pub struct Found {
 /// `began` is when the preparation started. A window fetch that finished after it is fresh
 /// enough to answer this one.
 ///
-/// The caller has already checked `channel` against the allowlist.
+/// The caller has already checked `channel` against the allowlist. `caller` is its scope, passed
+/// on to every read this makes.
 ///
 /// # Errors
 ///
 /// The errors of [`ops::messages`] and [`ops::message_by_id_scoped`].
 pub async fn messages_for_speech(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel: &ChannelInfo,
     thread: Option<&str>,
     ids: &[String],
@@ -573,7 +575,7 @@ pub async fn messages_for_speech(
                 // `ops::messages` remembers the window for everyone else as well.
                 // `remote-ops-audit`: counted as speech preparation's.
                 let window = crate::read_reason::ReadReason::Speech
-                    .scope(ops::messages(state, channel.id.as_str(), limit))
+                    .scope(ops::messages(state, caller, channel.id.as_str(), limit))
                     .await?;
                 *turn = Some(WindowRead::of(&window));
                 found.fetches = 1;
@@ -596,6 +598,7 @@ pub async fn messages_for_speech(
                 crate::read_reason::ReadReason::Speech
                     .scope(ops::lookup_messages(
                         state,
+                        caller,
                         channel,
                         Some(thread),
                         &missing,
@@ -621,6 +624,7 @@ pub async fn messages_for_speech(
                     crate::read_reason::ReadReason::Speech
                         .scope(ops::message_by_id_scoped(
                             state,
+                            caller,
                             channel.id.as_str(),
                             &id,
                             limit,

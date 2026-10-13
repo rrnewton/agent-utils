@@ -322,7 +322,7 @@ async fn a_read_the_provider_dates_says_as_of_on_messages_and_in_the_mcp_text() 
 async fn a_held_copy_says_when_this_server_read_it_and_as_of_how_old_it_is() {
     let h = harness("");
     *h.bridge.as_of.lock().expect("as_of") = Some(minutes_ago(10));
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     tokio::time::advance(Duration::from_secs(150)).await;
@@ -350,7 +350,7 @@ async fn the_shadow_is_off_unless_a_bridge_turns_it_on() {
     assert_eq!(discord.recent.view, RecentView::Messages);
     assert!(!recent_view::shadowed(&h.state, &channel(READ_CHANNEL)));
 
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -379,7 +379,7 @@ async fn a_shadowed_read_counts_where_the_flat_view_disagrees() {
     let h = harness("recent_view_shadow = true");
     assert!(recent_view::shadowed(&h.state, &channel(READ_CHANNEL)));
 
-    let window = ops::messages(&h.state, READ_CHANNEL, None)
+    let window = ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     let agreed = compared(&h.state, READ_CHANNEL, 1).await;
@@ -403,7 +403,7 @@ async fn a_shadowed_read_counts_where_the_flat_view_disagrees() {
         .lock()
         .expect("missing")
         .insert(ids[1].clone());
-    let window = ops::messages(&h.state, READ_CHANNEL, None)
+    let window = ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     assert_eq!(window.messages.len(), 3, "the caller gets /messages");
@@ -432,7 +432,7 @@ async fn a_shadowed_read_counts_where_the_flat_view_disagrees() {
         .lock()
         .expect("missing")
         .insert(late);
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     let later = compared(&h.state, READ_CHANNEL, 3).await;
@@ -469,7 +469,7 @@ async fn a_check_waits_until_recent_reads_have_stopped_and_runs_one_at_a_time() 
     h.state.recent_view_shadow = Arc::new(Shadow::new());
     *h.bridge.flat_takes.lock().expect("takes") = Duration::from_secs(2);
 
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     // A second channel's read starts at once and is slow.
@@ -477,7 +477,7 @@ async fn a_check_waits_until_recent_reads_have_stopped_and_runs_one_at_a_time() 
     *h.bridge.hold.lock().expect("hold") = Some(Arc::clone(&hold));
     let slow = {
         let state = h.state.clone();
-        tokio::spawn(async move { ops::messages(&state, WRITE_CHANNEL, None).await })
+        tokio::spawn(async move { ops::messages(&state, Scope::Read, WRITE_CHANNEL, None).await })
     };
     tokio::time::sleep(QUIET * 4).await;
     assert_eq!(
@@ -499,7 +499,7 @@ async fn a_check_waits_until_recent_reads_have_stopped_and_runs_one_at_a_time() 
     while h.bridge.flat_reads.load(Ordering::SeqCst) == 0 {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     // The first read of READ_CHANNEL was checked first, as the oldest waiting; the newer one
@@ -561,7 +561,7 @@ async fn the_storage_purge_drops_the_reads_waiting_for_a_check() {
     let mut h = harness("recent_view_shadow = true");
     h.state.recent_view_shadow = Arc::new(Shadow::new());
 
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     // Inside the quiet spell, so the check has not started.
@@ -585,7 +585,7 @@ async fn the_storage_purge_drops_the_reads_waiting_for_a_check() {
     *h.bridge.hold.lock().expect("hold") = Some(Arc::clone(&hold));
     let slow = {
         let state = h.state.clone();
-        tokio::spawn(async move { ops::messages(&state, READ_CHANNEL, None).await })
+        tokio::spawn(async move { ops::messages(&state, Scope::Read, READ_CHANNEL, None).await })
     };
     let started = |log: &[(Instant, Event)]| {
         log.iter()
@@ -614,7 +614,7 @@ async fn the_storage_purge_drops_the_reads_waiting_for_a_check() {
         2
     );
 
-    ops::messages(&h.state, READ_CHANNEL, None)
+    ops::messages(&h.state, Scope::Read, READ_CHANNEL, None)
         .await
         .expect("read");
     let tally = compared(&h.state, READ_CHANNEL, 1).await;

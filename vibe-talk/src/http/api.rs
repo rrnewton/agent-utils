@@ -1287,7 +1287,7 @@ pub async fn voice_end(
 /// balance on arbitrary strings.
 pub async fn speak(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
@@ -1304,6 +1304,7 @@ pub async fn speak(
     let began = std::time::Instant::now();
     let (_channel, message) = ops::message_by_id_scoped(
         &state,
+        caller,
         &channel_id,
         &message_id,
         query.limit,
@@ -1394,11 +1395,11 @@ pub struct LimitQuery {
 /// `GET /api/v1/channels/{channel_id}/messages`
 pub async fn messages(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessagesResponse>, ApiError> {
-    let window = ops::messages(&state, &channel_id, query.limit).await?;
+    let window = ops::messages(&state, caller, &channel_id, query.limit).await?;
     let dismissed = ops::dismissed_within(&state, &window.channel.id, &window.messages).await?;
     Ok(Json(MessagesResponse {
         complete: window.is_whole_channel(),
@@ -1478,12 +1479,13 @@ pub struct PageResponse {
 /// `GET /api/v1/channels/{channel_id}/page`
 pub async fn page(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<PageResponse>, ApiError> {
     let mut step = ops::page(
         &state,
+        caller,
         &channel_id,
         ops::PageRequest {
             limit: query.limit,
@@ -1585,7 +1587,7 @@ pub async fn timeline(
         after: query.after,
         limit,
     };
-    let (channel, mut page) = ops::timeline(&state, &channel_id, &request).await?;
+    let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
     crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
@@ -1667,12 +1669,13 @@ pub struct CountResponse {
 /// `GET /api/v1/channels/{channel_id}/count`
 pub async fn count(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<CountQuery>,
 ) -> Result<Json<CountResponse>, ApiError> {
     let tally = ops::count_within(
         &state,
+        caller,
         &channel_id,
         query.since.as_deref(),
         query.hours,
@@ -1708,12 +1711,13 @@ pub struct MessageResponse {
 /// fetches, so a very old message answers 404 rather than silently returning something else.
 pub async fn message_by_id(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     let (channel, message) = ops::message_by_id_scoped(
         &state,
+        caller,
         &channel_id,
         &message_id,
         query.limit,
@@ -1747,11 +1751,11 @@ pub struct DigestResponse {
 /// `GET /api/v1/channels/{channel_id}/digest`
 pub async fn digest(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<DigestResponse>, ApiError> {
-    let digest = ops::digest(&state, &channel_id, query.limit, query.width).await?;
+    let digest = ops::digest(&state, caller, &channel_id, query.limit, query.width).await?;
     Ok(Json(DigestResponse {
         channel: digest.channel,
         entries: digest.entries,
@@ -1822,11 +1826,12 @@ pub struct ActivityResponse {
 /// `GET /api/v1/activity` — the route behind `recent_activity`. `#190 voice-agent-tools`.
 pub async fn activity(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Query(query): Query<ActivityQuery>,
 ) -> Result<Json<ActivityResponse>, ApiError> {
     let activity = ops::activity(
         &state,
+        caller,
         ops::ActivityRequest {
             hours: query.hours,
             per_channel_limit: query.per_channel_limit,
@@ -1905,12 +1910,13 @@ pub struct ResolveResponse {
 /// `POST /api/v1/channels/{channel_id}/resolve` — semantic random access.
 pub async fn resolve(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<ResolveResponse>, ApiError> {
     let (channel, resolution, searched) = ops::resolve(
         &state,
+        caller,
         &channel_id,
         &request.query,
         request.limit,
@@ -3152,8 +3158,15 @@ pub async fn mark_read_upstream(
     let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
     let through = MessageId(request.message_id);
     if let Some(thread_id) = request.thread_id.as_deref() {
-        ops::message_by_id_scoped(&state, &channel_id, through.as_str(), None, Some(thread_id))
-            .await?;
+        ops::message_by_id_scoped(
+            &state,
+            Scope::Write,
+            &channel_id,
+            through.as_str(),
+            None,
+            Some(thread_id),
+        )
+        .await?;
     }
     let outcome = if request.after_reply {
         // Refused exactly as the provider refuses the owner's own mark, so the route has one answer
@@ -3474,11 +3487,11 @@ pub struct TodoResponse {
 /// `GET /api/v1/channels/{channel_id}/todo`
 pub async fn todo(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, ApiError> {
-    let mut todo = ops::todo(&state, &channel_id, query.limit).await?;
+    let mut todo = ops::todo(&state, caller, &channel_id, query.limit).await?;
     crate::render::fill(
         &state.config,
         &state.headings,
@@ -3565,7 +3578,8 @@ pub async fn dismiss(
         (Some(through), true) => {
             // WITH the window the caller read the list with. See `DismissRequest::limit`.
             let boundary = crate::model::MessageId(through);
-            ops::declare_bankruptcy(&state, &channel_id, &boundary, request.limit).await?
+            ops::declare_bankruptcy(&state, Scope::Write, &channel_id, &boundary, request.limit)
+                .await?
         }
         (None, false) => {
             let wanted: Vec<crate::model::MessageId> = request
@@ -3970,7 +3984,7 @@ pub struct PrepareSpeechResponse {
 /// - one content-free line records how long each phase took.
 pub async fn prepare_speech(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     Path(channel_id): Path<String>,
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
@@ -3998,6 +4012,7 @@ pub async fn prepare_speech(
     };
     let found = crate::read_ahead::messages_for_speech(
         &state,
+        caller,
         &channel,
         thread,
         &request.ids,
