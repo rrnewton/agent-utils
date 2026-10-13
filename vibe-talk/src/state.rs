@@ -143,6 +143,14 @@ pub struct AppState {
     /// `#272 voice-agent-instructions`; see [`crate::voice_prompt::OverrideAnswers`]. In memory and
     /// short-lived, so a call's start does not wait on the vendor every time.
     pub agent_override: Arc<crate::voice_prompt::OverrideAnswers>,
+    /// The handle every message-cache fill goes through. `#208 persistent-cache`; see
+    /// [`crate::cache::sink`].
+    ///
+    /// Always present, like [`AppState::live`], so a read site never asks whether a cache exists:
+    /// it asks the sink to begin a fill, under the caller's
+    /// [`crate::cache::FillGrant`] or a server one, and a read-scope caller has no grant to ask
+    /// with. In this build nothing installs a cache behind it, so every fill is refused.
+    pub message_cache: Arc<crate::cache::Sink>,
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {

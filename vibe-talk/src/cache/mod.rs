@@ -46,8 +46,8 @@
 //!
 //! A row for a channel the current route snapshot does not list, a row older than the age limit,
 //! coverage below it, an observation whose stamp is older than an erase, and anything at all that a
-//! read-scope caller saw: such a caller is never given a stamp to write with (that rule is
-//! enforced where the cache is wired in).
+//! read-scope caller saw: such a caller is never given a stamp to write with, because every fill
+//! begins at the [`Sink`] under a [`FillGrant`] and a read-scope caller has none ([`grant`]).
 //!
 //! # Privacy
 //!
@@ -75,6 +75,7 @@
 mod checkpoint;
 pub mod coverage;
 pub mod file;
+pub mod grant;
 pub mod marker;
 pub mod merge;
 mod reader;
@@ -82,6 +83,7 @@ pub mod rows;
 pub mod schema;
 pub mod search;
 pub mod search_text;
+pub mod sink;
 mod structure;
 mod writer;
 
@@ -92,8 +94,10 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 pub use file::default_path;
+pub use grant::{FillGrant, ServerFill};
 pub use rows::{CachedMessage, ChanKey, Incoming, Scope};
 pub use search_text::{PlainText, Rendered, SearchTextSource};
+pub use sink::{Fill, Sink};
 
 use crate::model::MessageId;
 

@@ -275,6 +275,7 @@ fn state_pieces_with(
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
+        message_cache: Arc::new(crate::cache::Sink::off()),
         post_gate: Arc::new(crate::post_gate::PostGate::new()),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),

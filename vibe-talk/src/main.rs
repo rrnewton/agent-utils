@@ -726,6 +726,7 @@ async fn main() -> anyhow::Result<()> {
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
+        message_cache: Arc::new(vibe_talk::cache::Sink::off()),
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
