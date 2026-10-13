@@ -296,12 +296,17 @@ fn state_pieces_with(
 /// from the [`FakeDiscord`] it wraps. A channel can be stalled on its own, to stand for the one
 /// command that hangs for a minute. Time is tokio's, so a test that pauses the clock measures
 /// these waits exactly and spends none of them.
+///
+/// By default a read answers with the channel as it stands when the delay ENDS. A real provider
+/// answers with a picture taken somewhere inside it, and a read that lands after a change it does
+/// not show is the case [`SlowChat::answering_as_of_the_start`] stands for.
 pub struct SlowChat {
     inner: Arc<FakeDiscord>,
     slot: tokio::sync::Semaphore,
     delay: Duration,
     stalled: Mutex<BTreeMap<crate::model::ChannelId, Duration>>,
     reads: std::sync::atomic::AtomicUsize,
+    as_of_start: bool,
 }
 
 impl SlowChat {
@@ -314,7 +319,16 @@ impl SlowChat {
             delay,
             stalled: Mutex::new(BTreeMap::new()),
             reads: std::sync::atomic::AtomicUsize::new(0),
+            as_of_start: false,
         }
+    }
+
+    /// Answer every read with the channel as it stood when the read took the slot, then wait the
+    /// delay: whatever changes during the delay is missing from the answer that lands after it.
+    #[must_use]
+    pub fn answering_as_of_the_start(mut self) -> Self {
+        self.as_of_start = true;
+        self
     }
 
     /// Make every read of `channel` take `delay` instead, until [`SlowChat::release`].
@@ -333,12 +347,18 @@ impl SlowChat {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    async fn wait_turn(
+    /// Hold the one slot for a read of `channel`, and answer it with what `read` gives: taken
+    /// before or after the delay, as this provider was built to.
+    async fn read<T, F>(
         &self,
         channel: &crate::model::ChannelId,
-    ) -> Result<tokio::sync::SemaphorePermit<'_>, crate::chat::ChatError> {
+        read: F,
+    ) -> Result<T, crate::chat::ChatError>
+    where
+        F: std::future::Future<Output = Result<T, crate::chat::ChatError>>,
+    {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let permit = self
+        let _turn = self
             .slot
             .acquire()
             .await
@@ -347,8 +367,14 @@ impl SlowChat {
             .get(channel)
             .copied()
             .unwrap_or(self.delay);
-        tokio::time::sleep(delay).await;
-        Ok(permit)
+        if self.as_of_start {
+            let answer = read.await;
+            tokio::time::sleep(delay).await;
+            answer
+        } else {
+            tokio::time::sleep(delay).await;
+            read.await
+        }
     }
 }
 
@@ -374,8 +400,11 @@ impl crate::chat::ChatClient for SlowChat {
         before: Option<&crate::model::MessageId>,
         after: Option<&crate::model::MessageId>,
     ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
-        let _turn = self.wait_turn(channel).await?;
-        self.inner.fetch_page(channel, limit, before, after).await
+        self.read(
+            channel,
+            self.inner.fetch_page(channel, limit, before, after),
+        )
+        .await
     }
 
     async fn fetch_recent(
@@ -383,8 +412,8 @@ impl crate::chat::ChatClient for SlowChat {
         channel: &crate::model::ChannelId,
         limit: u16,
     ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
-        let _turn = self.wait_turn(channel).await?;
-        self.inner.fetch_recent(channel, limit).await
+        self.read(channel, self.inner.fetch_recent(channel, limit))
+            .await
     }
 
     async fn post_message(

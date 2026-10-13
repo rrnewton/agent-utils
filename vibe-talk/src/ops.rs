@@ -377,16 +377,17 @@ pub async fn messages(
     // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
     // preparation compares a remembered window against (`crate::read_ahead`) are one number.
     let limit = window_limit(state, limit);
-    // Both before the fetch, not after: see `ReadAhead::remember` and `RecentWindows::record`.
+    // Before the fetch, not after, like the mark below: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
-    let started = tokio::time::Instant::now();
-    let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
     // `#210 voice-catchup-speed`. Every read of a channel's newest messages is the newest copy of
-    // it, whoever asked: kept raw, before anything below prepares it. See `crate::recent`.
+    // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
+    // while it ran applied again on top. See `crate::recent`.
+    let mark = state.live.recent().mark(&channel.id);
+    let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
     state
         .live
         .recent()
-        .record(&channel.id, &messages, limit, started);
+        .record(&channel.id, &messages, limit, mark);
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. Decided HERE, on every read, from the text as it now stands — never
     // recorded — so every caller of this function (the digest, the to-do list, a lookup by id,

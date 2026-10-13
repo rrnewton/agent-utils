@@ -435,6 +435,18 @@ impl FakeDiscord {
         message.content = content.to_owned();
     }
 
+    /// Delete a seeded message, as someone deleting it upstream would. `#210 voice-catchup-speed`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no such message was seeded, which is a mistake in the test that called it.
+    pub fn delete(&self, id: &MessageId) {
+        let mut state = self.lock();
+        let before = state.messages.len();
+        state.messages.retain(|m| m.id != *id);
+        assert!(state.messages.len() < before, "no seeded message {id}");
+    }
+
     /// The snowflake this fake assigned to `author`, if it has ever seen them speak.
     ///
     /// Deliberately NOT a general directory: a name this fake has never seen has no id, exactly

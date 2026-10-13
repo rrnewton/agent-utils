@@ -18,6 +18,7 @@ use tower::ServiceExt as _;
 use vibe_talk::auth::Scope;
 use vibe_talk::chat::ChatClient;
 use vibe_talk::discord::fake::FakeDiscord;
+use vibe_talk::live::LiveKind;
 use vibe_talk::mcp::protocol::{dispatch, Outcome};
 use vibe_talk::model::ChannelId;
 use vibe_talk::ops::{self, ActivityRequest, Currency, OpError};
@@ -39,11 +40,28 @@ struct Harness {
     slow: Arc<SlowChat>,
 }
 
+/// How the provider in a [`Harness`] behaves.
+#[derive(Clone, Copy, Default)]
+struct Provider {
+    /// An adapter delivers live events, as on the deployment this was written against: a held
+    /// window is reused for [`recent::REUSE_LIVE_FED`] rather than [`recent::REUSE_UNFED`].
+    fed: bool,
+    /// Every read answers with the channel as it stood when the read took the slot.
+    as_of_start: bool,
+}
+
 fn harness_with(delay: Duration) -> Harness {
-    let toml = testing::config_toml().replace(
+    harness_from(delay, Provider::default())
+}
+
+fn harness_from(delay: Duration, provider: Provider) -> Harness {
+    let mut toml = testing::config_toml().replace(
         "[elevenlabs]",
         &format!("[[channels]]\nid = \"{THIRD}\"\nlabel = \"night shift\"\nwritable = false\n\n[elevenlabs]"),
     );
+    if provider.fed {
+        toml.push_str("\n[ingest]\ntoken = \"test-ingest-token-0000000000\"\n");
+    }
     let (mut state, fake, _elevenlabs) = testing::state_from_toml(&toml);
     fake.register_channel(&channel(THIRD));
     let now = ops::now_ms();
@@ -54,7 +72,11 @@ fn harness_with(delay: Duration) -> Harness {
     ] {
         fake.seed_at(&channel(id), "agent", text, now - HOUR_MS);
     }
-    let slow = Arc::new(SlowChat::new(Arc::clone(&fake), delay));
+    let mut slow = SlowChat::new(Arc::clone(&fake), delay);
+    if provider.as_of_start {
+        slow = slow.answering_as_of_the_start();
+    }
+    let slow = Arc::new(slow);
     let client: Arc<dyn ChatClient> = slow.clone();
     state.replace_chat(client);
     Harness { state, fake, slow }
@@ -379,4 +401,93 @@ async fn opening_a_voice_session_reads_the_channels_ahead_of_the_agent() {
     for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
         assert!(h.state.live.recent().holds(&channel(id)), "{id}");
     }
+}
+
+/// A live adapter feeds every window, and a provider answers with the channel as it stood when the
+/// read began: the deployment's shape, and the one in which a read can land after a push it does
+/// not show.
+fn fed_harness() -> Harness {
+    harness_from(
+        READ,
+        Provider {
+            fed: true,
+            as_of_start: true,
+        },
+    )
+}
+
+/// Start a catch-up that needs every window read again, and come back while the lead team's read
+/// is running: it took the slot two seconds in, after the first channel's, and answers with the
+/// channel as it was then. Returns the catch-up, still running.
+async fn into_the_lead_teams_read(h: &Harness) -> tokio::task::JoinHandle<ops::Activity> {
+    catch_up(&h.state).await;
+    tokio::time::sleep(recent::REUSE_LIVE_FED + Duration::from_secs(1)).await;
+    let state = h.state.clone();
+    let running = tokio::spawn(async move { catch_up(&state).await });
+    tokio::time::sleep(READ + Duration::from_millis(400)).await;
+    running
+}
+
+/// A message created upstream while the lead team's read is running reaches this server as a
+/// push, and is in the window then held. The read lands after it without it; the push must
+/// survive that, or the next catch-up says the channel is current while missing its newest message.
+#[tokio::test(start_paused = true)]
+async fn a_message_pushed_while_its_channel_is_being_read_survives_the_read_landing() {
+    let h = fed_harness();
+    let lead = channel(WRITE_CHANNEL);
+    let running = into_the_lead_teams_read(&h).await;
+    let id = h
+        .fake
+        .seed_at(&lead, "lead", "pushed mid read", ops::now_ms());
+    h.state
+        .live
+        .publish(&lead, h.fake.message(&id).expect("seeded"));
+
+    let first = running.await.expect("the catch-up ran");
+    assert!(!current(&first, WRITE_CHANNEL), "not read again in time");
+    assert_eq!(said(&first, WRITE_CHANNEL), ["ship it", "pushed mid read"]);
+
+    // The read has landed by now, without the message: it answered from before it was created.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let second = catch_up(&h.state).await;
+    assert!(current(&second, WRITE_CHANNEL));
+    assert_eq!(
+        said(&second, WRITE_CHANNEL),
+        ["ship it", "pushed mid read"],
+        "the read that landed after the push undid it, and the window was served as current"
+    );
+}
+
+/// The same for a delete: a message deleted while its channel is being read stays deleted when the
+/// read that still had it lands.
+#[tokio::test(start_paused = true)]
+async fn a_message_deleted_while_its_channel_is_being_read_stays_deleted() {
+    let h = fed_harness();
+    let lead = channel(WRITE_CHANNEL);
+    let doomed = h
+        .fake
+        .seed_at(&lead, "lead", "about to be deleted", ops::now_ms());
+    let running = into_the_lead_teams_read(&h).await;
+    let tombstone = h.fake.message(&doomed).expect("seeded");
+    h.fake.delete(&doomed);
+    assert!(h.state.live.publish_ingested(
+        "delete-1".to_owned(),
+        LiveKind::Delete,
+        false,
+        &lead,
+        tombstone,
+    ));
+
+    let first = running.await.expect("the catch-up ran");
+    assert!(!current(&first, WRITE_CHANNEL), "not read again in time");
+    assert_eq!(said(&first, WRITE_CHANNEL), ["ship it"]);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let second = catch_up(&h.state).await;
+    assert!(current(&second, WRITE_CHANNEL));
+    assert_eq!(
+        said(&second, WRITE_CHANNEL),
+        ["ship it"],
+        "the read that landed after the delete brought the deleted message back as current"
+    );
 }

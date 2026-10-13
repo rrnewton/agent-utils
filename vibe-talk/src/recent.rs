@@ -22,13 +22,14 @@
 //! For each channel, the RAW messages of the newest successful read — any
 //! [`crate::ops::messages`] read, from a tool or from the page, or a refresh started here — and
 //! when that read began. Every create, edit and delete the [`crate::live::LiveHub`] publishes is
-//! merged in, so a window read a minute ago and fed since is as current as the feed. The
+//! merged in — including those that arrive while a read of it is running, see below — so a window
+//! read a minute ago and fed since is as current as the feed. The
 //! spoken forms and the noise marks are NOT held: they are worked out again each time a window is
 //! served, exactly as for a fresh read, so a held copy can never carry a stale classification.
 //!
 //! Memory only. Nothing here is written to disk, it is gone when the process restarts, and it is
-//! bounded by the channel allowlist times one read's size: every path that records or merges a
-//! window is already allowlist-gated.
+//! bounded by the channel allowlist times one read's size and [`JOURNAL`] pushes: every path that
+//! records or merges a window is already allowlist-gated.
 //!
 //! # One read per channel at a time
 //!
@@ -36,8 +37,24 @@
 //! read instead of queueing another behind it, and the read is a detached task, so it finishes —
 //! and fills the window — even when the caller that started it has given up. That is what makes
 //! the retry after an abandoned call cheap: the read it would have repeated has already landed.
+//!
+//! # A read does not undo what arrived while it ran
+//!
+//! A read takes seconds, and the provider's answer is a picture of the channel at some moment
+//! inside them. A message created, edited or deleted after that moment reaches this server as a
+//! push, and is merged into the window then held — and a read that landed afterwards and simply
+//! replaced the window would throw the push away. The window would then be served as current, from
+//! a read that had just finished, while missing exactly the newest change: a created message gone,
+//! a deleted one back.
+//!
+//! So every push is also kept, numbered, in a short per-channel journal ([`JOURNAL`] deep), and
+//! every read takes a [`ReadMark`] — the journal's number — before it asks the provider. When the
+//! read lands, the pushes numbered after its mark are applied again on top of what it brought. That
+//! is safe whether or not the provider's answer already had them: a delete stays deleted, an edit
+//! sets the text it carried, and a created message the read already brought is left as the read
+//! has it, since the read is at least as new as the creation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,6 +88,12 @@ pub const REUSE_UNFED: Duration = Duration::from_secs(15);
 /// was: enough that three channels cost one round trip against a provider that can take them,
 /// few enough that a long channel list does not burst a provider's rate limit.
 pub const REFRESH_CONCURRENCY: usize = 4;
+
+/// How many pushes each channel keeps, to apply again to a read that was running when they
+/// arrived. The depth the live hub keeps for a page that attaches late, and far more than one
+/// channel's pushes during one read: a read whose mark has fallen out of it does not replace a
+/// held window at all. See the module documentation.
+pub const JOURNAL: usize = crate::live::REPLAY_TAIL;
 
 /// The four durations, gathered so a test can shorten them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +163,24 @@ pub struct Snapshot {
     pub failure: Option<ChatError>,
 }
 
+/// Where a read of one channel began: when, and how many pushes that channel had had. Taken with
+/// [`RecentWindows::mark`] BEFORE the read asks the provider, and handed back to
+/// [`RecentWindows::record`] with what it read, so the pushes that arrived meanwhile are applied
+/// again rather than lost.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadMark {
+    started: Instant,
+    pushes: u64,
+}
+
+impl ReadMark {
+    /// When the read began.
+    #[must_use]
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+}
+
 #[derive(Default)]
 struct Slot {
     held: Option<Held>,
@@ -147,6 +188,30 @@ struct Slot {
     refreshing: Option<(u64, watch::Receiver<bool>)>,
     /// The newest refresh failure and when its read began. Cleared by a later success.
     failure: Option<(ChatError, Instant)>,
+    /// How many pushes this channel has had: the number of the newest one.
+    pushes: u64,
+    /// The newest [`JOURNAL`] of them, with their numbers, oldest first.
+    journal: VecDeque<(u64, LiveMessage)>,
+}
+
+impl Slot {
+    /// The pushes after `mark`, oldest first, or `None` when some of them are no longer kept.
+    fn pushes_since(&self, mark: ReadMark) -> Option<Vec<LiveMessage>> {
+        let kept_from = self
+            .journal
+            .front()
+            .map_or(self.pushes + 1, |(number, _)| *number);
+        if kept_from > mark.pushes + 1 {
+            return None;
+        }
+        Some(
+            self.journal
+                .iter()
+                .filter(|(number, _)| *number > mark.pushes)
+                .map(|(_, live)| live.clone())
+                .collect(),
+        )
+    }
 }
 
 /// Every channel's held window, and the refreshes running for them.
@@ -194,11 +259,25 @@ impl RecentWindows {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Keep the result of a successful read of `channel`, which began at `started`.
+    /// Where a read of `channel` that starts now begins. Take it BEFORE asking the provider.
+    #[must_use]
+    pub fn mark(&self, channel: &ChannelId) -> ReadMark {
+        let slots = self.slots();
+        ReadMark {
+            started: Instant::now(),
+            pushes: slots.get(channel).map_or(0, |slot| slot.pushes),
+        }
+    }
+
+    /// Keep the result of a successful read of `channel`, which began at `mark`, with every push
+    /// that arrived since applied again on top of it.
     ///
     /// A read that began before the one already held is dropped: two reads overlapping, the one
-    /// that started later saw at least as much of the channel, whichever finished first.
-    pub fn record(&self, channel: &ChannelId, messages: &[Message], limit: u16, started: Instant) {
+    /// that started later saw at least as much of the channel, whichever finished first. So is a
+    /// read whose pushes are no longer all kept, when a window is held: that window has had every
+    /// push merged as it came, and the read cannot be made to agree with them.
+    pub fn record(&self, channel: &ChannelId, messages: &[Message], limit: u16, mark: ReadMark) {
+        let started = mark.started;
         let mut slots = self.slots();
         let slot = slots.entry(channel.clone()).or_default();
         if slot
@@ -215,13 +294,25 @@ impl RecentWindows {
         {
             return;
         }
-        slot.held = Some(Held {
+        let since = slot.pushes_since(mark);
+        if since.is_none() && slot.held.is_some() {
+            tracing::warn!(
+                channel = %channel,
+                "a channel read was not kept: more pushes arrived while it ran than are journalled"
+            );
+            return;
+        }
+        let mut held = Held {
             messages: messages.to_vec(),
             limit,
             whole: messages.len() < usize::from(limit),
             read_started: started,
             read_finished: Instant::now(),
-        });
+        };
+        for live in since.unwrap_or_default() {
+            apply(&mut held, &live, Applying::AgainOnARead);
+        }
+        slot.held = Some(held);
     }
 
     fn note_failure(&self, channel: &ChannelId, error: ChatError, started: Instant) {
@@ -237,22 +328,21 @@ impl RecentWindows {
         slot.failure = Some((error, started));
     }
 
-    /// Fold one published change into `channel`'s window, when one is held.
+    /// Fold one published change into `channel`'s window, when one is held, and journal it for any
+    /// read of the channel still running.
     ///
-    /// A push never STARTS a window: one message says nothing about what came before it.
+    /// A push never STARTS a window: one message says nothing about what came before it. It is
+    /// journalled all the same, so the read that does start one keeps it.
     pub fn merge(&self, channel: &ChannelId, live: &LiveMessage) {
         let mut slots = self.slots();
-        let Some(held) = slots.get_mut(channel).and_then(|slot| slot.held.as_mut()) else {
-            return;
-        };
-        match live.kind {
-            LiveKind::Delete => held.messages.retain(|m| m.id != live.message.id),
-            LiveKind::Update => {
-                if let Some(at) = held.messages.iter().position(|m| m.id == live.message.id) {
-                    held.messages[at] = merged(&held.messages[at], &live.message);
-                }
-            }
-            LiveKind::Create => insert(held, &live.message),
+        let slot = slots.entry(channel.clone()).or_default();
+        slot.pushes += 1;
+        slot.journal.push_back((slot.pushes, live.clone()));
+        while slot.journal.len() > JOURNAL {
+            slot.journal.pop_front();
+        }
+        if let Some(held) = slot.held.as_mut() {
+            apply(held, live, Applying::AsItArrives);
         }
     }
 
@@ -348,6 +438,32 @@ impl Drop for Claim {
     }
 }
 
+/// Whether a push is being applied as it arrives, or again on top of a read that was running when
+/// it arrived.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Applying {
+    AsItArrives,
+    AgainOnARead,
+}
+
+/// Fold one push into a window.
+fn apply(held: &mut Held, live: &LiveMessage, applying: Applying) {
+    match live.kind {
+        LiveKind::Delete => held.messages.retain(|m| m.id != live.message.id),
+        LiveKind::Update => {
+            if let Some(at) = held.messages.iter().position(|m| m.id == live.message.id) {
+                held.messages[at] = merged(&held.messages[at], &live.message);
+            }
+        }
+        // The read is at least as new as the creation, so its copy of a message it brought — the
+        // text after a later edit whose push is still on its way, say — is the one to keep.
+        LiveKind::Create
+            if applying == Applying::AgainOnARead
+                && held.messages.iter().any(|m| m.id == live.message.id) => {}
+        LiveKind::Create => insert(held, &live.message),
+    }
+}
+
 /// The message a live edit leaves behind: the edit, keeping what an echo cannot see.
 ///
 /// A live copy carries no reactions and may carry no thread; neither absence means "removed", so
@@ -426,8 +542,10 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
     if let Some(claim) = claim {
         let state = state.clone();
         tokio::spawn(async move {
-            // Begun when asked for, not when a permit came free: the window is no newer than that.
-            let started = Instant::now();
+            // Begun when asked for, not when a permit came free: the window is no newer than that,
+            // and every push from then on is applied to it again. See the module documentation.
+            let mark = claim.windows.mark(&claim.channel);
+            let started = mark.started();
             let read = match claim.windows.reading.acquire().await {
                 Ok(_permit) => state.chat.fetch_recent(&claim.channel, limit).await,
                 Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
@@ -441,9 +559,7 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
                         millis,
                         "recent window refreshed"
                     );
-                    claim
-                        .windows
-                        .record(&claim.channel, &messages, limit, started);
+                    claim.windows.record(&claim.channel, &messages, limit, mark);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -542,7 +658,7 @@ mod tests {
         assert!(!windows.holds(&channel), "a push started a window");
 
         let read = [message(id(1), "one"), message(id(2), "two")];
-        windows.record(&channel, &read, 3, Instant::now());
+        windows.record(&channel, &read, 3, windows.mark(&channel));
         assert!(windows.snapshot(&channel).held.expect("held").whole);
 
         windows.merge(&channel, &live(LiveKind::Create, message(id(3), "three")));
@@ -587,7 +703,7 @@ mod tests {
         let channel = ChannelId("1".to_owned());
         let mut read = message(id(1), "one");
         read.reactions = Some(Vec::new());
-        windows.record(&channel, &[read], 50, Instant::now());
+        windows.record(&channel, &[read], 50, windows.mark(&channel));
         windows.merge(&channel, &live(LiveKind::Create, message(id(1), "one")));
         windows.merge(&channel, &live(LiveKind::Update, message(id(1), "one!")));
         let held = windows.snapshot(&channel).held.expect("held");
@@ -600,17 +716,127 @@ mod tests {
     async fn an_older_read_finishing_late_does_not_replace_a_newer_one() {
         let windows = RecentWindows::new();
         let channel = ChannelId("1".to_owned());
-        let early = Instant::now();
+        let early = windows.mark(&channel);
         tokio::time::sleep(Duration::from_secs(1)).await;
-        windows.record(&channel, &[message(id(2), "newer")], 50, Instant::now());
+        windows.record(
+            &channel,
+            &[message(id(2), "newer")],
+            50,
+            windows.mark(&channel),
+        );
         windows.record(&channel, &[message(id(1), "older")], 50, early);
         assert_eq!(ids(&windows, &channel), [id(2).to_string()]);
 
-        windows.note_failure(&channel, ChatError::Transport("late".to_owned()), early);
+        windows.note_failure(
+            &channel,
+            ChatError::Transport("late".to_owned()),
+            early.started(),
+        );
         assert!(
             windows.snapshot(&channel).failure.is_none(),
             "a failure of a read older than the held window is not news"
         );
+    }
+
+    fn contents(windows: &RecentWindows, channel: &ChannelId) -> Vec<String> {
+        windows
+            .snapshot(channel)
+            .held
+            .expect("held")
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    /// The provider answers with the channel as it stood when the read began; the pushes that
+    /// arrived while it ran are applied again, rather than undone by the read landing.
+    #[tokio::test]
+    async fn the_pushes_that_arrive_while_a_read_runs_are_applied_to_what_it_brings() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let before = [message(id(1), "one"), message(id(2), "about to go")];
+        windows.record(&channel, &before, 50, windows.mark(&channel));
+
+        let mark = windows.mark(&channel);
+        windows.merge(
+            &channel,
+            &live(LiveKind::Create, message(id(3), "pushed mid read")),
+        );
+        windows.merge(&channel, &live(LiveKind::Delete, message(id(2), "")));
+        windows.merge(
+            &channel,
+            &live(LiveKind::Update, message(id(1), "one, edited")),
+        );
+        windows.merge(&channel, &live(LiveKind::Create, message(id(4), "four")));
+        // The read's picture predates three of the pushes, and already has the fourth message
+        // with an edit whose push has not arrived yet.
+        let read = [
+            message(id(1), "one"),
+            message(id(2), "about to go"),
+            message(id(4), "four, edited"),
+        ];
+        windows.record(&channel, &read, 50, mark);
+
+        assert_eq!(
+            contents(&windows, &channel),
+            ["one, edited", "pushed mid read", "four, edited"]
+        );
+        // And a read whose mark comes after every push applies none of them.
+        let later = windows.mark(&channel);
+        windows.record(&channel, &read, 50, later);
+        assert_eq!(
+            contents(&windows, &channel),
+            ["one", "about to go", "four, edited"]
+        );
+    }
+
+    /// A push never starts a window, but the read that does start one keeps a push that arrived
+    /// while it ran.
+    #[tokio::test]
+    async fn the_first_read_of_a_channel_keeps_a_push_that_arrived_while_it_ran() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let mark = windows.mark(&channel);
+        windows.merge(&channel, &live(LiveKind::Create, message(id(2), "pushed")));
+        assert!(!windows.holds(&channel));
+        windows.record(&channel, &[message(id(1), "read")], 50, mark);
+        assert_eq!(contents(&windows, &channel), ["read", "pushed"]);
+    }
+
+    /// More pushes during one read than the journal keeps: the read cannot be made to agree with
+    /// them, so a held window — which had every one merged as it came — is kept instead.
+    #[tokio::test]
+    async fn a_read_whose_pushes_are_no_longer_all_kept_does_not_replace_a_held_window() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        windows.record(
+            &channel,
+            &[message(id(1), "one")],
+            3,
+            windows.mark(&channel),
+        );
+        let mark = windows.mark(&channel);
+        let pushed = u64::try_from(JOURNAL).expect("small") + 2;
+        for n in 2..=pushed {
+            windows.merge(&channel, &live(LiveKind::Create, message(id(n), "pushed")));
+        }
+        let fed = ids(&windows, &channel);
+        windows.record(&channel, &[message(id(1), "stale")], 3, mark);
+        assert_eq!(
+            ids(&windows, &channel),
+            fed,
+            "a stale read replaced a fed window"
+        );
+
+        // A journal that still reaches back to the mark is applied in full.
+        let mark = windows.mark(&channel);
+        windows.merge(
+            &channel,
+            &live(LiveKind::Create, message(id(pushed + 1), "newest")),
+        );
+        windows.record(&channel, &[message(id(pushed), "read")], 3, mark);
+        assert_eq!(contents(&windows, &channel), ["read", "newest"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -618,7 +844,7 @@ mod tests {
         let windows = RecentWindows::new();
         let channel = ChannelId("1".to_owned());
         let full: Vec<Message> = (1..=20).map(|n| message(id(n), "m")).collect();
-        windows.record(&channel, &full, 20, Instant::now());
+        windows.record(&channel, &full, 20, windows.mark(&channel));
         let reuse = Duration::from_secs(15);
         assert!(windows.reusable(&channel, 20, reuse));
         assert!(
