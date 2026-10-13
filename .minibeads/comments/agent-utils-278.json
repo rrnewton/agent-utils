@@ -6,5 +6,13 @@
     "body": "[opus 5.5] Review fixes landed in dcfc996e (remote-ops audit W6 and W7): a failed read in either column, with rows on screen or none, keeps the 45 s poll behind a pushed stream; a live message is kept over a read sent before it; a landed read ends its view's hold, a stream reset is never held, and a held read is made at the hold's end instead of dropped; a pushed stream silent for 40 s is let go. Each proved by a page test counting timeline requests, failing on c6bfed2c. Unverified: not run against a deployment; adapter liveness behind the server is still not checked; reactions, read state, the bookmark and pins from another device take up to 15 min to show behind a pushed stream (stated in the README).",
     "created_at": "2026-10-13T21:56:50.869490261Z",
     "updated_at": "2026-10-13T21:56:50.869490261Z"
+  },
+  {
+    "id": "agent-utils-278-ce5ae9bfa1f",
+    "issue_id": "agent-utils-278",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Second review fixes landed in a821399e (remote-ops audit W6 and W7). A read sent after a live event is believed: events are put back only over reads sent before them, and an edit puts back only its words. Every view a live event left something unsaid of (a message without facts, a removal of a message the store does not hold, an edit or removal of a thread's root) is owed a read: made now for a column showing it, at most once in 10 s (the list of threads once a minute), with the poll at 45 s until it lands, and behind its rows when any other view is next shown. A removal of a message the store does not hold gets the read every removal had before. A root's edit goes into its thread summary. A poll refit never puts the reconcile off. Each is proved by a page test that fails on b3d8081c. Unverified: not run against a deployment. The bridge's record-less stream now costs a read of the right column as well as Main per 10 s burst. Adapter liveness behind the server is still not checked. Behind a pushed stream, reactions, read state, the bookmark and pins changed on another device still take up to 15 min to show.",
+    "created_at": "2026-10-13T23:01:04.627544024Z",
+    "updated_at": "2026-10-13T23:01:04.627544024Z"
   }
 ]
