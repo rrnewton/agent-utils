@@ -1,10 +1,10 @@
 /* agent-utils website: the one stylesheet.
  *
  * No external resources of any kind: system fonts, no images except the local favicon and the
- * demo clips under media/, and a page Content-Security-Policy that would refuse anything else. Colours follow the visitor's
+ * demo clips under media/, and a page Content-Security-Policy that would refuse anything else. Colors follow the visitor's
  * system preference; the header's System/Light/Dark buttons (shown only when JavaScript runs)
- * store an override that sets <html data-theme>. Every text colour pair below meets WCAG AA in
- * both themes; scripts/check_site.py checks structure, links and origins, not colours, so keep
+ * store an override that sets <html data-theme>. Every text color pair below meets WCAG AA in
+ * both themes; scripts/check_site.py checks structure, links and origins, not colors, so keep
  * the ratios in mind when you change a value.
  */
 
@@ -475,6 +475,11 @@ main {
   line-height: 1.45;
   color: var(--text);
   max-width: 36rem;
+}
+
+.hero .hero-text {
+  max-width: 36rem;
+  font-size: 1.05rem;
 }
 
 .actions {

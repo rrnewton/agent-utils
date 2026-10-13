@@ -48,12 +48,12 @@
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
-<li><a href="vibe-talk.html" aria-current="page">vibe-talk</a></li>
+<li><a href="vibe-talk.html" aria-current="page">vibe-talk demo</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils">Source</a></li>
 </ul>
 </nav>
-<div class="theme-switch" role="group" aria-label="Colour theme">
+<div class="theme-switch" role="group" aria-label="Color theme">
 <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
 <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
 <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
@@ -70,7 +70,7 @@
 <p class="lead">A small Rust web server and phone web app for reading, discussing and replying to your coding agents' chat messages when you are away from the terminal: one-sentence summaries of long messages, named threads, replies from the phone, read-aloud and voice conversation.</p>
 <div class="callout" role="note" aria-labelledby="about-clips">
 <p class="callout-title" id="about-clips">About the clips on this page</p>
-<p>They show the real vibe-talk server and page, built from this repository, but no live chat service and no live model. The Google Chat space is a local mock bridge. The summaries and thread names come from a local mock Messages API that returns hand-written text after a short delay. The project, its agents and its owner are fictional. The tap ripple and the desktop pointer are drawn by the recorder, not by vibe-talk. <a href="#real">What is real and what is a stand-in</a> has the details.</p>
+<p>They show the real vibe-talk server and page, built from this repository, but no live chat service and no live model. The Google Chat space is a local mock bridge. The summaries and thread names come from a local mock of Anthropic's Messages API that returns hand-written text after a short delay. The project, its agents and its owner are fictional. The tap ripple and the desktop pointer are drawn by the recorder, not by vibe-talk. <a href="#real">What is real and what is a stand-in</a> has the details.</p>
 </div>
 </div>
 </div>
@@ -112,7 +112,7 @@
 <figcaption>Long agent reports collapse to one-sentence summaries with one tap.</figcaption>
 </figure>
 <div class="clip-text">
-<p>The channel of a fictional Google Chat space, on a phone. Long agent messages are folded to their first three lines. Tapping <strong>Summaries</strong> replaces each folded message with a tinted, labelled one-sentence summary, and the view scrolls through the day's plan, a test fix, a feature report and an approval request.</p>
+<p>The channel of a fictional Google Chat space, on a phone. Long agent messages are folded to their first three lines. Tapping <strong>Summaries</strong> replaces each folded message with a tinted, labeled one-sentence summary, and the view scrolls through the day's plan, a test fix, a feature report and an approval request.</p>
 <p>Each summary is one plain Messages API call with no tools, made once per message and then kept. The full message stays one tap away.</p>
 <p class="clip-meta">12.8 seconds, 1.4 MB · <a href="media/vibe-talk/channel-summaries.gif">Open the animation</a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#a-long-message-can-be-read-as-a-summary-of-itself">a long message can be read as a summary of itself</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#summaries">summaries</a></p>
@@ -129,7 +129,7 @@
 <figcaption>One tap opens the full report, drawn as the agent wrote it.</figcaption>
 </figure>
 <div class="clip-text">
-<p>A worker's report on a CSV export feature starts as its one-sentence summary and opens with a tap. The server renders the message's markup: bold headings, bullets, a results table, a numbered list and labelled links. The agent's <code>[worker-2]</code> tag and its title sit in the row header.</p>
+<p>A worker's report on a CSV export feature starts as its one-sentence summary and opens with a tap. The server renders the message's markup: bold headings, bullets, a results table, a numbered list and labeled links. The agent's <code>[worker-2]</code> tag and its title sit in the row header.</p>
 <p class="clip-meta">9.6 seconds, 0.8 MB · <a href="media/vibe-talk/long-report.gif">Open the animation</a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#how-message-text-is-drawn">how message text is drawn</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#rich-headers">rich headers</a></p>
 </div>
@@ -191,7 +191,7 @@
 <section class="section" id="real" aria-labelledby="real-title">
 <div class="wrap">
 <div class="section-head">
-<p class="eyebrow">Honesty</p>
+<p class="eyebrow">Provenance</p>
 <h2 id="real-title">What is real in the clips, and what is a stand-in</h2>
 <p>The clips were recorded to show the page, not to prove a deployment. Everything on screen is drawn by vibe-talk, but the chat service and the model behind it were local mocks.</p>
 </div>
@@ -249,7 +249,7 @@
 <tr><th scope="row">Google Chat</th><td>Through a compatible HTTP bridge that speaks Discord's API. You supply the bridge; none ships with agent-utils.</td><td>Reading has been exercised with real read-only traffic. Posting tests use local fakes.</td></tr>
 <tr><th scope="row">Slack</th><td>Built in, through a small fixed part of the Slack Web API.</td><td>The status table has no row for Slack. Its tests run against a local fake Slack server.</td></tr>
 <tr><th scope="row">Summaries and thread names</th><td>One plain Messages API call each: the Anthropic API, Google Vertex, or a gateway that speaks the Vertex path.</td><td>Tested against a local mock Messages API only; never run against a live model provider.</td></tr>
-<tr><th scope="row">Summaries without a model provider</th><td>The configured ElevenLabs conversational agent.</td><td>Never run against live ElevenLabs. With neither configured, long messages show as failed summaries; nothing falls back to truncation.</td></tr>
+<tr><th scope="row">Summaries from ElevenLabs instead</th><td>With no model provider configured, the ElevenLabs conversational agent writes them.</td><td>Never run against live ElevenLabs. With neither configured, long messages show as failed summaries; nothing falls back to truncation.</td></tr>
 <tr><th scope="row">Read-aloud</th><td>The phone's own speech engine, or ElevenLabs.</td><td>Device speech is a prototype.</td></tr>
 <tr><th scope="row">Voice conversation</th><td>ElevenLabs by default, or a WebSocket provider that your deployment runs.</td><td>A real ElevenLabs agent has been reached; in the README's last test it answered but called none of vibe-talk's tools.</td></tr>
 <tr><th scope="row">TLS</th><td>Not included. Terminate it in front of the server, or do not expose the server at all.</td><td>—</td></tr>
@@ -264,7 +264,7 @@
 <div class="section-head">
 <p class="eyebrow">Try it</p>
 <h2 id="try-title">Running it yourself</h2>
-<p>vibe-talk's quickstart goes from nothing to a talking agent in six steps, with exact commands: a Discord bot, the server's two tokens, a build, an optional step that puts it on the internet, an ElevenLabs agent, and a first conversation. It budgets about an hour for all six, and half that if you stop once the server runs. Its first section says which steps are first contact with a vendor, so a failure there reads as expected rather than as a broken build.</p>
+<p>vibe-talk's quickstart has six steps with exact commands: a Discord bot, the server's two tokens, a build, an optional step that puts it on the internet, an ElevenLabs agent, and a first conversation. It budgets about an hour for all six, and half that if you stop once the server runs. Two steps are first contact with a live vendor. Step 3 has never made an authenticated call to Discord. Step 5, pairing an ElevenLabs agent with vibe-talk, has not been seen working: the quickstart says no one has completed it, and in the README's last test a real agent answered but did not use vibe-talk's tools. The quickstart says all this up front, so a failure there reads as expected rather than as a broken build.</p>
 </div>
 <div class="grid grid-2">
 <div>
@@ -329,12 +329,12 @@ python3 scripts/check_site.py</code></pre>
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
-<li><a href="vibe-talk.html">vibe-talk</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/tree/main/site">Page source (site/)</a></li>
 </ul>
 </div>
 </div>
-<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your colour theme.</p>
+<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your color theme.</p>
 </div>
 </footer>
 </body>

@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>agent-utils: run a team of coding agents on one project</title>
-<meta name="description" content="agent-utils is an open-source suite of command-line tools for running a team of coding agents on one project: one coordinator you talk to, subagents in isolated Git worktrees, and plumbing that keeps their work visible, recoverable and landed.">
+<meta name="description" content="agent-utils is an open-source set of Linux command-line tools and agent instructions for running several coding agents on one project: one coordinator you talk to, subagents in isolated Git worktrees, and plumbing that keeps their work visible and recoverable until it lands.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
 (function () {
@@ -48,12 +48,12 @@
 <li><a href="index.html" aria-current="page">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
-<li><a href="vibe-talk.html">vibe-talk</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils">Source</a></li>
 </ul>
 </nav>
-<div class="theme-switch" role="group" aria-label="Colour theme">
+<div class="theme-switch" role="group" aria-label="Color theme">
 <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
 <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
 <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
@@ -67,16 +67,18 @@
 <div>
 <p class="eyebrow">Open source · MIT · Linux</p>
 <h1 id="hero-title">agent-utils</h1>
-<p class="tagline">Run a team of coding agents on one project and stay in charge of it. You talk to one coordinator agent. Each subagent works in its own isolated checkout. The rest of the suite keeps their work visible, recoverable and landed.</p>
+<p class="tagline">Linux command-line tools and agent instructions for running several coding agents, such as Claude Code and Codex, on one project at once.</p>
+<p class="hero-text">You talk to one coordinator agent. It gives each task to a subagent in its own Git worktree, checks the result itself, and merges or pushes it under your project's rules. Every agent stays in a terminal tab you can open and type into.</p>
+<p class="hero-text muted">For developers who already use a command-line coding agent and want several working on one repository for hours, on one Linux machine, without losing track of them.</p>
 <div class="actions">
 <a class="button button-primary" href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Get started</a>
+<a class="button button-secondary" href="architecture.html">How it works</a>
 <a class="button button-secondary" href="https://github.com/rrnewton/agent-utils">Source</a>
 </div>
 <ul class="facts" aria-label="At a glance">
-<li>Harness tools: Linux only</li>
-<li>Python 3.10+, nothing to build</li>
-<li>Needs Herdr (separate project)</li>
-<li>Pre-1.0; agentctl is beta</li>
+<li>Core tools: Linux only, Python 3.10+, nothing to build</li>
+<li>Needs Herdr, a separate terminal server</li>
+<li>Pre-1.0; the session tool, agentctl, is beta</li>
 </ul>
 </div>
 <figure class="prompt-card">
@@ -89,7 +91,7 @@
 <li>It detects your project and host, and shows a dependency table.</li>
 <li>It asks about ten questions, each with a default.</li>
 <li>It lists every action and waits for your yes.</li>
-<li>It builds the harness, checks it, and starts your coordinator.</li>
+<li>It moves your checkout one level down into a new project folder, the harness, checks every tool, and starts your coordinator there.</li>
 </ol>
 </div>
 </figure>
@@ -107,42 +109,42 @@
 <article class="card problem">
 <h3>Agents trip over each other</h3>
 <p>Two agents in one checkout overwrite each other's edits and branches, and one runaway build can fill the disk for everyone.</p>
-<p class="answer"><strong>wrkslots</strong> gives every agent its own Git worktree slot on its own branch, with per-slot resource limits and, optionally, its own sparse disk image.</p>
+<p class="answer"><strong><a href="tools.html#wrkslots">wrkslots</a></strong> gives every agent its own Git worktree slot on its own branch, with per-slot resource limits and, optionally, its own sparse disk image.</p>
 </article>
 <article class="card problem">
 <h3>Prompts get lost or sent twice</h3>
 <p>A follow-up typed into the wrong terminal, or resent because the first attempt looked like it failed, is easy to miss and hard to undo.</p>
-<p class="answer"><strong>agentctl</strong> delivers through a durable queue, checks the recipient before and after every keystroke, and sets aside a delivery it cannot confirm instead of replaying it.</p>
+<p class="answer"><strong><a href="tools.html#agentctl">agentctl</a></strong> delivers through a durable queue, checks the recipient before and after every keystroke, and sets aside a delivery it cannot confirm instead of replaying it.</p>
 </article>
 <article class="card problem">
 <h3>Background agents are hard to trust</h3>
 <p>An agent you cannot watch or interrupt is an agent you have to take on faith.</p>
-<p class="answer">Every agent runs as its own terminal interface in a tab of <strong>Herdr</strong>, a persistent terminal server, so you can attach to any of them and type.</p>
+<p class="answer">Every agent runs as its own terminal interface in a tab of <strong><a href="tools.html#herdr">Herdr</a></strong>, a persistent terminal server, so you can attach to any of them and type.</p>
 </article>
 <article class="card problem">
 <h3>Cleanup destroys work</h3>
 <p>Deleting a worktree that a process still uses, or one that holds unpushed commits, throws away work.</p>
-<p class="answer"><strong>wrkslots</strong> removes a slot only when the evidence shows nothing still uses it: an expired time-to-live and a dead owner, or the owner's own handoff and release. Independent process, Git and path checks must agree, unpublished commits are salvaged first, and missing evidence means no removal.</p>
+<p class="answer"><strong><a href="tools.html#wrkslots">wrkslots</a></strong> deletes a slot only when the evidence shows nothing still uses it: its time-to-live has run out and its owner is dead, or the owner handed it back with a handoff note. Independent process, Git and path checks must agree, unpushed commits are saved first, and if a check cannot be made, it refuses.</p>
 </article>
 <article class="card problem">
 <h3>"Done" is only a claim</h3>
 <p>A subagent that reports "tests pass" has said something. It has not shown it.</p>
-<p class="answer">The <strong>coordinator skill</strong> has the coordinator verify by content (the diff, the test output, the pushed ref), land under the project's own rules, and say what it did not verify.</p>
+<p class="answer">The coordinator follows the <strong><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">coordinator skill</a></strong>, a Markdown file of instructions it reads at start-up. It reads the diff, the test output and the pushed commit itself before calling work done, lands it under the project's own rules, and tells you what it did not check.</p>
 </article>
 <article class="card problem">
 <h3>The supervisor is away</h3>
 <p>Work carries on while you are in a meeting or on your phone, and questions pile up.</p>
-<p class="answer"><strong>agentctl chat</strong> connects a chat space to the coordinator. Google Chat works today: the bridge polls the space, once an hour by default, and setup asks whether to shorten that. The optional <strong>vibe-talk</strong> service is a phone reader and voice for a chat space. It never talks to the coordinator itself, and using it with agentctl chat today needs a piece you supply: a Discord-compatible bridge so vibe-talk can read Google Chat, or an agentctl chat adapter for Discord or Slack.</p>
+<p class="answer"><strong><a href="tools.html#agentctl-chat">agentctl chat</a></strong> connects a chat space to the coordinator. Google Chat works today: the bridge polls the space, once an hour by default, and setup asks whether to shorten that. The optional <strong><a href="vibe-talk.html">vibe-talk</a></strong> service is a phone reader and voice for a chat space. It never talks to the coordinator itself, and using it with agentctl chat today needs a piece you supply: a Discord-compatible bridge so vibe-talk can read Google Chat, or an agentctl chat adapter for Discord or Slack.</p>
 </article>
 <article class="card problem">
 <h3>A sandbox blocks the last step</h3>
 <p>An agent confined from the network can do all the work and still be unable to push it.</p>
-<p class="answer"><strong>herdr-run</strong> runs an allowlisted command, such as <code>git push</code>, in a visible Herdr pane outside the sandbox and records every run. The allowlist is yours to set.</p>
+<p class="answer"><strong><a href="tools.html#herdr-run">herdr-run</a></strong> runs an allowlisted command, such as <code>git push</code>, in a visible Herdr pane outside the sandbox and records every run. The allowlist is yours to set.</p>
 </article>
 <article class="card problem">
 <h3>Shared limits run out quietly</h3>
 <p>Several agents share one machine's CPUs and memory, and often one GitHub account.</p>
-<p class="answer"><strong>dagrun</strong> runs validation as a graph under CPU and memory limits. <strong>gh-paced</strong> paces <code>gh</code> calls, and <strong>agent-usage</strong> reads plan usage without a model call.</p>
+<p class="answer"><strong><a href="tools.html#dagrun">dagrun</a></strong> runs validation as a graph under CPU and memory limits. <strong><a href="tools.html#gh-paced">gh-paced</a></strong> paces <code>gh</code> calls, and <strong><a href="tools.html#agent-usage">agent-usage</a></strong> reads plan usage without a model call.</p>
 </article>
 </div>
 </div>
@@ -153,7 +155,7 @@
 <div class="section-head">
 <p class="eyebrow">Architecture</p>
 <h2 id="arch-title">How it fits together</h2>
-<p class="lead">A project that adopts the suite becomes a <em>harness</em>: a directory that holds the project's primary checkout, a folder of agent slots, a copy of agent-utils, and an <code>AGENTS.md</code> that makes the agent started there the coordinator.</p>
+<p class="lead">A project that adopts the suite becomes a <em>harness</em>: a directory that holds the project's primary checkout, a folder of agent slots, a copy of agent-utils, and an <code>AGENTS.md</code> that makes the agent started there the coordinator. The repository's own documents also call agent CLIs such as Claude Code and Codex "harnesses"; this site calls those agent CLIs and keeps "harness" for the directory.</p>
 </div>
 
 <figure class="arch" aria-labelledby="arch-caption">
@@ -194,7 +196,7 @@
 <ul class="arch-row">
 <li class="arch-node"><b>subagent A</b><span>Claude Code, in its own tab</span></li>
 <li class="arch-node"><b>subagent B</b><span>Codex, in its own tab</span></li>
-<li class="arch-node"><b>subagent C</b><span>another supported harness</span></li>
+<li class="arch-node"><b>subagent C</b><span>another supported agent CLI</span></li>
 </ul>
 </div>
 </div>
@@ -324,11 +326,11 @@
 <li>
 <h3>Tell your agent</h3>
 <blockquote class="prose"><p><code>Adopt agent-utils for this project, following skills/agent-utils-setup/SKILL.md from https://github.com/rrnewton/agent-utils.</code></p></blockquote>
-<p>That sentence is the whole entry point. Say it to a supported agent harness you are logged in to, such as Claude Code or Codex.</p>
+<p>That sentence is the whole entry point. Say it to Claude Code, Codex or another agent CLI the setup skill <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-setup/SKILL.md#phase-1-dependencies">supports</a>, while logged in.</p>
 </li>
 <li>
 <h3>It detects</h3>
-<p>The project (remote, default branch, uncommitted changes, worktrees, submodules), the agent harnesses on your <code>PATH</code>, and what the host offers: Git, Python, Herdr, a user systemd manager and cgroup v2, passwordless sudo or <code>fuse2fs</code> for disk-image slots, user namespaces, and optionally <code>cargo</code>, <code>podman</code> and <code>gh</code>. It always shows you this dependency table before it asks anything.</p>
+<p>The project (remote, default branch, uncommitted changes, worktrees, submodules), the agent CLIs on your <code>PATH</code>, and what the host offers: Git, Python, Herdr, a user systemd manager and cgroup v2, passwordless sudo or <code>fuse2fs</code> for disk-image slots, user namespaces, and optionally <code>cargo</code>, <code>podman</code> and <code>gh</code>. It always shows you this dependency table before it asks anything.</p>
 </li>
 <li>
 <h3>It asks</h3>
@@ -370,13 +372,13 @@
 <div class="section-head">
 <p class="eyebrow">Engineering</p>
 <h2 id="built-title">How it is built</h2>
-<p class="lead">The suite is meant to be checked, not taken on trust. Each of these is a mechanism you can read in the repository.</p>
+<p class="lead">Each of these is a mechanism you can read in the repository.</p>
 </div>
 <div class="grid grid-2">
 <article class="card">
 <h3>Two editions, one contract</h3>
-<p>Five tools (dagrun with its cpuset-alloc companion, tick-hub, pr-landing-planner, herdr-run and agentctl) are written twice, in Python and in Rust, as independent implementations. A differential harness runs both editions on the same representative, adversarial, boundary and seeded-random inputs, and compares machine output, exit behaviour and state.</p>
-<p>They share core contracts, not every feature. Each edition's extensions are listed, and a working audit found drift outside what the differentials compare.</p>
+<p>Five tools (dagrun with its cpuset-alloc companion, tick-hub, pr-landing-planner, herdr-run and agentctl) are written twice, in Python and in Rust, as independent implementations. Differential tests run both editions on the same representative, adversarial, boundary and seeded-random inputs, and compare machine output, exit behavior and state.</p>
+<p>They share core contracts, not every feature. Each edition's extensions are listed, and an audit in October 2026 found the editions differing in places the differential tests do not compare.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#what-is-compared">What is compared</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/README.md#implementations">Editions</a></p>
 </article>
 <article class="card">
@@ -388,11 +390,11 @@
 <article class="card">
 <h3>Fail closed</h3>
 <p>When evidence is missing, the tools refuse and say why. wrkslots will not remove a slot it cannot prove idle. cpuset-alloc will not fall back to an affinity mask a process can escape. gh-paced charges a command it cannot classify as a write. The source-checkout dispatcher never silently swaps one edition for the other.</p>
-<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">wrkslots</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/USER_GUIDE.md#collision-free-cpu-reservations">CPU reservations</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">Engine resolver</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">wrkslots</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/USER_GUIDE.md#collision-free-cpu-reservations">CPU reservations</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/bin/engine-resolver">The dispatcher</a></p>
 </article>
 <article class="card">
-<h3>Honest status</h3>
-<p>Status labels are plain words: core, optional, experimental, external, beta. A check the host cannot run is reported as skipped and never counted as a pass, and hosted CI declares itself partial for the checks it cannot run. Guards come with self-tests that prove they can fail. CI informs a human; it is not a merge gate.</p>
+<h3>How status is reported</h3>
+<p>Badges use plain words such as core, optional, experimental and beta. A check the host cannot run is reported as skipped and never counted as a pass, and hosted CI declares itself partial for the checks it cannot run. Guards come with self-tests that prove they can fail. This repository's own CI reports to a person; it does not block merges.</p>
 <p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#skipped-checks-and-partial-runs">Skipped is not passed</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/README.md#the-suite">Suite status table</a></p>
 </article>
 <article class="card">
@@ -442,12 +444,12 @@
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
-<li><a href="vibe-talk.html">vibe-talk</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/tree/main/site">Page source (site/)</a></li>
 </ul>
 </div>
 </div>
-<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your colour theme.</p>
+<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your color theme.</p>
 </div>
 </footer>
 </body>

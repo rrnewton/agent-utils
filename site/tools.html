@@ -48,12 +48,12 @@
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html" aria-current="page">Tools</a></li>
-<li><a href="vibe-talk.html">vibe-talk</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils">Source</a></li>
 </ul>
 </nav>
-<div class="theme-switch" role="group" aria-label="Colour theme">
+<div class="theme-switch" role="group" aria-label="Color theme">
 <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
 <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
 <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
@@ -67,6 +67,7 @@
 <p class="eyebrow">Tools</p>
 <h1>The tools</h1>
 <p class="lead">Each tool below starts with the problem it solves, then what you get and what it needs. Status and editions are stated as the repository's own documents state them. A tool's own <code>quickstart</code>, user guide and <code>--help</code> stay the authority for how to use it.</p>
+<p>Several tools exist twice, as independent Python and Rust implementations called <em>editions</em>; the badge on each tool says which it has. Paired editions follow a two-edition contract: they share their core commands and output, and each one's extras are listed. A harness runs the Python edition unless you ask for Rust.</p>
 <nav class="toc" aria-label="Tools on this page">
 <div>
 <p class="toc-label">Core</p>
@@ -118,7 +119,7 @@
 <section aria-labelledby="core">
 <div class="group-head">
 <h2 id="core">Core</h2>
-<p>Always set up. Together they let one coordinator delegate safely: named sessions, isolated workspaces, and a way for you to reach the coordinator.</p>
+<p>agentctl and wrkslots are always set up; the chat bridge is core too, but you can connect it later. Together they let one coordinator delegate safely: named sessions, isolated workspaces, and a way for you to reach the coordinator.</p>
 </div>
 
 <section class="tool tool-core" id="agentctl" aria-labelledby="agentctl-title">
@@ -147,10 +148,10 @@
 <ul>
 <li><code>start</code>, <code>send</code>, <code>read</code>, <code>wait</code>, <code>status</code>, <code>list</code> and <code>stop</code> on named sessions.</li>
 <li>Checks the recipient pane before and after every keystroke, reads it back to confirm delivery, and quarantines a probable misroute.</li>
-<li>Launch profiles in a private, git-ignored <code>.agentctl/profiles.json</code>: harness, mode, model, effort, literal arguments and environment, passed without shell expansion.</li>
+<li>Launch profiles in a private, git-ignored <code>.agentctl/profiles.json</code>: which agent CLI (the profile's <code>harness</code> field), mode, model, effort, literal arguments and environment, passed without shell expansion.</li>
 <li><code>start --slot</code> runs an agent inside a wrkslots slot's box.</li>
 <li><code>doctor</code> compares the registry with what Herdr reports; <code>capabilities</code> lists what this installation includes.</li>
-<li><code>agentctl skill install</code> installs its bundled skill for supported harnesses.</li>
+<li><code>agentctl skill install</code> installs its bundled skill for supported agent CLIs.</li>
 </ul>
 </div>
 <div>
@@ -230,20 +231,20 @@
 <section class="tool tool-core" id="agentctl-chat" aria-labelledby="agentctl-chat-title">
 <div class="tool-head">
 <h3 id="agentctl-chat-title"><code>agentctl chat</code></h3>
-<p class="badges"><span class="badge badge-core">core</span><span class="badge">setup can defer it</span><span class="badge badge-edition">Python + Rust, different bridges</span></p>
+<p class="badges"><span class="badge badge-core">core</span><span class="badge">connect later</span><span class="badge badge-edition">Python + Rust, different bridges</span></p>
 </div>
 <p class="tool-lede">Connects a chat space to one coordinator running in Herdr: allowed messages are typed into its pane, and its marked replies go back to the original thread.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
 <dd>You want to hand the coordinator work, and hear back, while you are away from the terminal, without giving every worker its own chat connection.</dd>
 <dt>What you get</dt>
-<dd>Messages from allow-listed senders only, stored durably before anything else happens. A reaction that means "received", not "done". Replies the agent writes between marker lines in its own output, posted to the right thread and retried under a stable request ID so they are not posted twice. A delivery whose outcome is uncertain is recorded, never retyped.</dd>
+<dd>Messages from allowlisted senders only, stored durably before anything else happens. A reaction that means "received", not "done". Replies the agent writes between marker lines in its own output, posted to the right thread and retried under a stable request ID so they are not posted twice. A delivery whose outcome is uncertain is recorded, never retyped.</dd>
 <dt>Needs</dt>
-<dd>Herdr. For Google Chat: a space ID, your user ID for the allow-list, and an OAuth access token or a command that prints one.</dd>
+<dd>Herdr. For Google Chat: a space ID, your user ID for the allowlist, and an OAuth access token or a command that prints one.</dd>
 <dt>Use it when</dt>
 <dd>You want to reach the coordinator from chat. Without it, you talk to the coordinator in its Herdr tab.</dd>
 <dt>Status</dt>
-<dd>Core, and setup lets you connect it later. Google Chat works today through the polling transport, once an hour by default; <code>--interval</code> sets a shorter cycle, down to a fraction of a second, and an operator-supplied event command delivers messages at once. The subscription-plugin protocol has no shipping provider yet. A coordinator started with <code>chat launch</code> belongs to the bridge's shell, not to agentctl's registry, so <code>agentctl send coordinator</code>, which tick-hub's delivery script uses, does not reach it. Prompts arrive as pasted terminal input, not through a native harness protocol, and reply capture depends on Herdr's bounded scrollback, so a clipped reply fails visibly rather than being guessed.</dd>
+<dd>Core, and setup lets you connect it later. Google Chat works today through the polling transport, once an hour by default; <code>--interval</code> sets a shorter cycle, down to a fraction of a second, and an operator-supplied event command delivers messages at once. The subscription-plugin protocol has no shipping provider yet. A coordinator started with <code>chat launch</code> belongs to the bridge's shell, not to agentctl's registry, so <code>agentctl send coordinator</code>, which tick-hub's delivery script uses, does not reach it. Prompts arrive as pasted terminal input, not through the agent CLI's own protocol, and reply capture depends on Herdr's bounded scrollback, so a clipped reply fails visibly rather than being guessed.</dd>
 <dt>Editions</dt>
 <dd>Two different bridges. Python: Google Chat polling, operator adapters, <code>chat launch</code> to start a coordinator and its bridge together in one Herdr pane, and <code>chat context</code>. Rust: an event-driven host for an installed subscription plugin, a separate one-shot outbound helper, and <code>sent</code> and <code>thread</code> for checking delivery. The agentctl-chat skill describes the Rust bridge.</dd>
 </dl>
@@ -310,7 +311,7 @@
 <section aria-labelledby="optional">
 <div class="group-head">
 <h2 id="optional">Optional</h2>
-<p>Offered during setup, never pushed, and addable later by asking the coordinator. Not every one is offered by setup: cpuset-alloc, parallel-experiment-runner and agent-usage are used directly.</p>
+<p>Offered during setup, never forced on you, and addable later by asking the coordinator. Not every one is offered by setup: cpuset-alloc, parallel-experiment-runner and agent-usage are used directly.</p>
 </div>
 
 <section class="tool" id="herdr-run" aria-labelledby="herdr-run-title">
@@ -331,7 +332,7 @@
 <dt>Status</dt>
 <dd>Optional, at version 0.4. Its allowlist is "a cooperative safety rail", not a containment boundary against a hostile process running as the same user. A command that outruns its timeout keeps running. The audit log is best-effort. Its end-to-end differential tests run against a fake Herdr.</dd>
 <dt>Editions</dt>
-<dd>Python and Rust, cross-checked by the differential harness.</dd>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
 </dl>
 <div class="tool-cols">
 <div>
@@ -339,7 +340,7 @@
 <ul>
 <li>Splits the command, checks the bare program name against policy, re-quotes every argument, and refuses known self-escapes.</li>
 <li>Captures results through files, not by scraping the screen.</li>
-<li>Will not type over a person: readiness checks are conservative, and one lock per pane serialises use.</li>
+<li>Will not type over a person: readiness checks are conservative, and one lock per pane serializes use.</li>
 <li>Bounded tabs: at the cap, a new tab replaces the least recently used idle one, and <code>reap</code> reports finished ones.</li>
 <li>Run records are pruned after four days by default. <code>net-doctor</code> checks that a pane can reach what the caller's sandbox cannot.</li>
 </ul>
@@ -381,7 +382,7 @@
 <dt>Status</dt>
 <dd>Optional, at version 0.2. It does not schedule itself or deliver what it prints; in a harness, a small <code>tick-deliver</code> script run by a 15-minute timer sends the tick's output to the coordinator with <code>agentctl send</code> whenever it contains an <code>ACTION:</code> line. Action handlers must be idempotent, because an interrupted run can emit an action before its state is written. There is no related-work document yet.</dd>
 <dt>Editions</dt>
-<dd>Python and Rust, cross-checked by the differential harness.</dd>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
 </dl>
 <h4>Documentation</h4>
 <ul class="doc-links">
@@ -415,7 +416,7 @@
 <dt>Status</dt>
 <dd>Optional, at version 0.15, the highest version in the suite. Its README says the shared resource-caps file has known gaps that must be resolved before it is treated as a trustworthy host policy. There is no related-work document yet; the planner design surveys the literature.</dd>
 <dt>Editions</dt>
-<dd>Python and Rust, cross-checked by the differential harness.</dd>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
 </dl>
 <div class="tool-cols">
 <div>
@@ -457,7 +458,7 @@
 <dt>Problem</dt>
 <dd>Concurrent benchmarks or jobs on one host need CPU cores that do not overlap, and reservations left behind by crashed processes must be reclaimed safely.</dd>
 <dt>What you get</dt>
-<dd><code>cpuset-alloc run --cores N --tag T -- CMD</code> launches the command in a cgroup scope verified to be limited to its reserved CPUs, plus <code>status</code> and <code>reclaim</code>. Stale holders are recognised by process ID and start time.</dd>
+<dd><code>cpuset-alloc run --cores N --tag T -- CMD</code> launches the command in a cgroup scope verified to be limited to its reserved CPUs, plus <code>status</code> and <code>reclaim</code>. Stale holders are recognized by process ID and start time.</dd>
 <dt>Needs</dt>
 <dd>Linux cgroups. It is a companion command inside the dagrun distribution and crate; setup does not offer it separately.</dd>
 <dt>Status</dt>
@@ -649,9 +650,9 @@
 <dt>Needs</dt>
 <dd>Python 3.10 or newer, or a Rust build; <code>gh</code> and <code>git</code> for live mode. Fixture mode needs no network.</dd>
 <dt>Status</dt>
-<dd>Experimental, at version 0.1. It "never merges, rebases, labels, refires, or otherwise mutates a pull request"; live mode only updates private refs in the clone you give it and may write a local plan archive. A separate, authorised operator does any landing, guided by the pr-landing-operations skill, and only where the repository's own rules allow it. There is no related-work document yet.</dd>
+<dd>Experimental, at version 0.1. It "never merges, rebases, labels, refires, or otherwise mutates a pull request"; live mode only updates private refs in the clone you give it and may write a local plan archive. A separate, authorized operator does any landing, guided by the pr-landing-operations skill, and only where the repository's own rules allow it. There is no related-work document yet.</dd>
 <dt>Editions</dt>
-<dd>Python and Rust, cross-checked by the differential harness.</dd>
+<dd>Python and Rust, cross-checked by the differential tests.</dd>
 </dl>
 <h4>Documentation</h4>
 <ul class="doc-links">
@@ -768,7 +769,7 @@
 <section class="section" aria-labelledby="install-title">
 <h2 id="install-title">Installing a tool on its own</h2>
 <div class="prose">
-<p>In a harness the core tools need no installing: the setup agent links the source-checkout dispatchers as <code>agent-utils/bin</code>, and they run the Python edition without a build. The exceptions are gh-paced and agent-usage, which are built with <code>cargo</code>, and vibe-talk, which is deployed separately. To use one tool outside a harness, install it from a checkout of this repository:</p>
+<p>In a harness the core tools need no installing: the commands in <code>agent-utils/bin</code> run straight from the checkout on the Python edition. The exceptions are gh-paced and agent-usage, which are built with <code>cargo</code>, and vibe-talk, which is deployed separately. To use one tool outside a harness, install it from a checkout of this repository:</p>
 <pre tabindex="0"><code>python3 -m pip install ./py/wrkslots      # a Python distribution
 cargo install --path rs/agentctl          # a Rust crate</code></pre>
 <p>Every paired tool and every Python-only tool has its own installable distribution; gh-paced and agent-usage are built from <code>rs/</code>. This site does not claim that any of them is published to a package index. See the <a href="https://github.com/rrnewton/agent-utils/blob/main/py/README.md">Python distributions</a> and <a href="https://github.com/rrnewton/agent-utils/blob/main/rs/README.md">Rust crates</a> for the full lists.</p>
@@ -804,12 +805,12 @@ cargo install --path rs/agentctl          # a Rust crate</code></pre>
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
-<li><a href="vibe-talk.html">vibe-talk</a></li>
+<li><a href="vibe-talk.html">vibe-talk demo</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/tree/main/site">Page source (site/)</a></li>
 </ul>
 </div>
 </div>
-<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your colour theme.</p>
+<p class="footer-note">agent-utils is MIT-licensed, pre-1.0 software for Linux. Herdr is a separate project. This site is hand-written HTML and CSS with no external resources; its only script remembers your color theme.</p>
 </div>
 </footer>
 </body>

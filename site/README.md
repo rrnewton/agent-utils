@@ -32,7 +32,7 @@ repository's own documents, which stay the authority.
   for directories, and only to tracked paths that are not symlinks.
 - Introduce a tool by the user's problem, the useful outcome, then its dependencies, and state its
   maturity the way its own documents do. This is a public page: never name a project that
-  consumes agent-utils, and keep host- or organisation-specific details out.
+  consumes agent-utils, and keep host- or organization-specific details out.
 - Every image has `alt`. GIFs stay at or under 3 MB.
 - A demo clip is a `<picture>`: the GIF in the `<img>`, with its own `width` and `height` so the
   page does not shift when it loads, and `loading="lazy"`; and its still poster as a `<source>`
