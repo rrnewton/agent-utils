@@ -17774,13 +17774,14 @@ function loadOutgoingMessages() {
       const entry = outgoingFromSaved(held);
       if (!entry) continue;
       outgoingMessages.set(entry.id, entry);
-      if (held.state === "sending" && held.phase === "queued" && entry.placement !== "unknown") queued.push(entry);
+      if (held.state === "sending" && held.phase === "queued") queued.push(entry);
     }
     // `#277 send-order`. A message that was waiting behind an earlier one to the same place still
     // is: it never left the device, and it goes once that one has — after a Retry on this page, or
-    // a Dismiss or Edit. One with nothing ahead of it any more is NOT sent on its own: nobody asked
-    // this page to send it, so it is left to Retry, as before. In order, so a message restored to
-    // the queue holds the ones written after it.
+    // a Dismiss or Edit. So does a reply still to be placed that was waiting behind another. One
+    // with nothing ahead of it any more is NOT sent on its own: nobody asked this page to send it,
+    // so it is left to Retry, as before. In order, so a message restored to the queue holds the ones
+    // written after it.
     for (const entry of queued) {
       Object.assign(entry, { state: "sending", phase: "queued", detail: "" });
       if (outgoingBlocker(entry)) {
@@ -18080,9 +18081,18 @@ function retryOutgoingMessage(id, automatic = false) {
 //     from Dismiss waits for the one already going out.
 //   * Other destinations are not held: a thread does not wait for the main channel or another thread.
 //   * A reply whose thread is still to be found out (`placeReplyTarget`) may be bound for any
-//     destination in its channel, so whatever was written after it in that channel waits for the
-//     placement, and then for its delivery only if both go to the same place. One that could not be
-//     placed posted nothing and holds nothing up. `#185 reply-new-thread`.
+//     destination in its channel, so whatever was written after it in that channel waits for it
+//     until it is placed, and then for its delivery only if both go to the same place. Placing it
+//     can fail — a read that timed out, on a slow bridge — and that posted nothing, but it gave up
+//     no place either: Retry may still send it anywhere in the channel, so what was written after
+//     it waits until it is placed and sent, or dismissed, or edited back into Reply. A read that
+//     failed for a moment is asked again on the automatic schedule below; nothing has been posted,
+//     so asking again cannot post anything twice. `#185 reply-new-thread`.
+//   * The rest of a post cut in parts, after a 207, goes where the server said the parts after the
+//     first went (`continueIn`, `#263 post-split-per-provider`), so it is in that thread's lane as
+//     well as its own: a message written later into that thread waits for it too.
+//   * A message with nothing left to send — a 207 that handed nothing back — can post nothing more,
+//     so it holds nothing up.
 //
 // Each entry keeps its own id and so its own idempotency key across every attempt (`#195
 // send-resilience`): waiting behind another message changes when it goes, never what it is.
@@ -18093,27 +18103,38 @@ function outgoingDestination(channel, threadId) {
 }
 
 /**
+ * The lanes `entry` posts in: its own destination, and the thread the rest of it continues in where
+ * that is another. Null for a reply still to be placed, which may post in any lane of its channel.
+ */
+function outgoingLanes(entry) {
+  if (entry.placement === "unknown") return null;
+  const lanes = [outgoingDestination(entry.channel, entry.threadId)];
+  if (entry.continueIn && entry.continueIn !== entry.threadId) {
+    lanes.push(outgoingDestination(entry.channel, entry.continueIn));
+  }
+  return lanes;
+}
+
+/**
  * The message `entry` has to wait for before it can go, or null when it can go now: by the rules
- * above, the first earlier message in its lane not yet sent, an earlier reply in its channel still
- * finding out where it goes, or a POST to its destination already on the wire. For a reply still to
- * be placed, only an earlier one still being placed: one read places both.
+ * above, the first earlier message in one of its lanes not yet sent, an earlier reply in its channel
+ * not yet placed, or a POST in one of its lanes already on the wire. For a reply still to be placed,
+ * only an earlier one not yet placed either: one read places both.
  */
 function outgoingBlocker(entry) {
-  const lane = entry.placement === "unknown" ? null : outgoingDestination(entry.channel, entry.threadId);
+  const lanes = outgoingLanes(entry);
   let earlier = true;
   for (const other of outgoingMessages.values()) {
     if (other === entry) {
       earlier = false;
       continue;
     }
-    if (other.channel !== entry.channel || other.state === "sent") continue;
-    const unplaced = other.placement === "unknown";
-    // Never placed (refused, unreadable, signed out) means never posted: nothing waits for it.
-    if (unplaced) {
-      if (earlier && other.state === "sending") return other;
+    if (other.channel !== entry.channel || other.state === "sent" || !other.remaining) continue;
+    if (other.placement === "unknown") {
+      if (earlier) return other;
       continue;
     }
-    if (lane === null || outgoingDestination(other.channel, other.threadId) !== lane) continue;
+    if (lanes === null || !outgoingLanes(other).some((lane) => lanes.includes(lane))) continue;
     if (earlier || (other.state === "sending" && other.phase === "posting")) return other;
   }
   return null;
@@ -18132,9 +18153,13 @@ function waitingBehind(ahead) {
     const seconds = Math.max(1, Math.round((waiting.at - Date.now()) / 1000));
     return `${which}, and goes again in ${seconds} s.`;
   }
-  return ahead.state === "unconfirmed"
-    ? `${which}, and its delivery is unconfirmed. Retry or Dismiss it to let this one go.`
-    : `${which}, and was not sent. ${editableSend(ahead) ? "Retry, Edit" : "Retry"} or Dismiss it to let this one go.`;
+  // Only the actions its row offers, so the reader is never sent to a button that is not there.
+  const actions = ["Retry", ...(editableSend(ahead) ? ["Edit"] : [])];
+  const choice = `${actions.join(", ")} or Dismiss it to let this one go.`;
+  if (ahead.state === "unconfirmed") return `${which}, and its delivery is unconfirmed. ${choice}`;
+  return ahead.placement === "unknown"
+    ? `${which}, and was not sent: which thread it goes in is not known yet. ${choice}`
+    : `${which}, and was not sent. ${choice}`;
 }
 
 /**
@@ -18246,6 +18271,8 @@ function outgoingCannotGo(entry, job) {
  */
 async function placeOutgoingMessage(entry, job) {
   if (job.stopped) return;
+  // When this attempt started: the next one's wait counts from here (`planOutgoingRetry`).
+  const startedAt = Date.now();
   try {
     if (outgoingCannotGo(entry, job)) return;
     entry.phase = "placing";
@@ -18259,11 +18286,16 @@ async function placeOutgoingMessage(entry, job) {
       // Nothing has been posted, so this is a plain failure the reader can retry, never the
       // "unconfirmed" of a POST whose answer was lost.
       entry.state = "failed";
-      entry.detail = redact(
-        "The message you answered came in live, and whether it is in a thread could not be " +
-          `found out, so this was not posted anywhere: ${error.message}. Retry once the channel ` +
-          "can be read."
-      );
+      const cause = "The message you answered came in live, and whether it is in a thread could not " +
+        `be found out, so this was not posted anywhere: ${error.message}.`;
+      // `#277 send-order`. A read that failed for a moment — timed out, lost its connection, met the
+      // chat service's 5xx — goes again on its own, as a lost send does: posting nothing, it cannot
+      // post anything twice, and every message written after this reply in its channel waits for
+      // it. A message the read does not carry is an answer, and is left to the reader.
+      const transient = Boolean(error.network || error.timedOut || error.status >= 500 ||
+        error.status === 408 || error.gatewayStatus >= 500);
+      const again = transient && planOutgoingRetry(entry, startedAt, true);
+      entry.detail = redact(again ? cause : `${cause} Retry once the channel can be read.`);
       return;
     }
     if (job.stopped) return;
@@ -18430,7 +18462,8 @@ async function dispatchOutgoingMessage(entry, job) {
 // words under the same key. There, and only there, a transient failure goes again after 3 s, 6 s,
 // 12 s and then every 20 s, six times in all, sooner when the connection returns or the page comes
 // back into view, and then stops and offers Retry. Everywhere else the only automatic send is one
-// that never left the device — held while it knew it was offline.
+// that never left the device — held while it knew it was offline, or a reply whose read to find out
+// which thread it goes in failed for a moment (`#277 send-order`), which posted nothing.
 //
 // `#277 send-order`. The waits were 5 s, 15 s and 45 s, counted from when the attempt FAILED. On a
 // slow bridge that was the wrong clock twice over: an attempt it takes half a minute to fail had
@@ -18483,13 +18516,18 @@ function outgoingRetryWait(used) {
 
 /**
  * After a transient failure of the attempt that started at `startedAt`: arm the next automatic
- * attempt, or leave the row to the reader.
+ * attempt, or leave the row to the reader. Answers whether one was armed.
+ *
+ * `unposted`: the attempt posted nothing — finding out where a reply goes (`placeOutgoingMessage`)
+ * — so going again is safe whether or not the provider honours a key, and spends one of the same
+ * OUTGOING_RETRY_ATTEMPTS. `#277 send-order`.
  */
-function planOutgoingRetry(entry, startedAt) {
+function planOutgoingRetry(entry, startedAt, unposted = false) {
   const used = entry.retriesUsed || 0;
-  if (!retriesItself(entry) || used >= OUTGOING_RETRY_ATTEMPTS) return;
+  if ((!unposted && !retriesItself(entry)) || used >= OUTGOING_RETRY_ATTEMPTS) return false;
   const at = Math.max(startedAt + outgoingRetryWait(used), Date.now() + OUTGOING_RETRY_FLOOR_MS);
   holdOutgoingMessage(entry, { at, offline: navigator.onLine === false, unsent: false });
+  return true;
 }
 
 /** Hold `entry` for an automatic send: at `at`, or when the connection returns. */
@@ -18761,11 +18799,14 @@ function editOutgoingReply(entry, text) {
 function dismissOutgoingMessage(id) {
   const entry = outgoingMessages.get(id);
   if (!entry || (entry.state === "sending" && !waitingItsTurn(entry))) return;
-  // `#277 send-order`. One taken back while it waited its turn was never sent: kept as that, never as
-  // a send that was on its way when the page closed.
-  const copy = entry.state === "sending"
-    ? { ...entry, state: "failed", phase: "", detail: "Dismissed while it waited its turn, so it was not sent." }
-    : { ...entry, phase: "" };
+  // `#277 send-order`. One taken back while it waited its turn was not sent this time: kept as that,
+  // never as a send that was on its way when the page closed — and, where an earlier try of it may
+  // have landed, as unconfirmed rather than as never sent.
+  const copy = entry.state !== "sending" ? { ...entry, phase: "" }
+    : entry.mayHavePosted
+      ? { ...entry, state: "unconfirmed", phase: "",
+        detail: "Dismissed while it waited its turn to go again, after a try whose delivery was not confirmed." }
+      : { ...entry, state: "failed", phase: "", detail: "Dismissed while it waited its turn, so it was not sent." };
   dismissedSends = [{ entry: copy, at: Date.now() },
     ...dismissedSends.filter((held) => held.entry.id !== id)];
   const kept = persistDismissedSends();
