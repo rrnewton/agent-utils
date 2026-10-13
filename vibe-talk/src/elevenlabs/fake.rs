@@ -113,6 +113,9 @@ struct State {
     /// Make the next read of an agent's configuration fail, and nothing else: a mint beside it
     /// still succeeds. One-shot.
     fail_agent_profile: Option<String>,
+    /// Make the next read of an agent's configuration wait this long before it answers: a vendor
+    /// that does not answer in time. One-shot.
+    stall_agent_profile: Option<Duration>,
 }
 
 impl FakeElevenLabs {
@@ -162,6 +165,7 @@ impl FakeElevenLabs {
                 voiceless_agents: BTreeSet::new(),
                 prompt_override: None,
                 fail_agent_profile: None,
+                stall_agent_profile: None,
             })),
         }
     }
@@ -176,6 +180,14 @@ impl FakeElevenLabs {
     /// refusing one call of two that a voice session makes side by side.
     pub fn fail_next_agent_profile(&self, detail: &str) {
         self.lock().fail_agent_profile = Some(detail.to_owned());
+    }
+
+    /// Make the next read of an agent's configuration wait `delay` before it answers, while mints
+    /// keep working: a vendor slower than a caller's deadline. The read is recorded as it starts,
+    /// so a caller that gives up on it has still asked once. Under a paused tokio clock the wait
+    /// costs no real time.
+    pub fn stall_next_agent_profile(&self, delay: Duration) {
+        self.lock().stall_agent_profile = Some(delay);
     }
 
     /// Declare that `agent_id` exists on this account but speaks in no voice of its own.
@@ -404,6 +416,10 @@ impl SignedUrlProvider for FakeElevenLabs {
         self.lock()
             .requested
             .push(agent_request(&config.api_base, agent_id).url);
+        let stall = self.lock().stall_agent_profile.take();
+        if let Some(delay) = stall {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(detail) = self.lock().fail_agent_profile.take() {
             return Err(SignedUrlError::Transport(detail));
         }

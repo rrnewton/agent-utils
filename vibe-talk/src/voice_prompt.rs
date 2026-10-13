@@ -754,6 +754,52 @@ mod tests {
         assert_eq!(agent_reads(), 2, "each call start asked the vendor again");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_vendor_that_does_not_answer_in_time_is_kept_as_a_failure_and_not_asked_again() {
+        // A vendor that keeps timing out is the costlier of the two failures: every call start it
+        // is asked at waits out the whole deadline. Its timeout is kept as "not allowed", as an
+        // error is, so the next call start neither waits on it nor believes an answer it gives.
+        let (state, _discord, _store, elevenlabs) = testing::state_with_store_and_voice();
+        let agent_reads = || {
+            elevenlabs
+                .requested()
+                .iter()
+                .filter(|url| url.contains("/convai/agents/"))
+                .count()
+        };
+        elevenlabs.allow_prompt_override(Some(true));
+        let stall = AGENT_CHECK_DEADLINE * 4;
+        elevenlabs.stall_next_agent_profile(stall);
+        let started = tokio::time::Instant::now();
+        let timed_out = for_session(&state)
+            .await
+            .expect("a hosted agent's session says");
+        assert!(
+            started.elapsed() < stall,
+            "the call start waited for the vendor past its deadline"
+        );
+        assert_eq!(
+            timed_out.transport,
+            PromptTransport::NotSent,
+            "a vendor that did not answer in time was taken for an agent that allows an override"
+        );
+        assert_eq!(timed_out.override_allowed, None);
+        assert_eq!(agent_reads(), 1);
+        let next = for_session(&state)
+            .await
+            .expect("a hosted agent's session says");
+        assert_eq!(
+            agent_reads(),
+            1,
+            "the next call start asked a vendor that had just timed out"
+        );
+        assert_eq!(
+            next.transport,
+            PromptTransport::NotSent,
+            "a timeout was not kept as not allowed"
+        );
+    }
+
     #[tokio::test]
     async fn a_call_carries_nothing_when_nothing_was_written_or_a_bridge_reads_the_profile() {
         let (state, _discord, _store) = testing::state_with_store();
