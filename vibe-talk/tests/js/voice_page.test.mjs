@@ -44315,9 +44315,11 @@ test("`#249 search-highlight`: a folded message whose hit is past its fold says 
   assert.match(line.text(), /^Further down: …plain words without it\. Then the engine stalled at noon, and later the engine restarted\. more plain words here\.…$/,
     `the line does not show the hits with words either side: ${line.text()}`);
   assert.deepStrictEqual(line.descendants().filter((n) => n.tagName === "mark").map((n) => n.text()), ["engine", "engine"]);
-  // After the text, before what follows it; and gone from sight while the message is open.
+  // After the text and the count of what its fold hides (`#244 elision-word-count`), before what
+  // follows them; and gone from sight while the message is open.
   const order = rows[0].children.map((kid) => kid.className);
-  assert.ok(order.indexOf("search-excerpt") === order.indexOf("body clamped") + 1, `the line is not straight after the text: ${order}`);
+  assert.ok(order.indexOf("elided") === order.indexOf("body clamped") + 1 && order.indexOf("search-excerpt") === order.indexOf("elided") + 1,
+    `the line is not straight after the text and its count of hidden words: ${order}`);
   await foldButton(rows[0]).click();
   await page.settle();
   assert.equal(line.hidden, true, "the line stayed under an open message, whose hits are in its text");
