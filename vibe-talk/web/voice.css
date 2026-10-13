@@ -4630,7 +4630,8 @@ a.search-hit-link {
   text-transform: none;
 }
 
-.seam-detail {
+.seam-detail,
+.seam-recap-detail {
   margin: 0.5rem 0 0;
   padding: 0.5rem 0.7rem;
   background: var(--panel);
@@ -4638,6 +4639,35 @@ a.search-hit-link {
   border-radius: 0.5rem;
   color: var(--muted);
   font-size: 0.82rem;
+}
+
+/*
+ * `#270 voice-transcript-markers`. What recap the call below a "new conversation" line was sent, in
+ * at most three words beside the label: "412-word recap sent", "no recap sent", "recap
+ * unsupported". In the label's quiet colour, not shouted in capitals, and free to wrap onto a
+ * second line inside its pill on a narrow phone rather than push the rule off the screen. Its
+ * sentence is a paragraph of its own under the label's, inside the disclosure.
+ */
+.seam-recap {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  letter-spacing: 0;
+  text-transform: none;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* Beside a chip the label keeps to one line, and the chip is what wraps. */
+.seam-summary:has(.seam-recap) .seam-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.seam-recap-detail {
+  margin-top: 0.35rem;
 }
 
 /* ---------------------------------------------------------- message text, as rendered ----- */

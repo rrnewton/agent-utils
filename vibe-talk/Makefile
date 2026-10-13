@@ -188,7 +188,8 @@ send-order-browser:
 # buttons held when it appears; then the frozen card it becomes, filed after its commit and restored
 # by a reload (`#270 voice-transcript-markers`); and at 1280x800 in two columns, wholly above a reply
 # open at the foot of the left column (`#277 reply-in-column`), its Send outlined beside a reply in
-# either column. Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
+# either column; and on the three phones, the line above a hosted call sent a 412-word recap saying
+# so (`#270`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
 # placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
