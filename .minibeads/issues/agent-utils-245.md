@@ -1,10 +1,11 @@
 ---
 title: 'done-feedback: a visible sign that the selected message was just marked Done'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T15:53:41.318517749+00:00
-updated_at: 2026-10-12T15:53:41.318517749+00:00
+updated_at: 2026-10-13T02:03:54.799690578+00:00
+closed_at: 2026-10-13T02:03:54.799690358+00:00
 ---
 
 # Description

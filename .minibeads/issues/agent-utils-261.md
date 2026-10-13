@@ -1,10 +1,11 @@
 ---
 title: 'two-column-connectors: right-angle connector lines between a thread''s root on the left and its card on the right, and newest threads at the bottom'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T20:39:04.284188617+00:00
-updated_at: 2026-10-12T20:39:04.284188617+00:00
+updated_at: 2026-10-13T02:03:54.824971644+00:00
+closed_at: 2026-10-13T02:03:54.824971553+00:00
 ---
 
 # Description

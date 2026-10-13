@@ -1,10 +1,11 @@
 ---
 title: 'timestamp-hover: hovering a message''s time shows its full date (Oct 11, Mon), with the year only when it differs'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T20:28:15.514536076+00:00
-updated_at: 2026-10-12T20:28:15.514536076+00:00
+updated_at: 2026-10-13T02:03:54.818768693+00:00
+closed_at: 2026-10-13T02:03:54.818768573+00:00
 ---
 
 # Description
