@@ -1612,8 +1612,10 @@ Nothing else reads them, a pushed edit or deletion drops the message, and the st
 them. Each channel's newest window is kept so the voice agent's catch-up can answer while the
 provider is slow (`#210 voice-catchup-speed`, `src/recent.rs`): the last read of each listed
 channel plus the changes pushed to it since. Its last 200 pushed changes are kept beside it, so a
-read that lands after one of them does not undo it. There is exactly one store, `src/store/`, and
-it holds these:
+read that lands after one of them does not undo it. The storage purge clears the windows and those
+changes too, and a read that was already running when it came keeps nothing when it lands, so the
+next catch-up reads every channel afresh. There is exactly one store, `src/store/`, and it holds
+these:
 
 * the `/voice` **conversation transcript** — what you said and what the agent said back;
 * **read marks** — how far you have been shown each channel;
@@ -1937,7 +1939,10 @@ clear-unread setting (back to off, in the running server too) alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
-   leaves the read marks alone, because the two are different records;
+   leaves the read marks alone, because the two are different records. It also empties the two
+   copies of channel text held in memory — read-aloud's recent messages and the voice catch-up's
+   channel windows with their pushed changes — and a read already running keeps nothing of what it
+   brings back;
 2. delete the file (`rm ~/.local/share/vibe-talk/vibe-talk.sqlite3`) — with the server stopped; or
 3. delete the mounted directory, which is also what `scripts/run.sh --status` prints.
 

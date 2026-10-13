@@ -2773,6 +2773,12 @@ pub async fn forget_conversations(
 /// It also turns every channel's clear-unread setting back to off (`#232 upstream-mark-read`), in
 /// the running loop as well as in the store, so nothing more is marked read at a provider once
 /// Settings says Off.
+///
+/// And it empties the two copies of channel text held in memory: read-aloud's recently fetched
+/// messages ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`) and the voice
+/// catch-up's channel windows with their journalled pushes
+/// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`). Both refuse what a read
+/// already running when the purge came brings back, so neither can be refilled from before it.
 pub async fn purge_storage(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -2784,6 +2790,7 @@ pub async fn purge_storage(
     drop(changing);
     // Not durable, so not in the list below, but channel text all the same.
     state.read_ahead.clear();
+    state.live.recent().clear();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,

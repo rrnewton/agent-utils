@@ -29,7 +29,8 @@
 //!
 //! Memory only. Nothing here is written to disk, it is gone when the process restarts, and it is
 //! bounded by the channel allowlist times one read's size and [`JOURNAL`] pushes: every path that
-//! records or merges a window is already allowlist-gated.
+//! records or merges a window is already allowlist-gated. The storage purge empties it: see
+//! [`RecentWindows::clear`] and "The purge" below.
 //!
 //! # One read per channel at a time
 //!
@@ -53,6 +54,20 @@
 //! is safe whether or not the provider's answer already had them: a delete stays deleted, an edit
 //! sets the text it carried, and a created message the read already brought is left as the read
 //! has it, since the read is at least as new as the creation.
+//!
+//! # The purge
+//!
+//! `DELETE /api/v1/storage` promises that nothing derived from a channel is left behind, and a
+//! held window and its journal are channel text. So the purge calls [`RecentWindows::clear`],
+//! which drops every window, every journal and every failure, and forgets every refresh running.
+//!
+//! A read already running when that happens must not put its result back when it lands: it read
+//! the channel before the owner asked for everything to go. A [`ReadMark`] therefore also carries
+//! how many purges there had been when it was taken, and [`RecentWindows::record`] keeps nothing
+//! from a read marked before the newest one. That is the cutoff `crate::read_ahead` keeps as a
+//! floor instant, counted instead of timed, so a read marked in the same clock tick as a purge is
+//! never mistaken for one marked after it. The next catch-up finds nothing held and reads every
+//! channel again, as on a fresh start; it does not wait on a refresh begun before the purge.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -163,14 +178,15 @@ pub struct Snapshot {
     pub failure: Option<ChatError>,
 }
 
-/// Where a read of one channel began: when, and how many pushes that channel had had. Taken with
-/// [`RecentWindows::mark`] BEFORE the read asks the provider, and handed back to
-/// [`RecentWindows::record`] with what it read, so the pushes that arrived meanwhile are applied
-/// again rather than lost.
+/// Where a read of one channel began: when, how many pushes that channel had had, and how many
+/// purges there had been. Taken with [`RecentWindows::mark`] BEFORE the read asks the provider,
+/// and handed back to [`RecentWindows::record`] with what it read, so the pushes that arrived
+/// meanwhile are applied again rather than lost, and a purge that came meanwhile is not undone.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadMark {
     started: Instant,
     pushes: u64,
+    purges: u64,
 }
 
 impl ReadMark {
@@ -214,10 +230,19 @@ impl Slot {
     }
 }
 
+/// Everything behind the one lock.
+#[derive(Default)]
+struct Windows {
+    slots: BTreeMap<ChannelId, Slot>,
+    /// How many times [`RecentWindows::clear`] has run. A read marked before the newest keeps
+    /// nothing.
+    purges: u64,
+}
+
 /// Every channel's held window, and the refreshes running for them.
 pub struct RecentWindows {
     timing: Timing,
-    slots: Mutex<BTreeMap<ChannelId, Slot>>,
+    windows: Mutex<Windows>,
     next_refresh: std::sync::atomic::AtomicU64,
     /// [`REFRESH_CONCURRENCY`] permits; a refresh holds one while it reads.
     reading: tokio::sync::Semaphore,
@@ -241,7 +266,7 @@ impl RecentWindows {
     pub fn with_timing(timing: Timing) -> Self {
         Self {
             timing,
-            slots: Mutex::new(BTreeMap::new()),
+            windows: Mutex::new(Windows::default()),
             next_refresh: std::sync::atomic::AtomicU64::new(1),
             reading: tokio::sync::Semaphore::new(REFRESH_CONCURRENCY),
         }
@@ -253,8 +278,8 @@ impl RecentWindows {
         self.timing
     }
 
-    fn slots(&self) -> std::sync::MutexGuard<'_, BTreeMap<ChannelId, Slot>> {
-        self.slots
+    fn windows(&self) -> std::sync::MutexGuard<'_, Windows> {
+        self.windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -262,24 +287,30 @@ impl RecentWindows {
     /// Where a read of `channel` that starts now begins. Take it BEFORE asking the provider.
     #[must_use]
     pub fn mark(&self, channel: &ChannelId) -> ReadMark {
-        let slots = self.slots();
+        let windows = self.windows();
         ReadMark {
             started: Instant::now(),
-            pushes: slots.get(channel).map_or(0, |slot| slot.pushes),
+            pushes: windows.slots.get(channel).map_or(0, |slot| slot.pushes),
+            purges: windows.purges,
         }
     }
 
     /// Keep the result of a successful read of `channel`, which began at `mark`, with every push
     /// that arrived since applied again on top of it.
     ///
-    /// A read that began before the one already held is dropped: two reads overlapping, the one
-    /// that started later saw at least as much of the channel, whichever finished first. So is a
-    /// read whose pushes are no longer all kept, when a window is held: that window has had every
-    /// push merged as it came, and the read cannot be made to agree with them.
+    /// A read marked before the newest purge is dropped: the owner asked for everything read until
+    /// then to go, and that includes what this read brought. A read that began before the one
+    /// already held is dropped: two reads overlapping, the one that started later saw at least as
+    /// much of the channel, whichever finished first. So is a read whose pushes are no longer all
+    /// kept, when a window is held: that window has had every push merged as it came, and the read
+    /// cannot be made to agree with them.
     pub fn record(&self, channel: &ChannelId, messages: &[Message], limit: u16, mark: ReadMark) {
         let started = mark.started;
-        let mut slots = self.slots();
-        let slot = slots.entry(channel.clone()).or_default();
+        let mut windows = self.windows();
+        if mark.purges != windows.purges {
+            return;
+        }
+        let slot = windows.slots.entry(channel.clone()).or_default();
         if slot
             .failure
             .as_ref()
@@ -315,9 +346,13 @@ impl RecentWindows {
         slot.held = Some(held);
     }
 
-    fn note_failure(&self, channel: &ChannelId, error: ChatError, started: Instant) {
-        let mut slots = self.slots();
-        let slot = slots.entry(channel.clone()).or_default();
+    fn note_failure(&self, channel: &ChannelId, error: ChatError, mark: ReadMark) {
+        let started = mark.started;
+        let mut windows = self.windows();
+        if mark.purges != windows.purges {
+            return;
+        }
+        let slot = windows.slots.entry(channel.clone()).or_default();
         if slot
             .held
             .as_ref()
@@ -328,14 +363,38 @@ impl RecentWindows {
         slot.failure = Some((error, started));
     }
 
+    /// Drop every held window, every journalled push and every failure, and forget every refresh
+    /// running. For the storage purge, which promises that nothing derived from a channel is left
+    /// behind.
+    ///
+    /// A read marked before this keeps nothing when it lands, so a refresh or a page read already
+    /// running cannot put back what it read. A refresh still running is forgotten rather than
+    /// joined, so the next catch-up reads afresh instead of waiting on a read whose result will be
+    /// dropped. See "The purge" in the module documentation.
+    pub fn clear(&self) {
+        let mut windows = self.windows();
+        windows.slots.clear();
+        windows.purges += 1;
+    }
+
+    /// Whether no channel text is held at all: no window, and no journalled push. What
+    /// [`RecentWindows::clear`] leaves.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.windows()
+            .slots
+            .values()
+            .all(|slot| slot.held.is_none() && slot.journal.is_empty())
+    }
+
     /// Fold one published change into `channel`'s window, when one is held, and journal it for any
     /// read of the channel still running.
     ///
     /// A push never STARTS a window: one message says nothing about what came before it. It is
     /// journalled all the same, so the read that does start one keeps it.
     pub fn merge(&self, channel: &ChannelId, live: &LiveMessage) {
-        let mut slots = self.slots();
-        let slot = slots.entry(channel.clone()).or_default();
+        let mut windows = self.windows();
+        let slot = windows.slots.entry(channel.clone()).or_default();
         slot.pushes += 1;
         slot.journal.push_back((slot.pushes, live.clone()));
         while slot.journal.len() > JOURNAL {
@@ -349,8 +408,8 @@ impl RecentWindows {
     /// What is known about `channel` right now.
     #[must_use]
     pub fn snapshot(&self, channel: &ChannelId) -> Snapshot {
-        let slots = self.slots();
-        let Some(slot) = slots.get(channel) else {
+        let windows = self.windows();
+        let Some(slot) = windows.slots.get(channel) else {
             return Snapshot::default();
         };
         Snapshot {
@@ -363,7 +422,8 @@ impl RecentWindows {
     /// Whether `channel` holds a window at all.
     #[must_use]
     pub fn holds(&self, channel: &ChannelId) -> bool {
-        self.slots()
+        self.windows()
+            .slots
             .get(channel)
             .is_some_and(|slot| slot.held.is_some())
     }
@@ -373,7 +433,8 @@ impl RecentWindows {
     /// whole channel.
     #[must_use]
     pub fn reusable(&self, channel: &ChannelId, scan: u16, reuse: Duration) -> bool {
-        self.slots()
+        self.windows()
+            .slots
             .get(channel)
             .and_then(|slot| slot.held.as_ref())
             .is_some_and(|held| {
@@ -386,8 +447,8 @@ impl RecentWindows {
     /// The receiver turns `true` when the refresh is over, however it ended. A claim is returned
     /// only to the caller that must run the read; every other caller is handed the same receiver.
     fn claim(self: &Arc<Self>, channel: &ChannelId) -> (watch::Receiver<bool>, Option<Claim>) {
-        let mut slots = self.slots();
-        let slot = slots.entry(channel.clone()).or_default();
+        let mut windows = self.windows();
+        let slot = windows.slots.entry(channel.clone()).or_default();
         if let Some((_, running)) = &slot.refreshing {
             return (running.clone(), None);
         }
@@ -406,8 +467,8 @@ impl RecentWindows {
     }
 
     fn finish_refresh(&self, channel: &ChannelId, number: u64) {
-        let mut slots = self.slots();
-        if let Some(slot) = slots.get_mut(channel) {
+        let mut windows = self.windows();
+        if let Some(slot) = windows.slots.get_mut(channel) {
             if slot
                 .refreshing
                 .as_ref()
@@ -568,7 +629,7 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
                         %error,
                         "recent window refresh failed"
                     );
-                    claim.windows.note_failure(&claim.channel, error, started);
+                    claim.windows.note_failure(&claim.channel, error, mark);
                 }
             }
             drop(claim);
@@ -727,11 +788,7 @@ mod tests {
         windows.record(&channel, &[message(id(1), "older")], 50, early);
         assert_eq!(ids(&windows, &channel), [id(2).to_string()]);
 
-        windows.note_failure(
-            &channel,
-            ChatError::Transport("late".to_owned()),
-            early.started(),
-        );
+        windows.note_failure(&channel, ChatError::Transport("late".to_owned()), early);
         assert!(
             windows.snapshot(&channel).failure.is_none(),
             "a failure of a read older than the held window is not news"
@@ -853,5 +910,61 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(16)).await;
         assert!(!windows.reusable(&channel, 20, reuse));
+    }
+
+    /// The storage purge leaves no channel text: no window, no journalled push, no failure, on
+    /// any channel.
+    #[tokio::test]
+    async fn the_purge_drops_every_window_and_every_journalled_push() {
+        let windows = RecentWindows::new();
+        let one = ChannelId("1".to_owned());
+        let two = ChannelId("2".to_owned());
+        let three = ChannelId("3".to_owned());
+        windows.record(&one, &[message(id(1), "one")], 50, windows.mark(&one));
+        windows.merge(&one, &live(LiveKind::Create, message(id(2), "pushed")));
+        // Journalled with no window to merge into.
+        windows.merge(&two, &live(LiveKind::Create, message(id(3), "journalled")));
+        windows.note_failure(
+            &three,
+            ChatError::Transport("down".to_owned()),
+            windows.mark(&three),
+        );
+        assert!(!windows.is_empty());
+
+        windows.clear();
+        assert!(windows.is_empty(), "channel text outlived the purge");
+        for channel in [&one, &two, &three] {
+            let known = windows.snapshot(channel);
+            assert!(known.held.is_none(), "{channel}");
+            assert!(known.failure.is_none(), "{channel}");
+            assert!(!known.refreshing, "{channel}");
+        }
+
+        // A push journalled before the purge is not applied to the first read after it.
+        let mark = windows.mark(&two);
+        windows.record(&two, &[message(id(1), "read")], 50, mark);
+        assert_eq!(contents(&windows, &two), ["read"]);
+    }
+
+    /// A read marked before the purge lands after it with what it read then. It keeps nothing,
+    /// and nor does its failure; a read marked after the purge, even in the same clock tick, is
+    /// kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_marked_before_the_purge_keeps_nothing_when_it_lands() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let before = windows.mark(&channel);
+        windows.merge(&channel, &live(LiveKind::Create, message(id(2), "pushed")));
+        windows.clear();
+        windows.record(&channel, &[message(id(1), "read")], 50, before);
+        assert!(windows.is_empty(), "a read begun before the purge undid it");
+        windows.note_failure(&channel, ChatError::Transport("late".to_owned()), before);
+        assert!(windows.snapshot(&channel).failure.is_none());
+
+        // The paused clock has not moved: same instant as the purge, and still after it.
+        let after = windows.mark(&channel);
+        assert_eq!(after.started(), before.started());
+        windows.record(&channel, &[message(id(1), "read")], 50, after);
+        assert_eq!(contents(&windows, &channel), ["read"]);
     }
 }

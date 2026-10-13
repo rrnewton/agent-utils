@@ -22,7 +22,9 @@
 //! the page has just drawn; a pushed edit or deletion drops a message from it, and the storage
 //! purge empties it. [`recent`] keeps each channel's newest window, with every change pushed to it
 //! since merged in, so the voice agent's catch-up can answer from it while the provider is slow,
-//! and says how old it is when it was not read again in time. [`store`] is the single thing kept
+//! and says how old it is when it was not read again in time; the storage purge empties that too,
+//! with the pushes kept beside it. Neither can be refilled by a read that was already running when
+//! the purge came. [`store`] is the single thing kept
 //! at rest, and it holds three things — the `/voice` transcript,
 //! how far the owner has read, and one short cached SUMMARY per long message. The first two are
 //! what this server itself authored; the third is derived from somebody else's message — a

@@ -491,3 +491,119 @@ async fn a_message_deleted_while_its_channel_is_being_read_stays_deleted() {
         "the read that landed after the delete brought the deleted message back as current"
     );
 }
+
+/// `GET` or `DELETE` `path` on the router, as `token`, and the status it answered.
+async fn call(state: &AppState, method: &str, path: &str, token: &str) -> StatusCode {
+    vibe_talk::http::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("the route answers")
+        .status()
+}
+
+/// The owner's erase: `DELETE /api/v1/storage`.
+async fn purge(state: &AppState) {
+    assert_eq!(
+        call(state, "DELETE", "/api/v1/storage", WRITE_TOKEN).await,
+        StatusCode::OK
+    );
+}
+
+/// `DELETE /api/v1/storage` erases everything, and the catch-up's windows and the pushes kept
+/// beside them are channel text.
+#[tokio::test(start_paused = true)]
+async fn the_storage_purge_leaves_no_channel_text_in_the_catch_up_memory() {
+    let h = harness();
+    catch_up(&h.state).await;
+    let lead = channel(WRITE_CHANNEL);
+    let id = h.fake.seed_at(&lead, "lead", "just landed", ops::now_ms());
+    h.state
+        .live
+        .publish(&lead, h.fake.message(&id).expect("seeded"));
+    for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
+        assert!(h.state.live.recent().holds(&channel(id)), "{id}");
+    }
+
+    purge(&h.state).await;
+    assert!(
+        h.state.live.recent().is_empty(),
+        "channel text outlived the purge"
+    );
+    for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
+        assert!(!h.state.live.recent().holds(&channel(id)), "{id}");
+    }
+}
+
+/// A read already running when the purge comes read the channel before the owner asked for
+/// everything to go. It must not put its window back when it lands.
+#[tokio::test(start_paused = true)]
+async fn a_refresh_running_across_the_purge_does_not_put_its_window_back() {
+    let h = harness();
+    assert_eq!(recent::warm(&h.state), 3);
+    // The first channel is being read; the other two are queued behind it.
+    tokio::time::sleep(READ / 2).await;
+    purge(&h.state).await;
+
+    tokio::time::sleep(3 * READ).await;
+    assert_eq!(
+        h.slow.reads(),
+        3,
+        "every read begun before the purge has landed"
+    );
+    assert!(
+        h.state.live.recent().is_empty(),
+        "a read begun before the purge put its window back"
+    );
+}
+
+/// The catch-up after a purge does not answer from the windows held before it: it reads every
+/// channel again, and so sees what the provider has now.
+#[tokio::test(start_paused = true)]
+async fn the_catch_up_after_a_purge_reads_every_channel_again() {
+    let h = harness();
+    catch_up(&h.state).await;
+    let before = h.slow.reads();
+    // Said upstream and not pushed: only a read can know of it.
+    h.fake
+        .seed_at(&channel(WRITE_CHANNEL), "lead", "said since", ops::now_ms());
+
+    purge(&h.state).await;
+    let activity = catch_up(&h.state).await;
+    assert_eq!(
+        h.slow.reads() - before,
+        3,
+        "the catch-up answered from windows the purge should have dropped"
+    );
+    for id in [READ_CHANNEL, WRITE_CHANNEL, THIRD] {
+        assert!(current(&activity, id), "{id}");
+    }
+    assert_eq!(said(&activity, WRITE_CHANNEL), ["ship it", "said since"]);
+}
+
+/// Nor does it wait on the reads that were running when the purge came, whose windows will be
+/// dropped: it starts its own, and every channel is answered from them.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_right_after_a_purge_does_not_wait_on_reads_begun_before_it() {
+    let h = harness_with(Duration::from_millis(500));
+    assert_eq!(recent::warm(&h.state), 3);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    purge(&h.state).await;
+
+    let activity = catch_up(&h.state).await;
+    assert_eq!(h.slow.reads(), 6, "three before the purge, three after");
+    for (id, text) in [
+        (READ_CHANNEL, "build is green"),
+        (WRITE_CHANNEL, "ship it"),
+        (THIRD, "pager is quiet"),
+    ] {
+        assert_eq!(said(&activity, id), [text], "{id}");
+        assert!(current(&activity, id), "{id}");
+    }
+}
