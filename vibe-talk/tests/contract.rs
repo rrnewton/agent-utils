@@ -508,6 +508,7 @@ fn samples() -> Value {
             to(&PendingPostResponse {
                 proposal: Some(PendingPost {
                     serial: 3,
+                    instance: "cnVuLW9uZQ".into(),
                     handle: "AAAAAAAAAAAAAAAAAAAAAA".into(),
                     channel_id: ChannelId("111".into()),
                     channel_name: "lead team".into(),
@@ -521,14 +522,16 @@ fn samples() -> Value {
                     thread_name: Some("release".into()),
                     expires_in_ms: 120_000,
                 }),
+                instance: "cnVuLW9uZQ".into(),
                 sends: Vec::new(),
-                sends_through: 0,
+                sends_through: Some(0),
                 settled: Vec::new(),
-                now_ms: 1_700_000_000_000,
+                now_ms: Some(1_700_000_000_000),
             }),
             to(&PendingPostResponse {
                 proposal: Some(PendingPost {
                     serial: 4,
+                    instance: "cnVuLW9uZQ".into(),
                     handle: "BBBBBBBBBBBBBBBBBBBBBB".into(),
                     channel_id: ChannelId("111".into()),
                     channel_name: "lead team".into(),
@@ -540,20 +543,23 @@ fn samples() -> Value {
                     thread_name: None,
                     expires_in_ms: 1,
                 }),
+                instance: "cnVuLW9uZQ".into(),
                 sends: Vec::new(),
-                sends_through: 2,
+                sends_through: Some(2),
                 settled: vec![ProposalSettled {
                     serial: 3,
                     fate: ProposalFate::Superseded,
                 }],
-                now_ms: 1_700_000_000_000,
+                now_ms: Some(1_700_000_000_000),
             }),
             to(&PendingPostResponse {
                 proposal: None,
+                instance: "cnVuLXR3bw".into(),
                 sends: vec![
                     VoiceSend {
                         text: "on my way".into(),
                         detail: sent_record(SendOutcome::Sent, SendHow::Tap),
+                        instance: "cnVuLXR3bw".into(),
                     },
                     VoiceSend {
                         text: "the first part".into(),
@@ -572,6 +578,7 @@ fn samples() -> Value {
                             text_truncated: true,
                             ..sent_record(SendOutcome::Partial, SendHow::Voice)
                         },
+                        instance: "cnVuLXR3bw".into(),
                     },
                     VoiceSend {
                         text: "rebase onto main".into(),
@@ -583,9 +590,10 @@ fn samples() -> Value {
                             origin: SendOrigin::Rest,
                             ..sent_record(SendOutcome::Unconfirmed, SendHow::Direct)
                         },
+                        instance: "cnVuLXR3bw".into(),
                     },
                 ],
-                sends_through: 5,
+                sends_through: Some(5),
                 settled: [
                     ProposalFate::Committed,
                     ProposalFate::Cancelled,
@@ -597,7 +605,20 @@ fn samples() -> Value {
                 .zip(1..)
                 .map(|(fate, serial)| ProposalSettled { serial, fate })
                 .collect(),
-                now_ms: 1_700_000_000_000,
+                now_ms: Some(1_700_000_000_000),
+            }),
+            // An older server's answer, from before `#270 voice-transcript-markers`: the proposal and
+            // nothing else. A page left open across a rollback to it must still read the proposal.
+            json!({
+                "proposal": {
+                    "serial": 2,
+                    "handle": "CCCCCCCCCCCCCCCCCCCCCC",
+                    "channel_id": "111",
+                    "channel_name": "lead team",
+                    "text": "on my way",
+                    "reply_to": null,
+                    "expires_in_ms": 5000
+                }
             }),
         ],
         "CommittedPostResponse": [

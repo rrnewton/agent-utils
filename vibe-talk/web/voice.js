@@ -9790,20 +9790,23 @@ const postWatch = {
   // Whether the owner opened a long draft with More. A new draft starts folded again.
   unfolded: false,
   // `#270 voice-transcript-markers`. The send memory's cursor, for the page's whole life: the
-  // newest `send_seq` this page has read, null until its first read ever says where the server is.
+  // newest `send_seq` this page has read, null until its first read ever says where the server is,
+  // and the run of the server (`instance`) whose numbering it is in.
   /** @type {number | null} */
   sentThrough: null,
-  // Each proposal this page showed, by serial, with the conversation it was shown in: a send of
-  // one of them is this page's wherever the server says it began.
-  /** @type {Map<number, string | null>} */
+  /** @type {string | null} */
+  sentInstance: null,
+  // Each proposal this page showed, under `postKey` — its serial AND the run of the server that
+  // numbered it, because a restarted server numbers its proposals from one again and the page
+  // stays open across that — with its handle and where it was shown: a send of one of them is this
+  // page's, and belongs to the conversation it was shown in, wherever the server says it began.
+  /** @type {Map<string, {handle: string, conversationId: string | null, window: {conversationId: string | null, from: number | null, to: number | null} | null}>} */
   shownSerials: new Map(),
-  // The frozen card drawn for each serial, so no send is drawn twice, and the `send_seq` it was
-  // drawn under when known: a server that restarted numbers its proposals from one again, and a
-  // send of a serial already drawn, under another `send_seq`, is another send.
-  /** @type {Map<number, HTMLElement>} */
+  // The frozen card drawn for each send, under the same key, so no send is drawn twice: the card,
+  // the `send_seq` it was drawn under when known, and the handle of the proposal it froze from when
+  // the commit's answer drew it (null when the send memory did).
+  /** @type {Map<string, {li: HTMLElement, sendSeq: number | null, handle: string | null}>} */
   sentDrawn: new Map(),
-  /** @type {Map<number, number | null>} */
-  sentSeqs: new Map(),
   // This page's calls in the server's clock, each `{conversationId, from, to}`: a send that began
   // inside one is this page's. `window` is the open one, whose end is still "now".
   /** @type {Array<{conversationId: string | null, from: number | null, to: number | null}>} */
@@ -9885,12 +9888,31 @@ function postWatchPath(waitSeconds) {
 }
 
 /**
+ * The key a proposal, a send and a frozen card are known by on this page: the serial, and which
+ * run of the server numbered it. `#270 voice-transcript-markers`. A server numbers its proposals
+ * from one again every time it starts, and this page stays open across that, so a serial alone
+ * would take the next run's "serial 3" for the card already drawn for the last run's — and draw
+ * nothing for it, or file it in the conversation the old one was shown in. An older server names
+ * no run; its key is the serial alone.
+ *
+ * @param {string | undefined | null} instance
+ * @param {number} serial
+ */
+const postKey = (instance, serial) => `${instance || ""}:${serial}`;
+
+/**
  * What one read said about the send memory. `#270 voice-transcript-markers`.
  *
  * The page's first read ever only learns where the server's numbering is. Every later one carries
  * the sends past the page's cursor, and each that is this page's — it began inside one of this
  * page's calls, or it is a proposal this page showed — is drawn as a frozen card, once, and filed
  * in the transcript from the server's own copy.
+ *
+ * The cursor only goes FORWARD within one run of the server: two reads whose answers crossed on the
+ * way — the last read of a call that ended and the first of the next — must not take it back and
+ * have the next read bring sends already drawn. A different run numbers its sends from its own
+ * clock, above anything the last one handed out, so its number is taken as it is; nothing drawn
+ * here is forgotten, because every card is known by its run as well as its serial.
  *
  * @param {VibeTalk.PendingPostResponse} answer
  */
@@ -9901,19 +9923,62 @@ function noteSendMemory(answer) {
     postWatch.lastNowAt = Date.now();
     if (postWatch.window && postWatch.window.from === null) postWatch.window.from = answer.now_ms;
   }
+  // An older server says nothing about a send memory: there is nothing to read.
+  if (typeof answer.sends_through !== "number") return;
+  const instance = answer.instance || "";
   if (postWatch.sentThrough === null) {
     postWatch.sentThrough = answer.sends_through;
+    postWatch.sentInstance = instance;
     return;
   }
-  // A server numbering below this page's cursor has restarted: its serials start again, so one
-  // already drawn here says nothing about a send of the same number now. The cards stay on screen.
-  if (answer.sends_through < postWatch.sentThrough) {
-    postWatch.sentDrawn.clear();
-    postWatch.sentSeqs.clear();
-    postWatch.shownSerials.clear();
+  for (const send of answer.sends || []) drawSentFromMemory(send, instance);
+  if (instance === postWatch.sentInstance) {
+    postWatch.sentThrough = Math.max(postWatch.sentThrough, answer.sends_through);
+  } else {
+    postWatch.sentThrough = answer.sends_through;
+    postWatch.sentInstance = instance;
   }
-  for (const send of answer.sends || []) drawSentFromMemory(send);
-  postWatch.sentThrough = answer.sends_through;
+}
+
+/**
+ * Remember that the page showed `proposal`, in the conversation on screen. The same proposal shown
+ * again — after a drop, in the next call — keeps the conversation it was first shown in; another
+ * proposal under a key seen before (a server that restarted and numbered from one again, but named
+ * no run) replaces it. Bounded, oldest out.
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ */
+function noteProposalShown(proposal) {
+  const key = postKey(proposal.instance, proposal.serial);
+  const held = postWatch.shownSerials.get(key);
+  if (held && held.handle === proposal.handle) return;
+  postWatch.shownSerials.delete(key);
+  postWatch.shownSerials.set(key, {
+    handle: proposal.handle,
+    conversationId: session.conversationId,
+    window: postWatch.window,
+  });
+  if (postWatch.shownSerials.size > 64) {
+    postWatch.shownSerials.delete(postWatch.shownSerials.keys().next().value);
+  }
+}
+
+/**
+ * The conversation the proposal under `key` was shown in: undefined when this page never showed
+ * it, null when nobody can say. A proposal shown before the voice service named the conversation —
+ * the hosted protocol names it a moment after the call opens — belongs to the conversation its call
+ * was given since, which that call's window holds.
+ *
+ * @param {string} key
+ * @returns {string | null | undefined}
+ */
+function shownConversation(key) {
+  const held = postWatch.shownSerials.get(key);
+  if (!held) return undefined;
+  if (held.conversationId) return held.conversationId;
+  const window = held.window;
+  if (!window) return null;
+  return (window === postWatch.window ? session.conversationId : window.conversationId) || null;
 }
 
 /**
@@ -9930,31 +9995,33 @@ function windowConversation(beganAt) {
   return undefined;
 }
 
-/** @param {VibeTalk.VoiceSend} send */
-function drawSentFromMemory(send) {
+/**
+ * @param {VibeTalk.VoiceSend} send
+ * @param {string} instance the run of the server that answered, for a send that does not say
+ */
+function drawSentFromMemory(send, instance) {
   const detail = send.detail;
-  const drawnUnder = postWatch.sentSeqs.get(detail.serial);
-  if (postWatch.sentDrawn.has(detail.serial) && (drawnUnder === null || drawnUnder === detail.send_seq)) {
+  const key = postKey(send.instance || instance, detail.serial);
+  const shown = shownConversation(key);
+  const drawn = postWatch.sentDrawn.get(key);
+  if (drawn && (drawn.sendSeq === null || drawn.sendSeq === detail.send_seq)) {
     // Drawn from the commit's answer, which had no number to file it under: this one does.
-    if (drawnUnder === null) postWatch.sentSeqs.set(detail.serial, detail.send_seq);
-    recordSent(detail.send_seq, postWatch.shownSerials.get(detail.serial) || session.conversationId, detail.serial);
+    if (drawn.sendSeq === null) drawn.sendSeq = detail.send_seq;
+    recordSent(detail.send_seq, shown || session.conversationId, key);
     return;
   }
-  const conversationId = postWatch.shownSerials.has(detail.serial)
-    ? postWatch.shownSerials.get(detail.serial)
-    : windowConversation(detail.begun_at_ms);
+  const conversationId = shown !== undefined ? shown : windowConversation(detail.begun_at_ms);
   if (conversationId === undefined) return;
   const turn = { speaker: "sent", text: send.text, at_ms: detail.sent_at_ms, detail: { kind: "sent", ...detail } };
   const li = placeSentCard(turn, conversationId || null);
-  postWatch.sentDrawn.set(detail.serial, li);
-  postWatch.sentSeqs.set(detail.serial, detail.send_seq);
+  postWatch.sentDrawn.set(key, { li, sendSeq: detail.send_seq, handle: null });
   // A card still up for this send — its commit's answer is on its way, or was lost: the memory says
   // it went, so the card freezes into this one, the focus with it.
-  if (postWatch.shown && postWatch.shown.serial === detail.serial) {
+  if (postWatch.shown && postKey(postWatch.shown.instance, postWatch.shown.serial) === key) {
     postWatch.parkOn = li;
     showPostProposal(null);
   }
-  recordSent(detail.send_seq, conversationId || null, detail.serial);
+  recordSent(detail.send_seq, conversationId || null, key);
 }
 
 /** The window's last read: what settled before it closed, and when it did. */
@@ -9965,7 +10032,9 @@ async function finalSendsRead(window) {
   }
   try {
     const answer = await apiDecoded("PendingPostResponse", postWatchPath(0));
-    window.to = answer.now_ms;
+    window.to = typeof answer.now_ms === "number"
+      ? answer.now_ms
+      : postWatch.lastNowMs + (Date.now() - postWatch.lastNowAt);
     noteSendMemory(answer);
   } catch (_error) {
     // The server's clock now, as near as this page can say: a window left open would claim
@@ -10053,13 +10122,8 @@ function showPostProposal(proposal) {
   const fresh = !previous || previous.handle !== proposal.handle;
   if (fresh) {
     // `#270 voice-transcript-markers`. A send of this proposal is this page's, and belongs to the
-    // conversation it was shown in, wherever the send memory says it began. Bounded, oldest out.
-    if (!postWatch.shownSerials.has(proposal.serial)) {
-      postWatch.shownSerials.set(proposal.serial, session.conversationId);
-      if (postWatch.shownSerials.size > 64) {
-        postWatch.shownSerials.delete(postWatch.shownSerials.keys().next().value);
-      }
-    }
+    // conversation it was shown in, wherever the send memory says it began.
+    noteProposalShown(proposal);
     postWatch.deadline = Date.now() + proposal.expires_in_ms;
     // Words the owner may be about to confirm appeared under a tap aimed at whatever was there
     // before — a row, the old text, or, now that the card is the next message in the list, the
@@ -10416,16 +10480,22 @@ const sentClaimed = new Set();
  * @param {any} answer the commit's answer, a 200 or a 207
  */
 function freezeSentCard(proposal, confirmedBy, outcome, answer) {
-  if (postWatch.sentDrawn.has(proposal.serial)) return;
-  const conversationId = postWatch.shownSerials.has(proposal.serial)
-    ? postWatch.shownSerials.get(proposal.serial)
-    : session.conversationId;
+  const key = postKey(proposal.instance, proposal.serial);
+  const sendSeq = typeof answer.send_seq === "number" ? answer.send_seq : null;
+  // Drawn already when it is this very send: the send memory's read can beat this answer, because
+  // the server wakes the long poll the moment the send settles, before this answer is on its way.
+  // Under one key that is the same send whoever drew it — unless this page froze another proposal
+  // under it, from a server that restarted without naming its run.
+  const drawn = postWatch.sentDrawn.get(key);
+  if (drawn && (drawn.handle === null || drawn.handle === proposal.handle ||
+    (sendSeq !== null && drawn.sendSeq === sendSeq))) return;
+  const shown = shownConversation(key);
+  const conversationId = shown !== undefined ? shown : session.conversationId;
   const first = outcome === "sent" && answer.posted && typeof answer.posted === "object" ? answer.posted : null;
   const parts = Array.isArray(answer.parts) ? answer.parts.length : 0;
   const posted = outcome === "sent" ? parts : Number(answer.posted) || 0;
   const thread = first && first.thread && !first.thread.is_root ? String(first.thread.id) : undefined;
   const now = Date.now();
-  const sendSeq = typeof answer.send_seq === "number" ? answer.send_seq : null;
   const turn = {
     speaker: "sent",
     text: proposal.text,
@@ -10456,10 +10526,9 @@ function freezeSentCard(proposal, confirmedBy, outcome, answer) {
     },
   };
   const li = placeSentCard(turn, conversationId || null);
-  postWatch.sentDrawn.set(proposal.serial, li);
-  postWatch.sentSeqs.set(proposal.serial, sendSeq);
+  postWatch.sentDrawn.set(key, { li, sendSeq, handle: proposal.handle });
   postWatch.parkOn = li;
-  if (sendSeq !== null) recordSent(sendSeq, conversationId || null, proposal.serial);
+  if (sendSeq !== null) recordSent(sendSeq, conversationId || null, key);
   else if (transcriptRecordsSupported) markNotKept(li);
 }
 
@@ -10608,13 +10677,14 @@ function placeSentCard(turn, conversationId) {
 }
 
 /** The server filed the card's send: draw its own copy where the page's was. */
-function correctSentCard(serial, turn) {
-  const li = postWatch.sentDrawn.get(serial);
-  if (!li || !li.parentNode) return;
+function correctSentCard(key, turn) {
+  const drawn = postWatch.sentDrawn.get(key);
+  const li = drawn && drawn.li;
+  if (!drawn || !li || !li.parentNode) return;
   const fresh = sentCardNode(turn);
   const focused = document.activeElement === li;
   preservingScroll(() => li.replaceWith(fresh));
-  postWatch.sentDrawn.set(serial, fresh);
+  drawn.li = fresh;
   if (focused) fresh.focus({ preventScroll: true });
   applySearch();
 }
@@ -10641,17 +10711,18 @@ async function openSentMessage(detail) {
 
 /**
  * File the send `sendSeq` in `conversationId`'s stored transcript, from the server's copy, in the
- * order the screen shows it: after every turn drawn above the card. Once per serial.
+ * order the screen shows it: after every turn drawn above the card. Once per send; `key` is the
+ * card's (`postKey`).
  */
-function recordSent(sendSeq, conversationId, serial) {
+function recordSent(sendSeq, conversationId, key) {
   if (!transcriptRecordsSupported || sentClaimed.has(sendSeq)) return;
   sentClaimed.add(sendSeq);
   recordInScreenOrder(() => {
     void recordRecord(conversationId, { speaker: "sent", text: "", send: sendSeq }).then((result) => {
-      const li = postWatch.sentDrawn.get(serial);
-      if (!li) return;
-      if (result && result.turn) correctSentCard(serial, result.turn);
-      else if (!result || result.refused !== "send_recorded") markNotKept(li);
+      const drawn = postWatch.sentDrawn.get(key);
+      if (!drawn) return;
+      if (result && result.turn) correctSentCard(key, result.turn);
+      else if (!result || result.refused !== "send_recorded") markNotKept(drawn.li);
     });
   });
 }
