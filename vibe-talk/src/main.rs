@@ -740,7 +740,15 @@ async fn main() -> anyhow::Result<()> {
     // server answers anything. They were probed when they were added; they are not probed again
     // here, because a channel the bot has since been removed from should fail the request that
     // touches it rather than stop the whole bridge from starting over somebody else's change.
-    match state.restore_added_channels().await {
+    //
+    // `#199 removable-config-channels`. Configured channels the owner took off his list stay off
+    // it. A store that cannot be read degrades to showing them, which is the state the file
+    // describes and the one that loses nothing.
+    //
+    // `#208 persistent-cache`. The message cache is armed only when both lists came back: a list
+    // the store could not give would make its sweep erase what the owner added.
+    let (added, hidden) = state.restore_channel_lists().await;
+    match added {
         Ok(restored) => {
             if restored > 0 {
                 tracing::info!(added = restored, "restored channels added in the app");
@@ -752,10 +760,7 @@ async fn main() -> anyhow::Result<()> {
         // unreadable alias does not stop the channel being read.
         Err(error) => tracing::warn!(%error, "could not restore channels added in the app"),
     }
-    // `#199 removable-config-channels`. Configured channels the owner took off his list stay off
-    // it. A store that cannot be read degrades to showing them, which is the state the file
-    // describes and the one that loses nothing.
-    match state.restore_hidden_channels().await {
+    match hidden {
         Ok(restored) => {
             if restored > 0 {
                 tracing::info!(

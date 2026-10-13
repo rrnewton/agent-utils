@@ -1087,6 +1087,94 @@ pub fn with_recent_timing(mut state: AppState, timing: crate::recent::Timing) ->
     state
 }
 
+/// A clock a test sets by hand, for the message cache. `#208 persistent-cache`.
+///
+/// The cache judges age by its own clock: it refuses rows older than its age limit, and a fixture
+/// written in 2023 is older than any limit by the system clock. A test places this clock near its
+/// fixture's times, and moves it to order one read after another.
+#[derive(Debug)]
+pub struct ManualClock(std::sync::atomic::AtomicI64);
+
+impl ManualClock {
+    /// A clock reading `now_ms`.
+    #[must_use]
+    pub fn at(now_ms: i64) -> Arc<Self> {
+        Arc::new(Self(std::sync::atomic::AtomicI64::new(now_ms)))
+    }
+
+    /// Set the clock to `now_ms`.
+    pub fn set(&self, now_ms: i64) {
+        self.0.store(now_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Move the clock forward by `ms`.
+    pub fn advance(&self, ms: i64) {
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// What the clock reads.
+    #[must_use]
+    pub fn now(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::cache::Clock for ManualClock {
+    fn now_ms(&self) -> i64 {
+        self.now()
+    }
+}
+
+/// Open a message cache in `dir`, read by `clock` and indexed by the page's own rendering for
+/// `state`'s providers, and put it behind `state`'s sink, WITHOUT arming it. `#208
+/// persistent-cache`. For a test of the startup guard, which arms it (or does not) through
+/// [`AppState::restore_channel_lists`]; every other test wants [`with_message_cache`].
+///
+/// # Panics
+///
+/// Panics if the cache cannot be opened, which is a broken test environment.
+#[must_use]
+pub fn install_message_cache(
+    state: &AppState,
+    dir: &std::path::Path,
+    clock: Arc<ManualClock>,
+) -> Arc<crate::cache::MessageCache> {
+    let cache = Arc::new(
+        crate::cache::MessageCache::open(crate::cache::CacheOptions {
+            // A directory of its own: the cache refuses one that other accounts can enter, which
+            // a system temporary directory's children are.
+            path: dir.join("message-cache").join("message-cache.sqlite3"),
+            store_path: None,
+            limits: crate::cache::Limits::default(),
+            search_text: Arc::new(crate::render::SearchText::from_config(&state.config)),
+            clock,
+        })
+        .expect("a message cache opens in a test directory"),
+    );
+    state.message_cache.install(Arc::clone(&cache));
+    cache
+}
+
+/// `state` with a message cache open in `dir` behind its sink, armed, and told the channels the
+/// server answers for: what a server with the cache on looks like once it has started. `#208
+/// persistent-cache`. Call it after the state's providers are final ([`AppState::replace_chat`],
+/// [`AppState::replace_providers`]): the cache names each channel under the provider that owns
+/// it when this is called, and a provider swapped in later is told to the cache as a change of
+/// routes.
+///
+/// The cache is reached again through `state.message_cache.cache()`.
+#[must_use]
+pub fn with_message_cache(
+    state: AppState,
+    dir: &std::path::Path,
+    clock: Arc<ManualClock>,
+) -> AppState {
+    drop(install_message_cache(&state, dir, clock));
+    state.message_cache.arm();
+    state.refresh_routes();
+    state
+}
+
 /// A directory that deletes itself, so a test can drive the real SQLite store.
 ///
 /// Hand-rolled rather than a `tempfile` dependency: it is twenty lines, and this crate's

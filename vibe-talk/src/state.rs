@@ -149,7 +149,8 @@ pub struct AppState {
     /// Always present, like [`AppState::live`], so a read site never asks whether a cache exists:
     /// it asks the sink to begin a fill, under the caller's
     /// [`crate::cache::FillGrant`] or a server one, and a read-scope caller has no grant to ask
-    /// with. In this build nothing installs a cache behind it, so every fill is refused.
+    /// with. Only tests install a cache behind it in this build, so every fill a server makes is
+    /// refused.
     pub message_cache: Arc<crate::cache::Sink>,
 }
 
@@ -286,9 +287,39 @@ impl AppState {
     /// Re-derive which provider owns each channel from the current allowlist.
     ///
     /// Called whenever the added-channel list changes, so the router reaches exactly the channels
-    /// this server answers for, each through the provider it belongs to.
+    /// this server answers for, each through the provider it belongs to. The message cache is told
+    /// the same list, after the router, so it names each channel under the provider that now owns
+    /// it; once armed, it erases every channel and provider key off the list (`#208
+    /// persistent-cache`, see [`crate::cache::sink`]).
     pub fn refresh_routes(&self) {
-        self.providers.replace_routes(&self.all_channels());
+        let channels = self.all_channels();
+        self.providers.replace_routes(&channels);
+        self.message_cache.set_routes(&channels, &self.providers);
+    }
+
+    /// Restore both lists the store keeps, [`AppState::restore_added_channels`] and then
+    /// [`AppState::restore_hidden_channels`], and arm the message cache only when BOTH came back.
+    ///
+    /// The cache sweeps every channel that is not on the list the moment it is armed. A store that
+    /// failed to answer leaves the list short — every channel added in the app missing, or a
+    /// hidden one back on it — and a sweep to that list would erase what the owner added. So an
+    /// answer missing from either leaves the cache unarmed for the life of the process: it sweeps
+    /// nothing and is filled by nothing (`#208 persistent-cache`, the startup guard). A deployment
+    /// with no store at all never arms one either; it has nowhere to keep a cache.
+    ///
+    /// Each result is handed back as the restore gave it, for the caller to report.
+    pub async fn restore_channel_lists(
+        &self,
+    ) -> (
+        Result<usize, crate::store::StoreError>,
+        Result<usize, crate::store::StoreError>,
+    ) {
+        let added = self.restore_added_channels().await;
+        let hidden = self.restore_hidden_channels().await;
+        if added.is_ok() && hidden.is_ok() {
+            self.message_cache.arm();
+        }
+        (added, hidden)
     }
 
     /// The namespace to record for a channel registered through `provider_key`, when one applies.

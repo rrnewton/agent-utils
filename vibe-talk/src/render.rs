@@ -202,6 +202,184 @@ pub fn markup_for(config: &Config, channel: &ChannelInfo) -> Markup {
         .unwrap_or_default()
 }
 
+/// What the message cache's full-text index holds of a body: its text as the page draws it, and
+/// the addresses of its links. `#208 persistent-cache`.
+///
+/// The page searches what a row SAYS — the drawn text, with emphasis gone and a link drawn by its
+/// short label (`widgets#123`), and the addresses its links go to — so an index built from the
+/// source alone would never offer a row whose match is only in the drawn form. This draws each
+/// body exactly as the page is sent it, through [`headed_body`] with the provider's own markup,
+/// and reads the result the way a browser's `textContent` does: every text node, entities
+/// decoded, no tag adding anything. A body the page draws as plain paragraphs is its text.
+///
+/// The closure that confirms a paren heading confirms none and records nothing: indexing a row
+/// must not change how another one is drawn. That costs nothing here, because a heading only
+/// marks words the body already holds.
+///
+/// [`SearchText::VERSION`] names these rules. A change to the rendering, the link labels or this
+/// reading of the result is a new version, and a cache built under the old one rebuilds its index
+/// text in the background. A test over a fixed corpus pins the output to the version, so a change
+/// that forgets the bump fails.
+#[derive(Clone, Debug, Default)]
+pub struct SearchText {
+    markups: HashMap<String, Markup>,
+}
+
+impl SearchText {
+    /// The label of the rules this indexes by.
+    pub const VERSION: &'static str = "render-1";
+
+    /// The rendering for every provider `config` names, each with its own markup.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            markups: config
+                .providers
+                .iter()
+                .map(|provider| (provider.key.clone(), provider.markup()))
+                .collect(),
+        }
+    }
+
+    /// One body as the page draws it, written in `markup` by an author who is (`bot`) or is not a
+    /// bot account: its visible text and its link addresses, in order.
+    #[must_use]
+    pub fn drawn(text: &str, markup: Markup, bot: bool) -> crate::cache::Rendered {
+        Self::drawn_named(text, markup, bot, &[])
+    }
+
+    /// [`SearchText::drawn`], with each of `mentions` drawn by the name the provider gave it, as
+    /// the page draws a message's [`Message::mentions`]. `#318 slack-mention-names`.
+    #[must_use]
+    pub fn drawn_named(
+        text: &str,
+        markup: Markup,
+        bot: bool,
+        mentions: &[MentionName],
+    ) -> crate::cache::Rendered {
+        let (html, _heading) = headed_body(text, markup, bot, &|_| false, mentions);
+        if html.is_empty() {
+            return crate::cache::Rendered {
+                text: text.to_owned(),
+                hrefs: Vec::new(),
+            };
+        }
+        text_content(&html)
+    }
+}
+
+impl crate::cache::SearchTextSource for SearchText {
+    fn version(&self) -> String {
+        Self::VERSION.to_owned()
+    }
+
+    fn rendered(&self, provider_key: &str, message: &Message) -> crate::cache::Rendered {
+        let markup = self.markups.get(provider_key).copied().unwrap_or_default();
+        Self::drawn_named(
+            &message.content,
+            markup,
+            message.author_is_bot,
+            &message.mentions,
+        )
+    }
+}
+
+/// The text content of sanitized HTML, as a browser reads it, and the address of every link in
+/// it.
+///
+/// Only for what [`SANITIZER`] wrote: well-formed tags, attribute values in double quotes, and
+/// text whose only markup characters are entities. A tag adds nothing to the text, because the
+/// HTML puts a newline after every block element itself.
+fn text_content(html: &str) -> crate::cache::Rendered {
+    let mut text = String::with_capacity(html.len());
+    let mut hrefs = Vec::new();
+    let mut rest = html;
+    while let Some(open) = rest.find('<') {
+        push_decoded(&mut text, &rest[..open]);
+        let tag = &rest[open + 1..];
+        let mut quote = None;
+        let close = tag.char_indices().find_map(|(at, c)| {
+            match (quote, c) {
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), c) if c == q => quote = None,
+                (None, '>') => return Some(at),
+                _ => {}
+            }
+            None
+        });
+        let Some(close) = close else {
+            // An unclosed tag is not something the sanitizer writes; what follows is not text.
+            rest = "";
+            break;
+        };
+        if let Some(href) = anchor_href(&tag[..close]) {
+            hrefs.push(href);
+        }
+        rest = &tag[close + 1..];
+    }
+    push_decoded(&mut text, rest);
+    crate::cache::Rendered { text, hrefs }
+}
+
+/// The decoded `href` of an opening `<a …>` tag, given what lies between its angle brackets.
+fn anchor_href(tag: &str) -> Option<String> {
+    let attributes = tag.strip_prefix('a')?;
+    if !attributes.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    let start = attributes.find(" href=\"")? + " href=\"".len();
+    let value = &attributes[start..];
+    let end = value.find('"')?;
+    let mut href = String::with_capacity(end);
+    push_decoded(&mut href, &value[..end]);
+    Some(href)
+}
+
+/// Append `text` to `out` with its character references decoded. A reference this does not know
+/// is kept as written.
+fn push_decoded(out: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let decoded = after
+            .find(';')
+            .filter(|&semi| semi <= 12)
+            .and_then(|semi| character_reference(&after[..semi]).map(|c| (c, semi)));
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+/// The character a reference names, without its `&` and `;`.
+fn character_reference(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{a0}'),
+        _ => {
+            let number = name.strip_prefix('#')?;
+            let code = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => number.parse().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
+}
+
 /// Fill [`Message::content_html`] and [`Message::heading`] for a batch read from `channel`.
 ///
 /// Called by the routes whose only reader is the page, and never by a path toward a model: the
@@ -3041,5 +3219,129 @@ mod tests {
             let expected = usize::from(text.starts_with('['));
             assert_eq!(marks, expected, "{text:?}: {html}");
         }
+    }
+}
+
+#[cfg(test)]
+mod search_text_tests {
+    use super::{Markup, SearchText};
+    use crate::cache::search_text::build;
+    use crate::cache::SearchTextSource as _;
+
+    #[test]
+    fn the_index_keeps_link_labels_addresses_and_words_emphasis_split() {
+        let pull = "https://github.com/octo/widgets/pull/12";
+        let body = format!("Fixed **wid**gets in {pull} and [the notes](https://example.test/notes?a=1&b=2) _today_");
+        let drawn = SearchText::drawn(&body, Markup::Discord, false);
+        assert_eq!(
+            drawn.text, "Fixed widgets in widgets#12 and the notes today\n",
+            "{drawn:?}"
+        );
+        assert_eq!(
+            drawn.hrefs,
+            [pull, "https://example.test/notes?a=1&b=2"],
+            "addresses are decoded, in order"
+        );
+        let text = build("Ada", &body, &drawn);
+        for needle in [
+            "widgets",
+            "widgets#12",
+            "the notes today",
+            pull,
+            "https://example.test/notes?a=1&b=2",
+            "**wid**gets",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+        }
+    }
+
+    #[test]
+    fn each_provider_is_drawn_in_its_own_markup_and_a_plain_body_is_its_text() {
+        let config = crate::testing::config();
+        let source = SearchText::from_config(&config);
+        let key = &config.providers[0].key;
+        let mut message = crate::cache::fixtures::message("1", "u", "a *b* <&> c", 5);
+        let discord = source.rendered(key, &message);
+        assert_eq!(discord.text, "a b <&> c\n");
+        assert!(discord.hrefs.is_empty());
+        assert_eq!(
+            SearchText::drawn("a *b* c <https://x.test/|label>", Markup::Slack, false),
+            crate::cache::Rendered {
+                text: "a b c label\n".to_owned(),
+                hrefs: vec!["https://x.test/".to_owned()],
+            }
+        );
+        message.content = "just words".to_owned();
+        assert_eq!(source.rendered(key, &message).text, "just words");
+        assert_eq!(
+            source
+                .rendered("a-provider-nobody-configured", &message)
+                .text,
+            "just words"
+        );
+        assert_eq!(source.version(), SearchText::VERSION);
+    }
+
+    /// Bodies of every shape the renderer treats differently, in every markup.
+    const CORPUS: &[(&str, bool)] = &[
+        ("plain words, nothing else", false),
+        ("**bold**, _italic_, *star* and ~~struck~~", false),
+        (
+            "a bare link https://github.com/octo/widgets/issues/7 mid-sentence",
+            false,
+        ),
+        (
+            "[a label](https://example.test/a?b=1&c=<2>) and <https://example.test/x|angled>",
+            false,
+        ),
+        ("`code with **stars**` and\n```\nblock <b>&amp;\n```", false),
+        ("- one\n- two\n  - nested\n1. Goal\n- step", false),
+        ("> quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |", false),
+        ("<@123456789> said <#987654321> & left", false),
+        ("[build-bot] Status: green. More words follow here.", true),
+        ("Release notes 10:52 PM ET\nsecond line", false),
+        ("__init__.py and snake_case_name", false),
+        ("emoji 🎉 and non-breaking\u{a0}space", false),
+    ];
+
+    /// Each `SearchText::VERSION` there has ever been, and the digest of the corpus under it. A
+    /// change to what the index is given changes the digest: bump the version (a cache built under
+    /// the old one then rebuilds its index text) and add a line, rather than editing one.
+    const PINNED: &[(&str, &str)] = &[(
+        "render-1",
+        "09987ed5048b1a31f6d567320deaf9fb276392766933c7a85a23eaef6bfe331c",
+    )];
+
+    fn corpus_digest() -> String {
+        let mut all = String::new();
+        for markup in [Markup::Discord, Markup::GoogleChat, Markup::Slack] {
+            for (body, bot) in CORPUS {
+                let drawn = SearchText::drawn(body, markup, *bot);
+                all.push_str(&drawn.text);
+                all.push('\u{0}');
+                all.push_str(&drawn.hrefs.join("\u{1}"));
+                all.push('\u{2}');
+            }
+        }
+        let digest = ring::digest::digest(&ring::digest::SHA256, all.as_bytes());
+        digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn what_the_index_is_given_changes_only_with_its_version() {
+        let digest = corpus_digest();
+        let versions: std::collections::HashSet<&str> = PINNED.iter().map(|(v, _)| *v).collect();
+        assert_eq!(versions.len(), PINNED.len(), "a version is pinned twice");
+        let pinned = PINNED
+            .iter()
+            .find(|(version, _)| *version == SearchText::VERSION)
+            .map(|(_, digest)| *digest);
+        assert_eq!(
+            pinned,
+            Some(digest.as_str()),
+            "the index text of the corpus is now {digest} under {}: if the rendering changed on \
+             purpose, bump SearchText::VERSION and pin the new digest under it",
+            SearchText::VERSION
+        );
     }
 }

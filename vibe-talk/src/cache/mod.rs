@@ -1107,6 +1107,14 @@ impl MessageCache {
         self.shared.epochs.stamp(chan)
     }
 
+    /// Local time by the cache's own clock, in milliseconds since the Unix epoch: what a read
+    /// that is about to start notes as its observation time, so that the times it offers and the
+    /// writer's own cutoffs are read from one clock.
+    #[must_use]
+    pub fn now_ms(&self) -> i64 {
+        self.shared.clock.now_ms()
+    }
+
     /// Replace the route snapshot the writer gates on, and sweep every channel and provider not
     /// in it out of the file.
     ///
