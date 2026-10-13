@@ -14,6 +14,15 @@ speaks the Discord-compatible bridge API on loopback:
   C is sent and the bridge keeps failing it -> D is sent and waits -> a real reload -> C is left to
   the reader, nothing is sent on its own, and D still waits behind C -> Retry on C -> C lands, then D.
 
+  E keeps failing -> F waits behind it -> Dismiss on E -> F lands, and E never does.
+
+  G, H and I are written one after another while the bridge takes most of a second over each ->
+  they reach it one at a time, in that order, never two at once.
+
+  The server on its own: P is posted by a caller that hangs up while the bridge is still working on
+  it, as a phone does when the page stops waiting, signs out or loses its connection -> Q, posted
+  next, does not reach the bridge until P has landed.
+
 The bridge records every post in the order it arrived, so "A then B" is what reached the chat
 service, not what the page drew. It needs the release binary, which has web/ compiled into it:
 `cargo build --release` first (the `send-order-browser` make target does). Pass --server-bin to use
@@ -62,11 +71,32 @@ class Bridge:
     arrivals: list[tuple[str, str, int]] = field(default_factory=list)
     fail_once: set[str] = field(default_factory=set)
     failing: set[str] = field(default_factory=set)
+    # Seconds the bridge works on a post, by first word, before it answers: a slow bridge.
+    hold: dict[str, float] = field(default_factory=dict)
+    # When each post reached the bridge, and when each one landed, by first word.
+    reached_at: dict[str, float] = field(default_factory=dict)
+    landed_at: dict[str, float] = field(default_factory=dict)
+    in_flight: int = 0
+    most_in_flight: int = 0
 
     def post(self, body: Json) -> tuple[int, Json]:
         content = str(body.get("content") or "")
-        nonce = str(body.get("nonce") or "")
         word = content.split()[0] if content.split() else ""
+        with self.lock:
+            self.reached_at.setdefault(word, time.monotonic())
+            self.in_flight += 1
+            self.most_in_flight = max(self.most_in_flight, self.in_flight)
+            delay = self.hold.get(word, 0.0)
+        try:
+            # Working on it, whether or not whoever asked is still waiting for the answer.
+            if delay:
+                time.sleep(delay)
+            return self.commit(word, str(body.get("nonce") or ""), content)
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+
+    def commit(self, word: str, nonce: str, content: str) -> tuple[int, Json]:
         with self.lock:
             if nonce and nonce in self.by_nonce:
                 # The same request again: the post it already made, never a second one.
@@ -87,7 +117,17 @@ class Bridge:
             if nonce:
                 self.by_nonce[nonce] = message
             self.arrivals.append((word, nonce, 200))
+            self.landed_at.setdefault(word, time.monotonic())
             return 200, message
+
+    def busiest(self) -> int:
+        """The most posts the bridge has had in hand at once since the last `calm()`."""
+        with self.lock:
+            return self.most_in_flight
+
+    def calm(self) -> None:
+        with self.lock:
+            self.most_in_flight = self.in_flight
 
     def landed(self) -> list[str]:
         """The first word of each message the chat service holds, in the order they landed."""
@@ -139,6 +179,35 @@ def bridge_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:
             pass
 
     return Handler
+
+
+def reply_request(port: int, text: str, key: str) -> bytes:
+    """A POST to the channel's reply route, as the page makes it, as raw HTTP/1.1."""
+    body = json.dumps({"text": text, "idempotency_key": key}).encode()
+    head = (
+        f"POST /api/v1/channels/{CHANNEL_ID}/reply HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        f"Authorization: Bearer {WRITE_TOKEN}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "\r\n"
+    )
+    return head.encode() + body
+
+
+def post_reply(port: int, text: str, key: str) -> int:
+    """POST `text` to the channel and wait for the answer; its HTTP status."""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v1/channels/{CHANNEL_ID}/reply",
+        data=json.dumps({"text": text, "idempotency_key": key}).encode(),
+        headers={"Authorization": f"Bearer {WRITE_TOKEN}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as error:
+        return int(error.code)
 
 
 def free_port() -> int:
@@ -362,13 +431,55 @@ def main() -> int:
                 landed_words = [word for word, _, status in bridge.tried() if status == 200]
                 check(landed_words[-2:] == ["C", "D"], f"D landed before C: {bridge.tried()}")
                 until(page, "the outbox did not empty after the reload", lambda: rows(page) == [])
+
+                # 3. E keeps failing; F waits behind it; Dismiss on E lets F go.
+                bridge.failing.add("E")
+                send(page, "E will not go through")
+                until(page, "E did not fail", lambda: [state for state, _ in rows(page)] == ["retrying"])
+                send(page, "F waits for E")
+                until(page, "F was not shown waiting behind E",
+                      lambda: [state for state, _ in rows(page)] == ["retrying", "queued"])
+                page.click("#outgoing-log li.outgoing-message:first-child .outgoing-dismiss")
+                until(page, "F did not land once E was dismissed", lambda: bridge.landed()[-1:] == ["F"])
+                check("E" not in bridge.landed(), f"E landed: {bridge.tried()}")
+                until(page, "the outbox did not empty after the Dismiss", lambda: rows(page) == [])
+                bridge.failing.discard("E")
+
+                # 4. A slow bridge: three messages written at once reach it one at a time, in order.
+                for word in ("G", "H", "I"):
+                    bridge.hold[word] = 0.8
+                bridge.calm()
+                for text in ("G goes first", "H goes second", "I goes third"):
+                    send(page, text)
+                until(page, "G, H and I did not all land", lambda: bridge.landed()[-3:] == ["G", "H", "I"], 20.0)
+                check(bridge.busiest() == 1,
+                      f"the bridge had {bridge.busiest()} posts to one channel in hand at once: {bridge.tried()}")
+                until(page, "the outbox did not empty after the slow bridge", lambda: rows(page) == [])
+
+                # 5. The server on its own: a caller that hangs up does not let the next post past.
+                bridge.hold["P"] = 2.5
+                bridge.calm()
+                with socket.create_connection(("127.0.0.1", port), timeout=10) as caller:
+                    caller.sendall(reply_request(port, "P is posted by a caller that hangs up", "send-order-p"))
+                    until(page, "P never reached the bridge", lambda: "P" in bridge.reached_at)
+                    time.sleep(0.2)
+                # P's caller has gone; the bridge is still working on P.
+                check("P" not in bridge.landed(), f"P landed before its caller hung up: {bridge.tried()}")
+                status = post_reply(port, "Q follows P", "send-order-q")
+                check(status == 200, f"Q was not posted: HTTP {status}")
+                check(bridge.landed()[-2:] == ["P", "Q"], f"Q landed before P, whose caller had hung up: {bridge.tried()}")
+                check(bridge.reached_at["Q"] >= bridge.landed_at["P"],
+                      "Q reached the bridge while it was still working on P, whose caller had hung up")
+                check(bridge.busiest() == 1, f"the bridge had {bridge.busiest()} posts in hand at once")
                 check(not errors, f"the page threw: {errors}")
                 version = context.browser.version if context.browser else "Chromium"
                 context.close()
         print(f"{version} at 412x915 against the real server and a mock Google Chat bridge: A failed at"
               " once and waited 3 s, B waited behind it and the bridge never saw it, A went again under the"
               " same nonce and landed, then B; C kept failing, D waited behind it across a real reload that"
-              " sent nothing, and Retry on C landed C, then D")
+              " sent nothing, and Retry on C landed C, then D; Dismiss on a failing E let F go; G, H and I"
+              " reached a slow bridge one at a time, in order; and Q did not reach the bridge until P, whose"
+              " caller hung up mid-post, had landed")
         return 0
     finally:
         if server is not None:
