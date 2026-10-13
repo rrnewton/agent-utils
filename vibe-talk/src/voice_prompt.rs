@@ -45,8 +45,27 @@
 //! not allow is believed — from the vendor's documentation, not from a call observed here — to end
 //! the conversation rather than be ignored, so "could not tell" is treated as "not allowed", and
 //! the note is the fallback, never the override.
+//!
+//! # An agent that allows it always gets this server's prompt
+//!
+//! Even with nothing of the owner's saved. The prompt carries the send rules, and those follow the
+//! Sending switch ([`Variant`]); a console prompt pasted by hand does not, so after the switch moved
+//! such an agent would go on reading back a message the server had already posted, or announce as
+//! sent one still waiting for a yes. Handing an agent that allows it the assembled prompt on every
+//! call is what makes its rules follow the switch. The cost is that its console prompt is never
+//! used, which the QUICKSTART says before an operator allows it. An agent that does not allow it
+//! is handed nothing when nothing is saved, and its call opens exactly as it always did.
+//!
+//! # The vendor is asked once in a while, not on every call
+//!
+//! Whether an agent allows the override is a round trip of its own, beside the mint. The answer is
+//! kept for [`AGENT_CHECK_TTL`] per agent ([`OverrideAnswers`]), so most calls do not wait on it at
+//! all. A failure or a timeout is not kept: it counts as "not allowed" for that call and is asked
+//! again at the next one.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::config::ConversationBackend;
 use crate::contract::{PromptDelivery, PromptTransport, SessionPrompt, VoicePromptSettings};
@@ -180,32 +199,87 @@ pub async fn set(state: &AppState, change: Change) -> Result<VoicePromptSettings
 }
 
 /// The longest a call's start waits to learn whether the hosted agent allows its prompt to be
-/// replaced. Asked beside the session mint rather than after it, so this is the most it can add;
-/// past it the answer counts as "not allowed", which sends the instructions as a note instead.
+/// replaced, when no answer is kept. Asked beside the session mint rather than after it, so this is
+/// the most it can add; past it the answer counts as "not allowed", which sends the instructions as
+/// a note instead.
 pub const AGENT_CHECK_DEADLINE: Duration = Duration::from_millis(2_500);
 
-/// What the page should hand a hosted agent as this call opens, or `None` when there is nothing:
-/// a provider that reads the profile instead, or an owner who has written nothing.
+/// How long the vendor's answer about one agent is believed. Short, because it is believed in both
+/// directions: an operator who withdraws the permission at the vendor while this still says
+/// "allowed" has his next calls handed an override the agent refuses — believed to end each such
+/// call — until it runs out. The QUICKSTART says so.
+pub const AGENT_CHECK_TTL: Duration = Duration::from_secs(120);
+
+/// What the vendor last said about each agent letting a client replace its prompt, and when.
+/// `#272 voice-agent-instructions`.
 ///
-/// The hosted agent is given the prompt for a credential that may post, under the send setting —
-/// the voice session that carries this needs the write token, and an agent that can propose is the
-/// one the voice page exists to confirm for. An operator who gives a hosted agent only the read
-/// token should not allow it a prompt override; the QUICKSTART says so.
-pub async fn for_session(state: &AppState) -> Option<SessionPrompt> {
-    if delivery(state) != PromptDelivery::Page {
-        return None;
+/// Only answers are kept. A failure or a timeout is "not allowed" for the call that met it and is
+/// asked again at the next, so a vendor that was briefly down does not keep the override away for
+/// the whole of [`AGENT_CHECK_TTL`].
+#[derive(Debug, Default)]
+pub struct OverrideAnswers {
+    answers: Mutex<HashMap<String, KeptAnswer>>,
+}
+
+/// One kept answer: what the agent's configuration said, and when it was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptAnswer {
+    /// `AgentProfile::prompt_override` as read: `None` when the configuration did not say.
+    pub allowed: Option<bool>,
+    /// When it was read.
+    pub at: Instant,
+}
+
+impl OverrideAnswers {
+    /// Nothing kept yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
-    let owner = current(state).await;
-    if owner.is_shipped() {
-        return None;
+
+    /// The answer kept for `agent`, if it was read less than [`AGENT_CHECK_TTL`] before `now`.
+    #[must_use]
+    pub fn fresh(&self, agent: &str, now: Instant) -> Option<KeptAnswer> {
+        let answers = self
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        answers
+            .get(agent)
+            .copied()
+            .filter(|kept| now.saturating_duration_since(kept.at) < AGENT_CHECK_TTL)
     }
-    let allowed = match tokio::time::timeout(
-        AGENT_CHECK_DEADLINE,
-        state.elevenlabs.agent_profile(&state.config.elevenlabs),
-    )
-    .await
-    {
-        Ok(Ok(profile)) => profile.prompt_override,
+
+    /// Keep what the vendor said about `agent` at `at`, in place of anything kept before.
+    pub fn keep(&self, agent: &str, allowed: Option<bool>, at: Instant) {
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(agent.to_owned(), KeptAnswer { allowed, at });
+    }
+}
+
+/// Whether the configured hosted agent lets a client replace its prompt: the kept answer while it
+/// is fresh, otherwise the vendor's, asked within [`AGENT_CHECK_DEADLINE`]. `None` when it did not
+/// say, could not be asked, or did not answer in time — all of which count as "not allowed".
+async fn override_allowed(state: &AppState) -> Option<bool> {
+    let config = &state.config.elevenlabs;
+    // Keyed by where it was asked and which agent, so two configurations cannot share an answer.
+    let agent = format!(
+        "{}\n{}",
+        config.api_base,
+        config.agent_id.as_deref().unwrap_or_default()
+    );
+    if let Some(kept) = state.agent_override.fresh(&agent, Instant::now()) {
+        return kept.allowed;
+    }
+    match tokio::time::timeout(AGENT_CHECK_DEADLINE, state.elevenlabs.agent_profile(config)).await {
+        Ok(Ok(profile)) => {
+            state
+                .agent_override
+                .keep(&agent, profile.prompt_override, Instant::now());
+            profile.prompt_override
+        }
         Ok(Err(error)) => {
             tracing::warn!(
                 %error,
@@ -221,7 +295,33 @@ pub async fn for_session(state: &AppState) -> Option<SessionPrompt> {
             );
             None
         }
-    };
+    }
+}
+
+/// What the page should hand a hosted agent as this call opens, or `None` when there is nothing:
+/// a provider that reads the profile instead, or an owner who has written nothing for an agent
+/// that keeps its console prompt.
+///
+/// An agent that allows its prompt to be replaced is handed the assembled prompt whether or not the
+/// owner has written anything, so its send rules follow the Sending switch (see the module
+/// documentation).
+///
+/// The hosted agent is given the prompt for a credential that may post, under the send setting —
+/// the voice session that carries this needs the write token, and an agent that can propose is the
+/// one the voice page exists to confirm for. This server cannot see which token the operator gave
+/// the agent's MCP connection at the vendor. One given only the read token should not be allowed a
+/// prompt override: it would be told it may send, and the server would refuse every send. The
+/// QUICKSTART and Settings say so.
+pub async fn for_session(state: &AppState) -> Option<SessionPrompt> {
+    if delivery(state) != PromptDelivery::Page {
+        return None;
+    }
+    let owner = current(state).await;
+    let allowed = override_allowed(state).await;
+    if owner.is_shipped() && allowed != Some(true) {
+        // Nothing of his, and an agent that keeps its console prompt: nothing to hand over.
+        return None;
+    }
     let variant = Variant::for_caller(true, send_approval::current(state).await);
     Some(session_prompt(variant, &owner, allowed))
 }
@@ -456,6 +556,90 @@ mod tests {
             assert!(none.text.is_empty());
             assert!(!none.system_prompt_applied && !none.instructions_applied);
         }
+    }
+
+    #[test]
+    fn an_agent_that_allows_it_gets_the_shipped_prompt_even_with_nothing_saved() {
+        for variant in [Variant::WriteConfirm, Variant::WriteDirect] {
+            let sent = session_prompt(variant, &OwnerPrompt::default(), Some(true));
+            assert_eq!(sent.transport, PromptTransport::PromptOverride);
+            assert_eq!(
+                sent.text,
+                voice_agent::prompt(variant).text,
+                "the send rules for the switch did not go"
+            );
+            assert!(!sent.system_prompt_applied && !sent.instructions_applied);
+        }
+    }
+
+    #[test]
+    fn a_kept_answer_is_believed_for_its_time_and_for_its_agent_only() {
+        let answers = OverrideAnswers::new();
+        let read = Instant::now();
+        assert_eq!(
+            answers.fresh("agent_a", read),
+            None,
+            "an answer nobody gave"
+        );
+        answers.keep("agent_a", Some(true), read);
+        let kept = answers.fresh("agent_a", read + AGENT_CHECK_TTL - Duration::from_millis(1));
+        assert_eq!(kept.map(|kept| kept.allowed), Some(Some(true)));
+        assert_eq!(
+            answers.fresh("agent_a", read + AGENT_CHECK_TTL),
+            None,
+            "an answer outlived its time"
+        );
+        assert_eq!(
+            answers.fresh("agent_b", read),
+            None,
+            "one agent's answer was believed of another"
+        );
+        // "It did not say" is an answer too, and is kept as one.
+        answers.keep("agent_b", None, read);
+        assert_eq!(
+            answers.fresh("agent_b", read).map(|kept| kept.allowed),
+            Some(None)
+        );
+        // A later answer replaces the earlier one.
+        answers.keep("agent_a", Some(false), read + Duration::from_secs(1));
+        assert_eq!(
+            answers
+                .fresh("agent_a", read + Duration::from_secs(1))
+                .map(|kept| kept.allowed),
+            Some(Some(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_vendor_is_asked_once_for_a_run_of_calls_and_again_after_a_failure() {
+        let (state, _discord, store, elevenlabs) = testing::state_with_store_and_voice();
+        let agent_reads = || {
+            elevenlabs
+                .requested()
+                .iter()
+                .filter(|url| url.contains("/convai/agents/"))
+                .count()
+        };
+        elevenlabs.fail_next_agent_profile("the vendor is down");
+        elevenlabs.allow_prompt_override(Some(true));
+        assert_eq!(
+            for_session(&state).await,
+            None,
+            "a vendor that did not answer was taken for an agent that allows an override"
+        );
+        assert_eq!(agent_reads(), 1);
+        let first = for_session(&state).await.expect("an agent that allows it");
+        assert_eq!(first.transport, PromptTransport::PromptOverride);
+        assert_eq!(agent_reads(), 2, "the failure was kept as an answer");
+        store
+            .set_owner_prompt(&owner("Call me Sam.", None))
+            .await
+            .expect("seed");
+        for _ in 0..3 {
+            let next = for_session(&state).await.expect("handed over");
+            assert_eq!(next.transport, PromptTransport::PromptOverride);
+        }
+        assert_eq!(agent_reads(), 2, "each call start asked the vendor again");
     }
 
     #[tokio::test]

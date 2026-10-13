@@ -128,6 +128,10 @@ pub struct AppState {
     /// What each channel's recent-view shadow has counted. `#208 persistent-cache`; see
     /// [`crate::recent_view`]. In memory, counts only, empty unless a provider turns it on.
     pub recent_view_shadow: Arc<crate::recent_view::Shadow>,
+    /// What the hosted voice agent's configuration last said about a client replacing its prompt.
+    /// `#272 voice-agent-instructions`; see [`crate::voice_prompt::OverrideAnswers`]. In memory and
+    /// short-lived, so a call's start does not wait on the vendor every time.
+    pub agent_override: Arc<crate::voice_prompt::OverrideAnswers>,
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {

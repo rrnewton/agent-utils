@@ -682,6 +682,7 @@ async fn main() -> anyhow::Result<()> {
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
+        agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         live: Arc::clone(&live),
         summarizer,

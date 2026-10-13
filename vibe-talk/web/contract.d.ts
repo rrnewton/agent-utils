@@ -1071,8 +1071,10 @@ declare namespace VibeTalk {
    * What the page hands a hosted agent as a call opens, so the call carries the owner's words.
    * `#272 voice-agent-instructions`.
    *
-   * On a voice session only when the provider is one the page configures and the owner has written
-   * something; absent, the page sends exactly what it always sent.
+   * On a voice session only when the provider is one the page configures, and either the owner has
+   * written something or the agent allows its prompt to be replaced — such an agent is handed the
+   * assembled prompt on every call, so its send rules follow the Sending switch. Absent, the page
+   * sends exactly what it always sent.
    */
   interface SessionPrompt {
     /**
@@ -1089,8 +1091,9 @@ declare namespace VibeTalk {
      */
     system_prompt_applied: boolean;
     /**
-     * What to send: the whole assembled prompt for `prompt_override`, the heading and the
-     * instructions for `contextual_update`; absent for `not_sent`.
+     * What to send: the whole assembled prompt for `prompt_override` — the shipped one when the
+     * owner saved nothing — the heading and the instructions for `contextual_update`; absent for
+     * `not_sent`.
      */
     text?: string;
     /**
@@ -1599,9 +1602,10 @@ declare namespace VibeTalk {
      * The owner's words for the agent, for the page to hand over as the socket opens. `#272
      * voice-agent-instructions`.
      *
-     * Filled in by `GET /api/v1/voice-session` for a hosted agent the page configures, and only
-     * when the owner has written something; a provider never sets it. A deployment-managed
-     * bridge reads the same words from `GET /api/v1/voice-agent` instead.
+     * Filled in by `GET /api/v1/voice-session` for a hosted agent the page configures, when the
+     * owner has written something or the agent allows its prompt to be replaced; a provider never
+     * sets it. A deployment-managed bridge reads the same words from `GET /api/v1/voice-agent`
+     * instead.
      */
     agent_prompt?: SessionPrompt | null;
     /**
