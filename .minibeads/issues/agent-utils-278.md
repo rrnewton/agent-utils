@@ -1,12 +1,13 @@
 ---
 title: 'page-live-reads: stop re-reading the channel for every live event and after a timed-out read'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-13T20:05:29.708859907+00:00
-updated_at: 2026-10-13T20:05:29.708859907+00:00
+updated_at: 2026-10-13T21:05:20.451265704+00:00
+closed_at: 2026-10-13T21:05:20.451265534+00:00
 ---
 
 # Description
