@@ -622,6 +622,80 @@ fn a_deleted_root_with_replies_leaves_its_replies_in_their_thread() {
 }
 
 #[test]
+fn a_complete_deltas_deletions_remove_ghosts_but_not_what_was_seen_after_it_started() {
+    // A bridge supersedes a message's id; the ghost goes by the delta's deleted list.
+    let fx = Fixture::new("cache-delta");
+    fx.list_scope(Scope::Flat, vec![m(1), m(2)], T0 + 100, None);
+    push(&fx, m(3), false, T0 + 300);
+    fx.offer(
+        &fx.chan,
+        Observation::Deleted {
+            ids: vec![mid("m1"), mid("m3"), mid("unknown")],
+            observed_ms: T0 + 200,
+        },
+    );
+    assert_eq!(content(&fx, "m1"), None, "the ghost is gone");
+    assert!(content(&fx, "m2").is_some());
+    assert!(
+        content(&fx, "m3").is_some(),
+        "set by a push after the delta's read started"
+    );
+    assert!(fx
+        .cache
+        .tombstoned(&fx.chan, &mid("unknown"))
+        .served()
+        .expect("served"));
+    // ...and an exhaustive Flat listing that lacks a row removes it the same way.
+    fx.list_scope(
+        Scope::Flat,
+        vec![m(3)],
+        T0 + 400,
+        Some(newest_proof(ListStart::ScopeStart)),
+    );
+    assert_eq!(content(&fx, "m2"), None);
+    // A thread list's record is kept; its count only moves with a newer read.
+    fx.offer(
+        &fx.chan,
+        Observation::Threads {
+            threads: vec![ThreadRecord {
+                thread_id: "t9".to_owned(),
+                root_id: Some(mid("m3")),
+                reply_count: Some(4),
+                reply_count_exact: true,
+                last_activity_ms: T0 + 9,
+            }],
+            observed_ms: T0 + 500,
+        },
+    );
+    fx.offer(
+        &fx.chan,
+        Observation::Threads {
+            threads: vec![ThreadRecord {
+                thread_id: "t9".to_owned(),
+                root_id: None,
+                reply_count: Some(1),
+                reply_count_exact: true,
+                last_activity_ms: T0 + 5,
+            }],
+            observed_ms: T0 + 450,
+        },
+    );
+    let record = fx
+        .cache
+        .thread(&fx.chan, "t9")
+        .served()
+        .expect("served")
+        .expect("kept");
+    assert_eq!(
+        record.reply_count,
+        Some(4),
+        "an older read does not lower it"
+    );
+    assert_eq!(record.root_id, Some(mid("m3")));
+    assert_eq!(record.last_activity_ms, T0 + 9);
+}
+
+#[test]
 fn a_pushed_snippet_never_overwrites_listing_text_and_a_listing_replaces_a_partial() {
     let fx = Fixture::new("cache-snippet");
     let full = Message {
