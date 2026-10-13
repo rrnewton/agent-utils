@@ -845,18 +845,16 @@ async fn name_one(
             .await?
             .map(|filed| filed.name),
     };
-    let page = deps
-        .chat
-        .fetch_timeline(
-            channel,
-            &TimelineRequest {
-                view: TimelineView::Thread,
-                thread_id: Some(snapshot.id.clone()),
-                before: None,
-                after: None,
-                limit: THREAD_FETCH_LIMIT,
-            },
-        )
+    let request = TimelineRequest {
+        view: TimelineView::Thread,
+        thread_id: Some(snapshot.id.clone()),
+        before: None,
+        after: None,
+        limit: THREAD_FETCH_LIMIT,
+    };
+    // `#278 timeline-single-flight`: counted as naming, whoever's request queued it.
+    let page = crate::read_reason::ReadReason::Naming
+        .scope(deps.chat.fetch_timeline(channel, &request))
         .await
         .map_err(|error| {
             SummaryError::Transport(format!("the thread could not be read: {error}"))

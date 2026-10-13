@@ -50948,3 +50948,18 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
   await press(control, focused(control), "Escape");
   assert.equal(replyBoxAt(control), "screen", "the control kept the reply, so this test cannot see it closed");
 });
+
+test("every timeline read says what it is for, in the refresh's own word", async () => {
+  // `#278 timeline-single-flight`, remote-ops audit W0.3: the server counts its provider reads by
+  // the reason the page gives, so each read carries the word its refresh already goes by.
+  const page = await threadPage();
+  const reasonOf = (path) => new URL(path, "http://fixture.test").searchParams.get("reason");
+  assert.equal(reasonOf(page.timelineCalls[0]), "enter", "opening the channel");
+  const reads = page.timelineCalls.length;
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  const polled = page.timelineCalls.slice(reads);
+  assert.ok(polled.some((path) => reasonOf(path) === "poll"), `the poll's read: ${polled.join("\n")}`);
+  const silent = page.timelineCalls.filter((path) => reasonOf(path) === null);
+  assert.deepStrictEqual(silent, [], "a timeline read said nothing about why it was made");
+});

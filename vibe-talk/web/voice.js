@@ -15848,7 +15848,8 @@ async function refreshThreadDirectory() {
   if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
   threadDirectoryInFlight = channel;
   threadDirectoryReadAt.set(channel, Date.now());
-  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
+  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}` +
+    "&reason=threads";
   // `#203 incremental-refresh`. With the thread list's forward cursor, only the threads that moved,
   // under the same rule as the poll's: a list a complete delta keeps current needs no full read.
   const cover = channelCanon.channel === channel ? channelCanon.views.get(viewKey("threads")) : null;
@@ -15979,7 +15980,8 @@ async function loadThreadDirectory(older) {
   const generation = ++threadDirectory.generation;
   Object.assign(threadDirectory, { loading: true, older, failed: false, error: "" });
   renderThreadDirectory();
-  let path = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
+  let path = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}` +
+    `&reason=${older ? "older" : "threads"}`;
   if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
   let payload;
   try {
@@ -16885,7 +16887,8 @@ async function readAllForCounts(channel) {
   const read = { context: JSON.stringify([channel, "flat", null]), channel, view: "flat", thread: null, canon: channelCanon };
   try {
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
-      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`, { signal }));
+      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
+      { signal }));
     countsAllReadFor.set(channel, outrun);
     // Not over a newest page of All that landed while this was on the wire — the reader switched to
     // All, or tapped N replies, and that read answered first: this answer is the older, and folded
@@ -17145,13 +17148,35 @@ async function writeInBatches(route, ids, landed) {
   return stored;
 }
 
-function timelinePath(before = null, after = null) {
+/**
+ * The path of a read of the view on screen. `reason` says what the read is for, in the words the
+ * refreshes already use (`poll`, `live`, `older`, ...), so the server can count its provider reads
+ * by cause. `#278 timeline-single-flight`.
+ *
+ * @param {string | null} [before]
+ * @param {string | null} [after]
+ * @param {string | null} [reason]
+ */
+function timelinePath(before = null, after = null, reason = null) {
   let path = `/api/v1/channels/${encodeURIComponent(el("discord-channel").value)}/timeline` +
     `?view=${channelView}&limit=${DISCORD_PAGE_LIMIT}`;
   path = withThreadQuery(path, selectedThreadId);
   if (before) path += `&before=${encodeURIComponent(before)}`;
   if (after) path += `&after=${encodeURIComponent(after)}`;
+  if (reason) path += `&reason=${encodeURIComponent(reason)}`;
   return path;
+}
+
+/**
+ * The one word a refresh's `reason` names for the server: the first of several merged into one
+ * queued load, or null when it named none. `#278 timeline-single-flight`.
+ *
+ * @param {string | (string | undefined)[] | undefined} reason
+ * @returns {string | null}
+ */
+function readReasonOf(reason) {
+  const first = Array.isArray(reason) ? reason.find((one) => typeof one === "string") : reason;
+  return typeof first === "string" ? first : null;
 }
 
 /**
@@ -17485,7 +17510,7 @@ async function loadTimeline(options) {
   };
   try {
     for (;;) {
-      const path = timelinePath(null, sent);
+      const path = timelinePath(null, sent, readReasonOf(options && options.reason));
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
@@ -17687,7 +17712,7 @@ async function pagesBackTo(payload, placeAt, current) {
   try {
     while (pages.length < REPLY_JUMP_PAGES && last.has_more === true && last.next_before &&
         !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
-      const path = timelinePath(last.next_before);
+      const path = timelinePath(last.next_before, null, "older");
       try {
         steps.pause();
         last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
@@ -17742,7 +17767,7 @@ async function loadOlderTimeline(signal) {
   olderFetchInFlight = true;
   renderOlderControl();
   try {
-    const path = timelinePath(discordOlderCursor);
+    const path = timelinePath(discordOlderCursor, null, "older");
     steps.pause();
     let payload;
     try {
@@ -18061,7 +18086,8 @@ async function placeReplyTarget(entry) {
   if (held && !channelCanon.unplaced.has(id)) return answeredThread(held);
   const payload = await apiDecoded(
     "TimelineResponse",
-    `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`
+    `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
+      "&reason=reply-place"
   );
   const messages = payload.messages || [];
   if (current()) {
@@ -29167,6 +29193,7 @@ async function loadEarlierReplyContext() {
       let path = withThreadQuery(
         `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=${view}&limit=${DISCORD_PAGE_LIMIT}`, thread);
       if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
+      path += "&reason=older";
       const payload = await readTimeline(path);
       if (generation !== replyContext.generation || String(el("discord-channel").value) !== channel) return;
       foldTimelinePage(payload, Boolean(cursor), view, thread);

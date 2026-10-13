@@ -210,7 +210,12 @@ pub async fn dispatch(state: &AppState, scope: Scope, raw: &Value) -> Outcome {
             id,
             json!({ "tools": tools_for(state, scope).await }),
         ))),
-        "tools/call" => call_tool(state, scope, id, request.params).await,
+        // `#278 timeline-single-flight`: every read a tool makes is counted as a tool's.
+        "tools/call" => {
+            crate::read_reason::ReadReason::Tool
+                .scope(call_tool(state, scope, id, request.params))
+                .await
+        }
         other => Outcome::Reply(Box::new(RpcResponse::err(
             id,
             RpcError::new(METHOD_NOT_FOUND, format!("method not found: {other}")),

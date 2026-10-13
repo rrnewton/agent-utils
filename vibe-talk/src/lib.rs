@@ -70,6 +70,7 @@ pub mod post_gate;
 pub mod probe;
 pub mod providers;
 pub mod read_ahead;
+pub mod read_reason;
 pub mod recent;
 pub mod recent_view;
 pub mod render;

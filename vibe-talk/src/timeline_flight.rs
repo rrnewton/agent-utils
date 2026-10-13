@@ -55,6 +55,7 @@ use tokio::time::Instant;
 
 use crate::chat::ChatError;
 use crate::model::ChannelId;
+use crate::read_reason::ReadReason;
 use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 use crate::timeline_forward::GenericPosition;
 
@@ -234,8 +235,8 @@ impl TimelineFlights {
     ///
     /// `seen` is the channel's live-feed pushes and storage purges when the request was made
     /// ([`crate::recent::ReadMark::seen`]). `memo` is how long a read this call starts is kept once
-    /// it lands; zero keeps nothing. `start` makes the read; it runs in a task of its own, and is
-    /// never cancelled by any caller going away.
+    /// it lands; zero keeps nothing. `start` makes the read; it runs in a task of its own, inside
+    /// the caller's [`ReadReason`], and is never cancelled by any caller going away.
     pub async fn read<F, Fut>(
         self: &Arc<Self>,
         mut key: Key,
@@ -288,7 +289,8 @@ impl TimelineFlights {
         let shared = match claim {
             Some(claim) => {
                 let work = start();
-                tokio::spawn(async move {
+                let reason = ReadReason::current();
+                tokio::spawn(reason.scope(async move {
                     let began = std::time::Instant::now();
                     let answer = work.await.map(|(page, position)| {
                         Arc::new(Fetched {
@@ -298,7 +300,7 @@ impl TimelineFlights {
                         })
                     });
                     claim.finish(answer);
-                });
+                }));
                 Shared::Read
             }
             None => Shared::Joined,

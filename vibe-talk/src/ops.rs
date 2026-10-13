@@ -2964,7 +2964,9 @@ async fn shared_window(
     began: std::time::Instant,
 ) -> Result<Window, OpError> {
     // `window_shared` remembers the window for everyone else as well.
-    let (window, joined) = window_shared(state, channel, limit, began).await?;
+    let (window, joined) = crate::read_reason::ReadReason::SummaryWindow
+        .scope(window_shared(state, channel, limit, began))
+        .await?;
     if joined {
         state.summary_counters.joined();
     } else {

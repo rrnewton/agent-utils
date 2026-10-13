@@ -954,3 +954,51 @@ async fn slack_web_api_calls_are_counted_as_the_far_end_counts_them() {
         .iter()
         .any(|row| row.name == "fetch_recent" && row.outcome == Outcome::NotFound));
 }
+
+#[tokio::test]
+async fn diagnostics_count_each_read_under_the_reason_it_was_made_for() {
+    // `#278 timeline-single-flight`, remote-ops audit W0.3. A read the page asked for counts under
+    // the page's word; one the server made for itself — a catch-up's refresh in its own task, the
+    // reachability probe — under the server's; one nobody said anything about, as untagged.
+    let (state, discord) = vibe_talk::testing::state();
+    let channel = ChannelId(vibe_talk::testing::READ_CHANNEL.to_owned());
+    discord.seed(&channel, "Grace Hopper", "words");
+    let router = vibe_talk::http::router(state.clone());
+    let messages = format!("/api/v1/channels/{}/messages", channel.0);
+    assert_eq!(
+        get(&router, &format!("{messages}?reason=visible")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(&router, &format!("{messages}?limit=5")).await.0,
+        StatusCode::OK
+    );
+    let mut refreshed = vibe_talk::recent::refresh(&state, &channel, 10);
+    refreshed.wait_for(|over| *over).await.expect("finished");
+    let channels = state.all_channels();
+    vibe_talk::probe::probe_channels(state.chat.as_ref(), &channels).await;
+
+    let (status, report) = get(&router, "/api/v1/diagnostics").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = report["upstream"]["providers"][0]["reasons"]
+        .as_array()
+        .expect("reasons")
+        .clone();
+    let count = |name: &str, reason: &str| -> u64 {
+        rows.iter()
+            .find(|row| row["name"] == name && row["reason"] == reason)
+            .and_then(|row| row["count"].as_u64())
+            .unwrap_or(0)
+    };
+    assert_eq!(count("fetch_recent_dated", "visible"), 1, "{rows:?}");
+    assert_eq!(count("fetch_recent_dated", "untagged"), 1, "{rows:?}");
+    assert_eq!(count("fetch_recent_dated", "recent"), 1, "{rows:?}");
+    assert!(
+        count("probe_channel", "probe") >= u64::try_from(channels.len()).unwrap(),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| row["name"] != "identity"),
+        "only reads are counted by reason: {rows:?}"
+    );
+}

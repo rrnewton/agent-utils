@@ -683,7 +683,11 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
             let mark = claim.windows.mark(&claim.channel);
             let started = mark.started();
             let read = match claim.windows.reading.acquire().await {
-                Ok(_permit) => crate::recent_view::read(&state, &claim.channel, limit).await,
+                Ok(_permit) => {
+                    crate::read_reason::ReadReason::Recent
+                        .scope(crate::recent_view::read(&state, &claim.channel, limit))
+                        .await
+                }
                 Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
             };
             let millis = started.elapsed().as_millis();

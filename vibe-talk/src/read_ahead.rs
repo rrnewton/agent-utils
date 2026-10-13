@@ -549,7 +549,9 @@ pub async fn messages_for_speech(
     match thread {
         None => {
             // The window read every caller shares, which remembers what it read for everyone else.
-            let (window, joined) = ops::window_shared(state, channel.clone(), limit, began).await?;
+            let (window, joined) = crate::read_reason::ReadReason::Speech
+                .scope(ops::window_shared(state, channel.clone(), limit, began))
+                .await?;
             found.joined = joined;
             found.fetches = usize::from(!joined);
             let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
