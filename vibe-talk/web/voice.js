@@ -10725,7 +10725,7 @@ async function commitShownProposal(proposal, confirmedBy) {
       const detail = redact(answer.detail || "the rest was not sent");
       const nothing = Number(answer.posted) === 0;
       const unconfirmed = nothing && answer.uncertain === true;
-      if (!nothing || unconfirmed) freezeSentCard(proposal, confirmedBy, unconfirmed ? "unconfirmed" : "partial", answer);
+      if (!nothing || unconfirmed) drawSentCard(proposal, confirmedBy, unconfirmed ? "unconfirmed" : "partial", answer);
       settlePostCard(proposal);
       showError(unconfirmed
         ? `The post to ${proposal.channel_name} could not be confirmed: ${detail}. Check the channel before sending it again.`
@@ -10739,7 +10739,7 @@ async function commitShownProposal(proposal, confirmedBy) {
           : { kind: "partial", proposal };
     } else if (VibeTalkContract.is("CommittedPostResponse", answer)) {
       // The frozen card first, so a focus the card had goes to it rather than to the list.
-      freezeSentCard(proposal, confirmedBy, "sent", answer);
+      drawSentCard(proposal, confirmedBy, "sent", answer);
       settlePostCard(proposal);
       setStatus(`Posted to ${proposal.channel_name}.`);
       outcome = { kind: "sent", proposal };
@@ -10840,6 +10840,29 @@ const SEND_MEMORY_RECHECK_MS = 3000;
 
 /** The sends, by `send_seq`, this page has asked the server to file. */
 const sentClaimed = new Set();
+
+/**
+ * {@link freezeSentCard}, from inside a commit the server has already answered as posted.
+ *
+ * A bug in drawing the card must never reach the commit's `catch`, which would tell the owner — and,
+ * for a spoken yes, the agent — that nothing was sent when something was. So it is thrown again on
+ * its own, where it still shows as an error of the page, and the commit's outcome stands. The send
+ * memory still holds the send, so a later read that reports it can still draw its card.
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ * @param {"ui" | "speaker_turn"} confirmedBy
+ * @param {"sent" | "partial" | "unconfirmed"} outcome
+ * @param {any} answer
+ */
+function drawSentCard(proposal, confirmedBy, outcome, answer) {
+  try {
+    freezeSentCard(proposal, confirmedBy, outcome, answer);
+  } catch (error) {
+    setTimeout(() => {
+      throw error;
+    }, 0);
+  }
+}
 
 /**
  * A frozen card for a send this page committed, from the commit's answer, before the server's own
