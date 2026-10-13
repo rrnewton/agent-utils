@@ -22,8 +22,10 @@ desk:
   its row and the screen; the words they restate are hidden, and every word of those is in the
   header; the rest of the body is drawn; on the desk a short header sits on the line of the row's
   buttons, and on the phone every header is the row's first line under them; the second message of
-  a combined row keeps its own first line; nothing scrolls sideways; the ⋯ menu of a headed row
-  opens over the row below and answers a click -> Rich headers turned off in Settings: no header
+  a combined row keeps its own first line; nothing scrolls sideways; every headed row's time is a
+  <time> whose title says its day (`#260 timestamp-hover`); the ⋯ menu of a headed row opens over
+  the row below and answers a click; on the desk a real hover over a row's time words its title
+  again -> Rich headers turned off in Settings: no header
   piece is drawn and every restated word is drawn where it was written; still off after a reload;
   on again -> on the desk, two columns with the thread on the right: its headed rows measured the
   same way.
@@ -38,6 +40,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
@@ -257,6 +260,8 @@ HEADERS_JS = """async (list) => {
     };
     const words = (text) => text.split(/[^\\p{L}\\p{N}]+/u).filter(Boolean);
     const squash = (text) => text.replace(/\\s+/g, ' ').trim();
+    // `#260 timestamp-hover`: what hovering a row's time says, the day in `dayLabel`'s words.
+    const dayTitle = /^((Today|Yesterday), )?[A-Z][a-z]{2} \\d{1,2}(, \\d{4})?, [A-Z][a-z]{2}, /;
     const placed = {};
     for (const row of document.querySelectorAll(`#${list} > li.discord-message[data-rh-len]`)) {
         const id = row.getAttribute('data-id');
@@ -288,7 +293,12 @@ HEADERS_JS = """async (list) => {
             if (!header.has(word)) problems.push(`${id}: "${word}" is in neither the header nor the body`);
         }
         const reply = row.querySelector(':scope > .meta > .reply-button').getBoundingClientRect();
-        const stamp = row.querySelector(':scope > .meta > .msg-time').getBoundingClientRect();
+        const time = row.querySelector(':scope > .meta > .msg-time');
+        const stamp = time.getBoundingClientRect();
+        if (time.tagName !== 'TIME' || !time.dateTime) problems.push(`${id}: the time is not a <time> with its instant`);
+        else if (!dayTitle.test(time.title) || !time.title.endsWith(`, ${time.textContent}`)) {
+            problems.push(`${id}: the time's title does not say its day: ${JSON.stringify(time.title)}`);
+        }
         const h = head.getBoundingClientRect();
         const on = (box) => h.top < box.bottom - 1 && h.bottom > box.top + 1;
         placed[id] = on(reply) ? 'header' : 'first line';
@@ -340,6 +350,9 @@ MENU_JS = """() => {
 }"""
 
 PROFILES = (("phone", 412, 915, True), ("desktop", 1280, 800, False))
+
+# `#260 timestamp-hover`: a row time's title, the day in `dayLabel`'s words and then the time.
+DAY_TITLE = re.compile(r"^((Today|Yesterday), )?[A-Z][a-z]{2} \d{1,2}(, \d{4})?, [A-Z][a-z]{2}, ")
 
 
 def arguments() -> argparse.Namespace:
@@ -470,6 +483,18 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
         menu = page.evaluate(MENU_JS)
         check(menu == "", f"{label}: {menu}")
         page.keyboard.press("Escape")
+
+        if not mobile:
+            # `#260 timestamp-hover`. A real hover over a row's time words its title again. The title is
+            # spoiled first, so only the page's own handler for the pointer arriving can put the day back.
+            time = f'#discord-log > li[data-id="{NEWEST}"] > .meta > .msg-time'
+            page.evaluate("(selector) => { document.querySelector(selector).title = 'stale'; }", time)
+            page.hover(time)
+            title = page.get_attribute(time, "title") or ""
+            shown = page.text_content(time) or ""
+            check(DAY_TITLE.match(title) is not None and title.endswith(f", {shown}"),
+                  f"{label}: hovering a row's time left its title {title!r}")
+            page.mouse.move(1, 1)
 
         # Off: the first lines as they were written, and kept across a reload.
         set_rich_headers(page, False)
