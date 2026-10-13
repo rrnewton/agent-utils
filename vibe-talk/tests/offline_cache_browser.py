@@ -168,6 +168,11 @@ view picker at its floor and nothing scrolled out of the pack; and a Tab walk fr
 controls in the order they are seen, each with a ring nothing clips. On a phone the dock is the one it
 was before: 149px, its bar and its tile of large buttons at their old heights and widths.
 
+Before that, two windows (`#265 window-channel-memory`): two pages of one profile, which share
+localStorage and each have their own sessionStorage, are left on two channels and reloaded; each
+reads and shows its own channel, not the one the other chose last, and a third page opened after
+them opens on the channel chosen last.
+
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
 
@@ -189,6 +194,8 @@ from typing import TYPE_CHECKING, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from playwright.sync_api import BrowserType, FloatRect, Page, Route
 
 
@@ -2185,6 +2192,9 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
+        windows_walk(playwright.chromium, args)
+        print("desktop at 1280x800, two windows of one profile: each reloaded on its own channel, not the"
+              " one the other chose last, and a third window opened on the channel chosen last")
         for label, width, height, mobile in DOCK_SIZES:
             heights = dock_walk(playwright.chromium, args, label, width, height, mobile)
             if mobile:
@@ -4491,6 +4501,85 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             check(not errors, f"{shape}: the page threw: {errors}")
             context.close()
             return float(empty["top"])
+    finally:
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
+    """`#265 window-channel-memory`: two pages of one browser profile, as two windows of the installed
+    app on a desk are — one `localStorage` between them and a `sessionStorage` each. Each is left on
+    its own channel and reloaded, and comes back on it rather than on the one the other chose last;
+    a third, opened after both, opens on the channel chosen last. Real storage, a real reload."""
+    api = DockApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/voice"
+    listed_first, listed_second = str(LONG_CHANNEL["id"]), str(CHANNEL["id"])
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-windows-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": 1280, "height": 800},
+            )
+            errors: list[str] = []
+
+            def channel(page: Page) -> str:
+                return str(page.evaluate("() => document.getElementById('discord-channel').value"))
+
+            def read_for(act: Callable[[], object], page: Page, expected: str, why: str) -> None:
+                """Do `act`, and wait for the channel read it leads to: one of `expected`, and only that.
+
+                A reopen reads its channel once the server has accepted the token, so by then the page
+                has taken the server's channel list and the picker holds what it will keep."""
+                with api.lock:
+                    api.requests.clear()
+                act()
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not api.reads():
+                    page.wait_for_timeout(50)
+                page.wait_for_timeout(200)
+                reads = api.reads()
+                check(bool(reads), f"windows: {why}: no channel was read")
+                read = sorted({r.split("/")[4] for r in reads})
+                check(read == [expected], f"windows: {why}: read {read}, expected {expected}")
+                check(channel(page) == expected, f"windows: {why}: the picker is on {channel(page)}, not {expected}")
+
+            def opened() -> Page:
+                page = context.new_page()
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                return page
+
+            def choose(page: Page, channel_id: str, why: str) -> None:
+                read_for(lambda: page.select_option("#discord-channel", channel_id), page, channel_id, why)
+
+            # The first window signs in, opens the channel — the first listed — and changes to the second.
+            first = context.pages[0]
+            first.on("pageerror", lambda error: errors.append(str(error)))
+            first.goto(url, wait_until="load")
+            first.fill("#api-token", TOKEN)
+            first.click("#save-token")
+            first.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            read_for(lambda: first.click("#view-switch"), first, listed_first, "the first window's channel")
+            choose(first, listed_second, "the first window's choice")
+            # A second window opens on that, the last choice, and is put on the first listed.
+            second = opened()
+            read_for(lambda: second.goto(url, wait_until="load"), second, listed_second,
+                     "a new window, on the channel chosen last")
+            choose(second, listed_first, "the second window's choice")
+            # Each reloads, on its own channel: the first window not on the one the second chose after it.
+            read_for(lambda: first.reload(wait_until="load"), first, listed_second, "the first window's reload")
+            read_for(lambda: second.reload(wait_until="load"), second, listed_first, "the second window's reload")
+            # A third window, opened after both, on the channel chosen last; a reload did not choose.
+            third = opened()
+            read_for(lambda: third.goto(url, wait_until="load"), third, listed_first,
+                     "a window opened after both, on the channel chosen last")
+            check(not errors, f"windows: the page threw: {errors}")
+            context.close()
     finally:
         api.stopping.set()
         server.shutdown()
