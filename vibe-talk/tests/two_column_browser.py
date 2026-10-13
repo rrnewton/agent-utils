@@ -40,7 +40,8 @@ desk size, with a mouse:
   page error at any step.
 
 `#262 search-load-older`, over a second channel whose history really pages — sixty messages, most posted
-to the channel itself, a page of ten at a time, the word in three of them three pages back — at 1280x800
+to the channel itself, a page of ten at a time, the word in one of them three pages back and two more a
+page further, so the walk brings matches on two pages — at 1280x800
 in two columns with a mouse and the keys, and at a 412x915 phone in one column with a finger:
 
   a search for the word empties the list and reads nothing by itself — before, the emptied list's own
@@ -48,7 +49,8 @@ in two columns with a mouse and the keys, and at a 412x915 phone in one column w
   before …", a 44px target -> on the desk a wheel upward at the head of the emptied list reads nothing
   either, and how many scroll events it fired is said -> Enter in the search field on the desk, a tap on the
   step back on the phone, the older reads held: "Searching… 1 of 5 · Stop" -> let go: the three
-  matches open under the step back, which has not moved, the note saying what was found between it and
+  matches open under the step back, which has moved no more than the sentence above it that nothing
+  matched, the reader still at the head of the list, the note saying what was found between it and
   them, and the line above the first match counting the unmatched messages it skips.
 
 Pass --screenshots DIR to keep a PNG of each state (the list, a selected thread, the links, the
@@ -796,7 +798,7 @@ OLDER_SIZES = (("search-older-1280", 1280, 800, False), ("search-older-phone", 4
 OLDER_TOTAL = 60
 OLDER_PAGE = 10
 OLDER_TERM = "glacier"
-OLDER_HITS = (21, 23, 25)
+OLDER_HITS = (13, 15, 21)
 # The one small thread among the newest, so the channel offers two columns: its first message and reply.
 OLDER_THREAD = "spaces/A/threads/release"
 OLDER_ROOT, OLDER_REPLY = 57, 58

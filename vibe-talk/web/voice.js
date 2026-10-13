@@ -1042,12 +1042,17 @@ function captureScroll() {
   if (held) return { pinned: false, anchor: held, top: held.getBoundingClientRect().top };
   // `#262 search-load-older`. While a walk for the search reads older pages, its control holds still and
   // the matches open under it — never the newest line followed, on a list short enough to be at its
-  // foot — until the reader moves it, which lets it go. Measured only while a walk runs.
+  // foot — until the reader scrolls it away, which lets it go. At the head of the list it may have moved
+  // without the reader: the sentence above it that nothing matched goes once something does, and there is
+  // no room above to keep it where it stood. Measured only while a walk runs.
   const walk = activeColumn.searchWalk;
   if (walk && walk.anchored) {
     const chip = el("load-older");
     const top = chip.getBoundingClientRect().top;
-    if (!chip.hidden && Math.abs(top - walk.chipTop) <= 1) return { pinned: false, anchor: chip, top };
+    if (!chip.hidden && (Math.abs(top - walk.chipTop) <= 1 || area.scrollTop <= 1)) {
+      walk.chipTop = top;
+      return { pinned: false, anchor: chip, top };
+    }
     walk.anchored = false;
   }
   const anchor = scrollAnchor(area);
