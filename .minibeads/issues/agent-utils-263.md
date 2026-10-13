@@ -1,10 +1,11 @@
 ---
 title: 'post-split-per-provider: split a long post only at the provider''s own limit, and put the extra parts in a thread under the first'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T22:39:41.315349693+00:00
-updated_at: 2026-10-12T22:39:41.315349693+00:00
+updated_at: 2026-10-13T05:29:09.764983263+00:00
+closed_at: 2026-10-13T05:29:09.764983122+00:00
 ---
 
 # Description

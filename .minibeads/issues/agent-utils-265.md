@@ -1,10 +1,11 @@
 ---
 title: 'window-channel-memory: a reload keeps each window on the channel it was showing'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-13T02:03:54.831197748+00:00
-updated_at: 2026-10-13T02:03:54.831197748+00:00
+updated_at: 2026-10-13T05:29:09.769090001+00:00
+closed_at: 2026-10-13T05:29:09.769089841+00:00
 ---
 
 # Description

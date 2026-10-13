@@ -1,10 +1,11 @@
 ---
 title: 'link-filter-kinds: the link filters gain Issues, Files and Other, so together they cover every link'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-13T02:03:54.836862290+00:00
-updated_at: 2026-10-13T02:03:54.836862290+00:00
+updated_at: 2026-10-13T05:29:09.773093987+00:00
+closed_at: 2026-10-13T05:29:09.773093886+00:00
 ---
 
 # Description
