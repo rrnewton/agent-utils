@@ -170,11 +170,95 @@ pub struct Config {
     /// Summarisation policy. Every field that changes what a summary says is part of the cache
     /// key; see [`crate::summarize::policy_version`].
     pub summaries: SummariesConfig,
-    /// Whether the configuration has a `[message_cache]` table, which this build accepts and
-    /// IGNORES. `#208 persistent-cache`: a later build reads it, and a host overlay turns it on.
-    /// Accepting it here means a rollback to this build still starts with such an overlay in
-    /// place; startup says that it was ignored.
-    pub message_cache_ignored: bool,
+    /// The `[message_cache]` table, read and checked. `#208 persistent-cache`.
+    ///
+    /// `None` when the table is ABSENT, which is not the same as `enabled = false`: absent means
+    /// "this configuration says nothing about a cache", and a later build treats a cache file it
+    /// finds in that state differently from one it was told to turn off. This build reads the
+    /// table and refuses a bad one at startup, but opens no cache: the cache library is not
+    /// called from the request path yet.
+    pub message_cache: Option<MessageCacheConfig>,
+}
+
+/// Default `[message_cache] max_days`: how long a cached message is kept, from when it was
+/// written upstream. A host overlay that turns the cache on sets its own, smaller value until the
+/// upstream retention is known.
+pub const DEFAULT_MESSAGE_CACHE_MAX_DAYS: u16 = 90;
+/// Default `[message_cache] max_megabytes`: the ceiling on the cache file and its two working
+/// files together.
+pub const DEFAULT_MESSAGE_CACHE_MAX_MEGABYTES: u32 = 256;
+/// Default `[message_cache] timeline_fallback_ms`: how long a timeline read waits on the provider
+/// before a cached page may stand in for it.
+pub const DEFAULT_MESSAGE_CACHE_TIMELINE_FALLBACK_MS: u64 = 10_000;
+
+/// `[message_cache]`: the disposable on-disk copy of channel messages. `#208 persistent-cache`.
+///
+/// A SEPARATE SQLite file from `[storage]`, never tables inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageCacheConfig {
+    /// Whether the cache may be opened at all. `false` is the shipped default, and on a build
+    /// that opens the cache it means "erase any cache file this server made".
+    pub enabled: bool,
+    /// Where the cache file lives. `None` means beside `[storage] path`, named after the store
+    /// and this host.
+    pub path: Option<PathBuf>,
+    /// Oldest message kept, in days from when it was written upstream: 1 to 365.
+    pub max_days: u16,
+    /// Ceiling on the cache file plus its `-wal` and `-shm` files, in megabytes: 16 to 4096.
+    pub max_megabytes: u32,
+    /// Whether older history may be fetched in the background to fill the cache.
+    pub backfill: CacheBackfill,
+    /// How long a timeline read waits on the provider before a cached page may answer instead,
+    /// in milliseconds: 1,000 to 60,000.
+    pub timeline_fallback_ms: u64,
+    /// Per-channel age limits, for conversations kept upstream for less time than `max_days`.
+    pub channels: Vec<CacheChannelLimit>,
+}
+
+impl Default for MessageCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            max_days: DEFAULT_MESSAGE_CACHE_MAX_DAYS,
+            max_megabytes: DEFAULT_MESSAGE_CACHE_MAX_MEGABYTES,
+            backfill: CacheBackfill::Adaptive,
+            timeline_fallback_ms: DEFAULT_MESSAGE_CACHE_TIMELINE_FALLBACK_MS,
+            channels: Vec::new(),
+        }
+    }
+}
+
+impl MessageCacheConfig {
+    /// The age limit for one channel, in days: its own `[[message_cache.channel]]` entry when it
+    /// has one, otherwise `max_days`.
+    #[must_use]
+    pub fn max_days_for(&self, channel_id: &str) -> u16 {
+        self.channels
+            .iter()
+            .find(|limit| limit.id.as_str() == channel_id)
+            .map_or(self.max_days, |limit| limit.max_days)
+    }
+}
+
+/// `[message_cache] backfill`: whether older history may be fetched to fill the cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheBackfill {
+    /// Fetch older history while nothing else is using the provider, one call at a time.
+    #[default]
+    Adaptive,
+    /// Cache only what reading brings in.
+    Off,
+}
+
+/// One `[[message_cache.channel]]` entry: a channel kept for less (or more) time than the default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheChannelLimit {
+    /// The channel, as `[[channels]] id` names it.
+    pub id: ChannelId,
+    /// Oldest message kept for this channel, in days: 1 to 365.
+    pub max_days: u16,
 }
 
 /// How message read-aloud is synthesized; separate from conversational voice mode.
@@ -879,9 +963,30 @@ struct FileConfig {
     summaries: FileSummaries,
     #[serde(default)]
     replay: FileReplay,
-    /// `#208 persistent-cache`. Accepted and IGNORED by this build, whatever it holds: a later
-    /// build reads it, and accepting it here lets a host overlay carry it across a rollback.
-    message_cache: Option<toml::Table>,
+    /// `#208 persistent-cache`. `None` when the table is absent, which is not `enabled = false`.
+    message_cache: Option<FileMessageCache>,
+}
+
+/// `[message_cache]` as written. Integers are read wide so that an out-of-range value is refused
+/// with its range named, rather than as a type error that does not say what would be accepted.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileMessageCache {
+    enabled: Option<bool>,
+    path: Option<String>,
+    max_days: Option<i64>,
+    max_megabytes: Option<i64>,
+    backfill: Option<CacheBackfill>,
+    timeline_fallback_ms: Option<i64>,
+    #[serde(default)]
+    channel: Vec<FileCacheChannel>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileCacheChannel {
+    id: String,
+    max_days: i64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1216,7 +1321,10 @@ impl Config {
         };
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
-        let message_cache_ignored = file.message_cache.is_some();
+        let message_cache = file
+            .message_cache
+            .map(|table| message_cache_config(table, storage.path.as_deref()))
+            .transpose()?;
         let summaries = summaries_config(
             get(ENV_SUMMARY_MODEL),
             get(ENV_SUMMARY_BACKEND),
@@ -1285,9 +1393,133 @@ impl Config {
             storage,
             summaries,
             replay,
-            message_cache_ignored,
+            message_cache,
         })
     }
+}
+
+/// Resolve and check `[message_cache]`. `#208 persistent-cache`.
+///
+/// Every bound is refused rather than clamped, and `0` is refused rather than read as
+/// "unlimited": a cache with no age or size limit is not something a typo should produce.
+fn message_cache_config(
+    file: FileMessageCache,
+    storage_path: Option<&Path>,
+) -> Result<MessageCacheConfig, ConfigError> {
+    fn ranged(
+        field: &str,
+        value: i64,
+        low: i64,
+        high: i64,
+        unit: &str,
+    ) -> Result<i64, ConfigError> {
+        if (low..=high).contains(&value) {
+            Ok(value)
+        } else {
+            Err(ConfigError::Invalid {
+                field: field.to_owned(),
+                detail: format!(
+                    "{value} is out of range; give {low} to {high} {unit} (0 is refused, not \
+                     read as unlimited)"
+                ),
+            })
+        }
+    }
+    let defaults = MessageCacheConfig::default();
+    let enabled = file.enabled.unwrap_or(defaults.enabled);
+    let path = file
+        .path
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    if let Some(path) = &path {
+        if !path.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: "message_cache.path".to_owned(),
+                detail: format!("{} is relative; give an absolute path", path.display()),
+            });
+        }
+        if Some(path.as_path()) == storage_path {
+            return Err(ConfigError::Invalid {
+                field: "message_cache.path".to_owned(),
+                detail: "is the same file as storage.path; the cache is a separate, disposable \
+                         file, and erasing it must never touch the store"
+                    .to_owned(),
+            });
+        }
+    }
+    if enabled && storage_path.is_none() {
+        // The switch that turns the cache off, and the list of every cache file this server has
+        // opened, are kept beside the store so that purging the store cannot turn the cache back
+        // on. With no store there is nowhere to keep them.
+        return Err(ConfigError::Invalid {
+            field: "message_cache.enabled".to_owned(),
+            detail: "needs storage.path: the cache's off switch is kept beside the store"
+                .to_owned(),
+        });
+    }
+    let narrow = |value: i64| u16::try_from(value).unwrap_or(u16::MAX);
+    let max_days = narrow(ranged(
+        "message_cache.max_days",
+        file.max_days.unwrap_or(i64::from(defaults.max_days)),
+        1,
+        365,
+        "days",
+    )?);
+    let max_megabytes = u32::try_from(ranged(
+        "message_cache.max_megabytes",
+        file.max_megabytes
+            .unwrap_or(i64::from(defaults.max_megabytes)),
+        16,
+        4096,
+        "megabytes",
+    )?)
+    .unwrap_or(u32::MAX);
+    let timeline_fallback_ms = u64::try_from(ranged(
+        "message_cache.timeline_fallback_ms",
+        file.timeline_fallback_ms
+            .unwrap_or(i64::try_from(defaults.timeline_fallback_ms).unwrap_or(i64::MAX)),
+        1_000,
+        60_000,
+        "milliseconds",
+    )?)
+    .unwrap_or(u64::MAX);
+    let mut channels: Vec<CacheChannelLimit> = Vec::new();
+    for entry in file.channel {
+        let id = entry.id.trim().to_owned();
+        if id.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "message_cache.channel.id".to_owned(),
+                detail: "is empty".to_owned(),
+            });
+        }
+        if channels.iter().any(|limit| limit.id.as_str() == id) {
+            return Err(ConfigError::Invalid {
+                field: "message_cache.channel.id".to_owned(),
+                detail: format!("{id:?} is listed twice"),
+            });
+        }
+        let max_days = narrow(ranged(
+            "message_cache.channel.max_days",
+            entry.max_days,
+            1,
+            365,
+            "days",
+        )?);
+        channels.push(CacheChannelLimit {
+            id: ChannelId(id),
+            max_days,
+        });
+    }
+    Ok(MessageCacheConfig {
+        enabled,
+        path,
+        max_days,
+        max_megabytes,
+        backfill: file.backfill.unwrap_or(defaults.backfill),
+        timeline_fallback_ms,
+        channels,
+    })
 }
 
 /// Resolve the `[replay]` section.
@@ -3762,18 +3994,42 @@ provider = "slack"
     }
 
     #[test]
-    fn a_message_cache_table_is_accepted_and_ignored_whatever_it_holds() {
-        // `#208 persistent-cache`. A later build reads `[message_cache]`; this one must still start
-        // with a host overlay that has one, or a rollback past that build would not boot.
+    fn a_message_cache_table_is_read_with_its_defaults_and_absent_is_not_off() {
+        // `#208 persistent-cache`, milestone `cache-store`. Absent and `enabled = false` are two
+        // different answers: the first says nothing about a cache, the second turns it off.
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
-        assert!(!cfg.message_cache_ignored);
+        assert_eq!(cfg.message_cache, None);
+        let text = format!("{FULL}\n[message_cache]\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("an empty table is valid");
+        assert_eq!(cfg.message_cache, Some(MessageCacheConfig::default()));
+        let defaults = MessageCacheConfig::default();
+        assert!(!defaults.enabled, "shipped off");
+        assert_eq!(defaults.max_days, 90);
+        assert_eq!(defaults.max_megabytes, 256);
+        assert_eq!(defaults.backfill, CacheBackfill::Adaptive);
+        assert_eq!(defaults.timeline_fallback_ms, 10_000);
+        assert_eq!(defaults.path, None);
+
         let text = format!(
-            "{FULL}\n[message_cache]\nenabled = true\nmax_days = 14\nmax_megabytes = 256\n\
-             backfill = \"adaptive\"\nsomething_a_later_build_adds = [1, 2]\n\
-             [message_cache.nested]\nanything = \"at all\"\n"
+            "{FULL}\n[storage]\npath = \"/data/state.sqlite3\"\n\
+             [message_cache]\nenabled = true\nmax_days = 14\nmax_megabytes = 64\n\
+             backfill = \"off\"\ntimeline_fallback_ms = 2500\n\
+             path = \"/data/cache/c.sqlite3\"\n\
+             [[message_cache.channel]]\nid = \"111\"\nmax_days = 1\n"
         );
-        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("accepted");
-        assert!(cfg.message_cache_ignored);
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
+        let cache = cfg.message_cache.expect("present");
+        assert!(cache.enabled);
+        assert_eq!(cache.max_days, 14);
+        assert_eq!(cache.max_megabytes, 64);
+        assert_eq!(cache.backfill, CacheBackfill::Off);
+        assert_eq!(cache.timeline_fallback_ms, 2500);
+        assert_eq!(
+            cache.path.as_deref(),
+            Some(Path::new("/data/cache/c.sqlite3"))
+        );
+        assert_eq!(cache.max_days_for("111"), 1);
+        assert_eq!(cache.max_days_for("222"), 14);
         // ...and the rest of the configuration is read exactly as without it.
         assert_eq!(
             cfg.storage.retention,
@@ -3782,6 +4038,75 @@ provider = "slack"
                 .storage
                 .retention
         );
+    }
+
+    #[test]
+    fn a_message_cache_table_refuses_bad_bounds_unknown_keys_and_the_store_path() {
+        // `#208 persistent-cache`, milestone `cache-store`.
+        let refused = |table: &str| -> String {
+            let text = format!("{FULL}\n[storage]\npath = \"/data/s.sqlite3\"\n{table}");
+            match Config::from_toml_and_env(&text, &env(&[])) {
+                Err(ConfigError::Invalid { field, .. }) => field,
+                Err(ConfigError::Parse(_)) => "parse".to_owned(),
+                other => panic!("{table:?} was not refused: {other:?}"),
+            }
+        };
+        for (table, field) in [
+            ("[message_cache]\nmax_days = 0\n", "message_cache.max_days"),
+            (
+                "[message_cache]\nmax_days = 366\n",
+                "message_cache.max_days",
+            ),
+            ("[message_cache]\nmax_days = -1\n", "message_cache.max_days"),
+            (
+                "[message_cache]\nmax_megabytes = 15\n",
+                "message_cache.max_megabytes",
+            ),
+            (
+                "[message_cache]\nmax_megabytes = 4097\n",
+                "message_cache.max_megabytes",
+            ),
+            (
+                "[message_cache]\ntimeline_fallback_ms = 0\n",
+                "message_cache.timeline_fallback_ms",
+            ),
+            (
+                "[message_cache]\npath = \"relative.sqlite3\"\n",
+                "message_cache.path",
+            ),
+            (
+                "[message_cache]\npath = \"/data/s.sqlite3\"\n",
+                "message_cache.path",
+            ),
+            (
+                "[[message_cache.channel]]\nid = \"111\"\nmax_days = 0\n",
+                "message_cache.channel.max_days",
+            ),
+            (
+                "[[message_cache.channel]]\nid = \" \"\nmax_days = 3\n",
+                "message_cache.channel.id",
+            ),
+            (
+                "[[message_cache.channel]]\nid = \"111\"\nmax_days = 3\n\
+                 [[message_cache.channel]]\nid = \"111\"\nmax_days = 4\n",
+                "message_cache.channel.id",
+            ),
+            // A typo must fail loudly rather than leave a bound at its default.
+            ("[message_cache]\nmax_megabyte = 64\n", "parse"),
+            ("[message_cache]\nbackfill = \"eager\"\n", "parse"),
+        ] {
+            assert_eq!(refused(table), field, "{table:?}");
+        }
+        // Turning it on needs somewhere to keep the off switch.
+        let text = format!("{FULL}\n[message_cache]\nenabled = true\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("needs a store");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "message_cache.enabled"),
+            "{err}"
+        );
+        // ...but a table that leaves it off is fine without one.
+        let text = format!("{FULL}\n[message_cache]\nenabled = false\nmax_days = 7\n");
+        Config::from_toml_and_env(&text, &env(&[])).expect("off needs no store");
     }
 
     #[test]

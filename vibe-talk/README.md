@@ -1692,7 +1692,7 @@ model provider or a real gateway.
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
-| Message cache | `[message_cache]` | — | **accepted and ignored** by this build, whatever it holds, and said so at startup: a later build reads it (`#208 persistent-cache`), and accepting it now lets a host overlay that turns it on survive a rollback to this build |
+| Message cache | `[message_cache]` | — | **read and checked, but no cache is opened** by this build, and startup says so (`#208 persistent-cache`). Keys: `enabled` (default `false`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default, or `off`), `timeline_fallback_ms` (default `10000`, 1000 to 60000), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false` |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is

@@ -438,13 +438,11 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
     std::fs::create_dir_all(&dir).expect("temp dir");
     let file = dir.join("rekey-state.sqlite3");
     let _ = std::fs::remove_file(&file);
-    // `[message_cache]` rides along, with keys this build has never heard of: it must be accepted,
-    // said to be ignored, and change nothing.
+    // `[message_cache]` rides along: it must be read, said to be unopened, and change nothing.
     let config = dir.join("vibe-talk.toml");
     std::fs::write(
         &config,
-        config_text()
-            + "\n[message_cache]\nenabled = true\nmax_days = 14\nsomething_later = \"anything\"\n",
+        config_text() + "\n[message_cache]\nenabled = true\nmax_days = 14\n",
     )
     .expect("write config");
     let summaries = vibe_talk::config::SummariesConfig::default();
@@ -515,8 +513,10 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
          wording:\n{first}"
     );
     assert!(
-        first.contains("[message_cache] is present; this build has no message cache"),
-        "the ignored table was not said to be ignored:\n{first}"
+        first.contains(
+            "[message_cache] is read and valid; this build does not open a message cache"
+        ),
+        "the table was not said to be left unopened:\n{first}"
     );
     // Numbers only: no summary text, no message id, no content hash, no key.
     for secret in [
@@ -608,7 +608,7 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
         "a restart with only the threshold and deadline changed re-keyed or swept something:\n\
          {second}"
     );
-    assert!(!second.contains("[message_cache] is present"), "{second}");
+    assert!(!second.contains("[message_cache] is read"), "{second}");
     let store =
         vibe_talk::store::sqlite::SqliteStore::open(&file, vibe_talk::store::Retention::default())
             .expect("reopen");

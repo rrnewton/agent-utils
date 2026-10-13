@@ -584,10 +584,13 @@ async fn main() -> anyhow::Result<()> {
         &summary_version,
     )
     .await;
-    // `#208 persistent-cache`. Accepted so a rollback to this build starts with an overlay that
-    // turns the cache on; nothing reads it here.
-    if config.message_cache_ignored {
-        tracing::info!("[message_cache] is present; this build has no message cache");
+    // `#208 persistent-cache`. The table is read and checked, so a bad overlay is refused here
+    // rather than by the build that first opens the cache; this build opens none.
+    if let Some(cache) = &config.message_cache {
+        tracing::info!(
+            enabled = cache.enabled,
+            "[message_cache] is read and valid; this build does not open a message cache"
+        );
     }
 
     // `#44 live-push`. Say the ingestion posture out loud in both directions, for the same reason
