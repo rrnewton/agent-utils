@@ -316,7 +316,7 @@ def open_columns(desk: Desk) -> None:
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
                   " && document.querySelectorAll('#side-cards > li').length === 3",
                   "pressing the layout button did not give two columns with the cards")
-    page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card")
+    page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
     desk.wait_for(f"() => document.querySelectorAll('#side-log > li[data-id]').length === {THREAD_ROWS[RUNNER]}",
                   "the runner's card did not select its thread on the right")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 11",
