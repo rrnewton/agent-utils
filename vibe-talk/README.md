@@ -1087,9 +1087,11 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   `latest_reply` on each root, and on the thread being short enough to count in one read (ten
   pages of replies): a root without `latest_reply`, or a longer thread, is read in full on every
   flat read, as before. An edit to a reply changes nothing on its root, so it can take
-  up to those fifteen minutes to show in the flat view, pull-to-refresh included. Opening the
-  thread shows it at once, and the flat view's next read then rereads that thread and shows it
-  too, at no extra call for the thread view.
+  up to those fifteen minutes to show in the flat view, pull-to-refresh included, counted from
+  the edit. Opening the thread shows it at once, and the flat view's next read then rereads that
+  thread and shows it too, at no extra call for the thread view; a flat read already under way
+  when the thread was opened keeps nothing it read of that thread, since it may have read it
+  before the edit.
 * **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.

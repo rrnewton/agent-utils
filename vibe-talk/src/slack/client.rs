@@ -127,9 +127,9 @@ pub struct HttpSlackClient {
     /// requests while crossing system events resumes rather than restarts. See `super::history`.
     pub(super) proven: Mutex<HashMap<(String, i64), (i64, Instant)>>,
     /// The replies each thread's last Flat read brought, by conversation and root `ts`, and what
-    /// the root said then, so the next Flat read reads only the threads that moved. `#282
-    /// slack-flat-skip`; see `super::timeline`.
-    pub(super) flat_threads: Mutex<HashMap<(String, String), super::timeline::FlatThread>>,
+    /// the root said then, so the next Flat read reads only the threads that moved; and when the
+    /// thread view last read each thread. `#282 slack-flat-skip`; see `super::timeline`.
+    pub(super) flat_memory: Mutex<super::timeline::FlatMemory>,
     /// How long those replies are trusted before a Flat read reads their thread in full again.
     pub(super) flat_reconcile: Duration,
     /// The most one post may carry, as Slack is sent it; see [`SlackConfig::post_limit`].
@@ -188,7 +188,7 @@ impl HttpSlackClient {
             users: Mutex::new(HashMap::new()),
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
-            flat_threads: Mutex::new(HashMap::new()),
+            flat_memory: Mutex::default(),
             flat_reconcile: super::timeline::FLAT_RECONCILE,
             post_limit: config.post_limit(),
             shim_profile: None,

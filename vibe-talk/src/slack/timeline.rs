@@ -261,8 +261,24 @@ pub(super) struct FlatThread {
     /// The thread's newest real replies, oldest first, root excluded, at most
     /// [`FLAT_MAX_REPLIES`].
     replies: Vec<Raw>,
-    /// When the thread was last read in full.
+    /// When the Flat read that last read the thread in full began, so the reconcile period is
+    /// counted from before anything it read: an edit made after this instant is not in it.
     full_at: std::time::Instant,
+}
+
+/// What Flat remembers between reads: the replies it holds for each thread, and when the thread
+/// view last read each thread. `#282 slack-flat-skip`, remote-ops audit W8 review.
+#[derive(Debug, Default)]
+pub(super) struct FlatMemory {
+    /// The replies held, by conversation and root `ts`.
+    threads: std::collections::HashMap<(String, String), FlatThread>,
+    /// When the thread view last read each thread, by conversation and root `ts`. A Flat read of
+    /// a thread that began before then may have read it before an edit the thread view has
+    /// already shown, so what it read is not held (`HttpSlackClient::remember_flat`).
+    viewed: std::collections::HashMap<(String, String), std::time::Instant>,
+    /// The latest instant dropped from `viewed` to keep it to [`FLAT_REMEMBERED_MAX`] threads. A
+    /// Flat read that began before it holds nothing, whatever thread it read.
+    viewed_floor: Option<std::time::Instant>,
 }
 
 /// One backward page of messages, before conversion.
@@ -696,12 +712,17 @@ impl HttpSlackClient {
     ///
     /// An edit to a reply changes nothing on its root, so Flat shows it when that period runs out;
     /// the thread view, which reads the thread itself, shows it at once, and once it has, the next
-    /// Flat read reads that thread in full (`check_flat_against_thread`).
+    /// Flat read reads that thread in full (`check_flat_against_thread`). A Flat read of a thread
+    /// that was already under way then, which may have read the thread before the edit, holds
+    /// nothing it read (`remember_flat`). The reconcile period is counted from the instant the full
+    /// read began, so an edit made at any moment reaches Flat within one period of it.
     ///
     /// What a count cannot show is left to the reconcile: two lags in the server's replies feed
     /// that cancel out, a deletion it still lists and a new reply, not the newest, it does not yet
     /// show, leave the count and the latest reply as the root reports them.
     async fn flat_replies(&self, conversation: &str, root: &Raw) -> Result<Vec<Raw>, ChatError> {
+        // Before anything is read or recalled: what this call holds can be no newer than this.
+        let began = std::time::Instant::now();
         let key = (conversation.to_owned(), root.ts.clone());
         let latest = root.activity_micros();
         let count = root.reply_count();
@@ -735,6 +756,7 @@ impl HttpSlackClient {
                             replies: replies.clone(),
                             full_at: held.full_at,
                         },
+                        began,
                     );
                     return Ok(replies);
                 }
@@ -766,8 +788,9 @@ impl HttpSlackClient {
                     latest_reply: latest,
                     reply_count: count,
                     replies: replies.clone(),
-                    full_at: std::time::Instant::now(),
+                    full_at: began,
                 },
+                began,
             );
         } else {
             self.forget_flat(&key);
@@ -777,9 +800,10 @@ impl HttpSlackClient {
 
     /// Stop holding a thread's replies, so the next Flat read reads it in full.
     fn forget_flat(&self, key: &(String, String)) {
-        self.flat_threads
+        self.flat_memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .threads
             .remove(key);
     }
 
@@ -792,12 +816,33 @@ impl HttpSlackClient {
     /// what is held is another. Only where the two overlap are they compared, message by message
     /// as Slack sent them, so a thread view of the newest replies says nothing about older ones,
     /// and a reply newer than what is held is left to the root's count.
+    ///
+    /// Every such read is also noted, whatever it found, so that a Flat read of the thread already
+    /// under way, which may have read it before an edit this read shows, holds nothing
+    /// (`remember_flat`). Nothing else could tell: such a Flat read may have nothing held to compare
+    /// with yet, or be about to put back the very replies this drops.
     fn check_flat_against_thread(&self, conversation: &str, thread: &str, raws: &[Raw]) {
         let key = (conversation.to_owned(), thread.to_owned());
-        let mut held = self
-            .flat_threads
+        let mut memory = self
+            .flat_memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let memory = &mut *memory;
+        let now = std::time::Instant::now();
+        while memory.viewed.len() >= FLAT_REMEMBERED_MAX && !memory.viewed.contains_key(&key) {
+            let Some((oldest, at)) = memory
+                .viewed
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, at)| (key.clone(), *at))
+            else {
+                break;
+            };
+            memory.viewed.remove(&oldest);
+            memory.viewed_floor = memory.viewed_floor.max(Some(at));
+        }
+        memory.viewed.insert(key.clone(), now);
+        let held = &mut memory.threads;
         let Some(entry) = held.get(&key) else {
             return;
         };
@@ -827,9 +872,10 @@ impl HttpSlackClient {
 
     /// The replies held for a thread, unless they were read in full a reconcile period ago.
     fn remembered_flat(&self, key: &(String, String)) -> Option<FlatThread> {
-        self.flat_threads
+        self.flat_memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .threads
             .get(key)
             .filter(|held| held.full_at.elapsed() < self.flat_reconcile)
             .cloned()
@@ -837,11 +883,24 @@ impl HttpSlackClient {
 
     /// Hold `thread` for the next Flat read, dropping what a reconcile would re-read anyway and,
     /// past [`FLAT_REMEMBERED_MAX`] threads, the one read in full longest ago.
-    fn remember_flat(&self, key: (String, String), thread: FlatThread) {
-        let mut held = self
-            .flat_threads
+    ///
+    /// Unless the thread view has read that thread since the Flat call that read it `began`:
+    /// then what that call read may predate an edit the thread view has already shown, and
+    /// holding it would keep the edit out of Flat until the reconcile. It is not held: what is
+    /// held already stays, having agreed with the thread view where the two overlap or been
+    /// dropped by it, and the next Flat read reads the thread from that, or in full. The check
+    /// and the insertion happen under one lock, as does the noting in
+    /// `check_flat_against_thread`, so the two cannot interleave.
+    fn remember_flat(&self, key: (String, String), thread: FlatThread, began: std::time::Instant) {
+        let mut memory = self
+            .flat_memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let viewed = memory.viewed.get(&key).copied().max(memory.viewed_floor);
+        if viewed.is_some_and(|viewed| viewed >= began) {
+            return;
+        }
+        let held = &mut memory.threads;
         held.retain(|_, entry| entry.full_at.elapsed() < self.flat_reconcile);
         while held.len() >= FLAT_REMEMBERED_MAX && !held.contains_key(&key) {
             let Some(oldest) = held

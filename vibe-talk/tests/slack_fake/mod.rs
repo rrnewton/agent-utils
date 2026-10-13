@@ -77,6 +77,32 @@ pub struct FakeState {
     /// `chat.postMessage` calls, numbered from 1, answered with HTTP 502, as a gateway that timed
     /// out waiting for Slack would. Nothing is posted for them.
     pub fail_posts: Vec<usize>,
+    /// Answer the next `conversations.replies` request for one thread late: see [`Hold`].
+    pub hold_replies: Option<Hold>,
+}
+
+/// A `conversations.replies` request answered late, so a test can act while a read is in flight.
+/// The answer is computed from the state when the request ARRIVES, as a server would, and sent
+/// only once the test releases it. Only the first matching request is held.
+#[derive(Clone)]
+pub struct Hold {
+    /// The thread, by root `ts`, whose next replies request is held.
+    pub thread: String,
+    /// Notified once that request has arrived and its answer has been computed.
+    pub arrived: Arc<tokio::sync::Notify>,
+    /// Notify this to send the answer.
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+impl Hold {
+    /// Hold the next replies request for `thread`.
+    pub fn new(thread: &str) -> Self {
+        Self {
+            thread: thread.to_owned(),
+            arrived: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 impl FakeState {
@@ -106,7 +132,15 @@ impl Fake {
         let shared = Arc::clone(&state);
         let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
             let shared = Arc::clone(&shared);
-            async move { handle(&shared, &uri, &headers, &body) }
+            async move {
+                let hold = take_hold(&shared, &uri, &body);
+                let response = handle(&shared, &uri, &headers, &body);
+                if let Some(hold) = hold {
+                    hold.arrived.notify_one();
+                    hold.release.notified().await;
+                }
+                response
+            }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -328,6 +362,20 @@ fn page(list: Vec<Value>, key: &str, params: &HashMap<String, String>, cap: usiz
     });
     answer[key] = Value::Array(slice);
     answer
+}
+
+/// The [`Hold`] this request matches, taken so that it holds no later request.
+fn take_hold(shared: &Mutex<FakeState>, uri: &Uri, body: &[u8]) -> Option<Hold> {
+    if uri.path().trim_start_matches("/api/") != "conversations.replies" {
+        return None;
+    }
+    let mut state = shared.lock().expect("state");
+    let thread = form(body).get("ts").cloned();
+    if state.hold_replies.as_ref().map(|hold| &hold.thread) == thread.as_ref() {
+        state.hold_replies.take()
+    } else {
+        None
+    }
 }
 
 fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> Response {

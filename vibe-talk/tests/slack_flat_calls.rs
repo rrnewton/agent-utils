@@ -938,3 +938,153 @@ async fn a_deletion_behind_a_system_event_and_a_reply_is_read_in_full() {
         .iter()
         .any(|params| !params.contains_key("oldest")));
 }
+
+/// Edit reply `index` of the thread rooted on `root` to say `text`, as Slack would: nothing on the
+/// root changes.
+fn edit_reply(fake: &Fake, root: &str, at: &str, text: &str) {
+    fake.with(|state| {
+        let reply = state
+            .replies
+            .get_mut(&(CH.to_owned(), root.to_owned()))
+            .expect("thread")
+            .iter_mut()
+            .find(|reply| reply["ts"] == json!(at))
+            .expect("reply");
+        reply["text"] = json!(text);
+        reply["edited"] = json!({"user": "UREPLIER1", "ts": ts(9800, 0)});
+    });
+}
+
+/// Run one Flat read with the first replies request for `thread` answered late, and while it is
+/// held, edit `at` in that thread and open the thread view, which shows the edit. Returns that
+/// Flat read, whose requests include the thread view's, and the texts the thread view showed.
+async fn flat_while_thread_view_shows_an_edit(
+    fake: &Fake,
+    client: &HttpSlackClient,
+    thread: &str,
+    at: &str,
+    text: &str,
+) -> (Read, Vec<String>) {
+    let hold = slack_fake::Hold::new(thread);
+    fake.with(|state| state.hold_replies = Some(hold.clone()));
+    let driver = async {
+        hold.arrived.notified().await;
+        edit_reply(fake, thread, at, text);
+        let (shown, _) = open_thread(fake, client, thread, 20).await;
+        hold.release.notify_one();
+        shown
+    };
+    let (read, shown) = tokio::join!(flat(fake, client), driver);
+    (read, shown)
+}
+
+/// A Flat read already under way when the thread view shows an edit read that thread before the
+/// edit, and must not store what it read once the thread view has spoken: here a forward read of
+/// a thread that moved, which would put back the replies held from before. The next Flat read
+/// reads that thread in full and shows the edit, as the thread view did. Remote-ops audit W8
+/// review.
+#[tokio::test]
+async fn a_forward_read_under_way_when_the_thread_view_shows_an_edit_is_not_held() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    assert_eq!(flat(&fake, &client).await.calls(), 23);
+
+    let (moved, index) = roots[0].clone();
+    add_reply(&fake, &moved, &ts(9900, 0));
+    let target = reply_ts(index, REPLIES - 2);
+    let (racing, shown) =
+        flat_while_thread_view_shows_an_edit(&fake, &client, &moved, &target, "edited mid-read")
+            .await;
+    assert!(shown.iter().any(|text| text == "edited mid-read"));
+    assert_eq!(
+        racing
+            .replies
+            .iter()
+            .filter(|params| params.contains_key("oldest"))
+            .count(),
+        1,
+        "one forward read, beside the thread view's three"
+    );
+    assert_eq!(racing.replies.len(), 1 + 3);
+    assert!(racing.messages.contains(&ts(9900, 0)));
+
+    let next = flat(&fake, &client).await;
+    assert_eq!(
+        next.threads(),
+        [moved.clone(), moved.clone()],
+        "that thread, read in full"
+    );
+    assert!(
+        next.texts.iter().any(|text| text == "edited mid-read"),
+        "the thread view showed an edit Flat still does not"
+    );
+}
+
+/// The same, for a thread Flat has never read: its first full read is under way when the thread
+/// view shows an edit to a reply that read had already passed, so nothing it read is held.
+/// Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_full_read_under_way_when_the_thread_view_shows_an_edit_is_not_held() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (opened, index) = roots[0].clone();
+    // On the first of the thread's two pages, which is the one held.
+    let target = reply_ts(index, 12);
+    let (racing, shown) =
+        flat_while_thread_view_shows_an_edit(&fake, &client, &opened, &target, "edited mid-read")
+            .await;
+    assert!(shown.iter().any(|text| text == "edited mid-read"));
+    assert_eq!(racing.calls(), 23 + 3, "and the thread view's three");
+    assert!(
+        !racing.texts.iter().any(|text| text == "edited mid-read"),
+        "the premise: that read began before the edit"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert_eq!(
+        next.threads(),
+        [opened.clone(), opened.clone()],
+        "that thread, read in full"
+    );
+    assert!(
+        next.texts.iter().any(|text| text == "edited mid-read"),
+        "the thread view showed an edit Flat still does not"
+    );
+}
+
+/// The reconcile period is counted from the instant a full read BEGAN, so a reply edited while
+/// that read was under way, after it had passed the reply, reaches Flat within one period of the
+/// edit: here a read held up for longer than the period is due again at once. Remote-ops audit W8
+/// review.
+#[tokio::test]
+async fn the_reconcile_period_counts_from_when_a_full_read_began() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client().with_flat_reconcile(Duration::from_secs(1));
+    let (slow, index) = roots[0].clone();
+    let target = reply_ts(index, 12);
+    let hold = slack_fake::Hold::new(&slow);
+    fake.with(|state| state.hold_replies = Some(hold.clone()));
+    let driver = async {
+        hold.arrived.notified().await;
+        edit_reply(&fake, &slow, &target, "edited mid-read");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        hold.release.notify_one();
+    };
+    let (racing, ()) = tokio::join!(flat(&fake, &client), driver);
+    assert_eq!(racing.calls(), 23);
+    assert!(
+        !racing.texts.iter().any(|text| text == "edited mid-read"),
+        "the premise: that read began before the edit"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert_eq!(
+        reads_of(&next, &slow).len(),
+        2,
+        "that thread, read in full at once"
+    );
+    assert!(next.texts.iter().any(|text| text == "edited mid-read"));
+}
