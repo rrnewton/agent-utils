@@ -144,7 +144,7 @@ let sideActive = false;
  *   | "channel-directory-more" | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
- *   | "close-settings" | "close-threads" | "collapse-all" | "column-toggle" | "dismiss-banner"
+ *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
  *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "retry-start"
@@ -166,7 +166,7 @@ let sideActive = false;
  *   | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
- *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
+ *   | "thread-back"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
  *   | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
@@ -540,10 +540,10 @@ function refusalSentence(error) {
 // the sign-in screen; the connection details and the knobs live in settings; the main screen is
 // the transcript and the two controls, and nothing else.
 
-const SCREENS = ["signin", "main", "settings", "reply", "help", "threads"];
+const SCREENS = ["signin", "main", "settings", "reply", "help"];
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
-const SCREEN_TITLES = { settings: "Settings", reply: "Reply", help: "Help", threads: "Threads" };
+const SCREEN_TITLES = { settings: "Settings", reply: "Reply", help: "Help" };
 
 let screenBeforeSettings = "signin";
 let currentScreen = "signin";
@@ -571,8 +571,6 @@ function showScreen(name) {
   el("close-settings").hidden = name !== "settings";
   el("close-reply").hidden = name !== "reply";
   el("close-help").hidden = name !== "help";
-  // `#194 thread-picker-polish`. The Threads screen returns to the channel it lists.
-  el("close-threads").hidden = name !== "threads";
   el("topbar-title").hidden = !destination;
   if (destination) {
     el("topbar-title").textContent = SCREEN_TITLES[name];
@@ -2646,7 +2644,7 @@ function markSearchNow() {
   const mark = () => {
     markedQuery = searchQuery;
     eachColumn(renderScrollTools);
-    if (columnsShown) filterSideCards();
+    if (sideColumnUp()) filterSideCards();
   };
   if (currentScreen === "main") preservingScroll(mark);
   else mark();
@@ -2897,7 +2895,7 @@ function applySearch() {
 function searchInAllOffered(searched) {
   return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchOpen &&
     !linksOnly && authorChoosing() === "everyone" && searchTerms(searchQuery).length > 0 &&
-    currentView === "discord" && threadingSupported && !columnsShown && channelView === "main";
+    currentView === "discord" && threadingSupported && !sideColumnUp() && channelView === "main";
 }
 
 /**
@@ -2957,6 +2955,11 @@ function searchEmptySentence(loaded) {
  * columns while two are up. Over the Pinned filter it speaks for the pins: the left column's list.
  */
 function renderSearchCount(typed, links, author = false) {
+  // `#281 view-keys`. Over the thread list on its own, the bar speaks for the cards.
+  if (threadListOnScreen()) {
+    sayCardCount();
+    return;
+  }
   const left = columns.main.searched;
   if (!left) return;
   const counted = [left, ...(sideShowing() && columns.side.searched && !left.pinned ? [columns.side.searched] : [])];
@@ -2975,6 +2978,26 @@ function renderSearchCount(typed, links, author = false) {
   el("search-count").textContent = left.pinned
     ? (!filtering ? `${loaded} pinned` : `${matched} of ${loaded} pinned`)
     : (!filtering ? "" : `${matched} of ${loaded} loaded`);
+}
+
+/** The count in the bar again, from what each column last counted: for a change of layout that redrew no row. */
+function refreshSearchCount() {
+  renderSearchCount(searchOpen && searchTerms(searchQuery).length > 0, searchOpen && linksOnly,
+    authorChoosing() !== "everyone");
+}
+
+/** The cards there are, and how many the search and Unread only leave, as `filterSideCards` last counted. */
+let sideCardCount = { cards: 0, shown: 0 };
+
+/**
+ * The bar's count over the thread list on its own: how many cards the text matches, of how many, while
+ * something is typed. `#281 view-keys`. Links and whose messages are not offered over cards, which
+ * hold neither.
+ */
+function sayCardCount() {
+  const typed = searchOpen && searchTerms(searchQuery).length > 0;
+  const { cards, shown } = sideCardCount;
+  setTextIfChanged(el("search-count"), typed ? `${shown} of ${cards} thread${cards === 1 ? "" : "s"}` : "");
 }
 
 /**
@@ -4326,7 +4349,7 @@ function showSearchOpen(open) {
   // Both columns: there is one search bar. `#229 desktop-two-column`.
   if (hidingRead() !== wasHidingRead) eachColumn(renderCachedTimeline);
   eachColumn(renderScrollTools);
-  if (columnsShown) refilterSideCards();
+  if (sideColumnUp()) refilterSideCards();
   if (open) {
     el("search-field").focus();
   }
@@ -6235,9 +6258,10 @@ const channelPane = {
   name: "channel",
   // The left column's, whichever column the code is working on when it asks. `#229 desktop-two-column`.
   scroller: () => leftEl("scroll-area"),
+  // None while the thread list is up on its own: the left column is behind it. `#281 view-keys`.
   list: () => inColumn(columns.main, () =>
-    (currentScreen === "main" && currentView === "discord" && (pinnedOnly || channelView !== "threads")
-      ? shownChannelList() : null)),
+    (currentScreen === "main" && currentView === "discord" && !threadListShown &&
+      (pinnedOnly || channelView !== "threads") ? shownChannelList() : null)),
   head: () => floatingClearance(leftEl("scroll-area")),
   // The chips float over the foot of the list, and the status line floats over them: a row under
   // either is under something.
@@ -6259,14 +6283,15 @@ const channelPane = {
  * `#229 desktop-two-column`. The right column's list in two columns: the thread's messages, or with
  * none selected its cards, which the arrows, j and k, Home and End move through as through messages,
  * Enter highlights and → enters (`#277 thread-card-focus`). Nothing floats over its head (its heading
- * is above the scroller), and its jump floats over its foot.
+ * is above the scroller), and its jump floats over its foot. `#281 view-keys`: and the same cards in
+ * the thread list, the column on its own.
  *
  * @type {KeyPane}
  */
 const sidePane = {
   name: "side",
   scroller: () => leftEl("side-scroll"),
-  list: () => (currentScreen === "main" && currentView === "discord" && columnsShown
+  list: () => (currentScreen === "main" && currentView === "discord" && sideColumnUp()
     ? leftEl(columns.side.mode === "thread" ? "side-log" : "side-cards") : null),
   head: () => leftEl("side-scroll").getBoundingClientRect().top,
   foot: () => {
@@ -6297,6 +6322,9 @@ let lastPane = channelPane;
  */
 function paneFor(node) {
   for (const pane of KEY_PANES) {
+    // The left column behind the thread list takes no keys: the cards are the list on screen; nor does
+    // the right column while it is not drawn, as when a card has just opened its thread. `#281 view-keys`.
+    if (pane === channelPane ? threadListOnScreen() : !sideColumnUp()) continue;
     if (node && nodeWithin(pane.scroller(), node)) return pane;
   }
   // `#277 reply-in-column`. A reply open at the foot of a column is that column's: Escape out of its
@@ -6803,8 +6831,16 @@ function focusMinimally(node) {
 /** `focusList`, unless the reader is typing in a field still on screen, which is never taken from them. */
 function settleFocus() {
   const held = document.activeElement;
-  if (held && isTextField(held) && shownNode(held)) return;
+  if (held && isTextField(held) && shownNode(held) && !behindThreadList(held)) return;
   focusList(currentScreen === "main" ? paneFor(held) : null);
+}
+
+/**
+ * Whether `node` is in the left column while the thread list covers it (`#281 view-keys`): drawn, as
+ * far as its `hidden` says, but out of sight, so neither the focus nor the keys are left there.
+ */
+function behindThreadList(node) {
+  return threadListOnScreen() && nodeWithin(leftEl("scroll-area"), node);
 }
 
 // --- scrolling
@@ -7106,7 +7142,8 @@ function openFromKeyboard(event, target) {
     return true;
   }
   // A card: a press on it, which highlights it and shows it whole, or puts that out. The keys stay on
-  // it; → goes into its thread. `#277 thread-card-focus`, and `#229 desktop-two-column` before it.
+  // it; → goes into its thread. `#277 thread-card-focus`, and `#229 desktop-two-column` before it. The
+  // same in the thread list, whose cards are the right column's (`#281 view-keys`).
   if (row.hasAttribute("data-card")) {
     const card = childByClass(row, "side-card");
     if (card) card.click();
@@ -7260,25 +7297,43 @@ function copyFromKeyboard(target) {
 /** Whether the list of the channel is the one on screen: where the keys about messages and views apply. */
 const channelOnScreen = () => currentScreen === "main" && currentView === "discord";
 
-/** 1, 2 and 3: Main, the Threads screen, and All (question 12). */
-function viewFromKeyboard(event) {
+/**
+ * Ctrl+1 to Ctrl+4 (Cmd on an Apple keyboard): Main, All, the thread list, and two columns, the four
+ * views in the picker's order (`chooseView`). `#281 view-keys`. The owner, 2026-10-13: "Change the 1 2
+ * 3 keystrokes ... so it is Cmd-1 through Cmd-3. It should work irrespective of whether we have the
+ * text box selected etc. ... TBH I think two column view should just be Cmd-4 as the 4th view."
+ *
+ * A chord, so it fires in a message box and in the search as it does anywhere else, and types nothing
+ * there; and from Settings, Help and Reply, which are left as their Back leaves them — a reply open at
+ * the foot of a column too, for any view but two columns, which keep it (`chooseView`, `#277
+ * reply-in-column`) — and from the call's view, which gives way to the channel as its switch does. Its default is kept from the browser
+ * — in Chromium that is the tab switch, which it hands the page first (`IDC_SELECT_TAB_*` is not among
+ * the shortcuts it reserves) — whenever it chose a view, and on a held key's repeats, which choose
+ * nothing. Where no view can be chosen (the sign-in screen, no channel) it is left to the browser.
+ *
+ * THE BARE 1, 2 AND 3 ARE RETIRED. Kept beside the chords they would have had to change meaning — 2
+ * was the Threads screen and 3 was All — and a key that silently does the other thing is worse than
+ * one that does nothing; a reader who wants a view has one chord for it, from anywhere.
+ *
+ * @param {"main" | "flat" | "threads" | "columns"} which
+ * @param {boolean} repeat
+ */
+function viewFromKeyboard(which, repeat) {
+  // A view is the page's, whichever column the keys are in.
+  if (sideActive) return inColumn(columns.main, () => viewFromKeyboard(which, repeat));
+  const channel = String(el("discord-channel").value || "");
+  const covering = currentScreen === "settings" || currentScreen === "help";
+  // Settings and Help are left for the screen they were opened over, which is the channel's only when
+  // that is the main screen.
+  if (!channel || !(currentScreen === "main" || currentScreen === "reply" || (covering && screenBeforeSettings === "main"))) {
+    return false;
+  }
+  if (repeat) return true;
+  if (covering) closeSettings();
+  else if (currentScreen === "reply") closeReply();
+  if (currentView !== "discord") pressViewSwitch();
   if (!channelOnScreen()) return false;
-  // `#229 desktop-two-column`. Main is the left column, and the right shows the thread selected.
-  if (columnsShown) {
-    setStatus("Two columns: Main is on the left. Choose a thread from a message or from the list.");
-    return true;
-  }
-  const key = event.key;
-  if (key === "1") {
-    if (channelView !== "main" || pinnedOnly) guardQuietly(() => changeChannelView("main"))();
-  } else if (!threadingSupported) {
-    setStatus("No threads here: Main is all of it.");
-    return true;
-  } else if (key === "2") {
-    guardQuietly(openThreadDirectory)();
-  } else if (channelView !== "flat" || pinnedOnly) {
-    guardQuietly(() => changeChannelView("flat"))();
-  }
+  chooseView(which);
   settleFocus();
   return true;
 }
@@ -7298,7 +7353,8 @@ function readModeFromKeyboard() {
 function filterFromKeyboard(which) {
   // The bar and its Pinned filter are the left column's, whichever column the keys are in. `#229`.
   if (sideActive) return inColumn(columns.main, () => filterFromKeyboard(which));
-  if (!channelOnScreen()) return false;
+  // Over the thread list on its own they would filter the column behind it. `#281 view-keys`.
+  if (!channelOnScreen() || threadListOnScreen()) return false;
   if (!searchOpen) setSearchOpen(true);
   if (which === "pinned") setPinnedOnly(!pinnedOnly);
   else if (which === "author") cycleAuthorFilter();
@@ -7506,7 +7562,6 @@ function goBack() {
   if (currentScreen === "settings") closeSettings();
   else if (currentScreen === "help") closeHelp();
   else if (replyOnScreen() && (currentScreen === "reply" || activeColumn === replyColumn)) closeReply();
-  else if (currentScreen === "threads") closeThreadDirectory();
   // Not over the right column's cards, whose column still holds the thread it showed last: that Back
   // was the X with nothing to close, and put the cards back at their foot. `#277 thread-card-focus`.
   else if (channelOnScreen() && channelView === "thread" && !(sideActive && columns.side.mode === "list")) leaveThread();
@@ -7531,8 +7586,9 @@ function closeDetailsOn(target) {
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
  * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
- * thread-card-focus`); then Back: out of Settings, Help, Reply or the Threads screen, or out of a
- * thread. Returns whether it did anything. With none of those it does nothing:
+ * thread-card-focus`); then Back: out of Settings, Help or Reply, or out of a thread — to the thread
+ * list, for one opened from it (`#281 view-keys`). Returns whether it did anything. With none of those
+ * it does nothing:
  * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
  */
 function onEscape(event, target) {
@@ -7667,9 +7723,9 @@ const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
     does: "Back: closes a menu, the search or a sheet, takes the highlight off a thread card, leaves Settings, " +
-      "Help, Reply, Threads or a thread. In a message box with text in it, leaves the box first and keeps the " +
-      "draft; on the channel or thread picker, back to the messages",
-    controls: ["close-settings", "close-reply", "close-help", "close-threads", "thread-back", "side-close"],
+      "Help, Reply or a thread — one opened from the thread list goes back to it. In a message box with text " +
+      "in it, leaves the box first and keeps the draft; on the channel or view picker, back to the messages",
+    controls: ["close-settings", "close-reply", "close-help", "thread-back", "side-close"],
     run: (event, target) => onEscape(event, target),
   },
   {
@@ -7740,7 +7796,8 @@ const KEYMAP = [
   {
     group: KEYS_MOVING, chords: [{ key: "ArrowRight" }],
     does: "Into the thread of the selected message. On the thread cards, into the highlighted card's thread, or " +
-      "else the selected card's. In two columns it opens on the right, and the keys go with it",
+      "else the selected card's. In two columns it opens on the right, and the keys go with it; from the thread " +
+      "list, across the window",
     rowControls: ["thread-badge", "side-card-open", "thread-card-open"],
     run: (event, target) => threadFromKeyboard(target),
   },
@@ -7751,9 +7808,37 @@ const KEYMAP = [
     controls: ["thread-back"],
     run: () => threadOutFromKeyboard(),
   },
+  // `#281 view-keys`. The four views, in the picker's order. Each repeats so that a held chord's
+  // repeats are taken too, each being the browser's tab switch as well; a repeat chooses nothing.
+  {
+    group: KEYS_VIEW, chords: [{ key: "1", mod: true }], repeats: true,
+    does: "Main: what was posted to the channel itself. From anywhere, a message box or the search included",
+    controls: ["thread-select"],
+    run: (event) => viewFromKeyboard("main", event.repeat),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "2", mod: true }], repeats: true,
+    does: "All: every message, thread replies included",
+    controls: ["thread-select"],
+    run: (event) => viewFromKeyboard("flat", event.repeat),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "3", mod: true }], repeats: true,
+    does: "Thread list: a card for each thread, across the window. Enter or a click highlights one; its replies " +
+      "button or → opens it, and Esc comes back to the list",
+    controls: ["thread-select"],
+    run: (event) => viewFromKeyboard("threads", event.repeat),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: "4", mod: true }], repeats: true,
+    does: "Two columns: Main on the left and the thread list, or the thread chosen from it, on the right. " +
+      "On a desk at least 1000px wide",
+    controls: ["thread-select", "column-toggle"],
+    run: (event) => viewFromKeyboard("columns", event.repeat),
+  },
   {
     group: KEYS_VIEW, chords: [{ key: "\\", mod: true }],
-    does: "Two columns on or off, on a wide enough desk",
+    does: "Two columns on or off, as the layout button beside the view picker does",
     controls: ["column-toggle"],
     run: () => columnsFromKeyboard(),
   },
@@ -7773,12 +7858,6 @@ const KEYMAP = [
     does: "Choose a channel",
     controls: ["discord-channel"],
     run: () => pickChannel(),
-  },
-  {
-    group: KEYS_MOVING, chords: [{ key: "1" }, { key: "2" }, { key: "3" }],
-    does: "Main, Threads or All",
-    controls: ["thread-select"],
-    run: (event) => viewFromKeyboard(event),
   },
   {
     group: KEYS_MOVING, chords: [{ key: "b" }, { key: "m" }],
@@ -7924,8 +8003,18 @@ function chordMatches(chord, event) {
     return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
   }
   const key = String(event.key || "");
-  if (chord.key.length === 1 && chord.key !== " ") return key === chord.key;
+  if (chord.key.length === 1 && chord.key !== " ") return key === chord.key || digitByPlace(chord, event);
   return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
+}
+
+/**
+ * Whether `event` is the digit chord `chord` by the place of its key, on a layout whose digit row types
+ * something else without Shift: on AZERTY Ctrl+1 reports "&", on the key a browser's own Ctrl+1 is read
+ * from. `#281 view-keys`. Never for a key that types a digit, which is read as that digit.
+ */
+function digitByPlace(chord, event) {
+  return Boolean(chord.mod) && /^[0-9]$/.test(chord.key) && !/^[0-9]$/.test(String(event.key || "")) &&
+    event.code === `Digit${chord.key}`;
 }
 
 /** A chord of one key that types a character: what the Settings switch turns off, and what never fires in a field. */
@@ -8091,7 +8180,7 @@ function renderKeyHints() {
   const binding = (id) => KEYMAP.find((one) => (one.controls || []).includes(id));
   el("search-toggle").setAttribute("title", `Search messages (${bindingWords(binding("search-toggle"), true)})`);
   el("open-settings").setAttribute("title", `Settings (${bindingWords(binding("open-settings"), true)})`);
-  for (const id of ["close-settings", "close-reply", "close-help", "close-threads"]) {
+  for (const id of ["close-settings", "close-reply", "close-help"]) {
     el(id).setAttribute("title", "Back (Esc)");
   }
   const groups = [];
@@ -8118,8 +8207,28 @@ function renderKeyHints() {
       list.append(row);
     }
     groups.push(heading, list);
+    if (group === KEYS_VIEW) {
+      const note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = viewKeysNote();
+      groups.push(note);
+    }
   }
   el("keyboard-keys").replaceChildren(...groups);
+}
+
+/**
+ * What the list of keys says under the views: where their chords work, what became of the bare digits,
+ * and where a browser may keep the chords for itself. `#281 view-keys`. Chromium hands a page Ctrl+1 to
+ * Ctrl+8 (Cmd on a Mac) before it switches tabs with them — they are not among the shortcuts it
+ * reserves — and in the installed app there are no tabs to switch; another browser may keep them.
+ */
+function viewKeysNote() {
+  const mod = modKeyName();
+  return `${mod}+1 to ${mod}+4 work from anywhere, in a message box or the search too, and type nothing there. ` +
+    "1, 2 and 3 on their own no longer change the view. In a browser tab, Chrome and Edge let this page have " +
+    `${mod}+1 to ${mod}+4 before their own tab switching; a browser that keeps them for its tabs switches tabs ` +
+    "instead, and the view picker in the bar chooses the same four views.";
 }
 
 // --- the canned prompts -------------------------------------------------------------------------
@@ -10793,7 +10902,6 @@ function renderControlBar() {
   el("topbar").hidden =
     el("close-settings").hidden &&
     el("close-reply").hidden &&
-    el("close-threads").hidden &&
     el("topbar-title").hidden &&
     (placement !== "top" || el("control-bar").hidden);
 }
@@ -14170,7 +14278,7 @@ function renderSideFreshness() {
   if (columnsShown && columns.side.mode === "thread") {
     [state, text] = inColumn(columns.side, () =>
       [channelFreshness, staleWords(channelFreshness, channelFreshAt, channelRefreshing)]);
-  } else if (columnsShown) {
+  } else if (sideColumnUp()) {
     const channel = String(el("discord-channel").value);
     state = threadListFailures.get(channel) || "fresh";
     const at = threadListLandedAt.get(channel) || inColumn(columns.main, () => channelFreshAt);
@@ -14258,7 +14366,7 @@ function reconcileChannelSnapshot(before) {
 // default later becomes.
 //
 // NOT THE SCREEN. A reopen lands on the main screen whatever was up: Settings and Help are a tap
-// away, the Threads screen is a choice half made, and a reply keeps its draft without its screen
+// away, and a reply keeps its draft without its screen
 // being reopened (`DRAFTS_KEY`). The selected channel already has its own key (`ACTIVE_CHANNEL_KEY`);
 // the record names it only so a place measured in one channel is never applied to another.
 //
@@ -14286,7 +14394,9 @@ function reconcileChannelSnapshot(before) {
 // chosen one in is taken from the shared record, behind the window's own choices. The read mode
 // is a preference of the device rather than a place, so it comes from the shared record whichever
 // window wrote that. What the right column shows in two columns is kept for the session only
-// (`sideThreads`), in memory, which is already the window's own.
+// (`sideThreads`), in memory, which is already the window's own. `#281 view-keys`: and the layout —
+// one column, the thread list on its own, or two columns — is the window's own as well (`COLUMNS_KEY`),
+// so each of the four views Ctrl+1 to Ctrl+4 choose is what a reload of that window comes back to.
 //
 // The window's storage, not its address: a channel in the URL would outlive a reload too, but it
 // would ride along in every link copied out of the address bar, and every route, the installed
@@ -14334,7 +14444,10 @@ const UI_STATE_CHANNELS = 50;
  * all, so this rather than the count is what stops a few long roots from growing it without end.
  */
 const UI_STATE_CHARS = 60000;
-/** The channel views a reopen comes back to. The Threads list is reached from the picker instead. */
+/**
+ * The channel views a reopen comes back to in one column. The thread list and two columns are layouts,
+ * kept for the window apart from any channel (`COLUMNS_KEY`, `#281 view-keys`).
+ */
 const REOPENED_VIEWS = ["main", "flat", "thread"];
 
 /**
@@ -14347,8 +14460,9 @@ function defaultChannelView() {
   return threadingSupported ? "flat" : "main";
 }
 
+// `#281 view-keys`: "list" for a thread opened from the thread list, whose Back is the list.
 const validSavedThread = (thread) => thread !== null && typeof thread === "object" &&
-  typeof thread.id === "string" && thread.id !== "" && ["main", "flat"].includes(thread.origin) &&
+  typeof thread.id === "string" && thread.id !== "" && ["main", "flat", "list"].includes(thread.origin) &&
   (thread.summary === null || VibeTalkContract.is("ThreadSummary", thread.summary));
 
 /** One channel's choice: Main, All, or a thread with where it was opened from and its summary. */
@@ -14559,7 +14673,8 @@ function openingChannelView() {
 /** Put the selected channel on the view it opens in. Draws nothing; every caller draws next. */
 function openChannelView() {
   // `#229 desktop-two-column`. In two columns the left column is Main, whatever the channel opens in.
-  const opening = columnsShown ? { view: "main", thread: null, summary: null, origin: "main" } : openingChannelView();
+  // `#281 view-keys`: and behind the thread list on its own.
+  const opening = sideColumnUp() ? { view: "main", thread: null, summary: null, origin: "main" } : openingChannelView();
   channelView = opening.view;
   selectedThreadId = opening.thread;
   selectedThread = opening.summary;
@@ -14610,7 +14725,7 @@ function viewOnScreen() {
   if (!channel || !REOPENED_VIEWS.includes(channelView) || (channelView === "thread" && !selectedThreadId)) return null;
   const thread = channelView === "thread" ? {
     id: String(selectedThreadId),
-    origin: ["main", "flat"].includes(threadOrigin) ? threadOrigin : defaultChannelView(),
+    origin: ["main", "flat", "list"].includes(threadOrigin) ? threadOrigin : defaultChannelView(),
     summary: savedThreadSummary(),
   } : null;
   return { channel, channelView, thread };
@@ -15063,7 +15178,7 @@ async function readBehindSwitch() {
  * view with nothing at all to draw is emptied and read with the loading line. Main and All keep the
  * reader on the message they were reading.
  */
-async function changeChannelView(view, threadId = null, summary = null) {
+async function changeChannelView(view, threadId = null, summary = null, origin = null) {
   // `#277 reply-in-column`. The list a reply open in this column answers a message of is going.
   if (replyDocked && activeColumn === replyColumn) putDockedReplyAway();
   // Before the view goes: where the reader is, and how current what they are reading is — what a
@@ -15083,7 +15198,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
   dropReplyArrowTap();
   rememberChannelDraft();
   rememberChannelContext();
-  if (view === "thread" && channelView !== "thread") threadOrigin = channelView;
+  // Where Back goes from a thread: the view it was opened from, or the one the opener says — the thread
+  // list, for a thread opened from its cards (`#281 view-keys`), whose left column was Main behind it.
+  if (view === "thread" && (origin || channelView !== "thread")) threadOrigin = origin || channelView;
   channelView = view;
   selectedThreadId = view === "thread" ? threadId : null;
   selectedThread = view === "thread" ? summary : null;
@@ -15109,7 +15226,8 @@ async function changeChannelView(view, threadId = null, summary = null) {
   // `#229 desktop-two-column`. Not in two columns, though: the left column is Main there because of
   // the layout, not by the reader's choice, and the right column's thread is not a view the channel
   // opens in. Leaving two columns goes back to the choice made in one.
-  if (!columnsShown && !sideActive && !columnsRestoring) {
+  // `#281 view-keys`: nor behind the thread list, whose left column is Main for the same reason.
+  if (!columnsShown && !threadListShown && !sideActive && !columnsRestoring) {
     const chosen = viewOnScreen();
     if (chosen) rememberChosenView(chosen);
     // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
@@ -15220,8 +15338,8 @@ async function changeChannelView(view, threadId = null, summary = null) {
  * what is on the page — on opening it, and on reopening the page in it.
  *
  * ...when All reaches back to where the thread starts. `#189 restore-ui-state` made All the view a
- * channel opens in, so All is nearly always covered, and an old thread — what the Threads screen is
- * for — began before All's newest page: inherited, it drew empty, with no cursor to walk back on
+ * channel opens in, so All is nearly always covered, and an old thread — what the thread list's
+ * older pages are for — began before All's newest page: inherited, it drew empty, with no cursor to walk back on
  * until the poll read it. That thread is read for itself instead.
  *
  * ...and when nothing says the thread has outgrown what is held. `#222 unread-replies`: a root's
@@ -15599,28 +15717,31 @@ function entryLandingHolds() {
 // messages already loaded — so opening it costs no request. Touching it also asks for the
 // channel's thread list in the background, at most once a minute, so the next look is complete.
 //
-// `#194 thread-picker-polish`. It lists one screenful, then "… Older threads", which opens the
-// Threads screen: every thread the channel has, paged from the server. And a thread is called the
-// same thing everywhere it is named — see `threadName`.
+// `#194 thread-picker-polish`. It lists one screenful. And a thread is called the same thing
+// everywhere it is named — see `threadName`.
+//
+// `#281 view-keys`. It is the VIEW picker now: Main, All, the thread list and, where the window draws
+// them, two columns, in the order Ctrl+1 to Ctrl+4 choose them, then the screenful of threads. The
+// "… Older threads" that closed the list opened a Threads screen of its own, a second list of threads
+// beside the right column's cards; the thread list, which is those cards across the window, replaced
+// both, and pages back through older threads where it stands (`loadOlderThreads`).
 
 /** How long a background read of one channel's thread list is reused by the selector. */
 const THREAD_DIRECTORY_REFRESH_MS = 60000;
 /**
- * How many threads the selector lists before "… Older threads", newest activity first: ABOUT ONE
- * PHONE SCREEN. `#194 thread-picker-polish`. The owner, of the forty it used to list: "It should
- * show only about one screen worth". A phone's native picker draws each option as a row about a
- * thumb high, and with Main and All above and "Older threads" below, eight threads is what fills
- * one screen of it without the sheet scrolling. Every thread past them is on the Threads screen.
+ * How many threads the selector lists, newest activity first: ABOUT ONE PHONE SCREEN. `#194
+ * thread-picker-polish`. The owner, of the forty it used to list: "It should show only about one
+ * screen worth". A phone's native picker draws each option as a row about a thumb high, and with
+ * Main, All and the thread list above (on a phone two columns are not offered), eight threads is what
+ * fills one screen of it without the sheet scrolling. Every thread past them is in the thread list.
  */
 const THREAD_SELECT_LIMIT = 8;
 /**
  * Longest name the selector shows, in characters. Short on purpose: a phone's native picker draws
  * its options large, and a sentence per option was unreadable. The heading over an open thread and
- * the Threads screen have the room, and show the same name less shortened.
+ * the thread list's cards have the room, and show the same name less shortened.
  */
 const THREAD_TITLE_CHARS = 28;
-/** The selector's last option, which opens the Threads screen rather than a view of the channel. */
-const OLDER_THREADS_OPTION = "older";
 
 const threadDirectoryReadAt = new Map();
 let threadDirectoryInFlight = null;
@@ -15649,7 +15770,7 @@ function firstLineOf(text, chars) {
 
 /**
  * How long ago, as briefly as a picker option allows — and ONE SCALE wherever the page gives a
- * thread's age: the selector, the heading over an open thread, and the Threads screen.
+ * thread's age: the selector, the heading over an open thread, and the thread list's cards.
  * `#194 thread-picker-polish`: the owner read "42h" in the selector and asked for days and hours.
  *
  *   under a minute     now
@@ -15696,7 +15817,7 @@ function threadChoice(id, summary = null, root = null) {
 
 /**
  * THE NAME A THREAD GOES BY, and the only place one is made: the selector's option, the heading
- * over an open thread, the Threads screen, the Threads list and the seam over a thread all ask
+ * over an open thread, the thread list's cards and the seam over a thread all ask
  * this, from the store, each time they draw.
  *
  * `#194 thread-picker-polish`. The owner found the heading over an open thread calling it one thing
@@ -15807,33 +15928,48 @@ function olderThreadsOnServer() {
   return Boolean(cover && cover.more);
 }
 
-/** Main, All, a screenful of threads and the way to the rest, with the view on screen selected. */
+/**
+ * The views the picker offers first, in the order Ctrl+1 to Ctrl+4 (Cmd on an Apple keyboard) choose
+ * them, with what it calls each. `#281 view-keys`: the thread list and two columns joined Main and All
+ * there, so that the one control that says which view is up says it for all four, and chooses them.
+ */
+const VIEW_CHOICES = [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["columns", "Two columns"]];
+
+/** What the picker's value is for the view on screen: one of `VIEW_CHOICES`, or `thread:<id>`. */
+function viewChoiceOnScreen() {
+  if (columnsShown) return "columns";
+  if (threadListShown) return "threads";
+  if (channelView === "thread" && selectedThreadId) return `thread:${selectedThreadId}`;
+  return channelView === "flat" ? "flat" : "main";
+}
+
+/**
+ * Main, All, the thread list, two columns where this window can draw them, then a screenful of threads,
+ * with the view on screen selected.
+ */
 function renderThreadSelect() {
   const select = el("thread-select");
   /** @type {Array<[string, string]>} */
   const options = [["main", "Main"]];
   if (threadingSupported) {
     options.push(["flat", "All"]);
+    // `#281 view-keys`. The thread list, and two columns, are of a channel that has threads to list.
+    // Two columns only where this window draws them (`columnsFit`): a phone is offered none.
+    if (threadListOffered()) {
+      options.push(["threads", "Thread list"]);
+      if (columnsFit) options.push(["columns", "Two columns"]);
+    }
     const choices = threadChoices();
     const shown = choices.slice(0, THREAD_SELECT_LIMIT);
     for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice)]);
     // The thread on screen is always offered, so the selector can say which one it is — even when
-    // it is older than the first screenful, as one opened from the Threads screen usually is.
+    // it is older than the first screenful, as one opened from the thread list often is.
     const open = openThreadChoice();
     if (open && !shown.some((choice) => choice.id === open.id)) {
       options.push([`thread:${open.id}`, threadLabel(open)]);
     }
-    // A channel that IS one thread has no others to page through.
-    if (!channelCanon.scope && (choices.length > shown.length || olderThreadsOnServer())) {
-      options.push([OLDER_THREADS_OPTION, "… Older threads"]);
-    }
   }
-  const current = channelView === "thread" && selectedThreadId
-    ? `thread:${selectedThreadId}`
-    : channelView === "flat" ? "flat" : "main";
-  // `#229 desktop-two-column`. In two columns the left column is Main and the right one shows the
-  // thread selected, so there is nothing for the picker to choose: it greys out and says why.
-  const twoColumns = columnsShown && threadingSupported;
+  const current = viewChoiceOnScreen();
   // Rebuilt only when what it offers changed, so a redraw while it is open does not close it.
   const signature = JSON.stringify(options);
   if (select.getAttribute("data-options") !== signature) {
@@ -15845,61 +15981,19 @@ function renderThreadSelect() {
     }));
     select.setAttribute("data-options", signature);
   }
-  // Every redraw puts it back on the view on screen, which is also what keeps "Older threads" from
-  // standing selected once the screen it opens is up, or has been left.
+  // Every redraw puts it back on the view on screen: a choice the window could not honour — two
+  // columns in a window too narrow for them — is not left standing as if it had been.
   select.value = current;
   // A provider without threads has nothing to choose; the picker stays, saying so by being inert.
   select.disabled = !threadingSupported;
-  // `#231 two-column-polish`. In two columns, greyed but no less a control: a Tab stop that says it
-  // is unavailable, and why, and refuses a press with the reason (`refuseGreyedPicker`). See
-  // #thread-select in web/voice.html.
-  if (select.hasAttribute("aria-disabled") !== twoColumns) {
-    if (twoColumns) select.setAttribute("aria-disabled", "true");
-    else select.removeAttribute("aria-disabled");
-  }
-  const why = twoColumns ? TWO_COLUMNS_PICKER_TITLE : threadingSupported
-    ? "Which part of the channel to read: Main, All, or one thread."
+  const why = threadingSupported
+    ? "Which view of the channel to read: Main, All, the thread list, two columns, or one thread."
     : "This channel's chat service does not offer threads here, so Main is the whole channel.";
   if (select.title !== why) select.title = why;
-  // Its description says why it is greyed, when it is; a picker that chooses needs none.
-  setTextIfChanged(leftEl("thread-select-note"), twoColumns || !threadingSupported ? why : "");
+  // Its description says why it is inert, when it is; a picker that chooses needs none.
+  setTextIfChanged(leftEl("thread-select-note"), threadingSupported ? "" : why);
   // The right column's heading and cards name threads from the same store.
-  if (columnsShown) renderSideColumn();
-}
-
-/** What the greyed picker says in two columns. `#229 desktop-two-column`. */
-const TWO_COLUMNS_PICKER_TITLE =
-  "Two columns: Main is on the left and the thread on the right. Choose a thread from a message or from the list.";
-
-/** Whether the view picker is greyed, as it is in two columns. `#231 two-column-polish`. */
-const pickerGreyed = () => el("thread-select").getAttribute("aria-disabled") === "true";
-
-/**
- * The keys that open a picker or change what it has chosen without opening it: the arrows and the
- * page keys, Space, Enter, F4, Alt+↓ and Alt+↑, and a character, which a picker takes as a search of
- * its options — so on the greyed picker a letter is not one of the page's keys, as on a picker that
- * chooses, which takes it too. Not Tab, which leaves it, nor Escape, which goes back to the list, nor
- * any other chord, which is the page's or the browser's.
- *
- * @param {KeyboardEvent} event
- */
-function picksByKey(event) {
-  // Alt+↓ and Alt+↑ open a picker in Chromium and Firefox off a Mac; no other chord touches one.
-  if (event.altKey && !event.ctrlKey && !event.metaKey) return event.key === "ArrowDown" || event.key === "ArrowUp";
-  if (event.ctrlKey || event.metaKey || event.altKey) return false;
-  return ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", "F4"]
-    .includes(event.key) || String(event.key || "").length === 1;
-}
-
-/**
- * A press on the greyed picker: it opens nothing, chooses nothing, and says why, in the status line
- * the view keys say it in, where a reader who pressed it is looking. `#231 two-column-polish`.
- *
- * @param {Event} event
- */
-function refuseGreyedPicker(event) {
-  swallow(event);
-  setStatus(TWO_COLUMNS_PICKER_TITLE);
+  if (sideColumnUp()) renderSideColumn();
 }
 
 /**
@@ -15916,25 +16010,26 @@ function renderThreadHeading() {
   el("thread-facts").hidden = facts === "";
 }
 
-/** The reader picked Main, All, a thread, or the way to the older ones. */
+/** The reader picked one of the four views, or a thread. */
 function onThreadSelect() {
-  // Greyed, it chose nothing, however a choice reached it: put back on the view on screen.
-  if (pickerGreyed()) {
-    renderThreadSelect();
-    return undefined;
-  }
   const value = String(el("thread-select").value);
-  if (value === OLDER_THREADS_OPTION) return openThreadDirectory();
-  if (value === "main" || value === "flat") {
-    if (channelView === value) return undefined;
-    return changeChannelView(value);
+  if (VIEW_CHOICES.some(([view]) => view === value)) {
+    chooseView(/** @type {"main" | "flat" | "threads" | "columns"} */ (value));
+    // The picker keeps the focus a choice made from it leaves there, unless the column it is in went.
+    return undefined;
   }
   if (!value.startsWith("thread:")) return undefined;
   const id = value.slice("thread:".length);
-  if (channelView === "thread" && String(selectedThreadId) === id) return undefined;
+  if (!columnsShown && !threadListShown && channelView === "thread" && String(selectedThreadId) === id) return undefined;
   // The store's summary when it has one. Never the option's own words: the heading names the
   // thread from the store, and a shortened name handed in here would be shortened twice.
-  return openThread(id, channelCanon.threads.find((summary) => String(summary.id) === id) || null);
+  const summary = channelCanon.threads.find((held) => String(held.id) === id) || null;
+  // From the thread list, as a card opens it: across the window, Esc back to the list. `#281 view-keys`.
+  if (threadListShown) return openThreadFromList(id, summary);
+  const opened = openThread(id, summary);
+  // In two columns the thread is selected on the right, and the picker goes on saying two columns.
+  renderThreadSelect();
+  return opened;
 }
 
 /** Read the channel's thread list in the background, so the selector names every thread. */
@@ -15966,6 +16061,8 @@ async function refreshThreadDirectory() {
       if (!foldTimelineDelta(payload, sent, "threads", null)) return;
     } else {
       foldTimelinePage(payload, false, "threads", null);
+      // The way back from the newest page, for "Older threads…" over the cards. `#281 view-keys`.
+      noteNewestThreadPage(channel, payload);
     }
     noteThreadListLanded(channel);
     renderThreadSelect();
@@ -15990,6 +16087,8 @@ function openThread(id, summary = null) {
   if (!threadingSupported || !id) return;
   // `#229 desktop-two-column`. In two columns a thread is selected on the right, and Main stays.
   if (columnsShown) return selectSideThread(String(id), summary);
+  // `#281 view-keys`. From the thread list on its own, across the window, with the way back to it.
+  if (threadListShown) return openThreadFromList(String(id), summary);
   return changeChannelView("thread", String(id), summary);
 }
 
@@ -15997,180 +16096,105 @@ function closeThread() {
   // In two columns, leaving the thread on the right is its X. `#229 desktop-two-column`.
   if (columnsShown && sideActive) return closeSideThread();
   if (channelView !== "thread") return;
+  // `#281 view-keys`. A thread opened from the thread list goes back to the list — or, where the
+  // channel has none to show any more, to the view it opens in.
+  if (threadOrigin === "list") {
+    if (threadListOffered()) return setLayout("list");
+    return changeChannelView(defaultChannelView());
+  }
   return changeChannelView(threadOrigin);
 }
 
-// --- the Threads screen -------------------------------------------------------------------------
+// --- older threads, from the thread list ---------------------------------------------------------
 //
-// `#194 thread-picker-polish`. The owner: the selector "shows too many threads with a scrollable
-// list. It should show only about one screen worth with an '... Older threads' option that pops up
-// a dedicated paginated selector page." This is that page. Every thread the store knows, newest
-// activity first, each named exactly as the selector names it plus the server's one-sentence
-// summary, and "Load older" steps back through the channel's thread list one server page at a
-// time, on the cursor the server hands back. Pages fold into the channel's store like any other
-// read, so a thread found here is one the selector and the heading can name.
-//
-// A SCREEN, like Reply, rather than a list over the channel: on a phone it needs the whole height,
-// and it has its own way back. Choosing a thread opens it and returns to the channel; leaving
-// returns the reader to the line they were reading.
+// `#194 thread-picker-polish` gave the picker "… Older threads", which opened a Threads screen: every
+// thread the store knew, and "Load older" stepping back through the channel's thread list one server
+// page at a time. `#281 view-keys` retired that screen — the owner, of it: "the duplicative threads
+// view also doesn't respect the 1/3 keystrokes anyway to jump out of it" — for the thread list, the
+// right column's cards across the window. Its paging is the cards' own now: "Older threads…" above
+// the oldest card reads the next page back where the reader is, and the page folds into the
+// channel's store like any other read, so the cards, the picker and the heading name what it found.
 
-const threadDirectory = {
-  /** The channel the screen lists; a read for another one is dropped. */
-  channel: "",
-  /** The server's `next_before` for the next older page, or null when there is none. */
-  cursor: null,
-  loading: false,
-  /** Which read is in flight or failed: the first page, or an older one. */
-  older: false,
-  failed: false,
-  error: "",
-  generation: 0,
-  /** Where the reader was in the channel, taken before the screen hid it. */
-  mark: null,
-};
+/**
+ * The walk back through one channel's thread list: the server's `next_before` for the next older page
+ * (null with none known yet, or none left), whether a read is out, and how the last one failed.
+ */
+const threadPages = { channel: "", cursor: /** @type {string | null} */ (null), loading: false, failed: false, error: "", generation: 0 };
 
-/** Open the Threads screen from the selector, and read the channel's newest page of threads. */
-function openThreadDirectory() {
-  // The selector goes back to the view on screen first: "Older threads" is a way somewhere, not a
-  // view, and must not be what the selector says the reader is reading.
-  renderThreadSelect();
-  const channel = String(el("discord-channel").value);
-  if (!threadingSupported || !channel || channelCanon.scope) return undefined;
-  // BEFORE the screen changes, as Reply does: once #screen-main is hidden nothing in it has a box.
-  threadDirectory.mark = captureScroll();
-  if (threadDirectory.channel !== channel) {
-    threadDirectory.cursor = null;
-    threadDirectory.failed = false;
+/** The walk back's state, reset for `channel` when it was another channel's. */
+function threadPagesFor(channel) {
+  if (threadPages.channel !== channel) {
+    Object.assign(threadPages, { channel, cursor: null, loading: false, failed: false, error: "" });
+    threadPages.generation += 1;
   }
-  threadDirectory.channel = channel;
-  showScreen("threads");
-  return loadThreadDirectory(false);
-}
-
-/** Leave the Threads screen for the channel, at the line the reader left. */
-function closeThreadDirectory() {
-  if (currentScreen !== "threads") return;
-  showScreen("main");
-  if (threadDirectory.mark) restoreScroll(threadDirectory.mark);
-  threadDirectory.mark = null;
-  renderThreadSelect();
-}
-
-/** A row on the Threads screen was chosen: open that thread, back on the channel. */
-function openFromThreadDirectory(id) {
-  const channel = threadDirectory.channel;
-  closeThreadDirectory();
-  if (String(el("discord-channel").value) !== channel) return undefined;
-  if (channelView === "thread" && String(selectedThreadId) === id) return undefined;
-  return openThread(id, channelCanon.threads.find((summary) => String(summary.id) === id) || null);
+  return threadPages;
 }
 
 /**
- * Read a page of the channel's thread list: the newest, or the next older one. A failure keeps the
- * rows already listed — they are still true — and says what failed beside a way to try again.
+ * A newest page of `channel`'s thread list landed: its `next_before` is where the walk back starts,
+ * unless the walk has already gone further back than that, whose pages are still in the store.
  */
-async function loadThreadDirectory(older) {
-  const channel = threadDirectory.channel;
-  const cursor = older ? threadDirectory.cursor : null;
-  if (older && !cursor) return;
-  const generation = ++threadDirectory.generation;
-  Object.assign(threadDirectory, { loading: true, older, failed: false, error: "" });
-  renderThreadDirectory();
-  let path = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
-  if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
-  let payload;
-  try {
-    payload = await apiDecoded("TimelineResponse", path);
-  } catch (error) {
-    if (generation !== threadDirectory.generation) return;
-    Object.assign(threadDirectory, {
-      loading: false,
-      failed: true,
-      error: (error && (error.detail || error.message)) || "the server did not answer",
-    });
-    renderThreadDirectory();
-    return;
-  }
-  if (generation !== threadDirectory.generation) return;
-  if (String(el("discord-channel").value) !== channel) {
-    threadDirectory.loading = false;
-    return;
-  }
-  foldTimelinePage(payload, older, "threads", null);
-  // The newest page is the selector's background read as well; it need not ask again this minute.
-  if (!older) {
-    threadDirectoryReadAt.set(channel, Date.now());
-    noteThreadListLanded(channel);
-  }
+function noteNewestThreadPage(channel, payload) {
+  const pages = threadPagesFor(channel);
   const next = payload.has_more === true ? payload.next_before || null : null;
-  // A REOPENED screen re-reads the newest page, but the older pages already loaded are still in
-  // the store and on screen: Load older continues from the deepest one rather than walking the
-  // reader back through pages they have already seen.
-  if (older || !threadDirectory.cursor || !next) threadDirectory.cursor = next;
-  threadDirectory.loading = false;
-  renderThreadDirectory();
+  if (!pages.cursor || !next) pages.cursor = next;
+}
+
+/** Whether there are older threads to read from "Older threads…": the server said so, or a cursor says it. */
+function olderThreadsToRead() {
+  const channel = String(el("discord-channel").value);
+  return olderThreadsOnServer() || (threadPages.channel === channel && threadPages.cursor !== null);
+}
+
+/**
+ * "Older threads…": the next page back of the channel's thread list, folded into the store, the cards
+ * drawn again with the reader kept on the card they were on (`renderSideCards`). With no cursor yet —
+ * the newest read was a delta, or the cards came from this device's snapshot — the newest page is read
+ * first for one. A failure keeps the cards, which are still true, and says so over them; the button
+ * stays, to try again.
+ */
+async function loadOlderThreads() {
+  const channel = String(el("discord-channel").value);
+  if (!threadingSupported || !channel || channelCanon.scope) return;
+  const pages = threadPagesFor(channel);
+  if (pages.loading) return;
+  const generation = ++pages.generation;
+  Object.assign(pages, { loading: true, failed: false, error: "" });
+  renderSideColumn();
+  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
+  const stale = () => generation !== pages.generation || String(el("discord-channel").value) !== channel;
+  try {
+    if (!pages.cursor) {
+      const newest = await apiDecoded("TimelineResponse", base);
+      if (stale()) return;
+      foldTimelinePage(newest, false, "threads", null);
+      threadDirectoryReadAt.set(channel, Date.now());
+      noteThreadListLanded(channel);
+      noteNewestThreadPage(channel, newest);
+    }
+    if (pages.cursor) {
+      const older = await apiDecoded("TimelineResponse", `${base}&before=${encodeURIComponent(pages.cursor)}`);
+      if (stale()) return;
+      foldTimelinePage(older, true, "threads", null);
+      pages.cursor = older.has_more === true ? older.next_before || null : null;
+    }
+  } catch (error) {
+    if (stale()) return;
+    pages.failed = true;
+    pages.error = (error && (error.detail || error.message)) || "the server did not answer";
+  } finally {
+    if (!stale()) pages.loading = false;
+  }
+  if (stale()) return;
   renderThreadSelect();
   renderThreadHeading();
+  renderSideColumn();
 }
 
-/** The standing sentence over the list. */
-function threadDirectorySentence(count) {
-  const state = threadDirectory;
-  if (state.loading) {
-    if (state.older) return "Loading older threads…";
-    return count === 0 ? "Loading threads…" : `${count} known on this device · asking the server for more…`;
-  }
-  if (state.failed) {
-    const what = state.older ? "older threads" : "the thread list";
-    const why = state.error.replace(/[.\s]+$/, "");
-    return `Could not load ${what}: ${why}.${count ? " The threads below are the ones already known." : ""}`;
-  }
-  if (count === 0) return "No threads in this channel yet.";
-  const listed = `${count} ${count === 1 ? "thread" : "threads"}, newest activity first`;
-  if (state.cursor) return `${listed}. Older ones are on the server.`;
-  // A provider that stopped scanning says so in the page's notice ("older threads are not
-  // listed"); "that is all of them" would then be a claim the server explicitly did not make.
-  const cover = channelCanon.views.get(viewKey("threads"));
-  const notice = cover && typeof cover.notice === "string" ? cover.notice.trim().replace(/[.\s]+$/, "") : "";
-  return notice ? `${listed}. ${notice.charAt(0).toUpperCase()}${notice.slice(1)}.` : `${listed}. That is all of them.`;
-}
-
-/** Draw the list. Every string is text; nothing from the chat service is parsed as markup. */
-function renderThreadDirectory() {
-  const choices = threadChoices();
-  // In two columns, the thread open on the right. `#229 desktop-two-column`.
-  const open = columnsShown
-    ? (sideShowing() ? inColumn(columns.side, () => String(selectedThreadId)) : null)
-    : channelView === "thread" && selectedThreadId ? String(selectedThreadId) : null;
-  el("thread-directory-list").replaceChildren(...choices.map((choice) => {
-    const row = document.createElement("li");
-    row.setAttribute("data-context-id", choice.id);
-    const button = document.createElement("button");
-    button.className = "thread-directory-open";
-    button.setAttribute("type", "button");
-    if (choice.id === open) button.setAttribute("aria-current", "true");
-    const label = document.createElement("span");
-    label.className = "thread-directory-label";
-    // The selector's own label, with the name given the room this screen has.
-    label.textContent = threadLabel(choice, Infinity);
-    button.append(label);
-    const said = choice.summary && typeof choice.summary.summary === "string" ? choice.summary.summary.trim() : "";
-    if (said) {
-      const sentence = document.createElement("span");
-      sentence.className = "thread-directory-summary";
-      sentence.textContent = said;
-      button.append(sentence);
-    }
-    button.addEventListener("click", () => guardQuietly(() => openFromThreadDirectory(choice.id))());
-    row.append(button);
-    return row;
-  }));
-  el("thread-directory-state").textContent = threadDirectorySentence(choices.length);
-  const more = el("thread-directory-more");
-  more.hidden = !threadDirectory.cursor || (threadDirectory.failed && threadDirectory.older);
-  more.disabled = threadDirectory.loading;
-  more.textContent = threadDirectory.loading && threadDirectory.older ? "Loading older…" : "Load older";
-  el("thread-directory-retry").hidden = !threadDirectory.failed;
+/** What the cards say of the walk back's last read, when it failed; else "". */
+function olderThreadsFailure() {
+  if (threadPages.channel !== String(el("discord-channel").value) || !threadPages.failed) return "";
+  return `Could not load older threads: ${threadPages.error.replace(/[.\s]+$/, "")}.`;
 }
 
 /** The Threads list's cards for `summaries`, their unread replies counted once for them all. */
@@ -29620,17 +29644,16 @@ function followReplyStore() {
 // script asks it, by whether the right column has a box (`renderColumns`): `voice.js` reads no media
 // query and no user agent, which the page suite holds it to.
 //
-// WHAT EACH COLUMN SHOWS. The left is Main, always, so the view picker has nothing to choose and
-// greys out, saying why. The right is the thread selected, read and drawn exactly as a thread is in
+// WHAT EACH COLUMN SHOWS. The left is Main, always. (The view picker greyed out here until `#281
+// view-keys` made two columns one of its four views.) The right is the thread selected, read and drawn exactly as a thread is in
 // one column (read modes, the landing on its first unread, reply arrows, reactions, Done, pins, the
 // walk back and its own composer at its foot), with a heading naming it and an X that deselects it.
-// With none selected it is a card per thread, newest activity first, as the Threads screen orders
-// them: "display_name: summary" where the summariser has named the thread and summed it up, else the
+// With none selected it is a card per thread: "display_name: summary" where the summariser has named the thread and summed it up, else the
 // text of its first message, three lines at most.
 //
 // SELECTING. Every way into a thread selects it on the right instead of leaving Main: its Thread(N)
 // tag, the "N unread" on a root, the root's "N replies" (which in one column gathers the replies
-// under the root, and here would show them twice, side by side), the Threads screen, and a card. A
+// under the root, and here would show them twice, side by side), the view picker, and a card. A
 // plain tap on a message does not: a tap folds and unfolds it, and replacing the right column on
 // every fold would throw away the reader's place in the thread they are reading.
 //
@@ -29644,9 +29667,20 @@ function followReplyStore() {
 // thread list, at most once a minute (`refreshThreadDirectory`). A refresh that brings nothing draws
 // nothing in either column. A live reply in the thread on the right is read once, as the thread.
 //
-// LEAVING. One column again shows the view last chosen in one column: in two, the view picker is not
-// the reader's to change, so nothing here touches that choice. The thread selected on the right is
-// kept per channel for the session, and selected again when two columns come back.
+// LEAVING. One column again shows the view last chosen in one column, or the one Ctrl+1 or Ctrl+2 or
+// the picker asked for: in two, the left column is Main by the layout, so nothing here touches that
+// choice. The thread selected on the right is kept per channel for the session, and selected again
+// when two columns come back.
+//
+// THE THREAD LIST. `#281 view-keys`. The owner, 2026-10-13: "Recall I wanted thread list view to be
+// converged with the two-column rendering of threads on the right. TBH I think two column view should
+// just be Cmd-4 as the 4th view." So the thread list (Ctrl+3) IS the right column, on its own across
+// the window — its heading, Unread only, the freshness line, "Older threads…" and the cards, one
+// rendering — and two columns (Ctrl+4) are Main beside it. It is drawn at every width, a phone's
+// included (`data-columns="list"` in web/voice.css), over the left column, which stays Main behind it
+// as it is in two columns, so going from one to the other moves nothing but the left column. A card
+// chosen there opens its thread across the window, one column, and Back from that thread is the list
+// again (`openThreadFromList`); its cards never show a thread themselves.
 //
 // HOW. See `COLUMN_IDS` at the head of this file: the code works on one column at a time, the left
 // one except inside `inColumn`. Everything that starts in the right column gets there first: its
@@ -29655,23 +29689,72 @@ function followReplyStore() {
 // each wait (`columnSteps`). What changes in one column and shows in both — a Done, a pin, a mode,
 // a filter — is drawn in each (`eachColumn`).
 
-/** The device's choice of one column or two: "two", or anything else for one. */
+/**
+ * The layout chosen: "two", "list" for the thread list on its own, or anything else for one column.
+ * `#281 view-keys`: this window's own (`windowItem`), which a reload of it comes back to, as `#265
+ * window-channel-memory` keeps its channel and view; and the device's, which a brand-new window opens
+ * in — the layout chosen last, in any window.
+ */
 const COLUMNS_KEY = "vibe-talk.voice.columns";
 
-/** Whether two columns are what the reader chose, kept on this device. */
-function storedColumnsChoice() {
+/** The layout this window opens in: its own choice, else the device's, else one column. */
+function storedLayoutChoice() {
+  let device = null;
   try {
-    return localStorage.getItem(COLUMNS_KEY) === "two";
+    device = localStorage.getItem(COLUMNS_KEY);
   } catch (_error) {
-    return false;
+    device = null;
   }
+  const own = windowItem(COLUMNS_KEY);
+  const stored = own !== null ? own : device;
+  return stored === "two" || stored === "list" ? stored : "one";
 }
 
-/** Whether the reader chose two columns. Applied only where they are offered and the window is wide enough. */
-let columnsChosen = storedColumnsChoice();
+/**
+ * The layout the reader chose: "one", "list" or "two". Applied where it is offered — a channel with
+ * threads to list — and two columns only where the window is wide enough for them.
+ *
+ * @type {"one" | "list" | "two"}
+ */
+let layoutChosen = storedLayoutChoice();
+
+/**
+ * The one-column layout two columns were chosen from, "one" or "list": what the layout button goes back to.
+ *
+ * @type {"one" | "list" | "two"}
+ */
+let layoutBeforeColumns = layoutChosen === "list" ? "list" : "one";
 
 /** Whether two columns are on screen now. */
 let columnsShown = false;
+
+/** Whether the thread list is on screen now, on its own over the left column. `#281 view-keys`. */
+let threadListShown = false;
+
+/** Whether the right column is on screen: beside Main, or on its own as the thread list. */
+const sideColumnUp = () => columnsShown || threadListShown;
+
+/**
+ * Whether the thread list is what is on screen now: the layout, on the channel of the main screen. It
+ * waits behind the call's view and the other screens, as two columns do, and the left column's call
+ * pane, its box included, is not covered there.
+ */
+const threadListOnScreen = () => threadListShown && currentScreen === "main" && currentView === "discord";
+
+/**
+ * Whether this window draws two columns: the layout button has a box, which web/voice.css gives it
+ * only on a desk at least 1000px wide. Asked where `renderColumns` decides, never per redraw, because
+ * asking lays the page out; the picker offers two columns by it.
+ */
+let columnsFit = false;
+
+/**
+ * The one-column view a key or the picker asked for with the layout, for the change of layout to show
+ * instead of the view the channel opens in: `{view, thread, summary, origin}`, or null.
+ *
+ * @type {{view: string, thread: string | null, summary: any, origin: string | null} | null}
+ */
+let oneColumnWanted = null;
 
 /**
  * True while leaving two columns puts back the view last chosen in one: that is the reader's choice
@@ -29855,15 +29938,22 @@ function followInOtherColumn() {
 }
 
 /**
- * Whether two columns are offered: the channel on the main screen, a provider with threads, and a
- * channel that is not itself one thread, which has no others to show beside it. How wide the window
- * is, and whether this is a desk, the stylesheet decides (`#column-toggle` is drawn only in the
- * desktop block at 1000px and wider).
+ * Whether the channel has a list of threads to show: a provider with threads, and a channel that is
+ * not itself one thread, which has no others. `#281 view-keys`: what the thread list and two columns
+ * are offered by, in the picker and to the keys, on any screen.
+ */
+function threadListOffered() {
+  const channel = String(el("discord-channel").value || "");
+  return threadingSupported && channel !== "" && !(channelCanon.channel === channel && channelCanon.scope);
+}
+
+/**
+ * Whether two columns, or the thread list, are offered now: the channel on the main screen, with a
+ * list of threads to show (`threadListOffered`). How wide the window is, and whether this is a desk,
+ * the stylesheet decides (`#column-toggle` is drawn only in the desktop block at 1000px and wider).
  */
 function columnsOffered() {
-  const channel = String(el("discord-channel").value || "");
-  return currentScreen === "main" && currentView === "discord" && threadingSupported && channel !== "" &&
-    !(channelCanon.channel === channel && channelCanon.scope);
+  return currentScreen === "main" && currentView === "discord" && threadListOffered();
 }
 
 /** The layout button: whether it is offered, and whether it is pressed. */
@@ -29871,8 +29961,10 @@ function renderColumnToggle() {
   const button = leftEl("column-toggle");
   const offered = columnsOffered();
   if (button.hidden === offered) button.hidden = !offered;
-  button.setAttribute("aria-pressed", columnsChosen ? "true" : "false");
-  const title = columnsChosen ? "Back to one column" : "Show Main and a thread side by side";
+  const chosen = layoutChosen === "two";
+  button.setAttribute("aria-pressed", chosen ? "true" : "false");
+  const title = !chosen ? "Show Main and a thread side by side"
+    : layoutBeforeColumns === "list" ? "Back to the thread list" : "Back to one column";
   if (button.title !== title) button.title = title;
 }
 
@@ -29882,32 +29974,87 @@ function sideHasBox() {
   return typeof side.getClientRects === "function" && side.getClientRects().length > 0;
 }
 
+/** Whether the layout button has a box: whether this window is a desk wide enough for two columns. */
+function toggleHasBox() {
+  const button = leftEl("column-toggle");
+  return !button.hidden && typeof button.getClientRects === "function" && button.getClientRects().length > 0;
+}
+
 /**
- * Decide again whether two columns are on screen, and go into them or out of them. Asked on the
- * changes that can move the answer — the toggle, the window resized, the view, the channel, the
- * screen — and never per scroll: asking whether the right column has a box lays the page out.
- * Off the main screen nothing is decided, so a visit to Settings or Reply comes back to both columns
- * as they were.
+ * Decide again what is on screen — one column, the thread list, or two columns — and go into it or
+ * out of what was. Asked on the changes that can move the answer — the layout chosen, the window
+ * resized, the view, the channel, the screen — and never per scroll: asking whether the right column
+ * has a box lays the page out. Off the main screen nothing is decided, so a visit to Settings or
+ * Reply comes back to the layout as it was.
  */
 function renderColumns() {
   if (currentScreen !== "main") return;
   renderColumnToggle();
   const screen = leftEl("screen-main");
-  const want = columnsChosen && columnsOffered();
-  if (screen.hasAttribute("data-columns") !== want) {
-    if (want) screen.setAttribute("data-columns", "two");
+  const fit = toggleHasBox();
+  const fitChanged = fit !== columnsFit;
+  columnsFit = fit;
+  let want = columnsOffered() && layoutChosen !== "one" ? layoutChosen : null;
+  // Two columns in a window too narrow for them: the layout they were chosen from — the thread list, or
+  // one column — until it is wide enough, the choice kept for then. `#281 view-keys`.
+  if (want === "two" && !fit) want = layoutBeforeColumns === "list" ? "list" : null;
+  if (screen.getAttribute("data-columns") !== want) {
+    if (want) screen.setAttribute("data-columns", want);
     else screen.removeAttribute("data-columns");
   }
-  // The call's view is one list. Two columns wait behind it, as they were, for the channel.
+  // The call's view is one list. Two columns, or the thread list, wait behind it, as they were.
   if (currentView === "discord") {
-    const shown = want && sideHasBox();
-    if (shown !== columnsShown) {
-      if (shown) enterColumns();
-      else leaveColumns();
-    }
+    const now = columnsShown ? "two" : threadListShown ? "list" : "one";
+    const next = want !== null && sideHasBox() ? want : "one";
+    if (next !== now) moveLayout(now, next);
+    else if (fitChanged) renderThreadSelect();
   }
   // `#261 two-column-connectors`. The links between the columns, drawn or taken away with them.
   scheduleColumnLinks();
+}
+
+/**
+ * From layout `now` to layout `next`: out of the one, then into the other. `#281 view-keys`. Between
+ * the thread list and two columns the right column stays as it is, and only the left one comes or goes.
+ *
+ * @param {"one" | "list" | "two"} now
+ * @param {"one" | "list" | "two"} next
+ */
+function moveLayout(now, next) {
+  // `#277 reply-in-column`. A reply open in a column of the two that go moves to the reply screen once
+  // the next layout is drawn under it (`leaveColumns`).
+  const handOff = now === "two" ? leaveColumns(next) : null;
+  if (now === "list") leaveThreadList(next);
+  if (next === "two") enterColumns(now);
+  else if (next === "list") enterThreadList(now);
+  renderThreadSelect();
+  if (handOff) handOff();
+}
+
+/** Keep `layout` as the one chosen: this window's, and the device's for the next new window. */
+function keepLayoutChoice(layout) {
+  try {
+    localStorage.setItem(COLUMNS_KEY, layout);
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  keepWindowItem(COLUMNS_KEY, layout);
+}
+
+/**
+ * Choose layout `layout`, keep the choice, and show it where it can be shown. Two columns chosen in a
+ * window too narrow for them are kept for when it is wider, as the layout button always kept them.
+ *
+ * @param {"one" | "list" | "two"} layout
+ */
+function setLayout(layout) {
+  // From the left column, whichever column asked: the layout changes what the left column shows.
+  if (sideActive) return inColumn(columns.main, () => setLayout(layout));
+  if (layout !== "two") layoutBeforeColumns = layout;
+  layoutChosen = layout;
+  keepLayoutChoice(layout);
+  renderColumns();
+  renderThreadSelect();
 }
 
 /** Ctrl/Cmd+\: the layout button. */
@@ -29915,47 +30062,156 @@ function columnsFromKeyboard() {
   if (!channelOnScreen()) return false;
   toggleColumns();
   // The choice is kept as the button keeps it; a window too narrow to show it says so.
-  if (columnsChosen && !columnsShown) setStatus("Two columns need a wider window; they come back when it is wider.");
+  if (layoutChosen === "two" && !columnsShown) setStatus(COLUMNS_TOO_NARROW);
   return true;
 }
 
-/** The reader pressed the layout button. */
+/** What a choice of two columns says in a window too narrow for them. */
+const COLUMNS_TOO_NARROW = "Two columns need a wider window; they come back when it is wider.";
+
+/** The reader pressed the layout button: two columns, or back to the layout they were chosen from. */
 function toggleColumns() {
-  columnsChosen = !columnsChosen;
-  try {
-    localStorage.setItem(COLUMNS_KEY, columnsChosen ? "two" : "one");
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-  renderColumns();
+  setLayout(layoutChosen === "two" ? layoutBeforeColumns : "two");
   settleFocus();
 }
 
 /**
- * Into two columns: Main on the left, drawn from what the page holds, and on the right the thread the
- * left column was showing, else the one selected there earlier in this session, else the cards.
+ * Show view `which` — "main", "flat", "threads" (the thread list) or "columns" — as Ctrl+1 to Ctrl+4
+ * and the picker choose them. `#281 view-keys`. Main and All are one column, the left; the thread list
+ * and two columns are layouts, kept as the layout button keeps two columns. Says why where the view
+ * cannot be shown: no threads, a channel that is one thread, a window too narrow for two columns.
+ *
+ * @param {"main" | "flat" | "threads" | "columns"} which
  */
-function enterColumns() {
+function chooseView(which) {
+  if (which !== "main" && !threadingSupported) {
+    setStatus("No threads here: Main is all of it.");
+    renderThreadSelect();
+    return;
+  }
+  if ((which === "threads" || which === "columns") && !threadListOffered()) {
+    setStatus("This channel is a single thread: there is no list of threads to show.");
+    renderThreadSelect();
+    return;
+  }
+  // `#277 reply-in-column`. A reply open at the foot of a column is put down as its Cancel puts it
+  // down, its words kept as a draft, by any view but two columns, which keep the column it is in: the
+  // others take that column away, or show the right one's cards. As the reply screen is left for a view
+  // chosen from it (`viewFromKeyboard`). Not handed to the reply screen, as two columns going by the
+  // layout button or a narrowed window hand it (`leaveColumns`): the reader chose a view to read, and
+  // the reply screen would cover it.
+  if (replyDocked && which !== "columns") closeReply();
+  if (which === "threads") {
+    setLayout("list");
+    return;
+  }
+  if (which === "columns") {
+    setLayout("two");
+    if (!columnsShown) setStatus(COLUMNS_TOO_NARROW);
+    return;
+  }
+  chooseOneColumn({ view: which, thread: null, summary: null, origin: null });
+}
+
+/**
+ * One column, showing `target`: the layout left for it, and the view asked for shown and kept as the
+ * channel's choice, as a choice made in one column always was.
+ *
+ * @param {{view: string, thread: string | null, summary: any, origin: string | null}} target
+ */
+function chooseOneColumn(target) {
+  if (sideActive) return inColumn(columns.main, () => chooseOneColumn(target));
+  oneColumnWanted = target;
+  setLayout("one");
+  // Already one column: no change of layout showed it.
+  const left = oneColumnWanted;
+  oneColumnWanted = null;
+  if (left) showOneColumnView(left, true);
+}
+
+/**
+ * Open thread `id` from the thread list: across the window, one column, and Back from it is the list
+ * again (`closeThread`). `#281 view-keys`. A card, the picker, and Enter on a card all come here.
+ */
+function openThreadFromList(id, summary = null) {
+  const known = summary || channelCanon.threads.find((held) => String(held.id) === String(id)) || null;
+  chooseOneColumn({ view: "thread", thread: String(id), summary: known, origin: "list" });
+}
+
+/**
+ * Put the left column on `target`, now that it is one column again. `record` for a view the reader
+ * asked for, which becomes the channel's choice; otherwise the view the channel opens in, put back
+ * without recording it again, which would turn a channel's default into a choice nobody made.
+ *
+ * @param {{view: string, thread: string | null, summary: any, origin: string | null}} target
+ * @param {boolean} record
+ */
+function showOneColumnView(target, record) {
+  const thread = target.thread === null ? null : String(target.thread);
+  const same = target.view === channelView && thread === (selectedThreadId ? String(selectedThreadId) : null);
+  if (same && !(record && pinnedOnly)) {
+    if (target.origin) threadOrigin = target.origin;
+    if (record) recordViewChoice();
+    return;
+  }
+  const show = () => changeChannelView(target.view, thread, target.summary, target.origin);
+  if (record) {
+    guardQuietly(show)();
+    return;
+  }
+  columnsRestoring = true;
+  try {
+    guardQuietly(show)();
+  } finally {
+    columnsRestoring = false;
+  }
+}
+
+/** Keep the view on screen as its channel's choice, in one column, where nothing switched views to do it. */
+function recordViewChoice() {
+  if (sideColumnUp() || sideActive) return;
+  const chosen = viewOnScreen();
+  if (chosen) rememberChosenView(chosen);
+  uiStateSettled = true;
+  saveUiState();
+}
+
+/**
+ * The left column on Main, as it is whenever the right column is up — beside it, or behind the thread
+ * list on its own. Not recorded as the channel's choice: it is the layout's, not the reader's.
+ */
+function leftColumnToMain() {
+  if (channelView === "main") return;
+  if (clientConfigApplied) {
+    guardQuietly(() => changeChannelView("main"))();
+  } else {
+    // A reopen, before sign-in has answered: Main drawn from what this device saved, with no read.
+    // Nothing is read on a token nobody has proved; the reopen's own read comes once it is.
+    channelView = "main";
+    selectedThreadId = null;
+    selectedThread = null;
+    hydrateChannelScope();
+    restoreChannelComposer();
+  }
+}
+
+/**
+ * Into two columns: Main on the left, drawn from what the page holds, and on the right the thread the
+ * left column was showing, else the one selected there earlier in this session, else the cards — as
+ * the thread list left them, coming from it (`#281 view-keys`).
+ *
+ * @param {"one" | "list" | "two"} from
+ */
+function enterColumns(from = "one") {
   columnsShown = true;
   const channel = String(el("discord-channel").value);
   const open = channelView === "thread" && selectedThreadId
     ? { id: String(selectedThreadId), summary: selectedThread }
     : sideThreads.get(channel) || null;
-  if (channelView !== "main") {
-    if (clientConfigApplied) {
-      guardQuietly(() => changeChannelView("main"))();
-    } else {
-      // A reopen, before sign-in has answered: Main drawn from what this device saved, with no read.
-      // Nothing is read on a token nobody has proved; the reopen's own read comes once it is.
-      channelView = "main";
-      selectedThreadId = null;
-      selectedThread = null;
-      hydrateChannelScope();
-      restoreChannelComposer();
-    }
-  }
+  leftColumnToMain();
   renderThreadSelect();
   if (open) guardQuietly(() => selectSideThread(open.id, open.summary))();
+  else if (from === "list") renderSideMode();
   else showSideList();
   // `#262 search-load-older`. Not one column any more: Search All goes, even where the left column was
   // Main already and nothing above searched it again.
@@ -29963,12 +30219,18 @@ function enterColumns() {
 }
 
 /**
- * Out of two columns, to the view last chosen in one column. The right column keeps what it shows,
+ * Out of two columns: to the view last chosen in one column, or the one asked for (`oneColumnWanted`);
+ * or to the thread list, the left column staying Main behind it. The right column keeps what it shows,
  * held, so two columns come back to it at once.
+ *
+ * @param {"one" | "list" | "two"} next
+ * @returns {(() => void) | null} The hand-off of a reply that was open in a column, to run once the
+ *   next layout is drawn; else null.
  */
-function leaveColumns() {
+function leaveColumns(next = "one") {
   // `#277 reply-in-column`. A reply open in a column is taken out of it before the views change under
-  // it, and given to the reply screen once one column is drawn.
+  // it, and given to the reply screen once the layout that follows is drawn: what this returns, which
+  // `moveLayout` runs then — over one column, or over the thread list (`#281 view-keys`).
   const replying = replyDocked;
   const typing = replying && nodeWithin(el("reply-compose"), document.activeElement);
   if (replying) undockReply();
@@ -29984,19 +30246,57 @@ function leaveColumns() {
     });
   }
   renderThreadSelect();
-  const opening = openingChannelView();
-  if (opening.view !== channelView || (opening.thread || null) !== (selectedThreadId || null)) {
-    columnsRestoring = true;
-    try {
-      guardQuietly(() => changeChannelView(opening.view, opening.thread, opening.summary))();
-    } finally {
-      columnsRestoring = false;
-    }
-  }
+  if (next === "one") showOneColumnLeft();
   // `#262 search-load-older`. One column again: on Main, where the search still matches nothing, Search
   // All is offered at once, not at the next keystroke. Back to Main, nothing above searched it again.
   renderSearchInAll();
-  if (replying) moveReplyToScreen(typing);
+  return replying ? () => moveReplyToScreen(typing) : null;
+}
+
+/** The left column, one column again: on the view asked for with the layout, else the one the channel opens in. */
+function showOneColumnLeft() {
+  const wanted = oneColumnWanted;
+  oneColumnWanted = null;
+  if (wanted) {
+    showOneColumnView(wanted, true);
+    return;
+  }
+  const opening = openingChannelView();
+  showOneColumnView({ view: opening.view, thread: opening.thread, summary: opening.summary, origin: null }, false);
+}
+
+/**
+ * Into the thread list: the right column on its own, its cards across the window, over the left
+ * column, which goes to Main behind it as it does for two columns. `#281 view-keys`. A thread the right
+ * column showed in two columns is put aside, held, for two columns to come back to; the list shows
+ * cards, always.
+ *
+ * @param {"one" | "list" | "two"} from
+ */
+function enterThreadList(from = "one") {
+  threadListShown = true;
+  leftColumnToMain();
+  if (from === "two" && columns.side.mode === "list") {
+    // The same cards, where the reader was in them.
+    renderSideMode();
+  } else {
+    showSideList();
+  }
+  renderSearchInAll();
+  refreshSearchCount();
+}
+
+/**
+ * Out of the thread list: to one column — the view asked for, or the one the channel opens in — or to
+ * two columns, Main coming in beside the cards as they are. `#281 view-keys`.
+ *
+ * @param {"one" | "list" | "two"} next
+ */
+function leaveThreadList(next = "one") {
+  threadListShown = false;
+  if (next === "one") showOneColumnLeft();
+  renderSearchInAll();
+  refreshSearchCount();
 }
 
 /** Show what the right column is showing — the cards or the thread — and say so in its heading. */
@@ -30021,7 +30321,7 @@ function renderSideMode() {
  * which thread it is in, once.
  */
 function renderSideColumn() {
-  if (!columnsShown) return;
+  if (!sideColumnUp()) return;
   if (columns.side.mode === "list") {
     renderSideFreshness();
     setTextIfChanged(leftEl("side-title"), "Threads");
@@ -30108,11 +30408,13 @@ function sideCardReplies(choice, tally) {
 let sideCardsDrawn = "";
 
 /**
- * One card per thread the channel's store knows — the Threads screen's source — each a fixed three
- * lines of what the thread is about, then how long since it moved, and the button into it saying how
- * many replies it has and how many of them are unread. A press on a card highlights it (`#277
- * thread-card-focus`); its button selects it. Redrawn only when what it would draw has changed, so a
- * refresh with nothing new draws nothing here either.
+ * One card per thread the channel's store knows, each a fixed three lines of what the thread is about,
+ * then how long since it moved, and the button into it saying how many replies it has and how many of
+ * them are unread. A press on a card highlights it (`#277 thread-card-focus`); its button goes into the
+ * thread — selected on the right in two columns, and from the thread list across the window
+ * (`enterCard`). Redrawn only when what it would draw has changed, so a refresh with nothing new draws
+ * nothing here either. `#281 view-keys`: the one rendering of the channel's threads, in two columns and
+ * in the thread list alike.
  *
  * `#261 two-column-connectors`. NEWEST ACTIVITY AT THE FOOT, as the channel's own lists have their
  * newest message: the owner, "We have the main chat views in forward-chronological mode with newest at
@@ -30134,7 +30436,7 @@ function renderSideCards() {
   }));
   const signature = JSON.stringify(cards.map(({ choice, text, root, age, replies, unread }) =>
     [choice.id, text, root, age, replies, unread]));
-  const more = olderThreadsOnServer();
+  const more = olderThreadsToRead();
   if (signature !== sideCardsDrawn) {
     sideCardsDrawn = signature;
     keepingCardPlace(() => {
@@ -30145,12 +30447,16 @@ function renderSideCards() {
     filterSideCards();
   }
   // Above the cards, so the reader's place is kept as it comes or goes.
-  const button = leftEl("side-more-threads");
+  const button = /** @type {HTMLButtonElement} */ (leftEl("side-more-threads"));
   if (button.hidden === more) {
     keepingCardPlace(() => {
       button.hidden = !more;
     });
   }
+  // `#281 view-keys`. It reads where it stands now, and says so while it does.
+  const loading = threadPages.loading && threadPages.channel === String(el("discord-channel").value);
+  setTextIfChanged(button, loading ? "Loading older threads…" : "Older threads…");
+  if (button.disabled !== loading) button.disabled = loading;
 }
 
 /**
@@ -30165,7 +30471,7 @@ function renderSideCards() {
  * @returns {{newest: boolean, id: string | null, offset: number} | null}
  */
 function cardAnchor() {
-  if (!columnsShown || columns.side.mode !== "list" || cardsOpening) return null;
+  if (!sideColumnUp() || columns.side.mode !== "list" || cardsOpening) return null;
   const area = leftEl("side-scroll");
   if (atBottom(area)) return { newest: true, id: null, offset: 0 };
   const top = area.getBoundingClientRect().top;
@@ -30297,9 +30603,12 @@ function filterSideCards() {
     if (fresh) unread += 1;
     if (kept && said) shown += 1;
   }
-  const state = sideListState(rows.length, unread, shown);
+  // `#281 view-keys`. A failed read of older threads is said over the cards it left as they were.
+  const state = [olderThreadsFailure(), sideListState(rows.length, unread, shown)].filter((part) => part !== "").join(" ");
   setTextIfChanged(leftEl("side-list-state"), state);
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
+  sideCardCount = { cards: rows.length, shown };
+  if (threadListOnScreen()) sayCardCount();
   // `#261 two-column-connectors`. The cards shown are what the links go to.
   scheduleColumnLinks();
 }
@@ -30463,7 +30772,9 @@ function sideCard({ choice, text, root, age, replies, unread }) {
 // To enter the thread you can click the 'N reply M unread' bit let's say or press '->' to go into the
 // thread."
 //
-// The cards are the right column's in two columns and the Threads list's in one, and both work so:
+// The cards are the right column's in two columns and the Threads list's in one, and both work so.
+// (`#281 view-keys` made the thread list, Ctrl+3, the right column's cards across the window, in one
+// column and on a phone: they work so there too, as they do on the right.)
 //
 //   * EVERY CARD STAYS CONTRACTED: three lines on the right, the thread's name in the list. `#257
 //     summary-truncation` showed the whole of the card under the mouse or the keys, and with the mouse
@@ -30590,7 +30901,8 @@ function cardOpener(prefix, replies, unread, open) {
 /**
  * Into the thread of card `row`, by its replies button or →. In two columns on the right, noted as
  * entered from the cards so that ← goes back out to them (`threadOutFromKeyboard`); in one column as
- * any thread opens, its Back the way to the Threads list.
+ * any thread opens, its Back the way to the Threads list. From the thread list, across the window, its
+ * Back, Esc and ← the way back to the list (`openThreadFromList`, `#281 view-keys`).
  *
  * @param {string} id
  * @param {any} summary
@@ -30598,6 +30910,7 @@ function cardOpener(prefix, replies, unread, open) {
  */
 function enterCard(id, summary, row) {
   if (row.parentNode !== leftEl("side-cards")) return openThread(id, summary);
+  if (threadListShown) return openThreadFromList(id, summary);
   const opened = selectSideThread(id, summary);
   columns.side.fromCards = true;
   return opened;
@@ -30617,14 +30930,15 @@ function litCardOnRight() {
 }
 
 /**
- * The thread cards on screen: the right column's while two columns show them, or the Threads list in one
- * column. Null otherwise.
+ * The thread cards on screen: the right column's while two columns show them, or the thread list does
+ * (`#281 view-keys`: the same cards, across the window), or the Threads list in one column. Null
+ * otherwise.
  *
  * @returns {HTMLElement | null}
  */
 function cardsOnScreen() {
   if (!channelOnScreen()) return null;
-  if (columnsShown) return columns.side.mode === "list" ? leftEl("side-cards") : null;
+  if (sideColumnUp()) return columns.side.mode === "list" ? leftEl("side-cards") : null;
   return inColumn(columns.main, () => (channelView === "threads" && !pinnedOnly ? leftEl("thread-list") : null));
 }
 
@@ -30672,7 +30986,7 @@ function showSideList() {
 
 /**
  * Select thread `id` on the right, from wherever the reader asked for it: its tag on a row, a count
- * of unread replies, a card, the Threads screen. Drawn at once from what the page holds and read
+ * of unread replies, a card, the view picker. Drawn at once from what the page holds and read
  * behind, landing on its first unread, exactly as a thread opens in one column.
  */
 function selectSideThread(id, summary = null) {
@@ -30737,9 +31051,15 @@ function resetSideColumn(reopen = false) {
   leftEl("side-loading").hidden = true;
   sideCardsDrawn = "";
   leftEl("side-cards").replaceChildren();
-  if (!columnsShown || !reopen) {
+  if (!sideColumnUp() || !reopen) {
     columns.side.mode = "list";
-    if (columnsShown) openSideCards();
+    if (sideColumnUp()) openSideCards();
+    return;
+  }
+  // `#281 view-keys`. The thread list shows cards, whatever two columns had selected on the right.
+  if (threadListShown) {
+    columns.side.mode = "list";
+    showSideList();
     return;
   }
   const open = sideThreads.get(String(el("discord-channel").value));
@@ -30765,7 +31085,7 @@ function resetSideColumn(reopen = false) {
  * @param {number | null} [since]
  */
 async function readSideColumn(reason, since = null) {
-  if (!columnsShown) return;
+  if (!sideColumnUp()) return;
   if (columns.side.mode === "thread") {
     await inColumn(columns.side, () => (since !== null && answeredSince(since, reason)
       ? undefined : loadDiscord({ keepPosition: true, reason })));
@@ -34564,23 +34884,12 @@ for (const view of ["main", "threads", "flat"]) {
 }
 el("thread-back").addEventListener("click", guardQuietly(closeThread));
 el("thread-select").addEventListener("change", guardQuietly(onThreadSelect));
-// `#231 two-column-polish`. Greyed in two columns: a press opens nothing, and says why.
-el("thread-select").addEventListener("mousedown", (event) => {
-  if (pickerGreyed()) refuseGreyedPicker(event);
-});
-el("thread-select").addEventListener("keydown", (event) => {
-  if (pickerGreyed() && picksByKey(event)) refuseGreyedPicker(event);
-});
-// `#194 thread-picker-polish`. The Threads screen's way back, its next page, and its second try.
-el("close-threads").addEventListener("click", closeThreadDirectory);
-el("thread-directory-more").addEventListener("click", guardQuietly(() => loadThreadDirectory(true)));
-el("thread-directory-retry").addEventListener("click", guardQuietly(() => loadThreadDirectory(threadDirectory.older)));
-// Touching the picker is the cue that the reader wants the full list of threads. Not the greyed one
-// (`#231 two-column-polish`), which a Tab passes through and which opens nothing: the list it would
-// read is read by the poll while the cards are up, and with a thread open is wanted by nothing.
+// Touching the picker is the cue that the reader wants the full list of threads. (`#231
+// two-column-polish` greyed it in two columns, and touching that one read nothing; since `#281
+// view-keys` it chooses there too.)
 for (const type of ["focus", "pointerdown"]) {
   el("thread-select").addEventListener(type, () => {
-    if (!pickerGreyed()) guardQuietly(refreshThreadDirectory)();
+    guardQuietly(refreshThreadDirectory)();
   });
 }
 el("channel-compose-text").addEventListener("input", rememberChannelDraft);
@@ -34615,7 +34924,8 @@ el("side-close").addEventListener("click", () => {
   // The X has gone with the thread: the keys go to the cards.
   if (document.activeElement === el("side-close") || focusLost()) focusList(sidePane);
 });
-el("side-more-threads").addEventListener("click", guardQuietly(openThreadDirectory));
+// `#281 view-keys`. The next page of older threads, read where the cards are.
+el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
@@ -34698,7 +35008,10 @@ if (typeof window.ResizeObserver === "function") {
   });
   for (const id of ["column-reply", "side-reply"]) replyGeometry.observe(leftEl(id));
 }
-el("view-switch").addEventListener("click", () => {
+el("view-switch").addEventListener("click", pressViewSwitch);
+
+/** The view switch, pressed: the call's view or the channel's, whichever is not up. */
+function pressViewSwitch() {
   const next = currentView === "voice" ? "discord" : "voice";
   // The reader's own move, so the record follows it from here on. `#189 restore-ui-state`.
   uiStateSettled = true;
@@ -34714,7 +35027,7 @@ el("view-switch").addEventListener("click", () => {
   // newest message, which would undo the restore `showView` just performed — the two halves have
   // to agree or the fix is invisible.
   readEnteredChannel(viewRestored);
-});
+}
 
 /** Read the channel just entered, and keep reading it while it stays on screen. */
 function readEnteredChannel(keepPosition) {
@@ -34932,7 +35245,7 @@ el("search-field").addEventListener("input", () => {
     // one redraw; otherwise they follow once the typing pauses (`markedQuery`).
     if (searchTerms(searchQuery).length === 0) markedQuery = searchQuery;
     eachColumn(renderScrollTools);
-    if (columnsShown) refilterSideCards();
+    if (sideColumnUp()) refilterSideCards();
   }));
   markSearchSoon();
 });

@@ -197,18 +197,22 @@ read-modes-browser:
 # back; in the message box PgUp pages the list and Ctrl+Home/End jump it; then the keymap: j, k and the
 # arrows move a visible focus ring, e marks Done and moves on, PgDn brings the ring to the page, Enter
 # folds, and -> enters a thread that <- and Esc leave; Ctrl+K and a channel chosen give the keys back to
-# the list, and Esc leaves the picker. Pass WEB_ROOT=dir to run it against another copy of the page,
-# and SCREENSHOTS=dir to keep a PNG of each step.
+# the list, and Esc leaves the picker; `#281 view-keys`: Ctrl+1 to Ctrl+4, and Cmd on an emulated Mac,
+# choose Main, All, the thread list and two columns from the message box, the search and a card, the
+# browser's default refused and no digit typed. Pass WEB_ROOT=dir to run it against another copy of
+# the page, and SCREENSHOTS=dir to keep a PNG of each step.
 keyboard-browser:
 	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#229 desktop-two-column` in a real Chromium at 1440x900 and 1280x800: the layout button draws Main
-# and the right column side by side inside the window, the view picker greyed; the right column's cards
-# are one height, newest activity first, the long one cut to three lines; a card's replies button and a
-# Main message's Thread(N) select a thread there under its name, each column scrolls alone under the
-# wheel, the X goes back to the cards, and a window narrowed to 900px is one column in its old view, two
-# again when wide. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
-# keep the list and thread states as PNGs.
+# and the right column side by side inside the window, the view picker saying so; `#281 view-keys`: the
+# thread list chosen from the picker is that column across the window, and real Ctrl+2 and Ctrl+4
+# leave and come back to two columns; the right column's cards are one height, newest activity first,
+# the long one cut to three lines; a card's replies button and a Main message's Thread(N) select a
+# thread there under its name, each column scrolls alone under the wheel, the X goes back to the cards,
+# and a window narrowed to 900px is one column in its old view, two again when wide. Pass WEB_ROOT=dir
+# to run it against another copy of the page, and SCREENSHOTS=dir to keep the list and thread states as
+# PNGs.
 two-column-browser:
 	python3 tests/two_column_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

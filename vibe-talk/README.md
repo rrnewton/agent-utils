@@ -386,8 +386,8 @@ A phone closes an installed app whenever it needs the memory, and reopening it u
 call view, in Main, at the newest message. `/voice` now keeps one small record in `localStorage`
 under `vibe-talk.voice.ui-state` and reopens on it:
 
-- **The call or the channel**, whichever was up. Settings, Help, Reply and the Threads screen are
-  not reopened; a reply's draft is kept, as before.
+- **The call or the channel**, whichever was up. Settings, Help and Reply are not reopened; a
+  reply's draft is kept, as before.
 - **Main, All or the thread** that was open, in the channel that was selected, with the thread's
   name in its heading.
 - **The view you chose in every other channel.** Main, All or a thread chosen in a channel is that
@@ -420,7 +420,9 @@ under `vibe-talk.voice.ui-state` and reopens on it:
   reloading a window does not count as choosing. The read mode is a device-wide preference and
   comes from the shared copy, and a view chosen in another window still applies in a channel this
   window has not chosen one in. What the right column shows in two columns is not kept across a
-  reload, as before.
+  reload, as before. The layout — one column, the thread list or two columns (`#281 view-keys`) — is
+  kept the same way, under `vibe-talk.voice.columns`: each window reloads in its own of the four
+  views, and a new window opens in the one chosen last.
 
 `make -C vibe-talk offline-cache-browser` walks that whole sequence in a real Chromium at an
 Android phone's size, against a loopback fake API. Pass `SCREENSHOTS=/tmp/shots` to keep one PNG
@@ -4165,16 +4167,27 @@ other view preferences are, so a reader who always turns them off does it once; 
 every kind is on, and a choice kept before Issues, Files and Other existed still holds with those
 three on.
 
-### Choosing a thread sits beside choosing the channel
+### Choosing a view sits beside choosing the channel
 
 `gchat-thread-selector`. The second picker on the control bar, immediately right of the channel
-picker and always there on the channel view, chooses what part of that channel to read:
+picker and always there on the channel view, chooses how to read that channel — since `#281
+view-keys`, one of four views, which Ctrl+1 to Ctrl+4 (Cmd+1 to Cmd+4 on a Mac) choose in the same
+order, from anywhere on the page, a message box or the search included:
 
-- **Main** — messages posted to the channel itself, with each thread's first message;
-- **All** — every message, threads included, in one history;
+- **Main** (Ctrl+1) — messages posted to the channel itself, with each thread's first message;
+- **All** (Ctrl+2) — every message, threads included, in one history;
+- **Thread list** (Ctrl+3) — a card for each thread, across the window (see below);
+- **Two columns** (Ctrl+4) — Main on the left and the thread list on the right, offered only on a desk
+  window at least 1000px wide;
 - then **about one phone screen of threads** (eight), most recently active first, each as
-  `age · replies · name` — for example `1d18h · 16 · Release checklist`;
-- and, when the channel has more threads than that, **… Older threads**.
+  `age · replies · name` — for example `1d18h · 16 · Release checklist` — to open one directly.
+
+The bare `1`, `2` and `3` that chose views before are retired: kept beside the chords they would
+have had to change meaning (`2` was the Threads screen, `3` All), and a key that silently does the
+other thing is worse than one that does nothing. In a browser tab, Chromium hands the page Ctrl+1 to
+Ctrl+8 before its own tab switching (they are not among the shortcuts it reserves), so the page takes
+them; in the installed app there are no tabs to switch. A browser that keeps them for its tabs
+switches tabs instead, and the picker chooses the same four views.
 
 A thread has **one name everywhere**: the summariser's display name when the server has one, else
 the provider's title, else its first message's first line. The picker shows it shortened; the
@@ -4182,11 +4195,20 @@ heading over an open thread shows the same facts and the same name with more roo
 together when a display name arrives later. Ages use one compact scale: `now`, `59m`, `23h`,
 `1d18h` (a whole day is just `3d`), `12d` from ten days, `6w` from four weeks, `2y` from a year.
 
-**… Older threads** opens the **Threads screen**: every thread in the channel, newest activity
-first, named exactly as the picker names them, with the server's one-sentence summary under each.
-**Load older** reads the next page of the channel's thread list; a failed read says so, keeps the
-rows already listed, and offers **Try again**. Choosing a thread opens it on the channel; the back
-arrow returns to the line you were reading. The screen only reads, so a read-scope token can use it.
+The **thread list** is the right column of two columns on its own, across the window, at every
+width, a phone's included: one rendering of the channel's threads, so the two never drift apart. Its
+heading says **Threads**, with **Unread only** beside it; each card is the thread's name and summary
+where the summariser has given them, else its first message, three lines at most, then how long since
+it moved, its replies and how many are unread, newest activity at the foot. **Older threads…** above
+the oldest card reads the next page of the channel's thread list where the reader is, and a failed
+read says so over the cards it left as they were, the button staying to try again. The cards work as
+the right column's do in two columns (`#279 thread-card-focus`): a click, a tap, or Enter on one
+highlights it, shown whole, and greys every other card's edge; its own **N replies · M unread**
+button, or → on the highlighted card (else the one the keys are on), opens its thread across the
+window, and Back, Esc or ← comes back to the list. The search filters the cards, and its count says how many threads it left; Pinned, Links and
+whose messages, which have nothing to filter among cards, are not shown over it. It replaced the
+Threads screen that **… Older threads** in the picker used to open, which listed the same threads a
+second way and took no view key to leave. It only reads, so a read-scope token can use it.
 
 The floating chips over the list (Summaries, Undo, Expand all, …) keep their height clear under
 the channel composer, so scrolled to the end they never cover the box you are typing in.
@@ -4654,7 +4676,9 @@ its top where it was and is shorter by the box, its chips standing on the box. T
 stays where it is, edged in the accent; only where the box would cover it does the column scroll, by as
 little as shows it. Send, Cancel and Esc put the box back and the column where it was when Reply was
 pressed, with the keys on its list. A column that changes under an open reply (another channel, thread
-or view) puts it away as a draft. One column — a phone, or a desk with the layout button off — keeps
+or view) puts it away as a draft; so do Ctrl+1 to Ctrl+3 pressed while it is open, as on the reply
+screen, the view they choose taking that column away, while Ctrl+4, two columns already, leaves it
+open (`#281 view-keys`). One column — a phone, or a desk with the layout button off — keeps
 the reply screen: on a phone a box under the list is what the on-screen keyboard covers, and the
 one-column desk keeps the continuity above. A window narrowed to one column while a reply is open in a
 column hands it to the reply screen, words and all. The other way round is left alone on purpose: a
@@ -4712,7 +4736,7 @@ scrolls from the keyboard the way any web page does:
 | `/` | Open the search with its field ready; pressed again, back to what you typed |
 | Enter, in the search field | Search older messages, a few pages at a time; the button at the head of the list says Stop meanwhile |
 | `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
-| Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply, Threads or a thread; never marks anything read |
+| Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply or a thread (one opened from the thread list goes back to it); never marks anything read |
 
 These keys did nothing before, and nothing was eating them. A browser scrolls the box that holds
 the focus, or else the document, and this page's document never scrolls: the frame is fixed and each
@@ -4760,7 +4784,7 @@ from, so it cannot name a key the page does not answer.
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
 | Ctrl+C (Cmd+C) | Copy the text of the selected message, when no text is selected |
-| `1`, `2`, `3` | Main, Threads, All |
+| Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
 | `h` | Show read, Collapse read, Hide read, in turn |
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:` | Expand all, Collapse all |
@@ -5377,11 +5401,14 @@ still followed once it goes live. The phone's dock is not touched: `tests/offlin
 measures it at 412px and 360px against what it was.
 
 **Two columns on a wide desk** (`#229 desktop-two-column`). In a window at least 1000px wide, a
-layout button beside the view picker puts Main in the left column and a thread in the right, as
-other chat clients' desktop apps lay a channel out; the choice is kept per device. 1000px is where
-each column still holds about 45 characters, the narrowest reading width the page allows; a window
-narrowed below it shows one column again and keeps the choice. In two columns the view picker greys
-out. The right column shows the selected thread, with its name, an X that deselects it, and its own
+layout button beside the view picker — or **Two columns** in the picker, or Ctrl+4 (`#281
+view-keys`) — puts Main in the left column and a thread in the right, as other chat clients' desktop
+apps lay a channel out; the choice is kept for the window, and for the next new window. 1000px is
+where each column still holds about 45 characters, the narrowest reading width the page allows; a
+window narrowed below it shows the layout two columns were chosen from — one column, or the thread
+list — and keeps the choice. In two columns the view picker says so and still chooses (it greyed out
+until `#281 view-keys`); a thread chosen in it is selected on the right. The right column on its own,
+across the window, is the thread list (Ctrl+3). The right column shows the selected thread, with its name, an X that deselects it, and its own
 composer; with none selected, a card per thread, saying the summariser's `display_name: summary` or
 else the thread's first message, three lines at most. The cards run as the channel's lists do
 (`#261 two-column-connectors`): the newest activity at the foot, opened scrolled to it, a thread
@@ -5399,8 +5426,9 @@ and unread count and every other link go grey; another card takes the highlight,
 again or Esc puts it out. It is kept per channel for the session, through the mouse moving over the
 cards, the keys walking them and the cards redrawn. The way into a thread is the card's own
 "N replies · M unread" button, or → on the highlighted card (else the one the keys are on); ← from a
-thread entered so comes back out to the cards, the keys on that card. The one-column Threads list's
-cards work the same way. Over the cards,
+thread entered so comes back out to the cards, the keys on that card. The thread list's cards (Ctrl+3)
+are these cards, and work the same way, a thread entered from one opening across the window. Over the
+cards,
 **links** join each root on
 Main to its thread's card (`#261 two-column-connectors`), as a diff tool joins a hunk on the left to
 its counterpart on the right: a right-angled line in the thread's colour (its Thread(N) tag's and
@@ -5417,7 +5445,7 @@ glide (`#280 scroll-stability`) — and a jump instead of a glide where the read
 animation frame, from passive scroll listeners, resizes and redraws, every rectangle read before
 anything is written and only what changed written; nothing is drawn or measured in one column, on a
 phone, over a thread, or while the page is hidden (`#226 page-energy-profile`). Thread(N), the
-unread count, N replies, the Threads screen and a card's replies button select a thread there, and a plain tap on
+unread count, N replies, the view picker and a card's replies button select a thread there, and a plain tap on
 a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
 in for the left column's list. The poll reads Main and the selected thread (two views, one delta
 each), a live reply in that thread is read once as the thread, and a refresh that brings nothing

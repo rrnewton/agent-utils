@@ -692,7 +692,7 @@ def narrowed_run(desk: Desk) -> None:
     page.click("#reply-cancel")
     page.set_viewport_size({"width": WIDTH, "height": HEIGHT})
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
-                  " && document.getElementById('thread-select').getAttribute('aria-disabled') === 'true'",
+                  " && document.getElementById('thread-select').value === 'columns'",
                   "narrowed: two columns did not come back")
     desk.notes.append("narrowed to 900px, the reply open on the right moved to the reply screen with its words")
 

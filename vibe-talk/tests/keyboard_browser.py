@@ -32,6 +32,14 @@ under a person's fingers, and measures the list that is on screen:
   rather than the picker -> "?" then "," leaves Help, and Help opened from Settings afterwards still
   goes back to Settings.
 
+`#281 view-keys`: Ctrl+1 to Ctrl+4 choose Main, All, the thread list and two columns, pressed with the
+focus in the channel's message box with a draft in it, in the search field with words typed, and inside
+the thread list on a card — and, in a second tab whose `navigator.platform` is emulated as a Mac's, the
+same with Cmd (Meta) — each changing the view the picker and the layout say, its default refused, and
+no digit typed into either field; Enter on a card highlights it, still in the thread list (`#279
+thread-card-focus`), -> opens its thread across the window, and Esc comes back to the list; the bare 1,
+2 and 3 change nothing.
+
 `#239 single-selection` adds real mouse moves (CDP `Input.dispatchMouseEvent`) to the keys, and after
 every step counts the rows the browser DRAWS lit, by computed style (the selected surface or a ring),
 which must be exactly one, holding the focus: a mouse move over a message takes the selection from the
@@ -354,7 +362,7 @@ RECORD_KEYS_JS = """() => {
 STATE_JS = """(id) => {
   const area = document.getElementById(id);
   const held = document.activeElement;
-  const screens = ['signin', 'main', 'settings', 'reply', 'help', 'threads'];
+  const screens = ['signin', 'main', 'settings', 'reply', 'help'];
   return {
     top: area.scrollTop,
     max: area.scrollHeight - area.clientHeight,
@@ -1038,6 +1046,113 @@ def two_columns_single(walk: Walk) -> None:
 
 PICKER_JS = "() => document.getElementById('discord-channel').value"
 
+# `#281 view-keys`. What the view keys change, and what they must not type into.
+VIEW_JS = """() => ({
+  picker: document.getElementById('thread-select').value,
+  layout: document.getElementById('screen-main').getAttribute('data-columns'),
+  side: document.getElementById('side-column').getClientRects().length > 0,
+  composer: document.getElementById('channel-compose-text').value,
+  search: document.getElementById('search-field').value,
+  focus: document.activeElement ? (document.activeElement.id || document.activeElement.tagName.toLowerCase()
+    + (document.activeElement.dataset && document.activeElement.dataset.id ? '#' + document.activeElement.dataset.id : '')) : null,
+  card: Boolean(document.activeElement && document.activeElement.matches('#side-cards > li[data-id]')),
+  heading: !document.getElementById('thread-heading').hidden,
+  keys: document.getElementById('keyboard-keys').textContent,
+})"""
+
+# Each view, as the picker names it and the layout the stylesheet is asked for.
+VIEWS = {"1": ("main", None), "2": ("flat", None), "3": ("threads", "list"), "4": ("columns", "two")}
+
+
+def view_keys(walk: Walk, mod: str, words: str) -> None:
+    """`#281 view-keys`: `mod`+1 to `mod`+4 from the message box, the search and the thread list; nothing typed."""
+
+    def view() -> Json:
+        value = walk.page.evaluate(VIEW_JS)
+        assert isinstance(value, dict)
+        return value
+
+    def choose(digit: str, where: str) -> Json:
+        press(walk.cdp, f"{mod}+{digit}")
+        picker, layout = VIEWS[digit]
+        walk.page.wait_for_function(
+            "([picker, layout]) => document.getElementById('thread-select').value === picker"
+            " && document.getElementById('screen-main').getAttribute('data-columns') === layout",
+            arg=[picker, layout], timeout=10_000)
+        walk.settled()
+        last = walk.last_key()
+        check(last["prevented"] is True, f"{words}+{digit} {where} was left to the browser's tab switch: {last}")
+        check(last["meta" if mod == "Meta" else "ctrl"] is True, f"{words}+{digit} {where} did not hold {mod}: {last}")
+        now = view()
+        check(now["side"] is (layout is not None), f"{words}+{digit} {where} drew the right column wrongly: {now}")
+        return now
+
+    choose("1", "from the list")
+    # The message box, a draft in it — this one alone: the device keeps drafts, and another tab's is cleared.
+    clear = ("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
+             "box.dispatchEvent(new Event('input')); }")
+    walk.page.evaluate(clear)
+    walk.page.click("#channel-compose-text")
+    for letter in "draft":
+        press(walk.cdp, letter)
+    for digit in ("2", "1", "4", "1", "2"):
+        now = choose(digit, "in the message box")
+        check(now["focus"] == "channel-compose-text", f"{words}+{digit} took the focus out of the box: {now['focus']!r}")
+        check(now["composer"] == "draft", f"{words}+{digit} typed into the message box: {now['composer']!r}")
+    now = choose("3", "in the message box")
+    check(now["composer"] == "draft", f"{words}+3 typed into the message box: {now['composer']!r}")
+    # The box is behind the list now: the focus goes to the list, its scroller or the card selected in it.
+    check(now["focus"] == "side-scroll" or now["card"] is True,
+          f"the thread list covered the box and left the focus on {now['focus']!r}")
+    walk.shot(f"view-keys-{words.lower()}-thread-list")
+    # The search field, words typed in it: it floats over every view, the thread list's included.
+    choose("1", "from the thread list")
+    walk.key("/")
+    for letter in "step":
+        press(walk.cdp, letter)
+    for digit in ("2", "3", "4", "1"):
+        now = choose(digit, "in the search field")
+        check(now["focus"] == "search-field", f"{words}+{digit} took the focus out of the search: {now['focus']!r}")
+        check(now["search"] == "step", f"{words}+{digit} typed into the search: {now['search']!r}")
+    walk.key("Escape")
+    # Inside the thread list, on a card: each chord leaves it; Enter highlights the card, -> goes into its
+    # thread (`#279 thread-card-focus`) and Esc comes back.
+    for digit in ("1", "2", "4"):
+        choose("3", "from one column or two")
+        press(walk.cdp, "ArrowDown")
+        walk.page.wait_for_function("() => document.activeElement && document.activeElement.matches('#side-cards > li[data-id]')",
+                                    timeout=5000)
+        choose(digit, "on a card in the thread list")
+    choose("3", "from two columns")
+    press(walk.cdp, "ArrowDown")
+    walk.page.wait_for_function("() => document.activeElement && document.activeElement.matches('#side-cards > li[data-id]')",
+                                timeout=5000)
+    press(walk.cdp, "Enter")
+    walk.page.wait_for_function("() => document.activeElement"
+                                " && document.activeElement.matches('#side-cards > li[data-id][data-highlighted]')",
+                                timeout=5000)
+    walk.settled()
+    check(view()["layout"] == "list" and not view()["heading"], f"Enter on a card left the thread list: {view()}")
+    press(walk.cdp, "ArrowRight")
+    walk.page.wait_for_function("() => !document.getElementById('thread-heading').hidden"
+                                " && !document.getElementById('screen-main').hasAttribute('data-columns')", timeout=10_000)
+    check(str(view()["picker"]).startswith("thread:"), f"-> on a card did not open its thread: {view()}")
+    press(walk.cdp, "Escape")
+    walk.page.wait_for_function("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'",
+                                timeout=10_000)
+    walk.shot(f"view-keys-{words.lower()}-back-to-list")
+    choose("1", "back in the thread list")
+    # The bare digits are retired: on the list they change nothing.
+    for digit in ("1", "2", "3"):
+        press(walk.cdp, digit)
+    walk.settled()
+    check(view()["picker"] == "main" and view()["layout"] is None, f"a bare digit changed the view: {view()}")
+    check(f"{words}+1" in str(view()["keys"]), f"the list of keys does not name {words}+1")
+    walk.page.evaluate(clear)
+    walk.notes.append(f"{words}+1 to {words}+4 chose Main, All, the thread list and two columns from the message "
+                      "box, the search field and a card in the thread list, the browser's default refused and no "
+                      "digit typed; Enter on a card highlighted it, -> opened its thread and Esc came back to the list")
+
 
 def picker_and_help_keys(walk: Walk) -> None:
     """Ctrl+K and a channel chosen gives the keys back to the list; Esc leaves the picker; Help's Back after "?"."""
@@ -1152,6 +1267,26 @@ def main() -> int:
             single_selection(walk, api)
             picker_and_help_keys(walk)
             two_columns_single(walk)
+            view_keys(walk, "Control", "Ctrl")
+
+            # The same on a Mac, as `navigator.platform` reports it there: the page says Cmd, and Cmd
+            # (Meta) is the chord. A second tab of the signed-in profile, its platform emulated.
+            mac = context.new_page()
+            mac.on("pageerror", lambda error: errors.append(str(error)))
+            mac_cdp = context.new_cdp_session(mac)
+            agent = str(page.evaluate("() => navigator.userAgent"))
+            mac_cdp.send("Emulation.setUserAgentOverride", {"userAgent": agent, "platform": "MacIntel"})
+            mac.goto(url, wait_until="load")
+            mac.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            if mac.evaluate("() => document.getElementById('view-switch').getAttribute('aria-checked')") != "true":
+                mac.click("#view-switch")
+            mac.wait_for_selector(first_row, state="visible", timeout=10_000)
+            check(mac.evaluate("() => navigator.platform") == "MacIntel", "the Mac's platform was not emulated")
+            mac.evaluate(RECORD_KEYS_JS)
+            mac_walk = Walk(mac, mac_cdp, args.screenshots)
+            mac_walk.step = walk.step
+            view_keys(mac_walk, "Meta", "Cmd")
+            walk.notes.extend(mac_walk.notes)
 
             check(not errors, f"the page threw: {errors}")
             browser_version = context.browser.version if context.browser else "Chromium"

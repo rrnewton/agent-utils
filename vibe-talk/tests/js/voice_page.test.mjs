@@ -1553,13 +1553,19 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // `#229 desktop-two-column`. The right column's list is as tall as the left's.
   elements.get("side-scroll").clientHeight = SCROLL_VIEWPORT_PX;
   // ...and the one layout question the page asks about it: whether it has a box at all. web/voice.css
-  // gives it one only on a desk at least 1000px wide, while #screen-main carries `data-columns="two"`.
+  // gives it one on a desk at least 1000px wide, while #screen-main carries `data-columns="two"`, and —
+  // `#281 view-keys`, the thread list — at every width while it carries `data-columns="list"`.
   // `page.wideDesk` says which window this is — a phone or a narrow window unless a test says
   // otherwise — and `page.setDesk` changes it as resizing the window does, resize event and all.
   elements.get("side-column").getClientRects = () => {
     const screen = elements.get("screen-main");
-    return page.wideDesk && !screen.hidden && screen.getAttribute("data-columns") === "two" ? [{ top: 0, bottom: 0 }] : [];
+    const layout = screen.hidden ? null : screen.getAttribute("data-columns");
+    return (page.wideDesk && layout === "two") || layout === "list" ? [{ top: 0, bottom: 0 }] : [];
   };
+  // The layout button, drawn by the same desktop block: what the page asks to know whether this window
+  // draws two columns at all, and so whether the view picker offers them. `#281 view-keys`.
+  elements.get("column-toggle").getClientRects = () =>
+    (page.wideDesk && !elements.get("column-toggle").hidden ? [{ top: 0, bottom: 0 }] : []);
   const page = {
     elements,
     el: (id) => {
@@ -1587,7 +1593,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
     screen() {
-      const showing = ["signin", "main", "settings", "reply", "help", "threads"].filter(
+      const showing = ["signin", "main", "settings", "reply", "help"].filter(
         (s) => !page.el(`screen-${s}`).hidden
       );
       assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
@@ -4740,8 +4746,9 @@ test("the header shows two things at a time, and which two depends on the screen
   // SCREEN". The list says so rather than being relaxed: only the ways back are declared here.
   //
   // `#194 thread-picker-polish` added a fourth way back, for the Threads screen, which returns to
-  // the channel it lists — at the leading edge with the others.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help", "close-threads"]);
+  // the channel it lists — at the leading edge with the others. `#281 view-keys` retired that screen
+  // for the thread list, a view of the main screen, and its way back with it.
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help"]);
 
   const page = newPage();
   const showing = () =>
@@ -4749,7 +4756,6 @@ test("the header shows two things at a time, and which two depends on the screen
       "close-settings",
       "close-reply",
       "close-help",
-      "close-threads",
       "topbar-title",
       "view-switch",
       "open-settings",
@@ -19542,7 +19548,8 @@ const scrollToBottom = (area) => {
 const focusName = (page) => (focused(page) ? `#${focused(page).id || focused(page).tagName}` : "nothing");
 
 test("EVERY LIST CAN HOLD THE FOCUS, from script and a click but never as a Tab stop, and draws no ring", () => {
-  for (const id of ["scroll-area", "reply-scroll", "screen-signin", "screen-settings", "screen-help", "screen-threads"]) {
+  // `#281 view-keys`: and the thread list's, the right column's scroller, as in two columns.
+  for (const id of ["scroll-area", "reply-scroll", "side-scroll", "screen-signin", "screen-settings", "screen-help"]) {
     const tag = new RegExp(`<[a-z]+ id="${id}"[^>]*>`).exec(HTML_CODE);
     assert.ok(tag, `#${id} is not in the markup`);
     assert.match(tag[0], /\btabindex="-1"/, `#${id} cannot hold the focus, so the scroll keys cannot reach it`);
@@ -20130,7 +20137,8 @@ test("NO KEY FIRES while an input method composes, from a phone's keyboard, or w
     // What a phone's on-screen keyboard reports for nearly every key.
     ["Unidentified", { keyCode: 229 }], ["/", { keyCode: 229 }],
     ["/", { altKey: true }], [",", { altKey: true }], ["j", { ctrlKey: true }], ["e", { metaKey: true }],
-    ["e", { altKey: true }], ["1", { ctrlKey: true }],
+    // `#281 view-keys`. Ctrl+1 to Ctrl+4 choose the views now; a chord past them is still the browser's.
+    ["e", { altKey: true }], ["5", { ctrlKey: true }], ["1", { ctrlKey: true, isComposing: true }],
     ["PageDown", { isComposing: true }],
   ]) {
     const event = await press(page, area, key, fields);
@@ -21111,17 +21119,69 @@ test("A KEY ABOUT ONE MESSAGE never acts on one scrolled out of sight: it brings
     "the second e did not mark the message the ring is round");
 });
 
-test("1, 2 AND 3 choose Main, the Threads screen and All; h cycles the read mode; ; and : expand and collapse all", async () => {
+test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and two columns from anywhere, a message box and the search included; h cycles the read mode; ; and : expand and collapse all", async () => {
   const page = await threadPage();
-  await press(page, page.el("scroll-area"), "1");
-  assert.equal(page.el("thread-select").value, "main", "1 did not choose Main");
-  await press(page, page.el("scroll-area"), "3");
-  assert.equal(page.el("thread-select").value, "flat", "3 did not choose All");
-  await press(page, page.el("scroll-area"), "2");
-  assert.equal(page.screen(), "threads", "2 did not open the Threads screen");
-  assert.equal(focused(page), page.el("screen-threads"), `on Threads the focus is on ${focusName(page)}`);
-  await press(page, page.el("screen-threads"), "Escape");
-  assert.equal(page.screen(), "main", "Esc did not leave the Threads screen");
+  page.wideDesk = true;
+  const picker = page.el("thread-select");
+  const layout = () => page.el("screen-main").getAttribute("data-columns");
+  // From the list, from the message box with a draft in it, and from the search field with words typed:
+  // each chord chooses its view, its default is kept from the browser, and nothing is typed.
+  await press(page, page.el("scroll-area"), "/");
+  await page.el("search-field").setValue("root");
+  await page.el("channel-compose-text").setValue("a draft");
+  for (const [target, fields] of [["scroll-area", { ctrlKey: true }], ["channel-compose-text", { ctrlKey: true }],
+    ["search-field", { metaKey: true }]]) {
+    for (const [key, value, columns] of [["1", "main", null], ["2", "flat", null], ["3", "threads", "list"],
+      ["4", "columns", "two"], ["1", "main", null]]) {
+      // The thread list covers the left column's box: the box is pressed from the list's column then.
+      const at = target === "channel-compose-text" && layout() === "list" ? page.el("side-scroll") : page.el(target);
+      const event = await press(page, at, key, fields);
+      await page.settle();
+      const what = `${JSON.stringify(fields)} ${key} in #${at.id}`;
+      assert.equal(event.defaulted, false, `${what} was left to the browser's tab switch`);
+      assert.equal(picker.value, value, `${what} did not choose ${value}`);
+      assert.equal(layout(), columns, `${what} did not lay the page out for ${value}`);
+    }
+  }
+  assert.equal(page.el("channel-compose-text").value, "a draft", "a view key typed into the message box");
+  assert.equal(page.el("search-field").value, "root", "a view key typed into the search");
+  // Esc in the search closes it, as ever, before it is Back anywhere.
+  await press(page, page.el("search-field"), "Escape");
+  assert.equal(page.el("search-field").hidden, true);
+  // The bare digits are retired: in a field they are digits, and on the list they do nothing.
+  for (const key of ["1", "2", "3"]) {
+    const event = await press(page, page.el("scroll-area"), key);
+    assert.equal(event.defaulted, true, `${key} on the list was taken`);
+    assert.equal(picker.value, "main", `${key} on the list changed the view`);
+  }
+  // Inside the thread list: Enter on a card highlights it, as on the right in two columns (`#279
+  // thread-card-focus`), and → opens its thread across the window; Esc is the list again, and the
+  // chords leave it as they leave any view.
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  await page.settle();
+  assert.equal(layout(), "list");
+  assert.equal(focused(page), page.el("side-scroll"), `in the thread list the focus is on ${focusName(page)}`);
+  await press(page, page.el("side-scroll"), "ArrowDown");
+  const card = focused(page);
+  assert.ok(card && card.hasAttribute("data-card"), `↓ in the thread list did not select a card: ${focusName(page)}`);
+  await press(page, card, "Enter");
+  await page.settle();
+  assert.equal(layout(), "list", "Enter on a card left the thread list");
+  assert.equal(card.getAttribute("data-highlighted"), "true", "Enter on a card of the thread list did not highlight it");
+  assert.equal(focused(page), card, `after Enter on a card the focus is on ${focusName(page)}`);
+  await press(page, card, "ArrowRight");
+  await page.settle();
+  assert.equal(layout(), null, "a card opened its thread inside the list");
+  assert.equal(page.el("thread-heading").hidden, false, "→ on a card did not open its thread");
+  assert.equal(picker.value, `thread:${card.getAttribute("data-id")}`);
+  await press(page, focused(page) || page.el("scroll-area"), "Escape");
+  await page.settle();
+  assert.equal(layout(), "list", "Esc from a thread opened from the list did not go back to the list");
+  const inside = await press(page, focused(page), "2", { metaKey: true });
+  await page.settle();
+  assert.equal(inside.defaulted, false);
+  assert.equal(picker.value, "flat", "Cmd+2 inside the thread list did not choose All");
+  assert.equal(layout(), null);
   const mode = () => page.el("todo-filter").getAttribute("data-read-mode");
   const modes = [mode()];
   for (let i = 0; i < 3; i += 1) {
@@ -21424,10 +21484,18 @@ test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the 
     for (const meaning of meanings) {
       assert.ok(list.includes(meaning), `${platform}: the list of keys leaves out "${meaning}"`);
     }
-    for (const words of ["↓ or j", "↑ or k", "Enter or o", "Esc", "PgUp", "Shift+E", "1, 2, 3", `${mod}+S`, `${mod}+,`,
-      `${mod}+K`, `${mod}+/`, `${mod}+Home`, `${alt}+↓`, "Shift+P", "Shift+L"]) {
+    for (const words of ["↓ or j", "↑ or k", "Enter or o", "Esc", "PgUp", "Shift+E", `${mod}+1`, `${mod}+2`, `${mod}+3`,
+      `${mod}+4`, `${mod}+S`, `${mod}+,`, `${mod}+K`, `${mod}+/`, `${mod}+Home`, `${alt}+↓`, "Shift+P", "Shift+L"]) {
       assert.ok(list.includes(words), `${platform}: the list of keys does not name ${words}`);
     }
+    // `#281 view-keys`. The bare digits are gone from it, and it says so, and where a browser may keep the chords.
+    assert.ok(!list.includes("1, 2, 3"), `${platform}: the list of keys still names the bare digits`);
+    assert.ok(list.includes(`${mod}+1 to ${mod}+4 work from anywhere, in a message box or the search too`),
+      `${platform}: the list of keys does not say the view chords work from anywhere`);
+    assert.ok(list.includes("1, 2 and 3 on their own no longer change the view"),
+      `${platform}: the list of keys does not say what became of the bare digits`);
+    assert.ok(list.includes("a browser that keeps them for its tabs switches tabs instead"),
+      `${platform}: the list of keys does not say a browser may keep the chords`);
     assert.ok(!list.includes(`${other}+`), `${platform}: the list of keys names ${other}`);
     // `#248 composer-key`. The chord left the search for the message box, and its tooltip with it.
     assert.equal(page.el("search-toggle").getAttribute("title"), "Search messages (/)", platform);
@@ -26550,8 +26618,9 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   await pickThread(page, "main");
   assert.equal(page.el("channel-view-tabs").hidden, true, "the tabs over the list came back");
   const offered = threadOptions(page);
-  assert.deepStrictEqual(offered.slice(0, 2), [["main", "Main"], ["flat", "All"]]);
-  assert.deepStrictEqual(offered.slice(2).map(([value]) => value).sort(),
+  // `#281 view-keys`: the thread list after them, the third view; two columns only on a desk wide enough.
+  assert.deepStrictEqual(offered.slice(0, 3), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]]);
+  assert.deepStrictEqual(offered.slice(3).map(([value]) => value).sort(),
     ["thread:spaces/A/threads/another", "thread:spaces/A/threads/one & two"]);
   // Age · replies · a short prefix of its first message, so a phone's large picker stays readable.
   // The age is on `briefAge`'s one scale (`#194 thread-picker-polish`): now, 5m, 23h, 1d18h, 12d, 6w, 2y.
@@ -26572,8 +26641,9 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   await signIn(empty);
   await showDiscord(empty, [message({ content: "no threads yet" })]);
   assert.equal(empty.el("channel-view-tabs").hidden, true);
-  // Always there, even with no threads yet: Main and All are still choices.
-  assert.deepStrictEqual(threadOptions(empty), [["main", "Main"], ["flat", "All"]]);
+  // Always there, even with no threads yet: Main and All are still choices, and the thread list, which
+  // says there are none yet (`#281 view-keys`).
+  assert.deepStrictEqual(threadOptions(empty), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]]);
 });
 
 test("the bar's thread picker opens a thread, All, and Main, and touching it reads the thread list once", async () => {
@@ -26759,12 +26829,12 @@ test("ages read as days and hours, never 42h, on one compact scale", async () =>
     page.threadingSupported = true;
     await signIn(page);
     await showDiscord(page, rows.map(([age], i) => agedRoot(page, i, age)));
-    const labels = threadOptions(page).slice(2).map(([, label]) => label);
+    const labels = threadOptions(page).slice(3).map(([, label]) => label);
     assert.deepStrictEqual(labels, rows.map(([, said], i) => `${said} · 1 · root number ${i}`));
   }
 });
 
-test("the picker lists one screenful of threads, newest first, then the way to the older ones", async () => {
+test("the picker lists the views, then one screenful of threads, newest first; the older ones are the thread list's", async () => {
   const page = newPage();
   page.threadingSupported = true;
   await signIn(page);
@@ -26772,49 +26842,28 @@ test("the picker lists one screenful of threads, newest first, then the way to t
   await showDiscord(page, roots);
   const offered = threadOptions(page);
   const cap = sourceConstant("THREAD_SELECT_LIMIT");
-  assert.deepStrictEqual(offered.slice(0, 2), [["main", "Main"], ["flat", "All"]]);
-  assert.deepStrictEqual(offered.slice(2, 2 + cap).map(([value]) => value),
+  assert.deepStrictEqual(offered.slice(0, 3), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]]);
+  assert.deepStrictEqual(offered.slice(3, 3 + cap).map(([value]) => value),
     Array.from({ length: cap }, (_, i) => `thread:spaces/A/threads/r${11 - i}`),
     "the picker did not list the newest threads first, one screenful of them");
-  assert.deepStrictEqual(offered.at(-1), ["older", "… Older threads"]);
-  assert.equal(offered.length, 2 + cap + 1, "the picker listed more than one screenful");
-
-  // A channel with fewer threads than that, and a server that says there are no more: no way on.
-  const few = newPage();
-  few.threadingSupported = true;
-  await signIn(few);
-  await showDiscord(few, Array.from({ length: 5 }, (_, i) => agedRoot(few, i, (5 - i) * 3600000)));
-  await few.el("thread-select").dispatch("pointerdown");
-  await few.settle();
-  assert.ok(!threadOptions(few).some(([value]) => value === "older"),
-    "the picker offered older threads that do not exist");
-
-  // ...and the same five, with a thread list that says older ones exist: the way on is back.
-  const more = newPage();
-  more.threadingSupported = true;
-  await signIn(more);
-  await showDiscord(more, Array.from({ length: 5 }, (_, i) => agedRoot(more, i, (5 - i) * 3600000)));
-  const standard = more.timeline;
-  more.timeline = async (path) => (path.includes("view=threads")
-    ? json(200, timelineAnswer({ view: "threads", threads: [agedSummary(more, 1, 30)], has_threads: true,
-      has_more: true, next_before: "older-cursor" }))
-    : standard(path));
-  assert.ok(!threadOptions(more).some(([value]) => value === "older"));
-  await more.el("thread-select").dispatch("pointerdown");
-  await more.settle();
-  assert.deepStrictEqual(threadOptions(more).at(-1), ["older", "… Older threads"],
-    "the server said older threads exist and the picker offered no way to them");
+  assert.equal(offered.length, 3 + cap, "the picker listed more than one screenful");
+  // `#281 view-keys`. No "… Older threads" opening a screen of its own: the thread list has them all.
+  assert.ok(!offered.some(([value]) => value === "older"), "the picker still offers a way to the Threads screen");
+  // A desk wide enough is offered two columns too, the fourth view, before the threads.
+  await page.setDesk(true);
+  assert.deepStrictEqual(threadOptions(page).slice(0, 4),
+    [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["columns", "Two columns"]]);
 });
 
-test("Older threads opens a Threads screen that pages back on the server's cursor and opens a thread", async () => {
+test("`#281 view-keys`: the thread list pages back on the server's cursor where it stands, and a card opens its thread across the window, Back coming back to the list", async () => {
   const page = newPage();
   page.threadingSupported = true;
-  // Read-scope: the screen only ever reads, so a token that may not post can use all of it.
+  // Read-scope: the list only ever reads, so a token that may not post can use all of it.
   page.tokenScope = "read";
   await signIn(page);
   // Twenty threads on the server, s1 the newest; the channel's Main shows none of their roots.
   const all = Array.from({ length: 20 }, (_, i) => agedSummary(page, i + 1, (i + 1) * 5,
-    i === 2 ? { summary: "Whether the storage tier moves on Tuesday." } : {}));
+    i === 2 ? { summary: "Whether the storage tier moves on Tuesday.", display_name: "storage-move" } : {}));
   const cursor = "opaque cursor /&?";
   const standard = page.timeline;
   page.timeline = async (path) => {
@@ -26834,49 +26883,42 @@ test("Older threads opens a Threads screen that pages back on the server's curso
   await showDiscord(page, [message({ id: "300", content: "main channel announcement" })]);
   const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
   const writesBefore = writes();
-  await page.el("thread-select").dispatch("pointerdown");
-  await page.settle();
-  assert.deepStrictEqual(threadOptions(page).at(-1), ["older", "… Older threads"]);
-
-  await pickThread(page, "older");
-  assert.equal(page.screen(), "threads", "Older threads did not open the Threads screen");
-  // Back on the view on screen — All, where the channel opened. `#189 restore-ui-state`.
-  assert.equal(page.el("thread-select").value, "flat", "the picker was left saying Older threads");
-  assert.equal(page.el("topbar-title").textContent, "Threads");
-  assert.equal(page.el("close-threads").hidden, false, "the Threads screen has no way back");
+  await pickThread(page, "threads");
+  assert.equal(page.screen(), "main", "the thread list is not a view of the main screen");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+  assert.equal(page.el("thread-select").value, "threads");
+  assert.equal(page.el("side-title").textContent, "Threads");
   const reads = () => page.timelineCalls.filter((call) => /view=threads/.test(call));
-  const rows = () => page.el("thread-directory-list").children;
-  const label = (li) => li.descendants().find((node) => node.className === "thread-directory-label").textContent;
-  assert.equal(rows().length, 10);
-  assert.deepStrictEqual(rows().map((li) => li.getAttribute("data-context-id")),
-    all.slice(0, 10).map((thread) => thread.id), "the rows are not newest activity first");
-  // The picker's own words: age · replies · name, with the name given this screen's room.
-  assert.equal(label(rows()[0]), "5h · 1 · Planning thread number 1");
-  assert.equal(label(rows()[1]), "10h · 2 · Planning thread number 2");
-  assert.equal(label(rows()[4]), "1d1h · 5 · Planning thread number 5");
-  assert.equal(optionLabel(page, `thread:${all[0].id}`), "5h · 1 · Planning thread number 1");
-  assert.match(rows()[2].text(), /Whether the storage tier moves on Tuesday\./,
-    "the server's one-sentence summary is not on the row");
-  assert.equal(page.el("thread-directory-more").hidden, false, "there is no way to older threads");
-  assert.match(page.el("thread-directory-state").textContent, /^10 threads, newest activity first\. Older ones/);
+  assert.ok(reads().length >= 1, "the thread list was not read for the cards");
+  // Newest activity at the foot, as the right column orders them, the summariser's words on a card.
+  assert.deepStrictEqual(cardIds(page), all.slice(0, 10).map((thread) => thread.id).reverse());
+  assert.equal(cardPart(page, all[2].id, "side-card-text"), "storage-move: Whether the storage tier moves on Tuesday.");
+  const more = page.el("side-more-threads");
+  assert.equal(more.hidden, false, "there is no way to older threads");
+  assert.equal(more.textContent, "Older threads…");
 
   const before = reads().length;
-  await page.el("thread-directory-more").click();
+  await more.click();
   await page.settle();
-  assert.equal(reads().length, before + 1);
+  assert.equal(reads().length, before + 1, "Older threads read more than the one page back");
   assert.equal(new URL(reads().at(-1), "http://fixture.test").searchParams.get("before"), cursor,
-    "Load older did not step back on the server's cursor");
-  assert.equal(rows().length, 20);
-  assert.equal(rows().at(-1).getAttribute("data-context-id"), all[19].id);
-  assert.equal(page.el("thread-directory-more").hidden, true, "Load older offered past the last page");
-  assert.match(page.el("thread-directory-state").textContent, /That is all of them\.$/);
+    "Older threads did not step back on the server's cursor");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Older threads left the thread list");
+  assert.equal(cardIds(page).length, 20);
+  assert.equal(cardIds(page)[0], all[19].id, "the oldest card is not at the head");
+  assert.equal(more.hidden, true, "Older threads offered past the last page");
 
-  // An old thread, from the second page: it opens on the channel, and the picker names it — even
-  // though it is far past the picker's one screenful.
+  // An old thread, from the second page. A click on its card highlights it there (`#279
+  // thread-card-focus`); its replies button opens it across the window, and the picker names it —
+  // even though it is far past the picker's one screenful.
   const old = all[14];
-  await rows().find((li) => li.getAttribute("data-context-id") === old.id).children[0].click();
+  await cardOf(page, old.id).click();
   await page.settle();
-  assert.equal(page.screen(), "main", "choosing a thread left the reader on the Threads screen");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "a click on a card left the thread list");
+  assert.deepStrictEqual(litCards(page), [old.id], "a click on a card of the thread list did not highlight it");
+  await openerOf(cardRow(page, old.id)).click();
+  await page.settle();
+  assert.equal(page.el("screen-main").hasAttribute("data-columns"), false, "the thread opened inside the list");
   assert.equal(page.tab(), "discord");
   assert.equal(page.el("thread-heading").hidden, false, "the chosen thread did not open");
   assert.equal(page.el("thread-select").value, `thread:${old.id}`);
@@ -26884,42 +26926,49 @@ test("Older threads opens a Threads screen that pages back on the server's curso
   assert.equal(headingLabel(page), optionLabel(page, `thread:${old.id}`));
   assert.equal(page.el("thread-facts").textContent, "3d3h · 15");
   assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), old.id);
-
-  // Opened again and dismissed: the picker goes back to the thread on screen both times.
-  await pickThread(page, "older");
-  assert.equal(page.screen(), "threads");
-  assert.equal(page.el("thread-select").value, `thread:${old.id}`);
-  const current = rows().find((li) => li.getAttribute("data-context-id") === old.id).children[0];
-  assert.equal(current.getAttribute("aria-current"), "true", "the open thread is not marked");
-  await page.el("close-threads").click();
-  assert.equal(page.screen(), "main");
-  assert.equal(page.el("thread-select").value, `thread:${old.id}`);
-  assert.equal(writes(), writesBefore, "the Threads screen wrote something");
+  // Back: the list again, all twenty cards, with no read of them.
+  const listReads = reads().length;
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Back from the thread did not come back to the list");
+  assert.equal(page.el("thread-select").value, "threads");
+  assert.equal(cardIds(page).length, 20, "the list came back without the older threads");
+  assert.equal(reads().length, listReads, "coming back to the list read it again");
+  assert.equal(writes(), writesBefore, "the thread list wrote something");
 });
 
-test("the Threads screen says when a read fails, keeps what it knew, and tries again", async () => {
+test("`#281 view-keys`: Older threads says when its read fails, keeps the cards it had, and tries again", async () => {
   const page = newPage();
   page.threadingSupported = true;
   await signIn(page);
   const roots = Array.from({ length: 10 }, (_, i) => agedRoot(page, i, (10 - i) * 3600000));
   await showDiscord(page, roots);
   const standard = page.timeline;
-  let failing = true;
-  page.timeline = async (path) => (path.includes("view=threads") && failing
-    ? json(502, { error: "discord_error", detail: "the provider is down" })
-    : standard(path));
-  await pickThread(page, "older");
-  assert.equal(page.screen(), "threads");
-  // Back on the view on screen, All, at once — not only once a read succeeds: this one failed.
-  assert.equal(page.el("thread-select").value, "flat", "the picker was left saying Older threads");
-  assert.equal(page.el("thread-directory-list").children.length, 10, "the threads already known were dropped");
-  assert.match(page.el("thread-directory-state").textContent, /^Could not load the thread list: the provider is down\./);
-  assert.equal(page.el("thread-directory-retry").hidden, false, "a failed read offered no second try");
-  failing = false;
-  await page.el("thread-directory-retry").click();
+  let failing = false;
+  page.timeline = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.get("view") !== "threads") return standard(path);
+    if (failing) return json(502, { error: "discord_error", detail: "the provider is down" });
+    return json(200, timelineAnswer({ view: "threads", threads: [agedSummary(page, 1, 30)], has_threads: true,
+      has_more: !url.searchParams.get("before"), next_before: url.searchParams.get("before") ? null : "back-cursor" }));
+  };
+  await pickThread(page, "threads");
+  const known = cardIds(page).length;
+  assert.ok(known >= 10, `the thread list did not show the threads already known: ${known}`);
+  assert.equal(page.el("side-more-threads").hidden, false);
+  failing = true;
+  await page.el("side-more-threads").click();
   await page.settle();
-  assert.equal(page.el("thread-directory-retry").hidden, true);
-  assert.match(page.el("thread-directory-state").textContent, /^10 threads, newest activity first\./);
+  assert.equal(cardIds(page).length, known, "the threads already known were dropped");
+  assert.match(page.el("side-list-state").textContent, /^Could not load older threads: the provider is down\./);
+  assert.equal(page.el("side-list-state").hidden, false);
+  assert.equal(page.el("side-more-threads").hidden, false, "a failed read offered no second try");
+  assert.equal(page.el("side-more-threads").disabled, false);
+  failing = false;
+  await page.el("side-more-threads").click();
+  await page.settle();
+  assert.equal(page.el("side-list-state").textContent, "", "the failure was still said once a read landed");
+  assert.equal(page.el("side-more-threads").hidden, true, "Older threads offered past the last page");
 });
 
 test("the floating chips keep their height clear above the composer, and never stand lower than its top edge", () => {
@@ -28355,7 +28404,7 @@ test("a thread nobody has answered yet is tagged Thread with no number, and grow
   await signIn(page);
   await showDiscord(page, [message({ id: "210", content: "nobody has answered this", thread: lone })]);
   assert.equal(threadButton(rowOf(page, "210")), undefined, "Main offered a chip for no replies");
-  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"]],
+  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]],
     "the picker offered a thread with nothing in it to read");
 
   await page.el("channel-view-flat").click();
@@ -33404,7 +33453,7 @@ test("a channel with child threads keeps a root-only Main, even after visiting a
   const page = await threadPage("main");
   const data = threadData();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not the served root-only page");
-  assert.equal(threadOptions(page).length, 4, "a threaded channel's picker lost its threads");
+  assert.equal(threadOptions(page).length, 5, "a threaded channel's picker lost its threads");
   assert.ok(threadButton(page.el("discord-log").children[1]), "a thread root lost its replies button");
 
   // A thread page names its thread too: that must not make the channel look scoped to it.
@@ -35460,6 +35509,58 @@ test("two windows on one channel each reopen in their own view, with the device'
     "the test cannot tell a window's own view from the device's");
 });
 
+test("`#281 view-keys` x `#265 window-channel-memory`: each window reopens in its own one of the four views, and a new window in the one chosen last", async () => {
+  /** A window on a wide desk over the device's `store`: a reload when handed its own `session`. */
+  const deskWindow = (store, session = null) => newPage(store, SCRIPT, (p) => {
+    if (session) p.session = session;
+    p.wideDesk = true;
+    p.messages = threadData().messages;
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  const view = (page) => page.el("thread-select").value;
+  const one = deskWindow(new Map());
+  await signIn(one);
+  await showDiscord(one, threadData().messages);
+  await press(one, one.el("scroll-area"), "3", { ctrlKey: true });
+  await one.settle();
+  assert.equal(view(one), "threads");
+  // A second window opens in the layout chosen last, and is put in two columns.
+  const two = deskWindow(one.storage);
+  await reopenedChannel(two);
+  await two.settle();
+  assert.equal(view(two), "threads", "a new window did not open in the view chosen last");
+  await press(two, two.el("scroll-area"), "4", { metaKey: true });
+  await two.settle();
+  assert.equal(view(two), "columns");
+  await one.setVisibility("hidden");
+  await two.setVisibility("hidden");
+  // Each window reloads in its own view; a third, new, in the one chosen last.
+  const oneAgain = deskWindow(one.storage, one.session);
+  await reopenedChannel(oneAgain);
+  await oneAgain.settle();
+  assert.equal(view(oneAgain), "threads", "a reload took the view another window chose");
+  assert.equal(oneAgain.el("screen-main").getAttribute("data-columns"), "list");
+  const twoAgain = deskWindow(two.storage, two.session);
+  await reopenedChannel(twoAgain);
+  await twoAgain.settle();
+  assert.equal(view(twoAgain), "columns", "the second window's reload lost two columns");
+  const three = deskWindow(one.storage);
+  await reopenedChannel(three);
+  await three.settle();
+  assert.equal(view(three), "columns", "a new window did not open in the view chosen last");
+  // And one column: Ctrl+2 in the first window is All, after its reload too.
+  await press(oneAgain, oneAgain.el("side-scroll"), "2", { ctrlKey: true });
+  await oneAgain.settle();
+  assert.equal(view(oneAgain), "flat");
+  await oneAgain.setVisibility("hidden");
+  const oneLast = deskWindow(oneAgain.storage, oneAgain.session);
+  await reopenedChannel(oneLast);
+  await oneLast.settle();
+  assert.equal(view(oneLast), "flat", "a reload of a window left in All did not come back to All");
+  assert.equal(oneLast.el("screen-main").hasAttribute("data-columns"), false);
+});
+
 test("a window's channel the server stops listing falls back to its first, as before; signing out forgets the window's record", async () => {
   const one = windowOnTwoChannels(new Map());
   await signIn(one);
@@ -35760,12 +35861,13 @@ test("a delta overtaken by a newer read of its view is dropped, not folded over 
   page.setClock(page.clock() + 120000);
   await page.el("thread-select").dispatch("pointerdown");
   await page.settle();
-  // While that delta is on the wire, something changes and the Threads screen reads the newest page
-  // of the same list, which issues a cursor of its own.
+  // While that delta is on the wire, something changes and the thread list's Older threads, with no
+  // cursor to step back from yet, reads the newest page of the same list, which issues a cursor of its
+  // own. (`#281 view-keys`: it was the Threads screen's first read.)
   server.hold = null;
   server.post(message({ id: "390", content: "moves the change record on" }));
-  await pickThread(page, "older");
-  assert.equal(page.screen(), "threads");
+  await page.el("side-more-threads").click();
+  await page.settle();
   const replaced = server.revision;
   held.open();
   await page.settle();
@@ -35773,7 +35875,6 @@ test("a delta overtaken by a newer read of its view is dropped, not folded over 
   assert.ok(!threadOptions(page).some(([value]) => value === `thread:${stale.id}`),
     "a delta older than the page it raced was folded over it");
   page.setClock(page.clock() + 120000);
-  await page.el("close-threads").click();
   await page.el("thread-select").dispatch("pointerdown");
   await page.settle();
   assert.equal(server.reads.at(-1).after, `threads@${replaced}`, "the dropped delta's cursor was taken up");
@@ -42355,6 +42456,51 @@ async function twoColumnServer(arrange = null, script = SCRIPT) {
   return { page, server, data };
 }
 
+test("`#281 view-keys`: the thread list is the right column on its own, across the window at every width, over the left column kept behind it", async () => {
+  // The stylesheet's, since this fixture lays nothing out: drawn outside the desk's block, so a phone
+  // has it too, in the list's own cell, under the floating line and over the left column.
+  const column = cssBlockOutside(TWO_COLUMN_QUERY, '#screen-main[data-columns="list"] > #side-column');
+  assert.match(column, /display:\s*grid/, "the thread list is not drawn outside the desk's block");
+  assert.match(column, /grid-row:\s*3/);
+  assert.match(column, /grid-column:\s*1/);
+  assert.match(column, /padding-top:\s*calc\(var\(--float-line\)/, "the head of the list is under the search glass");
+  // The left column is laid out still, out of sight, so coming back to it finds the reader where they were.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '#screen-main[data-columns="list"] > #scroll-area'), /visibility:\s*hidden/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '#screen-main[data-columns="list"] #channel-freshness'), /visibility:\s*hidden/,
+    "the left column's pill speaks over the thread list");
+  // The same cards as two columns, by the same rules: none of them is the desk's alone any more.
+  for (const selector of [".side-card", ".side-card-text", "#side-heading", "#side-scroll", "#side-more-threads"]) {
+    assert.ok(cssRulesElsewhere(TWO_COLUMN_QUERY, selector) > 0, `${selector} is drawn only on a desk`);
+  }
+
+  const page = await threadPage();
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  await page.settle();
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+  assert.ok(page.el("side-column").getClientRects().length > 0, "the thread list is not on screen on a phone");
+  assert.equal(page.el("side-list").hidden, false);
+  assert.equal(page.el("side-close").hidden, true, "an X with nothing to close");
+  assert.equal(page.el("side-unread-only").hidden, false, "Unread only is not over the thread list");
+  assert.deepStrictEqual(cardIds(page), threadData().threads.map((thread) => thread.id));
+  // On a phone two columns are not offered, and Ctrl+4 says why it did nothing.
+  assert.ok(!threadOptions(page).some(([value]) => value === "columns"), "a phone was offered two columns");
+  await press(page, page.el("side-scroll"), "4", { ctrlKey: true });
+  await page.settle();
+  assert.match(page.el("status").textContent, /wider window/);
+  assert.equal(page.el("thread-select").value, "threads", "Ctrl+4 in a narrow window left the thread list");
+  // A layout keyed on another keyboard: Ctrl+& is Ctrl+1 on AZERTY, by the place of its key.
+  const azerty = await press(page, page.el("side-scroll"), "&", { ctrlKey: true, code: "Digit1" });
+  await page.settle();
+  assert.equal(azerty.defaulted, false);
+  assert.equal(page.el("thread-select").value, "main", "Ctrl+1 on AZERTY did not choose Main");
+  // A channel that is itself one thread has no list to show.
+  const { page: scoped } = await scopedPage();
+  await press(scoped, scoped.el("scroll-area"), "3", { ctrlKey: true });
+  await scoped.settle();
+  assert.equal(scoped.el("screen-main").hasAttribute("data-columns"), false);
+  assert.match(scoped.el("status").textContent, /single thread/);
+});
+
 test("`#229 desktop-two-column`: the layout button is a toggle in the bar, offered on a channel with threads and drawn only on a desk 1000px wide", async () => {
   assertMarkupContains("bar-pack", "column-toggle");
   const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="bar-pack"'));
@@ -42394,7 +42540,9 @@ test("`#229 desktop-two-column`: pressed in a narrow window it waits for a wide 
   await page.settle();
   assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "true", "the button does not say it is pressed");
   assert.equal(page.storage.get(COLUMNS_STORAGE), "two", "the choice was not kept on the device");
-  assert.equal(page.el("screen-main").getAttribute("data-columns"), "two", "the stylesheet was not asked for two columns");
+  // `#281 view-keys`. Not asked of the stylesheet until the window can draw them: the layout they were
+  // chosen from stands meanwhile, one column here, and the thread list where they were chosen from it.
+  assert.equal(page.el("screen-main").hasAttribute("data-columns"), false, "a narrow window was asked for two columns");
   assert.ok(!inTwoColumns(page), "a narrow window was given two columns");
   assert.equal(page.el("thread-select").disabled, false, "one column on screen, and the view picker greyed out");
   assert.equal(page.el("thread-select").hasAttribute("aria-disabled"), false, "one column on screen, and the view picker greyed out");
@@ -42402,8 +42550,9 @@ test("`#229 desktop-two-column`: pressed in a narrow window it waits for a wide 
 
   await page.setDesk(true);
   assert.ok(inTwoColumns(page), "widening the window did not bring two columns");
-  assert.equal(page.el("thread-select").getAttribute("aria-disabled"), "true", "the view picker did not grey out");
-  assert.equal(page.el("thread-select").value, "main");
+  // `#281 view-keys`. Two columns are the picker's fourth view, which it says, rather than greying out.
+  assert.equal(page.el("thread-select").hasAttribute("aria-disabled"), false, "the view picker greyed out");
+  assert.equal(page.el("thread-select").value, "columns", "the view picker does not say two columns are up");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the left column is not Main");
   await threadBadge(rowWithId(page, "201")).click();
   await page.settle();
@@ -42449,7 +42598,7 @@ test("`#229 desktop-two-column`: a reload on a wide desk opens the channel in tw
   await page.settle();
   assert.ok(inTwoColumns(page), "the reload forgot two columns");
   assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "true");
-  assert.equal(page.el("thread-select").value, "main");
+  assert.equal(page.el("thread-select").value, "columns");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
   assert.equal(page.el("side-list").hidden, false, "the right column did not open on its list of threads");
   // ...and a narrow window reloads in one column, in the view chosen there.
@@ -42464,20 +42613,50 @@ test("`#229 desktop-two-column`: a reload on a wide desk opens the channel in tw
   assert.equal(narrow.el("thread-select").disabled, false);
 });
 
-test("`#229 desktop-two-column`: in two columns the view picker is greyed and says why, and the view keys say it too", async () => {
+test("`#281 view-keys`: in two columns the view picker says so and chooses, and Ctrl+1 to Ctrl+4 leave them for each view", async () => {
   const page = await threadPage();
   await twoColumns(page);
   const picker = page.el("thread-select");
-  // Greyed, by `aria-disabled` since `#231 two-column-polish`: see its own test below.
-  assert.equal(picker.getAttribute("aria-disabled"), "true");
-  assert.match(picker.title, /^Two columns: Main is on the left and the thread on the right\./);
+  // `#231 two-column-polish` greyed it here; two columns are its fourth view now, in the keys' order.
+  assert.equal(picker.hasAttribute("aria-disabled"), false, "the view picker is still greyed in two columns");
+  assert.equal(picker.value, "columns");
+  assert.deepStrictEqual(threadOptions(page).slice(0, 4),
+    [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["columns", "Two columns"]]);
+  // The bare digits are retired: they type nothing here and change nothing.
   for (const key of ["1", "2", "3"]) {
     const event = await press(page, page.el("scroll-area"), key);
-    assert.equal(event.defaulted, false, `${key} was left to the browser`);
-    assert.match(page.el("status").textContent, /^Two columns: Main is on the left/, `${key} did not say why it did nothing`);
+    assert.equal(event.defaulted, true, `${key} was taken`);
   }
-  assert.equal(page.screen(), "main", "2 opened the Threads screen in two columns");
-  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a view key changed the left column");
+  assert.ok(inTwoColumns(page), "a bare digit changed the layout");
+  // Ctrl+1: one column, Main.
+  let event = await press(page, page.el("scroll-area"), "1", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+1 was left to the browser's tab switch");
+  await page.settle();
+  assert.ok(!inTwoColumns(page), "Ctrl+1 left two columns up");
+  assert.equal(picker.value, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  // Ctrl+4 back, then Ctrl+2: All.
+  await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
+  await page.settle();
+  assert.ok(inTwoColumns(page), "Ctrl+4 did not bring two columns back");
+  assert.equal(picker.value, "columns");
+  event = await press(page, page.el("scroll-area"), "2", { metaKey: true });
+  assert.equal(event.defaulted, false);
+  await page.settle();
+  assert.ok(!inTwoColumns(page));
+  assert.equal(picker.value, "flat");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  // ...and the picker chooses as the keys do.
+  picker.value = "columns";
+  await picker.dispatch("change");
+  await page.settle();
+  assert.ok(inTwoColumns(page), "choosing Two columns in the picker did not give them");
+  picker.value = "threads";
+  await picker.dispatch("change");
+  await page.settle();
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "choosing Thread list did not show it");
+  assert.equal(picker.value, "threads");
+  assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "false", "the layout button still says two columns");
 });
 
 test("`#229 desktop-two-column`: with no thread selected, a card per thread, newest activity at the foot (`#261`), saying the summariser's name and summary or else its first message", async () => {
@@ -42509,14 +42688,16 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
     assert.ok(page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id).hasAttribute("data-card"));
   }
   // Fixed height, three lines, cut with an ellipsis: the stylesheet's, since this fixture lays nothing out.
-  const text = cssBlockIn(TWO_COLUMN_QUERY, ".side-card-text");
+  // Outside the two-column block since `#281 view-keys`: the thread list draws the same cards at any width.
+  const text = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text");
   assert.match(text, /-webkit-line-clamp:\s*3/);
   assert.match(text, /overflow:\s*hidden/);
   assert.match(text, /height:\s*calc\(3 \* 1\.35em\)/, "a card is not a fixed three lines tall");
   // `#257 summary-truncation`, since `#277 thread-card-focus`: save the card highlighted, which shows its
   // whole text, three lines tall at least, so nothing the clamp cuts is out of reach. The card under the
-  // mouse or the keys does not: see `#277`'s own tests below.
-  const whole = cssBlockIn(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
+  // mouse or the keys does not: see `#277`'s own tests below. Outside the two columns' block since `#281
+  // view-keys`, the thread list's cards being the same cards.
+  const whole = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
   assert.match(whole, /-webkit-line-clamp:\s*none/, "the highlighted card is still clamped");
   assert.match(whole, /overflow:\s*visible/, "the highlighted card still hides what runs over");
   assert.match(whole, /(^|[^-])height:\s*auto/, "the highlighted card is still a fixed three lines tall");
@@ -42571,7 +42752,7 @@ test("`#229 desktop-two-column`: every way into a thread selects it on the right
   // Drawn from what the page holds: All was read, and covers both threads.
   assert.deepStrictEqual(readViewsSince(page, reads).filter((view) => view === "thread"), [],
     "a thread the page holds was read again to be selected");
-  assert.equal(page.el("thread-select").value, "main", "selecting on the right moved the view picker");
+  assert.equal(page.el("thread-select").value, "columns", "selecting on the right moved the view picker");
   assert.ok(second);
 });
 
@@ -42974,7 +43155,7 @@ test("`#229 desktop-two-column`: keys for the page — another channel, the Pinn
   await page.settle();
   await page.settle();
   assert.equal(page.el("discord-channel").value, other.id, "Alt+↓ from the right column did not change channel");
-  assert.equal(page.el("thread-select").value, "main", "the left column left Main");
+  assert.equal(page.el("thread-select").value, "columns", "the new channel is not in two columns");
   assert.deepStrictEqual(shownIds(page), ["300"], "the left column did not read the new channel");
   assert.equal(page.el("side-list").hidden, false, "the right column did not go to the new channel's cards");
   assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Message the main channel");
@@ -43217,8 +43398,9 @@ test("`#231 two-column-polish`: a failed refresh of the thread on the right says
   const tag = /<p\s+id="side-freshness"[^>]*>/.exec(HTML_CODE)[0];
   assert.match(tag, /role="status"/);
   assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the line ships on screen, before anything has been read");
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#side-freshness"), /grid-row:\s*2/);
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#side-scroll"), /grid-row:\s*3/,
+  // The right column's own parts, wherever it is drawn: beside Main, or as the thread list (`#281 view-keys`).
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#side-freshness"), /grid-row:\s*2/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#side-scroll"), /grid-row:\s*3/,
     "the list is not placed below the line, so the line hidden would leave the list in the wrong row");
   const { page, server } = await twoColumnServer();
   await threadBadge(rowWithId(page, "201")).click();
@@ -43303,91 +43485,66 @@ test("`#231 two-column-polish` x `#226 page-energy-profile`: with the cards up, 
     "the negative control did not redraw the cards, so the check above proves nothing");
 });
 
-test("`#231 two-column-polish`: the greyed view picker is still a stop for the keys, says why to a screen reader, and a press on it opens nothing and says why", async () => {
-  // Described by a note outside the strip's pack, hidden: a description, not a line of the dock.
+test("`#281 view-keys`: the view picker chooses in two columns, where `#231` greyed it — a picker like any other, and a thread chosen there opens on the right", async () => {
+  // Still described by a note outside the strip's pack, hidden: what it says while the picker is inert.
   const tag = /<select\s+id="thread-select"[^>]*>/.exec(HTML_CODE)[0];
-  assert.match(tag, /aria-describedby="thread-select-note"/, "the picker has no description to say why it is greyed");
+  assert.match(tag, /aria-describedby="thread-select-note"/, "the picker has no description to say why it is inert");
   assert.match(/<p\s+id="thread-select-note"[^>]*>/.exec(HTML_CODE)[0], /(?:^|\s)hidden(?=[\s>])/);
   assert.ok(!markupHolds("bar-pack", "thread-select-note"), "the note is a member of the strip's pack");
-  assert.match(cssBlock('.bar-select[aria-disabled="true"]'), /opacity:\s*0\.45/, "the greyed picker is not drawn greyed");
+  assert.doesNotMatch(SCRIPT_CODE, /pickerGreyed|refuseGreyedPicker/, "the greyed picker's refusals are still there");
   const page = await threadPage();
   const picker = page.el("thread-select");
   const note = page.el("thread-select-note");
-  assert.equal(note.textContent, "", "a picker that chooses carries a reason it is greyed");
   await twoColumns(page);
-  assert.equal(picker.disabled, false, "the greyed picker is disabled, so the keys cannot reach it and a hover may not explain it");
-  assert.equal(picker.getAttribute("aria-disabled"), "true", "the picker does not say it is unavailable");
-  assert.match(note.textContent, /^Two columns: Main is on the left and the thread on the right\./,
-    "the picker's description does not say why it is greyed");
-  // Each key that would open it or choose with it: nothing chosen, the browser kept from it, and why.
-  // Alt+↓ and Alt+↑ open a picker in Chromium and Firefox off a Mac.
-  for (const [key, fields] of [["ArrowDown", {}], [" ", {}], ["Enter", {}], ["End", {}], ["t", {}],
-    ["ArrowDown", { altKey: true }], ["ArrowUp", { altKey: true }]]) {
-    const name = `${fields.altKey ? "Alt+" : ""}${JSON.stringify(key)}`;
-    page.el("status").textContent = "";
-    const event = await press(page, picker, key, fields);
-    assert.equal(event.defaulted, false, `${name} on the greyed picker was left to the browser`);
-    assert.match(page.el("status").textContent, /^Two columns: Main is on the left/, `${name} did not say why`);
-    assert.equal(picker.value, "main");
-  }
-  // Another chord is the browser's, Alt+← its way back among them.
-  page.el("status").textContent = "";
-  const back = await press(page, picker, "ArrowLeft", { altKey: true });
-  assert.equal(back.defaulted, true, "Alt+← on the greyed picker was kept from the browser");
-  assert.equal(page.el("status").textContent, "", "Alt+← on the greyed picker was refused as a press of it");
-  // Escape is still the way off it, back to the list.
+  assert.equal(picker.disabled, false);
+  assert.equal(picker.hasAttribute("aria-disabled"), false, "the picker still says it is unavailable in two columns");
+  assert.equal(note.textContent, "", "a picker that chooses carries a reason it is inert");
+  assert.match(picker.title, /^Which view of the channel to read: Main, All, the thread list, two columns, or one thread\.$/);
+  // Its own keys are its own, as on any picker: the browser opens it and chooses with it.
+  const arrow = await press(page, picker, "ArrowDown");
+  assert.equal(arrow.defaulted, true, "↓ on the picker was kept from the browser");
+  // Escape is the way off it, back to the list.
   await press(page, picker, "Escape");
   assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
-    `Escape on the greyed picker did not go back to the list: ${focusName(page)}`);
-  // A press of the mouse opens nothing and says why.
-  page.el("status").textContent = "";
-  const down = { defaulted: true, preventDefault() { this.defaulted = false; } };
-  await picker.dispatch("mousedown", down);
-  assert.equal(down.defaulted, false, "a press of the mouse opened the greyed picker");
-  assert.match(page.el("status").textContent, /^Two columns: Main is on the left/);
-  // Whatever reaches it chooses nothing: the left column stays Main.
-  picker.value = "flat";
-  await picker.dispatch("change");
-  await page.settle();
-  assert.equal(picker.value, "main", "a choice reached the greyed picker and stood");
-  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a choice on the greyed picker changed the left column");
-  // One column again: a picker that chooses, keys and all, and no reason.
-  await page.el("column-toggle").click();
-  await page.settle();
-  assert.equal(picker.hasAttribute("aria-disabled"), false);
-  assert.equal(note.textContent, "");
-  const arrow = await press(page, picker, "ArrowDown");
-  assert.equal(arrow.defaulted, true, "↓ on a picker that chooses was kept from the browser");
+    `Escape on the picker did not go back to the list: ${focusName(page)}`);
+  // A thread chosen in two columns is selected on the right; the picker goes on saying two columns.
+  const [first] = threadData().threads;
+  await pickThread(page, `thread:${first.id}`);
+  assert.ok(inTwoColumns(page), "choosing a thread left two columns");
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the thread chosen was not selected on the right");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the left column left Main");
+  assert.equal(picker.value, "columns");
+  // All chosen there: one column, All.
+  await pickThread(page, "flat");
+  assert.ok(!inTwoColumns(page));
+  assert.equal(picker.value, "flat");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   // A channel without threads: disabled, as it always was, and its description says why.
   const flat = newPage();
   await signIn(flat);
   await showDiscord(flat, [message({ content: "no threads on this provider" })]);
   assert.equal(flat.el("thread-select").disabled, true);
   assert.match(flat.el("thread-select-note").textContent, /does not offer threads here/);
+  assert.deepStrictEqual(threadOptions(flat), [["main", "Main"]], "a channel without threads offered views it cannot show");
 });
 
-test("`#231 two-column-polish` x `#226 page-energy-profile`: the greyed view picker, tabbed to or pressed, reads nothing", async () => {
-  // A touch on the picker reads the thread list, for the picker to offer. The greyed one opens
-  // nothing, and with a thread open on the right nothing else wants that list.
-  const touched = async (script) => {
-    const { page, server } = await twoColumnServer(null, script);
-    await threadBadge(rowWithId(page, "201")).click();
-    await page.settle();
-    page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
+test("`#281 view-keys` x `#226 page-energy-profile`: a touch on the view picker in two columns reads the thread list at most once a minute", async () => {
+  // A touch on the picker reads the thread list, for the picker to offer, as it does in one column.
+  // Not every touch: the read is reused for a minute, so tabbing past it or opening it again is free.
+  const { page, server } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
+  const picker = page.el("thread-select");
+  const touch = async () => {
     const reads = server.reads.length;
-    const picker = page.el("thread-select");
-    assert.equal(picker.getAttribute("aria-disabled"), "true");
     await picker.dispatch("focus");
     await picker.dispatch("pointerdown", { pointerType: "mouse" });
     await page.settle();
     return server.reads.slice(reads).map((read) => read.view);
   };
-  assert.deepStrictEqual(await touched(SCRIPT), [], "a touch on the greyed picker read something");
-  // The control: the touch read as it is on a picker that chooses. The same touch has to read the
-  // list, or the check above could not see it.
-  const control = await touched(brokenScript("    if (!pickerGreyed()) guardQuietly(refreshThreadDirectory)();",
-    "    guardQuietly(refreshThreadDirectory)();"));
-  assert.deepStrictEqual(control, ["threads"], "the negative control did not read the thread list, so the check above proves nothing");
+  assert.deepStrictEqual(await touch(), ["threads"], "a touch on the picker did not read the thread list for it");
+  assert.deepStrictEqual(await touch(), [], "a second touch within the minute read the thread list again");
 });
 
 /** The top-level bindings of `code` that nothing else in it names: declared, and never used. */
@@ -43569,7 +43726,7 @@ test("`#259 thread-list-unread-filter`: Unread only is a toggle on the right col
   const head = HTML_CODE.slice(HTML_CODE.indexOf('id="side-heading"'));
   assert.ok(head.indexOf('id="side-title"') < head.indexOf('id="side-unread-only"'),
     "the toggle is not beside the heading it filters");
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#side-unread-only[aria-pressed="true"]'), /border-color:\s*var\(--accent\)/,
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '#side-unread-only[aria-pressed="true"]'), /border-color:\s*var\(--accent\)/,
     "pressed, the toggle is not drawn as the bar's filters are");
 
   const { page } = await readThreadColumns(4, [0, 2]);
@@ -43800,7 +43957,7 @@ test("`#261 two-column-connectors`: the links are one SVG over the main screen, 
   assert.match(drawn, /position:\s*absolute/);
   assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link"), /stroke:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
     "a link is not drawn in its thread's colour, as the card's edge is");
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, ".side-card-row"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
     "the card's edge is no longer the colour a link is drawn in");
   // A reduced-motion reader's glide is a jump: the stylesheet says so, and the script reads it.
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--column-glide: auto;/,
@@ -44322,11 +44479,12 @@ const litCards = (page, list = "side-cards") => page.el(list).children
 const cardsUp = (page) => page.el("side-list").hidden === false && page.el("side-pane").hidden === true;
 
 test("`#277 thread-card-focus`: every card stays three lines — under the mouse, the keys' ring and Tab's — and only a highlighted card shows all of it", async () => {
-  const body = mediaBody(TWO_COLUMN_QUERY);
+  // Anywhere in the stylesheet: since `#281 view-keys` the cards' rules stand outside the two columns'
+  // block, for the thread list's cards, which are the same cards across the window.
   for (const lit of ['.side-card-row[data-selected="true"] > .side-card > .side-card-text', ".side-card:focus-visible > .side-card-text"]) {
-    assert.deepStrictEqual(cssRules(body, lit), [], `${lit} still shows the card whole, so the card under the mouse grows`);
+    assert.deepStrictEqual(cssRules(CSS_CODE, lit), [], `${lit} still shows the card whole, so the card under the mouse grows`);
   }
-  const whole = cssBlockIn(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
+  const whole = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
   assert.match(whole, /-webkit-line-clamp:\s*none/, "a highlighted card is still clamped");
   assert.match(whole, /overflow:\s*visible/, "a highlighted card still hides what runs over");
   assert.match(whole, /(^|[^-])height:\s*auto/, "a highlighted card is still a fixed three lines tall");
@@ -44375,8 +44533,9 @@ test("`#277 thread-card-focus`: a click highlights a card and shows it whole wit
 
 test("`#277 thread-card-focus`: while a card is highlighted every other card's edge and unread count, and every other link between the columns, go grey, and the highlighted card's link is drawn over them", async () => {
   const others = ".side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted])";
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, others), /border-left-color:\s*var\(--thread-grey\)/, "the other cards keep their colours");
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, `${others} .side-card-unread`), /color:\s*var\(--muted\)/,
+  // The cards' rules stand outside the two columns' block, for the thread list's too (`#281 view-keys`).
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, others), /border-left-color:\s*var\(--thread-grey\)/, "the other cards keep their colours");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, `${others} .side-card-unread`), /color:\s*var\(--muted\)/,
     "the other cards' unread counts keep the accent");
   assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link[data-dimmed]"), /stroke:\s*var\(--thread-grey\)/,
     "the other links keep their colours");
@@ -49995,7 +50154,7 @@ test("`#262 search-load-older`: Search All goes when two columns come, and a pre
   await all.click();
   await page.settle();
   assert.ok(inTwoColumns(page), "the press left two columns");
-  assert.equal(page.el("thread-select").value, "main", "the press made the left column of two All");
+  assert.equal(page.el("thread-select").value, "columns", "the press made the left column of two All");
   assert.deepStrictEqual(matchedIds(page), [], "the left column of two drew the replies");
   assert.equal(all.hidden, true);
 });

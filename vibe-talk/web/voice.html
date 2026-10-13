@@ -69,13 +69,6 @@
             <path d="M14.5 5 8 12l6.5 7" />
           </svg>
         </button>
-        <!-- `#194 thread-picker-polish`. The Threads screen gets its OWN way back as well: it returns
-             to the channel it lists, at the line the reader left. -->
-        <button id="close-threads" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
-          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14.5 5 8 12l6.5 7" />
-          </svg>
-        </button>
         <span id="topbar-title" class="topbar-title" hidden>Settings</span>
 
         <!--
@@ -549,10 +542,12 @@
             threads ... We need a button on the right hand side thread column to 'exit' (deselect) the
             thread and go back to the list."
 
-            The stylesheet ALONE decides whether it is on screen: web/voice.css draws it only inside the
-            desktop block, at 1000px and wider, while #screen-main carries `data-columns="two"`. Every
-            other window, and every phone, never shows it, so nothing about the one-column page changes.
-            web/voice.js learns whether two columns are in force by asking whether this has a box.
+            The stylesheet ALONE decides whether it is on screen: web/voice.css draws it beside Main only
+            inside the desktop block, at 1000px and wider, while #screen-main carries
+            `data-columns="two"`; and, `#281 view-keys`, on its own across the window at every width, a
+            phone's included, while #screen-main carries `data-columns="list"` — the THREAD LIST, whose
+            cards are these, over the left column. web/voice.js learns which is in force by asking
+            whether this has a box.
 
             The thread is drawn by the SAME code that draws a thread in #scroll-area. Each `side-` id
             below stands in for one of that pane's while web/voice.js works on this column
@@ -833,23 +828,6 @@
             <!-- A send that failed says so HERE, next to the text it did not send, and the text
                  stays in the box. -->
             <p id="reply-state" class="hint" aria-live="polite"></p>
-          </div>
-        </section>
-
-        <!-- ------------------------------------------------------------------ threads screen -->
-        <!--
-          `#194 thread-picker-polish`. Every thread in the channel, where the bar's thread picker
-          lists only one screenful of them and then "… Older threads". Newest activity first, each
-          row named exactly as the picker names it plus the server's one-sentence summary; Load
-          older steps back one server page at a time. Rows are built by `renderThreadDirectory` in
-          web/voice.js; choosing one opens that thread on the channel.
-        -->
-        <section id="screen-threads" class="screen" tabindex="-1" aria-label="Threads" hidden>
-          <p id="thread-directory-state" class="hint" role="status" aria-live="polite"></p>
-          <ul id="thread-directory-list" class="thread-directory" aria-label="Threads in this channel"></ul>
-          <div class="channel-actions">
-            <button id="thread-directory-more" class="secondary" type="button" hidden>Load older</button>
-            <button id="thread-directory-retry" class="secondary" type="button" hidden>Try again</button>
           </div>
         </section>
 
@@ -1745,7 +1723,9 @@
                 off under Keyboard in Settings. Nothing here starts a call, and Esc never marks
                 anything read. Ctrl+S (Cmd+S on a Mac) goes to the message box from anywhere, the
                 search box included, and so does Ctrl+Enter when you are not in a box; it used to
-                open the search, which / and the magnifying glass still do.
+                open the search, which / and the magnifying glass still do. Ctrl+1 to Ctrl+4 (Cmd+1 to
+                Cmd+4 on a Mac) choose the four views — Main, All, the thread list and two columns —
+                from anywhere, a box included; 1, 2 and 3 on their own no longer do.
               </p>
               <div id="keyboard-keys" role="group" aria-label="Keyboard shortcuts"></div>
             </details>
@@ -1996,26 +1976,38 @@
                 nothing unread opens on its newest message, as before.
               </p>
               <p class="hint">
-                <strong>Two columns.</strong> On a desk, in a window at least 1000 pixels wide, the
-                button with two panes beside the view picker puts <strong>Main</strong> on the left and
-                a thread on the right. The view picker greys out: there is nothing left for it to
-                choose. With no thread selected, the right column lists the channel's threads, newest
-                activity at the bottom as in the channel, each as its name and summary when they have
-                been summarised, or else its first message, three lines at most. A click on a card
-                <strong>highlights</strong> it: it shows all of it, and every other card's edge and every
-                other line between the columns go grey, until you click another card, the same one
+                <strong>Four views.</strong> The view picker in the bar, and Ctrl+1 to Ctrl+4 (Cmd on
+                a Mac), choose <strong>Main</strong>, <strong>All</strong>, the <strong>Thread
+                list</strong> and <strong>Two columns</strong>, in that order; below them the picker
+                lists the newest threads to open one directly. Each window remembers the view it was
+                left in. The thread list is a card for each of the channel's threads, across the
+                window, newest activity at the bottom as in the channel, each as its name and summary
+                when they have been summarised, or else its first message, three lines at most;
+                <strong>Unread only</strong> beside its heading narrows the list to the threads with
+                unread replies, and is remembered on this device; <strong>Older threads…</strong> at its
+                top reads further back. A click on a card <strong>highlights</strong> it: it shows all
+                of it, and every other card's edge goes grey, until you click another card, the same one
                 again, or press <kbd>Esc</kbd>. The card's <strong>N replies · M unread</strong> opens
-                its thread, and so does <kbd>→</kbd>, on the highlighted card or the one the keys are
-                on; <kbd>←</kbd> comes back to the cards. <strong>Unread only</strong> beside its
-                heading narrows the list to the threads with unread replies, and is remembered on this
-                device. The search finds a card by its own words or by the replies already loaded for
-                its thread, and says <em>in replies</em> on a card it found only there. A line in each
+                its thread across the window, and so does <kbd>→</kbd>, on the highlighted card or the
+                one the keys are on; Back, <kbd>Esc</kbd> or <kbd>←</kbd> comes back
+                to the list. The search finds a card by its own words or by the replies already loaded
+                for its thread, and says <em>in replies</em> on a card it found only there.
+              </p>
+              <p class="hint">
+                <strong>Two columns.</strong> On a desk, in a window at least 1000 pixels wide, the
+                fourth view — or the button with two panes beside the view picker — puts
+                <strong>Main</strong> on the left and the same thread list on the right, where a
+                thread chosen from it opens in its place. Its cards work as they do in the thread list:
+                a click <strong>highlights</strong> one, and every other card's edge and every other
+                line between the columns go grey, until you click another card, the same one again, or
+                press <kbd>Esc</kbd>; the card's <strong>N replies · M unread</strong>, or <kbd>→</kbd>,
+                opens its thread on the right, and <kbd>←</kbd> comes back to the cards. A line in each
                 thread's colour joins its first message on the left to its card
                 on the right while both are on screen; the highlighted card, or else the message or
                 card you select, draws its line even when the other end is off screen, pointing up or down to it, and if you stay on it
                 for about a second and a half the other column scrolls that end into view. A
                 thread's <strong>Thread(N)</strong>, its <strong>N
-                replies</strong> or <strong>M unread</strong>, the Threads screen and a card's
+                replies</strong> or <strong>M unread</strong>, the view picker and a card's
                 <strong>N replies · M unread</strong> each select the thread on the right; a tap on a message still only opens or folds
                 it. The <strong>×</strong> at the top of the right column goes back to the list. The
                 search, Links and the read mode apply to both columns, and <kbd>[</kbd> and
@@ -2023,11 +2015,14 @@
                 reply</strong> open the reply box at the foot of the column you pressed them in, with
                 the message you are answering edged in the accent where it stands; both columns stay
                 on screen, and <strong>Send reply</strong>, <strong>Cancel</strong> or
-                <kbd>Esc</kbd> puts the column back where it was. A reply that does not go says so on
+                <kbd>Esc</kbd> puts the column back where it was. Ctrl+1 to Ctrl+3 pressed in that box
+                put the reply down, its words kept as a draft, as <strong>Cancel</strong> does, and show
+                the view you chose. A reply that does not go says so on
                 the status line, and that column's <strong>Newest</strong> reads <strong>Reply not
                 sent</strong> until you go down to it and its <strong>Retry</strong>. A narrower window
-                shows one column again, in the view you left it in, and keeps the choice for when the
-                window is wide again; a reply you were writing moves to the reply screen with your words.
+                shows the view two columns were chosen from — the thread list, or one column as you left
+                it — and keeps the choice for when the window is wide again; a reply you were writing
+                moves to the reply screen with your words.
               </p>
               <p class="hint">
                 When the configured chat provider supports it, the row's <strong>⋯</strong> menu
@@ -2476,26 +2471,28 @@
               (every message, threads included), then each thread by name, most recently active
               first. A `select` for the same reason the channel picker is one.
 
-              `#231 two-column-polish`. Greyed in two columns with `aria-disabled`, not `disabled`, as
-              a bar button with nothing to act on is (see web/voice.css): a disabled control is no Tab
-              stop and not reliably a hover target, so the reason it is greyed reached nobody but a
-              mouse that waited on it. It stays a stop, says it is unavailable and why
-              (#thread-select-note), and a press on it opens nothing and says why in the status line.
+              `#281 view-keys`. The VIEW picker: Main, All, the thread list and, on a desk wide
+              enough, two columns — the four views Ctrl+1 to Ctrl+4 (Cmd on a Mac) choose, in their
+              order — then the threads. It chooses in two columns as well, where `#231
+              two-column-polish` had greyed it, so it says which of the four is up wherever the keys
+              can change it. #thread-select-note describes it while it is inert, on a chat service
+              without threads.
             -->
             <select id="thread-select" class="bar-select" aria-label="thread" aria-describedby="thread-select-note"
-                    title="Which part of the channel to read: Main, All, or one thread."></select>
+                    title="Which view of the channel to read: Main, All, the thread list, two columns, or one thread."></select>
 
             <!--
               `#229 desktop-two-column`. One column or two: Main on the left and a thread on the
               right, as other chat clients' desktop apps lay a channel out. Beside the view picker,
-              because in two columns that picker has nothing to choose and greys out. A toggle with a
+              whose fourth view it is (`#281 view-keys`), and pressed whenever that view is chosen;
+              pressed again it goes back to the view two columns were chosen from. A toggle with a
               fixed name and `aria-pressed`, so a screen reader says "Two columns, pressed" once
               rather than a name that changes and a state as well; the tooltip names what a press does.
 
               ONLY ON A DESK WIDE ENOUGH FOR TWO COLUMNS: web/voice.css draws it inside the desktop
               block at 1000px and wider and nowhere else, so a phone and a narrow window never see it.
-              The choice is kept on this device, and a window narrowed below that width shows one
-              column without forgetting it.
+              The choice is kept for this window and the device, and a window narrowed below that
+              width shows one column without forgetting it.
             -->
             <button id="column-toggle" class="bar-button" type="button" aria-pressed="false"
                     aria-label="Two columns" title="Show Main and a thread side by side" hidden>
@@ -2806,7 +2803,8 @@
       </div>
 
       <!--
-        `#231 two-column-polish`. Why the view picker is greyed, when it is: its description
+        `#231 two-column-polish`. Why the view picker is inert, when it is — on a chat service
+        without threads, since `#281 view-keys` made it choose in two columns: its description
         (`aria-describedby`), which a screen reader says with it, focused or read. Hidden, because it
         is a description and not a line of the dock; a description is read from the element it names
         whether or not that is drawn. Outside #bar-pack, whose every member is a control on the

@@ -614,8 +614,7 @@ a.search-hit-link {
    their own scroll — still inside the frame, never the page. */
 #screen-signin,
 #screen-settings,
-#screen-help,
-#screen-threads {
+#screen-help {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0.75rem calc(1rem + env(safe-area-inset-right)) 1rem
@@ -5750,13 +5749,6 @@ a.search-hit-link {
   cursor: not-allowed;
 }
 
-/* `#231 two-column-polish`. And the view picker greyed in two columns, by the same argument: still a
-   Tab stop and a hover target, so the reason it is greyed reaches a keyboard and a screen reader. */
-.bar-select[aria-disabled="true"] {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
 .tray-icon {
   width: 1.15rem;
   height: 1.15rem;
@@ -6486,8 +6478,7 @@ textarea {
      the same column, and never wider than the window less the gutter. */
   #reply-lead,
   #reply-context,
-  #reply-target,
-  #screen-threads {
+  #reply-target {
     max-width: var(--reading-width);
     margin-inline: auto;
   }
@@ -6707,8 +6698,9 @@ textarea {
   }
 }
 
-/* `#229 desktop-two-column`. Never drawn outside the block below: not on a phone, not in a narrow
-   window, not in one column. First, so the block's rules for the same elements are the later ones. */
+/* `#229 desktop-two-column`. Never drawn outside the block below — not on a phone, not in a narrow
+   window, not in one column — but for the right column as the thread list (`#281 view-keys`, after the
+   block). First, so the later rules for the same elements win. */
 #side-column,
 #column-links,
 #column-toggle,
@@ -6732,9 +6724,10 @@ textarea {
 /*
  * `#229 desktop-two-column`. MAIN ON THE LEFT AND A THREAD ON THE RIGHT, on a desk at least 1000px
  * wide, while the reader has chosen two columns (web/voice.js sets `data-columns="two"` on
- * #screen-main then, and only on the channel). Outside this block the right column and the layout
- * button are never drawn — below, unconditionally — so a phone and a narrow window are exactly as they
- * were, and a window narrowed below 1000px falls back to one column by this block ceasing to apply.
+ * #screen-main then, and only on the channel). Outside this block the layout button is never drawn,
+ * nor the right column beside Main — above, unconditionally — so a phone and a narrow window are
+ * exactly as they were, and a window narrowed below 1000px falls back to one column by this block
+ * ceasing to apply.
  *
  * WHY 1000px. Each column then gets about 490px, which after a row's insets holds about 45
  * characters: the narrowest reading width the width setting allows for the page's only column. Any
@@ -6878,110 +6871,10 @@ textarea {
     inset-inline: 0 50%;
   }
 
-  /* The heading names the thread as the picker does — "13h · 16 · its name" — and holds the X. */
-  #side-heading {
-    grid-row: 1;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    box-sizing: border-box;
-    width: 100%;
-    max-width: var(--reading-width);
-    min-height: 2.75rem;
-    margin-inline: auto;
-    padding: 0.35rem 0.75rem;
-    border-bottom: 1px solid var(--edge);
-  }
-
-  #side-facts {
-    flex: none;
-    white-space: pre;
-    color: var(--muted);
-  }
-
-  #side-facts::after {
-    content: " · ";
-  }
-
-  #side-title {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 600;
-  }
-
-  #side-close {
-    flex: none;
-    margin-inline-start: auto;
-  }
-
-  /* `#259 thread-list-unread-filter`. The cards' own filter, at the far end of the heading it narrows,
-     where the X stands over a thread: a quiet chip at rest, and pressed as the bar's filters are, ringed
-     and tinted in the accent with its words in the ink. */
-  #side-unread-only {
-    margin-inline-start: auto;
-  }
-
-  #side-unread-only[aria-pressed="true"] {
-    border-color: var(--accent);
-    color: var(--ink);
-    background: color-mix(in srgb, var(--accent) 18%, var(--panel));
-  }
-
-  /* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its
-     warning colour, but a line of the column rather than a pill floating over it — quiet, and never
-     over a row. Centred under the heading, cut with an ellipsis rather than wrapped. */
-  #side-freshness {
-    grid-row: 2;
-    box-sizing: border-box;
-    width: 100%;
-    max-width: var(--reading-width);
-    margin: 0 auto;
-    padding: 0.25rem 0.75rem;
-    color: var(--muted);
-    font-size: 0.75rem;
-    line-height: var(--freshness-line);
-    text-align: center;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  #side-freshness[data-state="offline"],
-  #side-freshness[data-state="failed"],
-  #side-freshness[data-state="slow"] {
-    color: var(--warn);
-  }
-
-  /* The right column's one scrolling element, built as #scroll-area is: its size is its cell's. */
-  #side-scroll {
-    grid-row: 3;
-    contain: size layout;
-    min-height: 0;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    padding: 0.35rem 0.75rem 0.5rem;
-  }
-
-  #side-list,
-  #side-pane {
-    max-width: var(--reading-width);
-    margin-inline: auto;
-  }
-
-  #side-tools {
-    position: absolute;
-    z-index: 2;
-    left: 50%;
-    /* Standing on a reply open at the foot of the column (`#277 reply-in-column`): web/voice.js writes
-       how far above the column's foot its top edge is, and 0 when there is none. */
-    bottom: calc(0.5rem + var(--side-reply-room, 0px));
-    width: calc(min(var(--reading-width), 100%) - 1.2rem);
-    transform: translateX(-50%);
-    display: flex;
-    pointer-events: none;
+  /* `#261 two-column-connectors`. In two columns the cards stand a little further from the divider than
+     the column's own inset, so that a few of the links' lanes fit in the gap beside their arrowheads. */
+  #screen-main[data-columns="two"] .side-cards {
+    margin-inline-start: 1.25rem;
   }
 
   /*
@@ -7018,143 +6911,310 @@ textarea {
   #side-reply #reply-text {
     max-height: max(5rem, 25vh);
   }
+}
 
-  /* The threads, one card each, every card the same height: three lines of what the thread is
-     about, clamped with an ellipsis, then how long since it moved beside the button into it — save the
-     card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
-  /* `#261 two-column-connectors`. A little further from the divider than the column's own inset, so
-     that a few of the links' lanes fit in the gap beside their arrowheads. */
-  .side-cards {
-    display: grid;
-    gap: 0.45rem;
-    margin: 0.2rem 0 0.6rem 1.25rem;
-    padding: 0;
-    list-style: none;
-  }
+/*
+ * `#229 desktop-two-column`, `#281 view-keys`. THE RIGHT COLUMN'S OWN PARTS — its heading, the line
+ * saying how old its rows are, its scroller, its jump, and the thread list's cards — wherever the
+ * column is drawn: beside Main in the block above, or on its own as the thread list below, at every
+ * width. Outside both, #side-column is not drawn, and none of this shows.
+ */
 
-  /* `#277 thread-card-focus`. The row is the card, its surface and its edge: its first button, what the
-     thread is about, spans it, and under that its facts and the button into the thread share a line.
-     A press anywhere on it but that button highlights it, so all of it says it can be pressed. */
-  .side-card-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 0.3rem 0.6rem;
-    box-sizing: border-box;
-    padding: 0 0.6rem 0.45rem 0;
-    background: var(--panel);
-    border: 1px solid var(--edge);
-    border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
-    border-radius: 0.6rem;
-    cursor: pointer;
-  }
+/* The heading names the thread as the picker does — "13h · 16 · its name" — and holds the X. */
+#side-heading {
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--reading-width);
+  min-height: 2.75rem;
+  margin-inline: auto;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--edge);
+}
 
-  .side-card {
-    grid-column: 1 / -1;
-    display: block;
-    box-sizing: border-box;
-    width: 100%;
-    padding: 0.55rem 0.75rem 0;
-    background: transparent;
-    color: inherit;
-    border: 0;
-    border-radius: 0.6rem 0.6rem 0 0;
-    font: inherit;
-    text-align: start;
-    cursor: pointer;
-  }
+#side-facts {
+  flex: none;
+  white-space: pre;
+  color: var(--muted);
+}
 
-  /* `#239 single-selection`. The selected card is lit as a selected message is, by `data-selected`
-     alone and whether the mouse or the keys chose it: a `:hover` here was a second lit card beside
-     the keys' one. The card's own buttons keep the browser's ring for the Tab that lands on them. */
-  .side-card-row[data-selected="true"] {
-    border-color: var(--accent);
-    border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
+#side-facts::after {
+  content: " · ";
+}
 
-  /* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
-  .side-card-row[data-highlighted] {
-    border-color: hsl(var(--thread-hue, 210) 55% 50%);
-    background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
-  }
+#side-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
 
-  /* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
-     filters hide greys nothing. */
-  .side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) {
-    border-left-color: var(--thread-grey);
-  }
+#side-close {
+  flex: none;
+  margin-inline-start: auto;
+}
 
-  .side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread {
-    color: var(--muted);
-  }
+/* `#259 thread-list-unread-filter`. The cards' own filter, at the far end of the heading it narrows,
+   where the X stands over a thread: a quiet chip at rest, and pressed as the bar's filters are, ringed
+   and tinted in the accent with its words in the ink. */
+#side-unread-only {
+  margin-inline-start: auto;
+}
 
-  .side-card-text {
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
-    overflow: hidden;
-    height: calc(3 * 1.35em);
-    line-height: 1.35;
-    overflow-wrap: anywhere;
-  }
+#side-unread-only[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
 
-  /* `#257 summary-truncation`, made `#277 thread-card-focus`. Three lines keep the list even, but a name
-     and a summary longer than three lines of this column were cut by the clamp with no way to read the
-     rest short of opening the thread, whose heading gives only the name. The card the reader was on
-     showed its whole text, and under a moving mouse that was a card growing and shrinking at every
-     move; the owner: "I also don't like the cards expanding." So the card HIGHLIGHTED, by a press,
-     shows it, and no other. Still three lines at least, so a short card does not shrink as it is. */
-  .side-card-row[data-highlighted] > .side-card > .side-card-text {
-    display: block;
-    -webkit-line-clamp: none;
-    line-clamp: none;
-    overflow: visible;
-    height: auto;
-    min-height: calc(3 * 1.35em);
-  }
+/* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its
+   warning colour, but a line of the column rather than a pill floating over it — quiet, and never
+   over a row. Centred under the heading, cut with an ellipsis rather than wrapped. */
+#side-freshness {
+  grid-row: 2;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--reading-width);
+  margin: 0 auto;
+  padding: 0.25rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: var(--freshness-line);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-  .side-card-facts {
-    grid-column: 1;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0 0.6rem;
-    padding-inline-start: 0.75rem;
-    color: var(--muted);
-    font-size: 0.8rem;
-  }
+#side-freshness[data-state="offline"],
+#side-freshness[data-state="failed"],
+#side-freshness[data-state="slow"] {
+  color: var(--warn);
+}
 
-  /* `#277 thread-card-focus`. The way into the thread, "3 replies · 2 unread": a chip at the foot of the
-     card, on its facts' line, in their size. */
-  .side-card-open {
-    grid-column: 2;
-    min-height: 1.75rem;
-    padding: 0.15rem 0.6rem;
-    background: transparent;
-    color: var(--ink);
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    font: inherit;
-    font-size: 0.8rem;
-    white-space: nowrap;
-    cursor: pointer;
-  }
+/* The right column's one scrolling element, built as #scroll-area is: its size is its cell's. */
+#side-scroll {
+  grid-row: 3;
+  contain: size layout;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.35rem 0.75rem 0.5rem;
+}
 
-  .side-card-unread {
-    color: var(--accent);
-    font-weight: 600;
-  }
+#side-list,
+#side-pane {
+  max-width: var(--reading-width);
+  margin-inline: auto;
+}
 
-  /* Found by the search in the thread's replies rather than the card's own words: said quietly. */
-  .side-card-hint {
-    font-style: italic;
-  }
+#side-tools {
+  position: absolute;
+  z-index: 2;
+  left: 50%;
+  /* Standing on a reply open at the foot of the column (`#277 reply-in-column`): web/voice.js writes
+     how far above the column's foot its top edge is, and 0 when there is none. */
+  bottom: calc(0.5rem + var(--side-reply-room, 0px));
+  width: calc(min(var(--reading-width), 100%) - 1.2rem);
+  transform: translateX(-50%);
+  display: flex;
+  pointer-events: none;
+}
 
-  #side-more-threads {
-    margin: 0 auto 0.6rem;
-    display: block;
+/* The threads, one card each, every card the same height: three lines of what the thread is
+   about, clamped with an ellipsis, then how long since it moved beside the button into it — save the
+   card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
+.side-cards {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.2rem 0 0.6rem;
+  padding: 0;
+  list-style: none;
+}
+
+/* `#277 thread-card-focus`. The row is the card, its surface and its edge: its first button, what the
+   thread is about, spans it, and under that its facts and the button into the thread share a line.
+   A press anywhere on it but that button highlights it, so all of it says it can be pressed. */
+.side-card-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  box-sizing: border-box;
+  padding: 0 0.6rem 0.45rem 0;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-radius: 0.6rem;
+  cursor: pointer;
+}
+
+.side-card {
+  grid-column: 1 / -1;
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.55rem 0.75rem 0;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-radius: 0.6rem 0.6rem 0 0;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+/* `#239 single-selection`. The selected card is lit as a selected message is, by `data-selected`
+   alone and whether the mouse or the keys chose it: a `:hover` here was a second lit card beside
+   the keys' one. The card's own buttons keep the browser's ring for the Tab that lands on them. */
+.side-card-row[data-selected="true"] {
+  border-color: var(--accent);
+  border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
+.side-card-row[data-highlighted] {
+  border-color: hsl(var(--thread-hue, 210) 55% 50%);
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+}
+
+/* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
+   filters hide greys nothing. */
+.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) {
+  border-left-color: var(--thread-grey);
+}
+
+.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread {
+  color: var(--muted);
+}
+
+.side-card-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  height: calc(3 * 1.35em);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+/* `#257 summary-truncation`, made `#277 thread-card-focus`. Three lines keep the list even, but a name
+   and a summary longer than three lines of this column were cut by the clamp with no way to read the
+   rest short of opening the thread, whose heading gives only the name. The card the reader was on
+   showed its whole text, and under a moving mouse that was a card growing and shrinking at every
+   move; the owner: "I also don't like the cards expanding." So the card HIGHLIGHTED, by a press,
+   shows it, and no other. Still three lines at least, so a short card does not shrink as it is. */
+.side-card-row[data-highlighted] > .side-card > .side-card-text {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  overflow: visible;
+  height: auto;
+  min-height: calc(3 * 1.35em);
+}
+
+.side-card-facts {
+  grid-column: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.6rem;
+  padding-inline-start: 0.75rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* `#277 thread-card-focus`. The way into the thread, "3 replies · 2 unread": a chip at the foot of the
+   card, on its facts' line, in their size. */
+.side-card-open {
+  grid-column: 2;
+  min-height: 1.75rem;
+  padding: 0.15rem 0.6rem;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.side-card-unread {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Found by the search in the thread's replies rather than the card's own words: said quietly. */
+.side-card-hint {
+  font-style: italic;
+}
+
+#side-more-threads {
+  margin: 0 auto 0.6rem;
+  display: block;
+}
+
+/*
+ * `#281 view-keys`. THE THREAD LIST: the right column on its own, across the window, at every width,
+ * while #screen-main carries `data-columns="list"` (web/voice.js, `renderColumns`). The owner wanted
+ * the thread list "converged with the two-column rendering of threads on the right", so it IS that
+ * column — its heading, Unread only, its freshness line, Older threads and its cards — drawn in the
+ * list's own cell over the left column, which stays laid out behind it, out of sight, so that coming
+ * back to it finds the reader where they were. The pill speaks for that column and is put out of sight
+ * with it; the search glass stays on the line over the head of the list, which makes room for it as
+ * the left column's pane does (`#pane-discord[data-freshness]`), and for the bar when it is open. The
+ * filters about messages — Pinned, Links, whose — have nothing to filter among cards and are not shown.
+ */
+#screen-main[data-columns="list"] > #side-column {
+  display: grid;
+  grid-row: 3;
+  grid-column: 1;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+  position: relative;
+  /* Under the floating line (the anchor is 2), over the column behind. */
+  z-index: 1;
+  padding-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
+}
+
+#screen-main[data-columns="list"][data-searching] > #side-column {
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
+}
+
+#screen-main[data-columns="list"] > #scroll-area,
+#screen-main[data-columns="list"] > #scroll-tools,
+#screen-main[data-columns="list"] #channel-freshness {
+  visibility: hidden;
+}
+
+#screen-main[data-columns="list"] > #width-grip,
+#screen-main[data-columns="list"] #pinned-filter,
+#screen-main[data-columns="list"] #links-filter,
+#screen-main[data-columns="list"] #author-filter,
+#screen-main[data-columns="list"] #link-kinds {
+  display: none;
+}
+
+/* On a phone the column reaches the screen's edges, past a notch's inset. */
+#screen-main[data-columns="list"] #side-scroll {
+  padding-inline: calc(0.75rem + env(safe-area-inset-left)) calc(0.75rem + env(safe-area-inset-right));
+}
+
+/* `#279 thread-card-focus`, under a finger: a card's way into its thread, "3 replies · 2 unread", is a
+   thumb's height, as a bar button is, where the desk's chip is the height of the facts beside it. */
+@media (pointer: coarse) {
+  #screen-main[data-columns="list"] .side-card-open {
+    min-height: 2.75rem;
+    padding-inline: 0.75rem;
   }
 }
 
@@ -7251,51 +7311,4 @@ textarea {
   flex: 0 0 auto;
   min-height: 2.75rem;
   min-width: 4rem;
-}
-
-/* ------------------------------------------------------------------------ the threads screen -- */
-/*
- * `#194 thread-picker-polish`. Every thread in the channel, one row each: "age · replies · name" in
- * the thread picker's own words, and the server's one-sentence summary under it when there is one.
- * A document like Settings, so it scrolls itself (with the secondary screens, above), inside the
- * frame and never the page. The whole row is the target, a thumb's height at least, and the name
- * wraps rather than running off a phone.
- */
-
-.thread-directory {
-  list-style: none;
-  margin: 0.4rem 0 0;
-  padding: 0;
-}
-
-.thread-directory li {
-  border-bottom: 1px solid var(--edge);
-}
-
-.thread-directory-open {
-  display: grid;
-  gap: 0.2rem;
-  width: 100%;
-  min-height: 2.75rem;
-  text-align: start;
-  background: transparent;
-  color: inherit;
-  border: 0;
-  padding: 0.55rem 0.25rem;
-}
-
-/* The thread already open, marked as the picker marks it: by being the current one. */
-.thread-directory-open[aria-current="true"] {
-  box-shadow: inset 3px 0 0 var(--accent);
-  padding-inline-start: 0.65rem;
-}
-
-.thread-directory-label {
-  overflow-wrap: anywhere;
-}
-
-.thread-directory-summary {
-  color: var(--muted);
-  font-size: 0.85rem;
-  overflow-wrap: anywhere;
 }

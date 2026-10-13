@@ -3,7 +3,8 @@
 
 `#229 desktop-two-column`. The owner, 2026-10-09: other chat clients' desktop apps give him a
 two-column view of a channel and he uses it a lot, so on a desk the dock gets a layout button: Main in
-the left column and a thread in the right, the view picker greyed out, and with no thread selected a
+the left column and a thread in the right, the view picker greyed out (until `#281 view-keys` made two
+columns its fourth view), and with no thread selected a
 list of the threads, a few lines each; the way into a thread on a message selects it on the right, and
 an X goes back to the list. The fake-DOM suite (tests/js/voice_page.test.mjs) pins what the page does;
 it lays nothing out, so it cannot say where the columns are. This does: the layout the stylesheet
@@ -15,9 +16,11 @@ desk size, with a mouse:
 
   sign in and open the channel, in All -> the layout button is drawn in the dock and pressed: two
   columns side by side, inside the window, neither overlapping the other, each at least 440px wide;
-  the view picker greyed out and the reading-width handle gone -> the greyed picker still takes the
-  focus, and a real down arrow and a real click on it choose nothing and say why (`#231
-  two-column-polish`); the right column is one region, named "Threads" -> the right column lists the
+  the view picker saying "Two columns" and the reading-width handle gone -> `#281 view-keys`: the
+  picker chooses there, where `#231 two-column-polish` greyed it: the thread list chosen from it is the
+  right column alone, across the window, its heading clear of the search glass and the left column
+  out of sight; a real Ctrl+2 is one column in All, and a real Ctrl+4 two columns again; the right
+  column is one region, named "Threads" -> the right column lists the
   threads as cards, newest activity at the foot (`#261 two-column-connectors`), every card the same
   height, the summarised one saying its name and summary, the long first message cut to three lines,
   still three lines under the mouse and shown whole on the card a click highlights (`#257
@@ -153,8 +156,8 @@ LAYOUT_JS = """() => {
         left: box('scroll-area'), right: box('side-column'), scroller: box('side-scroll'),
         toggle: box('column-toggle'), grip: box('width-grip'), dock: box('dock'),
         pressed: document.getElementById('column-toggle').getAttribute('aria-pressed'),
-        picker: {greyed: document.getElementById('thread-select').getAttribute('aria-disabled') === 'true'
-                         && !document.getElementById('thread-select').disabled,
+        picker: {greyed: document.getElementById('thread-select').hasAttribute('aria-disabled')
+                         || document.getElementById('thread-select').disabled,
                  value: document.getElementById('thread-select').value},
         overflow: document.documentElement.scrollWidth - window.innerWidth,
         windowWidth: window.innerWidth,
@@ -306,7 +309,8 @@ class Layout:
         return self.found[name]
 
     def picker(self) -> tuple[bool, str]:
-        """Whether the view picker is greyed (`aria-disabled`, still a stop for the keys), and its value."""
+        """Whether the view picker is greyed or disabled (it is neither on a channel with threads since
+        `#281 view-keys`), and its value."""
         part = self.found["picker"]
         assert isinstance(part, dict)
         return bool(part["greyed"]), str(part["value"])
@@ -346,35 +350,58 @@ def columns_walk(desk: Desk) -> None:
     desk.check(abs(left["top"] - right["top"]) < 80 and min(left["height"], right["height"]) > desk.height / 2,
                f"the columns are not side by side down the window: {left} {right}")
     greyed, value = two.picker()
-    desk.check(greyed and value == "main", f"the view picker is not greyed on Main: {greyed} {value}")
+    desk.check(not greyed and value == "columns", f"the view picker does not say two columns: {greyed} {value}")
     desk.check(not two.drawn("grip"), "the reading-width handle is still drawn in two columns")
     desk.check(float(str(two.value("overflow"))) <= 0, "the page scrolls sideways in two columns")
     desk.check(desk.rows("discord-log") == [str(200 + i) for i in range(24) if i not in (4, 6, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21)],
                f"the left column is not Main: {desk.rows('discord-log')}")
-    desk.notes.append(f"two columns side by side, {left['width']:.0f}px and {right['width']:.0f}px, the picker greyed")
+    desk.notes.append(f"two columns side by side, {left['width']:.0f}px and {right['width']:.0f}px, the picker saying so")
 
-    # `#231 two-column-polish`. The greyed picker is still a stop for the keys, and a real ↓ or a real
-    # click on it chooses nothing and says why; the right column is one region, named for its cards.
-    page.focus("#thread-select")
-    desk.check(page.evaluate("() => document.activeElement && document.activeElement.id") == "thread-select",
-               "the greyed view picker cannot hold the focus, so the keys cannot reach its reason")
-    page.keyboard.press("ArrowDown")
-    # The mouse, at the picker's middle: Playwright's own click refuses a control that says it is
-    # unavailable, which is the state under test.
-    picker_box = page.locator("#thread-select").bounding_box()
-    desk.check(picker_box is not None, "the greyed view picker is not drawn")
-    assert picker_box is not None
-    page.mouse.click(picker_box["x"] + picker_box["width"] / 2, picker_box["y"] + picker_box["height"] / 2)
-    desk.wait_for("() => document.getElementById('status').textContent.startsWith('Two columns: Main is on the left')",
-                  "a press on the greyed picker did not say why it is greyed")
-    desk.check(page.evaluate("() => document.getElementById('thread-select').value") == "main",
-               "a press on the greyed picker chose another view")
-    page.keyboard.press("Escape")
+    # `#281 view-keys`. The picker chooses in two columns: its four views first, in the keys' order. The
+    # thread list chosen from it is the right column on its own, across the window, the same cards, its
+    # heading clear of the search glass floating over the head of the list, and the left column out of
+    # sight. Then a real Ctrl+2 is one column in All, and a real Ctrl+4 two columns again, from All.
+    offered = page.evaluate("() => [...document.getElementById('thread-select').options].slice(0, 4).map((o) => o.value)")
+    desk.check(offered == ["main", "flat", "threads", "columns"], f"the picker does not offer the four views in order: {offered}")
+    page.select_option("#thread-select", "threads")
+    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
+                  " && document.querySelectorAll('#side-cards > li').length === 3",
+                  "choosing the thread list did not show it")
+    desk.settled()
+    listed = desk.layout()
+    whole = listed.box("right")
+    desk.check(whole["left"] <= 1 and whole["right"] >= desk.width - 1,
+               f"the thread list does not span the window: {whole}")
+    desk.check(page.evaluate("() => getComputedStyle(document.getElementById('scroll-area')).visibility") == "hidden",
+               "the left column shows through the thread list")
+    glass = page.locator("#search-toggle").bounding_box()
+    heading = page.locator("#side-heading").bounding_box()
+    assert glass is not None and heading is not None
+    desk.check(glass["y"] + glass["height"] <= heading["y"] + 1,
+               f"the search glass covers the thread list's heading: {glass} {heading}")
+    desk.check(not listed.drawn("grip"), "the reading-width handle is drawn over the thread list")
+    desk.check(float(str(listed.value("overflow"))) <= 0, "the page scrolls sideways in the thread list")
+    desk.check(listed.value("pressed") == "false", "the layout button still says two columns over the thread list")
+    desk.shot("1-thread-list")
+    page.keyboard.press("Control+2")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'flat'"
+                  " && document.getElementById('side-column').getClientRects().length === 0"
+                  " && document.querySelectorAll('#discord-log > li[data-id]').length === 24",
+                  "a real Ctrl+2 did not choose All in one column")
+    page.keyboard.press("Control+4")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'columns'"
+                  " && document.getElementById('side-column').getClientRects().length > 0"
+                  " && document.querySelectorAll('#discord-log > li[data-id]').length === 11"
+                  " && document.querySelectorAll('#side-cards > li').length === 3",
+                  "a real Ctrl+4 did not bring two columns back")
+    desk.settled()
+    desk.notes.append(f"the picker chose the thread list, {whole['width']:.0f}px across the window, its heading "
+                      "clear of the glass; Ctrl+2 was All in one column and Ctrl+4 two columns again")
     regions = page.evaluate("() => [...document.querySelectorAll('#side-column, #side-column [role=region]')]"
                             ".filter((node) => node.getAttribute('role') === 'region')"
                             ".map((node) => [node.id, node.getAttribute('aria-label')])")
     desk.check(regions == [["side-scroll", "Threads"]], f"the right column is not one region named for its cards: {regions}")
-    desk.notes.append("the greyed picker took the focus and refused ↓ and a click, saying why; one region on the right")
+    desk.notes.append("one region on the right")
 
     # The cards: newest activity at the foot (`#261 two-column-connectors`), one height, the summarised
     # one by its name and summary, and the long question cut to three lines.
@@ -482,14 +509,14 @@ def columns_walk(desk: Desk) -> None:
                   "one column again is not All, the view the channel was in")
     narrow = desk.layout()
     greyed, value = narrow.picker()
-    desk.check(not greyed and value == "flat", f"the view picker is still greyed in one column: {greyed} {value}")
+    desk.check(not greyed and value == "flat", f"the view picker does not say All in one column: {greyed} {value}")
     desk.check(not narrow.drawn("toggle"), "the layout button is drawn at 900px")
     desk.check(narrow.drawn("grip"), "the reading-width handle did not come back")
     page.set_viewport_size({"width": desk.width, "height": desk.height})
     # The stylesheet draws the right column the moment the window is wide again; the page decides two
-    # columns at the next frame, and its picker greying out is what says it has.
+    # columns at the next frame, and its picker saying so is what says it has.
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
-                  " && document.getElementById('thread-select').getAttribute('aria-disabled') === 'true'"
+                  " && document.getElementById('thread-select').value === 'columns'"
                   " && document.querySelectorAll('#discord-log > li[data-id]').length === 11",
                   "widening the window again did not bring two columns back")
     desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 4",
@@ -709,7 +736,7 @@ def links_walk(desk: Desk) -> None:
     page = desk.page
     page.set_viewport_size({"width": desk.width, "height": desk.height})
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
-                  " && document.getElementById('thread-select').getAttribute('aria-disabled') === 'true'",
+                  " && document.getElementById('thread-select').value === 'columns'",
                   "two columns did not come back for the links")
     page.click("#side-close")
     desk.wait_for("() => !document.getElementById('side-list').hidden", "the X did not go back to the cards")
@@ -966,7 +993,7 @@ def older_walk(desk: Desk, api: OlderApi, touch: bool) -> None:
         page.click("#column-toggle")
         desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0",
                       "pressing the layout button did not draw the right column")
-        desk.wait_for("() => document.getElementById('thread-select').value === 'main' && "
+        desk.wait_for("() => document.getElementById('thread-select').value === 'columns' && "
                       "document.querySelectorAll('#discord-log > li[data-id]').length > 0",
                       "the left column is not Main")
     desk.settled()

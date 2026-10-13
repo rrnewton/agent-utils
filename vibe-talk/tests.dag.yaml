@@ -376,9 +376,12 @@ steps:
   # server and moves on to the next unread, PgDn brings the ring to the page, Enter folds, and -> enters
   # a thread that <- and Esc leave, back on the message it was opened from; Ctrl+K opens the channel
   # picker, Esc leaves it for the list, a channel chosen from it gives the keys back to the list, and
-  # Help left by "," after "?" still goes back to Settings from Settings. Measured under dagrun on
-  # 2026-10-09 on a host at load 220: 27s wall (most of it waiting for each animated scroll to come to
-  # rest), 6.4s CPU, a 358MB peak.
+  # Help left by "," after "?" still goes back to Settings from Settings; `#281 view-keys`: Ctrl+1 to
+  # Ctrl+4, and Cmd in a second tab emulating a Mac, choose Main, All, the thread list and two columns
+  # from the message box, the search and a card, the browser's default refused and no digit typed.
+  # Measured under dagrun on 2026-10-09 on a host at load 220: 27s wall (most of it waiting for each
+  # animated scroll to come to rest), 6.4s CPU, a 358MB peak; the view keys added about 3s of 65s wall
+  # on 2026-10-13, outside dagrun on a busier host.
   - group: check
     job: keyboard-browser
     desc: the scroll, search and Settings keys and the keymap pressed through CDP in current Chromium at 1280x800
@@ -395,7 +398,9 @@ steps:
 
   # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column
   # side by side inside the window at 1440x900 and 1280x800, neither under 440px, the view picker
-  # greyed and the width handle gone; the right column's cards are one height, newest activity at the foot,
+  # saying so and the width handle gone; `#281 view-keys`: the thread list chosen from the picker is the
+  # right column across the window, its heading clear of the glass, and real Ctrl+2 and Ctrl+4 leave two
+  # columns for All and come back; the right column's cards are one height, newest activity at the foot,
   # the summarised thread by its name and summary and the long question cut to three lines, still three
   # under the mouse and whole once a click highlights it (`#277 thread-card-focus`); a card's replies
   # button and a Main message's Thread(N) select a thread on the right under its name, each column scrolls
