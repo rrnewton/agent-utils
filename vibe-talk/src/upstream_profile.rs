@@ -442,8 +442,9 @@ impl ProviderProfile {
     }
 
     /// Count the content bytes of each of `messages`.
-    pub fn record_content(&self, messages: &[Message]) {
-        if messages.is_empty() {
+    pub fn record_content<'m>(&self, messages: impl IntoIterator<Item = &'m Message>) {
+        let mut messages = messages.into_iter().peekable();
+        if messages.peek().is_none() {
             return;
         }
         let mut tallies = self.lock();
@@ -895,8 +896,8 @@ trait Rows {
     fn rows(&self) -> usize {
         0
     }
-    fn messages(&self) -> &[Message] {
-        &[]
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        std::iter::empty()
     }
 }
 
@@ -904,8 +905,8 @@ impl Rows for Vec<Message> {
     fn rows(&self) -> usize {
         self.len()
     }
-    fn messages(&self) -> &[Message] {
-        self
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.iter()
     }
 }
 
@@ -913,8 +914,8 @@ impl Rows for Message {
     fn rows(&self) -> usize {
         1
     }
-    fn messages(&self) -> &[Message] {
-        std::slice::from_ref(self)
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        std::iter::once(self)
     }
 }
 
@@ -922,8 +923,8 @@ impl Rows for crate::threads::TimelinePage {
     fn rows(&self) -> usize {
         self.messages.len() + self.threads.len()
     }
-    fn messages(&self) -> &[Message] {
-        &self.messages
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter()
     }
 }
 
@@ -931,7 +932,7 @@ impl Rows for crate::timeline_forward::GenericDelta {
     fn rows(&self) -> usize {
         self.page.rows()
     }
-    fn messages(&self) -> &[Message] {
+    fn messages(&self) -> impl Iterator<Item = &Message> {
         self.page.messages()
     }
 }
@@ -940,8 +941,8 @@ impl Rows for RecentRead {
     fn rows(&self) -> usize {
         self.messages.len()
     }
-    fn messages(&self) -> &[Message] {
-        &self.messages
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter()
     }
 }
 
@@ -949,8 +950,20 @@ impl Rows for crate::chat::RangeRead {
     fn rows(&self) -> usize {
         self.messages.len()
     }
-    fn messages(&self) -> &[Message] {
-        &self.messages
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter()
+    }
+}
+
+impl Rows for Vec<crate::chat::Lookup> {
+    fn rows(&self) -> usize {
+        self.messages().count()
+    }
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.iter().filter_map(|lookup| match lookup {
+            crate::chat::Lookup::Found(message) => Some(message.as_ref()),
+            crate::chat::Lookup::Absent | crate::chat::Lookup::Unseen => None,
+        })
     }
 }
 
@@ -1246,6 +1259,32 @@ impl ChatClient for ProfiledClient {
                 .fetch_range(channel, scope, range, order, limit, cursor),
         )
         .await
+    }
+
+    async fn fetch_messages(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
+        // Timed under what it costs upstream. A provider without a lookup of its own is asked
+        // exactly the reads the trait's default is made of (`Support::Emulated` says the default
+        // answers), so the default runs HERE and each of those reads is timed as itself, as it was
+        // before this method existed; only a native lookup is `fetch_messages`.
+        // remote-ops-audit W11 `#287 bulk-reads`.
+        match self.inner.read_caps(channel).by_ids {
+            crate::chat::Support::Native => {
+                self.timed(
+                    "fetch_messages",
+                    Direction::Read,
+                    self.inner.fetch_messages(channel, thread, ids),
+                )
+                .await
+            }
+            crate::chat::Support::Emulated => {
+                crate::chat::emulated_messages(self, channel, thread, ids).await
+            }
+        }
     }
 
     async fn post_message(

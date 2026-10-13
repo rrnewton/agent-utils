@@ -293,6 +293,7 @@ impl ChatClient for Native {
         ReadCaps {
             range: Support::Native,
             page_rows: 20,
+            ..ReadCaps::default()
         }
     }
 
@@ -528,6 +529,7 @@ async fn slack_reads_a_window_newest_first_in_one_call_per_page_it_holds() {
         ReadCaps {
             range: Support::Native,
             page_rows: 20,
+            ..ReadCaps::default()
         }
     );
     let read = client

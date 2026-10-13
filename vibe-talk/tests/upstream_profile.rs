@@ -22,8 +22,9 @@ use serde_json::Value;
 use slack_fake::{profiled, ts, Fake, FakeState, METHODS, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
-    ChatClient, ChatError, ChatIdentity, PostLimit, RangeOrder, RangeRead, ReadCaps, ReadScope,
-    RecentRead, RegisteredChannel, SourceClaim, Support, TimeRange, UpstreamClearOutcome,
+    ChatClient, ChatError, ChatIdentity, Lookup, PostLimit, RangeOrder, RangeRead, ReadCaps,
+    ReadScope, RecentRead, RegisteredChannel, SourceClaim, Support, TimeRange,
+    UpstreamClearOutcome,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -431,6 +432,7 @@ impl ChatClient for Recorder {
         self.note("read_caps");
         ReadCaps {
             range: Support::Native,
+            by_ids: Support::Native,
             page_rows: 7,
         }
     }
@@ -450,6 +452,25 @@ impl ChatClient for Recorder {
             exhausted: true,
             as_of: None,
         })
+    }
+    async fn fetch_messages(
+        &self,
+        _channel: &ChannelId,
+        _thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<Lookup>, ChatError> {
+        self.note("fetch_messages");
+        Ok(ids
+            .iter()
+            .enumerate()
+            .map(|(n, _)| {
+                if n == 0 {
+                    Lookup::Found(Box::new(self.message.clone()))
+                } else {
+                    Lookup::Absent
+                }
+            })
+            .collect())
     }
     async fn post_message(
         &self,
@@ -650,6 +671,22 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         calls.remove(0);
     }
     ran("fetch_range");
+    let looked = client
+        .fetch_messages(
+            &channel,
+            Some("t"),
+            &[id.clone(), MessageId("gone".to_owned())],
+        )
+        .await
+        .expect("lookup");
+    assert_eq!(looked[1], Lookup::Absent);
+    // As for a range read: the profiler asks whether the lookup is the provider's own.
+    {
+        let mut calls = recorder.calls.lock().expect("calls");
+        assert_eq!(calls.first(), Some(&"read_caps"), "{calls:?}");
+        calls.remove(0);
+    }
+    ran("fetch_messages");
     client
         .post_message(&channel, "hi", None)
         .await
@@ -727,10 +764,12 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         "an empty directory page"
     );
     assert_eq!(rows("fetch_range"), Some(1));
-    // Eight reads each return the one message; posts return ours and are not counted.
+    assert_eq!(rows("fetch_messages"), Some(1), "a found message is a row");
+    // Nine reads each return the one message (a lookup's absent id is no message); posts return
+    // ours and are not counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 8, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 8 * bytes);
+    assert_eq!(rec.content_bytes.messages, 9, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 9 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),
@@ -1090,4 +1129,40 @@ async fn a_read_reason_changes_nothing_but_the_figures() {
         assert_eq!(body, first, "reason={reason} changed the answer");
         assert_eq!(reads() - before, 1, "reason={reason} changed what was read");
     }
+}
+
+/// remote-ops-audit W11 `#287 bulk-reads`: a lookup by id on a provider without one of its own is
+/// the reads the trait's default is made of, and both wrappers record exactly those, never a
+/// `fetch_messages` the provider did not answer itself, so its diagnostics read as before.
+#[tokio::test]
+async fn an_emulated_lookup_by_id_is_timed_and_counted_as_the_reads_it_is_made_of() {
+    let fake = Arc::new(FakeDiscord::new());
+    let channel = ChannelId("C1".to_owned());
+    let kept = fake.seed(&channel, "ada", "words of some length");
+    let profile = UpstreamProfile::new();
+    let profiled = ProfiledClient::new(
+        Arc::clone(&fake) as Arc<dyn ChatClient>,
+        profile.provider("fake", "Fake"),
+    );
+    let looked = profiled
+        .fetch_messages(&channel, None, &[kept.clone(), MessageId("404".to_owned())])
+        .await
+        .expect("lookup");
+    assert!(matches!(&looked[0], Lookup::Found(m) if m.id == kept));
+    assert_eq!(looked[1], Lookup::Unseen, "a window proves nothing");
+    let report = profile.report();
+    let names: Vec<(&str, u64)> = report.providers[0]
+        .operations
+        .iter()
+        .map(|row| (row.name, row.count))
+        .collect();
+    assert_eq!(names, [("fetch_recent_dated", 1)], "{names:?}");
+
+    let counting = vibe_talk::testing::CountingChat::new(Arc::clone(&fake) as Arc<dyn ChatClient>);
+    counting
+        .fetch_messages(&channel, None, std::slice::from_ref(&kept))
+        .await
+        .expect("lookup");
+    assert_eq!(counting.count("fetch_recent_dated"), 1);
+    assert_eq!(counting.count("fetch_messages"), 0);
 }

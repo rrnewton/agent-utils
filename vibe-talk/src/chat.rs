@@ -467,6 +467,9 @@ pub enum Support {
 pub struct ReadCaps {
     /// [`ChatClient::fetch_range`] of the channel's own messages ([`ReadScope::Main`]).
     pub range: Support,
+    /// [`ChatClient::fetch_messages`]: several messages by id in fewer upstream calls than one
+    /// each. remote-ops-audit W11.
+    pub by_ids: Support,
     /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
     /// 100 unless the provider says otherwise.
     pub page_rows: u16,
@@ -476,10 +479,42 @@ impl Default for ReadCaps {
     fn default() -> Self {
         Self {
             range: Support::Emulated,
+            by_ids: Support::Emulated,
             page_rows: crate::discord::http::DISCORD_MAX_LIMIT,
         }
     }
 }
+
+/// What a lookup by id found for one of the ids asked for. remote-ops-audit W11 `#287 bulk-reads`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// The message, as the provider has it now. Boxed: a lookup's answers are mostly this.
+    Found(Box<Message>),
+    /// The provider PROVED there is no such message where it was looked for (the channel's own
+    /// messages, or the thread asked for): it answered that it has none by that id, or it read,
+    /// without a gap, the whole stretch of the channel the id would fall in, and the id was not in
+    /// it.
+    Absent,
+    /// Not where the lookup looked, which proves nothing: a window that did not reach back to it,
+    /// a read cut short, a copy older than now, or a message the provider has but cannot
+    /// represent. A caller that needs the message looks it up the way it would one at a time.
+    Unseen,
+}
+
+impl Lookup {
+    /// The message, when one was found.
+    #[must_use]
+    pub fn found(self) -> Option<Message> {
+        match self {
+            Self::Found(message) => Some(*message),
+            Self::Absent | Self::Unseen => None,
+        }
+    }
+}
+
+/// How many [`ChatClient::fetch_thread_message`] calls [`emulated_messages`] keeps in flight: what
+/// speech preparation has always used for one thread (`crate::read_ahead`).
+pub const LOOKUPS_IN_FLIGHT: usize = 4;
 
 /// Read and post access to configured chat channels.
 #[async_trait]
@@ -760,6 +795,33 @@ pub trait ChatClient: Send + Sync {
         emulated_range(self, channel, scope, range, order, limit, cursor).await
     }
 
+    /// The messages of `channel`, or of one `thread` of it, with the ids asked for: one [`Lookup`]
+    /// per id, in the order asked, a repeated id answered each time. remote-ops-audit W11
+    /// `#287 bulk-reads`.
+    ///
+    /// A native lookup ([`ReadCaps::by_ids`]) costs fewer upstream calls than one per id, about
+    /// one per run of ids that sit close together, and answers [`Lookup::Absent`] only where the
+    /// provider proves it.
+    ///
+    /// The default is [`emulated_messages`]: in a thread, one [`ChatClient::fetch_thread_message`]
+    /// per id, [`LOOKUPS_IN_FLIGHT`] at a time, the first failure failing the lookup; among the
+    /// channel's own messages, one window of the newest
+    /// ([`crate::discord::http::DISCORD_MAX_LIMIT`], through [`ChatClient::fetch_recent_dated`])
+    /// searched for each id.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the reads it is made of: a lookup that cannot answer for every id fails
+    /// rather than answer for some.
+    async fn fetch_messages(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<Lookup>, ChatError> {
+        emulated_messages(self, channel, thread, ids).await
+    }
+
     /// Post `content` to `channel`, optionally as a reply to an existing message.
     ///
     /// # Errors
@@ -965,6 +1027,292 @@ pub async fn emulated_range<C: ChatClient + ?Sized>(
         exhausted: false,
         as_of: None,
     })
+}
+
+/// [`ChatClient::fetch_messages`]'s default: a lookup by id made of the reads that answered one
+/// id before it existed. remote-ops-audit W11 `#287 bulk-reads`.
+///
+/// In a thread, one [`ChatClient::fetch_thread_message`] per id, [`LOOKUPS_IN_FLIGHT`] at a time,
+/// in the order asked; the first failure fails the lookup, as it failed speech preparation, and a
+/// provider's refusal of a message it does not have stays that refusal. Every answer is
+/// [`Lookup::Found`].
+///
+/// Among the channel's own messages, one [`ChatClient::fetch_recent_dated`] of the newest
+/// [`crate::discord::http::DISCORD_MAX_LIMIT`], searched for each id. An id not in that window is
+/// [`Lookup::Unseen`]: a window proves nothing about what is older than it. Only a window the
+/// provider proved reaches back to the channel's first message, and read now rather than from an
+/// older copy, proves an id absent.
+///
+/// Nothing is read for an empty list of ids.
+///
+/// # Errors
+///
+/// The errors of [`ChatClient::fetch_thread_message`] and [`ChatClient::fetch_recent_dated`].
+pub async fn emulated_messages<C: ChatClient + ?Sized>(
+    client: &C,
+    channel: &ChannelId,
+    thread: Option<&str>,
+    ids: &[MessageId],
+) -> Result<Vec<Lookup>, ChatError> {
+    use futures_util::{StreamExt as _, TryStreamExt as _};
+
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    match thread {
+        Some(thread) => {
+            // Made before they are streamed: a closure handing out the provider's boxed futures
+            // inside the stream is not general enough over their lifetimes for `async_trait`.
+            let lookups: Vec<_> = ids
+                .iter()
+                .map(|id| client.fetch_thread_message(channel, thread, id))
+                .collect();
+            futures_util::stream::iter(lookups)
+                .buffered(LOOKUPS_IN_FLIGHT)
+                .map_ok(|message| Lookup::Found(Box::new(message)))
+                .try_collect()
+                .await
+        }
+        None => {
+            let window = client
+                .fetch_recent_dated(channel, crate::discord::http::DISCORD_MAX_LIMIT)
+                .await?;
+            let proves_absence = window.exhausted && window.as_of.is_none();
+            Ok(ids
+                .iter()
+                .map(|id| match window.messages.iter().find(|m| m.id == *id) {
+                    Some(message) => Lookup::Found(Box::new(message.clone())),
+                    None if proves_absence => Lookup::Absent,
+                    None => Lookup::Unseen,
+                })
+                .collect())
+        }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::discord::fake::FakeDiscord;
+    use crate::model::UserId;
+
+    /// A provider with a thread of ten messages, and a channel window it may claim is the whole
+    /// channel; it counts what it is asked, and the most thread lookups in flight at once.
+    struct Threaded {
+        main: FakeDiscord,
+        exhausted: bool,
+        as_of: Option<String>,
+        windows: AtomicUsize,
+        in_flight: AtomicUsize,
+        most_in_flight: AtomicUsize,
+        looked_up: Mutex<Vec<String>>,
+    }
+
+    impl Threaded {
+        fn new(exhausted: bool, as_of: Option<&str>) -> Self {
+            Self {
+                main: FakeDiscord::new(),
+                exhausted,
+                as_of: as_of.map(str::to_owned),
+                windows: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                most_in_flight: AtomicUsize::new(0),
+                looked_up: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    fn reply(id: &str) -> Message {
+        Message {
+            id: MessageId(id.to_owned()),
+            channel_id: ChannelId("42".to_owned()),
+            author: "grace".to_owned(),
+            author_id: UserId("7".to_owned()),
+            author_is_bot: false,
+            timestamp: "2026-10-13T01:00:00Z".to_owned(),
+            spoken_time: String::new(),
+            reply_to: None,
+            content: format!("reply {id}"),
+            spoken_content: String::new(),
+            content_html: String::new(),
+            noise: false,
+            thread: None,
+            reactions: None,
+            heading: None,
+        }
+    }
+
+    #[async_trait]
+    impl ChatClient for Threaded {
+        async fn fetch_thread_message(
+            &self,
+            _channel: &ChannelId,
+            thread_id: &str,
+            message_id: &MessageId,
+        ) -> Result<Message, ChatError> {
+            self.looked_up
+                .lock()
+                .expect("log")
+                .push(format!("{thread_id}/{message_id}"));
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if message_id.as_str().starts_with('r') {
+                Ok(reply(message_id.as_str()))
+            } else {
+                Err(ChatError::Status {
+                    status: 404,
+                    body: "not in that thread".to_owned(),
+                })
+            }
+        }
+
+        async fn fetch_recent_dated(
+            &self,
+            channel: &ChannelId,
+            limit: u16,
+        ) -> Result<RecentRead, ChatError> {
+            self.windows.fetch_add(1, Ordering::SeqCst);
+            Ok(RecentRead {
+                messages: self.main.fetch_recent(channel, limit).await?,
+                as_of: self.as_of.clone(),
+                exhausted: self.exhausted,
+            })
+        }
+
+        async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+            self.main.identity().await
+        }
+
+        async fn fetch_page(
+            &self,
+            channel: &ChannelId,
+            limit: u16,
+            before: Option<&MessageId>,
+            after: Option<&MessageId>,
+        ) -> Result<Vec<Message>, ChatError> {
+            self.main.fetch_page(channel, limit, before, after).await
+        }
+
+        async fn post_message(
+            &self,
+            channel: &ChannelId,
+            content: &str,
+            reply_to: Option<&MessageId>,
+        ) -> Result<Message, ChatError> {
+            self.main.post_message(channel, content, reply_to).await
+        }
+    }
+
+    fn ids(list: &[&str]) -> Vec<MessageId> {
+        list.iter().map(|id| MessageId((*id).to_owned())).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_a_thread_the_default_asks_once_per_id_four_at_a_time_in_order() {
+        let provider = Threaded::new(false, None);
+        let channel = ChannelId("42".to_owned());
+        let asked = ids(&["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r2"]);
+        let answers = provider
+            .fetch_messages(&channel, Some("t"), &asked)
+            .await
+            .expect("found");
+        let bodies: Vec<String> = answers
+            .into_iter()
+            .map(|answer| answer.found().expect("found").content)
+            .collect();
+        assert_eq!(
+            bodies,
+            asked
+                .iter()
+                .map(|id| format!("reply {id}"))
+                .collect::<Vec<_>>(),
+            "one answer per id, in order, a repeat answered again"
+        );
+        assert_eq!(provider.looked_up.lock().expect("log").len(), 9);
+        assert_eq!(
+            provider.most_in_flight.load(Ordering::SeqCst),
+            LOOKUPS_IN_FLIGHT
+        );
+        assert_eq!(provider.windows.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_a_thread_the_default_fails_with_the_providers_own_refusal() {
+        let provider = Threaded::new(false, None);
+        let error = provider
+            .fetch_messages(&ChannelId("42".to_owned()), Some("t"), &ids(&["r1", "x9"]))
+            .await
+            .expect_err("a message the provider does not have fails the lookup, as it always did");
+        assert!(
+            matches!(error, ChatError::Status { status: 404, .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn among_the_channels_own_messages_the_default_reads_one_window_and_proves_nothing() {
+        let provider = Threaded::new(false, None);
+        let channel = ChannelId("42".to_owned());
+        let kept = provider.main.seed(&channel, "ada", "in the window");
+        let answers = provider
+            .fetch_messages(
+                &channel,
+                None,
+                &[kept.clone(), MessageId("404".to_owned()), kept.clone()],
+            )
+            .await
+            .expect("read");
+        assert_eq!(provider.windows.load(Ordering::SeqCst), 1, "one window");
+        assert!(matches!(&answers[0], Lookup::Found(m) if m.id == kept));
+        assert_eq!(answers[1], Lookup::Unseen, "not in a window is not absent");
+        assert!(matches!(&answers[2], Lookup::Found(m) if m.id == kept));
+        assert!(provider.looked_up.lock().expect("log").is_empty());
+
+        assert!(provider
+            .fetch_messages(&channel, None, &[])
+            .await
+            .expect("nothing")
+            .is_empty());
+        assert_eq!(provider.windows.load(Ordering::SeqCst), 1, "nothing asked");
+    }
+
+    #[tokio::test]
+    async fn only_a_current_window_of_the_whole_channel_proves_an_id_absent() {
+        let channel = ChannelId("42".to_owned());
+        for (exhausted, as_of, expected) in [
+            (true, None, Lookup::Absent),
+            (true, Some("2026-10-13T01:00:00Z"), Lookup::Unseen),
+            (false, None, Lookup::Unseen),
+        ] {
+            let provider = Threaded::new(exhausted, as_of);
+            provider.main.register_channel(&channel);
+            let answers = provider
+                .fetch_messages(&channel, None, &ids(&["404"]))
+                .await
+                .expect("read");
+            assert_eq!(
+                answers,
+                std::slice::from_ref(&expected),
+                "{exhausted} {as_of:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_that_says_nothing_looks_up_by_id_as_it_always_did() {
+        assert_eq!(ReadCaps::default().by_ids, Support::Emulated);
+        assert_eq!(
+            FakeDiscord::new()
+                .read_caps(&ChannelId("42".to_owned()))
+                .by_ids,
+            Support::Emulated
+        );
+    }
 }
 
 #[cfg(test)]

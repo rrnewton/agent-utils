@@ -1202,6 +1202,7 @@ impl ChatClient for HttpDiscordClient {
             crate::chat::ReadCaps {
                 range: crate::chat::Support::Native,
                 page_rows: BRIDGE_RANGE_ROWS,
+                ..crate::chat::ReadCaps::default()
             }
         } else {
             crate::chat::ReadCaps::default()
@@ -2649,6 +2650,7 @@ mod tests {
             crate::chat::ReadCaps {
                 range: crate::chat::Support::Native,
                 page_rows: BRIDGE_RANGE_ROWS,
+                ..crate::chat::ReadCaps::default()
             }
         );
         let read = client

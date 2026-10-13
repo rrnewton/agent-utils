@@ -919,6 +919,7 @@ impl ChatClient for HttpSlackClient {
         crate::chat::ReadCaps {
             range: crate::chat::Support::Native,
             page_rows: super::range::PAGE_ROWS,
+            ..crate::chat::ReadCaps::default()
         }
     }
 

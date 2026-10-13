@@ -819,6 +819,30 @@ impl crate::chat::ChatClient for CountingChat {
         .await
     }
 
+    /// Counted as what it costs upstream, as `ProfiledClient` times it: a native lookup is one
+    /// `fetch_messages`; an emulated one runs the trait's default here, so each read it is made of
+    /// is counted as itself. remote-ops-audit W11 `#287 bulk-reads`.
+    async fn fetch_messages(
+        &self,
+        channel: &crate::model::ChannelId,
+        thread: Option<&str>,
+        ids: &[crate::model::MessageId],
+    ) -> Result<Vec<crate::chat::Lookup>, crate::chat::ChatError> {
+        match self.inner.read_caps(channel).by_ids {
+            crate::chat::Support::Native => {
+                let call = match thread {
+                    Some(thread) => thread_call("fetch_messages", channel, thread),
+                    None => call_in("fetch_messages", channel),
+                };
+                self.counted(call, self.inner.fetch_messages(channel, thread, ids))
+                    .await
+            }
+            crate::chat::Support::Emulated => {
+                crate::chat::emulated_messages(self, channel, thread, ids).await
+            }
+        }
+    }
+
     async fn post_message(
         &self,
         channel: &crate::model::ChannelId,

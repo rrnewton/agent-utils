@@ -567,6 +567,20 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    /// The channel's own provider looks its messages up. remote-ops-audit W11 `#287 bulk-reads`. A
+    /// channel no provider holds is refused, as a lookup of one of its messages always was.
+    async fn fetch_messages(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
+        self.route(channel)?
+            .client
+            .fetch_messages(channel, thread, ids)
+            .await
+    }
+
     fn supports_channel_registration(&self) -> bool {
         match self.entries.as_slice() {
             [only] => only.client.supports_channel_registration(),
