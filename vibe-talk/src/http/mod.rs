@@ -305,6 +305,11 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/upstream-clear",
             get(api::upstream_clear).put(api::set_upstream_clear),
         )
+        // `#253 upstream-clear-polish`: Settings' "Mark read now".
+        .route(
+            "/api/v1/channels/{channel_id}/upstream-clear/now",
+            post(api::upstream_clear_now),
+        )
         // `#39 channel-alias`. The operator's own local name for a channel. WRITE scope both
         // ways, because it outlives the process — and NO MCP TOOL at all, which is the part that
         // actually keeps a model from renaming the channels it reports on. See `api::set_alias`

@@ -316,6 +316,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"mode":"off"}"#),
         ),
+        // `#253 upstream-clear-polish`: "Mark read now" pushes a message, so write.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/upstream-clear/now",
+            Write,
+            Nothing,
+        ),
         route(
             "PUT",
             "/api/v1/channels/{channel_id}/alias",

@@ -1099,7 +1099,7 @@
               <div id="upstream-clear" hidden>
                 <hr class="settings-rule" />
                 <label for="upstream-clear-mode">Clear unread in <span id="upstream-clear-provider">the chat service</span></label>
-                <select id="upstream-clear-mode" aria-describedby="upstream-clear-warning upstream-clear-state">
+                <select id="upstream-clear-mode" aria-describedby="upstream-clear-warning upstream-clear-threads upstream-clear-state">
                   <option value="off">Off</option>
                   <option value="dry_run">Dry run: log only, mark nothing</option>
                   <option value="on">On</option>
@@ -1109,15 +1109,27 @@
                   <span id="upstream-clear-warning-provider">the chat service</span> as soon as
                   vibe-talk receives it, including messages from people. The first message
                   vibe-talk receives after it is on also marks everything already unread there
-                  read, people's messages too. Replies inside threads keep their own unread state
-                  there and are not cleared. vibe-talk's own unread and Done state are not changed.
+                  read, people's messages too. vibe-talk's own unread and Done state are not changed.
                 </p>
-                <label id="upstream-clear-now-row" class="row" for="upstream-clear-now" hidden>
-                  <input id="upstream-clear-now" type="checkbox" />
-                  <span id="upstream-clear-now-label">Also mark what is unread there now</span>
-                </label>
+                <!--
+                  `#253 upstream-clear-polish`. Said plainly and on its own line, because it is the
+                  part that surprises: the service's read marker that can be moved covers the main
+                  conversation only, and nothing available can mark a thread read.
+                -->
+                <p id="upstream-clear-threads" class="hint">
+                  Thread replies stay unread in
+                  <span id="upstream-clear-threads-provider">the chat service</span>; only the main
+                  conversation is cleared.
+                </p>
+                <!--
+                  Save changes the mode. "Mark read now" (or "Try it now" in a dry run) is a one-shot
+                  act on the mode already saved: it pushes the newest message at once, and its
+                  progress and result go in the status line below. Shown only while the saved mode
+                  is on or a dry run and the choice above still matches it.
+                -->
                 <div class="channel-actions">
                   <button id="upstream-clear-save" class="secondary" type="button" disabled>Save</button>
+                  <button id="upstream-clear-push" class="secondary" type="button" hidden>Mark read now</button>
                 </div>
                 <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
               </div>

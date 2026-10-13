@@ -165,6 +165,8 @@ async fn a_bad_request_an_unknown_channel_and_a_server_without_a_store_are_refus
         json!({ "mode": "sometimes" }),
         json!({}),
         json!({ "mode": "on", "everything": true }),
+        // `#253 upstream-clear-polish`: pushing now is its own route, never part of a save.
+        json!({ "mode": "on", "clear_now": true }),
     ] {
         let (status, _) = call(
             &state,
@@ -203,47 +205,234 @@ async fn a_bad_request_an_unknown_channel_and_a_server_without_a_store_are_refus
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
-#[tokio::test]
-async fn clear_now_pushes_the_newest_message_and_settings_reports_it() {
+fn now_path(channel: &str) -> String {
+    format!("/api/v1/channels/{channel}/upstream-clear/now")
+}
+
+/// A server whose provider can clear, with the loop running, and `channel` set to `mode`.
+async fn running(
+    mode: &str,
+) -> (
+    AppState,
+    Arc<vibe_talk::discord::fake::FakeDiscord>,
+    Arc<vibe_talk::store::fake::FakeStore>,
+) {
     let (state, discord, store) = vibe_talk::testing::state_with_store();
     discord.enable_upstream_clear();
-    let channel = ChannelId(WRITE_CHANNEL.to_owned());
-    discord.seed(&channel, "agent", "older");
-    let newest = discord.seed(&channel, "agent", "newest");
+    tokio::spawn(Clearer::for_state(&state).run());
     let (status, view) = call(
         &state,
         "PUT",
         &path(WRITE_CHANNEL),
         WRITE_TOKEN,
-        Some(json!({ "mode": "on", "clear_now": true })),
+        Some(json!({ "mode": mode })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["pending"], true, "{view}");
+    (state, discord, store)
+}
+
+#[tokio::test(start_paused = true)]
+async fn mark_read_now_pushes_the_newest_message_at_once_and_answers_what_it_came_to() {
+    // `#253 upstream-clear-polish`. One press, one push, of the channel's newest message, without
+    // waiting for the next message or for the quiet period; and the answer carries the result.
+    let (state, discord, store) = running("on").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    discord.seed(&channel, "agent", "older");
+    let newest = discord.seed(&channel, "agent", "newest");
     assert!(
         discord.upstream_clears().is_empty(),
-        "the request pushed inline instead of leaving it to the loop"
+        "turning it on pushed by itself"
     );
-
-    let clearer = Clearer::for_state(&state);
-    assert!(clearer.push_due().await, "clear-now was not due at once");
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "pushed", "{answer}");
     assert_eq!(
         discord.upstream_clears(),
         vec![(channel.clone(), newest.clone(), false)]
     );
-
-    let (_, view) = call(&state, "GET", &path(WRITE_CHANNEL), READ_TOKEN, None).await;
-    assert_eq!(view["pending"], false);
-    assert_eq!(view["pushed"]["message_id"], newest.as_str());
-    assert_eq!(view["pushed"]["result"], "advanced");
+    // The answer names the pressed message and carries the attempt that answered it.
+    assert_eq!(answer["message_id"], newest.as_str(), "{answer}");
+    assert!(answer["message_at_ms"].as_i64().is_some(), "{answer}");
+    assert_eq!(answer["attempt"]["message_id"], newest.as_str(), "{answer}");
+    assert_eq!(answer["attempt"]["result"], "advanced", "{answer}");
+    assert_eq!(
+        answer["attempt"]["message_at_ms"], answer["message_at_ms"],
+        "{answer}"
+    );
+    let view = &answer["state"];
+    assert_eq!(
+        view["mode"], "on",
+        "pressing it changed the setting: {view}"
+    );
+    assert_eq!(view["pending"], false, "{view}");
+    assert_eq!(view["last"]["message_id"], newest.as_str());
     assert_eq!(view["last"]["result"], "advanced");
-    assert_eq!(view["failures"], 0);
+    assert_eq!(view["pushed"]["message_id"], newest.as_str());
     assert_eq!(
         store.upstream_clear_settings().await.expect("read")[0]
             .pushed
             .as_ref()
             .map(|pushed| pushed.message.clone()),
-        Some(newest)
+        Some(newest.clone())
+    );
+
+    // Pressed again with nothing newer: nothing is sent, and the answer says why.
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "covered", "{answer}");
+    assert!(answer.get("attempt").is_none(), "{answer}");
+    assert_eq!(
+        discord.upstream_clears().len(),
+        1,
+        "pushed the same message twice"
+    );
+
+    // A newer message is pushed by the next press, still one push per press.
+    let newer = discord.seed(&channel, "agent", "newer");
+    let (_, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(answer["outcome"], "pushed", "{answer}");
+    assert_eq!(
+        discord.upstream_clears(),
+        vec![(channel.clone(), newest, false), (channel, newer, false)]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn try_it_now_in_a_dry_run_asks_for_a_dry_run_and_writes_nothing() {
+    let (state, discord, _store) = running("dry_run").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let newest = discord.seed(&channel, "agent", "newest");
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "pushed", "{answer}");
+    assert_eq!(answer["attempt"]["result"], "dry_run", "{answer}");
+    assert_eq!(answer["state"]["last"]["result"], "dry_run", "{answer}");
+    assert_eq!(answer["state"]["mode"], "dry_run");
+    assert_eq!(
+        discord.upstream_clears(),
+        vec![(channel.clone(), newest, true)]
+    );
+    assert_eq!(
+        discord.upstream_cursor(&channel),
+        None,
+        "a dry run moved the marker"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mark_read_now_is_refused_while_off_and_at_read_scope_and_never_turns_it_on() {
+    // A page still showing On after another device turned it off must not turn it back on.
+    let (state, discord, store) = running("off").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    discord.seed(&channel, "agent", "newest");
+    let (status, refused) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "refused");
+    assert_eq!(
+        state.live.upstream_clear().mode(&channel),
+        UpstreamClearMode::Off
+    );
+    assert!(store
+        .upstream_clear_settings()
+        .await
+        .expect("read")
+        .iter()
+        .all(|setting| setting.mode == UpstreamClearMode::Off));
+    let (status, _) = call(&state, "POST", &now_path(WRITE_CHANNEL), READ_TOKEN, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&state, "POST", &now_path("9999999999"), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(discord.upstream_clears().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_push_is_answered_failed_and_the_next_press_keeps_the_retry_wait() {
+    // `#253 upstream-clear-polish`. An attempt was recorded and it failed: the press says it
+    // failed, never "pushed". A spent quota answers 429 with how long to wait, and pressing again
+    // must not spend another call before then: the press says it is waiting for the retry.
+    let (state, discord, _store) = running("on").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let newest = discord.seed(&channel, "agent", "newest");
+    discord.fail_upstream_clear_next(vibe_talk::chat::ChatError::Status {
+        status: 502,
+        body: "mark-read failed".to_owned(),
+    });
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "failed", "{answer}");
+    assert_eq!(answer["attempt"]["result"], "failed", "{answer}");
+    assert_eq!(answer["attempt"]["message_id"], newest.as_str(), "{answer}");
+    assert!(
+        answer["attempt"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("mark-read failed")),
+        "{answer}"
+    );
+    assert_eq!(answer["state"]["last"]["result"], "failed", "{answer}");
+    assert!(
+        answer["state"]["retry_at_ms"].as_i64().is_some(),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["state"]["pending"], true,
+        "the failed message was dropped: {answer}"
+    );
+
+    let (_, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(answer["outcome"], "retry_waiting", "{answer}");
+    assert_eq!(
+        discord.upstream_clears().len(),
+        1,
+        "a press cut the retry wait short"
+    );
+
+    // The retry still happens, by itself, for that message.
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    assert_eq!(
+        discord.upstream_clears(),
+        vec![
+            (channel.clone(), newest.clone(), false),
+            (channel, newest, false)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_that_does_not_finish_in_time_answers_waiting_within_45_seconds_and_still_lands() {
+    // `#253 upstream-clear-polish`. Held at most 45 s, under a common 60 s proxy read timeout.
+    let (state, discord, store) = running("on").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let newest = discord.seed(&channel, "agent", "newest");
+    let gate = discord.hold_upstream_clears();
+    let started = tokio::time::Instant::now();
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    let held = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "waiting", "{answer}");
+    assert!(
+        held >= std::time::Duration::from_secs(44) && held <= std::time::Duration::from_secs(45),
+        "held the request {held:?}"
+    );
+    assert_eq!(
+        vibe_talk::http::api::UPSTREAM_CLEAR_NOW_WAIT,
+        std::time::Duration::from_secs(45)
+    );
+    assert_eq!(answer["message_id"], newest.as_str(), "{answer}");
+    assert!(answer.get("attempt").is_none(), "{answer}");
+    assert_eq!(
+        discord.upstream_clears(),
+        vec![(channel.clone(), newest.clone(), false)]
+    );
+    gate.add_permits(1);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        store.upstream_clear_settings().await.expect("read")[0]
+            .pushed
+            .as_ref()
+            .map(|pushed| pushed.message.clone()),
+        Some(newest),
+        "the push the page stopped waiting for did not land"
     );
 }
 
@@ -375,4 +564,78 @@ async fn erasing_the_store_turns_every_channel_off_in_the_running_loop_too() {
         state.live.upstream_clear().mode(&enabled),
         UpstreamClearMode::On
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_setting_changed_while_the_press_waits_is_answered_changed() {
+    // `#253 upstream-clear-polish`. Another device turns it off, or to a dry run, while the push is
+    // on its way: the press says the setting changed, never that it was done.
+    for change in ["off", "dry_run"] {
+        let (state, discord, _store) = running("on").await;
+        let channel = ChannelId(WRITE_CHANNEL.to_owned());
+        let newest = discord.seed(&channel, "agent", "newest");
+        let gate = discord.hold_upstream_clears();
+        let pressing = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            discord.upstream_clears(),
+            vec![(channel.clone(), newest.clone(), false)],
+            "the press's push is not on its way"
+        );
+        let (status, _) = call(
+            &state,
+            "PUT",
+            &path(WRITE_CHANNEL),
+            WRITE_TOKEN,
+            Some(json!({ "mode": change })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The push in flight finishes, and is recorded, but it does not answer the press.
+        gate.add_permits(1);
+        let (status, answer) = pressing.await.expect("the press answered");
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["outcome"], "changed", "set to {change}: {answer}");
+        assert!(answer.get("attempt").is_none(), "{answer}");
+        assert_eq!(answer["state"]["mode"], change, "{answer}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_the_provider_refuses_is_answered_unavailable_with_its_attempt() {
+    let (state, discord, _store) = running("on").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    discord.seed(&channel, "agent", "newest");
+    discord.fail_upstream_clear_next(vibe_talk::chat::ChatError::Status {
+        status: 409,
+        body: r#"{"message":"thread_channel"}"#.to_owned(),
+    });
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "unavailable", "{answer}");
+    assert_eq!(answer["attempt"]["result"], "unavailable", "{answer}");
+    assert!(
+        answer["state"]["unavailable"].as_str().is_some(),
+        "{answer}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_push_the_bridge_no_longer_holds_is_answered_skipped() {
+    let (state, discord, _store) = running("on").await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    discord.seed(&channel, "agent", "newest");
+    discord.fail_upstream_clear_next(vibe_talk::chat::ChatError::Status {
+        status: 404,
+        body: r#"{"message":"unknown message"}"#.to_owned(),
+    });
+    let (status, answer) = call(&state, "POST", &now_path(WRITE_CHANNEL), WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "skipped", "{answer}");
+    assert_eq!(answer["attempt"]["result"], "skipped", "{answer}");
 }

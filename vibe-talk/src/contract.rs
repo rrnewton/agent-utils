@@ -289,6 +289,80 @@ pub struct UpstreamClearState {
     pub unavailable: Option<String>,
 }
 
+/// What Settings' "Mark read now" came to: `POST /api/v1/channels/{id}/upstream-clear/now`.
+/// `#253 upstream-clear-polish`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UpstreamClearNowResponse {
+    /// What happened to the press.
+    pub outcome: UpstreamClearNowOutcome,
+    /// The channel's newest message, the one the press asked to push. Absent with `no_message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<MessageId>,
+    /// That message's own instant, in milliseconds since the Unix epoch, when it can be read. An
+    /// attempt recorded later whose `message_at_ms` is at or after it answers the press, which is
+    /// how a page told `waiting` recognises the answer when it reads the state again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_at_ms: Option<i64>,
+    /// The recorded push that answered the press, with `pushed`, `failed` and `skipped`, and with
+    /// `unavailable` when the push itself was refused: the pressed message's own, or a newer
+    /// message's, which covers it. What the press came to is said from this, never from
+    /// `state.last`, which a later push may already have replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<UpstreamClearAttemptView>,
+    /// The channel's state after it, as `GET .../upstream-clear` would answer now.
+    pub state: UpstreamClearState,
+}
+
+/// What happened to a press of "Mark read now". `#253 upstream-clear-polish`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClearNowOutcome {
+    /// The press's push was made and the provider took it: `attempt` says whether its marker
+    /// moved, was already there, or, in a dry run, what a real push would have done.
+    Pushed,
+    /// The press's push was made and failed; `attempt.error` says why. It is retried by itself, at
+    /// `state.retry_at_ms`.
+    Failed,
+    /// The bridge no longer holds the message the push named, so nothing was marked; the next
+    /// message that arrives is pushed.
+    Skipped,
+    /// An earlier push, or an earlier dry run, already covers the newest message. Nothing was sent.
+    Covered,
+    /// The channel has no message that can be marked.
+    NoMessage,
+    /// The channel is waiting out a failure, from before the press or of an older push that was
+    /// already on its way, and the newest message goes when the retry is due, at
+    /// `state.retry_at_ms`. Nothing was sent for the press.
+    RetryWaiting,
+    /// The push is queued or on its way, and had not been recorded when the server stopped
+    /// waiting, at most 45 seconds after the press. The server keeps going without the page.
+    Waiting,
+    /// The channel's setting changed while the press waited (turned off, set to the other mode,
+    /// or every setting erased), or the channel stopped being one this server can clear, so the
+    /// push was not made as asked. `state` says what holds now.
+    Changed,
+    /// The provider refused this channel; `state.unavailable` says why.
+    Unavailable,
+}
+
+impl UpstreamClearNowOutcome {
+    /// The wire name, for log lines.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pushed => "pushed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Covered => "covered",
+            Self::NoMessage => "no_message",
+            Self::RetryWaiting => "retry_waiting",
+            Self::Waiting => "waiting",
+            Self::Changed => "changed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// One push, as Settings shows it. `#232 upstream-mark-read`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct UpstreamClearAttemptView {
@@ -651,6 +725,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<UpstreamClearState>(),
         // `#240 reading-bookmark`. Appended, for the same reason.
         generator.subschema_for::<BookmarkResponse>(),
+        // `#253 upstream-clear-polish`. Appended, for the same reason.
+        generator.subschema_for::<UpstreamClearNowResponse>(),
     ]
 }
 

@@ -2876,15 +2876,23 @@ pub async fn mark_read_upstream(
 
 /// What the owner chose for clearing a channel's unread state at its provider.
 /// `#232 upstream-mark-read`.
+///
+/// Only the mode. Pushing the newest message at once is its own act, `POST .../upstream-clear/now`
+/// (`#253 upstream-clear-polish`), so that pressing it can never also change the mode a stale page
+/// last saw.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamClearRequest {
     /// Off, a dry run, or on.
     pub mode: crate::store::UpstreamClearMode,
-    /// Also push the channel's newest message now, rather than at the next one that arrives.
-    #[serde(default)]
-    pub clear_now: bool,
 }
+
+/// The longest `POST .../upstream-clear/now` holds the request, reading the channel's newest
+/// message included, before answering that the push is still on its way. Long enough for a bridge
+/// to answer one push, and under the 60 s read timeout common to reverse proxies, so a slow push is
+/// answered `waiting` rather than cut off by the proxy as a gateway timeout.
+/// `#253 upstream-clear-polish`.
+pub const UPSTREAM_CLEAR_NOW_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Whether `channel`'s own provider can clear its unread state.
 fn upstream_clear_supported(state: &AppState, channel: &ChannelId) -> bool {
@@ -2948,8 +2956,8 @@ pub async fn upstream_clear(
 ///
 /// WRITE scope, and NO MCP TOOL: on, it marks every message in the channel read in the owner's
 /// own client, people's messages included, which is a decision about his attention that only he
-/// makes. With `clear_now` the channel's newest message is pushed at once instead of waiting for
-/// the next one; the push itself happens in the background, never inside this request.
+/// makes. Turning it on pushes nothing by itself; the next message that arrives is pushed, and
+/// with it everything before it.
 pub async fn set_upstream_clear(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -2982,28 +2990,108 @@ pub async fn set_upstream_clear(
     tracing::info!(
         channel = %channel.id,
         mode = setting.mode.as_str(),
-        clear_now = request.clear_now,
         "upstream-clear: channel {} ({}) set to {} in Settings",
         channel.id,
         channel.alias.as_deref().unwrap_or(&channel.label),
         setting.mode.as_str(),
     );
-    if request.clear_now && setting.mode != crate::store::UpstreamClearMode::Off {
-        match state.chat.fetch_recent(&channel.id, 1).await {
-            Ok(messages) => {
-                if let Some(newest) = messages.last() {
-                    state.live.upstream_clear().offer_now(&channel.id, newest);
+    Ok(no_store(Json(upstream_clear_view(&state, channel).await?)))
+}
+
+/// `POST /api/v1/channels/{channel_id}/upstream-clear/now` — Settings' "Mark read now" (or "Try it
+/// now" in a dry run): push the channel's newest message at once, and answer what it came to.
+/// `#253 upstream-clear-polish`.
+///
+/// WRITE scope and no MCP tool, like the setting itself. It changes no setting: a channel that is
+/// off is refused, so a page that still shows On after another device turned it off cannot turn
+/// it back on by pressing this. The push goes through the running loop like any other, so it is
+/// never two provider calls at once and never moves the marker backwards; this request only waits,
+/// at most [`UPSTREAM_CLEAR_NOW_WAIT`] in all, for the loop to record it. A channel waiting out a
+/// failure keeps its wait: the message goes at the retry, and the answer says so.
+///
+/// The outcome is what answered THIS press (`Candidates::wait_for`): `pushed` only when the push
+/// that covers the pressed message was taken by the provider, `failed` when it failed, `changed`
+/// when the setting changed meanwhile, and the recorded attempt rides along so the page says what
+/// it came to from that attempt rather than from whatever `state.last` holds by now.
+pub async fn upstream_clear_now(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    use crate::contract::UpstreamClearNowOutcome as Outcome;
+    use crate::store::UpstreamClearResult;
+    use crate::upstream_clear::{PushNow, Settled};
+
+    // One deadline for the whole request, the read of the newest message included.
+    let deadline = tokio::time::Instant::now() + UPSTREAM_CLEAR_NOW_WAIT;
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    let candidates = state.live.upstream_clear();
+    let off = || {
+        ApiError::from(ChatError::Refused(
+            "clearing unread is off for this channel; turn it on, or to a dry run, and save first"
+                .to_owned(),
+        ))
+    };
+    if candidates.mode(&channel.id) == crate::store::UpstreamClearMode::Off {
+        return Err(off());
+    }
+    let messages = tokio::time::timeout_at(deadline, state.chat.fetch_recent(&channel.id, 1))
+        .await
+        .map_err(|_elapsed| {
+            ChatError::Transport(format!(
+                "the channel's newest message could not be read within {} s, so nothing was pushed",
+                UPSTREAM_CLEAR_NOW_WAIT.as_secs()
+            ))
+        })??;
+    let newest = messages.last();
+    let mut attempt = None;
+    let outcome = match newest {
+        None => Outcome::NoMessage,
+        Some(newest) => match candidates.push_now(&channel.id, newest) {
+            PushNow::Off => return Err(off()),
+            PushNow::Unavailable => Outcome::Unavailable,
+            PushNow::Unplaceable => Outcome::NoMessage,
+            PushNow::Covered => Outcome::Covered,
+            PushNow::RetryWaiting => Outcome::RetryWaiting,
+            PushNow::Queued(ticket) => {
+                match candidates.wait_for(&channel.id, ticket, deadline).await {
+                    Settled::Recorded(recorded) => {
+                        let outcome = match recorded.result {
+                            UpstreamClearResult::Advanced
+                            | UpstreamClearResult::AlreadyRead
+                            | UpstreamClearResult::DryRun => Outcome::Pushed,
+                            UpstreamClearResult::Failed => Outcome::Failed,
+                            UpstreamClearResult::Skipped => Outcome::Skipped,
+                            UpstreamClearResult::Unavailable => Outcome::Unavailable,
+                        };
+                        attempt = Some(crate::contract::UpstreamClearAttemptView::from(&recorded));
+                        outcome
+                    }
+                    Settled::RetryWaiting => Outcome::RetryWaiting,
+                    Settled::Unavailable => Outcome::Unavailable,
+                    Settled::Changed => Outcome::Changed,
+                    Settled::Waiting => Outcome::Waiting,
                 }
             }
-            Err(error) => tracing::warn!(
-                channel = %channel.id,
-                %error,
-                "upstream-clear: could not read the newest message to clear now; the next \
-                 message that arrives is pushed instead"
-            ),
-        }
-    }
-    Ok(no_store(Json(upstream_clear_view(&state, channel).await?)))
+        },
+    };
+    tracing::info!(
+        channel = %channel.id,
+        outcome = outcome.as_str(),
+        "upstream-clear: channel {} ({}) pushed now from Settings: {}",
+        channel.id,
+        channel.alias.as_deref().unwrap_or(&channel.label),
+        outcome.as_str(),
+    );
+    Ok(no_store(Json(crate::contract::UpstreamClearNowResponse {
+        outcome,
+        message_id: newest.map(|newest| newest.id.clone()),
+        message_at_ms: newest
+            .and_then(crate::upstream_clear::position)
+            .map(|position| position.0),
+        attempt,
+        state: upstream_clear_view(&state, channel).await?,
+    })))
 }
 
 /// `POST /api/v1/channels/{channel_id}/read`

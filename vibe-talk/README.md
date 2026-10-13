@@ -1801,9 +1801,18 @@ some of the owner's channels, and those are mostly coding agents posting updates
 own client those updates bury the messages from people. With the same bridge opt-in, Settings offers
 **Clear unread in** *the service* for each channel whose provider can do it: off (the default), a
 dry run, or on. On, the SERVER moves the service's own read marker for that channel forward to the
-newest message it has seen there (live, or at startup and on "clear now" the channel's newest), so
+newest message it has seen there (live, at startup, and when the owner presses **Mark read now**), so
 that client's unread list keeps the people and vibe-talk keeps the agents.
 vibe-talk's own read marks and Done state are not touched, and nothing is ever read back.
+
+**Thread replies stay unread in Google Chat; only the main conversation is cleared.** Settings says
+this in those words beside the switch. Google Chat keeps a separate read state for each thread, and
+no supported interface available to the bridge can write it: the public REST and gRPC APIs, and the
+command-line client the bridge drives, move only the space's own marker (checked on 2026-10-12).
+Moving that marker leaves the replies inside threads unread, and Google Chat's Home feed is mostly
+followed threads, so much of what shows as unread there stays unread. Google's Developer Preview MCP
+tools for Chat include one that marks a thread read; a bridge with access to it could clear thread
+replies too. That is a possible future path, not something any bridge here does today.
 
 * **The setting is the server's.** It is kept in the store (one row per channel set, `off` when there
   is none), because the server acts with no page open. Write scope to change it, read scope to see
@@ -1815,25 +1824,39 @@ vibe-talk's own read marks and Done state are not touched, and nothing is ever r
 * **Never backwards.** A message at or before the newest one already covered is never pushed, and
   that floor survives a restart and the setting being turned off. At startup each enabled channel is
   checked against its newest message, so one that arrived while the server was down is still cleared.
-* **Failures retry** after 30 seconds, doubling to 15 minutes, plus up to a tenth more per channel.
-  A newer message replaces one waiting to be retried. The status line in Settings shows the last
-  push, a failure and its retry time, or why the channel cannot be cleared.
+* **Failures retry** after 30 seconds, doubling to 15 minutes, plus up to a tenth more per channel,
+  and never sooner than a `429`'s `retry_after`. A newer message replaces one waiting to be retried.
+  The status line in Settings shows the last push, a failure and its retry time, or why the channel
+  cannot be cleared.
+* **Mark read now** (`#253 upstream-clear-polish`). While a channel is on, Settings offers a one-shot
+  **Mark read now** button, **Try it now** in a dry run. It pushes the channel's newest message at
+  once, through the same loop, skipping the quiet period and the spacing between pushes but never a
+  retry wait after a failure. The button is disabled until the server answers, and the status line
+  shows progress and then what that press came to, said from the push that answered it and never
+  from a later one: marked, already read there, what a dry run would mark, failed (and when it is
+  tried again), nothing newer to mark, waiting to retry after an earlier failure, the setting changed
+  while it was on its way, or still on its way. The server holds the request at most 45 seconds, so
+  a common 60-second proxy timeout never cuts it off; still on its way by then, Settings asks again
+  every 4 seconds for up to 30 seconds, says what it came to as soon as that is recorded, and
+  otherwise says it has not been answered yet. It changes no setting, and a channel that is off
+  refuses it, so a page still showing On after another device turned it off cannot turn it back on.
+  Turning a channel on pushes nothing by itself: the next message that arrives is pushed, and with it
+  everything before it.
 * **Every attempt is logged on one line** beginning `upstream-clear:`, naming the mode, the channel,
   the message and its time, and the outcome (`advanced`, `already-read`, `dry-run`, `skipped`, or
   `failed`). A dry run decides everything and writes nothing, so an operator can check what would be
   marked before turning it on.
 * **What it cannot do.** The provider's marker covers the whole channel, so people's messages there
   are marked read too, and Settings says so beside the switch. A provider whose threads have their
-  own read state keeps replies inside threads unread. The first push also clears the backlog,
-  whether or not "clear now" was ticked, and the warning in Settings says that too: ticking it only
-  makes it happen at once rather than at the next message.
+  own read state keeps replies inside threads unread, as Google Chat does (above). The first push
+  also clears the backlog, and the warning in Settings says that too.
 * **Undo.** Turning it off stops all further pushes at once, and so does `DELETE /api/v1/storage`,
   which turns every channel back to off in the running server as well as in the store. Settings shows where the provider's
   marker was before vibe-talk first moved it; moving it back is a manual act in the provider's own
   tools, not a button here, because it would also mark unread whatever the owner has read since.
 
 The bridge implements `POST /channels/{id}/upstream-clear` with exactly
-`{"message_id":"...","dry_run":true|false}`. It reads its provider's current cursor, moves it through
+`{"message_id":"...","dry_run":true|false}`. It finds its provider's current cursor, moves it through
 that message only if the cursor is behind (never in a dry run), and answers
 `{"scope":"space","channel_id":"...","message_id":"...","target":"<instant>","previous":"<instant>|null","advanced":bool,"dry_run":bool}`.
 `advanced` says whether the cursor moved, and in a dry run whether it would have. `dry_run` is
@@ -1845,6 +1868,33 @@ cannot be cleared at all (for example one thread of a larger space, where the pr
 also clear messages vibe-talk never received), and vibe-talk stops until the setting is saved again;
 `429` with `retry_after` in seconds is waited out; anything else is a failure and is retried. An older
 bridge answers `405`, which Settings reports as a failure saying the bridge needs updating. Direct Discord is never offered it.
+
+Reading the cursor can be the scarce part. Google Chat allows about two read-state reads per user per
+minute, and a bridge that read the cursor fresh before every automatic write, for every channel,
+would spend that quota on its own. On this route, for a real push, a bridge may instead keep the
+cursor it last read or wrote for each space and read it fresh only when that is several minutes old
+or the target is not after it. Two calls always read it fresh instead, because a cached cursor
+would make them wrong:
+
+* **The owner's own mark**, `POST /channels/{id}/read` (**Mark read in**). It is rare, and it can
+  name any message, however old, so a stale cursor below that message would let it move the cursor
+  back behind what the owner has read since. It reads fresh before writing and writes nothing when
+  the cursor is already at or past the message.
+* **A dry run.** It writes nothing and exists to show what a real push would do, so its `advanced`
+  and `previous` must be the provider's own, not a remembered value.
+
+What the cache gives up on the automatic path, precisely. Each write's own target becomes the cached
+cursor, so nothing the bridge writes ever lands behind its own earlier writes. What it cannot see,
+for as long as a cached cursor is trusted, is anyone else moving the cursor. If the owner reads in
+the provider's own client past the message being pushed, which can only be messages newer than it
+that vibe-talk has not pushed yet, the push moves the cursor back to its target, and those newer
+messages show unread there again until the next push marks them, normally seconds later, when
+vibe-talk ingests them. The same goes for a second bridge (or any other client) writing the cursor
+of the same space for the same account: this bridge's cache does not see those writes, and can move
+the cursor back behind them. So two bridges that cache must not clear the same spaces for the same
+account. A spent quota is answered `429` with `retry_after` (and a `Retry-After` header), on this
+route and on `POST /channels/{id}/read`, so the server's own backoff waits it out instead of
+retrying at once.
 
 ### Where it lives
 
@@ -2140,7 +2190,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…"}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined |
 | GET | `/api/v1/channels/{id}/upstream-clear` | read | whether this server clears the channel's unread state in the provider's own client as it ingests messages, and what it last did; see "Clearing unread automatically" |
-| PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on", clear_now?:bool}` — set it; `clear_now` pushes the channel's newest message at once, in the background. Refused for a channel whose provider cannot do it |
+| PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on"}` — set it. Turning it on pushes nothing by itself; the next message that arrives is pushed. Refused for a channel whose provider cannot do it |
+| POST | `/api/v1/channels/{id}/upstream-clear/now` | **write** | no body — Settings' **Mark read now**: push the channel's newest message at once through the running loop and answer `{outcome, message_id?, message_at_ms?, attempt?, state}`: `outcome` is `pushed` (the provider took the push that covers the pressed message; `attempt` is it), `failed` or `skipped` (that push failed, or named a message the bridge no longer holds; `attempt` says so), `covered`, `no_message`, `retry_waiting`, `changed` (the setting changed meanwhile), `unavailable`, or `waiting` (nothing recorded within 45 s, the whole request included; the server carries on). Changes no setting; refused while the channel is off |
 | PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
 | PUT | `/api/v1/noise-rules` | **write** | `{rules:["…"]}` — replace the whole list of messages read automatically; answers what was stored. Read through client-config's `noise_rules`; see "Messages read automatically" |

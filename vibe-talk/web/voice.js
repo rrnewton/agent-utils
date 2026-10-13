@@ -110,8 +110,7 @@ let sideActive = false;
  *   | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
- *   | "reply-branch" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
- *   | "upstream-clear-now"} id
+ *   | "reply-branch" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"} id
  * @returns {HTMLInputElement}
  */
 /**
@@ -154,7 +153,8 @@ let sideActive = false;
  *   | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
  *   | "thread-back" | "thread-directory-more" | "thread-directory-retry"
- *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-save" | "view-switch"} id
+ *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
+ *   | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
  */
 /**
@@ -29113,8 +29113,16 @@ function renderAliasEditor() {
 // channel's own service can do it and only to a token that may change it, and the warning beside it
 // is always on screen, because what it does to the other app is the whole decision.
 
-/** How long after a save the box asks again, to show what the server's first push did. */
+/**
+ * How often, after a "Mark read now" the server stopped waiting on, the box asks again what the
+ * push came to. `#253 upstream-clear-polish`.
+ */
 const UPSTREAM_CLEAR_RECHECK_MS = 4000;
+/**
+ * How long the box keeps asking before it stops and says the push is still unanswered: asked every
+ * UPSTREAM_CLEAR_RECHECK_MS, so seven times. `#253 upstream-clear-polish`.
+ */
+const UPSTREAM_CLEAR_RECHECK_LIMIT_MS = 30000;
 
 /**
  * What the server last said about the channel the box is on: its id, its answer or null, and the
@@ -29125,6 +29133,24 @@ const UPSTREAM_CLEAR_RECHECK_MS = 4000;
 let upstreamClear = null;
 /** Counts reads, so an answer for a channel the box has since left is dropped rather than drawn. */
 let upstreamClearReads = 0;
+/**
+ * The channel a "Mark read now" press is waiting on the server for, or null. One press is one
+ * push: the button stays disabled until the answer, so a second tap cannot send a second request.
+ * `#253 upstream-clear-polish`.
+ *
+ * @type {string | null}
+ */
+let upstreamClearPushing = null;
+/**
+ * A press the server answered `waiting`, which the box is still asking about, or null. `mode` is
+ * the mode it was pressed in, `messageAtMs` the instant of the message it asked to push, and
+ * `before` the attempt the server had last recorded when it answered, so a newer one is
+ * recognised. `#253 upstream-clear-polish`.
+ *
+ * @type {{channel: string, service: string, mode: VibeTalk.UpstreamClearMode,
+ *   messageAtMs: number | null, before: string, asked: number, timer: number} | null}
+ */
+let upstreamClearFollowing = null;
 
 /** Whether the box offers the control for the channel `id`. */
 function upstreamClearOffered(id) {
@@ -29188,31 +29214,179 @@ function upstreamClearSentence(view, service) {
     : `On. When the next message arrives here, it and everything before it are marked read in ${service}.`;
 }
 
-/** Whether Save would change anything: another mode, or a clear-now asked for. */
-function upstreamClearChanged() {
-  const stored = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : null;
-  const chosen = el("upstream-clear-mode").value;
-  if (stored === null) return false;
-  return chosen !== stored || (chosen !== "off" && el("upstream-clear-now").checked);
+/**
+ * The status line after "Mark read now" (or "Try it now"): what the press came to.
+ * `#253 upstream-clear-polish`.
+ *
+ * What the push did is said from `answer.attempt`, the attempt that answered THIS press, and never
+ * from `state.last`, which a later push may already have replaced: "Done" only for a push the
+ * service took, a failure as a failure, and a setting changed meanwhile as that.
+ *
+ * @param {VibeTalk.UpstreamClearNowResponse} answer
+ * @param {string} service
+ */
+function upstreamClearNowSentence(answer, service) {
+  const view = answer.state;
+  const attempt = answer.attempt || null;
+  const last = view.last || null;
+  const dryRun = view.mode === "dry_run";
+  switch (answer.outcome) {
+    case "pushed":
+      if (!attempt) break;
+      if (attempt.result === "advanced") {
+        return `Done: marked read in ${service} through the message from ${upstreamClearClock(attempt.message_at_ms)}.`;
+      }
+      if (attempt.result === "already_read") {
+        return `Done: ${service} already had it read through the message from ` +
+          `${upstreamClearClock(attempt.message_at_ms)}, so nothing needed moving.`;
+      }
+      if (attempt.result === "dry_run") {
+        return `Dry run: would mark it read in ${service} through the message from ` +
+          `${upstreamClearClock(attempt.message_at_ms)}. Nothing was written.`;
+      }
+      break;
+    case "failed": {
+      const why = attempt && attempt.error ? attempt.error : `${service} did not answer`;
+      const when = view.retry_at_ms ? ` It is tried again by itself at ${upstreamClearClock(view.retry_at_ms)}.` : "";
+      return `Not done: the push failed: ${why}.${when}`;
+    }
+    case "skipped":
+      return "Nothing was marked: the bridge no longer holds the newest message. The next message that arrives is marked.";
+    case "changed":
+      return `Not finished: this channel's setting changed while the push was on its way. ${upstreamClearSentence(view, service)}`;
+    case "covered":
+      return dryRun
+        ? "Nothing newer to try: the dry run already covered the newest message here. Nothing was written."
+        : `Nothing newer to mark: the newest message here is already marked read in ${service}.`;
+    case "no_message":
+      return dryRun ? "There is no message here to try it on yet." : "There is no message here to mark read yet.";
+    case "waiting":
+      return `Still waiting for ${service} to answer. The server carries on without this page, ` +
+        "and this line shows what it came to when it does.";
+    case "retry_waiting": {
+      const why = last && last.result === "failed" && last.error ? ` (${last.error})` : "";
+      const when = view.retry_at_ms ? `, at ${upstreamClearClock(view.retry_at_ms)}` : "";
+      return `Not sent yet: the last try failed${why}, so the newest message goes with the next one${when}.`;
+    }
+    default:
+      break;
+  }
+  return upstreamClearSentence(view, service);
 }
 
-/** Show the clear-now choice and enable Save to match what is chosen. */
+/** One recorded attempt, as a key that changes when a newer attempt replaces it. */
+function upstreamClearAttemptKey(attempt) {
+  return attempt ? `${attempt.at_ms} ${attempt.message_id} ${attempt.result}` : "";
+}
+
+/**
+ * What a press the server answered `waiting` has come to, read from the channel's state as the
+ * server holds it now: the answer the server would have given had it waited this long, or null
+ * while nothing has answered the press yet. The same rules as the server's own wait: an attempt
+ * newer than the one recorded at the answer that reaches the pressed message answers it, whatever
+ * it came to; a newer failure short of it means the message waits for the retry; a refusal or
+ * another mode ends it. `#253 upstream-clear-polish`.
+ *
+ * @param {NonNullable<typeof upstreamClearFollowing>} press
+ * @param {VibeTalk.UpstreamClearState} view
+ * @returns {VibeTalk.UpstreamClearNowResponse | null}
+ */
+function upstreamClearPressSettled(press, view) {
+  if (view.mode !== press.mode) return { outcome: "changed", state: view };
+  const last = view.last || null;
+  const fresh = Boolean(last) && upstreamClearAttemptKey(last) !== press.before;
+  if (last && fresh && (press.messageAtMs === null || last.message_at_ms >= press.messageAtMs)) {
+    /** @type {Record<string, VibeTalk.UpstreamClearNowOutcome>} */
+    const outcomes = { failed: "failed", skipped: "skipped", unavailable: "unavailable" };
+    return { outcome: outcomes[last.result] || "pushed", attempt: last, state: view };
+  }
+  if (view.unavailable) return { outcome: "unavailable", state: view };
+  if (last && fresh && last.result === "failed") return { outcome: "retry_waiting", state: view };
+  return null;
+}
+
+/** Stop asking about a press the server answered `waiting`. */
+function stopFollowingUpstreamClear() {
+  if (upstreamClearFollowing) clearTimeout(upstreamClearFollowing.timer);
+  upstreamClearFollowing = null;
+}
+
+/**
+ * Ask again about a press the server answered `waiting`, every UPSTREAM_CLEAR_RECHECK_MS, until
+ * something answers it or UPSTREAM_CLEAR_RECHECK_LIMIT_MS have passed, and say what it came to.
+ * Only while Settings shows the press's channel. `#253 upstream-clear-polish`.
+ *
+ * @param {string} channel
+ * @param {VibeTalk.UpstreamClearNowResponse} answer
+ * @param {string} service
+ */
+function followUpstreamClear(channel, answer, service) {
+  stopFollowingUpstreamClear();
+  const press = {
+    channel,
+    service,
+    mode: answer.state.mode,
+    messageAtMs: typeof answer.message_at_ms === "number" ? answer.message_at_ms : null,
+    before: upstreamClearAttemptKey(answer.state.last),
+    asked: 0,
+    timer: 0,
+  };
+  upstreamClearFollowing = press;
+  const here = () => upstreamClearFollowing === press && Boolean(upstreamClear) &&
+    upstreamClear.channel === channel && !el("screen-settings").hidden;
+  const ask = async () => {
+    if (!here()) {
+      if (upstreamClearFollowing === press) upstreamClearFollowing = null;
+      return;
+    }
+    press.asked += 1;
+    const read = ++upstreamClearReads;
+    /** @type {VibeTalk.UpstreamClearState | null} */
+    let view = null;
+    try {
+      view = await apiDecoded("UpstreamClearState", `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear`);
+    } catch (_error) {
+      // Unread this time; asked again at the next tick, as long as the bound allows.
+      view = null;
+    }
+    if (!here()) return;
+    if (view && read === upstreamClearReads) adoptUpstreamClear(channel, view);
+    const settled = view ? upstreamClearPressSettled(press, view) : null;
+    if (settled) {
+      upstreamClearFollowing = null;
+      el("upstream-clear-state").textContent = upstreamClearNowSentence(settled, service);
+      return;
+    }
+    if ((press.asked + 1) * UPSTREAM_CLEAR_RECHECK_MS > UPSTREAM_CLEAR_RECHECK_LIMIT_MS) {
+      upstreamClearFollowing = null;
+      el("upstream-clear-state").textContent = `${service} has not answered yet. The server carries on ` +
+        "without this page; open Settings again later to see what it came to.";
+      return;
+    }
+    el("upstream-clear-state").textContent =
+      upstreamClearNowSentence({ outcome: "waiting", state: view || answer.state }, service);
+    press.timer = setTimeout(ask, UPSTREAM_CLEAR_RECHECK_MS);
+  };
+  press.timer = setTimeout(ask, UPSTREAM_CLEAR_RECHECK_MS);
+}
+
+/** Whether Save would change anything: a mode other than the server's. */
+function upstreamClearChanged() {
+  const stored = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : null;
+  return stored !== null && el("upstream-clear-mode").value !== stored;
+}
+
+/** Enable Save, and offer "Mark read now" or "Try it now", to match what is chosen and saved. */
 function renderUpstreamClearChoice() {
-  const chosen = el("upstream-clear-mode").value;
-  const stored = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : "off";
-  // Offered when turning it on or to a dry run from another mode, and on the mode in force, as a
-  // way to do it now for what is already there. It is about WHEN, never whether: the service's
-  // marker covers the whole channel, so the first push clears what is already unread either way,
-  // and the label must not suggest that leaving it unticked keeps anything unread.
-  el("upstream-clear-now-row").hidden = chosen === "off";
-  if (chosen === "off") el("upstream-clear-now").checked = false;
-  el("upstream-clear-now-label").textContent =
-    chosen === "dry_run"
-      ? "Also try it now on the newest message"
-      : stored === "on"
-        ? "Also mark the newest message read there now"
-        : "Mark what is unread there now, instead of at the next message";
+  const view = upstreamClear ? upstreamClear.view : null;
+  const stored = view ? view.mode : "off";
   el("upstream-clear-save").disabled = !upstreamClearChanged();
+  // The button acts on the SAVED mode, so it is offered only while the choice still matches it:
+  // "Mark read now" beside an unsaved Off would mark messages read in a channel being turned off.
+  const push = el("upstream-clear-push");
+  push.hidden = !view || stored === "off" || el("upstream-clear-mode").value !== stored || Boolean(view.unavailable);
+  push.textContent = stored === "dry_run" ? "Try it now" : "Mark read now";
+  push.disabled = upstreamClearPushing !== null;
 }
 
 /** Redraw the box for the channel its picker is on, reading the server's state when it changed. */
@@ -29224,10 +29398,10 @@ function renderUpstreamClear() {
   const service = chatServiceOf(id);
   el("upstream-clear-provider").textContent = service;
   el("upstream-clear-warning-provider").textContent = service;
+  el("upstream-clear-threads-provider").textContent = service;
   if (!upstreamClear || upstreamClear.channel !== String(id)) {
     upstreamClear = { channel: String(id), view: null, failure: "" };
     el("upstream-clear-mode").value = "off";
-    el("upstream-clear-now").checked = false;
     el("upstream-clear-state").textContent = "Checking with the server…";
     renderUpstreamClearChoice();
     // Asked only while Settings is showing: a page that never opens it never spends the request,
@@ -29256,7 +29430,6 @@ function drawUpstreamClear() {
 function adoptUpstreamClear(channel, view) {
   if (!upstreamClear || upstreamClear.channel !== channel) return;
   upstreamClear = { channel, view, failure: "" };
-  el("upstream-clear-now").checked = false;
   drawUpstreamClear();
 }
 
@@ -29291,20 +29464,24 @@ function refreshUpstreamClear() {
   }
 }
 
-/** Save the chosen mode, and clear-now when it is ticked. */
+/**
+ * Save the chosen mode. Turning it on pushes nothing by itself: the next message that arrives is
+ * marked, and everything before it, as the warning says; "Mark read now" does it at once.
+ */
 async function saveUpstreamClear() {
   const channel = el("settings-channel").value;
   if (!upstreamClearOffered(channel) || !upstreamClearChanged()) return;
   const mode = el("upstream-clear-mode").value;
-  const clearNow = mode !== "off" && el("upstream-clear-now").checked;
   el("upstream-clear-save").disabled = true;
   el("upstream-clear-state").textContent = "Saving…";
+  // A save is the owner's newest word on the channel: a press still being asked about is not.
+  stopFollowingUpstreamClear();
   let view;
   try {
     view = await apiDecoded(
       "UpstreamClearState",
       `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear`,
-      { method: "PUT", body: { mode, clear_now: clearNow } }
+      { method: "PUT", body: { mode } }
     );
   } catch (error) {
     el("upstream-clear-state").textContent = `Not saved: ${error.detail || error.message}`;
@@ -29313,14 +29490,56 @@ async function saveUpstreamClear() {
   }
   upstreamClearReads += 1;
   adoptUpstreamClear(String(channel), view);
-  // The push happens on the server in the background; ask again shortly to show what it did.
-  if (view.mode !== "off") {
-    setTimeout(() => {
-      if (upstreamClear && upstreamClear.channel === String(channel) && !el("screen-settings").hidden) {
-        loadUpstreamClear(String(channel));
-      }
-    }, UPSTREAM_CLEAR_RECHECK_MS);
+}
+
+/**
+ * "Mark read now", or "Try it now" in a dry run: the server pushes the channel's newest message at
+ * once, through its own loop, and answers what that came to, which goes in the status line.
+ * `#253 upstream-clear-polish`.
+ *
+ * One press, one request: the button is disabled from the press until the answer. It never
+ * changes the mode; the server refuses it for a channel another device has turned off.
+ */
+async function pushUpstreamClearNow() {
+  const channel = String(el("settings-channel").value);
+  const view = upstreamClear && upstreamClear.channel === channel ? upstreamClear.view : null;
+  if (!view || view.mode === "off" || upstreamClearPushing !== null || !upstreamClearOffered(channel)) return;
+  const service = view.provider_name || chatServiceOf(channel);
+  stopFollowingUpstreamClear();
+  upstreamClearPushing = channel;
+  renderUpstreamClearChoice();
+  el("upstream-clear-state").textContent = view.mode === "dry_run"
+    ? `Trying it on the newest message in ${service}…`
+    : `Marking the newest message read in ${service}…`;
+  /** @type {VibeTalk.UpstreamClearNowResponse | null} */
+  let answer = null;
+  /** @type {string} */
+  let failure = "";
+  try {
+    answer = await apiDecoded(
+      "UpstreamClearNowResponse",
+      `/api/v1/channels/${encodeURIComponent(channel)}/upstream-clear/now`,
+      { method: "POST" }
+    );
+  } catch (error) {
+    failure = `Not done: ${error.detail || error.message}`;
   }
+  upstreamClearPushing = null;
+  const here = Boolean(upstreamClear && upstreamClear.channel === channel);
+  if (!answer) {
+    if (here) el("upstream-clear-state").textContent = failure;
+    renderUpstreamClearChoice();
+    return;
+  }
+  upstreamClearReads += 1;
+  adoptUpstreamClear(channel, answer.state);
+  if (!here) {
+    renderUpstreamClearChoice();
+    return;
+  }
+  el("upstream-clear-state").textContent = upstreamClearNowSentence(answer, service);
+  // The server stopped waiting before the push landed; ask again until something answers it.
+  if (answer.outcome === "waiting") followUpstreamClear(channel, answer, service);
 }
 
 /**
@@ -30293,8 +30512,8 @@ el("settings-channel").addEventListener("change", () => {
 });
 // `#232 upstream-mark-read`. Choosing a mode only shows what Save would do; Save is the decision.
 el("upstream-clear-mode").addEventListener("change", renderUpstreamClearChoice);
-el("upstream-clear-now").addEventListener("change", renderUpstreamClearChoice);
 el("upstream-clear-save").addEventListener("click", saveUpstreamClear);
+el("upstream-clear-push").addEventListener("click", pushUpstreamClearNow);
 el("rename-channel").addEventListener("click", () => {
   showChannelPanel("rename-fields");
   el("channel-alias").focus();

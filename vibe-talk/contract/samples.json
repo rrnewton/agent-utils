@@ -1074,6 +1074,111 @@
       "view": "threads"
     }
   ],
+  "UpstreamClearNowResponse": [
+    {
+      "attempt": {
+        "at_ms": 1790000010000,
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "previous": "2026-09-25T11:00:00Z",
+        "result": "advanced",
+        "target": "2026-09-25T12:00:00Z"
+      },
+      "message_at_ms": 1790000005000,
+      "message_id": "300",
+      "outcome": "pushed",
+      "state": {
+        "channel": {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        "enabled_at_ms": 1790000000000,
+        "failures": 0,
+        "last": {
+          "at_ms": 1790000010000,
+          "message_at_ms": 1790000005000,
+          "message_id": "300",
+          "previous": "2026-09-25T11:00:00Z",
+          "result": "advanced",
+          "target": "2026-09-25T12:00:00Z"
+        },
+        "mode": "on",
+        "pending": false,
+        "previous_cursor": "2026-09-25T11:00:00Z",
+        "provider_name": "Google Chat",
+        "pushed": {
+          "at_ms": 1790000010000,
+          "message_at_ms": 1790000005000,
+          "message_id": "300",
+          "previous": "2026-09-25T11:00:00Z",
+          "result": "advanced",
+          "target": "2026-09-25T12:00:00Z"
+        },
+        "supported": true
+      }
+    },
+    {
+      "message_at_ms": 1790000005000,
+      "message_id": "300",
+      "outcome": "covered",
+      "state": {
+        "channel": {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        "enabled_at_ms": 1790000000000,
+        "failures": 0,
+        "mode": "dry_run",
+        "pending": false,
+        "provider_name": "Google Chat",
+        "supported": true
+      }
+    },
+    {
+      "attempt": {
+        "at_ms": 1790000010000,
+        "error": "Google Chat returned HTTP 502: mark-read failed",
+        "message_at_ms": 1790000005000,
+        "message_id": "300",
+        "result": "failed"
+      },
+      "message_at_ms": 1790000005000,
+      "message_id": "300",
+      "outcome": "failed",
+      "state": {
+        "channel": {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "provider": "discord",
+          "writable": true
+        },
+        "enabled_at_ms": 1790000000000,
+        "failures": 1,
+        "last": {
+          "at_ms": 1790000010000,
+          "error": "Google Chat returned HTTP 502: mark-read failed",
+          "message_at_ms": 1790000005000,
+          "message_id": "300",
+          "result": "failed"
+        },
+        "mode": "on",
+        "pending": true,
+        "provider_name": "Google Chat",
+        "retry_at_ms": 1790000040000,
+        "supported": true
+      }
+    }
+  ],
   "UpstreamClearState": [
     {
       "channel": {

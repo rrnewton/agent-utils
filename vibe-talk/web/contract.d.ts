@@ -1231,6 +1231,43 @@ declare namespace VibeTalk {
   type UpstreamClearMode = "off" | "dry_run" | "on";
 
   /**
+   * What happened to a press of "Mark read now". `#253 upstream-clear-polish`.
+   */
+  type UpstreamClearNowOutcome = "pushed" | "failed" | "skipped" | "covered" | "no_message" | "retry_waiting" | "waiting" | "changed" | "unavailable";
+
+  /**
+   * What Settings' "Mark read now" came to: `POST /api/v1/channels/{id}/upstream-clear/now`.
+   * `#253 upstream-clear-polish`.
+   */
+  interface UpstreamClearNowResponse {
+    /**
+     * The recorded push that answered the press, with `pushed`, `failed` and `skipped`, and with
+     * `unavailable` when the push itself was refused: the pressed message's own, or a newer
+     * message's, which covers it. What the press came to is said from this, never from
+     * `state.last`, which a later push may already have replaced.
+     */
+    attempt?: UpstreamClearAttemptView | null;
+    /**
+     * That message's own instant, in milliseconds since the Unix epoch, when it can be read. An
+     * attempt recorded later whose `message_at_ms` is at or after it answers the press, which is
+     * how a page told `waiting` recognises the answer when it reads the state again.
+     */
+    message_at_ms?: number | null;
+    /**
+     * The channel's newest message, the one the press asked to push. Absent with `no_message`.
+     */
+    message_id?: MessageId | null;
+    /**
+     * What happened to the press.
+     */
+    outcome: UpstreamClearNowOutcome;
+    /**
+     * The channel's state after it, as `GET .../upstream-clear` would answer now.
+     */
+    state: UpstreamClearState;
+  }
+
+  /**
    * What one automatic upstream clear came to. `#232 upstream-mark-read`.
    */
   type UpstreamClearResult = "advanced" | "already_read" | "dry_run" | "failed" | "skipped" | "unavailable";
@@ -1449,6 +1486,7 @@ declare namespace VibeTalk {
     PinChangeResponse: PinChangeResponse;
     UpstreamClearState: UpstreamClearState;
     BookmarkResponse: BookmarkResponse;
+    UpstreamClearNowResponse: UpstreamClearNowResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

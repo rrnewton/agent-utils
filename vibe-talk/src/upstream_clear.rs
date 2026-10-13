@@ -20,12 +20,17 @@
 //!   nothing newer, or after [`Timing::max_wait`] during steady traffic, and never sooner than
 //!   [`Timing::max_wait`] after that channel's previous push.
 //! * **Never backwards.** A message at or before the newest one already covered is never pushed;
-//!   that floor is in the store and survives a restart. The provider bridge also re-reads its
-//!   real cursor and refuses to move it back.
+//!   that floor is in the store and survives a restart. The provider bridge also checks its
+//!   cursor and refuses to move it back; on this path it may weigh a push against the cursor it
+//!   last read or wrote, a few minutes old at most, which the README's bridge section describes.
 //! * **Failures wait and retry**, doubling from [`Timing::retry_first`] to [`Timing::retry_cap`]
 //!   with a little per-channel jitter. The newest message always wins, and a success resets it.
 //! * **Every attempt is logged on one line** starting `upstream-clear:`, dry runs included, so
 //!   an operator can see what the server would do before the owner relies on it.
+//! * **"Mark read now"** in Settings ([`Candidates::push_now`], `#253 upstream-clear-polish`)
+//!   pushes the channel's newest message at once instead of after the quiet wait, through the same
+//!   loop, and the request waits for the loop to record that push ([`Candidates::wait_for`]) so
+//!   the page can say what it came to, a failure as a failure. It never shortens a retry wait.
 //!
 //! Pushes are serial across channels: one task, one provider call at a time.
 
@@ -136,6 +141,21 @@ struct Runtime {
     retry_at: Option<Instant>,
     retry_at_ms: Option<i64>,
     unavailable: Option<String>,
+    /// The latest push to finish AND be recorded in the store in this generation, whatever it came
+    /// to; see [`Candidates::wait_for`].
+    last_report: Option<Report>,
+    /// How many pushes have finished and been recorded in this generation, so a press can tell a
+    /// push after it from one before it.
+    reports: u64,
+}
+
+/// One finished, recorded push, as a press waiting on it needs it. `#253 upstream-clear-polish`.
+#[derive(Clone, Debug)]
+struct Report {
+    position: (i64, u64),
+    /// What was recorded; `None` when nothing was sent because the channel is no longer one this
+    /// server can clear.
+    attempt: Option<UpstreamClearAttempt>,
 }
 
 /// One push the loop has taken and not yet finished.
@@ -165,6 +185,63 @@ pub struct LiveStatus {
     pub unavailable: Option<String>,
 }
 
+/// What a press of "Mark read now" came to before anything is sent. `#253 upstream-clear-polish`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushNow {
+    /// The channel is off in the running loop.
+    Off,
+    /// Its provider refused the channel; nothing more is pushed until the setting is saved again.
+    Unavailable,
+    /// The message's instant cannot be read, and a cursor cannot be placed by a time nobody can
+    /// read.
+    Unplaceable,
+    /// An earlier push, or an earlier dry run, already covers it. Nothing is sent.
+    Covered,
+    /// The channel is waiting out a failure. The message is pushed when the retry is due, not
+    /// sooner: a press never shortens the wait a spent quota asked for.
+    RetryWaiting,
+    /// Due at once. Wait for it with [`Candidates::wait_for`].
+    Queued(Ticket),
+}
+
+/// What waiting on a press came to: [`Candidates::wait_for`]. `#253 upstream-clear-polish`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// The push that answers the press finished and was recorded: the pressed message's own, or a
+    /// newer message's, which covers it. This is the attempt as recorded, failures included.
+    Recorded(UpstreamClearAttempt),
+    /// An older push, already on its way when the press came, failed after it, and the channel is
+    /// waiting out that failure. The pressed message goes at the retry; nothing was sent for it.
+    RetryWaiting,
+    /// The provider refused the channel while the press waited.
+    Unavailable,
+    /// The channel's setting changed while the press waited (turned off, set to the other mode,
+    /// or every setting erased), or it is no longer a channel this server can clear, so the push
+    /// will not be made as asked.
+    Changed,
+    /// Nothing answered the press before the deadline. The push is still queued or on its way,
+    /// and the loop carries on without whoever was waiting.
+    Waiting,
+}
+
+/// A press that was queued, to wait on with [`Candidates::wait_for`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    generation: u64,
+    position: (i64, u64),
+    reports: u64,
+}
+
+/// What noting a message came to, when the channel takes it.
+#[derive(Clone, Copy, Debug)]
+struct Noted {
+    ticket: Ticket,
+    /// Whether it is now the channel's newest waiting message.
+    newest: bool,
+    /// Whether the channel is waiting out a failure.
+    retry_waiting: bool,
+}
+
 /// The newest message per enabled channel, waiting to be pushed, and the wake-up for the loop.
 ///
 /// Owned by [`crate::live::LiveHub`], which feeds it. Holds nothing for a channel that is off, so
@@ -174,6 +251,8 @@ pub struct Candidates {
     channels: Mutex<BTreeMap<ChannelId, Runtime>>,
     next_generation: Mutex<u64>,
     wake: Notify,
+    /// Woken each time a finished push has been recorded; see [`Candidates::wait_for`].
+    recorded: Notify,
     /// Held across a change to the store's settings and the matching change here; see
     /// [`Candidates::changing`].
     changes: tokio::sync::Mutex<()>,
@@ -199,31 +278,59 @@ impl Candidates {
     /// channel's newest waiting message.
     pub fn offer(&self, channel: &ChannelId, message: &Message) -> bool {
         self.note(channel, &message.id, &message.timestamp, false)
+            .is_ok_and(|noted| noted.newest)
     }
 
     /// [`Candidates::offer`] from a message's id and instant alone.
     pub fn offer_parts(&self, channel: &ChannelId, id: &MessageId, timestamp: &str) -> bool {
         self.note(channel, id, timestamp, false)
+            .is_ok_and(|noted| noted.newest)
     }
 
-    /// Note `message` and push it as soon as the loop can, without waiting for quiet or for the
-    /// spacing between pushes: the owner asked to clear what is unread now.
-    pub fn offer_now(&self, channel: &ChannelId, message: &Message) -> bool {
-        self.note(channel, &message.id, &message.timestamp, true)
+    /// Note `message`, the channel's newest, and push it as soon as the loop can, without waiting
+    /// for quiet or for the spacing between pushes: the owner pressed "Mark read now" (or "Try it
+    /// now" in a dry run). `#253 upstream-clear-polish`.
+    ///
+    /// A message already covered is not pushed again, and a channel waiting out a failure keeps
+    /// its wait: the message goes at the retry.
+    pub fn push_now(&self, channel: &ChannelId, message: &Message) -> PushNow {
+        match self.note(channel, &message.id, &message.timestamp, true) {
+            Err(refused) => refused,
+            Ok(noted) if noted.retry_waiting => PushNow::RetryWaiting,
+            Ok(noted) => PushNow::Queued(noted.ticket),
+        }
     }
 
-    fn note(&self, channel: &ChannelId, id: &MessageId, timestamp: &str, immediate: bool) -> bool {
+    fn note(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        timestamp: &str,
+        immediate: bool,
+    ) -> Result<Noted, PushNow> {
         let Some(position) = position_of(id, timestamp) else {
-            return false;
+            return Err(PushNow::Unplaceable);
         };
         let now = Instant::now();
         let mut channels = lock(&self.channels);
         let Some(runtime) = channels.get_mut(channel) else {
-            return false;
+            return Err(PushNow::Off);
         };
-        if runtime.unavailable.is_some() || runtime.floor.is_some_and(|floor| position <= floor) {
-            return false;
+        if runtime.unavailable.is_some() {
+            return Err(PushNow::Unavailable);
         }
+        if runtime.floor.is_some_and(|floor| position <= floor) {
+            return Err(PushNow::Covered);
+        }
+        let mut noted = Noted {
+            ticket: Ticket {
+                generation: runtime.generation,
+                position,
+                reports: runtime.reports,
+            },
+            newest: false,
+            retry_waiting: runtime.retry_at.is_some_and(|retry| retry > now),
+        };
         let pending = match runtime.pending.take() {
             Some(mut pending) if position <= pending.position => {
                 pending.last_seen = now;
@@ -233,7 +340,7 @@ impl Candidates {
                 if immediate {
                     self.wake.notify_one();
                 }
-                return false;
+                return Ok(noted);
             }
             Some(pending) => Pending {
                 message: id.clone(),
@@ -255,7 +362,85 @@ impl Candidates {
         runtime.pending = Some(pending);
         drop(channels);
         self.wake.notify_one();
-        true
+        noted.newest = true;
+        Ok(noted)
+    }
+
+    /// Wait, until `deadline` at the latest, for what answers the press `ticket` queued, and say
+    /// what that was. `#253 upstream-clear-polish`.
+    ///
+    /// Only an answer to THIS press settles it: a recorded push at or past the pressed message
+    /// (whatever it came to, so a failure is never reported as done), a failure of an older push
+    /// after the press (the pressed message then waits for the retry), the provider refusing the
+    /// channel, or the channel's setting changing. A push of an older message that succeeds after
+    /// the press does not; the pressed message is still to go.
+    pub async fn wait_for(
+        &self,
+        channel: &ChannelId,
+        ticket: Ticket,
+        deadline: Instant,
+    ) -> Settled {
+        loop {
+            // Armed before the check, so a record landing between the two still wakes it.
+            let recorded = self.recorded.notified();
+            tokio::pin!(recorded);
+            recorded.as_mut().enable();
+            if let Some(settled) = self.settled(channel, ticket) {
+                return settled;
+            }
+            tokio::select! {
+                () = &mut recorded => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    return self.settled(channel, ticket).unwrap_or(Settled::Waiting);
+                }
+            }
+        }
+    }
+
+    fn settled(&self, channel: &ChannelId, ticket: Ticket) -> Option<Settled> {
+        let channels = lock(&self.channels);
+        let Some(runtime) = channels.get(channel) else {
+            // Turned off, or every channel forgotten: nothing more will be pushed.
+            return Some(Settled::Changed);
+        };
+        if runtime.generation != ticket.generation {
+            return Some(Settled::Changed);
+        }
+        let since = runtime.reports > ticket.reports;
+        if let Some(report) = runtime.last_report.as_ref().filter(|_| since) {
+            if report.position >= ticket.position {
+                return Some(
+                    report
+                        .attempt
+                        .clone()
+                        .map_or(Settled::Changed, Settled::Recorded),
+                );
+            }
+        }
+        if runtime.unavailable.is_some() {
+            return Some(Settled::Unavailable);
+        }
+        if since && runtime.retry_at.is_some() {
+            return Some(Settled::RetryWaiting);
+        }
+        None
+    }
+
+    /// Say that `job` has finished and `attempt` is recorded (`None` when nothing was sent), and
+    /// wake whoever waits on it.
+    fn recorded(&self, job: &Job, attempt: Option<&UpstreamClearAttempt>) {
+        let mut channels = lock(&self.channels);
+        if let Some(runtime) = channels.get_mut(&job.channel) {
+            if runtime.generation == job.generation {
+                runtime.last_report = Some(Report {
+                    position: job.position,
+                    attempt: attempt.cloned(),
+                });
+                runtime.reports += 1;
+            }
+        }
+        drop(channels);
+        self.recorded.notify_waiters();
     }
 
     /// Hold this while changing settings in the store and then here, and let it go before any
@@ -278,6 +463,8 @@ impl Candidates {
         channels.clear();
         drop(channels);
         self.wake.notify_one();
+        // A press waiting on a push that will now never happen stops waiting.
+        self.recorded.notify_waiters();
         forgotten
     }
 
@@ -320,6 +507,8 @@ impl Candidates {
                             retry_at: None,
                             retry_at_ms: None,
                             unavailable: None,
+                            last_report: None,
+                            reports: 0,
                         },
                     );
                 }
@@ -327,6 +516,8 @@ impl Candidates {
         }
         drop(channels);
         self.wake.notify_one();
+        // A press waiting on this channel stops waiting when its setting changes.
+        self.recorded.notify_waiters();
     }
 
     /// The mode the loop is acting on for `channel`: off when it holds nothing for it.
@@ -674,6 +865,7 @@ impl Clearer {
                  cleared; nothing was pushed",
                 job.channel
             );
+            self.candidates.recorded(&job, None);
             return true;
         }
         let dry_run = job.mode == UpstreamClearMode::DryRun;
@@ -713,6 +905,8 @@ impl Clearer {
                 "upstream-clear: could not record this attempt; Settings will show an older one"
             );
         }
+        // Only now, so a press waiting on this push reads the attempt back from the store.
+        self.candidates.recorded(&job, Some(&attempt));
         true
     }
 
@@ -1532,5 +1726,249 @@ mod tests {
         tokio::time::advance(Duration::from_secs(120)).await;
         assert!(!clearer.push_due().await);
         assert!(fake.upstream_clears().is_empty());
+        assert_eq!(
+            clearer.candidates.push_now(&channel, &message),
+            PushNow::Off,
+            "a press pushed for a channel that is off"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_press_pushes_at_once_inside_the_spacing_and_the_wait_ends_when_it_is_recorded() {
+        // `#253 upstream-clear-polish`. "Mark read now" skips the quiet period and the spacing
+        // between pushes, and whoever waits on it wakes once the attempt is in the store.
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        let first = arrive(&fake, &agents(), 0);
+        clearer.candidates.offer(&agents(), &first);
+        pass(6).await;
+        assert_eq!(fake.upstream_clears().len(), 1);
+        // Two seconds after a push, well inside the 30 s spacing.
+        let second = arrive(&fake, &agents(), 8);
+        let PushNow::Queued(ticket) = clearer.candidates.push_now(&agents(), &second) else {
+            panic!("the press was not queued");
+        };
+        let started = Instant::now();
+        let settled = clearer
+            .candidates
+            .wait_for(&agents(), ticket, started + Duration::from_secs(45))
+            .await;
+        let Settled::Recorded(attempt) = settled else {
+            panic!("the press settled as {settled:?}");
+        };
+        assert_eq!(attempt.message, second.id, "settled by another push");
+        assert_eq!(attempt.result, UpstreamClearResult::Advanced);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the press waited {:?} for the spacing",
+            started.elapsed()
+        );
+        assert_eq!(
+            fake.upstream_clears(),
+            vec![
+                (agents(), first.id.clone(), false),
+                (agents(), second.id.clone(), false)
+            ]
+        );
+        let setting = &store.upstream_clear_settings().await.expect("read")[0];
+        assert_eq!(
+            setting.last.as_ref().map(|last| &last.message),
+            Some(&second.id),
+            "the wait ended before the attempt was recorded"
+        );
+        // Nothing newer: covered, and nothing is sent.
+        assert_eq!(
+            clearer.candidates.push_now(&agents(), &second),
+            PushNow::Covered
+        );
+        let mut unreadable = second.clone();
+        unreadable.timestamp = "yesterday".to_owned();
+        assert_eq!(
+            clearer.candidates.push_now(&agents(), &unreadable),
+            PushNow::Unplaceable
+        );
+        pass(120).await;
+        assert_eq!(fake.upstream_clears().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_ends_when_the_setting_changes_and_otherwise_at_its_deadline() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        // No loop running: nothing will ever record the push.
+        let message = arrive(&fake, &agents(), 0);
+        let PushNow::Queued(ticket) = clearer.candidates.push_now(&agents(), &message) else {
+            panic!("the press was not queued");
+        };
+        let started = Instant::now();
+        assert_eq!(
+            clearer
+                .candidates
+                .wait_for(&agents(), ticket, started + Duration::from_secs(45))
+                .await,
+            Settled::Waiting,
+            "settled with nothing recorded"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(45));
+        for change in [UpstreamClearMode::DryRun, UpstreamClearMode::Off] {
+            let candidates = Arc::clone(&clearer.candidates);
+            let PushNow::Queued(ticket) = candidates.push_now(&agents(), &message) else {
+                panic!("the press was not queued");
+            };
+            let waiting = tokio::spawn(async move {
+                let started = Instant::now();
+                let settled = candidates
+                    .wait_for(&agents(), ticket, started + Duration::from_secs(45))
+                    .await;
+                (settled, started.elapsed())
+            });
+            pass(1).await;
+            clearer.candidates.set_mode(&agents(), change, None);
+            let (settled, waited) = waiting.await.expect("the wait finished");
+            assert_eq!(
+                settled,
+                Settled::Changed,
+                "set to {change:?}, the press said {settled:?}"
+            );
+            assert!(
+                waited < Duration::from_secs(2),
+                "the wait ran on for {waited:?} after it was set to {change:?}"
+            );
+            if change == UpstreamClearMode::DryRun {
+                clearer
+                    .candidates
+                    .set_mode(&agents(), UpstreamClearMode::On, None);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_press_whose_push_fails_settles_as_that_failure_never_as_done() {
+        // `#253 upstream-clear-polish`. The reviewer's case: an attempt was recorded, and it failed.
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        let message = arrive(&fake, &agents(), 0);
+        fake.fail_upstream_clear_next(ChatError::Status {
+            status: 502,
+            body: "mark-read failed".to_owned(),
+        });
+        let PushNow::Queued(ticket) = clearer.candidates.push_now(&agents(), &message) else {
+            panic!("the press was not queued");
+        };
+        let settled = clearer
+            .candidates
+            .wait_for(&agents(), ticket, Instant::now() + Duration::from_secs(45))
+            .await;
+        let Settled::Recorded(attempt) = settled else {
+            panic!("the press settled as {settled:?}");
+        };
+        assert_eq!(attempt.result, UpstreamClearResult::Failed);
+        assert_eq!(attempt.message, message.id);
+        assert!(attempt
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("502")));
+        assert!(clearer.candidates.status(&agents()).retry_at_ms.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_press_behind_an_older_push_waits_past_its_success_and_says_so_when_it_fails() {
+        // `#253 upstream-clear-polish`. A push of an OLDER message already on its way when the
+        // press came does not answer the press: its success is not the press's, and its failure
+        // leaves the pressed message waiting for the retry.
+        for fails in [false, true] {
+            let fake = Arc::new(FakeDiscord::new());
+            fake.enable_upstream_clear();
+            let store = Arc::new(FakeStore::new());
+            let clearer = clearer(&fake, &store);
+            on(&clearer, &agents(), UpstreamClearMode::On).await;
+            let gate = fake.hold_upstream_clears();
+            tokio::spawn(clearer.clone().run());
+            let older = arrive(&fake, &agents(), 0);
+            clearer.candidates.offer(&agents(), &older);
+            pass(6).await;
+            assert_eq!(
+                fake.upstream_clears().len(),
+                1,
+                "the older push is not on its way"
+            );
+            let newest = arrive(&fake, &agents(), 7);
+            let PushNow::Queued(ticket) = clearer.candidates.push_now(&agents(), &newest) else {
+                panic!("the press was not queued");
+            };
+            let candidates = Arc::clone(&clearer.candidates);
+            let waiting = tokio::spawn(async move {
+                candidates
+                    .wait_for(&agents(), ticket, Instant::now() + Duration::from_secs(45))
+                    .await
+            });
+            if fails {
+                fake.fail_upstream_clear_next(ChatError::Status {
+                    status: 502,
+                    body: "mark-read failed".to_owned(),
+                });
+            }
+            gate.add_permits(1);
+            pass(1).await;
+            if fails {
+                assert_eq!(waiting.await.expect("waited"), Settled::RetryWaiting);
+                assert_eq!(
+                    fake.upstream_clears().len(),
+                    1,
+                    "the pressed message went before the retry"
+                );
+                assert!(clearer.candidates.status(&agents()).pending);
+                continue;
+            }
+            assert!(
+                !waiting.is_finished(),
+                "the older push's success settled the press"
+            );
+            gate.add_permits(1);
+            let settled = waiting.await.expect("waited");
+            let Settled::Recorded(attempt) = settled else {
+                panic!("the press settled as {settled:?}");
+            };
+            assert_eq!(attempt.message, newest.id, "settled by the older push");
+            assert_eq!(attempt.result, UpstreamClearResult::Advanced);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_press_the_provider_refuses_settles_as_unavailable() {
+        let fake = Arc::new(FakeDiscord::new());
+        fake.enable_upstream_clear();
+        let store = Arc::new(FakeStore::new());
+        let clearer = clearer(&fake, &store);
+        on(&clearer, &agents(), UpstreamClearMode::On).await;
+        tokio::spawn(clearer.clone().run());
+        let message = arrive(&fake, &agents(), 0);
+        fake.fail_upstream_clear_next(ChatError::Status {
+            status: 409,
+            body: r#"{"message":"thread_channel"}"#.to_owned(),
+        });
+        let PushNow::Queued(ticket) = clearer.candidates.push_now(&agents(), &message) else {
+            panic!("the press was not queued");
+        };
+        let settled = clearer
+            .candidates
+            .wait_for(&agents(), ticket, Instant::now() + Duration::from_secs(45))
+            .await;
+        let Settled::Recorded(attempt) = settled else {
+            panic!("the press settled as {settled:?}");
+        };
+        assert_eq!(attempt.result, UpstreamClearResult::Unavailable);
+        assert!(clearer.candidates.status(&agents()).unavailable.is_some());
     }
 }
