@@ -23649,10 +23649,13 @@ function renderOlderControl() {
 //
 // `#262 search-load-older`. The owner, 2026-10-12: "searching for a term XYZ in two column view found
 // zero hits; in one column, scrolling up while searching loaded older pages and found 3 ... 2 column
-// view should not PRECLUDE loading hits". The search filters what is loaded, and a step back fired only
-// by scrolling near the top; a page that brought only rows the search hides added no height, and a list
-// the search had emptied sat at the top already, where scrolling up fires no scroll event at all. So
-// paging stalled under a filter, and the step back said "Older messages" and nothing about finding.
+// view should not PRECLUDE loading hits". The search filters what is loaded, and a step back was fired
+// only by the list's scroll position reaching its head, which under a filter nothing bounded: measured in
+// Chromium, a search that emptied the list chained steps back through the channel's whole history, each
+// page drawn and hidden moving the position enough to fire the next; on Main, which holds no replies,
+// that is a walk to the start that finds nothing. The step back meanwhile said "Older messages" and
+// nothing about finding. So the scroll's own step gives way while a filter chooses rows
+// (`maybeLoadOlder`), and the search's walk below is the one way back, bounded, and the reader's.
 //
 // WHILE A FILTER CHOOSES ROWS (a term, Links or whose messages), each column's step back says "Search
 // before Oct 3", the day that column reaches back to. A tap on it, or Enter in the search field, walks
@@ -24119,6 +24122,11 @@ function maybeLoadOlder() {
   if (currentView !== "discord" || pinnedOnly || discordMoreAbove !== true || olderFetchInFlight) {
     return;
   }
+  // `#262 search-load-older`. Nor while a filter chooses rows, where the step back offers a bounded walk
+  // instead (`searchOffered`). Measured in Chromium: once a search emptied the list, each step's page,
+  // drawn and then hidden by the search, moved the scroll position at the head enough to fire the next
+  // step, and the page read the channel's whole history back that nobody asked for.
+  if (searchOffered()) return;
   if (el("scroll-area").scrollTop > OLDER_TRIGGER_PX) {
     return;
   }

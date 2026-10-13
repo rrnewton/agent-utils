@@ -3814,6 +3814,51 @@ Rules the page drew itself — the seam between two calls, the date rules — **
 they were explaining**. A seam says the agent below it never heard the words above it, and left
 standing over a filtered list it says that about two rows that are no longer adjacent.
 
+### Searching further back
+
+`#262 search-load-older`. The owner: *"searching for a term XYZ in two column view found zero hits; in
+one column, scrolling up while searching loaded older pages and found 3 ... 2 column view should not
+PRECLUDE loading hits."* The search reads only what is loaded, and an older page was read only by
+scrolling near the top of the list. A page that brought nothing the search lets through added no
+height, and a list the search had emptied already sat at its top, where scrolling up fires no scroll
+event at all, so paging stalled under a search; the button at the head of the list said "Older
+messages" and nothing about finding.
+
+So while a search, **Links** or whose messages chooses rows, each column's button at the head of its
+list says **"Search before Oct 3"** — the day that column reaches back to ("Search replies before …"
+in a thread) — and **Enter** in the search field, a phone keyboard's Search key, does the same as a
+press. One press reads up to **five** older pages, starts no page that the last one's time says would
+end past **fifteen seconds**, and stops at the end of the page that brings **three** new matches.
+Meanwhile the button says **"Searching… 2 of 5 · Stop"**, and pressing it aborts the read on the wire.
+Every press is one more search and nothing chains pages by itself; the button always says how far back
+the next one starts. Any change to the search, closing the right column's thread, leaving two columns,
+another channel or view, a reply's jump or a filter's own walk back ends a walk where it is, and only
+one runs at a time.
+
+What a walk found is counted among messages **older than where it started**, so a message arriving
+live or a poll can neither stop it nor be reported as found, and in messages, as the count is: a
+combined row is every message it holds, so the count beside the field and the lines between matches
+add up. It is said once, under the button, until the search changes: *Found 3 in 2 pages (98
+messages), back to Sep 30.* The button holds still while the walk runs and the matches open directly
+under it, the line above the first saying how many unmatched messages it skips. With nothing matched,
+the sentence where the messages were says how far back that is: *Nothing in the 643 messages loaded so
+far, back to Sep 28, matches that search.*
+
+**Hide read steps aside while a search chooses rows**, on a chat service with threads, as Collapse read
+does: an old match is read by definition, and a walk under Hide read would read pages and draw almost
+nothing of them. Read matches show greyed, the read mode kept on the device is untouched, and closing
+the search brings Hide read back. On a chat service without threads Hide read is a list of its own,
+read for itself; there it stays in force, no walk is offered, and the sentence says how to search older
+messages instead.
+
+**Main holds a thread's first message and none of its replies**, and that is most of why a search on
+the left of two columns found nothing. Main's sentence says so; in one column a search nothing on Main
+matches offers **"Search All — thread replies too"**, which opens All with the search kept; in two
+columns the cards on the right are found by what the thread's first message says (where the card shows
+its summary) and by the replies the page has loaded, and the thread selected there walks its own older
+replies. A walk reads only the routes a scroll up reads: no server route is new. Finding a reply the
+page has never loaded, in two columns, needs a server search, which waits on the persistent cache.
+
 ### A filter keeps your place
 
 `#243 filter-keeps-selection`. The owner: *"when you adjust the filter, the highlighted message MUST
@@ -4432,6 +4477,7 @@ scrolls from the keyboard the way any web page does:
 | Home, End | The top of the list, or its newest message |
 | Ctrl+Home, Ctrl+End (Cmd on a Mac) | The same from anywhere, a message box included |
 | `/` | Open the search with its field ready; pressed again, back to what you typed |
+| Enter, in the search field | Search older messages, a few pages at a time; the button at the head of the list says Stop meanwhile |
 | `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
 | Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply, Threads or a thread; never marks anything read |
 

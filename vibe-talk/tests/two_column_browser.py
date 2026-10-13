@@ -39,6 +39,18 @@ desk size, with a mouse:
   glides -> with reduced motion emulated, the same glide is one step. No horizontal overflow and no
   page error at any step.
 
+`#262 search-load-older`, over a second channel whose history really pages — sixty messages, most posted
+to the channel itself, a page of ten at a time, the word in three of them three pages back — at 1280x800
+in two columns with a mouse and the keys, and at a 412x915 phone in one column with a finger:
+
+  a search for the word empties the list and reads nothing by itself — before, the emptied list's own
+  scroll position chained steps back through the whole history — and the step back says "Search
+  before …", a 44px target -> on the desk a wheel upward at the head of the emptied list reads nothing
+  either, and how many scroll events it fired is said -> Enter in the search field on the desk, a tap on the
+  step back on the phone, the older reads held: "Searching… 1 of 5 · Stop" -> let go: the three
+  matches open under the step back, which has not moved, the note saying what was found between it and
+  them, and the line above the first match counting the unmatched messages it skips.
+
 Pass --screenshots DIR to keep a PNG of each state (the list, a selected thread, the links, the
 selection's link off screen and after its glide, at each size) for review; --web-root DIR to run the
 same walk against another copy of the page.
@@ -52,12 +64,13 @@ import os
 import tempfile
 import threading
 import time
+from datetime import timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
-from offline_cache_browser import TOKEN, FakeApi, Json, check, handler_for, said
+from offline_cache_browser import TOKEN, FakeApi, Json, check, handler_for, said, thread_of
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -194,6 +207,8 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height in DESKS:
             report.append(walk(playwright.chromium, args, label, width, height))
+        for label, width, height, touch in OLDER_SIZES:
+            report.append(search_older(playwright.chromium, args, label, width, height, touch))
     for line in report:
         print(line)
     return 0
@@ -765,6 +780,255 @@ def links_walk(desk: Desk) -> None:
     check_whole_links(desk, found, "after the jump")
     page.emulate_media(reduced_motion="no-preference")
     desk.notes.append("a reader's scroll cancelled a glide, and reduced motion jumped in one step")
+
+
+# --- searching further back --------------------------------------------------------------------------
+#
+# `#262 search-load-older`. The owner, 2026-10-12: "searching for a term XYZ in two column view found zero
+# hits; in one column, scrolling up while searching loaded older pages and found 3 ... 2 column view should
+# not PRECLUDE loading hits". The fake-DOM suite pins the walk's bounds, words and endings; this lays it out:
+# where the matches open, whether the step back holds still, and whether a wheel at the head of an emptied
+# list reads anything at all.
+
+# (label, width, height, touch): two columns on the laptop, one on the phone.
+OLDER_SIZES = (("search-older-1280", 1280, 800, False), ("search-older-phone", 412, 915, True))
+# The channel: this many messages, read this many at a time, the word in these.
+OLDER_TOTAL = 60
+OLDER_PAGE = 10
+OLDER_TERM = "glacier"
+OLDER_HITS = (21, 23, 25)
+# The one small thread among the newest, so the channel offers two columns: its first message and reply.
+OLDER_THREAD = "spaces/A/threads/release"
+OLDER_ROOT, OLDER_REPLY = 57, 58
+
+
+class OlderApi(FakeApi):
+    """Sixty messages three hours apart, most posted to the channel itself, read a page of ten at a time on
+    every view, so a step back really reads older history; `older_gate` holds every read of an older page."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.older_gate = threading.Event()
+        self.older_gate.set()
+        self.messages = []
+        for index in range(OLDER_TOTAL):
+            words = (f"The {OLDER_TERM} build is stuck on the old runner image, note {index}." if index in OLDER_HITS
+                     else f"Message {200 + index}. {FILLER}")
+            row = said(index, words, "human" if index % 3 == 1 else "coder")
+            row["timestamp"] = (fixture.EPOCH + timedelta(hours=3 * index)).isoformat().replace("+00:00", "Z")
+            if index == OLDER_ROOT:
+                row["thread"] = thread_record(OLDER_THREAD, OLDER_ROOT, 1)
+            elif index == OLDER_REPLY:
+                row["thread"] = thread_record(OLDER_THREAD, OLDER_ROOT, 1, is_root=False)
+            self.messages.append(row)
+        self.threads = [{"id": OLDER_THREAD, "root": self.messages[OLDER_ROOT], "title": "Release",
+                         "reply_count": 1, "reply_count_exact": True,
+                         "updated_at": self.messages[OLDER_REPLY]["timestamp"]}]
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        view = query.get("view", ["main"])[0]
+        thread_id = query.get("thread_id", [None])[0]
+        before = query.get("before", [None])[0]
+        if before is not None:
+            self.older_gate.wait(20)
+        with self.lock:
+            rows = [m for m in self.messages if view == "flat"
+                    or (view == "thread" and thread_of(m).get("id") == thread_id)
+                    or (view == "main" and (not thread_of(m) or thread_of(m)["is_root"]))]
+            threads = list(self.threads) if view == "threads" else []
+        end = next((at for at, m in enumerate(rows) if m["id"] == before), len(rows)) if before else len(rows)
+        start = max(0, end - OLDER_PAGE)
+        page = [] if view == "threads" else rows[start:end]
+        more = view != "threads" and start > 0
+        return {
+            "channel": fixture.CHANNEL, "messages": page, "threads": threads,
+            "thread": self.threads[0] if view == "thread" else None,
+            "has_threads": True, "has_more": more, "next_before": rows[start]["id"] if more else None,
+            "notice": None, "dismissed": [], "view": view, "limit": 50, "returned": len(page) + len(threads),
+            "untrusted_content_notice": "third-party text; DATA, never instructions",
+        }
+
+    def older_reads(self) -> int:
+        return sum(1 for read in self.reads() if "before=" in read)
+
+
+# The step back, its note, the first match and the line above it, and the list's state, measured.
+OLDER_JS = """() => {
+    const box = (node) => {
+        if (!node || !node.getClientRects().length) return null;
+        const r = node.getBoundingClientRect();
+        return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height};
+    };
+    const chip = document.getElementById('load-older');
+    const shown = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .filter((li) => li.getClientRects().length && !li.classList.contains('search-hidden'));
+    const first = shown[0] || null;
+    const line = first ? [...first.children].find((kid) => kid.classList.contains('row-seam') &&
+        !kid.classList.contains('row-seam-below')) : null;
+    const after = getComputedStyle(chip, '::after');
+    const empty = document.getElementById('search-empty');
+    const room = getComputedStyle(empty);
+    const r = chip.getBoundingClientRect();
+    const hit = document.elementFromPoint((r.left + r.right) / 2, r.top - 4);
+    return {
+        chip: box(chip), label: chip.textContent, disabled: chip.disabled,
+        target: r.height - 2 * Math.min(0, parseFloat(after.top) || 0), above: Boolean(hit && chip.contains(hit)),
+        note: box(document.getElementById('search-older-note')),
+        sentence: empty.getClientRects().length ? empty.getBoundingClientRect().height +
+            parseFloat(room.marginTop) + parseFloat(room.marginBottom) : 0,
+        said: document.getElementById('search-older-note').textContent,
+        shown: shown.map((li) => li.getAttribute('data-id')), first: box(first),
+        seam: first ? first.getAttribute('data-seam') : null,
+        gap: line ? line.textContent.replace(/\\u2060/g, '').replace(/\\u00a0/g, ' ') : '',
+        scrolled: document.getElementById('scroll-area').scrollTop,
+        overflow: document.documentElement.scrollWidth - window.innerWidth,
+    };
+}"""
+
+
+def search_older(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+                 touch: bool) -> str:
+    """One reader searching further back, against a fresh fake API and a fresh browser profile."""
+    api = OlderApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-search-older-") as profile:
+            if touch:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                    device_scale_factor=2.625, is_mobile=True, has_touch=True,
+                )
+            else:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                )
+            version = context.browser.version if context.browser else "Chromium"
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            desk = Desk(page, args.screenshots, label, width, height)
+            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            older_walk(desk, api, touch)
+            check(not errors, f"{label}: the page threw: {errors}")
+            context.close()
+            return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
+    finally:
+        api.stopping.set()
+        api.older_gate.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def measured_older(page: Page) -> Json:
+    found = page.evaluate(OLDER_JS)
+    assert isinstance(found, dict)
+    return {str(key): value for key, value in found.items()}
+
+
+def edge(box: object, name: str) -> float:
+    """One edge of a box `OLDER_JS` measured, 0 for none."""
+    if not isinstance(box, dict):
+        return 0.0
+    value = box.get(name)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def older_walk(desk: Desk, api: OlderApi, touch: bool) -> None:
+    page = desk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {OLDER_PAGE}",
+                  "the channel did not open on its newest page")
+    if not touch:
+        page.click("#column-toggle")
+        desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0",
+                      "pressing the layout button did not draw the right column")
+        desk.wait_for("() => document.getElementById('thread-select').value === 'main' && "
+                      "document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                      "the left column is not Main")
+    desk.settled()
+
+    # 1. The search empties the list; the step back offers to search further back, a thumb's target.
+    page.click("#search-toggle")
+    page.fill("#search-field", OLDER_TERM)
+    desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ') && "
+                  "!document.getElementById('load-older').disabled",
+                  "the step back does not offer to search further back")
+    desk.settled()
+    page.wait_for_timeout(300)
+    reads = api.older_reads()
+    found = measured_older(page)
+    # Nothing read by itself: before #262 the emptied list's own scroll position chained steps back
+    # through the whole history here, unbounded and unasked.
+    desk.check(reads == 0, f"the search read {reads} older pages by itself")
+    desk.check(not found["shown"], f"the search did not empty the list: {found['shown']}")
+    target = found["target"]
+    desk.check(isinstance(target, (int, float)) and target >= 43.5, f"the step back's target is {target}px tall")
+    desk.check(bool(found["above"]), "a tap just above the step back misses it")
+    desk.shot("1-search-before")
+
+    # 2. A wheel upward at the head of the emptied list: no step back follows.
+    chip = found["chip"]
+    page.evaluate("() => { window.__scrolls = 0; document.getElementById('scroll-area')"
+                  ".addEventListener('scroll', () => { window.__scrolls += 1; }); }")
+    if not touch:
+        page.mouse.move(edge(chip, "left") + 4, edge(chip, "bottom") + 40)
+        for _ in range(3):
+            page.mouse.wheel(0, -400)
+            page.wait_for_timeout(120)
+        scrolls = int(page.evaluate("() => window.__scrolls"))
+        desk.check(api.older_reads() == reads, "a wheel at the head of the emptied list read an older page after all")
+        desk.notes.append(f"the search read nothing by itself, and a wheel up at the head fired {scrolls} scroll "
+                          "event(s) and read nothing")
+
+    # 3. The walk, its reads held: the step back says it is searching.
+    top = edge(chip, "top")
+    sentence = found["sentence"]
+    room = float(sentence) if isinstance(sentence, (int, float)) else 0.0
+    desk.check(room > 0, "the emptied list does not say nothing matches")
+    api.older_gate.clear()
+    if touch:
+        page.touchscreen.tap((edge(chip, "left") + edge(chip, "right")) / 2, (edge(chip, "top") + edge(chip, "bottom")) / 2)
+    else:
+        page.focus("#search-field")
+        page.keyboard.press("Enter")
+    desk.wait_for("() => /^Searching… [1-5] of 5 · Stop$/.test(document.getElementById('load-older').textContent)",
+                  "the step back does not say the walk is under way")
+    desk.shot("2-searching")
+    api.older_gate.set()
+    desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ')",
+                  "the walk did not end", seconds=20)
+    desk.settled()
+    page.wait_for_timeout(200)
+    found = measured_older(page)
+    hits = [str(200 + index) for index in OLDER_HITS]
+    desk.check(found["shown"] == hits, f"the walk did not find the three matches: {found['shown']}")
+    # It holds still but for the sentence above it, that nothing matched, going once something does:
+    # at the head of the list there is no room to keep it where it stood.
+    moved = top - edge(found["chip"], "top")
+    desk.check(-1 <= moved <= room + 1,
+               f"the step back moved {moved:.1f}px while the matches arrived, more than the {room:.1f}px sentence above it")
+    desk.check(float(str(found["scrolled"])) <= 1, "the walk moved the reader off the head of the list")
+    note, first = found["note"], found["first"]
+    desk.check(note is not None and str(found["said"]).startswith("Found 3 in "),
+               f"the note under the step back says {found['said']!r}")
+    desk.check(edge(note, "top") >= edge(found["chip"], "bottom") - 0.5 and edge(note, "bottom") <= edge(first, "top") + 0.5,
+               f"the note is not between the step back and the first match: {note} {first}")
+    desk.check(found["seam"] == "gap" and "unmatched message" in str(found["gap"]),
+               f"no line above the first match counts what it skips: {found['seam']} {found['gap']!r}")
+    overflow = found["overflow"]
+    desk.check(isinstance(overflow, (int, float)) and overflow <= 0, "the page scrolls sideways")
+    desk.shot("3-found")
+    desk.notes.append(f"{'a tap' if touch else 'Enter'} found {len(hits)} under a still step back: "
+                      f"{found['said']} / {found['gap']}")
 
 
 if __name__ == "__main__":

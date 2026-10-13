@@ -48552,25 +48552,36 @@ test("`#262 search-load-older`: a change to the search ends the walk; so do a wa
   assert.equal(page.el("search-older-note").hidden, true);
 });
 
-test("`#262 search-load-older`: a tap while the scroll's step back is on the wire starts the walk, with that step as its first page", async () => {
+test("`#262 search-load-older`: under a filter the scroll's own step back gives way to the walk, and one already on the wire is the walk's first page", async () => {
   const { page } = await searchPage({ pages: 10 });
   await search(page, "engine");
   await page.settle();
-  page.olderHold = searchHold();
-  const hold = page.olderHold;
-  // The reader scrolls to the head of the list: a plain step goes out.
+  // At the head of the list the search emptied, a scroll reads nothing by itself: the walk is bounded,
+  // and the reader's, and a page drawn and hidden there must not fire the next step on its own.
   page.el("scroll-area").scrollTop = 0;
   await page.el("scroll-area").dispatch("scroll");
   await page.settle();
-  const reads = searchReads(page).length;
-  assert.ok(reads >= 1, "scrolling to the head took no step back");
+  assert.equal(searchReads(page).length, 0, "a scroll under the search read an older page by itself");
+  // With nothing typed it steps back as ever; typed while that step is on the wire, a tap takes it as
+  // the walk's first page, and the control is not greyed out meanwhile.
+  await page.el("search-field").setValue("");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  page.el("scroll-area").scrollTop = 0;
+  await page.el("scroll-area").dispatch("scroll");
+  await page.settle();
+  assert.equal(searchReads(page).length, 1, "scrolling to the head took no step back");
+  await page.el("search-field").setValue("engine");
+  await page.settle();
+  assert.match(page.el("load-older").textContent, /^Search before /);
   assert.equal(page.el("load-older").disabled, false, "the step back was greyed out under the scroll's step");
   void page.el("load-older").click();
   await page.settle();
   assert.equal(page.el("load-older").textContent, "Searching… 1 of 5 · Stop");
   hold.open();
   await settleWalk(page);
-  assert.equal(searchReads(page).length, reads - 1 + SEARCH_OLDER_PAGES, "the scroll's step was not the walk's first page");
+  assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "the scroll's step was not the walk's first page");
 });
 
 test("`#262 search-load-older`: a card that shows its thread's summary is found by what the thread's first message says too", async () => {
