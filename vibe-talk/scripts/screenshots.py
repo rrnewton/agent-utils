@@ -2192,7 +2192,7 @@ def _act_done_feedback(driver: Driver) -> None:
 
 
 def _undo_done_feedback(driver: Driver) -> None:
-    """After `50-done-feedback`'s capture: its Undo, so later pictures do not draw that message read."""
+    """After `53-done-feedback`'s capture: its Undo, so later pictures do not draw that message read."""
     driver.click("undo-dismiss")
     driver.page.wait_for_function(
         "() => { const r = [...document.querySelectorAll('#discord-log > li')].find((n) => "
@@ -4734,7 +4734,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="49-elision-word-count",
+        name="52-elision-word-count",
         what="folded messages ending with how many words the fold hides: a few under one, a wall under another",
         act=_act_elision_word_count,
         profiles=("android-412", "laptop-1280"),
@@ -4775,7 +4775,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="50-done-feedback",
+        name="53-done-feedback",
         what="a message just marked Done: ringed in dashed grey at the read strength, the next unread selected in the solid accent",
         act=_act_done_feedback,
         after=_undo_done_feedback,
@@ -4841,7 +4841,7 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="51-help-sections",
+        name="54-help-sections",
         what="Help opened from a ? on Settings: that entry open at the top, every other one folded to its heading",
         act=_act_help_sections,
         profiles=("android-412", "laptop-1280"),

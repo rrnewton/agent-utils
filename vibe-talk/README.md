@@ -3920,7 +3920,7 @@ message box keeps its room under itself, where the status pill it speaks on at e
 animation by computed style in Chromium, takes an Undo inside the hold, measures the row of chips at
 360 and 412 pixels (a plain Undo, taking no line a bare one did not) and at 1280 (named, on one line),
 and at all three walks the list up from its end a few pixels at a time through the whole message box,
-requiring that no chip and no status pill ever meets the box or its Send; `50-done-feedback`
+requiring that no chip and no status pill ever meets the box or its Send; `53-done-feedback`
 photographs the moment.
 
 ### Replying from the page
@@ -4251,7 +4251,7 @@ disclosure is the browser's own, a heading is a button to a screen reader and to
 and the browser's find (Ctrl+F) still searches folded entries and opens the one it lands in where
 the browser supports that: Chromium does (the same mechanism opens a folded entry for a text
 fragment, which was checked in Chromium 151), and so does current Firefox; a browser that does not
-cannot find text in a folded entry until Expand all. `51-help-sections` photographs Help opened from
+cannot find text in a folded entry until Expand all. `54-help-sections` photographs Help opened from
 a `?`.
 
 ### A conversation can end three ways, and they are three different sentences
