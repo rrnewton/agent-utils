@@ -846,6 +846,57 @@ async fn an_edit_pushed_while_the_page_is_fetching_is_not_undone_when_the_fetch_
     assert_eq!(chat.windows.load(Ordering::SeqCst), 2);
 }
 
+/// The same through the channel's ordinary read (`ops::messages`), which remembers what it read
+/// for read-aloud as the page's walk does.
+#[tokio::test(start_paused = true)]
+async fn an_edit_pushed_while_a_channel_read_is_fetching_is_not_undone_when_the_fetch_lands() {
+    let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    let path = format!("/api/v1/channels/{READ_CHANNEL}/messages");
+    let read = call(&app, "GET", &path, None);
+    let edit = async {
+        tokio::time::sleep(FETCH / 5).await;
+        chat.edit("102", "the words as edited");
+        call_as(
+            &app,
+            INGEST_TOKEN,
+            "POST",
+            "/api/v1/live/events",
+            Some(json!({
+                "event_id": "edit-102",
+                "historical": false,
+                "kind": "update",
+                "message": pushed("102", "the words as edited"),
+            })),
+        )
+        .await
+    };
+    let ((read_status, read_body), (edit_status, edit_body)) = tokio::join!(read, edit);
+    assert_eq!(read_status, StatusCode::OK, "{read_body}");
+    assert_eq!(edit_status, StatusCode::ACCEPTED, "{edit_body}");
+    assert_eq!(
+        read_body["messages"][1]["content"], "words of message 102",
+        "the read was meant to land with the text from before the edit"
+    );
+
+    let (status, body) = call(&app, "POST", &prepare_path(), Some(json!({"ids": ["102"]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        play(&app, &body).await,
+        "the words as edited",
+        "the channel read that was in flight put the old text back"
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        &prepare_path(),
+        Some(json!({"ids": ["101", "103"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(prepared_ids(&body), ["101", "103"]);
+    assert_eq!(chat.windows.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_purge_while_the_page_is_fetching_leaves_nothing_behind_when_the_fetch_lands() {
     let (app, state, _chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));

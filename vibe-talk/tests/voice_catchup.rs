@@ -24,7 +24,7 @@ use vibe_talk::model::ChannelId;
 use vibe_talk::ops::{self, ActivityRequest, Currency, OpError};
 use vibe_talk::recent::{self, ACTIVITY_DEADLINE, COLD_DEADLINE};
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{self, SlowChat, READ_CHANNEL, WRITE_CHANNEL, WRITE_TOKEN};
+use vibe_talk::testing::{self, SlowChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 
 /// A third channel, so a catch-up costs what the measured ones did: three reads.
 const THIRD: &str = "3333333333";
@@ -513,6 +513,65 @@ async fn purge(state: &AppState) {
     assert_eq!(
         call(state, "DELETE", "/api/v1/storage", WRITE_TOKEN).await,
         StatusCode::OK
+    );
+}
+
+/// The page's ordinary read of a channel is the newest copy of it, and the catch-up that follows
+/// answers from it rather than asking the provider for the same channel again.
+#[tokio::test(start_paused = true)]
+async fn an_ordinary_read_of_a_channel_is_what_the_next_catch_up_answers_from() {
+    let h = harness();
+    let path = format!("/api/v1/channels/{READ_CHANNEL}/messages");
+    assert_eq!(
+        call(&h.state, "GET", &path, READ_TOKEN).await,
+        StatusCode::OK
+    );
+    assert_eq!(h.slow.reads(), 1);
+    assert!(
+        h.state.live.recent().holds(&channel(READ_CHANNEL)),
+        "a channel read did not reach the catch-up's memory"
+    );
+
+    let activity = catch_up(&h.state).await;
+    assert_eq!(
+        h.slow.reads(),
+        3,
+        "the catch-up read again the channel the page had just read"
+    );
+    assert!(current(&activity, READ_CHANNEL));
+    assert_eq!(said(&activity, READ_CHANNEL), ["build is green"]);
+}
+
+/// A message pushed while the page's ordinary read of its channel is running is in the window that
+/// read leaves behind, though the provider answered from before it was created.
+#[tokio::test(start_paused = true)]
+async fn a_push_that_arrives_while_a_channel_read_runs_survives_the_read_landing() {
+    let h = fed_harness();
+    let lead = channel(WRITE_CHANNEL);
+    let state = h.state.clone();
+    let reading = tokio::spawn(async move { ops::messages(&state, WRITE_CHANNEL, None).await });
+    tokio::time::sleep(READ / 2).await;
+    let id = h
+        .fake
+        .seed_at(&lead, "lead", "pushed mid read", ops::now_ms());
+    h.state
+        .live
+        .publish(&lead, h.fake.message(&id).expect("seeded"));
+    let window = reading.await.expect("the read ran").expect("the read");
+    assert!(
+        window
+            .messages
+            .iter()
+            .all(|m| m.content != "pushed mid read"),
+        "the provider was meant to answer from before the push"
+    );
+
+    let activity = catch_up(&h.state).await;
+    assert!(current(&activity, WRITE_CHANNEL));
+    assert_eq!(
+        said(&activity, WRITE_CHANNEL),
+        ["ship it", "pushed mid read"],
+        "the channel read that landed after the push undid it"
     );
 }
 
