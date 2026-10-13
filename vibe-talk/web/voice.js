@@ -8726,12 +8726,14 @@ function isExactReadBack(said, shown) {
 function unsayableDraft(text) {
   const raw = String(text).normalize("NFC");
   if (/<[^<>\s]+>/u.test(raw)) return "mention";
+  // The apostrophe in the last class is written as an escape. The page suite pairs the quotes in
+  // this file to set its strings aside, and a bare one in a pattern throws that pairing out of step.
   const rest = raw
     .replace(/[\u2018\u2019]/gu, "'")
     .replace(/(\p{L})-(?=\p{L})/gu, "$1")
     .replace(/(\s)[\u2013\u2014](?=\s)/gu, "$1")
     .replace(/[.,;:!?\u2026]+(?=\s|$)/gu, "")
-    .replace(/[\p{L}\p{Nd}'\s]/gu, "");
+    .replace(/[\p{L}\p{Nd}\u0027\s]/gu, "");
   return rest ? "symbols" : null;
 }
 
