@@ -5028,9 +5028,17 @@ hold, for both wire protocols:
   A read-back that adds a "not", a chat message read aloud, an answer to a different question that
   happens to contain the card's words, or a re-read of new words while the old card is still up
   cannot stand in for it. Any turn of the owner's ends the read-back; only a fresh one — "read it
-  back again" — or a new draft read back in full arms a yes again. A draft with a mention, or any
-  other `<…>` token, is never confirmed by voice: the model says a name there, so no read-back can
-  be held to the card exactly.
+  back again" — or a new draft read back in full arms a yes again.
+* **The draft is plain words.** The read-back is held to the card by its words, and a voice says
+  only words, so anything else in a draft could change what is posted while every word still
+  matched — and text-to-speech drops exactly those things: `~~don't~~ merge the PR` is heard as
+  "don't merge the PR", and `github.com.evil.io` as the same words as `github.com/evil.io`. So a
+  draft is confirmed by voice only when it holds nothing but letters, digits, spaces, apostrophes,
+  a hyphen inside a word, a dash with a space on each side, and sentence punctuation (`. , ; : ! ?
+  …`) followed by a space or the end. A mention (the model says a name there), a link or a bare
+  domain, a sign such as `+1` or `#123`, an emoji, a time or a decimal (`10:30`, `3.5`), and any
+  markup — strike, spoiler, quote, emphasis, code — make it tap-only, and the agent and the status
+  line say why.
 * **It was heard to the end.** The answer arrived after the read-back's audio finished playing. On
   `vibe-talk-v1`, which sends partial transcripts, that is when the answer began; on the hosted
   protocol, which sends only final transcripts, it is when the answer's transcript arrived, so a
@@ -5093,8 +5101,10 @@ an agent waiting on "Send it?" hears the result.
 * **What a no meant.** Any answer that starts like a no withdraws the draft while sending is the
   subject — "no problem, send it" included, and a "stop" said only to stop the agent talking. That
   is the safe direction; ask for the draft again.
-* **Coverage.** Mentions, links, code and numbers are rarely read out exactly as written, so those
-  drafts fall back to a tap, and the agent and the status line say so.
+* **Coverage.** Only plain words can be confirmed by voice (above). A draft with a mention, a
+  link, a symbol, an emoji, a time or a decimal, or any formatting falls back to a tap, and so does
+  one whose words the model does not read back exactly as written; the agent and the status line
+  say which.
 
 The mechanics of a proposal, all over the write-scope REST routes in the table above:
 

@@ -8439,9 +8439,13 @@ function settlePostCard(proposal) {
 // What counts, all of it checked when the answer's final transcript arrives (`spokenYesRefusal`):
 //
 //   * THE CARD. The draft is the one this call's agent proposed — not one already waiting when the
-//     call opened, nor one from before a replacement session — it has not lapsed, and it holds no
-//     sign-in token and no mention or other `<…>` token (a model says a name there, so no read-back
-//     can be held to it exactly).
+//     call opened, nor one from before a replacement session — it has not lapsed, it holds no
+//     sign-in token, and it is made of nothing a voice can drop or misread (`unsayableDraft`): only
+//     letters, digits, spaces, apostrophes, sentence punctuation, a hyphen inside a word and a
+//     spaced dash. The read-back is held to the card by its WORDS, and a voice says only words, so
+//     a mention (the model says a name there), a link, a symbol such as + or #, an emoji, or
+//     markup — ~~struck~~, ||hidden||, > quoted, *stressed*, `code` — could change what is posted
+//     while every word still matched: "~~don't~~ merge the PR" is heard as "don't merge the PR".
 //   * A REAL SPOKEN CALL with echo cancellation on. A typed call has no spoken answer, and without
 //     echo cancellation the agent's own "Send it?" can come back as the answer.
 //   * AN UNINTERRUPTED READ-BACK. Nothing cut the assistant off since the user last spoke, and on
@@ -8519,7 +8523,8 @@ const SPOKEN_YES_REASONS = {
   mismatch: "the read-back was not the card's text word for word, with nothing added",
   no_question: "the read-back did not end with the question Send it",
   interposed: "a message came between the read-back and the yes",
-  mention: "the draft has a mention or a link in it, which a read-back cannot say exactly",
+  mention: "the draft mentions someone, which a read-back cannot say exactly",
+  symbols: "the draft has a link, a symbol or formatting in it, which a read-back cannot say exactly",
   hint: "only a plain answer such as yes or send it counts, with nothing added",
   early: "the yes came before the read-back finished playing",
   echo: "that may have been the assistant's own voice, so answer the next read-back with a plain yes",
@@ -8666,6 +8671,36 @@ function isExactReadBack(said, shown) {
 }
 
 /**
+ * Why no read-back can be held to a draft whose text is `text`, as a key of SPOKEN_YES_REASONS, or
+ * null when one can.
+ *
+ * Pure. The read-back is compared word for word (`isExactReadBack`), and `answerWords` keeps only
+ * letters, digits and apostrophes, so anything else in the draft is invisible to that comparison —
+ * and it is exactly what a voice drops: markup that strikes, hides or quotes words, a + or a -
+ * before a number, an emoji, the dots and slashes that make one address another. So the draft may
+ * hold only letters, decimal digits, whitespace, apostrophes, a hyphen between two letters, a dash
+ * with a space on each side, and sentence punctuation — . , ; : ! ? … — followed by a space or the
+ * end. A dot or a colon inside a word ("github.com", "10:30") is not sentence punctuation. An
+ * accent that composes with its letter is part of the letter; a combining mark that does not — a
+ * stroke drawn through a word is one — is not. Anything else makes the draft tap-only; a mention
+ * says so by name.
+ *
+ * @param {string} text
+ * @returns {"mention" | "symbols" | null}
+ */
+function unsayableDraft(text) {
+  const raw = String(text).normalize("NFC");
+  if (/<[^<>\s]+>/u.test(raw)) return "mention";
+  const rest = raw
+    .replace(/[\u2018\u2019]/gu, "'")
+    .replace(/(\p{L})-(?=\p{L})/gu, "$1")
+    .replace(/(\s)[\u2013\u2014](?=\s)/gu, "$1")
+    .replace(/[.,;:!?\u2026]+(?=\s|$)/gu, "")
+    .replace(/[\p{L}\p{Nd}'\s]/gu, "");
+  return rest ? "symbols" : null;
+}
+
+/**
  * Why what the assistant said is not a read-back of `shown`, as a key of SPOKEN_YES_REASONS, or
  * null when it is one.
  *
@@ -8678,7 +8713,6 @@ function isExactReadBack(said, shown) {
  * @param {{text: string, card: string | null}[]} turns
  */
 function readBackRefusal(shown, turns) {
-  if (/<[^<>\s]+>/u.test(shown.text)) return "mention";
   const all = answerWords(turns.map((turn) => turn.text).join(" "));
   const since = answerWords(
     turns.filter((turn) => turn.card === shown.handle).map((turn) => turn.text).join(" ")
@@ -8941,12 +8975,15 @@ function spokenYesRefusal(shown, answer, heard) {
   if (session.chat) return "typed_call";
   if (session.echoCancellation !== true) return "echo_cancellation_off";
   if (heard.cut || (session.protocol === "vibe-talk-v1" && !heard.done)) return "interrupted";
+  // Before the read-back, which cannot see what makes a draft unsayable: its words may all match.
+  const unsayable = unsayableDraft(shown.text);
+  if (unsayable) return unsayable;
   const readBack = readBackRefusal(shown, heard.turns);
   if (readBack) {
     // An exact read-back with a relayed message or a notice after it: it was not the last thing said.
     const readBackBefore = heard.interposed &&
       heard.sinceUser.some((turn) => isExactReadBack(answerWords(turn.text), shown));
-    return readBack !== "mention" && readBackBefore ? "interposed" : readBack;
+    return readBackBefore ? "interposed" : readBack;
   }
   const answeredAt = heard.answerAt || Date.now();
   const playEnd = session.playEndMs || 0;

@@ -31729,7 +31729,78 @@ test("`#264 voice-send-approval`: a draft with a mention is never sent by voice,
   hostedHears(socket, "yes");
   await settleSpokenYes(page);
   assert.deepEqual(page.proposalCommits, []);
-  assert.match(pageNotices(socket)[0], /has a mention or a link in it/);
+  assert.match(pageNotices(socket)[0], /mentions someone, which a read-back cannot say exactly/);
+});
+
+// A read-back is held to the card by its words, and a voice says only words. Whatever else a draft
+// holds — markup, a link's dots and slashes, a sign, an emoji — is invisible to that comparison and
+// is exactly what text-to-speech drops, so it could change what is posted while every word matched.
+
+test("`#264 voice-send-approval`: only plain words and sentence punctuation can be confirmed by voice", () => {
+  const unsayable = newPage().pure("unsayableDraft");
+  for (const text of [
+    "on it, rebasing now",
+    "Don\u2019t merge the PR yet. I'll re-run the tests first!",
+    "Wait \u2014 is the build green? Yes; ship it: today\u2026",
+    "café at 5pm",
+    "line one\nline two.",
+  ]) {
+    assert.equal(unsayable(text), null, text);
+  }
+  for (const [text, why] of [
+    ["<@123456789> on it", "mention"],
+    ["~~don't~~ merge the PR", "symbols"],
+    ["~don't~ merge the PR", "symbols"],
+    ["||not|| ready", "symbols"],
+    ["> merge it", "symbols"],
+    ["*do not* merge", "symbols"],
+    ["`rm -rf` it", "symbols"],
+    ["+1", "symbols"],
+    ["-1 from me", "symbols"],
+    ["\u{1F44E}", "symbols"],
+    ["log in at https://github.com.evil.io/login", "symbols"],
+    ["log in at github.com.evil.io", "symbols"],
+    ["see [the fix](https://evil.example/x)", "symbols"],
+    ["@everyone merge now", "symbols"],
+    ["PR #123", "symbols"],
+    ["meet at 10:30", "symbols"],
+    ["version 3.5", "symbols"],
+    ["d\u0336o\u0336n\u0336't merge", "symbols"],
+    ["on it\u200b", "symbols"],
+  ]) {
+    assert.equal(unsayable(text), why, text);
+  }
+});
+
+test("`#264 voice-send-approval`: a struck-through word or a changed link is never confirmed by voice, even when every word matches", async () => {
+  for (const [text, said] of [
+    // What text-to-speech makes of the server's own read-back: the strike is silent.
+    ["~~don't~~ merge the PR", "To lead team: don't merge the PR. Send it?"],
+    // The read-back word for word, markup and all: still not something a voice can say.
+    ["~~don't~~ merge the PR", "To lead team: ~~don't~~ merge the PR. Send it?"],
+    // One link read back as another: the same words once the dots and slashes are gone.
+    ["log in at https://github.com.evil.io/login", "To lead team: log in at https://github.com/evil.io/login. Send it?"],
+    ["see [the fix](https://evil.example/x)", "To lead team: see the fix. Send it?"],
+  ]) {
+    const page = newPage();
+    const socket = await readBackDuringACall(page, { pending: spokenDraft({ text }), said });
+    const before = page.audio.played;
+    hostedHears(socket, "yes");
+    await settleSpokenYes(page);
+    assert.deepEqual(page.proposalCommits, [], `${text} / ${said}: committed`);
+    assert.equal(page.el("post-confirm").hidden, false, `${text}: the card went`);
+    const notices = pageNotices(socket);
+    assert.equal(notices.length, 1, `${text}: ${notices.join("\n")}`);
+    assert.match(notices[0], /^Voice page: the message was NOT sent: the draft has a link, a symbol or formatting in it, which a read-back cannot say exactly\./, text);
+    assert.match(page.el("status").textContent, /^Not sent — the draft has a link, a symbol or formatting in it/, text);
+    assert.equal(page.audio.played, before + 1, `${text}: no tone`);
+
+    // A tap still sends it: the card shows the exact text.
+    page.expireTimers(2000);
+    await page.el("post-confirm-send").click();
+    await page.settle();
+    assert.deepEqual(page.proposalCommits.map((c) => [c.text, c.confirmed_by]), [[text, "ui"]]);
+  }
 });
 
 // Every yes is answered. The agent says only "One moment." on a yes and waits for the page, so a
