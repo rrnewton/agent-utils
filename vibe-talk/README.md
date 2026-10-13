@@ -2850,10 +2850,19 @@ established.
 
 Updates use `kind: "update"` with the complete current message. Deletes use
 `{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
-They become `event: message_update` and `event: message_delete`; the page re-reads the authoritative
-window while preserving its scroll position, rather than leaving a stale row or trying to patch a
-derived combined row in place. Creates remain `event: message`, so existing polling producers and
-older clients keep their wire contract.
+They become `event: message_update` and `event: message_delete`. On a channel with threads the page
+puts the edited message, or the removal, into its store and draws the rows from there, keeping the
+reader's place, with no read (`#278 page-live-reads`); the un-threaded view re-reads the
+authoritative window instead, rather than patching a derived combined row in place. Creates remain
+`event: message`, so existing polling producers and older clients keep their wire contract.
+
+An optional `"placed": true` on a create or update is the adapter's word that the message's
+`thread` field is complete: present, with `reply_count` the thread's count with this message
+counted, for a message in a thread; absent only for a message posted to the channel outside every
+thread. The page then places and counts the message from the event alone — its SSE event carries
+`thread_facts` — and reads nothing for it. Without it, which is the default and what a stream that
+cannot say which thread a message is in must send, the page places the message with a read, at most
+one every ten seconds whatever arrives meanwhile. A deletion ignores it.
 
 SSE resume ids are event ids, not message-order cursors. Adapter ids are namespaced with `push:` on
 that internal wire so even a numeric provider event id cannot be mistaken for a numeric message
@@ -3027,6 +3036,25 @@ fifteen seconds. Coming back draws what arrived from the store, reads once what 
 once if the poll came due meanwhile, and reopens the stream from the last event it saw, so nothing
 in between is skipped. Until the stream is back the pill says "Updated" rather than "Live ·
 updated". During a call the stream stays open and the agent hears what arrives, as before.
+
+**A live event is drawn from what it carries, and the poll waits while a pushed stream is
+attached** (`#278 page-live-reads`, remote-ops audit W6 and W7). Behind a bridge one read of a
+channel can cost the adapter a scan of the whole space, and the page used to send one for every
+live message and two for every edit or removal. Now, on a channel with threads, an edit or removal
+is applied from its event and drawn from the store, in both columns, with no read; an edit that
+lands while a read sent before it is out is applied again over that read's answer. A live message
+whose event carries `thread_facts` — its producer placed it — is placed by them, and its thread's
+root and card take the count and latest activity they give, with no read. One without them, or
+whose facts leave a reply's count unsaid, or name a thread the store's list of threads lacks, is
+read for at most once every ten seconds, whatever arrives meanwhile; on the voice pane it is not read
+at all, entering the channel reads it. While an adapter's pushed stream is attached the poll waits
+fifteen minutes instead of forty-five seconds, since the stream carries every creation, edit and
+removal; it goes back to forty-five seconds the moment the stream drops, and the stream coming back
+polls at once. A server that polls its provider itself sees creations only, so its channels keep
+the forty-five seconds. And when a view's read is given up on at twenty seconds, nothing the reader
+did not ask for — the poll, a live message's read, coming back to the page, a stream reset — reads
+that view again until the server's own fifty-second bound has passed or a live event arrives;
+entering the view and pull-to-refresh still read.
 
 **`user_message`, not `contextual_update`, and that is the substance of the feature.** A
 contextual update injects text into the agent's context *without consuming a turn*: the agent

@@ -643,6 +643,79 @@ async fn historical_push_is_replayed_on_the_wire_and_mutations_are_typed() {
     assert!(text.contains("\"message_id\":\"10\""));
 }
 
+/// The `data:` of every event in `text`, parsed.
+fn event_data(text: &str) -> Vec<Value> {
+    text.split("\n\n")
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .map(|data| serde_json::from_str(data).expect("event data is JSON"))
+        .collect()
+}
+
+/// `#278 page-live-reads`, remote-ops audit W6. An adapter that says where a message sits spares
+/// the page the read that would place it: its event carries the thread facts. One that does not
+/// say — the bridge's stream today — sends none, and a thread record alone is not its word that the
+/// record's count is the thread's with this message counted.
+#[tokio::test]
+async fn a_message_the_adapter_placed_carries_its_thread_facts_and_one_it_did_not_carries_none() {
+    let (app, _live) = enabled();
+    let mut body = open_stream(&app, None).await.into_body();
+    let record = json!({
+        "id": "t1", "root_message_id": "30", "is_root": false,
+        "reply_count": 3, "reply_count_exact": true,
+    });
+    let mut reply = message("31", "an answer, placed");
+    reply["thread"] = record.clone();
+    let mut unvouched = message("32", "an answer, with a record but no word");
+    unvouched["thread"] = record.clone();
+    for (event_id, placed, payload) in [
+        (
+            "unplaced",
+            None,
+            message("30", "said nothing of where it sits"),
+        ),
+        ("main", Some(true), message("33", "placed on the channel")),
+        ("reply", Some(true), reply),
+        ("unvouched", None, unvouched),
+    ] {
+        let mut event = json!({
+            "event_id": event_id,
+            "historical": false,
+            "kind": "create",
+            "message": payload,
+        });
+        if let Some(placed) = placed {
+            event["placed"] = json!(placed);
+        }
+        assert_eq!(
+            post(&app, Some(INGEST_TOKEN), event).await.0,
+            StatusCode::ACCEPTED
+        );
+    }
+    let events = event_data(&read_events(&mut body, 4).await);
+    let facts: Vec<&Value> = events.iter().map(|event| &event["thread_facts"]).collect();
+    assert_eq!(facts[0], &Value::Null, "an unplaced message carried facts");
+    assert_eq!(
+        facts[1],
+        &json!({"thread": null, "reply_count": null, "reply_count_exact": false, "updated_at": null}),
+        "a message placed on the channel did not say it is in no thread"
+    );
+    assert_eq!(
+        facts[2],
+        &json!({
+            "thread": record,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "updated_at": "2026-08-20T10:00:00+00:00",
+        }),
+        "a placed reply did not carry its thread's count and activity"
+    );
+    assert_eq!(
+        facts[3],
+        &Value::Null,
+        "a record without the adapter's word carried facts"
+    );
+}
+
 #[tokio::test]
 async fn opaque_reconnect_cursor_replays_exactly_after_it_or_forces_a_reset() {
     let (app, _live) = enabled();

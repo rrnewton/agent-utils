@@ -8352,7 +8352,8 @@ async function apiDecoded(type, path, options) {
  * `#195 send-resilience`. The server bounds its own read of a slow chat service, but at a figure
  * set for the service — fifty seconds, in the incident this was written for — not for a reader
  * looking at the screen. Giving up here does not cancel the server's read; it only stops this page
- * waiting on it, and the next poll asks again.
+ * waiting on it, and the next poll asks again — not before the server's own bound has passed, unless
+ * a live event says the service is answering (`readHeld`, `#278 page-live-reads`).
  *
  * @template T
  * @param {number} ms
@@ -13393,6 +13394,8 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   // ...and read state too, and what it says of the replies the store lacks. `#222 unread-replies`.
   foldReadState(payload, view);
   noteReplyGaps(payload, view, older, false, before);
+  // `#278 page-live-reads`. Never the words from before an edit the stream has already delivered.
+  reapplyLivePatches(payload);
 }
 
 /**
@@ -13545,6 +13548,8 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     newest: payload.next_after || null,
   });
   channelCanon.complete = delta.complete === true;
+  // `#278 page-live-reads`. Never the words from before an edit the stream has already delivered.
+  reapplyLivePatches(payload);
   return true;
 }
 
@@ -14023,6 +14028,9 @@ function noteChannelReadFailure(error) {
     // `#195 send-resilience`. Said, over the rows it is about: a refresh nobody asked for needs no
     // banner on top of it. See `refreshQuietly`.
     if (error) error.shownInPill = true;
+    // `#278 page-live-reads`. Rows the pill says are not current are polled for at forty-five
+    // seconds, even behind a pushed stream (`pollInterval`).
+    fitPollToStream();
   }
 }
 
@@ -16938,8 +16946,11 @@ function sentEpochOf(payload) {
  */
 async function readTimeline(path, options) {
   const sent = readStateEpoch;
+  // `#278 page-live-reads`: and which live edits and removals came after it (`reapplyLivePatches`).
+  const live = liveEventEpoch;
   const payload = await apiDecoded("TimelineResponse", path, options);
   readSentEpochs.set(payload, sent);
+  liveSentEpochs.set(payload, live);
   return payload;
 }
 
@@ -17410,6 +17421,9 @@ function landedAnswer(pages) {
 }
 
 async function loadTimeline(options) {
+  // `#278 page-live-reads`. Nothing nobody asked for while a read of this view the page gave up on
+  // may still be running at the server: the next poll past its bound, or a live event, reads it.
+  if (readHeld(channelContextKey(), options && options.reason)) return;
   const generation = ++discordLoadGeneration;
   // `#229 desktop-two-column`. The column this read is for: its work after every wait is done there.
   const steps = columnSteps();
@@ -17488,6 +17502,7 @@ async function loadTimeline(options) {
       const path = timelinePath(null, sent);
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
+      const sentAt = Date.now();
       try {
         steps.pause();
         payload = await within(CHANNEL_READ_TIMEOUT_MS,
@@ -17495,6 +17510,7 @@ async function loadTimeline(options) {
         steps.resume();
       } catch (error) {
         steps.resume();
+        if (error && error.timedOut) holdAfterTimeout(context, sentAt);
         // A cursor the server can no longer continue is not a failed refresh. Forget it and read
         // the newest page now, in the same hold: the pill says "refreshing…" and nothing else.
         if (sent && isCursorRefusal(error) && sameStore()) {
@@ -25476,6 +25492,9 @@ async function loadDiscord(options) {
   if (todoMode) {
     return loadTodo(options);
   }
+  // `#278 page-live-reads`. As for a timeline read (`loadTimeline`).
+  const context = channelContextKey();
+  if (readHeld(context, options && options.reason)) return;
   const generation = ++discordLoadGeneration;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
@@ -25491,6 +25510,7 @@ async function loadDiscord(options) {
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   renderChannelLoading(true);
+  const sentAt = Date.now();
   try {
     if (!keepPosition) {
       setStatus("fetching the channel…");
@@ -25524,6 +25544,7 @@ async function loadDiscord(options) {
     // message already answered, which matters most here: this runs every DISCORD_POLL_MS.
     requestVisibleSummaries();
   } catch (error) {
+    if (error && error.timedOut) holdAfterTimeout(context, sentAt);
     if (currentDiscordLoad(generation, channel, false)) noteChannelReadFailure(error);
     throw error;
   } finally {
@@ -30642,6 +30663,79 @@ const DISCORD_POLL_MS = 45000;
 // waiting and says the refresh failed. Above what a slow service ordinarily takes — ten to twelve
 // seconds, in the incident this was written for — and well inside the server's own fifty.
 const CHANNEL_READ_TIMEOUT_MS = 20000;
+// `#278 page-live-reads`, remote-ops audit W7. The server's own bound on a read of a slow chat
+// service, from when the read was sent. Giving up at `CHANNEL_READ_TIMEOUT_MS` does not stop the
+// server's read, nor the scan behind it at the chat service, so until this has passed a read of
+// the same view sent again is a second scan of the same space; see `readHeld`.
+const SERVER_READ_BOUND_MS = 50000;
+
+/**
+ * How long the poll waits: `TIMELINE_RECONCILE_MS` while an adapter's pushed stream is attached,
+ * and `DISCORD_POLL_MS` otherwise. `#278 page-live-reads`, remote-ops audit W6. A pushed stream
+ * carries every creation, edit and removal as it happens, so the poll is then only the
+ * reconciliation it is everywhere else at fifteen minutes; the stream going away brings the
+ * forty-five seconds back (`fitPollToStream`), and coming back polls at once. So does a read that
+ * failed, whose rows the pill says are not current: the poll is how they come back. A server that
+ * polls its provider itself publishes creations only, so its channels keep the forty-five seconds.
+ */
+function pollInterval() {
+  const current = !["slow", "failed", "offline"].includes(channelFreshness);
+  return liveAttached && liveDelivery === "push" && current ? TIMELINE_RECONCILE_MS : DISCORD_POLL_MS;
+}
+
+/**
+ * The stream attached or went away: an armed poll waits as long as `pollInterval` now says, never
+ * longer than it said before going away. Nothing while no poll is armed — a hidden page, another
+ * view — which arms its own when it comes back.
+ */
+function fitPollToStream() {
+  if (discordPollTimer === null) return;
+  const interval = pollInterval();
+  if (interval > DISCORD_POLL_MS) scheduleDiscordPoll(interval);
+  else if (discordPollDueAt - Date.now() > interval) scheduleDiscordPoll(interval);
+}
+
+/**
+ * By view (`channelContextKey`), until when a read of it the page gave up on may still be running at
+ * the server. `#278 page-live-reads`, remote-ops audit W7. The page used to send another read of the
+ * view as soon as it gave up — the read queued behind it, the next live message, the page shown
+ * again — each one a second scan of the space while the first ran on to the server's bound.
+ *
+ * @type {Map<string, number>}
+ */
+const readHolds = new Map();
+
+/** Reads nobody asked for, which a view's hold refuses; the reader's own (`enter`, `pull`) go. */
+const HELD_REASONS = ["live", "visible", "poll", "replay", "mutation", "reset"];
+
+/** A read of `context` sent at `sentAt` was given up on: hold that view until the server's bound. */
+function holdAfterTimeout(context, sentAt) {
+  readHolds.set(context, sentAt + SERVER_READ_BOUND_MS);
+}
+
+/**
+ * Whether a read of `context` for `reason` must not be sent: one given up on may still be running at
+ * the server, and nothing has arrived since to say the service is answering. Every reason of a queued
+ * read must be one the hold refuses.
+ *
+ * @param {string} context
+ * @param {string | (string | undefined)[] | undefined} reason
+ */
+function readHeld(context, reason) {
+  const until = readHolds.get(context);
+  if (until === undefined) return false;
+  if (Date.now() >= until) {
+    readHolds.delete(context);
+    return false;
+  }
+  const reasons = Array.isArray(reason) ? reason : [reason];
+  return reasons.every((one) => one !== undefined && HELD_REASONS.includes(one));
+}
+
+/** A live event arrived: the service is answering, and the views it may have changed can be read. */
+function releaseReadHolds() {
+  readHolds.clear();
+}
 let discordPollTimer = null;
 let discordFetchInFlight = false;
 // The view a timeline read on the wire is for (`channelContextKey`), or null: a switch back to a
@@ -30744,7 +30838,7 @@ function stopDiscordPolling() {
  * page-energy-profile`, while the page is hidden: a poll armed or come due then waits for the
  * page to be shown (`resumePolling`). `delay` is the rest of a wait a glance away interrupted.
  */
-function scheduleDiscordPoll(delay = DISCORD_POLL_MS) {
+function scheduleDiscordPoll(delay = pollInterval()) {
   stopDiscordPolling();
   discordPollDueAt = Date.now() + delay;
   if (document.hidden) {
@@ -30798,9 +30892,10 @@ function pollDiscord() {
 //
 //   * THE POLL WAITS. One armed, or come due, resumes when the page is shown: a fresh wait, or now
 //     when its time passed while hidden.
-//   * A LIVE MESSAGE GOES INTO THE STORE AND NO FURTHER. No row, no read. An edit or a removal waits
-//     for a read the same way. The agent of a call still hears it (`relayToAgent`): a call is what
-//     the phone in a pocket is most likely to be doing.
+//   * A LIVE MESSAGE GOES INTO THE STORE AND NO FURTHER. No row, no read. An edit or a removal goes
+//     into the store the same way (`#278 page-live-reads`; one the page cannot read waits for a
+//     read). The agent of a call still hears it (`relayToAgent`): a call is what the phone in a
+//     pocket is most likely to be doing.
 //   * AFTER `LIVE_HIDDEN_CLOSE_MS` WITHOUT A CALL, THE STREAM IS LET GO, with the last event it saw.
 //     During a call it stays: that is how the agent hears the channel.
 //
@@ -30865,13 +30960,14 @@ function resumePolling(how) {
   discordPollPaused = false;
   if (currentView !== "discord") return;
   if (how === "now") pollDiscord();
-  else scheduleDiscordPoll(how === "fresh" ? DISCORD_POLL_MS : Math.max(0, discordPollDueAt - Date.now()));
+  else scheduleDiscordPoll(how === "fresh" ? pollInterval() : Math.max(0, discordPollDueAt - Date.now()));
 }
 
 /**
  * Back in sight: draw what the stream put in the store while the page was hidden, as a read would
- * have drawn it. Answers what is still owed a read — "mutation" for an edit or a removal, "live" for
- * a message, which the server places (its thread, its counts) — or null for nothing.
+ * have drawn it. Answers what is still owed a read — "mutation" for an edit or a removal the page
+ * could not apply itself, "live" for a message whose event did not say where it sits or what it did
+ * to its thread's counts (`liveFactsMissing`), which the server says — or null for nothing.
  */
 function catchUpHiddenArrivals() {
   if (liveHiddenTimer !== null) {
@@ -30880,8 +30976,14 @@ function catchUpHiddenArrivals() {
   }
   const mutation = mutationArrivedHidden;
   const arrived = liveArrivedHidden || replaysAwaitingRead.size > 0;
+  // `#278 page-live-reads`. Only what the events left unsaid is owed a read; an edit or a removal
+  // they carried whole changed the store, and is drawn from it below.
+  const owed = liveReadOwedHidden || replaysAwaitingRead.size > 0;
+  const changed = liveChangedHidden;
   mutationArrivedHidden = false;
   liveArrivedHidden = false;
+  liveReadOwedHidden = false;
+  liveChangedHidden = false;
   if (arrived && currentView === "discord" && threadingSupported &&
       channelCanon.channel === String(el("discord-channel").value) && channelCanon.views.has(viewKey())) {
     const area = el("scroll-area");
@@ -30905,8 +31007,10 @@ function catchUpHiddenArrivals() {
       }
     });
     saveChannelScope();
+    // The same rows with other words, or fewer rows, which drawing what arrived does not redraw.
+    if (changed) drawLiveChange();
   }
-  return mutation ? "mutation" : arrived ? "live" : null;
+  return mutation ? "mutation" : owed ? "live" : null;
 }
 
 // --- resuming an earlier conversation ------------------------------------------------------------
@@ -31347,11 +31451,14 @@ function renderLiveState() {
     return;
   }
   if (liveDelivery === "push") {
+    // `#278 page-live-reads`: and how often the channel view reads itself, which the stream decides.
     state.textContent = liveAttached
       ? "Live updates are configured for adapter push, and this page is connected to the server " +
-        "stream. This does not verify that the external adapter is healthy."
+        "stream, so the channel view re-reads itself every fifteen minutes while its reads " +
+        "succeed. This does not verify that the external adapter is healthy."
       : "Live updates are configured for adapter push, but this page is not connected to the " +
-        "server stream at the moment. It keeps trying; adapter health is not verified here.";
+        "server stream at the moment, so the channel view re-reads itself every forty-five " +
+        "seconds. It keeps trying; adapter health is not verified here.";
     return;
   }
   state.textContent = liveAttached
@@ -31367,7 +31474,9 @@ function stopChannelStream() {
   liveChannel = null;
   liveAttached = false;
   liveLastEventId = null;
+  forgetLiveFactRead();
   renderLiveState();
+  fitPollToStream();
 }
 
 /** Reads waiting for the stream to attach, each to be run once. */
@@ -31429,9 +31538,9 @@ function startChannelStream(channelId, resumeFrom = null) {
  * honesty with it, leaving a list that looks current and is not.
  */
 async function followChannel(channelId, generation) {
-  while (generation === liveGeneration) {
+  for (let attempt = 0; generation === liveGeneration; attempt += 1) {
     try {
-      await readChannelStream(channelId, generation);
+      await readChannelStream(channelId, generation, attempt > 0);
     } catch (error) {
       if (generation !== liveGeneration) {
         return;
@@ -31445,6 +31554,9 @@ async function followChannel(channelId, generation) {
     }
     liveAttached = false;
     renderLiveState();
+    // `#278 page-live-reads`. Nothing is pushing to the page now: the poll is the forty-five seconds
+    // again until the stream is back.
+    fitPollToStream();
     // Refused, or gone: a read held for the attach is not held through the retry delay as well.
     releaseLiveAttachWaiters();
     const resumed = await liveRetryDelay(generation);
@@ -31461,7 +31573,13 @@ function liveRetryDelay(generation) {
   });
 }
 
-async function readChannelStream(channelId, generation) {
+/**
+ * One connection of the stream. `reconnect`: the stream this follows dropped and this is it coming
+ * back, which may have missed what it would have said — so behind a pushed stream, whose poll waits
+ * fifteen minutes while it is attached (`pollInterval`), the channel is polled at once.
+ * `#278 page-live-reads`.
+ */
+async function readChannelStream(channelId, generation, reconnect = false) {
   const headers = { Authorization: `Bearer ${token()}` };
   if (liveLastEventId) {
     // The one thing that makes a reconnect neither duplicate nor drop: the server replays what
@@ -31487,6 +31605,12 @@ async function readChannelStream(channelId, generation) {
   liveAttached = true;
   renderLiveState();
   releaseLiveAttachWaiters();
+  if (reconnect && liveDelivery === "push" && currentView === "discord" && !document.hidden &&
+      clientConfigApplied && String(el("discord-channel").value) === String(channelId)) {
+    pollDiscord();
+  } else {
+    fitPollToStream();
+  }
   const decoder = new TextDecoder();
   let buffer = "";
   for (;;) {
@@ -31581,6 +31705,9 @@ function onStreamFrame(frame) {
       awaitReplayRead(`${frame.event}:${id}`, String(channel), liveAttachReads);
       return;
     }
+    // `#278 page-live-reads`. On a threaded channel the rows are drawn from the store, so the edit or
+    // removal the event carries whole goes into the store and is drawn from there, with no read.
+    if (threadingSupported && applyLiveMutation(frame.event, payload)) return;
     // A fetched row may combine several messages and the update may change whether they still
     // combine. Re-reading the authoritative page is safer than trying to patch that derived DOM
     // structure in place, and `keepPosition` preserves where the reader was.
@@ -31597,13 +31724,19 @@ function onStreamFrame(frame) {
     refreshAfterLiveMutation();
     return;
   }
-  receiveLiveMessage(payload.message, payload.self_posted, payload.replayed, payload.from_tail);
+  receiveLiveMessage(payload.message, payload.self_posted, payload.replayed, payload.from_tail,
+    payload.thread_facts || null);
 }
 
 let liveMutationRefreshRunning = false;
 let liveMutationRefreshNeeded = false;
 
-/** Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. */
+/**
+ * Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. On a
+ * channel with threads, since `#278 page-live-reads`, only for an event the page cannot read — an
+ * edit or removal it can read is applied from the event (`applyLiveMutation`); the un-threaded view
+ * reads for every one.
+ */
 function refreshAfterLiveMutation() {
   // `#226 page-energy-profile`. Not for a hidden page: the read that coming back makes answers it.
   if (threadingSupported && document.hidden) {
@@ -31636,6 +31769,311 @@ function refreshAfterLiveMutation() {
   })();
 }
 
+// --- what a live event says, drawn without a read ------------------------------------------------
+//
+// `#278 page-live-reads`, remote-ops audit W6. A read of the channel followed every live message,
+// and two every edit or removal, because the server owned what they changed: which thread a message
+// is in, its root's count, its thread's latest activity, the words of an edited row. Behind the
+// Google Chat bridge each of those reads could cost a scan of the whole space. So the event now
+// carries them: a removal is its id, an edit the whole message, and a message its producer placed
+// comes with its thread facts (`LiveThreadFacts`). The page puts them into the store and draws the
+// store, as a read would have. A read is still sent for what an event leaves unsaid — a message the
+// stream did not place, a count it did not give, the card of a thread the store has never listed —
+// and then at most once in `LIVE_FACT_READ_MS`, whatever arrived meanwhile.
+
+/** The least time between two reads for what live messages left unsaid: ten seconds. */
+const LIVE_FACT_READ_MS = 10000;
+/** When the last such read went out, by the clock. */
+let liveFactReadAt = -Infinity;
+/** The one read waiting for that time to pass, or null. */
+let liveFactReadTimer = null;
+/** The columns it reads, each once. @type {Set<typeof activeColumn>} */
+const liveFactReadColumns = new Set();
+/** Whether a live message delivered while the page was hidden left something only a read can say. */
+let liveReadOwedHidden = false;
+
+/**
+ * Whether a live message leaves something only a read of the channel can say, given the facts its
+ * event carried (`LiveThreadFacts`, or null): where it sits, when its producer did not place it; and
+ * for a reply, its thread's count when that was not given, its thread's card when the store holds a
+ * list of threads without it, and which held message is its root when the facts do not name one and
+ * none held says so.
+ *
+ * @param {VibeTalk.LiveThreadFacts | null} facts
+ */
+function liveFactsMissing(facts) {
+  if (!facts) return true;
+  const thread = facts.thread ? String(facts.thread.id) : null;
+  if (thread === null || thread === channelCanon.scope || facts.thread.is_root === true) return false;
+  if (typeof facts.reply_count !== "number") return true;
+  if (channelCanon.views.has(viewKey("threads")) && !channelCanon.threads.some((held) => String(held.id) === thread)) {
+    return true;
+  }
+  return !facts.thread.root_message_id &&
+    !channelCanon.messages.some((held) => threadOf(held) === thread && held.thread.is_root === true);
+}
+
+/**
+ * Put what a live event said of its thread into the store: the count on its root and on its thread's
+ * summary, the activity on the summary, and on a root the store held with no record — its thread
+ * begun by this reply — the record. Answers whether anything held changed. Absolute, where
+ * `foldLiveMessage` can only add one: the provider counted what this page never saw.
+ *
+ * @param {VibeTalk.LiveThreadFacts} facts
+ */
+function applyThreadFacts(facts) {
+  const thread = facts.thread ? String(facts.thread.id) : null;
+  if (thread === null || thread === channelCanon.scope) return false;
+  const counted = typeof facts.reply_count === "number";
+  const count = counted ? { reply_count: facts.reply_count, reply_count_exact: facts.reply_count_exact } : {};
+  const named = facts.thread.root_message_id ? String(facts.thread.root_message_id) : null;
+  let changed = false;
+  channelCanon.messages = channelCanon.messages.map((held) => {
+    const root = threadOf(held) === thread ? held.thread.is_root === true : named !== null && !held.thread && String(held.id) === named;
+    if (!root) return held;
+    const record = held.thread ||
+      { id: facts.thread.id, root_message_id: facts.thread.root_message_id, is_root: true, reply_count: null, reply_count_exact: false };
+    const next = { ...record, ...count };
+    if (held.thread && JSON.stringify(next) === JSON.stringify(held.thread)) return held;
+    changed = true;
+    return { ...held, thread: next };
+  });
+  const summary = channelCanon.threads.find((held) => String(held.id) === thread);
+  if (summary) {
+    const later = typeof facts.updated_at === "string" && !(timeOf(summary, "updated_at") >= Date.parse(facts.updated_at));
+    const next = { ...summary, ...count, ...(later ? { updated_at: facts.updated_at } : {}) };
+    if (JSON.stringify(next) !== JSON.stringify(summary)) {
+      upsertThreadSummary(next);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Draw every column showing the selected channel again from the store, after a live event changed
+ * it and no read will draw the change: the rows and their counts, the cards, the thread picker. As a
+ * read draws what it folded — the reader's place kept or the newest line followed, what arrived
+ * counted — and saved for the next start.
+ */
+function drawLiveChange(positions = null) {
+  if (!threadingSupported || currentView !== "discord" || channelCanon.channel !== String(el("discord-channel").value)) return;
+  eachColumn(() => {
+    const projected = projectView();
+    if (!projected) {
+      syncUnreadReplies();
+      return;
+    }
+    if (channelView === "threads") {
+      timelineThreads = projected;
+      el("thread-list").replaceChildren(...projected.map(threadCard));
+      return;
+    }
+    const area = el("scroll-area");
+    const position = (positions && positions.get(activeColumn)) || channelReadPosition(area);
+    timelineMessages = projected;
+    renderCachedTimeline();
+    const keeps = readFilterKeeps();
+    settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
+      { keepPosition: true, area, ...position });
+  });
+  renderSideColumn();
+  renderThreadSelect();
+  saveChannelScope();
+}
+
+/**
+ * Settle each column after a live message that changed no other row went in, as the read that used
+ * to follow it did: a column whose view it joined follows the newest line for a reader who was on
+ * it, or says it arrived to one who was not, and asks for its summary if it is long. Nothing is
+ * rebuilt: that read, finding the row it brought already drawn, drew nothing either (`#226
+ * page-energy-profile`). `#278 page-live-reads`.
+ *
+ * @param {VibeTalk.Message} message
+ * @param {Map<typeof activeColumn, ReturnType<typeof channelReadPosition>>} positions
+ */
+function settleLiveArrival(message, positions) {
+  if (!threadingSupported || currentView !== "discord" || channelCanon.channel !== String(el("discord-channel").value)) return;
+  const id = String(message.id);
+  eachColumn(() => {
+    const position = positions.get(activeColumn);
+    if (!position || channelView === "threads" || !timelineMessages.some((held) => String(held.id) === id)) return;
+    const keeps = readFilterKeeps();
+    settleAfterRead(timelineMessages.filter((held) => !hidingRead() || keeps(held)),
+      { keepPosition: true, area: el("scroll-area"), ...position });
+  });
+  requestVisibleSummaries();
+}
+
+/**
+ * Where the reader is in each column showing messages, taken before a live change goes in, for
+ * `drawLiveChange` to settle each one as a read settles what it brought.
+ *
+ * @returns {Map<typeof activeColumn, ReturnType<typeof channelReadPosition>>}
+ */
+function liveDrawPositions() {
+  const positions = new Map();
+  if (currentView === "discord") eachColumn(() => positions.set(activeColumn, channelReadPosition(el("scroll-area"))));
+  return positions;
+}
+
+/**
+ * Read `column`'s view for what a live message left unsaid: now, when no such read went out in the
+ * last `LIVE_FACT_READ_MS`; otherwise once that has passed, for everything that arrived meanwhile.
+ */
+function oweLiveFactRead(column) {
+  liveFactReadColumns.add(column);
+  if (liveFactReadTimer !== null) return;
+  const wait = liveFactReadAt + LIVE_FACT_READ_MS - Date.now();
+  if (wait > 0) {
+    liveFactReadTimer = setTimeout(() => {
+      liveFactReadTimer = null;
+      sendLiveFactRead();
+    }, wait);
+    return;
+  }
+  sendLiveFactRead();
+}
+
+/** The read `oweLiveFactRead` owes, once per column. A hidden page owes it to coming back. */
+function sendLiveFactRead() {
+  const owed = [...liveFactReadColumns];
+  liveFactReadColumns.clear();
+  if (owed.length === 0 || currentView !== "discord") return;
+  if (document.hidden) {
+    liveReadOwedHidden = true;
+    return;
+  }
+  liveFactReadAt = Date.now();
+  for (const column of owed) {
+    // A thread on the right closed since it was owed is read when it is next shown.
+    if (column === columns.side && !sideShowing()) continue;
+    refreshQuietly(() => inColumn(column, () => loadDiscord({ keepPosition: true, reason: "live" })))();
+  }
+}
+
+/** The stream stopped: what it owed belongs to a channel the next stream's entry reads anyway. */
+function forgetLiveFactRead() {
+  if (liveFactReadTimer !== null) clearTimeout(liveFactReadTimer);
+  liveFactReadTimer = null;
+  liveFactReadColumns.clear();
+}
+
+/**
+ * The edits and removals the stream delivered while a read was on the wire, by message id: the
+ * edited message, or null for a removal, with the count of live events when it came and the clock.
+ * A read sent before one may carry the copy from before it, and folding that would put the old
+ * words back, or the removed row; so each is applied again over any read sent before it
+ * (`reapplyLivePatches`), until no such read can still land: `SERVER_READ_BOUND_MS` after it.
+ *
+ * @type {Map<string, {message: VibeTalk.Message | null, epoch: number, at: number}>}
+ */
+const livePatches = new Map();
+/** How many live edits and removals this page has applied, for `livePatches`. */
+let liveEventEpoch = 0;
+/** @type {WeakMap<object, number>} each read's `liveEventEpoch` when it was sent */
+const liveSentEpochs = new WeakMap();
+
+/**
+ * An edit (`message_update`) or removal (`message_delete`) from the stream, as it happened: into the
+ * store, and drawn from there. Answers false for an event this cannot read, which then gets the
+ * authoritative re-read a malformed event always got.
+ *
+ * NOT A GUESS AT WHAT CHANGED. An edit carries the whole message as it now stands and a removal its
+ * id, so the store's copy is replaced or dropped outright. A copy with no thread record keeps the
+ * held one, as every live copy does (`foldLiveMessage`). A message the store does not hold is left
+ * to the read that next covers it, which brings it as it then is. A removed reply is one fewer on
+ * its thread's counts.
+ *
+ * @param {string} event
+ * @param {any} payload
+ */
+function applyLiveMutation(event, payload) {
+  /** @type {{channel: string, id: string, message: VibeTalk.Message | null} | null} */
+  let change = null;
+  if (event === "message_update" && VibeTalkContract.is("LiveMessageEvent", payload)) {
+    change = { channel: String(payload.message.channel_id), id: String(payload.message.id), message: payload.message };
+  } else if (event === "message_delete" && VibeTalkContract.is("LiveDeleteEvent", payload)) {
+    change = { channel: String(payload.channel_id), id: String(payload.message_id), message: null };
+  }
+  if (change === null) return false;
+  const { channel, id, message: edited } = change;
+  if (channel !== String(el("discord-channel").value)) return true;
+  releaseReadHolds();
+  if (channelCanon.channel !== channel) loadCanon(channel);
+  liveEventEpoch += 1;
+  for (const [patched, patch] of [...livePatches]) {
+    if (Date.now() - patch.at > SERVER_READ_BOUND_MS) livePatches.delete(patched);
+  }
+  livePatches.set(id, { message: edited, epoch: liveEventEpoch, at: Date.now() });
+  const held = channelCanon.messages.find((message) => String(message.id) === id);
+  if (!held) return true;
+  const positions = document.hidden ? null : liveDrawPositions();
+  if (edited) foldLiveMessage(edited, true, false);
+  else removeHeldMessage(held);
+  if (positions === null) {
+    liveArrivedHidden = true;
+    liveChangedHidden = true;
+    return true;
+  }
+  drawLiveChange(positions);
+  return true;
+}
+
+/** Whether an edit or removal changed the store while the page was hidden: coming back draws it. */
+let liveChangedHidden = false;
+
+/** Take a removed message out of the store, and off its thread's counts when it was a reply. */
+function removeHeldMessage(held) {
+  const id = String(held.id);
+  channelCanon.messages = channelCanon.messages.filter((message) => String(message.id) !== id);
+  channelCanon.dismissed.delete(id);
+  channelCanon.unplaced.delete(id);
+  archivedIds.delete(id);
+  const thread = threadOf(held);
+  if (thread === null || held.thread.is_root === true || thread === channelCanon.scope) return;
+  const fewer = (record) => (typeof record.reply_count === "number" && record.reply_count > 0
+    ? { ...record, reply_count: record.reply_count - 1 } : record);
+  channelCanon.messages = channelCanon.messages.map((message) =>
+    threadOf(message) === thread && message.thread.is_root === true ? { ...message, thread: fewer(message.thread) } : message);
+  const summary = channelCanon.threads.find((candidate) => String(candidate.id) === thread);
+  if (summary) upsertThreadSummary(fewer(summary));
+}
+
+/**
+ * Apply again every live edit and removal that came after `payload`'s read was sent, over what that
+ * read just put in the store. Called when any page of a view is folded. Patches past
+ * `SERVER_READ_BOUND_MS` are dropped: every read sent before them has landed or been given up.
+ *
+ * @param {object} payload
+ */
+function reapplyLivePatches(payload) {
+  if (livePatches.size === 0) return;
+  const sent = liveSentEpochs.get(payload);
+  const now = Date.now();
+  for (const [id, patch] of [...livePatches]) {
+    if (now - patch.at > SERVER_READ_BOUND_MS) {
+      livePatches.delete(id);
+      continue;
+    }
+    if (typeof sent !== "number" || patch.epoch <= sent) continue;
+    const held = channelCanon.messages.find((message) => String(message.id) === id);
+    if (!held) continue;
+    if (patch.message === null) {
+      channelCanon.messages = channelCanon.messages.filter((message) => String(message.id) !== id);
+      continue;
+    }
+    // The read's thread record and reactions, which an edit's copy may lack; the edit's words.
+    const kept = {
+      ...held, ...patch.message,
+      thread: patch.message.thread || held.thread,
+      ...(Array.isArray(patch.message.reactions) || !Array.isArray(held.reactions) ? {} : { reactions: held.reactions }),
+    };
+    if (sameMessage(held, kept)) continue;
+    channelCanon.messages = channelCanon.messages.map((message) => (message === held ? kept : message));
+  }
+}
+
 /**
  * A message has arrived. Put it on screen, then decide whether the agent hears about it.
  *
@@ -31644,7 +32082,7 @@ function refreshAfterLiveMutation() {
  * when it mattered — after a refresh, which is the moment a replayed message is most likely to
  * arrive twice.
  */
-function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
+function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = null) {
   observeOutgoingMessages([message]);
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
@@ -31657,6 +32095,8 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     renderOutgoingEverywhere();
     return;
   }
+  // `#278 page-live-reads`. The service is answering: a view whose read was given up on may be read.
+  if (!fromTail) releaseReadHolds();
   // A live message for this channel is proof the list is current as of now. Only a list already
   // current moves its stamp: saved or failed rows stay labelled until a read replaces them.
   if (!replayed && channelFreshness === "fresh" && channelFreshAt) {
@@ -31676,12 +32116,20 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // make every message look already held. A held message is already in the view drawn from the
     // store, or deliberately not when the to-do filter hides it, so it is not appended again.
     const held = replayed ? heldMessage(message.id) : null;
+    // `#278 page-live-reads`. A message its producer placed carries its thread record as a fact, and
+    // is placed by it: a copy with no record is then on the main channel, not merely unsaid.
+    const placed = facts && facts.thread && !message.thread ? { ...message, thread: facts.thread } : message;
+    // What only a read can still say of it: where it sits, when nobody placed it; or its thread's
+    // count, or its thread's card. A replayed copy is answered by the reads of `awaitReplayRead`.
+    const owed = !replayed && liveFactsMissing(facts);
     if (document.hidden) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
       if (!held) {
-        foldLiveMessage(message, true, replayed);
+        foldLiveMessage(placed, !facts, replayed);
+        if (facts && !replayed && applyThreadFacts(facts)) liveChangedHidden = true;
         liveArrivedHidden = true;
+        if (owed) liveReadOwedHidden = true;
         followReplyStore();
       }
       renderOutgoingEverywhere();
@@ -31692,19 +32140,35 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // and whether or not it lands: a reply in the thread it offers to start turns the row's tag into
     // Thread(1) at once, and the offer has to go with it.
     if (!held) {
-      appendToColumns(message, true, replayed);
+      // Where the reader is, before the row goes in: whether they were on the newest line decides
+      // whether it is followed. `#278 page-live-reads`.
+      const positions = replayed ? null : liveDrawPositions();
+      appendToColumns(placed, !facts, replayed);
+      // ...and what it did to its thread — one more on its root's count and card, or the count and
+      // activity its event gave — and the newest line followed, or what arrived counted: drawn now,
+      // as the read that used to follow every live message drew it. Any read still owed draws after.
+      // A reply changes its root's row and its thread's card, so the views are drawn again, as that
+      // read drew them; anything else is the one row that went in, and nothing is rebuilt.
+      const counted = facts !== null && !replayed && applyThreadFacts(facts);
+      const thread = threadOf(placed);
+      const reply = thread !== null && placed.thread.is_root !== true && thread !== channelCanon.scope;
+      if (positions !== null) {
+        if (counted || reply) drawLiveChange(positions);
+        else settleLiveArrival(placed, positions);
+      }
       followReplyStore();
     }
     renderOutgoingEverywhere();
     relayToAgent(message, selfPosted, replayed);
-    // The server owns thread membership, counts and activity ordering. Re-read the active
-    // context instead of dropping a reply from another thread into the visible conversation.
+    // The server owns thread membership, counts and activity ordering. When the event did not carry
+    // them, read the active context instead of dropping a reply from another thread into the visible
+    // conversation — at most once in `LIVE_FACT_READ_MS` (`oweLiveFactRead`).
     // `#229 desktop-two-column`: a reply in the thread on the right is read as that thread, which
     // brings its root's count with it; anything else as Main. One read, never one per column.
-    if (!replayed) {
-      const column = inSideThread(heldMessage(String(message.id)) || message) ? columns.side : columns.main;
-      refreshQuietly(() => inColumn(column, () => loadDiscord({ keepPosition: true, reason: "live" })))();
-    } else if (!held) {
+    if (owed) {
+      const column = inSideThread(heldMessage(String(message.id)) || placed) ? columns.side : columns.main;
+      oweLiveFactRead(column);
+    } else if (replayed && !held) {
       awaitReplayRead(String(message.id), String(message.channel_id),
         fromTail ? liveAttachReads : timelineReadsStarted);
     }
@@ -31768,7 +32232,7 @@ function heldMessage(id) {
  * to land, and `settleReplays` decides then; with none on the wire and the channel on screen, it
  * starts one. The voice pane starts none: entering the channel reads it, and that read answers for
  * everything waiting. A LIVE frame is not asked about: it is newer than any read on the wire, so it
- * always re-reads, as `refreshAfterLiveMutation` explains.
+ * is drawn from what it carries, and read for only what it leaves unsaid (`#278 page-live-reads`).
  *
  * @param {string} key the id of a new message, which a landed page holding it answers for; an
  *   edit or removal is keyed by its event and id, which no page's message id can match, because

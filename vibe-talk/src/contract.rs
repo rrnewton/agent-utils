@@ -741,6 +741,32 @@ pub struct LiveMessageEvent<'a> {
     pub self_posted: bool,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
+    /// What the page would otherwise read the channel again to learn: where the message sits, and
+    /// what it did to its thread's count and latest activity. Sent only when the message's producer
+    /// vouched for where it sits; absent, the message may be a reply whose thread the stream did not
+    /// say, and the page places it with a read. `#278 page-live-reads`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_facts: Option<LiveThreadFacts>,
+}
+
+/// The facts a live message carries so that the page need not read its channel again to place it.
+/// `#278 page-live-reads`, remote-ops audit W6.
+///
+/// Unlike `message.thread`, whose absence only says nothing was reported, `thread` here is a
+/// statement: null means the message was posted to the channel outside every thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LiveThreadFacts {
+    /// The message's thread record, or null for a message posted to the channel outside every
+    /// thread.
+    pub thread: Option<crate::threads::MessageThread>,
+    /// How many replies the thread's root has with this message counted, as its producer reported
+    /// it; null when it did not.
+    pub reply_count: Option<u64>,
+    /// Whether that count is exact rather than the provider's estimate.
+    pub reply_count_exact: bool,
+    /// The thread's latest activity as this event left it, RFC 3339: the message's own time when
+    /// it was created in a thread; null for an edit, which moves no thread, and outside a thread.
+    pub updated_at: Option<String>,
 }
 
 /// The data of a live stream `message_delete` event: only the ids, never the removed text.

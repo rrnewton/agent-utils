@@ -476,6 +476,7 @@ async fn a_message_deleted_while_its_channel_is_being_read_stays_deleted() {
         false,
         &lead,
         tombstone,
+        false,
     ));
 
     let first = running.await.expect("the catch-up ran");

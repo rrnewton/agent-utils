@@ -765,6 +765,7 @@ mod tests {
             historical: false,
             message,
             self_posted: false,
+            placed: false,
         }
     }
 

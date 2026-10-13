@@ -346,6 +346,14 @@ pub struct IngestEventRequest {
     /// True for catch-up/history delivered while a subscription resumes, false only for an event
     /// the adapter knows arrived live.
     pub historical: bool,
+    /// True when the adapter vouches for where a created or updated message sits: its `thread`
+    /// record is present for a message in a thread, with `reply_count` the thread's count with this
+    /// message counted, and absent only for a message posted to the channel outside every thread.
+    /// The page then places it, and counts it, with no read (`#278 page-live-reads`). False, the
+    /// default, for an adapter whose stream cannot say which thread a message is in: the page reads
+    /// to place it. Ignored on a delete.
+    #[serde(default)]
+    pub placed: bool,
     /// The normalized change.
     #[serde(flatten)]
     pub change: IngestChange,
@@ -421,6 +429,7 @@ pub async fn ingest_event(
     let IngestEventRequest {
         event_id,
         historical,
+        placed,
         change,
     } = request;
     let (kind, channel_id, mut message) = match change {
@@ -512,9 +521,10 @@ pub async fn ingest_event(
     if kind != crate::live::LiveKind::Create {
         state.read_ahead.forget(&channel_id, &message.id);
     }
-    let accepted = state
-        .live
-        .publish_ingested(event_id, kind, historical, &channel_id, message);
+    let accepted =
+        state
+            .live
+            .publish_ingested(event_id, kind, historical, &channel_id, message, placed);
     let status = if accepted {
         StatusCode::ACCEPTED
     } else {

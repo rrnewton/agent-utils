@@ -440,6 +440,86 @@
       "replayed": true,
       "self_posted": true,
       "untrusted_content_notice": "third-party text"
+    },
+    {
+      "from_tail": false,
+      "message": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "replayed": false,
+      "self_posted": false,
+      "thread_facts": {
+        "reply_count": null,
+        "reply_count_exact": false,
+        "thread": null,
+        "updated_at": null
+      },
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "from_tail": false,
+      "message": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "[build-bot] Status, 15:05Z. hello",
+        "content_html": "<p><em>hello</em></p>\n",
+        "heading": {
+          "cut": 28,
+          "tag": "build-bot",
+          "time": "15:05Z",
+          "title": "Status"
+        },
+        "id": "301",
+        "noise": true,
+        "reactions": [
+          {
+            "count": 1,
+            "emoji": "👀"
+          },
+          {
+            "count": 2,
+            "custom": true,
+            "custom_id": "112233",
+            "emoji": "party-parrot"
+          }
+        ],
+        "reply_to": "200",
+        "spoken_content": "hello, spoken",
+        "spoken_time": "noon",
+        "thread": {
+          "id": "t1",
+          "is_root": false,
+          "reply_count": 3,
+          "reply_count_exact": true,
+          "root_message_id": "200"
+        },
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "replayed": false,
+      "self_posted": false,
+      "thread_facts": {
+        "reply_count": 3,
+        "reply_count_exact": true,
+        "thread": {
+          "id": "t1",
+          "is_root": false,
+          "reply_count": 3,
+          "reply_count_exact": true,
+          "root_message_id": "200"
+        },
+        "updated_at": "2026-09-25T12:00:00+00:00"
+      },
+      "untrusted_content_notice": "third-party text"
     }
   ],
   "LiveResetEvent": [

@@ -470,6 +470,13 @@ declare namespace VibeTalk {
      */
     self_posted: boolean;
     /**
+     * What the page would otherwise read the channel again to learn: where the message sits, and
+     * what it did to its thread's count and latest activity. Sent only when the message's producer
+     * vouched for where it sits; absent, the message may be a reply whose thread the stream did not
+     * say, and the page places it with a read. `#278 page-live-reads`.
+     */
+    thread_facts?: LiveThreadFacts | null;
+    /**
      * Standing reminder that the content is third-party text.
      */
     untrusted_content_notice: string;
@@ -487,6 +494,35 @@ declare namespace VibeTalk {
      * Events this subscriber missed, or `0` when the count is unknown.
      */
     missed: number;
+  }
+
+  /**
+   * The facts a live message carries so that the page need not read its channel again to place it.
+   * `#278 page-live-reads`, remote-ops audit W6.
+   *
+   * Unlike `message.thread`, whose absence only says nothing was reported, `thread` here is a
+   * statement: null means the message was posted to the channel outside every thread.
+   */
+  interface LiveThreadFacts {
+    /**
+     * How many replies the thread's root has with this message counted, as its producer reported
+     * it; null when it did not.
+     */
+    reply_count: number | null;
+    /**
+     * Whether that count is exact rather than the provider's estimate.
+     */
+    reply_count_exact: boolean;
+    /**
+     * The message's thread record, or null for a message posted to the channel outside every
+     * thread.
+     */
+    thread: MessageThread | null;
+    /**
+     * The thread's latest activity as this event left it, RFC 3339: the message's own time when
+     * it was created in a thread; null for an edit, which moves no thread, and outside a thread.
+     */
+    updated_at: string | null;
   }
 
   /**

@@ -113,7 +113,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
 use crate::chat::{ChatClient, ChatError};
-use crate::contract::{LiveDeleteEvent, LiveMessageEvent, LiveResetEvent};
+use crate::contract::{LiveDeleteEvent, LiveMessageEvent, LiveResetEvent, LiveThreadFacts};
 use crate::model::{sort_oldest_first, ChannelId, ChannelInfo, Message, MessageId};
 use crate::state::AppState;
 
@@ -197,6 +197,15 @@ pub struct LiveMessage {
     ///
     /// The page must not relay these into a live conversation; see the module documentation.
     pub self_posted: bool,
+    /// Whether the producer vouched for where the message sits: its `thread` record is present, or
+    /// absent because it was posted to the channel outside every thread. Only then does the page
+    /// get [`LiveThreadFacts`] and skip the read that would place it. `#278 page-live-reads`.
+    ///
+    /// The poller places what carries a record and nothing else: a provider's listing may hold a
+    /// reply it reports no thread for, and saying "main channel" of it would put it there on the
+    /// page until the next full read. An adapter places a message by saying so (`placed` on its
+    /// event), which commits it to the record's count being the thread's with this message counted.
+    pub placed: bool,
 }
 
 /// What a subscriber gets when it attaches.
@@ -338,12 +347,14 @@ impl LiveHub {
     /// later reads, so the message is kept either way.
     pub fn publish(&self, channel: &ChannelId, message: Message) {
         let self_posted = self.is_self_posted(&message.id);
+        let placed = message.thread.is_some();
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
             kind: LiveKind::Create,
             historical: false,
             message,
             self_posted,
+            placed,
         };
         self.publish_inner(channel, live, false);
     }
@@ -352,6 +363,8 @@ impl LiveHub {
     ///
     /// Returns `false` when this channel has already accepted `event_id` inside the bounded
     /// de-duplication window. The duplicate is not broadcast or added to the replay tail.
+    /// `placed` is the adapter's word that the message's thread record is complete; see
+    /// [`LiveMessage::placed`].
     pub fn publish_ingested(
         &self,
         event_id: String,
@@ -359,6 +372,7 @@ impl LiveHub {
         historical: bool,
         channel: &ChannelId,
         message: Message,
+        placed: bool,
     ) -> bool {
         let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
         let live = LiveMessage {
@@ -367,6 +381,7 @@ impl LiveHub {
             historical,
             message,
             self_posted,
+            placed: placed && kind != LiveKind::Delete,
         };
         self.publish_inner(channel, live, true)
     }
@@ -615,6 +630,7 @@ fn message_event(live: &LiveMessage, from_tail: bool) -> axum::response::sse::Ev
             replayed,
             from_tail,
             untrusted_content_notice: crate::untrusted::NOTICE,
+            thread_facts: thread_facts(live),
         }),
         LiveKind::Delete => event.json_data(LiveDeleteEvent {
             channel_id: live.message.channel_id.clone(),
@@ -627,6 +643,27 @@ fn message_event(live: &LiveMessage, from_tail: bool) -> axum::response::sse::Ev
     // ending the stream with a reset is the honest answer: the page re-reads and sees the
     // message, rather than being handed a frame it cannot parse.
     encoded.unwrap_or_else(|_| reset_event(0))
+}
+
+/// What a page would read the channel again to learn about `live`, when its producer placed it:
+/// where it sits, its thread's count with it counted, and the activity it gave that thread.
+/// `#278 page-live-reads`, remote-ops audit W6. Nothing for a message nobody placed, which is how
+/// the page knows it must still read: a stream that does not say which thread a message is in has
+/// not said it is in none.
+fn thread_facts(live: &LiveMessage) -> Option<LiveThreadFacts> {
+    if !live.placed || live.kind == LiveKind::Delete {
+        return None;
+    }
+    let thread = live.message.thread.clone();
+    Some(LiveThreadFacts {
+        reply_count: thread.as_ref().and_then(|thread| thread.reply_count),
+        reply_count_exact: thread
+            .as_ref()
+            .is_some_and(|thread| thread.reply_count_exact),
+        updated_at: (live.kind == LiveKind::Create && thread.is_some())
+            .then(|| live.message.timestamp.clone()),
+        thread,
+    })
 }
 
 fn reset_event(missed: u64) -> axum::response::sse::Event {
@@ -1853,6 +1890,91 @@ mod tests {
         );
     }
 
+    /// `#278 page-live-reads`, remote-ops audit W6: the facts that spare the page a read are sent
+    /// only for a message somebody placed. The poller places what carries a thread record; an
+    /// adapter, what it says it placed; nobody, a deletion.
+    #[test]
+    fn thread_facts_go_only_with_a_message_its_producer_placed() {
+        let channel = ChannelId("1111".to_owned());
+        let hub = hub_for(&channel);
+        let record = crate::threads::MessageThread {
+            id: "t1".to_owned(),
+            root_message_id: Some(MessageId("1".to_owned())),
+            is_root: false,
+            reply_count: Some(3),
+            reply_count_exact: true,
+        };
+        let mut reply = message(&channel, 2, "an answer");
+        reply.thread = Some(record.clone());
+        hub.publish(&channel, message(&channel, 1, "polled, no record"));
+        hub.publish(&channel, reply.clone());
+        hub.publish_ingested(
+            "main".to_owned(),
+            LiveKind::Create,
+            false,
+            &channel,
+            message(&channel, 3, "pushed, placed on the channel"),
+            true,
+        );
+        hub.publish_ingested(
+            "edit".to_owned(),
+            LiveKind::Update,
+            false,
+            &channel,
+            reply,
+            true,
+        );
+        hub.publish_ingested(
+            "unplaced".to_owned(),
+            LiveKind::Create,
+            false,
+            &channel,
+            message(&channel, 4, "pushed, unsaid"),
+            false,
+        );
+        hub.publish_ingested(
+            "gone".to_owned(),
+            LiveKind::Delete,
+            false,
+            &channel,
+            message(&channel, 3, ""),
+            true,
+        );
+        let facts: Vec<_> = hub
+            .subscribe(&channel, None)
+            .replay
+            .iter()
+            .map(thread_facts)
+            .collect();
+        assert_eq!(
+            facts,
+            vec![
+                None,
+                Some(LiveThreadFacts {
+                    thread: Some(record.clone()),
+                    reply_count: Some(3),
+                    reply_count_exact: true,
+                    updated_at: Some("2026-08-20T10:00:00+00:00".to_owned()),
+                }),
+                Some(LiveThreadFacts {
+                    thread: None,
+                    reply_count: None,
+                    reply_count_exact: false,
+                    updated_at: None,
+                }),
+                // An edit moves no thread's activity.
+                Some(LiveThreadFacts {
+                    thread: Some(record),
+                    reply_count: Some(3),
+                    reply_count_exact: true,
+                    updated_at: None,
+                }),
+                None,
+                None,
+            ]
+        );
+    }
+
     #[test]
     fn adapter_retry_deduplication_is_bounded_and_evicts_oldest_first() {
         let channel = ChannelId("1111".to_owned());
@@ -1864,6 +1986,7 @@ mod tests {
                 false,
                 &channel,
                 message(&channel, n as u64 + 1, "m"),
+                false,
             ));
         }
         assert!(
@@ -1873,6 +1996,7 @@ mod tests {
                 false,
                 &channel,
                 message(&channel, 1, "retried after the window"),
+                false,
             ),
             "the oldest id must eventually leave the bounded de-duplication window"
         );
@@ -1883,6 +2007,7 @@ mod tests {
                 false,
                 &channel,
                 message(&channel, INGEST_DEDUPE_MEMORY as u64 + 1, "recent retry"),
+                false,
             ),
             "a recent retry must still be suppressed"
         );

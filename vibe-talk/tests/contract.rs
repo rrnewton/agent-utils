@@ -15,9 +15,9 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
-    LiveDelivery, LiveMessageEvent, LiveResetEvent, MessagesResponse, NoiseRules, PendingPost,
-    PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals,
-    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
+    LiveDelivery, LiveMessageEvent, LiveResetEvent, LiveThreadFacts, MessagesResponse, NoiseRules,
+    PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription,
+    ReplyDismissals, TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
     VibeTalkV1ServerFrame, VoicePromptSettings, VoiceSettings,
 };
@@ -521,6 +521,7 @@ fn samples() -> Value {
                 from_tail: false,
                 self_posted: false,
                 untrusted_content_notice: "third-party text",
+                thread_facts: None,
             }),
             to(&LiveMessageEvent {
                 message: &threaded,
@@ -528,6 +529,35 @@ fn samples() -> Value {
                 from_tail: true,
                 self_posted: true,
                 untrusted_content_notice: "third-party text",
+                thread_facts: None,
+            }),
+            // `#278 page-live-reads`: a message its producer placed says so, on the main channel
+            // (no thread) and in a thread (its record, its thread's count and activity).
+            to(&LiveMessageEvent {
+                message: &plain,
+                replayed: false,
+                from_tail: false,
+                self_posted: false,
+                untrusted_content_notice: "third-party text",
+                thread_facts: Some(LiveThreadFacts {
+                    thread: None,
+                    reply_count: None,
+                    reply_count_exact: false,
+                    updated_at: None,
+                }),
+            }),
+            to(&LiveMessageEvent {
+                message: &threaded,
+                replayed: false,
+                from_tail: false,
+                self_posted: false,
+                untrusted_content_notice: "third-party text",
+                thread_facts: Some(LiveThreadFacts {
+                    thread: threaded.thread.clone(),
+                    reply_count: Some(3),
+                    reply_count_exact: true,
+                    updated_at: Some(threaded.timestamp.clone()),
+                }),
             }),
         ],
         "LiveDeleteEvent": [to(&LiveDeleteEvent {

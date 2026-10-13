@@ -498,6 +498,17 @@
           "description": "Whether THIS SERVER posted it; the page must not relay these into a live conversation.",
           "type": "boolean"
         },
+        "thread_facts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LiveThreadFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the page would otherwise read the channel again to learn: where the message sits, and\nwhat it did to its thread's count and latest activity. Sent only when the message's producer\nvouched for where it sits; absent, the message may be a reply whose thread the stream did not\nsay, and the page places it with a read. `#278 page-live-reads`."
+        },
         "untrusted_content_notice": {
           "description": "Standing reminder that the content is third-party text.",
           "type": "string"
@@ -529,6 +540,49 @@
       "required": [
         "missed",
         "detail"
+      ],
+      "type": "object"
+    },
+    "LiveThreadFacts": {
+      "description": "The facts a live message carries so that the page need not read its channel again to place it.\n`#278 page-live-reads`, remote-ops audit W6.\n\nUnlike `message.thread`, whose absence only says nothing was reported, `thread` here is a\nstatement: null means the message was posted to the channel outside every thread.",
+      "properties": {
+        "reply_count": {
+          "description": "How many replies the thread's root has with this message counted, as its producer reported\nit; null when it did not.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reply_count_exact": {
+          "description": "Whether that count is exact rather than the provider's estimate.",
+          "type": "boolean"
+        },
+        "thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageThread"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The message's thread record, or null for a message posted to the channel outside every\nthread."
+        },
+        "updated_at": {
+          "description": "The thread's latest activity as this event left it, RFC 3339: the message's own time when\nit was created in a thread; null for an edit, which moves no thread, and outside a thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread",
+        "reply_count",
+        "reply_count_exact",
+        "updated_at"
       ],
       "type": "object"
     },
