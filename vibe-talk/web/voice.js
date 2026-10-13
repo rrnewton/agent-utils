@@ -12904,6 +12904,11 @@ let recordQueue = Promise.resolve();
  */
 function recordTurn(who, text, options = {}) {
   if (recordingBroken || !session.conversationId || !text) {
+    // `#270 voice-transcript-markers`. Something said in this call that a broken store will not keep
+    // still makes it the conversation the next call carries on from. Its recap then says it could
+    // not be had, rather than an older call's recap going out under a line that says "the
+    // conversation above".
+    if (recordingBroken && session.conversationId && text) session.recordedAny = true;
     return;
   }
   const speaker = who === "you" ? "you" : "agent";

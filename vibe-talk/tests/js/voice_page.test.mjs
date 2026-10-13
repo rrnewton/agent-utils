@@ -35167,6 +35167,36 @@ async function callInto(page, conversationId) {
   return socket;
 }
 
+test("`#270 voice-transcript-markers`: a call whose words a broken store would not keep is still the one the next call resumes from", async () => {
+  // A call that recorded nothing because it said nothing is never resumed from. One that said
+  // something the store would not take is: resuming an older call instead would send that call's
+  // recap under a line saying it is "the conversation above".
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  const first = await startTalkingNamed(page, "conv_a");
+  await page.settle();
+  first.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "what happened overnight" } }) });
+  await watchTurns(page);
+  // The store goes down within the call: recording stops for the rest of the page's life.
+  page.storeStatus = 503;
+  first.onmessage({ data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "the runner stalled" } }) });
+  await watchTurns(page);
+  assert.match(page.el("storage-state").textContent, /Not recording/);
+  await page.el("hang-up").click();
+  await page.settle();
+
+  const second = await callInto(page, "conv_b");
+  second.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "and the arm64 job" } }) });
+  await watchTurns(page);
+  await page.el("hang-up").click();
+  await page.settle();
+
+  await callInto(page, "conv_c");
+  assert.match(page.replayCalls.at(-1), /\/conversations\/conv_b\/replay$/,
+    "the next call was sent an older call's recap, not the one above it");
+});
+
 test("`#270 voice-transcript-markers`: the line above a call says what recap it was sent, beside how the call before ended", async () => {
   const resume = sourceStringTable("RESUME_SEAM_DETAILS");
   const page = newPage();
