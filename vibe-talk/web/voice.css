@@ -1725,6 +1725,22 @@ a.search-hit-link {
 }
 
 /*
+ * `#277 reply-in-column`. THE MESSAGE BEING ANSWERED by a reply open at the foot of its column: at full
+ * strength, a read one included, edged in the accent as the reply screen edges it (`#reply-target`),
+ * and with the accent's bar inside its left edge, so it is found at a glance among rows the selection's
+ * ring may also be round. Its place on the list is unchanged: it is the same row, marked.
+ */
+#side-log li.discord-message[data-replying],
+#discord-log li.discord-message[data-replying],
+#pinned-log li.discord-message[data-replying] {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  border-color: var(--accent);
+  box-shadow: inset 0.25rem 0 0 var(--accent);
+}
+
+/*
  * ASKED FOR, and not yet speaking.
  *
  * The reader taps and then waits on this server, on ElevenLabs, and on a whole message being
@@ -6621,7 +6637,8 @@ textarea {
    window, not in one column. First, so the block's rules for the same elements are the later ones. */
 #side-column,
 #column-links,
-#column-toggle {
+#column-toggle,
+#column-reply {
   display: none;
 }
 
@@ -6690,8 +6707,11 @@ textarea {
     color: var(--accent);
   }
 
+  /* A fourth row, under the lists, for a reply open in the left column (`#277 reply-in-column`): no
+     height at all while none is, so the lists are exactly as they were. */
   #screen-main[data-columns="two"] {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
   }
 
   #screen-main[data-columns="two"] > #connection-banner,
@@ -6707,7 +6727,8 @@ textarea {
     display: grid;
     grid-column: 2;
     grid-row: 1 / -1;
-    grid-template-rows: auto auto minmax(0, 1fr);
+    /* ...and its own fourth row for a reply open in it, as the left column's. */
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
     grid-template-columns: minmax(0, 1fr);
     min-height: 0;
     position: relative;
@@ -6869,11 +6890,40 @@ textarea {
     position: absolute;
     z-index: 2;
     left: 50%;
-    bottom: 0.5rem;
+    /* Standing on a reply open at the foot of the column (`#277 reply-in-column`): web/voice.js writes
+       how far above the column's foot its top edge is, and 0 when there is none. */
+    bottom: calc(0.5rem + var(--side-reply-room, 0px));
     width: calc(min(var(--reading-width), 100%) - 1.2rem);
     transform: translateX(-50%);
     display: flex;
     pointer-events: none;
+  }
+
+  /*
+   * `#277 reply-in-column`. A reply opened in either column is written at that column's foot, under
+   * its list, in the reply screen's own box (#reply-compose, moved here while it is open): the owner,
+   * "Reply in the right column or left column, whichever I clicked the reply button in." Its own row
+   * of the column's grid, so the list above it is shorter by the box and nothing else about either
+   * column changes: neither is covered, and the top of the list stays where it was. Tinted as the
+   * reply screen is, the one thing that says "this is Reply", with the hairline the lists' other
+   * edges have. The box is held to the column's reading width, as on the reply screen (above).
+   */
+  #screen-main[data-columns="two"] > #column-reply {
+    display: block;
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  #side-reply {
+    grid-row: 4;
+  }
+
+  #column-reply,
+  #side-reply {
+    min-width: 0;
+    padding: 0.6rem 0 0.75rem;
+    border-top: 1px solid var(--edge);
+    background: var(--reply-tint);
   }
 
   /* The threads, one card each, every card the same height: three lines of what the thread is

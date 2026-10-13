@@ -313,6 +313,11 @@ class FakeApi:
         with self.lock:
             return [r for r in self.requests if "/timeline?" in r or "/page" in r]
 
+    def post(self, path: str, body: Json) -> tuple[int, Json]:
+        """A POST to `path` with its JSON body, as status and answer. None is served here; a walk that
+        writes (`tests/reply_in_column_browser.py`, its replies and Done) answers its own."""
+        return 404, {"error": "not_found", "detail": "not served by this check"}
+
     def summary(self, message_id: str) -> tuple[int, Json]:
         """A message's summary, as status and body. Only the tile walk (`TileApi`) serves one; every
         other walk is answered as it always was, by the route this check does not serve."""
@@ -689,7 +694,13 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             with api.lock:
                 api.requests.append(f"POST {self.path}")
-            self.json(404, {"error": "not_found", "detail": "not served by this check"})
+            # Read whole, so that the next request on this kept-alive connection starts where it should.
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"
+            try:
+                parsed: object = json.loads(raw)
+            except ValueError:
+                parsed = {}
+            self.json(*api.post(unquote(urlsplit(self.path).path), parsed if isinstance(parsed, dict) else {}))
 
         def do_PUT(self) -> None:  # noqa: N802
             self.pin_write(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"))

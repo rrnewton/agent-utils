@@ -4545,6 +4545,24 @@ and `b` or the Bookmark chip brings you back. `make -C vibe-talk reply-continuit
 all of this in Chromium at 1280x800 and 412x915, at three text sizes, then resizes the window (and
 turns the phone) with Reply up, and sends a reply.
 
+**In two columns there is no reply screen** (`#277 reply-in-column`). The owner: "Reply and
+quote-reply destroy two column mode. Again I expected minimal disruption. Reply in the right column
+or left column, whichever I clicked the reply button in." So in two columns, Reply, Quote reply, a
+row's Draft and a failed reply's Edit open the reply screen's own box — "Your reply" and the id it
+answers, the box, the new-thread choice and where it posts, Cancel and Send reply — at the foot of the
+column the button was in, under that column's list. It is the same box, moved (`dockReply` in
+`web/voice.js`), so where a reply goes, the quote, the draft kept on Cancel, Enter and Esc are exactly
+the reply screen's. Both columns stay on screen; the other one does not move, and the pressed one keeps
+its top where it was and is shorter by the box, its chips standing on the box. The message answered
+stays where it is, edged in the accent; only where the box would cover it does the column scroll, by as
+little as shows it. Send, Cancel and Esc put the box back and the column where it was when Reply was
+pressed, with the keys on its list. A column that changes under an open reply (another channel, thread
+or view) puts it away as a draft. One column — a phone, or a desk with the layout button off — keeps
+the reply screen: on a phone a box under the list is what the on-screen keyboard covers, and the
+one-column desk keeps the continuity above. A window narrowed to one column while a reply is open in a
+column hands it to the reply screen, words and all. `make -C vibe-talk reply-in-column-browser`
+measures this in Chromium at 1280x800.
+
 ### Enter sends, in every message box, until you say otherwise
 
 Enter used to mean three things. The channel's box (and so a thread's, which is the same box) sent on

@@ -396,10 +396,16 @@ const FIXTURE_TREE = {
   // `#247 reply-continuity` put the room that holds the message in place at its head, and moved the
   // line naming the message beside the box's label, out of the scroll.
   "reply-scroll": ["reply-lead", "reply-context-more", "reply-context-state", "reply-context", "reply-target"],
+  // `#277 reply-in-column`. The block under the conversation, which two columns move to the foot of a
+  // column and back, so what is inside it goes with it: whether the focus is in the reply's box is a
+  // question of where that box is.
+  "screen-reply": ["reply-scroll", "reply-compose"],
+  "reply-compose": ["reply-target-meta", "reply-text", "reply-branch-row", "reply-destination", "reply-cancel", "reply-send", "reply-state"],
+  "reply-branch-row": ["reply-branch"],
   // `#229 desktop-two-column`. The right column of the desk's two-column layout: its heading, its
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
-  "side-column": ["side-heading", "side-freshness", "side-scroll", "side-tools"],
+  "side-column": ["side-heading", "side-freshness", "side-scroll", "side-reply", "side-tools"],
   "side-heading": ["side-facts", "side-title", "side-unread-only", "side-close"],
   "side-scroll": ["side-search-empty", "side-list", "side-pane"],
   "side-list": ["side-list-state", "side-more-threads", "side-cards"],
@@ -45606,7 +45612,14 @@ test("`#243 filter-keeps-selection`: a reader who scrolls while the walk back re
 /** Open Reply on the row of `list` holding message `id`, type `text`, press Send, and let it settle. */
 async function replyAndSend(page, id, text = "on it", list = "discord-log") {
   await replyButton(rowHoldingId(page, id, list)).click();
-  assert.equal(page.screen(), "reply", `Reply on ${id} did not open the reply screen`);
+  // `#277 reply-in-column`. In two columns the box opens at the foot of the column pressed in.
+  if (inTwoColumns(page)) {
+    assert.equal(page.screen(), "main", `Reply on ${id} replaced both columns with the reply screen`);
+    assert.equal(page.el("reply-compose").parentNode, page.el(list.startsWith("side-") ? "side-reply" : "column-reply"),
+      `Reply on ${id} did not open in the column it was pressed in`);
+  } else {
+    assert.equal(page.screen(), "reply", `Reply on ${id} did not open the reply screen`);
+  }
   await page.el("reply-text").setValue(text);
   await page.el("reply-send").click();
   await page.settle();
@@ -50578,4 +50591,230 @@ test("`#268 voice-call-drops`: every timer a healthy call arms, fired, never end
   ));
   const controlSocket = await walk(control);
   assert.ok(controlFrames(controlSocket).includes("quit"), "the control's timer hung up unseen: this walk sees nothing");
+});
+
+// --- `#277 reply-in-column` ---------------------------------------------------------------------
+//
+// The owner, 2026-10-13: "Reply and quote-reply destroy two column mode. Again I expected minimal
+// disruption. Reply in the right column or left column, whichever I clicked the reply button in. But
+// instead the whole screen got replaced with the reply interface." In two columns the reply screen's
+// own box opens at the foot of the column pressed in; one column keeps the reply screen.
+// tests/two_column_browser.py measures where it is drawn in a real browser.
+
+/** Where the reply's box is: "left", "right", or "screen", its place on the reply screen. */
+const replyBoxAt = (page) => {
+  const parent = page.el("reply-compose").parentNode;
+  if (parent === page.el("column-reply")) return "left";
+  if (parent === page.el("side-reply")) return "right";
+  if (parent === page.el("screen-reply")) return "screen";
+  return parent ? `#${parent.id}` : "nowhere";
+};
+
+/** The rows edged as the message a reply open in a column answers, as "left:id" and "right:id". */
+const replyingRows = (page) => [
+  ...page.el("discord-log").children.filter((li) => li.hasAttribute("data-replying")).map((li) => `left:${li.getAttribute("data-id")}`),
+  ...page.el("side-log").children.filter((li) => li.hasAttribute("data-replying")).map((li) => `right:${li.getAttribute("data-id")}`),
+];
+
+/** Two columns, the first thread selected on the right: Main on the left, 201 and 202 on the right. */
+async function replyColumnsPage(script = SCRIPT) {
+  const { page, data } = await twoColumnServer(null, script);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the premise is the first thread on the right");
+  return { page, data };
+}
+
+/** A posted reply's body with its idempotency key said as whether it has one, to compare two pages' posts. */
+const keyless = (body) => {
+  const { idempotency_key: key, ...rest } = body;
+  return { ...rest, keyed: Boolean(key) };
+};
+
+test("`#277 reply-in-column`: in two columns Reply opens its box at the foot of the column it was pressed in, both columns staying, and Cancel puts all of it back", async () => {
+  const { page } = await replyColumnsPage();
+  const left = page.el("scroll-area");
+  const right = page.el("side-scroll");
+  const before = { left: left.scrollTop, right: right.scrollTop, leftIds: shownIds(page), rightIds: sideIds(page) };
+  for (const [column, row, id, list] of [
+    ["left", () => rowWithId(page, "200"), "200", left],
+    ["right", () => sideRow(page, "202"), "202", right],
+  ]) {
+    await replyButton(row()).click();
+    assert.equal(page.screen(), "main", `${column}: Reply replaced both columns with the reply screen`);
+    assert.ok(inTwoColumns(page), `${column}: Reply took the page out of two columns`);
+    assert.equal(replyBoxAt(page), column, `${column}: the box did not open in the column Reply was pressed in`);
+    const [own, other] = column === "left" ? ["column-reply", "side-reply"] : ["side-reply", "column-reply"];
+    assert.equal(page.el(own).hidden, false, `${column}: the column's place for a reply is not shown`);
+    assert.equal(page.el(other).hidden, true, `${column}: the other column has a box too`);
+    assert.deepStrictEqual(replyingRows(page), [`${column}:${id}`], `${column}: the message answered is not the one edged`);
+    assert.match(page.el("reply-target-meta").textContent, new RegExp(`id ${id}$`), `${column}: the box does not say what it answers`);
+    assert.equal(focused(page), page.el("reply-text"), `${column}: the box did not take the focus; ${focusName(page)} has it`);
+    assert.deepStrictEqual([shownIds(page), sideIds(page)], [before.leftIds, before.rightIds], `${column}: a column's rows changed`);
+    assert.deepStrictEqual([left.scrollTop, right.scrollTop], [before.left, before.right], `${column}: a column moved`);
+    await page.el("reply-cancel").click();
+    assert.equal(page.screen(), "main");
+    assert.equal(replyBoxAt(page), "screen", `${column}: Cancel left the box in the column`);
+    assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [true, true],
+      `${column}: Cancel left a column's place for a reply on screen`);
+    assert.deepStrictEqual(replyingRows(page), [], `${column}: Cancel left the message edged`);
+    assert.deepStrictEqual([left.scrollTop, right.scrollTop], [before.left, before.right], `${column}: Cancel did not put the column back`);
+    assert.ok(nodeWithinFixture(list, focused(page)), `${column}: after Cancel the keys are on ${focusName(page)}, not the column's list`);
+  }
+
+  // THE CONTROL: the reply screen in two columns, as it was. The walk above sees it.
+  const { page: control } = await replyColumnsPage(brokenScript(
+    'const docked = columnsShown && currentScreen === "main" && currentView === "discord";', "const docked = false;"));
+  await replyButton(rowWithId(control, "200")).click();
+  assert.equal(control.screen(), "reply", "the control opened no reply screen, so this test cannot see one");
+});
+
+test("`#277 reply-in-column`: Send from a column posts what the reply screen posts in one column — Main's message to Main, the thread's into its thread — once, and puts the column back", async () => {
+  // One column first: what the reply screen posts for each, from Main and from the thread.
+  const one = await threadPage("main");
+  distinctReplies(one);
+  await replyButton(rowOf(one, "200")).click();
+  assert.equal(one.screen(), "reply", "the premise is the reply screen in one column");
+  await one.el("reply-text").setValue("noted");
+  await one.el("reply-send").click();
+  await one.settle();
+  await pickThread(one, "thread:spaces/A/threads/one & two");
+  await replyButton(rowOf(one, "202")).click();
+  await one.el("reply-text").setValue("agreed");
+  await one.el("reply-send").click();
+  await one.settle();
+  const expected = one.repliesPosted.map((call) => keyless(call.body));
+  assert.equal(expected.length, 2);
+  assert.equal(expected[1].thread_id, "spaces/A/threads/one & two", "the premise is a reply in the thread posted into it");
+
+  const { page } = await replyColumnsPage();
+  distinctReplies(page);
+  const left = page.el("scroll-area");
+  const right = page.el("side-scroll");
+  // Where each column was: at its newest message, which a reader there goes on following as the reply
+  // is posted at the foot, or a place up its list, which is kept.
+  const place = (area) => (atBottomOf(area) ? "newest" : area.scrollTop);
+  const before = [place(left), place(right)];
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("noted");
+  await page.el("reply-send").click();
+  // A second press arrives at a box that has gone: nothing more is posted.
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(replyBoxAt(page), "screen", "Send left the box in the column");
+  assert.equal(page.screen(), "main", "Send from a column went to another screen");
+  assert.equal(place(left), before[0], "Send did not put the left column back");
+  assert.ok(nodeWithinFixture(left, focused(page)), `after Send the keys are on ${focusName(page)}, not the left column's list`);
+  await replyButton(sideRow(page, "202")).click();
+  assert.equal(replyBoxAt(page), "right");
+  await page.el("reply-text").setValue("agreed");
+  await press(page, page.el("reply-text"), "Enter");
+  await page.settle();
+  assert.equal(replyBoxAt(page), "screen", "Enter sent and left the box in the column");
+  assert.deepStrictEqual(page.repliesPosted.map((call) => keyless(call.body)), expected,
+    "a reply sent from a column did not post what the reply screen posts, once each");
+  assert.equal(place(right), before[1], "Enter did not put the right column back");
+  assert.ok(nodeWithinFixture(right, focused(page)), `after Enter the keys are on ${focusName(page)}, not the right column's list`);
+  assert.deepStrictEqual(replyingRows(page), []);
+  // The Done a sent reply makes is drawn where the message stands, in the column it was answered in.
+  assert.equal(sideRow(page, "202").getAttribute("data-archived"), "true", "the reply's Done was not drawn on the right");
+  assert.equal(rowWithId(page, "200").getAttribute("data-archived"), "true", "the reply's Done was not drawn on the left");
+});
+
+test("`#277 reply-in-column`: Quote reply in either column quotes the words selected there in that column's box, the caret under the quote, and Cancel keeps only the draft there was", async () => {
+  const { page } = await replyColumnsPage();
+  distinctReplies(page);
+  for (const [column, row, id, words] of [
+    ["left", () => rowWithId(page, "200"), "200", "announcement"],
+    ["right", () => sideRow(page, "202"), "202", "first thread answer"],
+  ]) {
+    await page.selectText(wordsIn(row()), null, words);
+    assert.equal(replyLabel(row()), "Quote reply", `${column}: no Quote reply`);
+    await replyButton(row()).click();
+    assert.equal(replyBoxAt(page), column, `${column}: Quote reply did not open in its column`);
+    assert.equal(page.screen(), "main");
+    assert.equal(page.el("reply-text").value, `> ${words}\n\n`, `${column}: the quote is not in the box`);
+    assert.equal(page.el("reply-text").selectionStart, `> ${words}\n\n`.length, `${column}: the caret is not under the quote`);
+    assert.equal(focused(page), page.el("reply-text"));
+    assert.deepStrictEqual(replyingRows(page), [`${column}:${id}`]);
+    await page.el("reply-cancel").click();
+    assert.equal(draftMarkerOf(row()).hidden, true, `${column}: a quote left untouched was kept as a draft`);
+  }
+  // Written under and sent: the quote and the words, into the thread.
+  await page.selectText(wordsIn(sideRow(page, "202")), null, "first thread answer");
+  await replyButton(sideRow(page, "202")).click();
+  await page.el("reply-text").setValue("> first thread answer\n\nyes, this");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
+    { text: "> first thread answer\n\nyes, this", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: false });
+});
+
+test("`#277 reply-in-column`: Escape closes an empty box at once; with words, the first goes to the column's list and keeps the draft, and the next puts the reply down; c goes back to the box", async () => {
+  const { page } = await replyColumnsPage();
+  const left = page.el("scroll-area");
+  await replyButton(rowWithId(page, "200")).click();
+  await press(page, page.el("reply-text"), "Escape");
+  assert.equal(replyBoxAt(page), "screen", "Escape in an empty box did not put the reply down");
+  assert.ok(nodeWithinFixture(left, focused(page)), `after Escape the keys are on ${focusName(page)}`);
+
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("half a thought");
+  await press(page, page.el("reply-text"), "Escape");
+  assert.equal(replyBoxAt(page), "left", "Escape in a box with words in it put the reply down");
+  assert.ok(nodeWithinFixture(left, focused(page)), `Escape out of the box left the keys on ${focusName(page)}, not its column's list`);
+  await press(page, focused(page), "c");
+  assert.equal(focused(page), page.el("reply-text"), `c went to ${focusName(page)}, not the reply open in the column`);
+  await press(page, page.el("reply-text"), "Escape");
+  await press(page, focused(page), "Escape");
+  assert.equal(replyBoxAt(page), "screen", "the second Escape did not put the reply down");
+  assert.equal(page.screen(), "main");
+  assert.ok(inTwoColumns(page), "Escape left two columns");
+  assert.equal(sideIds(page).length, 2, "Escape closed the thread on the right as well as the reply");
+  assert.equal(draftMarkerOf(rowWithId(page, "200")).hidden, false, "the words were not kept as a draft");
+  await replyButton(rowWithId(page, "200")).click();
+  assert.equal(page.el("reply-text").value, "half a thought", "Reply did not open with the draft");
+});
+
+test("`#277 reply-in-column`: two columns going while a reply is open hand it to the reply screen, words and all; a column showing something else puts it away as a draft; one column is the reply screen", async () => {
+  const { page } = await replyColumnsPage();
+  await replyButton(sideRow(page, "202")).click();
+  await page.el("reply-text").setValue("keep me");
+  await page.setDesk(false);
+  assert.ok(!inTwoColumns(page), "the premise is one column");
+  assert.equal(page.screen(), "reply", "a reply open in a column was lost when two columns went");
+  assert.equal(replyBoxAt(page), "screen");
+  assert.equal(page.el("reply-text").value, "keep me", "the words did not go with the reply");
+  assert.match(page.el("reply-target-meta").textContent, /id 202$/);
+  assert.equal(page.el("reply-target").children.length, 1, "the reply screen does not show the message answered");
+  assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [true, true]);
+  distinctReplies(page);
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
+    { text: "keep me", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: false },
+    "the reply moved to the screen did not post where it was going");
+
+  // One column: the reply screen, as it was.
+  await replyButton(rowWithId(page, "200")).click();
+  assert.equal(page.screen(), "reply", "Reply in one column did not open the reply screen");
+  await page.el("reply-cancel").click();
+
+  // Back in two: the X on the thread a reply is open under puts the reply away, keeping its words.
+  await page.setDesk(true);
+  assert.ok(inTwoColumns(page));
+  assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+  await replyButton(sideRow(page, "201")).click();
+  await page.el("reply-text").setValue("about the root");
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(replyBoxAt(page), "screen", "a reply open under a thread outlived the thread");
+  assert.equal(page.screen(), "main");
+  assert.equal(draftMarkerOf(rowWithId(page, "201")).hidden, false, "the words of the reply put away were not kept");
+  // ...and the call's view, which has no columns, does too.
+  await replyButton(rowWithId(page, "200")).click();
+  assert.equal(replyBoxAt(page), "left");
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(replyBoxAt(page), "screen", "the call's view kept a reply open in a column");
 });

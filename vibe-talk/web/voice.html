@@ -531,6 +531,17 @@
           </div>
 
           <!--
+            `#277 reply-in-column`. Where a reply opened in the LEFT column of two is written: the reply
+            screen's own box (#reply-compose, moved here while it is open, so there is one box, one Send
+            and one set of rules), at the foot of the column under its list. The owner: "Reply in the
+            right column or left column, whichever I clicked the reply button in." Both columns stay on
+            screen as they were; Send or Cancel puts the box back and the column where it was. The right
+            column's is #side-reply, which stands in for this one there (`COLUMN_IDS`). web/voice.css
+            places it only in two columns; empty and hidden otherwise.
+          -->
+          <div id="column-reply" role="group" aria-label="Reply" hidden></div>
+
+          <!--
             `#229 desktop-two-column`. The RIGHT COLUMN of the desk's two-column layout: Main stays in
             #scroll-area on the left, and this column shows one thread of the channel or, with none
             selected, a card for each thread to choose one from. The owner: "the right column contains
@@ -618,6 +629,8 @@
                 </div>
               </div>
             </div>
+            <!-- `#277 reply-in-column`. The right column's place for a reply opened in it: see #column-reply. -->
+            <div id="side-reply" role="group" aria-label="Reply" hidden></div>
             <div id="side-tools">
               <button id="side-jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>
                 <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -790,8 +803,13 @@
           </div>
           <!-- `#247 reply-continuity`. Everything under the conversation, as one block: on a desk it
                is held to the reading column the rows above it are, in the type that column is
-               measured in. -->
-          <div class="reply-compose">
+               measured in.
+
+               `#277 reply-in-column`. In two columns this block, ids and all, is moved to the foot
+               of the column Reply was pressed in (#column-reply or #side-reply) and back here when
+               the reply closes: the same box whichever screen it is on. It stays the LAST child of
+               this screen, which is where it is put back. -->
+          <div id="reply-compose" class="reply-compose">
             <!-- Who is being answered, and the id the answer goes to, on the label's line: under the
                  message rather than between it and the earlier ones, so that the message itself is
                  drawn exactly as the channel draws it. -->
@@ -1996,8 +2014,13 @@
                 list each select the thread on the right; a tap on a message still only opens or folds
                 it. The <strong>×</strong> at the top of the right column goes back to the list. The
                 search, Links and the read mode apply to both columns, and <kbd>[</kbd> and
-                <kbd>]</kbd> move the keys between them. A narrower window shows one column again, in
-                the view you left it in, and keeps the choice for when the window is wide again.
+                <kbd>]</kbd> move the keys between them. <strong>Reply</strong> and <strong>Quote
+                reply</strong> open the reply box at the foot of the column you pressed them in, with
+                the message you are answering edged in the accent where it stands; both columns stay
+                on screen, and <strong>Send reply</strong>, <strong>Cancel</strong> or
+                <kbd>Esc</kbd> puts the column back where it was. A narrower window shows one column
+                again, in the view you left it in, and keeps the choice for when the window is wide
+                again; a reply you were writing moves to the reply screen with your words.
               </p>
               <p class="hint">
                 When the configured chat provider supports it, the row's <strong>⋯</strong> menu
