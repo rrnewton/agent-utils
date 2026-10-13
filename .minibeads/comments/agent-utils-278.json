@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-278-c7d7077b8fa",
+    "issue_id": "agent-utils-278",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Review fixes landed in dcfc996e (remote-ops audit W6 and W7): a failed read in either column, with rows on screen or none, keeps the 45 s poll behind a pushed stream; a live message is kept over a read sent before it; a landed read ends its view's hold, a stream reset is never held, and a held read is made at the hold's end instead of dropped; a pushed stream silent for 40 s is let go. Each proved by a page test counting timeline requests, failing on c6bfed2c. Unverified: not run against a deployment; adapter liveness behind the server is still not checked; reactions, read state, the bookmark and pins from another device take up to 15 min to show behind a pushed stream (stated in the README).",
+    "created_at": "2026-10-13T21:56:50.869490261Z",
+    "updated_at": "2026-10-13T21:56:50.869490261Z"
+  }
+]
