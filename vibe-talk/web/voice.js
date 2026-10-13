@@ -8714,7 +8714,11 @@ function askedAboutSending(turns, answer) {
   return question.some((word) => SENDING_WORDS.has(word));
 }
 
-/** Forget the conversation so far: a new call, a hang-up, or a replacement voice session. */
+/**
+ * Forget the conversation so far: a new call, a hang-up, or a replacement voice session.
+ *
+ * @param {"earlier_draft" | "replaced_session"} [why] why a draft on the card now may not be sent by voice
+ */
 function resetSpokenYes(why = "earlier_draft") {
   const settling = spokenYes.settling;
   if (settling) clearTimeout(settling.timer);
