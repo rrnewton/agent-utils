@@ -5665,30 +5665,43 @@ a.search-hit-link {
   font-size: 0.82rem;
 }
 
-/* ONE LINE, ALWAYS, so the countdown changing its words never moves the buttons under a thumb. */
+/* ONE LINE, ALWAYS, so the status changing its words never moves the buttons under a thumb — least
+   of all when a spoken yes starts to settle, and Don't send is the only way to stop the send. A
+   fixed height, not a minimum: a line that wrapped moved Don't send down 19px at exactly that
+   moment. The page's sentences fit the narrowest card (`POST_CARD_STATUS` in web/voice.js); a larger
+   type size is cut with an ellipsis rather than wrapped, and read out whole either way, because the
+   card's accessible description includes this line. */
 #post-confirm-expiry {
-  min-height: 1.45em;
+  height: 1.45em;
+  line-height: 1.45;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   color: var(--muted);
   font-size: 0.82rem;
 }
 
-/* Send is the filled primary button and takes the room; Don't send is the outlined one beside it.
-   Both at least 44px tall. When "Send to {channel}" does not fit beside Don't send, Send wraps onto
-   a row of its own under it, the whole width of the card — still last, still nearest the thumb — and
-   only a name too long even for that is cut on screen; the accessible name is always whole. */
+/* ONE ROW, as designed: Don't send, then Send, which is the filled primary button and takes the
+   room, both at least 44px tall. Stacked, Don't send stood straight above Send with half a rem
+   between them, which is the wrong button for a thumb that lands a little high. A slightly smaller
+   label and padding are what let "Send to lead team" sit beside Don't send whole on the narrowest
+   card the page draws (a 360px phone's call pane); a longer name is cut on screen, and the
+   accessible name is always whole. */
 .post-confirm-actions {
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  gap: 0.4rem;
   margin: 0.45rem 0 0;
 }
 
 #post-confirm-send,
 #post-confirm-cancel {
   min-height: 2.75rem;
-  padding-inline: 0.7rem;
+  padding-inline: 0.55rem;
+  font-size: 0.9rem;
 }
 
 #post-confirm-send {
-  flex: 1 1 auto;
+  flex: 1 1 8rem;
   min-width: 0;
 }
 
