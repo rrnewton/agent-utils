@@ -10198,6 +10198,25 @@ function draftBelowView() {
   return card.getBoundingClientRect().top >= area.getBoundingClientRect().top + (area.clientHeight || 0);
 }
 
+/**
+ * What the card's status line says, in each of its states. `#269 approval-card-inline`.
+ *
+ * ONE LINE, on the narrowest card the page draws — a 360px phone's call pane, where the card stands
+ * at the owner's own 15% inset — because the line sits right above the buttons: a sentence that
+ * wrapped when a spoken yes began to settle moved Don't send down under the thumb at the one moment
+ * it is the only way to stop the send. The stylesheet holds the line to one line's height and cuts
+ * anything longer with an ellipsis, so even a larger type size never moves the buttons; these are
+ * short enough that nothing is cut on a phone at the page's own size. The whole sentence is read
+ * out either way: the card's accessible description includes this line.
+ */
+const POST_CARD_STATUS = {
+  waiting: (seconds) => `Waiting for you · lapses in ${seconds} s`,
+  changed: (seconds) => `Changed: read again · lapses in ${seconds} s`,
+  settling: "Heard yes — tap Don't send to stop",
+  lapsed: "Lapsed — nothing was posted.",
+  token: "Has your sign-in token · tap Don't send",
+};
+
 function renderPostExpiry() {
   if (postWatch.tick !== null) {
     clearTimeout(postWatch.tick);
@@ -10206,25 +10225,24 @@ function renderPostExpiry() {
   const proposal = postWatch.shown;
   if (!proposal) return;
   const status = el("post-confirm-expiry");
+  // A sign-in token in the text: this page will not send it, so Don't send is the only way on.
   if (redact(proposal.text) !== proposal.text) {
-    status.textContent =
-      "This text contains your sign-in token, so this page will not send it. Tap Don't send.";
+    status.textContent = POST_CARD_STATUS.token;
     return;
   }
   const seconds = Math.max(0, Math.ceil((postWatch.deadline - Date.now()) / 1000));
   if (seconds === 0) {
     el("post-confirm-send").disabled = true;
-    status.textContent = "This draft has lapsed. Nothing was posted.";
+    status.textContent = POST_CARD_STATUS.lapsed;
     return;
   }
   // A spoken yes is settling: what the next second does is send, and the one control that stops
   // it is on this card. The countdown does not write over that.
   const settling = spokenYes.settling;
   if (settling && settling.handle === proposal.handle) {
-    status.textContent = "Heard yes — sending… Tap Don't send to stop.";
+    status.textContent = POST_CARD_STATUS.settling;
   } else {
-    const changed = postWatch.changed ? "The assistant changed the text — read it again" : "Waiting for you";
-    status.textContent = `${changed} · lapses in ${seconds} s`;
+    status.textContent = postWatch.changed ? POST_CARD_STATUS.changed(seconds) : POST_CARD_STATUS.waiting(seconds);
   }
   postWatch.tick = setTimeout(() => {
     postWatch.tick = null;

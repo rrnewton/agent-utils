@@ -34104,7 +34104,7 @@ test("a card that appears where none was shown holds Send too, without saying th
   // `#269 approval-card-inline`: the card is the next message in the list now, where a tap aimed at
   // the last row may land on either button, so Don't send is held with Send.
   assert.equal(page.el("post-confirm-cancel").disabled, true, "Don't send was live on the card's first frame");
-  assert.doesNotMatch(page.el("post-confirm-expiry").textContent, /changed the text/, "a first card said it changed");
+  assert.doesNotMatch(page.el("post-confirm-expiry").textContent, /Changed/, "a first card said it changed");
 
   await page.el("post-confirm-send").click();
   await page.el("post-confirm-cancel").click();
@@ -34128,7 +34128,7 @@ test("a newer proposal replaces the card, holds Send, says so, and then Send com
   await page.settle();
   assert.equal(page.el("post-confirm-text").textContent, "actually, tomorrow");
   assert.equal(page.el("post-confirm-send").disabled, true, "Send was live the moment the words changed");
-  assert.match(page.el("post-confirm-expiry").textContent, /changed the text — read it again/);
+  assert.match(page.el("post-confirm-expiry").textContent, /^Changed: read again · lapses in \d+ s$/);
 
   // A tap aimed at the old words lands during the hold and sends nothing.
   await page.el("post-confirm-send").click();
@@ -34137,7 +34137,7 @@ test("a newer proposal replaces the card, holds Send, says so, and then Send com
 
   assert.equal(page.expireTimers(2000), 1, "no hold was armed");
   assert.equal(page.el("post-confirm-send").disabled, false, "Send stayed held");
-  assert.match(page.el("post-confirm-expiry").textContent, /changed the text/, "the change mark did not outlast the hold");
+  assert.match(page.el("post-confirm-expiry").textContent, /^Changed:/, "the change mark did not outlast the hold");
   await page.el("post-confirm-send").click();
   await page.settle();
   assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.text]), [[newer.handle, newer.text]]);
@@ -34148,7 +34148,7 @@ test("a proposal carrying the sign-in token is neither shown nor sendable", asyn
   await proposedDuringACall(page, proposal({ text: "here you go: write-token-aaaaaaaaaaaaaaaa" }));
   assert.ok(!page.el("post-confirm-text").textContent.includes("write-token-aaaaaaaaaaaaaaaa"));
   assert.equal(page.el("post-confirm-send").disabled, true);
-  assert.match(page.el("post-confirm-expiry").textContent, /contains your sign-in token/);
+  assert.equal(page.el("post-confirm-expiry").textContent, "Has your sign-in token · tap Don't send");
   await page.el("post-confirm-send").click();
   await page.settle();
   assert.deepEqual(page.proposalCommits, []);
@@ -34163,7 +34163,7 @@ test("the card counts down to the lapse, and a lapsed card cannot send", async (
   assert.match(page.el("post-confirm-expiry").textContent, /lapses in 1 s/);
   page.setClock(page.clock() + 1000);
   page.expireTimers(1000);
-  assert.match(page.el("post-confirm-expiry").textContent, /lapsed\. Nothing was posted/);
+  assert.equal(page.el("post-confirm-expiry").textContent, "Lapsed — nothing was posted.");
   assert.equal(page.el("post-confirm-send").disabled, true);
   assert.equal(page.expireTimers(1000), 0, "the countdown kept ticking past the lapse");
 });
@@ -34298,6 +34298,24 @@ test("`#269 approval-card-inline`: while a draft is up the message box is one li
     "the card is not at the owner's own inset, so freezing it would move it sideways");
 });
 
+test("`#269 approval-card-inline`: the status line is one line high whatever it says, and the buttons share one row", () => {
+  // A minimum height let a long status wrap and push Don't send down as a spoken yes settled.
+  const line = cssBlock("#post-confirm-expiry");
+  assert.match(line, /(^|[;\s])height:\s*1\.45em/, "the status line is not held to one line's height");
+  assert.match(line, /white-space:\s*nowrap/, "the status line wraps");
+  assert.match(line, /text-overflow:\s*ellipsis/, "a status too long for the card is not cut");
+  assert.doesNotMatch(line, /min-height/, "a minimum lets the status line grow");
+  assert.match(cssBlock(".post-confirm-actions"), /flex-wrap:\s*nowrap/, "Send can wrap under Don't send");
+  // Every sentence the line shows fits a 360px phone's call pane (measured in Chromium): short.
+  const card = /const POST_CARD_STATUS = \{([\s\S]*?)\n\};/.exec(SCRIPT);
+  assert.ok(card, "the card's status lines are no longer in one place");
+  const said = [...card[1].matchAll(/["`]([^"`]+)["`]/g)].map((m) => m[1].replace(/\$\{seconds\}/, "118"));
+  assert.ok(said.length >= 5, `found ${said.length} status lines`);
+  for (const sentence of said) {
+    assert.ok(sentence.length <= 40, `"${sentence}" is ${sentence.length} characters, too long for one line`);
+  }
+});
+
 test("`#269 approval-card-inline`: docked, the card clears the home indicator and only its words scroll", () => {
   // NOT VERIFIABLE BY SCREENSHOT: Chromium's emulation reports a zero inset. Off the main screen the
   // control pane, which carries the bottom inset everywhere else, is hidden and the docked card is
@@ -34344,10 +34362,10 @@ test("`#269 approval-card-inline`: a spoken yes settling says so on the card, wi
   page.expireTimers(2000);
   hostedHears(socket, "yes");
   await page.settle();
-  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — sending… Tap Don't send to stop.");
+  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — tap Don't send to stop");
   // The countdown's tick does not write over it.
   page.expireTimers(1000);
-  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — sending… Tap Don't send to stop.");
+  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — tap Don't send to stop");
   await page.el("post-confirm-cancel").click();
   await page.settle();
   assert.deepEqual(page.proposalCommits, []);
