@@ -25949,7 +25949,9 @@ test("the floating chips keep their height clear above the composer, and never s
   // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
   assert.match(SCRIPT_CODE, /addEventListener\("scroll", \(\) => \{\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);/,
     "a scroll moves the box under the chips and nothing moves them");
-  assert.match(SCRIPT_CODE, /renderJumpNewest\(\);\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);\s*\}, 0\);/,
+  // In the same deferred decision as the jump; what else that decision redraws after it (`#261
+  // two-column-connectors`' links) may follow.
+  assert.match(SCRIPT_CODE, /renderJumpNewest\(\);\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);[^{}]*\}, 0\);/,
     "the box moving without a scroll leaves the chips where they were");
   assert.match(SCRIPT_CODE, /"--composer-top", `\$\{top\}px`/, "nothing writes the box's top edge for the stylesheet");
 });
