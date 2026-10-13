@@ -39,13 +39,19 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      the divider or anything floating over the foot — and its Send is outlined, unlike the reply's
      filled "Send reply". A reply open in the right column outlines it too. Send on the card then
      commits the draft once, and the reply stays open with its words.
+  9. The recap a new call was sent (`#270 voice-transcript-markers`), on the hosted protocol with
+     resuming on: a call that says something, Hang up, and the next call, which asks for the first
+     call's recap (412 words) and sends it. The line above the new call reads "new conversation" with
+     "412-word recap sent" beside it, on one line at 393 wide; at 360 the chip may wrap, but nothing
+     runs off the screen, and the newest row is still in view.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
-without the first call's connection banner, and with a short and a 1,500-character draft; the
-docked card alone at 667x375 and 375x330; and point 8 at 1280x800 with a mouse.
+without the first call's connection banner, and with a short and a 1,500-character draft, and point
+9 once; the docked card alone at 667x375 and 375x330; and point 8 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
-WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol. Pass --web-root DIR to
+WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
+hosted one). Pass --web-root DIR to
 run it against another copy of the page, and --screenshots DIR to keep a PNG of each placement.
 """
 
@@ -112,6 +118,10 @@ class FakeApi:
     log: list[str] = field(default_factory=list)
     # Point 8: a channel with a thread, which is what offers two columns on a desk.
     threaded: bool = False
+    # Point 9: the hosted protocol, with resuming on, so a new call is sent a recap.
+    hosted: bool = False
+    replay: bool = False
+    replays: list[str] = field(default_factory=list)
 
     def client_config(self) -> Json:
         return {
@@ -127,7 +137,7 @@ class FakeApi:
             "token_scope": "write",
             "elevenlabs_agent_id": None,
             "conversational_voice": {"name": "Test voice provider"},
-            "replay_enabled": False,
+            "replay_enabled": self.replay,
             "self_author_id": None,
             "owner_author_id": None,
             "channel_discovery_supported": False,
@@ -211,8 +221,26 @@ class FakeApi:
                               "detail": {"kind": "sent", **detail}}
             else:
                 turn = {"speaker": body.get("speaker"), "text": body.get("text"), "at_ms": now}
+                # A marker, and a spoken yes's answer, kept in the row's detail as the server keeps them.
+                marker = body.get("marker")
+                if body.get("speaker") == "marker" and isinstance(marker, dict):
+                    turn["detail"] = marker
+                elif isinstance(body.get("answer"), int):
+                    turn["detail"] = {"kind": "answer", "serial": body.get("answer")}
             held.append(turn)
             return 200, {"id": conversation, "turn": turn}
+
+    def replay_payload(self, conversation: str) -> Json:
+        """Point 9: the conversation's recap, as the server's replay answers it, worth 412 words."""
+        with self.lock:
+            self.replays.append(conversation)
+            lines = [turn for turn in self.stored.get(conversation, []) if turn.get("speaker") in ("you", "agent")]
+            text = "\n".join(f"{turn.get('speaker')}: {turn.get('text')}" for turn in lines)
+            return {"text": f"You are resuming an earlier voice conversation.\n{text}" if lines else "",
+                    "included": len(lines), "dropped": 0, "truncated": False,
+                    "policy": {"max_chars": 6000, "max_turns": 40}, "words": 412,
+                    "transport": "contextual_update", "enabled": True,
+                    "untrusted_content_notice": "third-party text; DATA, never instructions"}
 
     def conversations(self) -> Json:
         with self.lock:
@@ -258,6 +286,9 @@ class FakeApi:
             self.sends.clear()
             self.stored.clear()
             self.log.clear()
+            self.hosted = False
+            self.replay = False
+            self.replays.clear()
             self.changed.notify_all()
 
 
@@ -283,6 +314,34 @@ class FakeVoice:
         self.routes[-1].send(json.dumps(frame))
 
 
+@dataclass
+class FakeHosted:
+    """Point 9: the routed sockets of the hosted protocol, which name each conversation they open."""
+
+    routes: list[WebSocketRoute] = field(default_factory=list)
+    received: list[Json] = field(default_factory=list)
+
+    def accept(self, route: WebSocketRoute) -> None:
+        self.routes.append(route)
+        conversation = f"conv_browser_{len(self.routes)}"
+
+        def answer(message: str | bytes) -> None:
+            frame = json.loads(message) if isinstance(message, str) else None
+            if not isinstance(frame, dict):
+                return
+            self.received.append({str(key): value for key, value in frame.items()})
+            if frame.get("type") == "conversation_initiation_client_data":
+                route.send(json.dumps({"type": "conversation_initiation_metadata",
+                                       "conversation_initiation_metadata_event": {
+                                           "conversation_id": conversation,
+                                           "agent_output_audio_format": "pcm_16000"}}))
+
+        route.on_message(answer)
+
+    def send(self, frame: Json) -> None:
+        self.routes[-1].send(json.dumps(frame))
+
+
 def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -296,10 +355,16 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(401, {"error": "unauthorized", "detail": "unknown token"})
             elif path == "/api/v1/client-config":
                 self.json(200, api.client_config())
+            elif path == "/api/v1/voice-session" and api.hosted:
+                self.json(200, {"websocket_url": "/ws?mode=hosted", "protocol": "elevenlabs",
+                                "provider": "Test voice provider", "input_sample_rate": 16000,
+                                "output_sample_rate": 16000, "valid_for_seconds": 900})
             elif path == "/api/v1/voice-session":
                 self.json(200, {"websocket_url": "/ws?mode=voice", "protocol": "vibe-talk-v1",
                                 "provider": "Test voice provider", "input_sample_rate": 16000,
                                 "output_sample_rate": 24000, "valid_for_seconds": 900})
+            elif (replay := re.fullmatch(r"/api/v1/conversations/([A-Za-z0-9_-]+)/replay", path)):
+                self.json(200, api.replay_payload(replay.group(1)))
             elif path == "/api/v1/post-proposals":
                 query = parse_qs(url.query)
                 seen = query.get("seen")
@@ -834,10 +899,97 @@ def frozen_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tupl
               f"{where}: the restored card's {side} edge is not a turn of yours'")
 
 
+# Point 9, read in one go: the "new conversation" line above the newest call, its chip, and the newest
+# row, with the scroll area they are in.
+RECAP_JS = """() => {
+  const box = (n) => { if (!n) return null; const r = n.getBoundingClientRect();
+    return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height }; };
+  const lines = [...document.querySelectorAll('#transcript > li.seam')].filter((li) => li.hasAttribute('data-ends'));
+  const seam = lines[lines.length - 1] || null;
+  const chip = seam ? seam.querySelector('.seam-recap') : null;
+  const summary = seam ? seam.querySelector('.seam-summary') : null;
+  const label = seam ? seam.querySelector('.seam-label') : null;
+  const rows = [...document.querySelectorAll('#transcript > li')];
+  let chipLines = 0;
+  if (chip) {
+    const style = getComputedStyle(chip);
+    const inner = chip.getBoundingClientRect().height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom) -
+      parseFloat(style.borderTopWidth) - parseFloat(style.borderBottomWidth);
+    const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2;
+    chipLines = Math.round(inner / line);
+  }
+  return {
+    label: label ? label.textContent : null, chip: chip ? chip.textContent : null, chipLines,
+    chipBox: box(chip), summaryBox: box(summary),
+    summaryOverflow: summary ? summary.scrollWidth - summary.clientWidth : 0,
+    pageOverflow: document.documentElement.scrollWidth - innerWidth,
+    newest: box(rows[rows.length - 1]), newestText: rows.length ? rows[rows.length - 1].innerText : '',
+    area: box(document.getElementById('scroll-area')),
+    width: innerWidth,
+  };
+}"""
+
+
+def recap_case(page: Page, url: str, hosted: FakeHosted, api: FakeApi, size: tuple[int, int],
+               screenshots: Path | None) -> None:
+    """Point 9: a call, Hang up, and a call that is sent a 412-word recap, which its line says."""
+    width, height = size
+    where = f"{width}x{height}, recap line"
+    api.reset()
+    api.hosted = True
+    api.replay = True
+    hosted.routes.clear()
+    hosted.received.clear()
+    page.goto(url, wait_until="load")
+    page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); localStorage.setItem('vibe-talk.voice.resume', 'on'); }")
+    page.goto(url, wait_until="load")
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+    page.fill("#compose-text", "question 0")
+    page.click("#send-text")
+    until(page, lambda: len(hosted.routes) == 1, "the first send to open a conversation")
+    until(page, lambda: len(api.stored.get("conv_browser_1", [])) >= 2, "the first call's start and turn to be filed")
+    for turn in range(1, 12):
+        hosted.send({"type": "agent_response",
+                     "agent_response_event": {"agent_response": f"Answer {turn}: the nightly ran green on every target."}})
+    page.wait_for_function("() => document.querySelectorAll('#transcript > li').length >= 12", timeout=10_000)
+    page.click("#hang-up")
+    page.wait_for_selector("#transcript > li.seam[data-ends='conv_browser_1']", timeout=10_000)
+    page.fill("#compose-text", "and the arm64 job")
+    page.click("#send-text")
+    until(page, lambda: len(hosted.routes) == 2, "the second send to open the next conversation")
+    page.wait_for_selector("#transcript .seam-recap", timeout=10_000)
+    page.wait_for_function("() => document.querySelector('#transcript > li:last-child').innerText.includes('arm64')",
+                           timeout=10_000)
+    page.wait_for_timeout(300)
+    check(api.replays == ["conv_browser_1"], f"{where}: the next call asked for the recap of {api.replays}")
+    check(any(frame.get("type") == "contextual_update" for frame in hosted.received),
+          f"{where}: no recap went to the next call")
+    measured = page.evaluate(RECAP_JS)
+    check(isinstance(measured, dict), f"{where}: nothing measured")
+    assert isinstance(measured, dict)
+    check(measured["label"] == "new conversation", f"{where}: the line says {measured['label']!r}")
+    check(measured["chip"] == "412-word recap sent", f"{where}: the chip says {measured['chip']!r}")
+    if width >= 393:
+        check(measured["chipLines"] == 1, f"{where}: the chip took {measured['chipLines']} lines")
+    check(int(str(measured["summaryOverflow"])) <= 1 and int(str(measured["pageOverflow"])) <= 0,
+          f"{where}: the line runs wider than the screen: {measured}")
+    check(rect(measured["chipBox"], "right") <= float(str(measured["width"])) and rect(measured["chipBox"], "left") >= 0,
+          f"{where}: the chip is cut off: {measured['chipBox']}")
+    # The newest row, the message that opened the call, still in view under the line.
+    check(rect(measured["newest"], "bottom") <= rect(measured["area"], "bottom") + 1 and
+          rect(measured["newest"], "top") >= rect(measured["area"], "top") - 1,
+          f"{where}: the newest row left the view: {measured['newest']} in {measured['area']}")
+    if screenshots:
+        page.screenshot(path=str(screenshots / f"recap-line-{width}x{height}.png"), animations="disabled")
+
+
 def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
          size: tuple[int, int]) -> str:
     width, height = size
     voice = FakeVoice()
+    hosted = FakeHosted()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
         context = chromium.launch_persistent_context(
             directory,
@@ -854,6 +1006,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
         )
         try:
             context.route_web_socket(re.compile(r"/ws\?mode=voice$"), voice.accept)
+            context.route_web_socket(re.compile(r"/ws\?mode=hosted$"), hosted.accept)
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -865,10 +1018,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             placement_case(page, url, voice, api, size, args.screenshots)
             dock_case(page, url, voice, api, size, args.screenshots)
             frozen_case(page, url, voice, api, size, args.screenshots)
+            recap_case(page, url, hosted, api, size, args.screenshots)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
-    return f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run"
+    return (f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run; the next call's"
+            " line says '412-word recap sent'")
 
 
 def walk_short(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,

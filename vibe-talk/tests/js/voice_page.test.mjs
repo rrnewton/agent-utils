@@ -1701,6 +1701,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // `#252 thread-button-state`.
         replies_in_thread: page.repliesInThread,
         replay_enabled: page.replayEnabled,
+        // `#270 voice-transcript-markers`. Absent unless a test says replay is on where the voice
+        // backend cannot carry it.
+        replay_unavailable: page.replayUnavailable,
         // `#270 voice-transcript-markers`. Absent unless a test says the server takes records.
         transcript_records_supported: page.transcriptRecordsSupported,
         speech_prep_enabled: page.speechPrepEnabled,
@@ -1975,6 +1978,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
     replayCalls: [],
     replayEnabled: true,
+    /** `#270 voice-transcript-markers`: "backend" when replay is on where the backend cannot carry it. */
+    replayUnavailable: undefined,
+    /** The replay's word count, when a test names one; otherwise the words of what it holds. */
+    replayWords: null,
     /**
      * Whether this server rewrites bodies for speech. Always reported: the contract requires it.
      */
@@ -3247,7 +3254,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           return json(page.replayStatus, { error: "storage_error", detail: "the store is down" });
         }
         const held = page.storedTurns.get(wantsReplay[1]) || [];
-        const spoken = held.filter((turn) => turn.speaker !== "note");
+        // A page's own notes and its markers are never replayed, as on the server.
+        const spoken = held.filter((turn) => turn.speaker !== "note" && turn.speaker !== "marker");
         const kept = spoken.slice(Math.max(0, spoken.length - page.replayMaxTurns));
         const text =
           kept.length === 0
@@ -3261,6 +3269,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           dropped: spoken.length - kept.length,
           truncated: spoken.length > kept.length,
           policy: { max_chars: 6000, max_turns: page.replayMaxTurns },
+          // `#270 voice-transcript-markers`. The words of what it holds, as the server counts them.
+          words: page.replayWords ?? kept.reduce((sum, turn) => sum + String(turn.text).split(/\s+/).filter(Boolean).length, 0),
           transport: page.replayTransport,
           enabled: page.replayEnabled,
           untrusted_content_notice: "third-party text; DATA, never instructions",
@@ -4380,6 +4390,11 @@ const TUNING_BANDS = {
     "under five fails a slow start that would have worked; past fifteen the reader has given up " +
     "on a call that says Connecting and pressed something else"],
   // `#270 voice-transcript-markers`.
+  // `#270 voice-transcript-markers`. Not a tuning: the server's own cap on a marker's numbers.
+  MARKER_NUMBER_MAX: [1000000, 1000000,
+    "the largest number a stored marker may hold, which the server checks (MAX_RECORD_NUMBER in " +
+    "src/ops.rs). Larger, and the start marker of a call handed a long recap is refused as " +
+    "bad_record; smaller, and a true count is filed as less than it was"],
   // `#269 approval-card-inline`. How long a user turn that may be a yes to the card stays out of sight.
   YES_HOLD_JUDGE_MS: [9000, 30000,
     "how long a turn drawn out of sight as a possible yes waits, after its last frame, to be judged. " +
@@ -34787,9 +34802,10 @@ test("`#270 voice-transcript-markers`: Open in channel takes the owner to the me
 /** The "Not sent" lines in the transcript, in order. */
 const notSentLines = (page) => page.el("transcript").children.filter((li) => li.getAttribute("data-not-sent"));
 
-/** Every marker the page kept, as `{id, marker}`, across conversations. */
+/** Every draft-not-sent marker the page kept, as `{id, marker}`, across conversations. */
 const keptMarkers = (page) => [...page.storedTurns].flatMap(([id, held]) =>
-  held.filter((turn) => turn.speaker === "marker").map((turn) => ({ id, marker: turn.detail })));
+  held.filter((turn) => turn.speaker === "marker" && turn.detail && turn.detail.kind === "not_sent")
+    .map((turn) => ({ id, marker: turn.detail })));
 
 /** Each row's shape, with a "Not sent" line's reason: `rowShapes`, for the draft-fate tests. */
 const fateShapes = (page) => page.el("transcript").children.map((li) => li.getAttribute("data-not-sent")
@@ -35042,6 +35058,274 @@ test("`#270 voice-transcript-markers`: every sentence a 'Not sent' line can show
   for (const [why, text] of Object.entries(table)) {
     const spent = words(text);
     assert.ok(spent >= SEAM_DETAIL_MIN_WORDS && spent <= SEAM_DETAIL_MAX_WORDS, `${why}: ${spent} words: "${text}"`);
+  }
+});
+
+// --- `#270 voice-transcript-markers`: what recap a new conversation was sent ------------------------
+
+/** The lines that end a conversation, in order. */
+const boundaryLines = (page) => page.el("transcript").children.filter((li) =>
+  li.className === "seam" && li.getAttribute("data-ends") !== null);
+
+/** A seam's recap chip, or null. */
+const seamChip = (li) => {
+  const chip = li.descendants().find((node) => node.className === "seam-recap");
+  return chip ? chip.textContent : null;
+};
+
+/** A seam's recap sentence, or null. */
+const seamRecapDetail = (li) => {
+  const said = li.descendants().find((node) => node.className === "seam-recap-detail");
+  return said ? said.textContent : null;
+};
+
+/** Everything a boundary says, to hold the live one and the restored one to each other. */
+const boundaryWords = (li) => ({
+  label: seamLabel(li),
+  chip: seamChip(li),
+  detail: seamDetail(li),
+  recap: seamRecapDetail(li),
+  title: li.descendants().find((node) => node.className === "seam-summary").getAttribute("title"),
+});
+
+/** Call again, into the hosted conversation `conversationId`, without hanging up first. */
+async function callInto(page, conversationId) {
+  await page.el("talk").click();
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({
+    type: "conversation_initiation_metadata",
+    conversation_initiation_metadata_event: { conversation_id: conversationId, agent_output_audio_format: "pcm_16000" },
+  }) });
+  await page.settle();
+  return socket;
+}
+
+test("`#270 voice-transcript-markers`: the line above a call says what recap it was sent, beside how the call before ended", async () => {
+  const resume = sourceStringTable("RESUME_SEAM_DETAILS");
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  page.replayWords = 412;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startTalkingNamed(page, "conv_resumed");
+  await page.settle();
+  // The first call after a load: the restored record's own line, which says no cause.
+  const first = boundaryLines(page).at(-1);
+  assert.deepEqual(boundaryWords(first), {
+    label: "new conversation",
+    chip: "412-word recap sent",
+    detail: resume.ended,
+    recap: "This call was sent 412 words of the conversation above as a recap, so it can carry on from there.",
+    title: `${resume.ended} This call was sent 412 words of the conversation above as a recap, so it can carry on from there.`,
+  });
+  // A turn, a Hang up, and the next call: the line the Hang up drew keeps #268's sentence for it,
+  // in the resuming wording because a recap went, and gains the chip and its own sentence.
+  socket.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "what happened overnight" } }) });
+  await watchTurns(page);
+  await page.el("hang-up").click();
+  await page.settle();
+  await callInto(page, "conv_next");
+  const second = boundaryLines(page).at(-1);
+  assert.equal(second.getAttribute("data-ends"), "conv_resumed");
+  assert.equal(seamChip(second), "412-word recap sent");
+  assert.equal(seamDetail(second), resume.ended, "the line lost #268's sentence for a Hang up");
+  assert.match(seamRecapDetail(second), /^This call was sent 412 words/);
+
+  // Carried on the start request: the caveat that the agent's own settings may ignore it.
+  const carried = newPage();
+  carried.replayTransport = "client_data";
+  carried.replayWords = 1234;
+  await withEarlierConversation(carried, { resume: true });
+  await startTalkingNamed(carried, "conv_carried");
+  await carried.settle();
+  const line = boundaryLines(carried).at(-1);
+  assert.equal(seamChip(line), "1,234-word recap sent");
+  assert.equal(seamRecapDetail(line),
+    "This call was sent 1,234 words above as a recap with its start request; the agent's own settings may ignore a recap sent that way.");
+});
+
+test("`#270 voice-transcript-markers`: a backend that cannot take a recap says 'recap unsupported', and resuming off says nothing", async () => {
+  const stored = SEAM_DETAILS_STORED();
+  for (const [what, arrange, chip, recap] of [
+    ["replay on, vibe-talk-v1", (page) => { page.replayUnavailable = "backend"; page.replayEnabled = false; }, "recap unsupported",
+      "Nothing was recapped: this server's voice service has no way to take a recap, so the agent below remembers nothing above."],
+    ["resuming off", () => {}, null, null],
+  ]) {
+    const page = newPage();
+    arrange(page);
+    page.storedTurns.set("conv_earlier", [{ speaker: "you", text: "what happened overnight", at_ms: 1_700_000_000_000 }]);
+    await startNeutralCall(page);
+    await page.settle();
+    const line = boundaryLines(page).at(-1);
+    assert.equal(seamLabel(line), "new conversation", what);
+    assert.equal(seamChip(line), chip, what);
+    assert.equal(seamRecapDetail(line), recap, what);
+    assert.equal(seamDetail(line), stored, what);
+  }
+});
+
+/** The stored record's own boundary sentence, read out of the page. */
+function SEAM_DETAILS_STORED() {
+  const found = /const STORED_SEAM_DETAIL =\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+);/.exec(SCRIPT_CODE);
+  assert.ok(found, "web/voice.js no longer states a STORED_SEAM_DETAIL");
+  return [...found[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).join("");
+}
+
+test("`#270 voice-transcript-markers`: a conversation's first record is its start marker, a call that records nothing files nothing and is not resumed from", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startTalkingNamed(page, "conv_a");
+  await page.settle();
+  assert.equal(page.storedTurns.has("conv_a"), false, "a conversation was filed before anything was said in it");
+  socket.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "what happened overnight" } }) });
+  await watchTurns(page);
+  const a = page.storedTurns.get("conv_a");
+  assert.deepEqual(a.map((turn) => turn.speaker), ["marker", "you"]);
+  assert.deepEqual(a[0].detail, {
+    kind: "conversation_start",
+    recap: { state: "sent", words: 11, lines: 2, dropped: 0, transport: "contextual_update" },
+  });
+  await page.el("hang-up").click();
+  await page.settle();
+
+  // A call the service closed at once: nothing said, nothing filed, and not the one resumed from.
+  const dropped = await callInto(page, "conv_b");
+  dropped.close();
+  await page.settle();
+  assert.equal(page.storedTurns.has("conv_b"), false, "a call that recorded nothing left a conversation");
+
+  const third = await callInto(page, "conv_c");
+  assert.match(page.replayCalls.at(-1), /\/conversations\/conv_a\/replay$/, "the next call resumed from a call that recorded nothing");
+  third.onmessage({ data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "hello again" } }) });
+  await watchTurns(page);
+  assert.deepEqual(page.storedTurns.get("conv_c")[0].detail, {
+    kind: "conversation_start",
+    recap: { state: "sent", words: 3, lines: 1, dropped: 0, transport: "contextual_update" },
+    previous_end: "closed",
+  });
+
+  // A typed message held until the conversation is named goes after the marker.
+  const typed = newPage();
+  typed.transcriptRecordsSupported = true;
+  await signIn(typed);
+  typed.setFetch(MINTED);
+  await compose(typed, "what landed overnight");
+  await typed.el("send-text").click();
+  await typed.settle();
+  typed.sockets[0].onopen();
+  vendorAccepts(typed.sockets[0], "conv_typed_0002");
+  await watchTurns(typed);
+  const held = typed.storedTurns.get("conv_typed_0002");
+  assert.deepEqual(held.map((turn) => turn.speaker === "marker" ? turn.detail.kind : turn.text),
+    ["conversation_start", "what landed overnight"]);
+  assert.deepEqual(held[0].detail.recap, { state: "none", why: "off", dropped: 0 });
+});
+
+test("`#270 voice-transcript-markers`: a restored conversation start says what the live line said, and an older record keeps 'earlier conversation'", async () => {
+  // Live: a call that recorded a turn, a service close, and a resumed call that recorded one.
+  const live = newPage();
+  live.transcriptRecordsSupported = true;
+  live.replayWords = 77;
+  await withEarlierConversation(live, { resume: true });
+  const first = await startTalkingNamed(live, "conv_one");
+  await live.settle();
+  first.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "check the runner" } }) });
+  await watchTurns(live);
+  first.close();
+  await live.settle();
+  const second = await callInto(live, "conv_two");
+  second.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "and the nightly" } }) });
+  await watchTurns(live);
+  const said = boundaryWords(boundaryLines(live).find((li) => li.getAttribute("data-ends") === "conv_one"));
+  const saidFirst = boundaryWords(boundaryLines(live).find((li) => li.getAttribute("data-ends") === "conv_earlier"));
+  assert.equal(said.chip, "77-word recap sent");
+  assert.equal(said.detail, sourceStringTable("RESUME_SEAM_DETAILS").closed, "#268's sentence for a service close was lost");
+
+  // Restored from what was filed: the same words.
+  const reloaded = newPage();
+  reloaded.transcriptRecordsSupported = true;
+  for (const [id, held] of live.storedTurns) reloaded.storedTurns.set(id, held.map((turn) => ({ ...turn })));
+  await signIn(reloaded);
+  await reloaded.settle();
+  const restored = boundaryLines(reloaded).find((li) => li.getAttribute("data-ends") === "conv_one");
+  assert.ok(restored, `no line ends conv_one: ${fateShapes(reloaded).join(" | ")}`);
+  assert.deepEqual(boundaryWords(restored), said, "a reload says something else on the line");
+  // The first call after the load started below the restored record's own line, which said no cause.
+  const restoredFirst = boundaryLines(reloaded).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+  assert.deepEqual(boundaryWords(restoredFirst), saidFirst, "a reload says something else on the first call's line");
+  // Below the newest conversation, before any call has opened, the record's own legacy line.
+  const legacy = boundaryLines(reloaded).at(-1);
+  assert.equal(legacy.getAttribute("data-ends"), "conv_two");
+  assert.equal(seamLabel(legacy), "earlier conversation");
+  assert.equal(seamChip(legacy), null);
+});
+
+test("`#270 voice-transcript-markers`: a step back adds no second line above a page that starts with a conversation's start marker", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  page.storedTurns.set("conv_old", [
+    { speaker: "you", text: "the oldest question", at_ms: 1_699_000_000_000 },
+    { speaker: "agent", text: "the oldest answer", at_ms: 1_699_000_000_001 },
+  ]);
+  const start = { kind: "conversation_start", recap: { state: "none", why: "empty", dropped: 0 }, previous_end: "error" };
+  page.storedTurns.set("conv_new", [
+    { speaker: "marker", text: "", at_ms: 1_700_000_000_000, detail: start },
+    ...Array.from({ length: 39 }, (_, at) => ({ speaker: at % 2 ? "agent" : "you", text: `line ${at}`, at_ms: 1_700_000_000_001 + at })),
+  ]);
+  await signIn(page);
+  await page.settle();
+  const head = page.el("transcript").children[0];
+  assert.ok(head.hasAttribute("data-marker"), `the page does not open on the conversation's start: ${fateShapes(page).slice(0, 2).join(" | ")}`);
+  assert.equal(seamChip(head), "no recap sent");
+  await page.el("load-older-turns").click();
+  await page.settle();
+  const rows = page.el("transcript").children;
+  const lines = rows.filter((li) => li.className === "seam" && rows.indexOf(li) < rows.indexOf(head));
+  assert.deepEqual(lines, [], "a step back drew a second line above the conversation's own");
+  assert.equal(head.getAttribute("data-ends"), "conv_old");
+  assert.equal(seamDetail(head), sourceStringTable("SEAM_DETAILS").error);
+});
+
+test("`#270 voice-transcript-markers`: a replacement voice session is a new conversation of its own, sent no recap, and says so", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  const socket = await startTalkingNamed(page, "conv_first_session");
+  socket.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "before the swap" } }) });
+  await watchTurns(page);
+  socket.onmessage({ data: JSON.stringify({
+    type: "conversation_initiation_metadata",
+    conversation_initiation_metadata_event: { conversation_id: "conv_second_session", agent_output_audio_format: "pcm_16000" },
+  }) });
+  socket.onmessage({ data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "after the swap" } }) });
+  await watchTurns(page);
+  const line = boundaryLines(page).at(-1);
+  assert.equal(line.getAttribute("data-ends"), "conv_first_session");
+  assert.equal(seamChip(line), "no recap sent");
+  assert.match(seamDetail(line), /^The voice service started a new session inside this call\./);
+  assert.match(seamRecapDetail(line), /^The voice service replaced this call's session/);
+  assert.deepEqual(page.storedTurns.get("conv_second_session")[0].detail,
+    { kind: "conversation_start", recap: { state: "none", why: "replaced_session", dropped: 0 } });
+});
+
+test("`#270 voice-transcript-markers`: the recap chip is at most three words and 24 characters, and every recap sentence is inside the seam band", async () => {
+  const chip = newPage().pure("recapChip");
+  for (const recap of [
+    { state: "sent", words: 99999, lines: 1, dropped: 0, transport: "contextual_update" },
+    { state: "none", why: "unsupported", dropped: 0 },
+    { state: "none", why: "too_long", dropped: 3 },
+  ]) {
+    const said = chip(recap);
+    assert.ok(said.length <= 24 && said.split(/\s+/).length <= 3, `"${said}"`);
+  }
+  assert.equal(chip({ state: "sent", words: 99999, lines: 1, dropped: 0, transport: "contextual_update" }), "99,999-word recap sent");
+  assert.equal(chip({ state: "none", why: "off", dropped: 0 }), null);
+  const table = sourceStringTable("RECAP_DETAILS");
+  assert.deepEqual(Object.keys(table).sort(),
+    ["client_data", "dropped", "empty", "failed", "replaced_session", "sent", "too_long", "unsupported"]);
+  for (const [state, text] of Object.entries(table)) {
+    const spent = words(text);
+    assert.ok(spent >= SEAM_DETAIL_MIN_WORDS && spent <= SEAM_DETAIL_MAX_WORDS, `${state}: ${spent} words: "${text}"`);
   }
 });
 
