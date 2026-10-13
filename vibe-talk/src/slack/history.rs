@@ -71,7 +71,7 @@ pub(super) struct Run {
 
 /// Which side of the cursor a narrowing walk wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Toward {
+pub(super) enum Toward {
     /// The oldest messages newer than the cursor, from a newest-first feed.
     Newer,
     /// The newest messages older than the cursor, from an oldest-first feed.
@@ -89,7 +89,7 @@ impl Toward {
 }
 
 /// The `want` real messages nearest the cursor, returned oldest first.
-fn nearest(raws: &[Raw], want: usize, toward: Toward) -> Vec<Raw> {
+pub(super) fn nearest(raws: &[Raw], want: usize, toward: Toward) -> Vec<Raw> {
     let mut real: Vec<Raw> = raws.iter().filter(|raw| raw.is_real()).cloned().collect();
     real.sort_by_key(|raw| toward.coord(raw.micros));
     real.dedup_by_key(|raw| raw.micros);
@@ -425,7 +425,7 @@ impl HttpSlackClient {
     /// Every message between two exclusive bounds, within `max_pages` pages.
     ///
     /// Returns what was read, system events included, and whether the window was exhausted.
-    async fn window(
+    pub(super) async fn window(
         &self,
         feed: Feed<'_>,
         oldest: Option<i64>,
@@ -474,7 +474,7 @@ impl HttpSlackClient {
     /// system events cannot be crossed in one call. When the probes run out, the stretch already
     /// proven empty is returned as [`Narrowed::Proven`] for the caller to remember; the next call
     /// with the same cursor resumes from there instead of starting over.
-    async fn narrow(
+    pub(super) async fn narrow(
         &self,
         feed: Feed<'_>,
         toward: Toward,
@@ -580,7 +580,7 @@ impl HttpSlackClient {
 }
 
 /// What a narrowing search concluded.
-enum Narrowed {
+pub(super) enum Narrowed {
     /// The real messages nearest the cursor, gap-free against it (possibly none at all).
     Found(Vec<Raw>),
     /// No real message lies between the cursor and this instant; the search ran out before
@@ -589,7 +589,10 @@ enum Narrowed {
 }
 
 /// Move to the next page's cursor, refusing one that does not advance.
-fn advance(current: Option<String>, next: Option<String>) -> Result<Option<String>, ChatError> {
+pub(super) fn advance(
+    current: Option<String>,
+    next: Option<String>,
+) -> Result<Option<String>, ChatError> {
     match next {
         Some(next) if current.as_deref() != Some(next.as_str()) => Ok(Some(next)),
         _ => Err(shape("a paging cursor did not advance")),

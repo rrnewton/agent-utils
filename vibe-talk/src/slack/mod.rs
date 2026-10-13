@@ -43,6 +43,7 @@ mod client;
 mod history;
 pub mod ids;
 pub mod mrkdwn;
+mod range;
 mod timeline;
 
 pub use client::{HttpSlackClient, SLACK_MAX_TEXT_CHARS};

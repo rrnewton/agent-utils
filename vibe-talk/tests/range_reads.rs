@@ -8,6 +8,8 @@
 //! change that is MEANT to alter what such a provider is asked or answers:
 //! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test range_reads`.
 
+mod slack_fake;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
+use slack_fake::{profiled, system, thread, ts, Fake, FakeState};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
     ChatClient, ChatError, ChatIdentity, RangeOrder, RangeRead, ReadCaps, ReadScope, Support,
@@ -461,4 +464,364 @@ async fn the_router_asks_each_channels_own_provider_whether_and_how_it_reads_by_
             .sum::<u64>();
         assert_eq!(timed, 1, "{} timed its range read", provider.provider);
     }
+}
+
+const SLACK_CH: &str = "C0000MAIN1";
+
+fn slack_channel() -> ChannelId {
+    ChannelId(SLACK_CH.to_owned())
+}
+
+/// Milliseconds of a fixture `ts` that falls on a whole millisecond.
+fn slack_ms(seconds: i64) -> i64 {
+    (slack_fake::BASE_SECS + seconds) * 1000
+}
+
+/// A conversation of `older` messages one second apart, then `inside` more from second 10 000:
+/// the window a test reads starts on the first of those.
+fn slack_history(older: i64, inside: i64, newer: i64) -> FakeState {
+    let mut state = FakeState::default();
+    let mut list = Vec::new();
+    for i in 0..older {
+        list.push(profiled(&ts(i, 0), "UADA00001", "Ada", &format!("old {i}")));
+    }
+    for i in 0..inside {
+        list.push(profiled(
+            &ts(10_000 + i, 0),
+            "UADA00001",
+            "Ada",
+            &format!("in {i}"),
+        ));
+    }
+    for i in 0..newer {
+        list.push(profiled(
+            &ts(20_000 + i, 0),
+            "UADA00001",
+            "Ada",
+            &format!("new {i}"),
+        ));
+    }
+    state.history.insert(SLACK_CH.to_owned(), list);
+    state
+}
+
+fn contents(read: &RangeRead) -> Vec<String> {
+    read.messages.iter().map(|m| m.content.clone()).collect()
+}
+
+/// remote-ops-audit W10 proof. Newest first, a window with 150 messages in it and 400 before it
+/// costs one `conversations.history` call per 20 rows it holds, every one pinned to the window,
+/// and is exhausted only because Slack said so.
+#[tokio::test]
+async fn slack_reads_a_window_newest_first_in_one_call_per_page_it_holds() {
+    let fake = Fake::start(slack_history(400, 150, 0), 20).await;
+    let client = fake.client();
+    assert_eq!(
+        client.read_caps(&slack_channel()),
+        ReadCaps {
+            range: Support::Native,
+            page_rows: 20,
+        }
+    );
+    let read = client
+        .fetch_range(
+            &slack_channel(),
+            &ReadScope::Main,
+            TimeRange {
+                since_ms: slack_ms(10_000),
+                until_ms: None,
+            },
+            RangeOrder::NewestFirst,
+            500,
+            None,
+        )
+        .await
+        .expect("read");
+    assert_eq!(
+        contents(&read),
+        (0..150).map(|i| format!("in {i}")).collect::<Vec<_>>(),
+        "every message of the window, oldest first, and none before it"
+    );
+    assert!(read.exhausted, "Slack answered has_more: false");
+    assert_eq!(read.next, None);
+    let calls = fake.requests("conversations.history");
+    assert_eq!(calls.len(), 8, "150 rows at 20 a page: {calls:?}");
+    let latest = calls[0].get("latest").cloned().expect("latest is pinned");
+    for call in &calls {
+        assert_eq!(
+            call.get("oldest").map(String::as_str),
+            Some(ts(10_000, 0).as_str())
+        );
+        assert_eq!(
+            call.get("latest"),
+            Some(&latest),
+            "one window for every page"
+        );
+        assert_eq!(call.get("inclusive").map(String::as_str), Some("true"));
+    }
+}
+
+/// A step stops at what it was asked for and hands back Slack's cursor; the next step reads the
+/// same pinned window from there, and the walk is the window, once.
+#[tokio::test]
+async fn slack_continues_a_window_from_its_own_cursor_without_reading_anything_twice() {
+    let fake = Fake::start(slack_history(10, 150, 0), 20).await;
+    let client = fake.client();
+    let range = TimeRange {
+        since_ms: slack_ms(10_000),
+        until_ms: None,
+    };
+    let mut cursor: Option<String> = None;
+    let mut walked: Vec<String> = Vec::new();
+    let mut steps = 0;
+    loop {
+        let read = client
+            .fetch_range(
+                &slack_channel(),
+                &ReadScope::Main,
+                range,
+                RangeOrder::NewestFirst,
+                50,
+                cursor.as_deref(),
+            )
+            .await
+            .expect("read");
+        steps += 1;
+        assert!(read.messages.len() <= 50);
+        let mut step = contents(&read);
+        step.extend(walked);
+        walked = step;
+        if read.exhausted {
+            assert_eq!(read.next, None);
+            break;
+        }
+        cursor = Some(read.next.expect("a step short of the end continues"));
+        assert!(steps < 10, "the walk ends");
+    }
+    assert_eq!(steps, 3);
+    assert_eq!(
+        walked,
+        (0..150).map(|i| format!("in {i}")).collect::<Vec<_>>()
+    );
+    // Each step of 50 is pages of 20, 20 and the 10 still wanted: never a row asked for and
+    // dropped, which Slack's cursor would then step over.
+    let calls = fake.requests("conversations.history");
+    let asked: Vec<&str> = calls
+        .iter()
+        .map(|call| call.get("limit").map_or("", String::as_str))
+        .collect();
+    assert_eq!(
+        asked,
+        ["50", "30", "10", "50", "30", "10", "50", "30", "10"]
+    );
+    assert!(calls
+        .iter()
+        .all(|call| call.get("latest") == calls[0].get("latest")));
+
+    // A cursor is for the read that issued it.
+    let error = client
+        .fetch_range(
+            &slack_channel(),
+            &ReadScope::Main,
+            TimeRange {
+                since_ms: slack_ms(9_000),
+                until_ms: None,
+            },
+            RangeOrder::NewestFirst,
+            50,
+            cursor.as_deref(),
+        )
+        .await
+        .expect_err("another window");
+    assert!(matches!(error.cause(), ChatError::Refused(_)), "{error}");
+}
+
+/// remote-ops-audit W10: a step with nothing real in it is not the end of the window. Slack's
+/// `has_more` is the only proof, however short the step.
+#[tokio::test]
+async fn slack_never_takes_a_short_step_for_the_end_of_the_window() {
+    let mut state = FakeState::default();
+    let mut list: Vec<Value> = (0..5)
+        .map(|i| profiled(&ts(i, 0), "UADA00001", "Ada", &format!("real {i}")))
+        .collect();
+    list.extend((0..60).map(|i| system(&ts(100 + i, 0), "channel_join")));
+    state.history.insert(SLACK_CH.to_owned(), list);
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    let range = TimeRange {
+        since_ms: slack_ms(0),
+        until_ms: None,
+    };
+    let read = client
+        .fetch_range(
+            &slack_channel(),
+            &ReadScope::Main,
+            range,
+            RangeOrder::NewestFirst,
+            5,
+            None,
+        )
+        .await
+        .expect("read");
+    assert!(read.messages.is_empty(), "{:?}", contents(&read));
+    assert!(!read.exhausted, "nothing real in a step proves nothing");
+    assert_eq!(
+        fake.calls("conversations.history"),
+        2,
+        "one page and one more"
+    );
+    let mut cursor = read.next;
+    let mut found = Vec::new();
+    for _ in 0..20 {
+        let Some(at) = cursor.take() else { break };
+        let read = client
+            .fetch_range(
+                &slack_channel(),
+                &ReadScope::Main,
+                range,
+                RangeOrder::NewestFirst,
+                5,
+                Some(&at),
+            )
+            .await
+            .expect("read");
+        found.splice(0..0, contents(&read));
+        if read.exhausted {
+            break;
+        }
+        cursor = read.next;
+    }
+    assert_eq!(
+        found,
+        (0..5).map(|i| format!("real {i}")).collect::<Vec<_>>()
+    );
+}
+
+/// remote-ops-audit W10: oldest first, a window with an end is read up to that end and no
+/// further, so a span costs what it holds, not what came after it.
+#[tokio::test]
+async fn slack_reads_a_span_oldest_first_without_reading_past_its_end() {
+    let fake = Fake::start(slack_history(10, 30, 400), 20).await;
+    let client = fake.client();
+    let range = TimeRange {
+        since_ms: slack_ms(10_000),
+        until_ms: Some(slack_ms(20_000)),
+    };
+    let read = client
+        .fetch_range(
+            &slack_channel(),
+            &ReadScope::Main,
+            range,
+            RangeOrder::OldestFirst,
+            11,
+            None,
+        )
+        .await
+        .expect("read");
+    assert_eq!(
+        contents(&read),
+        (0..11).map(|i| format!("in {i}")).collect::<Vec<_>>()
+    );
+    assert!(!read.exhausted, "19 more are in the window");
+    let calls = fake.requests("conversations.history");
+    assert_eq!(
+        calls.len(),
+        2,
+        "30 rows at 20 a page, none of the 400 after: {calls:?}"
+    );
+    for call in &calls {
+        assert_eq!(
+            call.get("latest").map(String::as_str),
+            Some(ts(20_000, 0).as_str()),
+            "bounded by the window's end"
+        );
+    }
+    let mut walked = contents(&read);
+    let mut cursor = read.next;
+    while let Some(at) = cursor.take() {
+        let read = client
+            .fetch_range(
+                &slack_channel(),
+                &ReadScope::Main,
+                range,
+                RangeOrder::OldestFirst,
+                11,
+                Some(&at),
+            )
+            .await
+            .expect("read");
+        walked.extend(contents(&read));
+        if read.exhausted {
+            break;
+        }
+        cursor = read.next;
+    }
+    assert_eq!(
+        walked,
+        (0..30).map(|i| format!("in {i}")).collect::<Vec<_>>()
+    );
+    assert!(fake
+        .requests("conversations.history")
+        .iter()
+        .all(|call| call.get("latest").map(String::as_str) == Some(ts(20_000, 0).as_str())));
+}
+
+/// A thread is read by time through `conversations.replies`, in its own order, from its own
+/// cursor; a whole history with replies is refused rather than guessed.
+#[tokio::test]
+async fn slack_reads_a_threads_window_through_its_replies() {
+    let mut state = FakeState::default();
+    let mut root = profiled(&ts(0, 0), "UADA00001", "Ada", "root");
+    let replies: Vec<(String, String)> = (0..50)
+        .map(|i| (ts(100 + i, 0), format!("reply {i}")))
+        .collect();
+    thread(&mut state, SLACK_CH, &mut root, &replies);
+    state.history.insert(SLACK_CH.to_owned(), vec![root]);
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    let range = TimeRange {
+        since_ms: slack_ms(110),
+        until_ms: Some(slack_ms(140)),
+    };
+    let scope = ReadScope::Thread(ts(0, 0));
+    let read = client
+        .fetch_range(
+            &slack_channel(),
+            &scope,
+            range,
+            RangeOrder::OldestFirst,
+            100,
+            None,
+        )
+        .await
+        .expect("read");
+    assert_eq!(
+        contents(&read),
+        (10..40).map(|i| format!("reply {i}")).collect::<Vec<_>>()
+    );
+    assert!(read.exhausted);
+    let calls = fake.requests("conversations.replies");
+    assert_eq!(calls.len(), 2, "30 replies at 20 a page: {calls:?}");
+    for call in &calls {
+        assert_eq!(call.get("ts").map(String::as_str), Some(ts(0, 0).as_str()));
+        assert_eq!(
+            call.get("oldest").map(String::as_str),
+            Some(ts(110, 0).as_str())
+        );
+        assert!(call.contains_key("latest"));
+    }
+    assert_eq!(fake.calls("conversations.history"), 0);
+
+    let error = client
+        .fetch_range(
+            &slack_channel(),
+            &ReadScope::Flat,
+            range,
+            RangeOrder::OldestFirst,
+            100,
+            None,
+        )
+        .await
+        .expect_err("refused");
+    assert!(matches!(error.cause(), ChatError::Refused(_)), "{error}");
 }

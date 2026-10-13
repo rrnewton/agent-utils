@@ -913,6 +913,29 @@ impl ChatClient for HttpSlackClient {
             .map_err(|error| error.with_provider(&self.provider_name))
     }
 
+    /// Slack reads by time itself: `conversations.history` and `conversations.replies` take
+    /// `oldest`, `latest` and a cursor. remote-ops-audit W10 `#287 bulk-reads`; see `super::range`.
+    fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
+        crate::chat::ReadCaps {
+            range: crate::chat::Support::Native,
+            page_rows: super::range::PAGE_ROWS,
+        }
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        scope: &crate::chat::ReadScope,
+        range: crate::chat::TimeRange,
+        order: crate::chat::RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::RangeRead, ChatError> {
+        self.read_range(channel, scope, range, order, limit, cursor)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
     async fn post_message(
         &self,
         channel: &ChannelId,
