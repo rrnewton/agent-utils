@@ -349,6 +349,14 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"ask_before_send":true}"#),
         ),
+        // `#272 voice-agent-instructions`.
+        route("GET", "/api/v1/voice-prompt", Read, Nothing),
+        route(
+            "PUT",
+            "/api/v1/voice-prompt",
+            Write,
+            Json(r#"{"instructions":"Be brief."}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/not-noise",

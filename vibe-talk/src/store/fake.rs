@@ -34,6 +34,7 @@ use super::{
     MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
+use crate::voice_agent::OwnerPrompt;
 
 /// One cached summary as the fake holds it.
 ///
@@ -69,6 +70,9 @@ struct State {
     /// The owner's "ask before the voice agent sends"; `None` until he chooses.
     /// `#264 voice-send-approval`.
     ask_before_send: Option<bool>,
+    /// The owner's words for the voice agent; `None` until he saves any.
+    /// `#272 voice-agent-instructions`.
+    owner_prompt: Option<OwnerPrompt>,
     /// `(channel, message)` to `(when it was exempted, insertion order)`: the "not noise" list,
     /// with enough of the real table's shape to reproduce its count bound and its eviction order.
     noise_exemptions: BTreeMap<(String, String), (i64, u64)>,
@@ -662,6 +666,19 @@ impl StateStore for FakeStore {
         Ok(ask)
     }
 
+    async fn owner_prompt(&self) -> Result<Option<OwnerPrompt>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.owner_prompt.clone())
+    }
+
+    async fn set_owner_prompt(&self, prompt: &OwnerPrompt) -> Result<OwnerPrompt, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.owner_prompt = Some(prompt.clone());
+        Ok(prompt.clone())
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -1079,6 +1096,7 @@ impl StateStore for FakeStore {
         state.aliases.clear();
         state.noise_rules = None;
         state.ask_before_send = None;
+        state.owner_prompt = None;
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();

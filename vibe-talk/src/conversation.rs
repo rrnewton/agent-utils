@@ -40,6 +40,14 @@ pub struct VoiceSession {
     pub input_sample_rate: u32,
     /// Speaker PCM sample rate emitted by the provider.
     pub output_sample_rate: u32,
+    /// The owner's words for the agent, for the page to hand over as the socket opens. `#272
+    /// voice-agent-instructions`.
+    ///
+    /// Filled in by `GET /api/v1/voice-session` for a hosted agent the page configures, and only
+    /// when the owner has written something; a provider never sets it. A deployment-managed
+    /// bridge reads the same words from `GET /api/v1/voice-agent` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prompt: Option<crate::contract::SessionPrompt>,
 }
 
 /// Why a voice session could not be opened.
@@ -126,6 +134,7 @@ impl ConversationalVoiceProvider for ElevenLabsConversationProvider {
             valid_for_seconds: Some(signed.valid_for_seconds),
             input_sample_rate: 16_000,
             output_sample_rate: 16_000,
+            agent_prompt: None,
         })
     }
 }
@@ -173,6 +182,7 @@ impl ConversationalVoiceProvider for WebSocketConversationProvider {
             valid_for_seconds: None,
             input_sample_rate: 24_000,
             output_sample_rate: 24_000,
+            agent_prompt: None,
         })
     }
 }

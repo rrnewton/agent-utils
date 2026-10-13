@@ -788,7 +788,67 @@ pub async fn client_config(
         token_scope: scope.into(),
         noise_rules: noise_rules_view(&state).await,
         voice_settings: Some(crate::send_approval::view(&state).await),
+        voice_prompt: Some(crate::voice_prompt::view(&state).await),
     }))
+}
+
+/// `GET /api/v1/voice-prompt` — the owner's additional instructions and his edited system prompt.
+/// `#272 voice-agent-instructions`.
+///
+/// READ scope, because the prompt they are assembled into is served at read scope too, and it
+/// rides on client-config. `no-store`, because it changes when he saves.
+pub async fn voice_prompt(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Response, ApiError> {
+    Ok(no_store(Json(crate::voice_prompt::view(&state).await)))
+}
+
+/// The largest `PUT /api/v1/voice-prompt` body accepted: both texts at their limits, four bytes a
+/// character at worst, escaped, with room for the field names.
+pub const VOICE_PROMPT_BODY_BYTES: usize = 8
+    * (crate::voice_agent::MAX_INSTRUCTIONS_CHARS + crate::voice_agent::MAX_SYSTEM_PROMPT_CHARS)
+    + 1_024;
+
+/// A save from Settings' Instructions editor. Each field absent keeps that text as it is.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoicePromptRequest {
+    /// The additional instructions; empty removes them.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// The base prompt; empty, or the shipped prompt itself, restores the shipped one.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+}
+
+/// `PUT /api/v1/voice-prompt` — save the owner's instructions, his system prompt, or both.
+/// `#272 voice-agent-instructions`.
+///
+/// WRITE scope, and — as with [`set_voice_settings`] — **the scope is not what keeps the voice
+/// agent out**: no tool reaches this route. Neither text can change what the agent may do; that
+/// section is chosen from the token and the send setting when the prompt is assembled. 413
+/// `too_large` for a text over its limit, 503 `storage_not_configured` with no store.
+pub async fn set_voice_prompt(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<VoicePromptRequest>,
+) -> Result<Response, ApiError> {
+    if request.instructions.is_none() && request.system_prompt.is_none() {
+        return Err(ApiError::bad_request(
+            "send `instructions`, `system_prompt`, or both; an empty request would report success \
+             for having changed nothing",
+        ));
+    }
+    let settings = crate::voice_prompt::set(
+        &state,
+        crate::voice_prompt::Change {
+            instructions: request.instructions,
+            system_prompt: request.system_prompt,
+        },
+    )
+    .await?;
+    Ok(no_store(Json(settings)))
 }
 
 /// `GET /api/v1/voice-settings` — whether the voice agent asks before it sends.
@@ -985,7 +1045,14 @@ pub async fn voice_session(
     State(state): State<AppState>,
     _scope: WriteScope,
 ) -> Result<Response, ApiError> {
-    let session: VoiceSession = state.conversation.open_session().await?;
+    // `#272 voice-agent-instructions`. Beside the mint rather than after it: asking a hosted agent
+    // whether it takes a prompt override is a round trip of its own, and the call is waiting.
+    let (session, agent_prompt) = tokio::join!(
+        state.conversation.open_session(),
+        crate::voice_prompt::for_session(&state)
+    );
+    let mut session: VoiceSession = session?;
+    session.agent_prompt = agent_prompt;
     let warming = crate::recent::warm(&state);
     tracing::info!(
         channels = warming,
@@ -1008,12 +1075,16 @@ pub async fn voice_agent(
     // straddle a change made between two reads. `#264 voice-send-approval`.
     let approval = crate::send_approval::current(&state).await;
     let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await, approval);
+    // `#272 voice-agent-instructions`: the owner's words go into the prompt here, which is how a
+    // bridge that fetches this as each call opens carries them.
+    let owner = crate::voice_prompt::current(&state).await;
     let profile = crate::voice_agent::profile(
         &manifest,
         scope,
         state.chat.provider_name(),
         state.config.timezone.name(),
         approval,
+        &owner,
     );
     Ok(no_store(Json(profile)))
 }

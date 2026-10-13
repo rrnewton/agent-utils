@@ -295,6 +295,17 @@
           "description": "Server version, so a stale cached page is visible.",
           "type": "string"
         },
+        "voice_prompt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoicePromptSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's own words for the voice agent, as Settings shows them. `#272\nvoice-agent-instructions`.\n\nHere so the Instructions editor is drawn at sign-in, as the send setting is. Readable at\nread scope — the assembled prompt is served there too, to a bridge holding the read token —\nand changed only by a write-scope `PUT /api/v1/voice-prompt`. Absent from an older server;\nthe page then hides the editor."
+        },
         "voice_settings": {
           "anyOf": [
             {
@@ -1011,6 +1022,41 @@
         }
       ]
     },
+    "PromptDelivery": {
+      "description": "How the owner's words reach the voice agent. `#272 voice-agent-instructions`.",
+      "oneOf": [
+        {
+          "const": "profile",
+          "description": "A deployment-managed bridge fetches the assembled prompt from `GET /api/v1/voice-agent` as\neach call opens, so both texts reach its next call.",
+          "type": "string"
+        },
+        {
+          "const": "page",
+          "description": "The page hands them to a hosted agent as each call opens: the whole assembled prompt when\nthe agent allows its prompt to be replaced, otherwise the instructions alone, as a note at\nthe start. The voice session says which ([`SessionPrompt`]).",
+          "type": "string"
+        }
+      ]
+    },
+    "PromptTransport": {
+      "description": "How the page hands the owner's words to a hosted agent. `#272 voice-agent-instructions`.",
+      "oneOf": [
+        {
+          "const": "prompt_override",
+          "description": "As the system prompt itself, in the initiation frame's\n`conversation_config_override.agent.prompt.prompt`. Only when the agent allows it: an\noverride it does not allow is believed to end the conversation.",
+          "type": "string"
+        },
+        {
+          "const": "contextual_update",
+          "description": "As a `contextual_update` sent right after the initiation frame. The agent keeps its own\nprompt; only the instructions reach it.",
+          "type": "string"
+        },
+        {
+          "const": "not_sent",
+          "description": "Nothing: the owner edited only the base prompt, and this agent does not take one.",
+          "type": "string"
+        }
+      ]
+    },
     "ProviderDescription": {
       "description": "One configured chat provider, as the page needs to know it.",
       "properties": {
@@ -1138,6 +1184,40 @@
       "required": [
         "from",
         "messages"
+      ],
+      "type": "object"
+    },
+    "SessionPrompt": {
+      "description": "What the page hands a hosted agent as a call opens, so the call carries the owner's words.\n`#272 voice-agent-instructions`.\n\nOn a voice session only when the provider is one the page configures and the owner has written\nsomething; absent, the page sends exactly what it always sent.",
+      "properties": {
+        "instructions_applied": {
+          "description": "Whether the owner's additional instructions are in what is sent.",
+          "type": "boolean"
+        },
+        "override_allowed": {
+          "description": "What the agent's configuration said about replacing its prompt; absent when it could not\nbe read or did not say, which is treated as not allowed.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "system_prompt_applied": {
+          "description": "Whether the owner's edited base prompt is in what is sent.",
+          "type": "boolean"
+        },
+        "text": {
+          "description": "What to send: the whole assembled prompt for `prompt_override`, the heading and the\ninstructions for `contextual_update`; absent for `not_sent`.",
+          "type": "string"
+        },
+        "transport": {
+          "$ref": "#/$defs/PromptTransport",
+          "description": "How to hand `text` over."
+        }
+      },
+      "required": [
+        "transport",
+        "system_prompt_applied",
+        "instructions_applied"
       ],
       "type": "object"
     },
@@ -1980,9 +2060,83 @@
       ],
       "type": "object"
     },
+    "VoicePromptSettings": {
+      "description": "The owner's own words for the voice agent, as Settings shows them. `#272\nvoice-agent-instructions`.\n\nThe body of `GET` and `PUT /api/v1/voice-prompt`, and `voice_prompt` in client-config. Both\ntexts join only the scope-neutral part of the prompt: what the agent can do — read, send, or\nask first — is added by the server from the caller's token and the send setting, after them.",
+      "properties": {
+        "changeable": {
+          "description": "Whether this server can keep a change. False with no store configured, and when the store\ncannot be read — the agent then gets the shipped prompt.",
+          "type": "boolean"
+        },
+        "delivery": {
+          "$ref": "#/$defs/PromptDelivery",
+          "description": "How these words reach this deployment's voice agent."
+        },
+        "edited_from_version": {
+          "description": "The prompt version shipped when he last saved his copy; present exactly when he has one.\nBehind `prompt_version` means the shipped prompt has changed since.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "instructions": {
+          "description": "Additional instructions, added to every call. Empty for none.",
+          "type": "string"
+        },
+        "max_instructions_chars": {
+          "description": "The longest `instructions` a save may carry, in characters.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_system_prompt_chars": {
+          "description": "The longest `system_prompt` a save may carry, in characters.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prompt_version": {
+          "description": "The version of the prompt this server ships.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "system_prompt": {
+          "description": "The base prompt in force: the owner's edited copy when `system_prompt_edited`, otherwise\nthe shipped one, so the editor always opens on what the agent is actually given.",
+          "type": "string"
+        },
+        "system_prompt_edited": {
+          "description": "Whether `system_prompt` is the owner's edited copy.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "instructions",
+        "system_prompt",
+        "system_prompt_edited",
+        "prompt_version",
+        "max_instructions_chars",
+        "max_system_prompt_chars",
+        "changeable",
+        "delivery"
+      ],
+      "type": "object"
+    },
     "VoiceSession": {
       "description": "A browser-ready conversational voice session.",
       "properties": {
+        "agent_prompt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionPrompt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's words for the agent, for the page to hand over as the socket opens. `#272\nvoice-agent-instructions`.\n\nFilled in by `GET /api/v1/voice-session` for a hosted agent the page configures, and only\nwhen the owner has written something; a provider never sets it. A deployment-managed\nbridge reads the same words from `GET /api/v1/voice-agent` instead."
+        },
         "input_sample_rate": {
           "description": "Microphone PCM sample rate expected by the provider.",
           "format": "uint32",
@@ -2107,6 +2261,9 @@
     },
     {
       "$ref": "#/$defs/MessagesResponse"
+    },
+    {
+      "$ref": "#/$defs/VoicePromptSettings"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

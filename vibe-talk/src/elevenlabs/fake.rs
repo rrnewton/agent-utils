@@ -106,6 +106,13 @@ struct State {
     /// is here and has no voice" are two DIFFERENT failures with two different remedies, and a
     /// fake that could only produce one of them would leave the other's remedy untested.
     voiceless_agents: BTreeSet<String>,
+    /// What every agent's configuration says about a client replacing its prompt: `None` says
+    /// nothing, as an agent configured before the setting existed would. `#272
+    /// voice-agent-instructions`.
+    prompt_override: Option<bool>,
+    /// Make the next read of an agent's configuration fail, and nothing else: a mint beside it
+    /// still succeeds. One-shot.
+    fail_agent_profile: Option<String>,
 }
 
 impl FakeElevenLabs {
@@ -153,8 +160,22 @@ impl FakeElevenLabs {
                 minted_url: MINTED_URL.to_owned(),
                 fail_with: None,
                 voiceless_agents: BTreeSet::new(),
+                prompt_override: None,
+                fail_agent_profile: None,
             })),
         }
+    }
+
+    /// Say what the agents' configuration reports about replacing their prompt. `#272
+    /// voice-agent-instructions`.
+    pub fn allow_prompt_override(&self, allowed: Option<bool>) {
+        self.lock().prompt_override = allowed;
+    }
+
+    /// Make the next read of an agent's configuration fail while mints keep working: the vendor
+    /// refusing one call of two that a voice session makes side by side.
+    pub fn fail_next_agent_profile(&self, detail: &str) {
+        self.lock().fail_agent_profile = Some(detail.to_owned());
     }
 
     /// Declare that `agent_id` exists on this account but speaks in no voice of its own.
@@ -383,6 +404,9 @@ impl SignedUrlProvider for FakeElevenLabs {
         self.lock()
             .requested
             .push(agent_request(&config.api_base, agent_id).url);
+        if let Some(detail) = self.lock().fail_agent_profile.take() {
+            return Err(SignedUrlError::Transport(detail));
+        }
         if let Some(detail) = self.lock().fail_with.take() {
             return Err(SignedUrlError::Transport(detail));
         }
@@ -399,6 +423,7 @@ impl SignedUrlProvider for FakeElevenLabs {
             agent_id: agent_id.to_owned(),
             name: Some("the fake agent".to_owned()),
             voice_id: (!voiceless).then(|| KNOWN_VOICE_ID.to_owned()),
+            prompt_override: self.lock().prompt_override,
         })
     }
 }

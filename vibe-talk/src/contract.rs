@@ -176,6 +176,98 @@ pub struct ClientConfigResponse {
     /// always asked; the page then hides the checkbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_settings: Option<VoiceSettings>,
+    /// The owner's own words for the voice agent, as Settings shows them. `#272
+    /// voice-agent-instructions`.
+    ///
+    /// Here so the Instructions editor is drawn at sign-in, as the send setting is. Readable at
+    /// read scope — the assembled prompt is served there too, to a bridge holding the read token —
+    /// and changed only by a write-scope `PUT /api/v1/voice-prompt`. Absent from an older server;
+    /// the page then hides the editor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_prompt: Option<VoicePromptSettings>,
+}
+
+/// The owner's own words for the voice agent, as Settings shows them. `#272
+/// voice-agent-instructions`.
+///
+/// The body of `GET` and `PUT /api/v1/voice-prompt`, and `voice_prompt` in client-config. Both
+/// texts join only the scope-neutral part of the prompt: what the agent can do — read, send, or
+/// ask first — is added by the server from the caller's token and the send setting, after them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct VoicePromptSettings {
+    /// Additional instructions, added to every call. Empty for none.
+    pub instructions: String,
+    /// The base prompt in force: the owner's edited copy when `system_prompt_edited`, otherwise
+    /// the shipped one, so the editor always opens on what the agent is actually given.
+    pub system_prompt: String,
+    /// Whether `system_prompt` is the owner's edited copy.
+    pub system_prompt_edited: bool,
+    /// The prompt version shipped when he last saved his copy; present exactly when he has one.
+    /// Behind `prompt_version` means the shipped prompt has changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_from_version: Option<u32>,
+    /// The version of the prompt this server ships.
+    pub prompt_version: u32,
+    /// The longest `instructions` a save may carry, in characters.
+    pub max_instructions_chars: u32,
+    /// The longest `system_prompt` a save may carry, in characters.
+    pub max_system_prompt_chars: u32,
+    /// Whether this server can keep a change. False with no store configured, and when the store
+    /// cannot be read — the agent then gets the shipped prompt.
+    pub changeable: bool,
+    /// How these words reach this deployment's voice agent.
+    pub delivery: PromptDelivery,
+}
+
+/// How the owner's words reach the voice agent. `#272 voice-agent-instructions`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDelivery {
+    /// A deployment-managed bridge fetches the assembled prompt from `GET /api/v1/voice-agent` as
+    /// each call opens, so both texts reach its next call.
+    Profile,
+    /// The page hands them to a hosted agent as each call opens: the whole assembled prompt when
+    /// the agent allows its prompt to be replaced, otherwise the instructions alone, as a note at
+    /// the start. The voice session says which ([`SessionPrompt`]).
+    Page,
+}
+
+/// What the page hands a hosted agent as a call opens, so the call carries the owner's words.
+/// `#272 voice-agent-instructions`.
+///
+/// On a voice session only when the provider is one the page configures and the owner has written
+/// something; absent, the page sends exactly what it always sent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SessionPrompt {
+    /// How to hand `text` over.
+    pub transport: PromptTransport,
+    /// What to send: the whole assembled prompt for `prompt_override`, the heading and the
+    /// instructions for `contextual_update`; absent for `not_sent`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Whether the owner's edited base prompt is in what is sent.
+    pub system_prompt_applied: bool,
+    /// Whether the owner's additional instructions are in what is sent.
+    pub instructions_applied: bool,
+    /// What the agent's configuration said about replacing its prompt; absent when it could not
+    /// be read or did not say, which is treated as not allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_allowed: Option<bool>,
+}
+
+/// How the page hands the owner's words to a hosted agent. `#272 voice-agent-instructions`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTransport {
+    /// As the system prompt itself, in the initiation frame's
+    /// `conversation_config_override.agent.prompt.prompt`. Only when the agent allows it: an
+    /// override it does not allow is believed to end the conversation.
+    PromptOverride,
+    /// As a `contextual_update` sent right after the initiation frame. The agent keeps its own
+    /// prompt; only the instructions reach it.
+    ContextualUpdate,
+    /// Nothing: the owner edited only the base prompt, and this agent does not take one.
+    NotSent,
 }
 
 /// Whether the voice agent must ask before it sends. `#264 voice-send-approval`.
@@ -784,6 +876,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<VoiceSettings>(),
         // `#208 persistent-cache`. Appended, for the same reason.
         generator.subschema_for::<MessagesResponse>(),
+        // `#272 voice-agent-instructions`. Appended, for the same reason.
+        generator.subschema_for::<VoicePromptSettings>(),
     ]
 }
 

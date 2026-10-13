@@ -335,6 +335,16 @@ fn routes(state: AppState) -> Router {
             "/api/v1/voice-settings",
             get(api::voice_settings).put(api::set_voice_settings),
         )
+        // `#272 voice-agent-instructions`. The owner's additional instructions and his edited
+        // system prompt. READ scope to see them, as the assembled prompt is; WRITE scope to change
+        // them — and NO MCP TOOL, because a model that could rewrite its own instructions could
+        // drop the rules about untrusted chat text. The body is bounded at the texts' own limits.
+        .route(
+            "/api/v1/voice-prompt",
+            get(api::voice_prompt)
+                .put(api::set_voice_prompt)
+                .layer(DefaultBodyLimit::max(api::VOICE_PROMPT_BODY_BYTES)),
+        )
         .route(
             "/api/v1/channels/{channel_id}/not-noise",
             post(api::not_noise),

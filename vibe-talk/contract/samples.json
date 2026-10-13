@@ -166,6 +166,17 @@
       "upstream_clear_supported": true,
       "upstream_read_mark_supported": true,
       "version": "0.0.0",
+      "voice_prompt": {
+        "changeable": true,
+        "delivery": "page",
+        "edited_from_version": 8,
+        "instructions": "Call me Sam.",
+        "max_instructions_chars": 4000,
+        "max_system_prompt_chars": 20000,
+        "prompt_version": 9,
+        "system_prompt": "You read me the chat.",
+        "system_prompt_edited": true
+      },
       "voice_settings": {
         "ask_before_send": true,
         "changeable": true
@@ -1409,6 +1420,29 @@
       "type": "error"
     }
   ],
+  "VoicePromptSettings": [
+    {
+      "changeable": true,
+      "delivery": "page",
+      "edited_from_version": 8,
+      "instructions": "Call me Sam.",
+      "max_instructions_chars": 4000,
+      "max_system_prompt_chars": 20000,
+      "prompt_version": 9,
+      "system_prompt": "You read me the chat.",
+      "system_prompt_edited": true
+    },
+    {
+      "changeable": false,
+      "delivery": "profile",
+      "instructions": "",
+      "max_instructions_chars": 4000,
+      "max_system_prompt_chars": 20000,
+      "prompt_version": 9,
+      "system_prompt": "You are a voice assistant.",
+      "system_prompt_edited": false
+    }
+  ],
   "VoiceSession": [
     {
       "input_sample_rate": 16000,
@@ -1423,6 +1457,49 @@
       "output_sample_rate": 24000,
       "protocol": "vibe-talk-v1",
       "provider": "Voice",
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "agent_prompt": {
+        "instructions_applied": true,
+        "override_allowed": true,
+        "system_prompt_applied": true,
+        "text": "You read me the chat.",
+        "transport": "prompt_override"
+      },
+      "input_sample_rate": 16000,
+      "output_sample_rate": 16000,
+      "protocol": "elevenlabs",
+      "provider": "ElevenLabs",
+      "valid_for_seconds": 900,
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "agent_prompt": {
+        "instructions_applied": true,
+        "system_prompt_applied": false,
+        "text": "Call me Sam.",
+        "transport": "contextual_update"
+      },
+      "input_sample_rate": 16000,
+      "output_sample_rate": 16000,
+      "protocol": "elevenlabs",
+      "provider": "ElevenLabs",
+      "valid_for_seconds": 900,
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "agent_prompt": {
+        "instructions_applied": false,
+        "override_allowed": false,
+        "system_prompt_applied": false,
+        "transport": "not_sent"
+      },
+      "input_sample_rate": 16000,
+      "output_sample_rate": 16000,
+      "protocol": "elevenlabs",
+      "provider": "ElevenLabs",
+      "valid_for_seconds": 900,
       "websocket_url": "wss://voice.example/session"
     }
   ],
