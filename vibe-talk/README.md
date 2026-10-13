@@ -5019,8 +5019,11 @@ says which:
     say plainly that the new prompt must be pasted there rather than "only if its provider lets
     this page replace it".
 
-  The vendor's answer is kept for two minutes per agent, so most call starts do not wait on it; a
-  failure or a timeout is not kept, and is asked again at the next call. Two minutes is also how
+  The vendor's answer is kept for two minutes per agent, so most call starts do not wait on it. A
+  failure or a timeout counts as not allowed and is kept for twenty seconds: a deployment where the
+  read always fails (a key that can mint a session but not read the agent, or a vendor that keeps
+  timing out) waits up to 2.5 seconds and logs a warning once in that time, not at every call
+  start, and a vendor that was briefly down is asked again soon after. Two minutes is also how
   long an operator who withdraws the permission at the vendor must wait (or restart the server)
   before the page stops sending an override the agent now refuses.
 

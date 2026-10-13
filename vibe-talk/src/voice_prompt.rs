@@ -62,8 +62,11 @@
 //!
 //! Whether an agent allows the override is a round trip of its own, beside the mint. The answer is
 //! kept for [`AGENT_CHECK_TTL`] per agent ([`OverrideAnswers`]), so most calls do not wait on it at
-//! all. A failure or a timeout is not kept: it counts as "not allowed" for that call and is asked
-//! again at the next one.
+//! all. A failure or a timeout counts as "not allowed", and is kept too, but only for
+//! [`AGENT_CHECK_FAILURE_TTL`]: a deployment where the read always fails — a key that can mint a
+//! session but not read the agent, or a vendor that keeps timing out — must not wait up to
+//! [`AGENT_CHECK_DEADLINE`] and log a warning at every call start, and a vendor that was briefly
+//! down is asked again soon.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -212,12 +215,18 @@ pub const AGENT_CHECK_DEADLINE: Duration = Duration::from_millis(2_500);
 /// call — until it runs out. The QUICKSTART says so.
 pub const AGENT_CHECK_TTL: Duration = Duration::from_secs(120);
 
+/// How long a failure to read the agent's configuration — an error or a timeout — is kept, as "not
+/// allowed". Long enough that a deployment where the read always fails pays the round trip, and logs
+/// its warning, once in a while rather than at every call start; short enough that a vendor that
+/// was briefly down keeps the override away for seconds, not for the whole of [`AGENT_CHECK_TTL`].
+pub const AGENT_CHECK_FAILURE_TTL: Duration = Duration::from_secs(20);
+
 /// What the vendor last said about each agent letting a client replace its prompt, and when.
 /// `#272 voice-agent-instructions`.
 ///
-/// Only answers are kept. A failure or a timeout is "not allowed" for the call that met it and is
-/// asked again at the next, so a vendor that was briefly down does not keep the override away for
-/// the whole of [`AGENT_CHECK_TTL`].
+/// An answer is kept for [`AGENT_CHECK_TTL`]. A failure or a timeout is kept as "not allowed" for
+/// [`AGENT_CHECK_FAILURE_TTL`] only, so a vendor that was briefly down does not keep the override
+/// away for long, and one that always fails is not asked at every call start.
 #[derive(Debug, Default)]
 pub struct OverrideAnswers {
     answers: Mutex<HashMap<String, KeptAnswer>>,
@@ -226,10 +235,26 @@ pub struct OverrideAnswers {
 /// One kept answer: what the agent's configuration said, and when it was read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeptAnswer {
-    /// `AgentProfile::prompt_override` as read: `None` when the configuration did not say.
+    /// `AgentProfile::prompt_override` as read: `None` when the configuration did not say, or when
+    /// it could not be read.
     pub allowed: Option<bool>,
-    /// When it was read.
+    /// When it was read, or when the read failed.
     pub at: Instant,
+    /// The read failed or timed out, so there is no answer: kept for [`AGENT_CHECK_FAILURE_TTL`].
+    pub failed: bool,
+}
+
+impl KeptAnswer {
+    /// How long this is believed: an answer for [`AGENT_CHECK_TTL`], a failure for
+    /// [`AGENT_CHECK_FAILURE_TTL`].
+    #[must_use]
+    pub fn lifetime(&self) -> Duration {
+        if self.failed {
+            AGENT_CHECK_FAILURE_TTL
+        } else {
+            AGENT_CHECK_TTL
+        }
+    }
 }
 
 impl OverrideAnswers {
@@ -239,7 +264,7 @@ impl OverrideAnswers {
         Self::default()
     }
 
-    /// The answer kept for `agent`, if it was read less than [`AGENT_CHECK_TTL`] before `now`.
+    /// What is kept for `agent`, if it is younger than its [`KeptAnswer::lifetime`] at `now`.
     #[must_use]
     pub fn fresh(&self, agent: &str, now: Instant) -> Option<KeptAnswer> {
         let answers = self
@@ -249,29 +274,59 @@ impl OverrideAnswers {
         answers
             .get(agent)
             .copied()
-            .filter(|kept| now.saturating_duration_since(kept.at) < AGENT_CHECK_TTL)
+            .filter(|kept| now.saturating_duration_since(kept.at) < kept.lifetime())
     }
 
     /// Keep what the vendor said about `agent` at `at`, in place of anything kept before.
     pub fn keep(&self, agent: &str, allowed: Option<bool>, at: Instant) {
+        self.insert(
+            agent,
+            KeptAnswer {
+                allowed,
+                at,
+                failed: false,
+            },
+        );
+    }
+
+    /// Keep that asking the vendor about `agent` failed or timed out at `at`, in place of anything
+    /// kept before: "not allowed", for [`AGENT_CHECK_FAILURE_TTL`].
+    pub fn keep_failure(&self, agent: &str, at: Instant) {
+        self.insert(
+            agent,
+            KeptAnswer {
+                allowed: None,
+                at,
+                failed: true,
+            },
+        );
+    }
+
+    fn insert(&self, agent: &str, kept: KeptAnswer) {
         self.answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(agent.to_owned(), KeptAnswer { allowed, at });
+            .insert(agent.to_owned(), kept);
     }
 }
 
-/// Whether the configured hosted agent lets a client replace its prompt: the kept answer while it
-/// is fresh, otherwise the vendor's, asked within [`AGENT_CHECK_DEADLINE`]. `None` when it did not
-/// say, could not be asked, or did not answer in time — all of which count as "not allowed".
-async fn override_allowed(state: &AppState) -> Option<bool> {
-    let config = &state.config.elevenlabs;
-    // Keyed by where it was asked and which agent, so two configurations cannot share an answer.
-    let agent = format!(
+/// Where the hosted agent is asked about, and which agent: the key its answer is kept under, so two
+/// configurations cannot share an answer.
+fn agent_key(config: &crate::config::ElevenLabsConfig) -> String {
+    format!(
         "{}\n{}",
         config.api_base,
         config.agent_id.as_deref().unwrap_or_default()
-    );
+    )
+}
+
+/// Whether the configured hosted agent lets a client replace its prompt: what is kept while it is
+/// fresh, otherwise the vendor's answer, asked within [`AGENT_CHECK_DEADLINE`]. `None` when it did
+/// not say, could not be asked, or did not answer in time — all of which count as "not allowed",
+/// and the last two of which are kept for [`AGENT_CHECK_FAILURE_TTL`].
+async fn override_allowed(state: &AppState) -> Option<bool> {
+    let config = &state.config.elevenlabs;
+    let agent = agent_key(config);
     if let Some(kept) = state.agent_override.fresh(&agent, Instant::now()) {
         return kept.allowed;
     }
@@ -283,17 +338,21 @@ async fn override_allowed(state: &AppState) -> Option<bool> {
             profile.prompt_override
         }
         Ok(Err(error)) => {
+            state.agent_override.keep_failure(&agent, Instant::now());
             tracing::warn!(
                 %error,
                 "could not read whether the voice agent allows its prompt to be replaced; \
-                 treating it as not allowed"
+                 treating it as not allowed for {} s",
+                AGENT_CHECK_FAILURE_TTL.as_secs()
             );
             None
         }
         Err(_) => {
+            state.agent_override.keep_failure(&agent, Instant::now());
             tracing::warn!(
                 "the voice agent's configuration did not answer in time; treating a prompt \
-                 override as not allowed"
+                 override as not allowed for {} s",
+                AGENT_CHECK_FAILURE_TTL.as_secs()
             );
             None
         }
@@ -610,8 +669,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_failure_is_kept_as_not_allowed_for_less_time_than_an_answer() {
+        let answers = OverrideAnswers::new();
+        let failed = Instant::now();
+        answers.keep_failure("agent_a", failed);
+        let kept = answers
+            .fresh(
+                "agent_a",
+                failed + AGENT_CHECK_FAILURE_TTL - Duration::from_millis(1),
+            )
+            .expect("a failure that was not kept");
+        assert_eq!(kept.allowed, None, "a failure was kept as an answer");
+        assert!(kept.failed);
+        assert_eq!(
+            answers.fresh("agent_a", failed + AGENT_CHECK_FAILURE_TTL),
+            None,
+            "a failure was believed for as long as an answer"
+        );
+        assert!(AGENT_CHECK_FAILURE_TTL < AGENT_CHECK_TTL);
+        // An answer read after it replaces it, and is kept for an answer's time.
+        let read = failed + AGENT_CHECK_FAILURE_TTL;
+        answers.keep("agent_a", Some(true), read);
+        let kept = answers.fresh("agent_a", read + AGENT_CHECK_TTL - Duration::from_millis(1));
+        assert_eq!(
+            kept.map(|kept| (kept.allowed, kept.failed)),
+            Some((Some(true), false))
+        );
+    }
+
     #[tokio::test]
-    async fn the_vendor_is_asked_once_for_a_run_of_calls_and_again_after_a_failure() {
+    async fn the_vendor_is_asked_once_for_a_run_of_calls_and_a_failure_is_kept_briefly() {
         let (state, _discord, store, elevenlabs) = testing::state_with_store_and_voice();
         let agent_reads = || {
             elevenlabs
@@ -632,9 +720,29 @@ mod tests {
         );
         assert_eq!(failed.override_allowed, None);
         assert_eq!(agent_reads(), 1);
+        // The failure is kept, briefly: a deployment where the read always fails must not wait on
+        // the vendor, and log a warning, at every call start.
+        for _ in 0..2 {
+            let again = for_session(&state)
+                .await
+                .expect("a hosted agent's session says");
+            assert_eq!(again.transport, PromptTransport::NotSent);
+        }
+        assert_eq!(
+            agent_reads(),
+            1,
+            "every call start asked a vendor that had just failed"
+        );
+        // Once the failure has run out, the vendor is asked again.
+        let lapsed = Instant::now()
+            .checked_sub(AGENT_CHECK_FAILURE_TTL)
+            .expect("the clock has run that long");
+        state
+            .agent_override
+            .keep_failure(&agent_key(&state.config.elevenlabs), lapsed);
         let first = for_session(&state).await.expect("an agent that allows it");
         assert_eq!(first.transport, PromptTransport::PromptOverride);
-        assert_eq!(agent_reads(), 2, "the failure was kept as an answer");
+        assert_eq!(agent_reads(), 2, "a failure was kept past its time");
         store
             .set_owner_prompt(&owner("Call me Sam.", None))
             .await

@@ -456,10 +456,18 @@ async fn a_hosted_agent_that_refuses_or_cannot_be_asked_gets_only_the_instructio
     let handed = session(&harness).await["agent_prompt"].clone();
     assert_eq!(handed["transport"], "contextual_update", "{handed}");
     assert!(handed.get("override_allowed").is_none(), "{handed}");
-    // ...and the next call, with the vendor back, is given the whole prompt.
+    // ...and the failure is kept for a few seconds: the next call does not wait on the vendor
+    // again, and is still given the note. (That the vendor is asked again once it runs out is
+    // tested beside the cache, where the clock can be moved.)
+    let reads = agent_reads(&harness);
     assert_eq!(
         session(&harness).await["agent_prompt"]["transport"],
-        "prompt_override"
+        "contextual_update"
+    );
+    assert_eq!(
+        agent_reads(&harness),
+        reads,
+        "the next call start asked a vendor that had just failed"
     );
 }
 
