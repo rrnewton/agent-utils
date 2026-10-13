@@ -3417,13 +3417,15 @@ SCENES: tuple[Scene, ...] = (
                 # Matched on what the sentence CLAIMS, not on who the far end is. The page names
                 # whichever conversational voice provider is configured, so pinning one vendor's
                 # name here made a provider-neutral rewording look like a page that had stopped
-                # explaining itself. What has to survive is the localisation: our side got as far
-                # as a session, and the step that failed was this browser opening the socket.
+                # explaining itself. What has to survive is the localisation. `#268 voice-call-drops`:
+                # this scene's call HAD opened, so the page no longer blames the browser for not
+                # opening its socket; it says the connection was cut without a goodbye, by the network,
+                # the phone or the voice service, and that the reader did not hang up.
                 "it says where the failure is, not 'see the console'",
                 "(() => { const said = document.getElementById('error').textContent || ''; "
                 "return /The connection to .+ failed/.test(said) && "
-                "/accepted your token/.test(said) && "
-                "/could not open its WebSocket/.test(said); })()",
+                "/cut without a goodbye/.test(said) && "
+                "/not by\\s+Hang up/.test(said); })()",
             ),
             (
                 "the dot says error, not suspended",
