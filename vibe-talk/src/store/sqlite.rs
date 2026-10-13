@@ -4739,6 +4739,92 @@ mod tests {
         assert_eq!(summary_rows(&store), 5);
     }
 
+    #[tokio::test]
+    async fn a_file_past_the_voice_settings_step_takes_the_cut_at_step_with_the_choice_kept() {
+        // `#264 voice-send-approval` and `#208 persistent-cache` each wrote a step after the
+        // bookmarks; the voice-settings one landed first, so the `cut_at` one follows it. A file a
+        // deployment already moved past the voice-settings step must take the `cut_at` step and
+        // keep the owner's choice, and a fresh file must arrive with both.
+        let voice_step = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("CREATE TABLE voice_settings"))
+            .expect("the voice settings step is in the ladder");
+        assert!(
+            voice_step < cut_at_step(),
+            "the cut_at step must follow the voice settings step a deployment may already hold"
+        );
+
+        let dir = TempDir::new("sqlite-voice-then-cut-at");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..cut_at_step()] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO voice_settings VALUES (1, 0, 5);
+                     INSERT INTO summaries
+                     VALUES ('v1-old', '1111111111', '1000000000000000100', '0000000000000007',
+                             'A whole answer.', 5);",
+                )
+                .expect("an owner's choice and a summary");
+            connection
+                .pragma_update(
+                    None,
+                    "user_version",
+                    i64::try_from(cut_at_step()).expect("small"),
+                )
+                .expect("stamp old schema");
+        }
+        let upgraded = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        assert_eq!(
+            upgraded.ask_before_send().await.expect("read"),
+            Some(false),
+            "the cut_at step lost the owner's choice"
+        );
+        assert_eq!(
+            summary_table(&upgraded),
+            vec![(
+                "v1-old".to_owned(),
+                "1111111111".to_owned(),
+                "1000000000000000100".to_owned(),
+                "A whole answer.".to_owned(),
+                None,
+            )],
+            "a summary filed before the step reads whole"
+        );
+        {
+            let guard = upgraded
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let version: i64 = guard
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, i64::try_from(MIGRATIONS.len()).expect("small"));
+        }
+
+        let fresh_dir = TempDir::new("sqlite-voice-and-cut-at-fresh");
+        let fresh = store(&fresh_dir, Retention::default());
+        assert_eq!(fresh.ask_before_send().await.expect("read"), None);
+        assert!(!fresh.set_ask_before_send(false).await.expect("save"));
+        let key = summary_key("1000000000000000100", 7);
+        fresh
+            .cache_summary(&key, "An answer cut…", Some(640))
+            .await
+            .expect("file");
+        let hit = fresh
+            .cached_summary(&key)
+            .await
+            .expect("read")
+            .expect("filed");
+        assert_eq!(hit.cut_at, Some(640));
+        assert_eq!(fresh.ask_before_send().await.expect("read"), Some(false));
+    }
+
     const KEPT_VERSION_FOR_TESTS: &str = super::super::KEPT_VERSION;
 
     #[tokio::test]
