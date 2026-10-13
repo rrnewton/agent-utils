@@ -118,6 +118,11 @@ impl Read {
             .map(|params| params["ts"].clone())
             .collect()
     }
+
+    /// Whether the read returned a message that says exactly `text`.
+    fn shows(&self, text: &str) -> bool {
+        self.texts.iter().any(|shown| shown == text)
+    }
 }
 
 async fn flat(fake: &Fake, client: &HttpSlackClient) -> Read {
@@ -955,6 +960,26 @@ fn edit_reply(fake: &Fake, root: &str, at: &str, text: &str) {
     });
 }
 
+/// Run one Flat read with the first replies request for `thread` answered late, its answer taken
+/// from the thread as it was when the request arrived, and run `during` while it is held. Returns
+/// that Flat read, whose requests include any `during` sent, and what `during` returned.
+async fn flat_held_during<T>(
+    fake: &Fake,
+    client: &HttpSlackClient,
+    thread: &str,
+    during: impl std::future::Future<Output = T>,
+) -> (Read, T) {
+    let hold = slack_fake::Hold::new(thread);
+    fake.with(|state| state.hold_replies = Some(hold.clone()));
+    let driver = async {
+        hold.arrived.notified().await;
+        let out = during.await;
+        hold.release.notify_one();
+        out
+    };
+    tokio::join!(flat(fake, client), driver)
+}
+
 /// Run one Flat read with the first replies request for `thread` answered late, and while it is
 /// held, edit `at` in that thread and open the thread view, which shows the edit. Returns that
 /// Flat read, whose requests include the thread view's, and the texts the thread view showed.
@@ -965,17 +990,11 @@ async fn flat_while_thread_view_shows_an_edit(
     at: &str,
     text: &str,
 ) -> (Read, Vec<String>) {
-    let hold = slack_fake::Hold::new(thread);
-    fake.with(|state| state.hold_replies = Some(hold.clone()));
-    let driver = async {
-        hold.arrived.notified().await;
+    flat_held_during(fake, client, thread, async {
         edit_reply(fake, thread, at, text);
-        let (shown, _) = open_thread(fake, client, thread, 20).await;
-        hold.release.notify_one();
-        shown
-    };
-    let (read, shown) = tokio::join!(flat(fake, client), driver);
-    (read, shown)
+        open_thread(fake, client, thread, 20).await.0
+    })
+    .await
 }
 
 /// A Flat read already under way when the thread view shows an edit read that thread before the
@@ -1134,4 +1153,245 @@ async fn a_reply_its_root_does_not_yet_count_shows_once_it_does_or_at_the_reconc
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let reconciled = flat(&fake, &client).await;
     assert!(reconciled.messages.contains(&late));
+}
+
+/// What an edit between two overlapping Flat reads makes a reply say.
+const EDITED: &str = "edited between the two reads";
+
+/// Two Flat reads overlap, as they do for two devices or tabs polling one channel, or the page's
+/// poll beside its read for counts: A reads a thread before an edit, B begins later, reads it
+/// after the edit and shows it, and A finishes last. What A read is no newer than what B showed,
+/// so A must not put its copy back over B's: the next Flat read shows the edit, as B did. Nothing
+/// the client sees shows which of the two read the thread first, since A's answer arrives after
+/// B's, so the next read may read that thread again; it reads no other. Remote-ops audit W8
+/// review round 2.
+#[tokio::test]
+async fn an_older_flat_read_does_not_take_back_an_edit_a_newer_one_showed() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (thread, index) = roots[0].clone();
+    // On the first of the thread's two pages, which is the one held.
+    let target = reply_ts(index, 12);
+    let (a, b) = flat_held_during(&fake, &client, &thread, async {
+        edit_reply(&fake, &thread, &target, EDITED);
+        flat(&fake, &client).await
+    })
+    .await;
+    assert!(!a.shows(EDITED), "the premise: A read it before the edit");
+    assert!(
+        b.shows(EDITED),
+        "the premise: B read it after, and showed it"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert!(
+        next.shows(EDITED),
+        "B showed an edit, and the next Flat read took it back"
+    );
+    assert!(
+        next.threads().iter().all(|read| *read == thread),
+        "only that thread, if any, is read again; the nine A and B read alike stay held"
+    );
+}
+
+/// The same when B's read does not agree with B's root, here a root that briefly counts one reply
+/// more than the thread holds, so B holds nothing for that thread: A, finishing last, must not
+/// fill the place B left empty with its older copy. Remote-ops audit W8 review round 2.
+#[tokio::test]
+async fn an_older_flat_read_does_not_fill_the_place_a_newer_one_emptied() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (thread, index) = roots[0].clone();
+    let target = reply_ts(index, 12);
+    let (a, b) = flat_held_during(&fake, &client, &thread, async {
+        edit_reply(&fake, &thread, &target, EDITED);
+        set_reply_count(&fake, &thread, REPLIES + 1);
+        let b = flat(&fake, &client).await;
+        set_reply_count(&fake, &thread, REPLIES);
+        b
+    })
+    .await;
+    assert!(!a.shows(EDITED), "the premise: A read it before the edit");
+    assert!(
+        b.shows(EDITED),
+        "the premise: B read it after, and showed it"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert!(
+        next.shows(EDITED),
+        "B showed an edit, and the next Flat read took it back"
+    );
+    assert_eq!(next.threads(), [thread.clone(), thread.clone()]);
+}
+
+/// The same for two forward reads of a thread that moved: A reads the new reply, it is edited,
+/// and B reads it edited and shows it. Both build on the same full read, so when each thread was
+/// last read in full cannot order them, and A must still not put back its copy of the new reply.
+/// Remote-ops audit W8 review round 2.
+#[tokio::test]
+async fn an_older_forward_read_does_not_take_back_an_edit_a_newer_one_showed() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    assert_eq!(flat(&fake, &client).await.calls(), 23);
+
+    let (moved, _) = roots[0].clone();
+    let news = ts(9900, 0);
+    add_reply(&fake, &moved, &news);
+    let (a, b) = flat_held_during(&fake, &client, &moved, async {
+        edit_reply(&fake, &moved, &news, EDITED);
+        flat(&fake, &client).await
+    })
+    .await;
+    assert_eq!(
+        a.replies
+            .iter()
+            .filter(|params| params.contains_key("oldest"))
+            .count(),
+        2,
+        "the premise: two forward reads, A's and B's"
+    );
+    assert!(!a.shows(EDITED), "the premise: A read it before the edit");
+    assert!(
+        b.shows(EDITED),
+        "the premise: B read it after, and showed it"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert!(
+        next.shows(EDITED),
+        "B showed an edit, and the next Flat read took it back"
+    );
+    assert!(
+        next.threads().iter().all(|read| *read == moved),
+        "only that thread, if any, is read again"
+    );
+}
+
+/// Which of two overlapping Flat reads began first says nothing about which read a thread first.
+/// Here A begins first, but a rate limit holds it back; B begins later and reads the thread before
+/// an edit; A then reads it after the edit and shows it. B finishes last, and must not put its
+/// copy back over A's. Remote-ops audit W8 review round 2.
+#[tokio::test]
+async fn a_later_flat_read_that_read_the_thread_sooner_does_not_take_back_an_edit() {
+    let (state, root) = one_thread(REPLIES);
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    // On the first of the thread's two pages.
+    let target = ts(1000 + 12, 0);
+    // A's first request for the thread is refused with a rate limit, answered late; A reads the
+    // thread when it tries again, 50 ms after that answer.
+    let limited = slack_fake::Hold::new(&root);
+    fake.with(|state| {
+        state.hold_replies = Some(limited.clone());
+        state.rate_limit_once = Some(("conversations.replies".to_owned(), 0));
+    });
+    let a_done = tokio::sync::Notify::new();
+    let a = async {
+        let read = flat(&fake, &client).await;
+        a_done.notify_one();
+        read
+    };
+    let driver = async {
+        limited.arrived.notified().await;
+        let held = slack_fake::Hold::new(&root);
+        fake.with(|state| state.hold_replies = Some(held.clone()));
+        let steer = async {
+            held.arrived.notified().await;
+            edit_reply(&fake, &root, &target, EDITED);
+            limited.release.notify_one();
+            a_done.notified().await;
+            held.release.notify_one();
+        };
+        let (b, ()) = tokio::join!(flat(&fake, &client), steer);
+        b
+    };
+    let (a, b) = tokio::join!(a, driver);
+    assert!(a.shows(EDITED), "the premise: A read it after the edit");
+    assert!(
+        !b.shows(EDITED),
+        "the premise: B read it before, and finished last"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert!(
+        next.shows(EDITED),
+        "A showed an edit, and the next Flat read took it back"
+    );
+}
+
+/// Two Flat reads that overlap but read a thread alike leave nothing to take back, so what the
+/// first to finish held stays held, and the next read of that thread costs no call. Remote-ops
+/// audit W8 review round 2.
+#[tokio::test]
+async fn overlapping_flat_reads_that_read_a_thread_alike_keep_it_held() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    assert_eq!(flat(&fake, &client).await.calls(), 23);
+
+    let (moved, _) = roots[0].clone();
+    let news = ts(9900, 0);
+    add_reply(&fake, &moved, &news);
+    let (a, b) = flat_held_during(&fake, &client, &moved, flat(&fake, &client)).await;
+    assert!(a.messages.contains(&news) && b.messages.contains(&news));
+
+    let next = flat(&fake, &client).await;
+    assert!(next.replies.is_empty(), "nothing moved since: no call");
+    assert!(next.messages.contains(&news));
+}
+
+/// The other way round: A reads a thread before an edit and finishes first, holding what it read;
+/// B, begun before A finished, reads the thread after the edit, shows it, and finishes last.
+/// Nothing the client sees says B read the thread after A did, so B holds nothing; but it must
+/// drop A's copy, or the next Flat read takes back the edit B showed. Remote-ops audit W8 review
+/// round 2.
+#[tokio::test]
+async fn a_flat_read_that_cannot_hold_its_copy_still_drops_an_older_one() {
+    let (state, root) = one_thread(REPLIES);
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    // On the first of the thread's two pages.
+    let target = ts(1000 + 12, 0);
+    let first = slack_fake::Hold::new(&root);
+    fake.with(|state| state.hold_replies = Some(first.clone()));
+    let a_done = tokio::sync::Notify::new();
+    let a = async {
+        let read = flat(&fake, &client).await;
+        a_done.notify_one();
+        read
+    };
+    let driver = async {
+        first.arrived.notified().await;
+        edit_reply(&fake, &root, &target, EDITED);
+        let second = slack_fake::Hold::new(&root);
+        fake.with(|state| state.hold_replies = Some(second.clone()));
+        let steer = async {
+            second.arrived.notified().await;
+            first.release.notify_one();
+            a_done.notified().await;
+            second.release.notify_one();
+        };
+        let (b, ()) = tokio::join!(flat(&fake, &client), steer);
+        b
+    };
+    let (a, b) = tokio::join!(a, driver);
+    assert!(
+        !a.shows(EDITED),
+        "the premise: A read it before the edit, and finished first"
+    );
+    assert!(
+        b.shows(EDITED),
+        "the premise: B read it after, and finished last"
+    );
+
+    let next = flat(&fake, &client).await;
+    assert!(
+        next.shows(EDITED),
+        "B showed an edit, and the next Flat read took it back"
+    );
+    assert_eq!(next.threads(), [root.clone(), root.clone()]);
 }

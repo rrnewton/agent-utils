@@ -1091,7 +1091,11 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   the edit. Opening the thread shows it at once, and the flat view's next read then rereads that
   thread and shows it too, at no extra call for the thread view; a flat read already under way
   when the thread was opened keeps nothing it read of that thread, since it may have read it
-  before the edit. The root is trusted the other way too: a reply that the thread's replies
+  before the edit. Two flat reads that overlap, from two devices or tabs say, are treated the
+  same way: one that began before the other finished keeps nothing it read of a thread the
+  other read, and drops what the other kept unless the two read that thread alike, so neither
+  can take back an edit the other has already shown; at worst the next flat read rereads that
+  thread. The root is trusted the other way too: a reply that the thread's replies
   already list, but its root in the channel's history does not yet count, shows in the flat view
   once the root counts it, or at that thread's next full read, within those fifteen minutes,
   where before every flat read showed it at once. Behind a bridge that keeps no cache of its own,
