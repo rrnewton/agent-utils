@@ -8830,9 +8830,16 @@ async function openConversation(options) {
   // that never reached the voice service, whatever the close code says.
   let opened = false;
   clearOpenTimer();
-  openTimer = setTimeout(() => {
+  const openDeadline = () => {
     openTimer = null;
     if (session.socket !== socket || opened) return;
+    // A page sent to the background while connecting: a phone holds its timers and its network,
+    // so a deadline that ran out there says nothing about the voice service. Wait again, and
+    // judge once the reader has been back for longer than the suspension grace.
+    if (wasSuspended() || document.visibilityState === "hidden") {
+      openTimer = setTimeout(openDeadline, SOCKET_OPEN_TIMEOUT_MS);
+      return;
+    }
     // Stop listening before closing: the close this causes is the page's own, and has nothing
     // more to report than what is reported here.
     socket.onopen = null;
@@ -8856,7 +8863,8 @@ async function openConversation(options) {
     dismissBanner();
     addDetail(`the voice socket did not open within ${Math.round(SOCKET_OPEN_TIMEOUT_MS / 1000)} s`);
     teardown();
-  }, SOCKET_OPEN_TIMEOUT_MS);
+  };
+  openTimer = setTimeout(openDeadline, SOCKET_OPEN_TIMEOUT_MS);
 
   socket.onopen = () => {
     opened = true;

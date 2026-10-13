@@ -6494,6 +6494,44 @@ test("hanging up while the socket is still connecting is the reader's act, not a
   assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 0, "the deadline outlived the hang-up");
 });
 
+test("a start sent to the background while connecting is not blamed on the voice service until the page is back", async () => {
+  // A phone put in a pocket during Connecting holds the page's timers and its network, so the
+  // deadline running out there says nothing about the service. It is armed again instead, and
+  // judged once the reader has been back for longer than the suspension grace.
+  const grace = sourceConstant("SUSPENSION_GRACE_MS");
+  const page = newPage();
+  await startUnopened(page);
+  await page.setVisibility("hidden");
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 1, "no deadline was armed for the open");
+  await page.settle();
+  assert.equal(page.el("error").hidden, true, "a page in the background was reported as an unreachable service");
+  assert.notEqual(page.el("talk-label").textContent, "Try again");
+  assert.equal(page.timingPosts.length, 0, "the start was recorded as failed while the page was away");
+
+  // Back, but inside the grace: still the background's doing.
+  await page.setVisibility("visible");
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 1, "the deadline was not armed again");
+  await page.settle();
+  assert.equal(page.el("error").hidden, true, "the moment of coming back was blamed on the service");
+
+  // Back for longer than the grace, and the socket has still not opened: now it is the service.
+  page.setClock(page.clock() + grace + 1);
+  assert.equal(page.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 1, "the deadline was not armed again");
+  await page.settle();
+  assert.match(page.el("error").textContent, /^The voice service is not reachable\./);
+  assert.equal(page.timingPosts.length, 1);
+  assert.equal(page.timingPosts[0].socket_timeout, true);
+
+  // And a socket that opens while the page is away is simply a call.
+  const opens = newPage();
+  const socket = await startUnopened(opens);
+  await opens.setVisibility("hidden");
+  opens.expireTimers(SOCKET_OPEN_TIMEOUT_MS);
+  socket.onopen();
+  assert.equal(opens.expireTimers(SOCKET_OPEN_TIMEOUT_MS), 0, "the deadline outlived the open");
+  assert.equal(opens.el("error").hidden, true);
+});
+
 test("a deployment socket on another host is named, as what may explain the refusal", async () => {
   const page = newPage();
   const socket = await startUnopened(page, "wss://other-host.example/ws?mode=test");
