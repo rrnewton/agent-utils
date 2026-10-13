@@ -378,6 +378,15 @@
           "$ref": "#/$defs/Message",
           "description": "The FIRST message as the chat service accepted it."
         },
+        "send_seq": {
+          "description": "The send memory's number for this send, under which the voice page records it. `#270\nvoice-transcript-markers`. Absent only when the memory was emptied while it was on its way.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "serial": {
           "description": "Which proposal this was.",
           "format": "uint64",
@@ -903,6 +912,20 @@
           ],
           "description": "The message it would reply to, when any."
         },
+        "reply_to_author": {
+          "description": "Who wrote the message it would reply to, when this server holds that message. `#269\napproval-card-inline`: the card says \"replying to Alex\", never an id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reply_to_excerpt": {
+          "description": "The first few words of the message it would reply to, flattened, when this server holds\nit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "serial": {
           "description": "Correlates this proposal's steps in the access log. Increases with every proposal.",
           "format": "uint64",
@@ -912,6 +935,13 @@
         "text": {
           "description": "The exact text that would be posted.",
           "type": "string"
+        },
+        "thread_name": {
+          "description": "The name of the thread the message it would reply to is in, when that is a thread this\nserver has named.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -926,8 +956,13 @@
       "type": "object"
     },
     "PendingPostResponse": {
-      "description": "The post waiting for confirmation, or `null` when none is.",
+      "description": "The post waiting for confirmation, or `null` when none is.\n\n`#270 voice-transcript-markers` adds the post gate's send memory: every message the voice agent\nposted in the last [`crate::post_gate::SEND_MEMORY_TTL`], however it was approved, published\nonce it settled. A page reads it with `sent_after`, the newest `send_seq` it has seen; without\nthat it gets no sends and waits as it always did.",
       "properties": {
+        "now_ms": {
+          "description": "The server's clock, in milliseconds since the Unix epoch, for placing a send's\n`begun_at_ms` in a call.",
+          "format": "int64",
+          "type": "integer"
+        },
         "proposal": {
           "anyOf": [
             {
@@ -938,10 +973,32 @@
             }
           ],
           "description": "The pending proposal. At most one exists: a new proposal supersedes the old."
+        },
+        "sends": {
+          "description": "The sends that settled after `sent_after`, oldest first. Absent when there are none, and\nwhenever the request carried no `sent_after`.",
+          "items": {
+            "$ref": "#/$defs/VoiceSend"
+          },
+          "type": "array"
+        },
+        "sends_through": {
+          "description": "The newest `send_seq` this server has handed out: the page's next `sent_after`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settled": {
+          "description": "What became of the proposals this server still remembers, oldest first. Absent when none.",
+          "items": {
+            "$ref": "#/$defs/ProposalSettled"
+          },
+          "type": "array"
         }
       },
       "required": [
-        "proposal"
+        "proposal",
+        "sends_through",
+        "now_ms"
       ],
       "type": "object"
     },
@@ -1174,6 +1231,56 @@
         }
       ]
     },
+    "ProposalFate": {
+      "description": "What became of a proposal once it stopped being pending, as the long poll reports it.\n`#270 voice-transcript-markers`.\n\nFiner than [`Refusal`], which only has to tell a second commit why it is refused: the voice page\nsays \"the draft lapsed\" only for a proposal that really did, and nothing for one a newer draft\nreplaced or one that was sent.",
+      "oneOf": [
+        {
+          "const": "committed",
+          "description": "A commit was accepted for it. Whether the post then went is the send memory's to say.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "It was withdrawn.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "It outlived [`PROPOSAL_TTL`].",
+          "type": "string"
+        },
+        {
+          "const": "superseded",
+          "description": "A newer proposal replaced it.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "A commit restated something else, which spent it.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProposalSettled": {
+      "description": "What became of one proposal. `#270 voice-transcript-markers`.",
+      "properties": {
+        "fate": {
+          "$ref": "#/$defs/ProposalFate",
+          "description": "What became of it."
+        },
+        "serial": {
+          "description": "The proposal's number.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "serial",
+        "fate"
+      ],
+      "type": "object"
+    },
     "ProviderDescription": {
       "description": "One configured chat provider, as the page needs to know it.",
       "properties": {
@@ -1316,6 +1423,209 @@
       "required": [
         "from",
         "messages"
+      ],
+      "type": "object"
+    },
+    "SendHow": {
+      "description": "How the owner approved a send. `#270 voice-transcript-markers`.",
+      "oneOf": [
+        {
+          "const": "tap",
+          "description": "He tapped Send on the card.",
+          "type": "string"
+        },
+        {
+          "const": "voice",
+          "description": "He said yes to the read-back, and the page sent it.",
+          "type": "string"
+        },
+        {
+          "const": "direct",
+          "description": "Nobody was asked: \"Ask me before the voice agent sends\" was off.",
+          "type": "string"
+        }
+      ]
+    },
+    "SendOrigin": {
+      "description": "Which door a send came through. Stored for audit; nothing is drawn from it.",
+      "oneOf": [
+        {
+          "const": "commit",
+          "description": "A confirmed proposal, through the commit route.",
+          "type": "string"
+        },
+        {
+          "const": "mcp",
+          "description": "A direct send from the MCP tool.",
+          "type": "string"
+        },
+        {
+          "const": "rest",
+          "description": "A direct send from `POST /api/v1/post-proposals`.",
+          "type": "string"
+        }
+      ]
+    },
+    "SendOutcome": {
+      "description": "What a send is known to have posted.",
+      "oneOf": [
+        {
+          "const": "sent",
+          "description": "All of it.",
+          "type": "string"
+        },
+        {
+          "const": "partial",
+          "description": "Some of its parts, and not the rest.",
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "description": "Nobody knows: the chat service's answer was lost, or the request was abandoned on its way.",
+          "type": "string"
+        }
+      ]
+    },
+    "SentRecord": {
+      "description": "One message the voice agent posted, as a `sent` row records it. `#270\nvoice-transcript-markers`.\n\nEvery field comes from this server's own copy of the send, never from a page. The times are\nhere rather than in the row's `at_ms`, which must stay non-decreasing within a conversation\nfor [`TranscriptCursor`]; `at_ms` is when the row was recorded.",
+      "properties": {
+        "begun_at_ms": {
+          "description": "When the send began, by the server's clock.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "channel_id": {
+          "description": "The channel it went to.",
+          "type": "string"
+        },
+        "channel_name": {
+          "description": "That channel's name as the owner knows it, when it was sent.",
+          "type": "string"
+        },
+        "how": {
+          "$ref": "#/$defs/SendHow",
+          "description": "How the owner approved it."
+        },
+        "message_id": {
+          "description": "The first part as the chat service accepted it, when one was.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/SendOrigin",
+          "description": "Which door it came through."
+        },
+        "outcome": {
+          "$ref": "#/$defs/SendOutcome",
+          "description": "What is known to have been posted."
+        },
+        "parts_posted": {
+          "description": "How many parts are known to have been posted.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parts_total": {
+          "description": "How many parts the message was cut into.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reply_to": {
+          "description": "The message it answered, kept so a page can open it. Never drawn as an id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reply_to_author": {
+          "description": "Who wrote the message it answered, when this server had that message to hand.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reply_to_excerpt": {
+          "description": "The first few words of the message it answered, flattened, when this server had it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "send_seq": {
+          "description": "Where it stands in the order sends settled, which is the long poll's cursor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sent_at_ms": {
+          "description": "When the send settled, by the server's clock.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "serial": {
+          "description": "The proposal's number, or the direct send's: the same counter.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text_chars": {
+          "description": "How many characters were posted, whatever the row holds.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text_truncated": {
+          "description": "Whether the row's text is shorter than what was posted: a stored row is capped at\n[`MAX_TURN_CHARS`].",
+          "type": "boolean"
+        },
+        "thread_id": {
+          "description": "The thread it went to, when not the conversation itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_name": {
+          "description": "That thread's name, when this server knows one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uncertain_part": {
+          "description": "The part, counted from 1, that failed in a way that may have posted it anyway.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unsent_chars": {
+          "description": "How many characters were certainly not posted.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "serial",
+        "send_seq",
+        "channel_id",
+        "channel_name",
+        "parts_posted",
+        "parts_total",
+        "unsent_chars",
+        "outcome",
+        "how",
+        "origin",
+        "text_truncated",
+        "text_chars",
+        "begun_at_ms",
+        "sent_at_ms"
       ],
       "type": "object"
     },
@@ -2287,6 +2597,24 @@
         "max_system_prompt_chars",
         "changeable",
         "delivery"
+      ],
+      "type": "object"
+    },
+    "VoiceSend": {
+      "description": "One message the voice agent posted, as the send memory publishes it. `#270\nvoice-transcript-markers`.\n\nThe same text and detail a `sent` transcript row records, so a page draws a live card and a\nrestored one with the same code.",
+      "properties": {
+        "detail": {
+          "$ref": "#/$defs/SentRecord",
+          "description": "Where it went, how it was approved, and what is known to have been posted."
+        },
+        "text": {
+          "description": "The text that went, capped as a transcript row is.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "detail"
       ],
       "type": "object"
     },
