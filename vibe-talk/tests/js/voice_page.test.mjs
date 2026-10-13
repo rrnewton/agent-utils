@@ -23670,6 +23670,91 @@ test("live updates and deletes re-read the authoritative channel without losing 
   );
 });
 
+// --- `#277 scroll-stability`: a read that lands, or a message that arrives, never moves the reader
+//
+// The owner, 2026-10-13: "I swear I just saw an instance where it jumped me to the bottom of the screen
+// in the main message view (two column mode)... I don't think I touched anything. I think it was
+// something updating underneath." A read took the reader's place as it went OUT and settled to it when
+// it landed, seconds later behind a bridge: a reader on the newest line when it went who had scrolled up
+// since was thrown back to the bottom. And on a channel with threads a message arriving live went in
+// before anybody asked whether the reader was on the newest line, so a reader who was on it was never
+// followed.
+// tests/scroll_stability_browser.py measures both in Chromium; these hold the rules.
+
+/** A channel of long messages, taller than the list, with or without threads. */
+function stabilityChannel(page, threads) {
+  page.threadingSupported = threads;
+  return Array.from({ length: 14 }, (_unused, index) =>
+    message({ id: `277${String(index).padStart(2, "0")}`, content: longMessage(`message ${index}`) }));
+}
+
+/**
+ * The first row whose foot is below the list's top edge, and where its top is: what the reader is on.
+ * Where it stands without the loading line over the rows: a browser's scroll anchoring holds the rows
+ * still as that line comes and goes, and this layout model has none, so here the line pushes them down
+ * for as long as it stands.
+ */
+function readerOn(page) {
+  const top = page.el("scroll-area").getBoundingClientRect().top;
+  const row = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > top);
+  const line = page.el("channel-loading");
+  const pushed = line.hidden ? 0 : line.getBoundingClientRect().height;
+  return { id: row.getAttribute("data-id"), top: row.getBoundingClientRect().top - pushed };
+}
+
+for (const threads of [true, false]) {
+  const kind = threads ? "with threads" : "without threads";
+
+  test(`${kind}: a read sent while the reader was on the newest line, landing after they scrolled up, leaves them where they are`, async () => {
+    const page = newPage();
+    const messages = stabilityChannel(page, threads);
+    const stream = await withLiveChannel(page, messages);
+    const area = page.el("scroll-area");
+    assert.ok(atBottomOf(area), "the channel did not open on its newest line");
+    // The read an edit asks for, held on the wire.
+    const held = gate(threads ? page.timeline : page.channelPage);
+    if (threads) page.timeline = held.respond;
+    else page.channelPage = held.respond;
+    const edited = { ...messages[3], content: longMessage("message 3, edited") };
+    page.messages = [...messages.slice(0, 3), edited, ...messages.slice(4)];
+    await deliver(page, stream, sseUpdate("edit-277", edited));
+    // Up the history while it is out.
+    area.scrollTop = Math.round(area.scrollHeight / 3);
+    const before = readerOn(page);
+    assert.ok(!atBottomOf(area), "the reader did not leave the newest line");
+    held.open();
+    await page.settle();
+    await page.settle();
+    assert.match(page.el("discord-log").text(), /message 3, edited/, "the held read never landed");
+    assert.ok(!atBottomOf(area), "the read that landed threw the reader back to the newest line");
+    assert.deepStrictEqual(readerOn(page), before, "the read that landed moved the row the reader was on");
+  });
+
+  test(`${kind}: a message arriving live is followed by a reader on the newest line, and moves nobody up the list`, async () => {
+    const page = newPage();
+    const messages = stabilityChannel(page, threads);
+    const stream = await withLiveChannel(page, messages);
+    const area = page.el("scroll-area");
+    assert.ok(atBottomOf(area), "the channel did not open on its newest line");
+    const first = message({ id: "27790", content: longMessage("arrived live") });
+    page.messages = [...messages, first];
+    await deliver(page, stream, sseMessage(first));
+    await page.settle();
+    assert.ok(rowWithId(page, "27790"), "the live message never reached the list");
+    assert.ok(atBottomOf(area), "a reader on the newest line was left above the message that arrived");
+
+    area.scrollTop = Math.round(area.scrollHeight / 3);
+    const before = readerOn(page);
+    const second = message({ id: "27791", content: longMessage("arrived live again") });
+    page.messages = [...page.messages, second];
+    await deliver(page, stream, sseMessage(second));
+    await page.settle();
+    assert.ok(rowWithId(page, "27791"), "the second live message never reached the list");
+    assert.deepStrictEqual(readerOn(page), before, "a message arriving moved a reader up the list");
+    assert.ok(jumpSaysArrived(page), "nothing offered the reader up the list the message that arrived");
+  });
+}
+
 test("a held mutation refresh cannot paint the old channel under a new selection", async () => {
   const page = newPage();
   const other = { id: "2220000000000000002", label: "other team", writable: true };
@@ -43878,6 +43963,55 @@ test("`#261 two-column-connectors`: the glide waits for nothing once the selecti
     page.expireTimers(COLUMN_GLIDE_MS);
     assert.deepStrictEqual(page.el("side-scroll").glides.map((glide) => glide.behavior), ["auto"],
       "a reader who asks for reduced motion was given a smooth glide");
+  } finally {
+    restore();
+  }
+});
+
+test("`#277 scroll-stability` x `#261`: a selection a redraw hands on, its card gone under Unread only, glides nothing", async () => {
+  const restore = layColumnsOut();
+  try {
+    const run = async (script) => {
+      // The fixture's own timeline, kept from before the change record replaces it: its newest page of
+      // Main says which replies are Done (`reply_dismissals`), which is how a Done made on another device
+      // reaches this one.
+      const { page } = await linkedColumns(16, (p) => { p.plainTimeline = p.timeline; }, script);
+      await page.el("side-unread-only").click();
+      await page.settle();
+      const left = page.el("scroll-area");
+      const right = page.el("side-scroll");
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      right.scrollTop = 0;
+      await right.dispatch("scroll");
+      await page.nextFrame();
+      // The reader's choice: the first card, its root on screen at Main's head, so nothing glides.
+      await mouseTo(page, threadCard(page, 0), 900, 60);
+      assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t0"]);
+      page.expireTimers(COLUMN_GLIDE_MS);
+      assert.equal(left.glides, undefined, "a card whose root was on screen glided Main");
+      // The reader goes down Main to its foot, and the first thread is read on another device: its card
+      // goes under Unread only, and the selection is handed to the card now first, whose root is far
+      // above Main's foot.
+      left.scrollTop = left.scrollHeight;
+      await left.dispatch("scroll");
+      await page.nextFrame();
+      page.dealtWith.add("301");
+      page.timeline = page.plainTimeline;
+      await reReadChannel(page);
+      await page.nextFrame();
+      const handed = litRows(page);
+      assert.ok(!shownCardIds(page).includes("spaces/A/threads/t0"), "the read card is still shown, so this proves nothing");
+      page.expireTimers(COLUMN_GLIDE_MS);
+      return { handed, glides: left.glides, at: left.scrollTop, foot: left.scrollHeight - left.clientHeight };
+    };
+    const kept = await run(SCRIPT);
+    assert.equal(kept.glides, undefined, "a selection nobody chose glided Main away from the reader");
+    assert.equal(kept.at, kept.foot, "Main moved from where the reader put it");
+    // THE CONTROL: arming the glide for a handed-on selection too glides Main up, so the test can tell.
+    const control = await run(brokenScript("armColumnGlide(selectionRedrawn ? null : pane, lit);", "armColumnGlide(pane, lit);"));
+    assert.deepStrictEqual(control.handed, ["side-cards:spaces/A/threads/t1"], "the selection was not handed to the next card");
+    assert.ok(control.glides && control.glides.length === 1, "the control did not glide, so the test cannot tell");
   } finally {
     restore();
   }

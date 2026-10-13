@@ -5157,7 +5157,8 @@ function seam(label, detail) {
   // disclosure at the bottom of a scrolled list ends up if nothing moves.
   details.addEventListener("toggle", () => {
     if (details.open) {
-      li.scrollIntoView({ block: "end" });
+      // The least that shows it: never a move for one already on screen. `#277 scroll-stability`.
+      li.scrollIntoView({ block: "nearest" });
     }
   });
   details.append(summary, body);
@@ -6495,6 +6496,13 @@ function bringIntoView(pane, row, from = 1) {
 }
 
 /**
+ * True while `keepSelection` draws the selection again after a redraw: a selection handed on to another
+ * row because its message went, which nobody chose. `#277 scroll-stability`: it arms no glide of the
+ * other column (`noteLinkedSelection`).
+ */
+let selectionRedrawn = false;
+
+/**
  * Put the keyboard's selection back after a redraw took its row away. Called at the end of every
  * pass over the scroll tools, which every bulk redraw of the lists ends with.
  *
@@ -6522,7 +6530,12 @@ function keepSelection() {
     if (lost) row.focus({ preventScroll: true });
   }
   // The new row of the selected message is lit, the old one having gone with the redraw.
-  drawSelection();
+  selectionRedrawn = true;
+  try {
+    drawSelection();
+  } finally {
+    selectionRedrawn = false;
+  }
 }
 
 // --- the mouse and the keys move one selection (`#239 single-selection`)
@@ -6778,6 +6791,19 @@ function focusList(pane) {
   }
 }
 
+/**
+ * Give `node`, a control in a list — a message box at its foot, an item of a row's menu — the focus,
+ * scrolling only when it is off screen, and then the least that shows it. `#277 scroll-stability`. A
+ * browser's own `focus()` scrolls a control it cannot show whole to the MIDDLE of the list, which on a
+ * list being read is a jump of half a screen for the sake of one control.
+ *
+ * @param {HTMLElement} node
+ */
+function focusMinimally(node) {
+  node.focus({ preventScroll: true });
+  if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
 /** `focusList`, unless the reader is typing in a field still on screen, which is never taken from them. */
 function settleFocus() {
   const held = document.activeElement;
@@ -6967,7 +6993,7 @@ function stepMenu(node, direction) {
   if (items.length === 0) return false;
   const at = items.indexOf(node);
   const next = at < 0 ? items[direction > 0 ? 0 : items.length - 1] : items[(at + direction + items.length) % items.length];
-  next.focus();
+  focusMinimally(next);
   return true;
 }
 
@@ -7196,7 +7222,7 @@ function menuFromKeyboard(target) {
   if (pressed === null) return false;
   if (pressed === "took") return true;
   const [first] = menuItems();
-  if (first) first.focus();
+  if (first) focusMinimally(first);
   return true;
 }
 
@@ -7319,8 +7345,8 @@ function composeFromKeyboard() {
   }
   const box = el("channel-compose-text");
   if (!channelOnScreen() || !shownNode(box)) return false;
-  // Not `preventScroll`: the box is at the foot of the list, and writing in it is going there.
-  box.focus();
+  // The box is at the foot of the list, and writing in it is going there: as far as shows it.
+  focusMinimally(box);
   return true;
 }
 
@@ -15491,9 +15517,39 @@ function landOnFirstUnread() {
   // it — a view this page held, drawn again, comes back without its folds in that list.
   const fold = childByClass(first, "fold");
   if (fold && first.getAttribute("data-collapsed") === "true") fold.click();
-  placeEntryLanding(entryHeadRow(first), first);
+  if (!landAtFoot(first)) placeEntryLanding(entryHeadRow(first), first);
   renderScrollTools();
   requestVisibleSummaries();
+  return true;
+}
+
+/**
+ * `#277 scroll-stability`. The first unread message is the thread's NEWEST, and shown whole at the foot of
+ * the list: the thread opens there, scrolled all the way down, as a thread with nothing unread does — the
+ * newest message, the box under it, and as much above as fits. False, with the list left where it was,
+ * when the message is not the newest, or is taller than the room under the floating line, whose head
+ * the landing then shows (`placeEntryLanding`).
+ *
+ * The owner, 2026-10-13: "the thread view also feels like it is not starting out scrolled all the way to
+ * the bottom". A thread whose one unread reply was its newest was landed with the root brought to the
+ * head (`entryHeadRow`), which in Chromium left the box under the reply, and the foot, 88px below the
+ * screen at a desk (tests/scroll_stability_browser.py). Landed at the foot, it is followed from there as
+ * any reader on the newest line is.
+ *
+ * @param {Element} first
+ */
+function landAtFoot(first) {
+  const rows = [...el("discord-log").children].filter((row) => drawnOnItsOwn(row));
+  if (rows[rows.length - 1] !== first) return false;
+  const area = el("scroll-area");
+  const was = area.scrollTop;
+  area.scrollTop = area.scrollHeight;
+  if (first.getBoundingClientRect().top < floatingClearance(area) + REPLY_LANDING_GAP_PX - 1) {
+    area.scrollTop = was;
+    return false;
+  }
+  entryLanding = null;
+  setJumpNewest(false);
   return true;
 }
 
@@ -16363,8 +16419,8 @@ function startThread(id) {
   const opened = openThread(id);
   inColumn(columnsShown ? columns.side : columns.main, () => {
     const box = el("channel-compose-text");
-    // Not `preventScroll`: the box is at the foot of the thread, and writing in it is going there.
-    if (shownNode(box) && !box.disabled) box.focus();
+    // The box is at the foot of the thread, and writing in it is going there: as far as shows it.
+    if (shownNode(box) && !box.disabled) focusMinimally(box);
   });
   return opened;
 }
@@ -17533,10 +17589,12 @@ async function loadTimeline(options) {
       seamsAfterMidnight();
       return;
     }
+    // Where the reader is now, not where they were when the read went out. `#277 scroll-stability`.
+    const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
     // One pass over the scroll tools, at the end, however often settling asks. `#226`.
     holdingScrollTools(() => {
       const messages = applyTimelinePage(joinedDeltas(deltas), false, false, true);
-      settleAfterRead(messages, { keepPosition, area, ...position, ownAct });
+      settleAfterRead(messages, { area, ...at, ownAct });
       noteFreshRead(deltas[deltas.length - 1]);
       saveChannelScope();
       renderScrollTools();
@@ -17620,9 +17678,11 @@ async function loadTimeline(options) {
       }
       landed.push(payload);
       // Under rows drawn from the store, a reader off the newest line keeps their message: the view
-      // is walked back to it before anything is drawn, so the list changes once, under them.
-      const anchored = behindHeld && current && !position.wasAtNewest && position.anchorId
-        ? timelineMessages.find((message) => String(message.id) === position.anchorId) : null;
+      // is walked back to it before anything is drawn, so the list changes once, under them. The
+      // message they are on NOW, which the wait for this page gave them time to change. `#277`.
+      const reading = behindHeld && current ? channelReadPosition(area) : position;
+      const anchored = behindHeld && current && !reading.wasAtNewest && reading.anchorId
+        ? timelineMessages.find((message) => String(message.id) === reading.anchorId) : null;
       const placeAt = timeOf(anchored, "timestamp");
       steps.pause();
       const older = Number.isFinite(placeAt)
@@ -17636,8 +17696,10 @@ async function loadTimeline(options) {
       // real browsers scrollTop is clamped when it disappears, but making the
       // order explicit also keeps the viewport model deterministic.
       renderChannelLoading(false);
-      // Where the reader is among the held rows now, which the walk gave them time to change.
-      const at = behindHeld ? { ...channelReadPosition(area), heldPlaceAt: placeAt } : position;
+      // Where the reader is now — among the held rows, which the walk gave them time to change, or
+      // in whatever list was up while the read was out. `#277 scroll-stability`.
+      const landedAt = landedReadPosition(area, keepPosition, position.wasAtNewest);
+      const at = behindHeld ? { ...landedAt, heldPlaceAt: placeAt } : landedAt;
       // ...unless what is on screen came from the device or a read that failed: those rows are what
       // the reader has, and the refresh MERGES into them rather than replacing them with one page.
       if (!keepPosition && channelFreshness === "fresh") {
@@ -17657,7 +17719,7 @@ async function loadTimeline(options) {
       holdingScrollTools(() => {
         let messages = applyTimelinePage(payload);
         for (const page of older) messages = applyTimelinePage(page, true);
-        settleAfterRead(messages, { keepPosition, area, ...at, ownAct });
+        settleAfterRead(messages, { area, ...at, ownAct });
         noteFreshRead(payload);
         saveChannelScope();
         renderScrollTools();
@@ -18862,7 +18924,7 @@ function dropOutgoing(id) {
 
 /** Focus a message box with the caret after its last character, where the reader goes on writing. */
 function focusAtEnd(box) {
-  box.focus();
+  focusMinimally(box);
   const end = box.value.length;
   if (typeof box.setSelectionRange === "function") box.setSelectionRange(end, end);
 }
@@ -25706,6 +25768,37 @@ function settleAfterRead(messages, how) {
   }
 }
 
+/**
+ * Where the reader is as a read LANDS, for `settleAfterRead`: measured then, never when the read was
+ * sent. `#277 scroll-stability`. The owner, 2026-10-13: "I swear I just saw an instance where it jumped
+ * me to the bottom of the screen in the main message view (two column mode)... I don't think I touched
+ * anything. I think it was something updating underneath." A read is on the wire for as long as the
+ * server takes — seconds, behind a bridge — and every read took the reader's place as it went out:
+ * one sent while the reader was on the newest line, who then scrolled up to read, threw them back to
+ * the bottom when it landed, and one sent while they were further up put them back where they had been
+ * before they scrolled. Measured in Chromium (tests/scroll_stability_browser.py). What was true at the
+ * send is kept for one question only: `sentAtNewest`, whether the reader was then on the newest line.
+ *
+ * A read that would take the reader to the newest message — entering the channel over rows already up,
+ * saved on this device or drawn by an earlier read — finds them where they are when it lands too: a
+ * reader who was on the newest line when it went out and has scrolled away since is reading, and is
+ * left there, with the jump to the newest offered for what arrived. One who was not on the newest line
+ * when it went out — a pull at the head of the list, a walk back whose snapshot expired — is taken to
+ * the newest as asked, as before.
+ *
+ * Asked once the in-flow loading line over the rows has gone (`renderChannelLoading(false)`): the rows
+ * as they stand without it, which is where a browser's own scroll anchoring has held them as it came
+ * and went, and where the reader was before it came.
+ *
+ * @param {HTMLElement} area
+ * @param {boolean} keepPosition
+ * @param {boolean} sentAtNewest
+ */
+function landedReadPosition(area, keepPosition, sentAtNewest) {
+  const at = channelReadPosition(area);
+  return { ...at, keepPosition: keepPosition || (sentAtNewest && !at.wasAtNewest) };
+}
+
 /** Capture the channel row the reader is looking at before an authoritative replacement. */
 function channelReadPosition(area) {
   // A message a filter change holds in place is the one kept, and the newest line is not followed.
@@ -25774,13 +25867,15 @@ async function loadDiscord(options) {
       return;
     }
     renderChannelLoading(false);
+    // Where the reader is now, not where they were when the read went out. `#277 scroll-stability`.
+    const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
     const loaded = applyNewestPage(payload);
     // Inline, at the head of the list, rather than on the transient strip. `#63
     // status-line-placement`: this is a standing fact about what you are looking at, and the strip
     // takes itself away after a few seconds.
     renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
     const messages = payload.messages || [];
-    settleAfterRead(messages, { keepPosition, area, ...position });
+    settleAfterRead(messages, { area, ...at });
     channelFreshAt = Date.now();
     setChannelFreshness("fresh");
     notePinsRevision(payload.pins_revision);
@@ -26380,6 +26475,8 @@ async function loadTodo(options) {
       return;
     }
     renderChannelLoading(false);
+    // Where the reader is now, not where they were when the read went out. `#277 scroll-stability`.
+    const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
     // THE QUEUE, minus the reader's own words when they have said those are already read.
     //
     // Filtered HERE rather than on the server: this is a preference held in one browser, and the
@@ -26408,9 +26505,8 @@ async function loadTodo(options) {
     renderChannelSeam(todoSummary());
     renderTodoControls();
     settleAfterRead(messages, {
-      keepPosition,
       area,
-      ...position,
+      ...at,
       ownAct: Boolean(options && options.ownAct),
     });
     renderScrollTools();
@@ -31076,7 +31172,12 @@ function noteLinkedSelection() {
   const key = card !== null ? `card:${card}` : pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
   if (key !== linkedSelection) {
     linkedSelection = key;
-    if (card !== null) armColumnGlide(sidePane, cardRowOnRight(card));
+    // `#280 scroll-stability`. Only a selection the reader made glides the other column to its other end.
+    // One a redraw handed on — its message gone under Hide read, its card filtered out by Unread only —
+    // was nobody's choice, and the other column moving 1.5 s later was "something updating underneath":
+    // the wait for the selection that went is dropped, and none is armed.
+    if (selectionRedrawn) armColumnGlide(null, lit);
+    else if (card !== null) armColumnGlide(sidePane, cardRowOnRight(card));
     else armColumnGlide(pane, lit);
   }
   scheduleColumnLinks();
@@ -32207,7 +32308,14 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // and whether or not it lands: a reply in the thread it offers to start turns the row's tag into
     // Thread(1) at once, and the offer has to go with it.
     if (!held) {
+      // `#277 scroll-stability`. Whether each column's reader is on its newest line is asked BEFORE
+      // the row goes in, which is what changes the answer — as the channel without threads below
+      // asks it, and as a send does (`#229`). Asked after, by the read below, a reader on the newest
+      // line was a row short of it by then and was never followed: the message arrived out of sight
+      // under them, and the jump offered to take them to it.
+      const pinned = liveFollowers();
       appendToColumns(message, true, replayed);
+      followLiveArrival(pinned);
       followReplyStore();
     }
     renderOutgoingEverywhere();
@@ -32254,6 +32362,34 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // reader is looking at it, it gets a summary. `#49 cached-summaries`.
   requestVisibleSummaries();
   relayToAgent(message, selfPosted, replayed);
+}
+
+/**
+ * Which columns' readers follow a message arriving now: each one on the newest line of its list, on
+ * the main screen in the channel's view. Not one a filter change holds in place (`followsNewest`),
+ * nor one just landed on a thread's first unread who has not moved since, whom the landing outranks
+ * (`entryLandingHolds`). Asked BEFORE the message goes in. `#277 scroll-stability`.
+ *
+ * @returns {{main: boolean, side: boolean}}
+ */
+function liveFollowers() {
+  const follows = () => currentScreen === "main" && currentView === "discord" &&
+    !entryLandingHolds() && followsNewest(el("scroll-area"));
+  return {
+    main: inColumn(columns.main, follows),
+    side: sideShowing() && inColumn(columns.side, follows),
+  };
+}
+
+/**
+ * Keep each reader `liveFollowers` found on the newest line on it, now that the message is in. The
+ * rest are not moved at all; the read behind the message offers them the jump (`settleAfterRead`).
+ *
+ * @param {{main: boolean, side: boolean}} pinned
+ */
+function followLiveArrival(pinned) {
+  if (pinned.main) inColumn(columns.main, scrollToNewest);
+  if (pinned.side && sideShowing()) inColumn(columns.side, scrollToNewest);
 }
 
 /**
@@ -34831,6 +34967,66 @@ if (typeof window.ResizeObserver === "function") {
       if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
     });
   }).observe(leftEl("side-scroll"));
+}
+// `#277 scroll-stability`. THE RIGHT COLUMN'S READER ON ITS NEWEST LINE STAYS ON IT while what is in
+// the list changes size under them with nothing scrolled. The cards are why: the one under the pointer
+// is drawn whole (`#257 summary-truncation`), which in Chromium left the list of threads 43px above its
+// foot the moment the mouse came to rest on its last card — "the thread view also feels like it is not
+// starting out scrolled all the way to the bottom" — and further from it than the slack, the reader had
+// stopped following the threads that moved to the foot. A thread on the right is kept the same way.
+//
+// What the reader was doing is the list's state at its LAST SCROLL: a browser delivers scroll events
+// before it reports sizes in the same frame, so a scroll this page made — a landing, a jump, a place
+// kept across a redraw — has been noted by the time a size it changed in the same task is reported,
+// and a reader the page put somewhere else is not "on the newest line" here. Nothing else moves:
+//
+//   * A READER UP THE LIST is left exactly where they are. The browser's own scroll anchoring holds
+//     the card or row they are on through a change above it, and every redraw holds it itself
+//     (`keepingCardPlace`, `settleAfterRead`).
+//   * A LIST TOO SHORT TO SCROLL has its reader at its head as much as at its foot: growing past the
+//     screen, it opens downward under them.
+//   * NOT A RESIZE OF THE COLUMN, nor a change of what it shows — the cards or a thread, another thread,
+//     another screen — which have rules of their own (`#207`, `#218`); the state is noted afresh instead.
+//   * NOT A PLACE ANOTHER RULE HOLDS: a thread's landing on its first unread (`#221`), a message a
+//     filter change holds (`#243`), and the step back a walk for the search holds still (`#262`).
+//
+// Main is left as `#207 scrollback-jump` decided: every redraw and every read that changes its rows keeps
+// the reader itself (`preservingScroll`, `settleAfterRead`), and a newest message growing under a reader
+// on its newest line with nothing redrawn offers the jump to its end.
+if (typeof window.ResizeObserver === "function") {
+  const area = leftEl("side-scroll");
+  /** @type {{foot: boolean, width: number, height: number, context: string} | null} */
+  let footing = null;
+  // What the column is showing: a change of it is not the content changing under the reader.
+  const contextOf = () => (columnsShown
+    ? `${currentScreen}|${currentView}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinnedOnly}`)}`
+    : "one");
+  // On the newest line, and scrolled to it. What the column shows is noted only by this observer's
+  // passes, which a change of it always brings: not on every scroll event.
+  const note = (context = footing ? footing.context : "") => {
+    footing = { foot: area.scrollTop > 0 && atBottom(area), width: area.clientWidth, height: area.clientHeight, context };
+  };
+  // Whether the reader may be kept on the newest line now: the right column on screen, and no other rule
+  // holding a place in it.
+  const free = () => {
+    if (!columnsShown || currentScreen !== "main" || currentView !== "discord") return false;
+    if (columns.side.mode === "list") return !cardsOpening;
+    return inColumn(columns.side, () => {
+      const walk = activeColumn.searchWalk;
+      return !entryLandingHolds() && heldFilterRow() === null && !(walk && walk.anchored);
+    });
+  };
+  area.addEventListener("scroll", () => note(), { passive: true });
+  const footKeeper = new window.ResizeObserver(() => {
+    const was = footing;
+    const context = contextOf();
+    if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight &&
+        was.context === context && !atBottom(area, 1) && free()) {
+      area.scrollTop = area.scrollHeight;
+    }
+    note(context);
+  });
+  for (const box of area.children) footKeeper.observe(box);
 }
 // `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
 // without a redraw: the window resized or turned, the reading column dragged, the reader's type
