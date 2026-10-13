@@ -15,6 +15,10 @@
 //!
 //! A deployment with one provider is a router with one entry, so it behaves exactly as it did
 //! before multi-provider support existed: every call reaches that provider whatever the channel.
+//!
+//! Every provider's client is wrapped in a [`ProfiledClient`] as the router is built, so each
+//! operation is timed whoever calls it, including the live poller, which holds a provider's
+//! client directly. `#208 persistent-cache`; see [`crate::upstream_profile`].
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -24,6 +28,7 @@ use async_trait::async_trait;
 use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel, SourceClaim};
 use crate::config::{Config, ProviderKind};
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
+use crate::upstream_profile::{ProfiledClient, UpstreamProfile};
 
 /// One configured provider and the client that reaches it.
 pub struct ProviderEntry {
@@ -31,7 +36,8 @@ pub struct ProviderEntry {
     pub key: String,
     /// The namespace recorded beside channels this provider registered.
     pub namespace: String,
-    /// The client for this provider.
+    /// The client for this provider. Inside a [`ChatRouter`], always a [`ProfiledClient`] around
+    /// the client the entry was built with.
     pub client: Arc<dyn ChatClient>,
     /// This provider's live poll interval in seconds, `0` when it is not polled.
     pub live_poll_seconds: u64,
@@ -54,6 +60,7 @@ pub struct ChatRouter {
     default: Option<usize>,
     routes: RwLock<BTreeMap<ChannelId, usize>>,
     display_name: String,
+    profile: Arc<UpstreamProfile>,
 }
 
 impl std::fmt::Debug for ChatRouter {
@@ -74,16 +81,40 @@ const CURSOR_PREFIX: &str = "p";
 impl ChatRouter {
     /// A router over `entries`; channels that name no provider belong to `default_key`.
     ///
+    /// Each entry's client is timed into a new [`UpstreamProfile`]; see
+    /// [`ChatRouter::with_profile`].
+    ///
     /// # Panics
     ///
     /// Panics when `entries` is empty: a deployment always has at least one provider, and the
     /// configuration loader refuses one that does not.
     #[must_use]
     pub fn new(entries: Vec<ProviderEntry>, default_key: Option<&str>) -> Self {
+        Self::with_profile(entries, default_key, Arc::new(UpstreamProfile::new()))
+    }
+
+    /// [`ChatRouter::new`], timing each entry's client into `profile` under the entry's key.
+    ///
+    /// For a builder that hands the same profile to a provider's own client first, as
+    /// [`ChatRouter::from_config`] does for Slack's per-call timings.
+    ///
+    /// # Panics
+    ///
+    /// As [`ChatRouter::new`].
+    #[must_use]
+    pub fn with_profile(
+        mut entries: Vec<ProviderEntry>,
+        default_key: Option<&str>,
+        profile: Arc<UpstreamProfile>,
+    ) -> Self {
         assert!(
             !entries.is_empty(),
             "a chat router needs at least one provider"
         );
+        for entry in &mut entries {
+            let recorder = profile.provider(&entry.key, entry.client.provider_name());
+            entry.client = Arc::new(ProfiledClient::new(Arc::clone(&entry.client), recorder));
+        }
         let default = match entries.len() {
             1 => Some(0),
             _ => default_key.and_then(|key| entries.iter().position(|entry| entry.key == key)),
@@ -94,6 +125,7 @@ impl ChatRouter {
             default,
             routes: RwLock::new(BTreeMap::new()),
             display_name,
+            profile,
         }
     }
 
@@ -117,14 +149,15 @@ impl ChatRouter {
     ///
     /// Returns [`ChatError`] when a provider's client cannot be built.
     pub fn from_config(config: &Config) -> Result<Self, ChatError> {
+        let profile = Arc::new(UpstreamProfile::new());
         let mut entries = Vec::with_capacity(config.providers.len());
         for provider in &config.providers {
             let client: Arc<dyn ChatClient> = match &provider.kind {
                 ProviderKind::Discord(discord) => {
                     Arc::new(crate::discord::http::HttpDiscordClient::new(discord)?)
                 }
-                ProviderKind::Slack(slack) => Arc::new(crate::slack::HttpSlackClient::new(
-                    &crate::slack::SlackConfig {
+                ProviderKind::Slack(slack) => Arc::new(
+                    crate::slack::HttpSlackClient::new(&crate::slack::SlackConfig {
                         provider_name: provider.name.clone(),
                         api_base: slack.api_base.clone(),
                         token: slack.token.clone(),
@@ -136,8 +169,9 @@ impl ChatRouter {
                         upstream_clear: slack.upstream_clear,
                         max_post_chars: slack.max_post_chars,
                         max_post_bytes: slack.max_post_bytes,
-                    },
-                )?),
+                    })?
+                    .with_shim_profile(profile.provider(&provider.key, &provider.name)),
+                ),
             };
             entries.push(ProviderEntry {
                 key: provider.key.clone(),
@@ -146,9 +180,15 @@ impl ChatRouter {
                 live_poll_seconds: provider.live_poll_seconds,
             });
         }
-        let router = Self::new(entries, config.default_provider_key());
+        let router = Self::with_profile(entries, config.default_provider_key(), profile);
         router.replace_routes(&config.channels);
         Ok(router)
+    }
+
+    /// How long each provider's operations and calls have taken, in numbers only.
+    #[must_use]
+    pub fn profile(&self) -> &Arc<UpstreamProfile> {
+        &self.profile
     }
 
     /// Every provider, in configuration order.

@@ -736,6 +736,11 @@ async fn main() -> anyhow::Result<()> {
     if state.chat.supports_upstream_clear() {
         tokio::spawn(vibe_talk::upstream_clear::Clearer::for_state(&state).run());
     }
+    // `#208 persistent-cache`. One line per provider per hour: how long its operations and Web API
+    // calls took that hour, and how big the messages read were. Names and numbers only.
+    tokio::spawn(vibe_talk::upstream_profile::log_every_hour(Arc::clone(
+        providers.profile(),
+    )));
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

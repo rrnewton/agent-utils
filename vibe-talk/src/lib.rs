@@ -87,5 +87,6 @@ pub mod threads;
 pub mod timeline_forward;
 pub mod untrusted;
 pub mod upstream_clear;
+pub mod upstream_profile;
 pub mod voice_agent;
 pub mod voice_health;

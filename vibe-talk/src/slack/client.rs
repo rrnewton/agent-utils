@@ -5,7 +5,7 @@
 //! the rate-limit budget and the translation of Slack's `{ok:false}` answers live in one place.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ use crate::chat::{
 use crate::config::Secret;
 use crate::model::{ChannelId, Message, MessageId, UserId};
 use crate::threads::MessageThread;
+use crate::upstream_profile::{self, ProviderProfile, Series};
 
 /// Slack's own ceiling on `chat.postMessage` text: "Slack will truncate messages containing more
 /// than 40,000 characters", <https://docs.slack.dev/reference/methods/chat.postMessage>, read
@@ -127,6 +128,9 @@ pub struct HttpSlackClient {
     pub(super) proven: Mutex<HashMap<(String, i64), (i64, Instant)>>,
     /// The most one post may carry, as Slack is sent it; see [`SlackConfig::post_limit`].
     pub(super) post_limit: crate::chat::PostLimit,
+    /// Where each Web API request is timed, by method and outcome, when the client was built with
+    /// one. `#208 persistent-cache`; see [`crate::upstream_profile`].
+    shim_profile: Option<Arc<ProviderProfile>>,
 }
 
 impl HttpSlackClient {
@@ -179,7 +183,20 @@ impl HttpSlackClient {
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
             post_limit: config.post_limit(),
+            shim_profile: None,
         })
+    }
+
+    /// Time every Web API request this client sends into `profile`, by method and outcome.
+    /// `#208 persistent-cache`.
+    ///
+    /// Each request counts once, including one answered with a rate limit and sent again, which
+    /// is how the far end's own log counts them. A request the caller stopped waiting for counts
+    /// as abandoned.
+    #[must_use]
+    pub fn with_shim_profile(mut self, profile: Arc<ProviderProfile>) -> Self {
+        self.shim_profile = Some(profile);
+        self
     }
 
     /// Call one Web API method, waiting out rate limits within [`RATE_LIMIT_BUDGET`].
@@ -202,7 +219,22 @@ impl HttpSlackClient {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            match self.attempt(&url, method, params).await? {
+            let timer = self
+                .shim_profile
+                .as_deref()
+                .map(|profile| profile.start(Series::ShimCall, method));
+            let answer = self.attempt(&url, method, params).await;
+            if let Some(timer) = timer {
+                timer.finish(
+                    match &answer {
+                        Ok(Outcome::Done(_)) => upstream_profile::Outcome::Ok,
+                        Ok(Outcome::Limited(_)) => upstream_profile::Outcome::RateLimited,
+                        Err(error) => upstream_profile::Outcome::of(error),
+                    },
+                    0,
+                );
+            }
+            match answer? {
                 Outcome::Done(value) => return Ok(value),
                 Outcome::Limited(retry_after) => {
                     let wait = retry_after.max(MIN_RETRY_WAIT);

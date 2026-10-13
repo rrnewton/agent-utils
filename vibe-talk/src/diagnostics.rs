@@ -128,7 +128,7 @@ pub struct CheckReport {
 }
 
 /// Every check, and the arithmetic over them.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DiagnosticsReport {
     /// True when nothing failed. Warnings do not clear it and do not set it.
     pub ok: bool,
@@ -153,6 +153,10 @@ pub struct DiagnosticsReport {
     /// when no provider has the shadow on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_view_shadow: Vec<crate::recent_view::ChannelTally>,
+    /// How long each provider's operations and Web API calls have taken since the process
+    /// started, and how big the messages read were. Numbers only: no channel, message or text.
+    /// Not a check, and never a failure. `#208 persistent-cache`; see [`crate::upstream_profile`].
+    pub upstream: crate::upstream_profile::UpstreamReport,
 }
 
 /// Redact every secret this deployment holds out of a string.
@@ -347,6 +351,8 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         took_ms: deadline.elapsed_ms(),
         summaries: state.summary_counters.snapshot(),
         recent_view_shadow: crate::recent_view::report(state),
+        // Read after the checks, so the calls this report just made are counted too.
+        upstream: state.providers.profile().report(),
     }
 }
 
