@@ -966,6 +966,15 @@ class FakeElement {
   }
 
   /**
+   * Put a field's caret, as `HTMLTextAreaElement.setSelectionRange` does: kept, so a test can read
+   * where the page put it. `#267 quote-reply` puts it under the quote it writes into the reply box.
+   */
+  setSelectionRange(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
+
+  /**
    * Let go of the focus, as `HTMLElement.blur` does: counted, so a test knows the page asked. A field
    * kept on `change` is kept when it loses the focus, which is why `#224 keyboard-shortcuts` asks.
    */
@@ -1005,6 +1014,52 @@ class FakeElement {
   text() {
     return [this, ...this.descendants()].map((node) => node.textContent).join("");
   }
+}
+
+/**
+ * The document's text selection, as `getSelection()` returns it, with only what the page reads: its
+ * ranges' common ancestors, whether it is collapsed, its text, and `removeAllRanges`. `#267
+ * quote-reply`. Nothing is laid out, so a test says what the selection holds and what its text reads
+ * as (`page.selectText`); the page decides from where it lies and what it says.
+ */
+class FakeSelection {
+  constructor() {
+    this.ranges = [];
+    this.text = "";
+    this.cleared = 0;
+  }
+
+  get rangeCount() {
+    return this.ranges.length;
+  }
+
+  get isCollapsed() {
+    return this.ranges.length === 0 || this.text === "";
+  }
+
+  getRangeAt(index) {
+    return this.ranges[index];
+  }
+
+  removeAllRanges() {
+    this.ranges = [];
+    this.text = "";
+    this.cleared += 1;
+  }
+
+  toString() {
+    return this.text;
+  }
+}
+
+/** The nearest element holding both `a` and `b`, as a range's `commonAncestorContainer` is. */
+function commonAncestor(a, b) {
+  const above = new Set();
+  for (let at = a; at; at = at.parentNode) above.add(at);
+  for (let at = b; at; at = at.parentNode) {
+    if (above.has(at)) return at;
+  }
+  return null;
 }
 
 /**
@@ -2185,11 +2240,29 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   page.setPlatform = (platform) => {
     navigator.platform = platform;
   };
+  // `#267 quote-reply`. The text the reader has selected: nothing, until a test selects some.
+  page.selection = new FakeSelection();
+  /**
+   * Select text from `from` to `to` (one node, or two), reading as `text`, and tell the page as a
+   * browser does, by `selectionchange` on the document.
+   */
+  page.selectText = async (from, to, text) => {
+    page.selection.ranges = [{ commonAncestorContainer: commonAncestor(from, to || from) }];
+    page.selection.text = text;
+    await page.documentEvent("selectionchange");
+  };
+  /** Let go of the selection, as a tap or a click elsewhere does. */
+  page.clearSelection = async () => {
+    page.selection.ranges = [];
+    page.selection.text = "";
+    await page.documentEvent("selectionchange");
+  };
   const context = {
     document,
     localStorage,
     sessionStorage,
     Date: FixedDate,
+    getSelection: () => page.selection,
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },
       location: { origin: "https://vibe.example" },
@@ -47451,4 +47524,296 @@ test("`#185 reply-new-thread`: Edit of a failed new-thread reply whose thread ha
   await page.settle();
   assert.deepStrictEqual(page.repliesPosted.at(-1).body,
     { text: "starting a thread on it", reply_to: "210", thread_id: data.lone.id });
+});
+
+// --- `#267 quote-reply` --------------------------------------------------------------------------
+//
+// The owner, 2026-10-13: "when I highlight part of a message, the Reply button turns into 'Quote
+// Reply' ... Clicking that button replies ... but it prepends `> SELECTED TEXT FOR QUOTATION` and a
+// blank line to the text input box where I type in the rest."
+
+/** The deepest node of a row's drawn body that has words: where a reader's selection starts and ends. */
+const wordsIn = (li) => {
+  const body = bodyOf(li);
+  return [...body.descendants()].reverse().find((node) => node.textContent !== "") || body;
+};
+
+/** A channel of three plain messages, the second answered once, on a page signed in. */
+async function quotePage(arrange = null) {
+  const page = newPage(new Map(), SCRIPT, arrange);
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "the first message, about the runner" }),
+    message({ id: "1000000000000000002", content: "the second message, about the deploy", ...ALICE }),
+    message({ id: "1000000000000000003", content: "an answer to the second", reply_to: "1000000000000000002", ...OWNER }),
+  ]);
+  return page;
+}
+
+test("`#267 quote-reply`: words selected in one message make its Reply Quote reply, and it is Reply again when they go", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  const second = rowWithId(page, "1000000000000000002");
+  assert.equal(replyLabel(second), "Reply (1)", "the premise: the second message counts its reply");
+  await page.selectText(wordsIn(first), null, "about the runner");
+  assert.equal(replyLabel(first), "Quote reply", "a selection in the message did not make its Reply Quote reply");
+  assert.equal(replyButton(first).getAttribute("data-quote"), "true", "Quote reply is not drawn as one");
+  assert.equal(replyButton(first).getAttribute("title"), sourceString("QUOTE_REPLY_TITLE"));
+  assert.equal(replyButton(first).getAttribute("aria-label"), null, "Quote reply is named other than by its words");
+  for (const id of ["1000000000000000002", "1000000000000000003"]) {
+    assert.match(replyLabel(rowWithId(page, id)), /^Reply/, `${id}: a selection in another message changed its Reply`);
+    assert.equal(replyButton(rowWithId(page, id)).hasAttribute("data-quote"), false);
+  }
+  // To the next message: the first is Reply again, the second Quote reply, its count kept.
+  await page.selectText(wordsIn(second), null, "the deploy");
+  assert.equal(replyLabel(first), "Reply", "the first message kept Quote reply after the selection moved on");
+  assert.equal(replyButton(first).getAttribute("title"), "Reply to this message");
+  assert.equal(replyLabel(second), "Quote reply (1)", "a message with replies lost its count, or was not Quote reply");
+  assert.equal(replyButton(second).getAttribute("aria-label"), "Quote reply, 1 reply already");
+  // Let go, with the mouse: Reply at once, the count as it was.
+  await page.clearSelection();
+  assert.equal(replyLabel(second), "Reply (1)", "Quote reply outlived the selection");
+  assert.equal(replyButton(second).getAttribute("aria-label"), "Reply, 1 reply already");
+  assert.equal(replyButton(second).hasAttribute("data-quote"), false);
+  // Selected words that are only spaces are no quote.
+  await page.selectText(wordsIn(first), null, "   ");
+  assert.equal(replyLabel(first), "Reply", "a selection of nothing but spaces was offered as a quote");
+});
+
+test("`#267 quote-reply`: a selection across two messages, in a row's header or buttons, or in a message box, leaves every Reply as it is", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  const second = rowWithId(page, "1000000000000000002");
+  const labels = () => page.el("discord-log").children.map(replyLabel);
+  const plain = labels();
+  const author = first.descendants().find((node) => node.hasClass("msg-author"));
+  for (const [from, to, what] of [
+    [wordsIn(first), wordsIn(second), "across two messages"],
+    [author, wordsIn(first), "from the author's name into the words"],
+    [author, null, "on the author's name"],
+    [replyButton(first), null, "on Reply itself"],
+    [page.el("channel-compose-text"), null, "in the channel's message box"],
+    [page.el("status-line"), null, "in the page's own controls"],
+  ]) {
+    await page.selectText(from, to, "some words");
+    assert.deepStrictEqual(labels(), plain, `a selection ${what} changed a Reply`);
+  }
+  // A selection that was one message's and then grows across two goes at once, after a touch too.
+  await page.documentEvent("pointerdown", { pointerType: "touch", target: wordsIn(first) });
+  await page.selectText(wordsIn(first), null, "the first");
+  assert.equal(replyLabel(first), "Quote reply");
+  await page.selectText(wordsIn(first), wordsIn(second), "the first message ... the second");
+  assert.deepStrictEqual(labels(), plain, "a selection that grew across two messages left Quote reply behind");
+  await replyButton(first).click();
+  assert.equal(page.screen(), "reply");
+  assert.equal(page.el("reply-text").value, "", "Reply quoted a selection that was not its message's");
+});
+
+test("`#267 quote-reply`: Quote reply opens the reply with the words quoted line by line, an empty line, and the box focused with the caret under them; Send posts it as Reply would", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  // As a browser reads a selection over two paragraphs and a line break, untidy at the ends.
+  await page.selectText(wordsIn(first), null, "  the first   message, about\n\n\n the runner \t\nand  more  \n");
+  await replyButton(first).click();
+  assert.equal(page.screen(), "reply", "Quote reply did not open the reply screen");
+  const quote = "> the first message, about\n>\n> the runner\n> and more\n\n";
+  assert.equal(page.el("reply-text").value, quote, "the quote is not the selection, line by line, then an empty line");
+  assert.equal(focused(page), page.el("reply-text"), `the box was not ready to write in: ${focusName(page)}`);
+  assert.equal(page.el("reply-text").selectionStart, quote.length, "the caret is not under the quote");
+  assert.equal(page.el("reply-text").selectionEnd, quote.length);
+  assert.ok(page.selection.cleared >= 1, "the words quoted stayed selected on the hidden list");
+  assert.equal(replyLabel(first), "Reply", "Reply stayed Quote reply after its quote was taken");
+  // Written under it, and sent: the quote and the answer, to the message, as Reply sends.
+  await page.el("reply-text").setValue(`${quote}it is wedged on the cache`);
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.at(-1).body,
+    { text: `${quote}it is wedged on the cache`, reply_to: "1000000000000000001" },
+    "the quote reply did not post as a reply to its message");
+
+  // Longer than the cap: cut at the end of a word, with "…", the whole quote within it.
+  const max = sourceConstant("QUOTE_MAX_CHARS");
+  const fresh = await quotePage();
+  const row = rowWithId(fresh, "1000000000000000002");
+  const long = "the overnight run is still going on the shard ".repeat(80);
+  await fresh.selectText(wordsIn(row), null, long);
+  await replyButton(row).click();
+  const value = fresh.el("reply-text").value;
+  assert.match(value, /^> the overnight run/);
+  assert.ok(value.endsWith("…\n\n"), "a long quote does not end with …");
+  const said = value.slice(2, -2);
+  assert.ok(said.length <= max, `the quote is ${said.length} characters, over ${max}`);
+  assert.ok(said.length > max - 30, `the quote was cut far short of ${max}: ${said.length}`);
+  assert.match(said, /[a-z]…$/, "the quote was cut in the middle of a word, or after a space");
+  assert.ok(long.startsWith(said.slice(0, -1)), "the cut quote is not the start of the selection");
+  // The control: one under the cap is quoted whole.
+  const short = await quotePage();
+  const whole = "x".repeat(max);
+  const shortRow = rowWithId(short, "1000000000000000003");
+  await short.selectText(wordsIn(shortRow), null, whole);
+  await replyButton(shortRow).click();
+  assert.equal(short.el("reply-text").value, `> ${whole}\n\n`, "a quote exactly at the cap was cut");
+});
+
+test("`#267 quote-reply`: a draft already written stays under the quote; a quote left untouched is not kept as a draft", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001", content: "the first message, about the runner" })]);
+  const row = () => rowWithId(page, "1000000000000000001");
+  const saved = () => JSON.parse(store.get("vibe-talk.voice.drafts") || "{}")["1000000000000000001"];
+  await replyButton(row()).click();
+  await page.el("reply-text").setValue("my half-written answer");
+  await page.el("reply-cancel").click();
+  assert.equal(saved(), "my half-written answer", "the premise: the draft was kept");
+  // Quote reply: the quote over the draft, the caret between them.
+  await page.selectText(wordsIn(row()), null, "about the runner");
+  await replyButton(row()).click();
+  assert.equal(page.el("reply-text").value, "> about the runner\n\nmy half-written answer", "the draft was lost or the quote not over it");
+  assert.equal(page.el("reply-text").selectionStart, "> about the runner\n\n".length);
+  // Cancel without writing: the draft as it was, and no quote in it.
+  await page.el("reply-cancel").click();
+  assert.equal(saved(), "my half-written answer", "an untouched quote was kept in the draft");
+  assert.equal(row().draftMarker.hidden, false, "the draft's marker went");
+  // With no draft at all, an untouched quote leaves none.
+  await replyButton(row()).click();
+  await page.el("reply-text").setValue("");
+  await page.el("reply-cancel").click();
+  assert.equal(saved(), undefined, "the premise: no draft");
+  await page.selectText(wordsIn(row()), null, "about the runner");
+  await replyButton(row()).click();
+  await page.el("reply-cancel").click();
+  assert.equal(saved(), undefined, "a quote nobody wrote under became a draft");
+  assert.equal(row().draftMarker.hidden, true, "a quote nobody wrote under put Draft on the row");
+  // Written under, it is a draft like any other, quote and all; quoting the same words again adds none.
+  await page.selectText(wordsIn(row()), null, "about the runner");
+  await replyButton(row()).click();
+  await page.el("reply-text").setValue("> about the runner\n\nstill looking");
+  await page.el("reply-cancel").click();
+  assert.equal(saved(), "> about the runner\n\nstill looking");
+  await page.selectText(wordsIn(row()), null, "about the runner");
+  await replyButton(row()).click();
+  assert.equal(page.el("reply-text").value, "> about the runner\n\nstill looking", "the same quote was put in twice");
+});
+
+test("`#267 quote-reply`: on Slack Quote reply is offered too and posts where Reply posts; on Google Chat it keeps Reply's new-thread choice", async () => {
+  for (const slack of [true, false]) {
+    const name = slack ? "Slack" : "Google Chat";
+    const { page } = await freshMessagePage((p) => { p.repliesInThread = slack || undefined; });
+    await pickThread(page, "main");
+    const row = rowOf(page, "210");
+    await page.selectText(wordsIn(row), null, "nobody has answered");
+    assert.equal(replyLabel(row), "Quote reply", `${name}: no Quote reply`);
+    await replyButton(row).click();
+    assert.equal(page.el("reply-text").value, "> nobody has answered\n\n", `${name}: the quote is not in the box`);
+    assert.equal(page.el("reply-branch-row").hidden, slack, `${name}: the new-thread box is not as Reply offers it`);
+    await page.el("reply-text").setValue("> nobody has answered\n\nI will");
+    await page.el("reply-send").click();
+    await page.settle();
+    // What Reply posts on each (`#252 thread-button-state`): Slack's server threads it from there.
+    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "> nobody has answered\n\nI will", reply_to: "210" },
+      `${name}: Quote reply did not post as Reply does`);
+  }
+});
+
+test("`#267 quote-reply`: r on the selected message quotes the words selected in it, and only in it", async () => {
+  const page = await keyboardPage();
+  const row = channelRow(page, "29");
+  row.focus();
+  FakeElement.focusVisible = true;
+  await page.selectText(wordsIn(row), null, "a sentence about the overnight run");
+  await press(page, row, "r");
+  assert.equal(page.screen(), "reply", "r did not open the reply screen");
+  assert.equal(page.el("reply-text").value, "> a sentence about the overnight run\n\n", "r did not quote the selection");
+  assert.equal(focused(page), page.el("reply-text"), `after r the focus is on ${focusName(page)}`);
+  await page.el("reply-cancel").click();
+  await page.settle();
+  // Words selected in another message: r answers the message it acts on, plainly.
+  const other = channelRow(page, "28");
+  await page.selectText(wordsIn(other), null, "message 28");
+  assert.equal(replyLabel(other), "Quote reply");
+  const selected = channelRow(page, "29");
+  selected.focus();
+  await press(page, selected, "r");
+  assert.equal(page.screen(), "reply");
+  assert.equal(page.el("reply-target").children[0].getAttribute("data-id"), "29", "r answered another message");
+  assert.equal(page.el("reply-text").value, "", "r quoted words from a message it did not answer");
+  // The list of keys says so.
+  assert.ok(page.el("keyboard-keys").text().includes("Quote reply"), "the list of keys does not say r quotes");
+});
+
+test("`#267 quote-reply`: after a touch, a selection the tap took away still quotes for a moment, and the label says so until then", async () => {
+  const hold = sourceConstant("QUOTE_HOLD_MS");
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  await page.documentEvent("pointerdown", { pointerType: "touch", target: wordsIn(first) });
+  await page.selectText(wordsIn(first), null, "about the runner");
+  // The phone clears the selection as the finger lands on Reply, before the click.
+  await page.clearSelection();
+  assert.equal(replyLabel(first), "Quote reply", "the label went before the tap could arrive");
+  await replyButton(first).click();
+  assert.equal(page.el("reply-text").value, "> about the runner\n\n", "the tap that cleared the selection lost the quote");
+  await page.el("reply-cancel").click();
+  await page.settle();
+  // Let go and left alone: Reply again once the moment is over, and a press is a plain Reply.
+  await page.selectText(wordsIn(first), null, "about the runner");
+  await page.clearSelection();
+  assert.equal(page.expireTimers(hold), 1, "nothing lets a touch's held selection go");
+  assert.equal(replyLabel(first), "Reply", "Quote reply outlived its moment");
+  await replyButton(first).click();
+  assert.equal(page.el("reply-text").value, "", "a selection let go long ago was quoted");
+  // A new selection inside the moment holds again from the start, and is the one quoted.
+  await page.el("reply-cancel").click();
+  await page.settle();
+  await page.selectText(wordsIn(first), null, "the first");
+  await page.clearSelection();
+  await page.selectText(wordsIn(first), null, "the runner");
+  assert.equal(page.expireTimers(hold), 0, "a selection made again was still let go on the old timer");
+  await replyButton(first).click();
+  assert.equal(page.el("reply-text").value, "> the runner\n\n");
+});
+
+test("`#267 quote-reply`: dragging over a message's words neither folds it nor reads it aloud; the click that ends the drag selects the row", async () => {
+  const page = newPage();
+  await signIn(page);
+  const lines = await showDiscord(page, [message({ id: "1000000000000000001", content: "x ".repeat(2000) }),
+    message({ id: "1000000000000000002", content: "short" })]);
+  const li = lines[0];
+  assert.equal(li.getAttribute("data-collapsed"), "true", "the premise: a long message starts folded");
+  await page.documentEvent("pointerdown", { pointerType: "mouse", target: wordsIn(li) });
+  await page.selectText(wordsIn(li), null, "x x x");
+  const click = { target: wordsIn(li) };
+  await li.dispatch("click", click);
+  await page.el("scroll-area").dispatch("click", click);
+  assert.equal(li.getAttribute("data-collapsed"), "true", "a drag over the words folded the message open");
+  assert.equal(selectedId(page), "1000000000000000001", "the drag's click did not select the row it was in");
+  assert.equal(replyLabel(li), "Quote reply");
+  // In Read, the same drag reads nothing aloud; the control, a tap with nothing selected, does.
+  const reading = newPage();
+  await signIn(reading);
+  const [row] = await inReadingMode(reading, [message({ id: "1000000000000000003", content: "read me" })]);
+  const heard = () => reading.speakCalls.length + reading.players.length +
+    (reading.deviceSpeech ? reading.deviceSpeech.utterances.length : 0);
+  await reading.selectText(wordsIn(row), null, "read");
+  await row.dispatch("click", { target: wordsIn(row) });
+  await reading.settle();
+  assert.equal(heard(), 0, "a drag over the words in Read read it aloud");
+  await reading.clearSelection();
+  await row.dispatch("click", { target: wordsIn(row) });
+  await reading.settle();
+  assert.ok(heard() > 0, "a tap in Read read nothing aloud, so this test cannot see a drag doing it");
+});
+
+test("`#267 quote-reply`: Help says what Quote reply does, where it posts, and how long a quote may be", () => {
+  const entry = helpEntry("channel");
+  assert.match(entry, /<strong>Quote reply<\/strong>/);
+  assert.match(entry, /on Slack that is the message's\s+thread/);
+  assert.match(entry, /a quote you leave untouched\s+is not kept as a draft/);
+  const max = sourceConstant("QUOTE_MAX_CHARS");
+  assert.match(entry, new RegExp(`Up to ${max.toLocaleString("en-US")} characters are quoted`), "Help does not state the cap the code keeps");
+  // Drawn in the accent, over the selected row's and a focused row's ink.
+  for (const list of ["#side-log", "#discord-log", "#pinned-log"]) {
+    const block = cssBlock(`:root ${list} li.discord-message .meta .reply-button[data-quote="true"]`);
+    assert.match(block, /color:\s*var\(--accent\)/);
+  }
 });
