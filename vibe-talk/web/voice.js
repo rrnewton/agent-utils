@@ -94,14 +94,17 @@ const COLUMN_IDS = {
  * and `searchNote` what the last one found, kept under its control until the search changes (`#262
  * search-load-older`, `searchOlder`).
  *
+ * `fromCards` says the thread the right column shows was entered from its card, so that ← goes back
+ * out to the cards (`#277 thread-card-focus`, `enterCard`).
+ *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, state: unknown[] | null, searched: SearchCount | null,
  *   searchWalk: any, searchNote: {key: string, text: string} | null}} ColumnFields
- * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread"}}}
+ * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
 const columns = {
   main: { name: "main", state: null, searched: null, searchWalk: null, searchNote: null },
-  side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list" },
+  side: { name: "side", state: null, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false },
 };
 /** The column the code is working on now. The left one, except inside `inColumn`. */
 let activeColumn = columns.main;
@@ -6253,9 +6256,9 @@ const channelPane = {
 
 /**
  * `#229 desktop-two-column`. The right column's list in two columns: the thread's messages, or with
- * none selected its cards, which the arrows, j and k, Home and End move through as through messages
- * and Enter opens. Nothing floats over its head (its heading is above the scroller), and its jump
- * floats over its foot.
+ * none selected its cards, which the arrows, j and k, Home and End move through as through messages,
+ * Enter highlights and → enters (`#277 thread-card-focus`). Nothing floats over its head (its heading
+ * is above the scroller), and its jump floats over its foot.
  *
  * @type {KeyPane}
  */
@@ -6993,8 +6996,8 @@ function keyContext(target) {
 function rowForAct(target, runLine = false) {
   const { pane, row } = keyContext(target);
   if (!pane || !row) return { pane, row: null, took: false };
-  // A card of the right column is a thread, not a message: only Enter and o act on it, and open it.
-  // `#229 desktop-two-column`.
+  // A card of the right column is a thread, not a message: only Enter and o act on it, and highlight
+  // it (`#277 thread-card-focus`; → enters it, `cardForArrow`). `#229 desktop-two-column`.
   if (row.hasAttribute("data-card")) return { pane, row: runLine ? row : null, took: false };
   if (!runLine && row.getAttribute("data-read-run") === "head") {
     setStatus("Read messages: Enter opens them.");
@@ -7080,7 +7083,8 @@ function openFromKeyboard(event, target) {
     selectRow(pane, row, false);
     return true;
   }
-  // A card: its thread, selected, with the keys in it. `#229 desktop-two-column`.
+  // A card: a press on it, which highlights it and shows it whole, or puts that out. The keys stay on
+  // it; → goes into its thread. `#277 thread-card-focus`, and `#229 desktop-two-column` before it.
   if (row.hasAttribute("data-card")) {
     const card = childByClass(row, "side-card");
     if (card) card.click();
@@ -7100,8 +7104,22 @@ function pressRowButton(target, className) {
   return button;
 }
 
-/** →: into the selected message's thread, by its own thread tag (question 3). */
+/**
+ * →: into the selected message's thread, by its own thread tag (question 3); on the thread cards, into
+ * the thread of the highlighted card, or of the card the keys are on, by its replies button (`#277
+ * thread-card-focus`).
+ */
 function threadFromKeyboard(target) {
+  const card = cardForArrow(target);
+  const opener = card ? childByClass(card, card.hasAttribute("data-card") ? "side-card-open" : "thread-card-open") : null;
+  if (opener) {
+    opener.click();
+    // In two columns the keys go into the thread with it, as from a message's tag; in one column the
+    // rows the focus was on have been replaced by the rows of the thread.
+    if (columnsShown) focusList(sidePane);
+    else settleFocus();
+    return true;
+  }
   const { row, took } = rowForAct(target);
   const badge = row ? childByClass(row, "thread-badge") : null;
   if (!badge || badge.hidden) return took;
@@ -7133,6 +7151,15 @@ function threadOutFromKeyboard() {
   // `#229 desktop-two-column`.
   if (columnsShown) {
     if (!sideActive || currentScreen !== "main" || currentView !== "discord") return false;
+    // `#277 thread-card-focus`. A thread entered from its card goes back out to the cards, as → came
+    // in: the X, and the keys on the card it was entered from.
+    if (columns.side.mode === "thread" && columns.side.fromCards) {
+      const card = cardRowOnRight(inColumn(columns.side, () => String(selectedThreadId)));
+      closeSideThread();
+      if (card && card.parentNode && rowShown(card)) selectRow(sidePane, card);
+      else focusList(sidePane);
+      return true;
+    }
     focusList(channelPane);
     return true;
   }
@@ -7458,7 +7485,9 @@ function goBack() {
   else if (currentScreen === "help") closeHelp();
   else if (replyOnScreen() && (currentScreen === "reply" || activeColumn === replyColumn)) closeReply();
   else if (currentScreen === "threads") closeThreadDirectory();
-  else if (channelOnScreen() && channelView === "thread") leaveThread();
+  // Not over the right column's cards, whose column still holds the thread it showed last: that Back
+  // was the X with nothing to close, and put the cards back at their foot. `#277 thread-card-focus`.
+  else if (channelOnScreen() && channelView === "thread" && !(sideActive && columns.side.mode === "list")) leaveThread();
   else return false;
   return true;
 }
@@ -7479,7 +7508,8 @@ function closeDetailsOn(target) {
  * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
- * holds (`isBarPicker`); then Back: out of Settings, Help, Reply or the Threads screen, or out of a
+ * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
+ * thread-card-focus`); then Back: out of Settings, Help, Reply or the Threads screen, or out of a
  * thread. Returns whether it did anything. With none of those it does nothing:
  * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
  */
@@ -7512,6 +7542,7 @@ function onEscape(event, target) {
     focusList(paneFor(target));
     return true;
   }
+  if (putOutLitCard()) return true;
   return goBack();
 }
 
@@ -7613,9 +7644,9 @@ const KEYS_WRITING = "Writing";
 const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
-    does: "Back: closes a menu, the search or a sheet, leaves Settings, Help, Reply, Threads or a thread. " +
-      "In a message box with text in it, leaves the box first and keeps the draft; on the channel or " +
-      "thread picker, back to the messages",
+    does: "Back: closes a menu, the search or a sheet, takes the highlight off a thread card, leaves Settings, " +
+      "Help, Reply, Threads or a thread. In a message box with text in it, leaves the box first and keeps the " +
+      "draft; on the channel or thread picker, back to the messages",
     controls: ["close-settings", "close-reply", "close-help", "close-threads", "thread-back", "side-close"],
     run: (event, target) => onEscape(event, target),
   },
@@ -7679,19 +7710,22 @@ const KEYMAP = [
   },
   {
     group: KEYS_MOVING, chords: [{ key: "Enter" }, { key: "o" }],
-    does: "Open or close the selected message, as a tap does (in Read, read it aloud). On a “… read messages …” line, open the run",
-    rowControls: ["fold"],
+    does: "Open or close the selected message, as a tap does (in Read, read it aloud). On a “… read messages …” line, " +
+      "open the run. On a thread card, highlight it and show all of it, or put that out",
+    rowControls: ["fold", "side-card"],
     run: (event, target) => openFromKeyboard(event, target),
   },
   {
     group: KEYS_MOVING, chords: [{ key: "ArrowRight" }],
-    does: "Into the thread of the selected message. In two columns it opens on the right, and the keys go with it",
-    rowControls: ["thread-badge"],
+    does: "Into the thread of the selected message. On the thread cards, into the highlighted card's thread, or " +
+      "else the selected card's. In two columns it opens on the right, and the keys go with it",
+    rowControls: ["thread-badge", "side-card-open", "thread-card-open"],
     run: (event, target) => threadFromKeyboard(target),
   },
   {
     group: KEYS_MOVING, chords: [{ key: "ArrowLeft" }],
-    does: "Out of a thread, back where you came from. In two columns, from the right column back to Main",
+    does: "Out of a thread, back where you came from. In two columns, from the right column back to Main, or " +
+      "back to the thread cards from a thread entered from one",
     controls: ["thread-back"],
     run: () => threadOutFromKeyboard(),
   },
@@ -15245,7 +15279,7 @@ function catchUpHeldView() {
   if (ids(projected) === ids(held)) return false;
   if (threads) {
     timelineThreads = projected;
-    el("thread-list").replaceChildren(...projected.map(threadCard));
+    el("thread-list").replaceChildren(...threadCards(projected));
   } else {
     timelineMessages = projected;
     renderCachedTimeline();
@@ -16087,23 +16121,42 @@ function renderThreadDirectory() {
   el("thread-directory-retry").hidden = !threadDirectory.failed;
 }
 
-function threadCard(summary) {
+/** The Threads list's cards for `summaries`, their unread replies counted once for them all. */
+function threadCards(summaries) {
+  const tally = replyTally();
+  return summaries.map((summary) => threadCard(summary, tally));
+}
+
+/**
+ * A card of the Threads list. `#277 thread-card-focus`: as the right column's cards are (`sideCard`).
+ * Its button, the thread's name, highlights it, and shows under the name what the thread is about —
+ * its summary, else its first message's words — which the card keeps to itself otherwise; the button
+ * beside it, "3 replies · 2 unread", goes into the thread.
+ */
+function threadCard(summary, tally) {
+  const id = String(summary.id);
+  const choice = threadChoice(id, summary);
   const row = document.createElement("li");
   row.className = "thread-card";
-  row.setAttribute("data-context-id", String(summary.id));
+  row.setAttribute("data-context-id", id);
   row.style.setProperty("--thread-hue", threadHue(summary.id));
   const button = document.createElement("button");
   button.className = "thread-open";
   button.setAttribute("type", "button");
   const title = document.createElement("strong");
   // `#194 thread-picker-polish`: the name the selector and the heading use, given the card's room.
-  title.textContent = threadName(threadChoice(summary.id, summary), Infinity);
-  const meta = document.createElement("span");
-  meta.className = "meta";
-  meta.textContent = threadCount(summary.reply_count, summary.reply_count_exact);
-  button.append(title, meta);
-  button.addEventListener("click", inThisColumn(() => guardQuietly(() => openThread(summary.id, summary))()));
-  row.append(button);
+  title.textContent = threadName(choice, Infinity);
+  const said = typeof summary.summary === "string" ? summary.summary.trim() : "";
+  const first = choice.root ? messageText(choice.root).replace(/\s+/g, " ").trim() : "";
+  const about = document.createElement("span");
+  about.className = "thread-card-text";
+  about.textContent = said || (first === title.textContent ? "" : first);
+  button.append(title, about);
+  button.addEventListener("click", () => toggleLitCard(id, row));
+  const open = cardOpener("thread-card", sideCardReplies(choice, tally), sideCardUnread(choice, tally),
+    inThisColumn(() => guardQuietly(() => enterCard(id, summary, row))()));
+  row.append(button, open);
+  paintLitCard(row, id);
   // `#129 message-search`. A thread card is what stands in this list where messages stand in the
   // others, so the filter has to reach it or searching on the threads tab silently does nothing.
   searchable(row, title.textContent);
@@ -17241,10 +17294,10 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
     list.replaceChildren(...glom(shown.filter((m) => !heldIds.has(String(m.id)))).map(discordNode), ...list.children);
     const cards = el("thread-list");
     const heldThreads = new Set([...cards.children].map((row) => row.getAttribute("data-context-id")));
-    cards.replaceChildren(...timelineThreads.filter((t) => !heldThreads.has(String(t.id))).map(threadCard), ...cards.children);
+    cards.replaceChildren(...threadCards(timelineThreads.filter((t) => !heldThreads.has(String(t.id)))), ...cards.children);
   } else {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
-    el("thread-list").replaceChildren(...timelineThreads.map(threadCard));
+    el("thread-list").replaceChildren(...threadCards(timelineThreads));
   }
   // The arrows are measured once, by the pass over the search every caller ends with. `#226`.
   holdingReplyArrows(renderChannelRows);
@@ -29964,9 +30017,10 @@ let sideCardsDrawn = "";
 
 /**
  * One card per thread the channel's store knows — the Threads screen's source — each a fixed three
- * lines of what the thread is about, then how long since it moved, how many replies it has and how
- * many of them are unread. Choosing one selects it. Redrawn only when what it would draw has changed,
- * so a refresh with nothing new draws nothing here either.
+ * lines of what the thread is about, then how long since it moved, and the button into it saying how
+ * many replies it has and how many of them are unread. A press on a card highlights it (`#277
+ * thread-card-focus`); its button selects it. Redrawn only when what it would draw has changed, so a
+ * refresh with nothing new draws nothing here either.
  *
  * `#261 two-column-connectors`. NEWEST ACTIVITY AT THE FOOT, as the channel's own lists have their
  * newest message: the owner, "We have the main chat views in forward-chronological mode with newest at
@@ -30011,9 +30065,10 @@ function renderSideCards() {
  * Where the reader is in the cards, to put them back after the cards change under them: a thread that
  * moved going to the foot, the cards filtered, the line over them coming or going. `#261
  * two-column-connectors`. As a list of messages keeps its reader (`keepingFilterPlace`, whose rules
- * these are): the reader on the foot follows it; else the selected card while it shows, else the
- * first card showing, stays at its height. Null with the cards not on screen, and while they are
- * being opened, which places the reader itself (`placeOpenedCards`).
+ * these are): the reader on the foot follows it; else the highlighted card while it shows (`#277
+ * thread-card-focus`), else the selected one, else the first card showing, stays at its height. Null
+ * with the cards not on screen, and while they are being opened, which places the reader itself
+ * (`placeOpenedCards`).
  *
  * @returns {{newest: boolean, id: string | null, offset: number} | null}
  */
@@ -30029,8 +30084,8 @@ function cardAnchor() {
     return box.bottom > top && box.top < foot;
   };
   const mark = markOf(sidePane);
-  const chosen = mark ? rows.find((row) => row.getAttribute("data-id") === mark.id) : undefined;
-  const row = chosen && seen(chosen) ? chosen : rows.find(seen);
+  const card = (/** @type {string | null} */ id) => (id === null ? undefined : rows.find((one) => one.getAttribute("data-id") === id));
+  const row = [card(litCard()), card(mark ? mark.id : null)].find((one) => one && seen(one)) || rows.find(seen);
   if (!row) return null;
   return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top };
 }
@@ -30259,41 +30314,257 @@ function refilterSideCards() {
   keepingCardPlace(filterSideCards);
 }
 
-/** One card. Every string is text; nothing from the chat service is parsed as markup. */
+/**
+ * One card. Every string is text; nothing from the chat service is parsed as markup.
+ *
+ * `#277 thread-card-focus`. The row is the card, edged in its thread's colour. Its first button, what
+ * the thread is about, highlights it (`toggleLitCard`), and so does a press anywhere else on the card
+ * but the button under it, which goes into the thread and says how many replies it has and how many of
+ * them are unread (`cardOpener`). Beside that, how long since the thread moved.
+ */
 function sideCard({ choice, text, root, age, replies, unread }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
   row.setAttribute("data-id", choice.id);
   row.setAttribute("data-card", "");
+  row.style.setProperty("--thread-hue", threadHue(choice.id));
   const button = document.createElement("button");
   button.className = "side-card";
   button.setAttribute("type", "button");
-  button.style.setProperty("--thread-hue", threadHue(choice.id));
   const body = document.createElement("span");
   body.className = "side-card-text";
   body.textContent = text;
+  button.append(body);
+  button.addEventListener("click", () => toggleLitCard(choice.id, row));
+  sayRowShortcut(button, "side-card");
   const facts = document.createElement("span");
   facts.className = "side-card-facts";
-  facts.textContent = [age, replies].filter((part) => part !== "").join(" · ");
-  if (unread) {
-    const chip = document.createElement("span");
-    chip.className = "side-card-unread";
-    chip.textContent = unread;
-    facts.append(chip);
-    // `#259 thread-list-unread-filter`: what Unread only keeps.
-    row.setAttribute("data-unread", "");
-  }
-  button.append(body, facts);
+  facts.textContent = age;
+  // `#259 thread-list-unread-filter`: what Unread only keeps.
+  if (unread) row.setAttribute("data-unread", "");
+  const open = cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(choice.id, choice.summary, row))());
+  row.append(button, facts, open);
+  // A press on the card's facts, or on its edge round the buttons, is a press on the card. Its two
+  // buttons answer their own.
+  row.addEventListener("click", (event) => {
+    const at = event && event.target;
+    if (at && at !== row && !nodeWithin(facts, at)) return;
+    toggleLitCard(choice.id, row);
+  });
   // Where the search says it found the card in its replies (`markReplyMatch`).
   /** @type {any} */ (row).cardFacts = facts;
-  button.addEventListener("click", () => guardQuietly(() => selectSideThread(choice.id, choice.summary))());
-  row.append(button);
+  paintLitCard(row, choice.id);
   // `#129 message-search`. A card stands in this list where messages stand in the others, so the
   // search reaches it, as it reaches the cards of the Threads list; and by its first message's words
   // where the card says a summary of them. `#262 search-load-older`.
   searchable(row, text, threadName(choice, Infinity), root);
   return row;
+}
+
+// --- one card highlighted ------------------------------------------------------------------------
+//
+// `#277 thread-card-focus`. The owner, 2026-10-13, of the thread cards: "It is VERY busy with all the
+// colored lines... Let's make it so when we highlight a thread card all the other lines grey out and we
+// can see what we've highlighted. I also don't like the cards expanding. Let's leave the thread cards
+// contracted. Let's CLICK to put a persistent highlight and expand on one card (NOT enter the thread).
+// To enter the thread you can click the 'N reply M unread' bit let's say or press '->' to go into the
+// thread."
+//
+// The cards are the right column's in two columns and the Threads list's in one, and both work so:
+//
+//   * EVERY CARD STAYS CONTRACTED: three lines on the right, the thread's name in the list. `#257
+//     summary-truncation` showed the whole of the card under the mouse or the keys, and with the mouse
+//     moving over the cards that was a card growing and shrinking under it at every move.
+//   * A PRESS ON A CARD HIGHLIGHTS IT — a click anywhere on it but its replies button, or Enter on it
+//     with the keys or Tab — and shows it whole. It stays: the mouse moving over the cards, the keys
+//     walking through them and the cards drawn again leave it where it is. Another card pressed takes
+//     it, and the same one pressed again or Esc puts it out. One per channel, for the session.
+//   * WHILE ONE IS HIGHLIGHTED, EVERY OTHER CARD'S EDGE AND UNREAD COUNT GO GREY, and so does every
+//     other link between the columns, the highlighted card's drawn over them: the stylesheet greys the
+//     cards while the highlighted one shows (a card a filter hides greys nothing), and the links are
+//     greyed where they are drawn (`planColumnLinks`).
+//   * THE WAY IN is the card's "3 replies · 2 unread", a button of its own (`cardOpener`), or →: into
+//     the highlighted card's thread, or with none the card the keys are on — and on a card's own
+//     button, where Tab leaves the focus, that card's (`cardForArrow`). In two columns ← comes back out
+//     to the cards, the keys on the card entered, as Esc and the X come back to them; in one column ←,
+//     Esc and Back come back to the Threads list, as they always did.
+
+/**
+ * By channel, the thread whose card is highlighted, for this session.
+ *
+ * @type {Map<string, string>}
+ */
+const litCards = new Map();
+
+/** The thread whose card is highlighted in the channel on screen, or null. */
+function litCard() {
+  return litCards.get(String(el("discord-channel").value)) || null;
+}
+
+/** The thread a card of either list stands for. */
+const cardThread = (/** @type {HTMLElement} */ row) =>
+  String(row.getAttribute(row.hasAttribute("data-card") ? "data-id" : "data-context-id"));
+
+/**
+ * Draw `row`, the card of thread `id`, highlighted or not: `data-highlighted` on it, which the stylesheet
+ * draws, and its button saying whether the card is expanded. Written only where it changes.
+ *
+ * @param {HTMLElement} row
+ * @param {string} id
+ */
+function paintLitCard(row, id) {
+  const lit = litCard() === id;
+  if (row.hasAttribute("data-highlighted") !== lit) {
+    if (lit) row.setAttribute("data-highlighted", "true");
+    else row.removeAttribute("data-highlighted");
+  }
+  const button = childByClass(row, row.hasAttribute("data-card") ? "side-card" : "thread-open");
+  const expanded = lit ? "true" : "false";
+  if (button && button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
+}
+
+/** Draw every card of both lists as the highlight now stands, and the links between the columns with it. */
+function paintLitCards() {
+  for (const list of ["side-cards", "thread-list"]) {
+    for (const row of /** @type {HTMLElement[]} */ ([...leftEl(list).children])) paintLitCard(row, cardThread(row));
+  }
+  noteLinkedSelection();
+}
+
+/**
+ * A press on card `row`, of thread `id`: highlighted, or put out when it is the one highlighted. The card
+ * stays where it was on the screen, and is then shown whole where it fits: a card grown past the foot of
+ * its list comes up as far as shows it, and one taking the highlight from a card above it does not jump
+ * up as that one shrinks.
+ *
+ * @param {string} id
+ * @param {HTMLElement} row
+ */
+function toggleLitCard(id, row) {
+  const channel = String(el("discord-channel").value);
+  if (litCards.get(channel) === id) litCards.delete(channel);
+  else litCards.set(channel, id);
+  const pane = row.parentNode === leftEl("side-cards") ? sidePane : channelPane;
+  const before = rowShown(row) ? row.getBoundingClientRect().top : null;
+  paintLitCards();
+  if (before === null || !row.parentNode) return;
+  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;
+  bringIntoView(pane, row);
+}
+
+/**
+ * A card's way into its thread: "3 replies · 2 unread", the owner's "N reply M unread" bit, a button of
+ * its own beside the card's, which only highlights. Its parts are named for its list, by `prefix`:
+ * "side-card" on the right, "thread-card" in the Threads list. With no count and nothing unread it says
+ * "Open thread". A screen reader hears what it does, in the words it shows.
+ *
+ * @param {string} prefix
+ * @param {string} replies "3 replies", "about 3 replies", or "".
+ * @param {string} unread "2 unread", "2+ unread", "1 new", or "".
+ * @param {() => void} open
+ */
+function cardOpener(prefix, replies, unread, open) {
+  const button = document.createElement("button");
+  button.className = `${prefix}-open`;
+  button.setAttribute("type", "button");
+  const parts = [];
+  if (replies || !unread) {
+    const count = document.createElement("span");
+    count.className = `${prefix}-replies`;
+    count.textContent = replies || "Open thread";
+    parts.push(count);
+  }
+  if (unread) {
+    const fresh = document.createElement("span");
+    fresh.className = `${prefix}-unread`;
+    fresh.textContent = unread;
+    if (parts.length) parts.push(document.createTextNode(" · "));
+    parts.push(fresh);
+  }
+  button.append(...parts);
+  const said = [replies, unread].filter(Boolean).join(" · ");
+  button.setAttribute("aria-label", said ? `Open this thread, ${said}` : "Open thread");
+  button.setAttribute("title", "Open this thread");
+  sayRowShortcut(button, `${prefix}-open`);
+  button.addEventListener("click", open);
+  return button;
+}
+
+/**
+ * Into the thread of card `row`, by its replies button or →. In two columns on the right, noted as
+ * entered from the cards so that ← goes back out to them (`threadOutFromKeyboard`); in one column as
+ * any thread opens, its Back the way to the Threads list.
+ *
+ * @param {string} id
+ * @param {any} summary
+ * @param {HTMLElement} row
+ */
+function enterCard(id, summary, row) {
+  if (row.parentNode !== leftEl("side-cards")) return openThread(id, summary);
+  const opened = selectSideThread(id, summary);
+  columns.side.fromCards = true;
+  return opened;
+}
+
+/** The right column's card of thread `id`, or null. */
+function cardRowOnRight(/** @type {string | null} */ id) {
+  if (id === null) return null;
+  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).find((row) => row.getAttribute("data-id") === id) || null;
+}
+
+/** The thread whose card is highlighted while that card shows on the right beside Main, which the links follow; else null. */
+function litCardOnRight() {
+  if (!columnLinksShown()) return null;
+  const row = cardRowOnRight(litCard());
+  return row && rowShown(row) ? String(row.getAttribute("data-id")) : null;
+}
+
+/**
+ * The thread cards on screen: the right column's while two columns show them, or the Threads list in one
+ * column. Null otherwise.
+ *
+ * @returns {HTMLElement | null}
+ */
+function cardsOnScreen() {
+  if (!channelOnScreen()) return null;
+  if (columnsShown) return columns.side.mode === "list" ? leftEl("side-cards") : null;
+  return inColumn(columns.main, () => (channelView === "threads" && !pinnedOnly ? leftEl("thread-list") : null));
+}
+
+/**
+ * The card → goes into, on the cards on screen — the right column's while the key is for that column,
+ * or the Threads list in one column: the card whose own button holds the focus, as Tab leaves it, which
+ * is the card the key was pressed on; else the highlighted card while it shows; else, on the right, the
+ * card the keys are on, while it is on screen. Null anywhere else.
+ *
+ * @param {HTMLElement} target
+ * @returns {HTMLElement | null}
+ */
+function cardForArrow(target) {
+  const list = cardsOnScreen();
+  const right = list === leftEl("side-cards");
+  if (!list || (right && paneFor(target) !== sidePane)) return null;
+  const rows = /** @type {HTMLElement[]} */ ([...list.children]).filter(rowShown);
+  const held = rows.find((row) => row !== target && nodeWithin(row, target));
+  if (held) return held;
+  const lit = litCard();
+  const chosen = lit === null ? undefined : rows.find((row) => cardThread(row) === lit);
+  if (chosen) return chosen;
+  if (!right) return null;
+  const { row } = keyContext(target);
+  return row && row.hasAttribute("data-card") && rowInView(sidePane, row) ? row : null;
+}
+
+/** Esc: the highlighted card on screen put out. Whether there was one. */
+function putOutLitCard() {
+  const list = cardsOnScreen();
+  const lit = litCard();
+  const row = list && lit !== null
+    ? /** @type {HTMLElement[]} */ ([...list.children]).find((one) => cardThread(one) === lit && rowShown(one)) : undefined;
+  if (!row || lit === null) return false;
+  toggleLitCard(lit, row);
+  return true;
 }
 
 /** The right column with no thread selected: its cards, and the thread list read behind them. */
@@ -30312,6 +30583,8 @@ function selectSideThread(id, summary = null) {
   const thread = String(id);
   const channel = String(el("discord-channel").value);
   if (!columnsShown || !channel) return undefined;
+  // Entered from its card, `enterCard` says so once this returns. `#277 thread-card-focus`.
+  columns.side.fromCards = false;
   const known = summary || channelCanon.threads.find((held) => String(held.id) === thread) || null;
   sideThreads.set(channel, { id: thread, summary: known });
   const was = columns.side.mode;
@@ -30458,6 +30731,8 @@ function inSideThread(message) {
 //   * The SELECTED message or card, in either column (`#239 single-selection`), draws its link even
 //     when the other end is off screen: from the end on screen to the gap, then up or down to the edge
 //     of the other column, where an arrowhead points the way to it. Drawn over the others, heavier.
+//   * A HIGHLIGHTED card (`#277 thread-card-focus`) takes the selection's place while it shows: its
+//     link is the one drawn so, whatever the mouse is over, and every other link is grey.
 //   * And if it stays selected for COLUMN_GLIDE_MS with the other end off screen, the other column
 //     scrolls smoothly until that end is level with it (`glideToCounterpart`) — unless the selection
 //     moves or the reader scrolls that column first. Where the reader's system asks for reduced
@@ -30533,6 +30808,17 @@ function selectedLinkPair(pairs) {
   const lit = pane ? pane.lit : null;
   if (!lit) return null;
   return pairs.find((pair) => (pane === sidePane ? pair.card : pair.row) === lit) || null;
+}
+
+/**
+ * The pair whose link is drawn heavy and over the rest: the highlighted card's while it shows, whatever
+ * is selected (`#277 thread-card-focus`), else the selection's. Null when that end has no pair.
+ *
+ * @param {{thread: string, row: HTMLElement, card: HTMLElement}[]} pairs
+ */
+function chosenLinkPair(pairs) {
+  const lit = litCardOnRight();
+  return lit !== null ? pairs.find((pair) => pair.thread === lit) || null : selectedLinkPair(pairs);
 }
 
 /**
@@ -30617,10 +30903,14 @@ const linkAt = (value, origin) => Math.round((value - origin) * 2) / 2;
  * its colour, whether it is the selection's, which way it is clipped ("up" or "down", or "both" ends
  * shown), the line and the marks at its ends. The selection's is last, so it is drawn over the rest.
  *
+ * `lit`, the thread whose card is highlighted while it shows (`#277 thread-card-focus`): every other
+ * link is `dimmed`, drawn grey, so the highlighted card's stands out.
+ *
  * @param {ReturnType<typeof measureColumnLinks>} measured
  * @param {{thread: string, row: HTMLElement, card: HTMLElement} | null} chosen
+ * @param {string | null} [lit]
  */
-function planColumnLinks(measured, chosen) {
+function planColumnLinks(measured, chosen, lit = null) {
   const { corner, left, right, gap, ends } = measured;
   const links = [];
   for (const end of ends) {
@@ -30686,7 +30976,7 @@ function planColumnLinks(measured, chosen) {
       marks = `${pointing(lx, fy, link.clip)} ${into(tx, ty)}`;
     }
     return { thread: link.end.pair.thread, hue: threadHue(link.end.pair.thread), selected: link.selected,
-      clip: link.clip, line, marks };
+      dimmed: lit !== null && link.end.pair.thread !== lit, clip: link.clip, line, marks };
   });
   return [...plan.filter((link) => !link.selected), ...plan.filter((link) => link.selected)];
 }
@@ -30731,6 +31021,11 @@ function drawLinkPath(path, kind, link, d) {
     if (link.selected) path.setAttribute("data-selected", "true");
     else path.removeAttribute("data-selected");
   }
+  // Grey beside a highlighted card. `#277 thread-card-focus`.
+  if (path.hasAttribute("data-dimmed") !== link.dimmed) {
+    if (link.dimmed) path.setAttribute("data-dimmed", "true");
+    else path.removeAttribute("data-dimmed");
+  }
   if (path.style.getPropertyValue("--thread-hue") !== String(link.hue)) path.style.setProperty("--thread-hue", String(link.hue));
 }
 
@@ -30757,7 +31052,7 @@ function scheduleColumnLinks() {
       return;
     }
     const pairs = columnLinkPairs();
-    renderColumnLinks(pairs.length ? planColumnLinks(measureColumnLinks(pairs), selectedLinkPair(pairs)) : []);
+    renderColumnLinks(pairs.length ? planColumnLinks(measureColumnLinks(pairs), chosenLinkPair(pairs), litCardOnRight()) : []);
   });
 }
 
@@ -30770,14 +31065,19 @@ let columnGlide = /** @type {{key: string, other: HTMLElement, at: number, timer
 /**
  * The selection was drawn again (`drawSelection`): the links follow it, and a selection that is new
  * arms the wait before its other end is brought on screen, which the old one's no longer is.
+ *
+ * `#277 thread-card-focus`. While a card is highlighted, it is what the links follow instead: a card
+ * highlighted arms the wait for its own root, and the mouse passing over other cards arms nothing.
  */
 function noteLinkedSelection() {
+  const card = litCardOnRight();
   const pane = activePane();
   const lit = pane ? pane.lit : null;
-  const key = pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
+  const key = card !== null ? `card:${card}` : pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
   if (key !== linkedSelection) {
     linkedSelection = key;
-    armColumnGlide(pane, lit);
+    if (card !== null) armColumnGlide(sidePane, cardRowOnRight(card));
+    else armColumnGlide(pane, lit);
   }
   scheduleColumnLinks();
 }
@@ -30812,7 +31112,7 @@ function glideToCounterpart() {
   if (!glide || glide.key !== linkedSelection || document.hidden || !columnLinksShown()) return;
   if (Math.abs(glide.other.scrollTop - glide.at) > 1) return;
   const pairs = columnLinkPairs();
-  const chosen = selectedLinkPair(pairs);
+  const chosen = chosenLinkPair(pairs);
   if (!chosen) return;
   const measured = measureColumnLinks([chosen]);
   const [end] = measured.ends;

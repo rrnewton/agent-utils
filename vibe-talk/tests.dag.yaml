@@ -396,10 +396,11 @@ steps:
   # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column
   # side by side inside the window at 1440x900 and 1280x800, neither under 440px, the view picker
   # greyed and the width handle gone; the right column's cards are one height, newest activity at the foot,
-  # the summarised thread by its name and summary and the long question cut to three lines; a card and
-  # a Main message's Thread(N) select a thread on the right under its name, each column scrolls alone
-  # under the wheel over it, the X goes back to the cards, a 900px window is one column in the view it
-  # was in and two again when widened, real keys (] Esc j Enter [) move between the columns and through
+  # the summarised thread by its name and summary and the long question cut to three lines, still three
+  # under the mouse and whole once a click highlights it (`#277 thread-card-focus`); a card's replies
+  # button and a Main message's Thread(N) select a thread on the right under its name, each column scrolls
+  # alone under the wheel over it, the X goes back to the cards, a 900px window is one column in the view
+  # it was in and two again when widened, real keys (] Esc j -> [) move between the columns and through
   # the cards, and a phone's width draws neither the button nor the column. `#261 two-column-connectors`:
   # the links from Main's roots to their cards drawn for exactly the pairs on screen, touching their
   # boxes in their colours, the selected card's link pointing off screen, Main's 1.5 s glide to its
@@ -418,6 +419,27 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 22
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#277 thread-card-focus` in the browser engine, at 1280x800 over the right column's cards with a mouse
+  # and the keys, and at 412x915 over the Threads list by touch: every card contracted, the one under the
+  # mouse too; a click or a tap highlights one, shown whole and not entered, and every other card's edge
+  # and every other link turns the page's grey — by the colour Chromium computes and by the pixels a
+  # screenshot holds there — the highlighted card's own staying in its thread's colour; its replies button
+  # enters its thread, <- or Back comes out to it still highlighted, Esc puts the highlight out, and ->
+  # enters the card the keys are on. Measured on 2026-10-13: about 5s wall.
+  - group: check
+    job: thread-card-focus-browser
+    desc: one thread card highlighted and shown whole, every other card's edge and link grey by computed colour and by pixels, its replies button and -> entering it, <- and Esc coming back, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_card_focus_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

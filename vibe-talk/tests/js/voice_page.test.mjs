@@ -27459,14 +27459,17 @@ test("Threads is ordered oldest to newest, opens at bottom and returns to its sa
   assert.equal(list.hidden, false);
   assert.equal(page.el("discord-log").hidden, true);
   assert.deepEqual(list.children.map((row) => row.getAttribute("data-context-id")), page.threads.map((t) => t.id));
-  assert.equal(list.children[0].text(), "First discussion1 reply");
-  assert.doesNotMatch(list.children[0].text(), /first thread root/,
-    "the root body was repeated after the short thread title and reply count");
+  // `#277 thread-card-focus`: its name, then the button into it. What the thread is about is said by the
+  // card highlighted alone (`.thread-card-text`, which the stylesheet shows on that card only).
+  assert.equal(list.children[0].children[0].children[0].text(), "First discussion");
+  assert.match(openerOf(list.children[0], "thread-card-open").text(), /^1 reply( · 1 unread)?$/);
+  assert.deepStrictEqual(list.children[0].descendants().filter((node) => /first thread root/.test(node.textContent))
+    .map((node) => node.className), ["thread-card-text"], "the root body was repeated after the short thread title and reply count");
   const area = page.el("scroll-area");
   assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
   area.scrollTop = 30;
   const reads = page.timelineCalls.length;
-  await list.children[0].children[0].click();
+  await openerOf(list.children[0], "thread-card-open").click();
   assert.equal(page.el("thread-heading").hidden, false);
   assert.equal(page.el("thread-title").textContent, "First discussion");
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["201", "202"]);
@@ -30813,7 +30816,7 @@ test("one store per channel: every view it covered is drawn after a reload with 
   const data = threadData();
   await first.el("channel-view-threads").click();
   await first.settle();
-  await first.el("thread-list").children[0].children[0].click();
+  await openerOf(first.el("thread-list").children[0], "thread-card-open").click();
   await first.settle();
   await first.el("thread-back").click();
   await first.el("channel-view-flat").click();
@@ -30847,7 +30850,7 @@ test("one store per channel: every view it covered is drawn after a reload with 
   await page.settle();
   assert.deepStrictEqual(page.el("thread-list").children.map((card) => card.getAttribute("data-context-id")),
     data.threads.map((t) => t.id));
-  page.el("thread-list").children[0].children[0].click();
+  openerOf(page.el("thread-list").children[0], "thread-card-open").click();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
   assert.equal(page.el("thread-title").textContent, "First discussion");
@@ -30922,7 +30925,7 @@ test("switching Main, Threads, All and a read thread in one page is local, and e
   const page = await threadPage();
   const data = threadData();
   await page.el("channel-view-threads").click();
-  await page.el("thread-list").children[0].children[0].click();
+  await openerOf(page.el("thread-list").children[0], "thread-card-open").click();
   await page.el("thread-back").click();
   await page.el("channel-view-flat").click();
   await page.el("channel-view-main").click();
@@ -30945,7 +30948,7 @@ test("switching Main, Threads, All and a read thread in one page is local, and e
   await page.el("channel-view-threads").click();
   assert.equal(page.el("thread-list").children.at(-1).getAttribute("data-context-id"), first.id,
     "the thread with the newest activity did not move to the bottom");
-  await page.el("thread-list").children.at(-1).children[0].click();
+  await openerOf(page.el("thread-list").children.at(-1), "thread-card-open").click();
   assert.deepStrictEqual(shownIds(page), ["201", "202", "205"], "the thread missed its own live reply");
   await page.el("thread-back").click();
   await page.el("channel-view-main").click();
@@ -42181,9 +42184,11 @@ const cardOf = (page, id) => {
   const row = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id);
   return row ? row.children[0] : null;
 };
+/** A part of a card, by its class, as text. Anywhere on the card's row: since `#277 thread-card-focus` its
+ * facts and its way into the thread stand beside its button, which holds what the thread is about. */
 const cardPart = (page, id, name) => {
-  const card = cardOf(page, id);
-  const part = card ? card.descendants().find((node) => node.className === name) : null;
+  const row = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id);
+  const part = row ? row.descendants().find((node) => node.className === name) : null;
   return part ? part.text() : null;
 };
 /** The timeline reads made since `from`, as their views: "thread", "main", "flat", "threads". */
@@ -42387,8 +42392,10 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   assert.deepStrictEqual(cardIds(page), [first.id, second.id], "the cards are not newest activity at the foot");
   assert.equal(cardPart(page, first.id, "side-card-text"), "runner-wedged: The overnight runner hung and was restarted by hand.");
   assert.equal(cardPart(page, second.id, "side-card-text"), "second thread root");
-  assert.match(cardPart(page, first.id, "side-card-facts"), /^(now|\d+[mhdwy]|\d+d\d+h) · 1 reply/,
-    "the card does not say how long since the thread moved and how many replies it has");
+  // `#277 thread-card-focus`: how long since it moved, and beside that the button into it with its count.
+  assert.match(cardPart(page, first.id, "side-card-facts"), /^(now|\d+[mhdwy]|\d+d\d+h)$/,
+    "the card does not say how long since the thread moved");
+  assert.match(cardPart(page, first.id, "side-card-replies"), /^1 reply$/, "the card does not say how many replies it has");
   for (const id of cardIds(page)) {
     assert.ok(page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id).hasAttribute("data-card"));
   }
@@ -42397,17 +42404,14 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   assert.match(text, /-webkit-line-clamp:\s*3/);
   assert.match(text, /overflow:\s*hidden/);
   assert.match(text, /height:\s*calc\(3 \* 1\.35em\)/, "a card is not a fixed three lines tall");
-  // `#257 summary-truncation`: save the card the reader is on — under the mouse or the keys, which is
-  // the selected one — which shows its whole text, three lines tall at least, so nothing the clamp
-  // cuts is out of reach.
-  for (const lit of ['.side-card-row[data-selected="true"] > .side-card > .side-card-text',
-    ".side-card:focus-visible > .side-card-text"]) {
-    const whole = cssBlockIn(TWO_COLUMN_QUERY, lit);
-    assert.match(whole, /-webkit-line-clamp:\s*none/, `${lit} is still clamped`);
-    assert.match(whole, /overflow:\s*visible/, `${lit} still hides what runs over`);
-    assert.match(whole, /(^|[^-])height:\s*auto/, `${lit} is still a fixed three lines tall`);
-    assert.match(whole, /min-height:\s*calc\(3 \* 1\.35em\)/, `${lit} shrinks a short card as it is lit`);
-  }
+  // `#257 summary-truncation`, since `#277 thread-card-focus`: save the card highlighted, which shows its
+  // whole text, three lines tall at least, so nothing the clamp cuts is out of reach. The card under the
+  // mouse or the keys does not: see `#277`'s own tests below.
+  const whole = cssBlockIn(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
+  assert.match(whole, /-webkit-line-clamp:\s*none/, "the highlighted card is still clamped");
+  assert.match(whole, /overflow:\s*visible/, "the highlighted card still hides what runs over");
+  assert.match(whole, /(^|[^-])height:\s*auto/, "the highlighted card is still a fixed three lines tall");
+  assert.match(whole, /min-height:\s*calc\(3 \* 1\.35em\)/, "the highlighted card shrinks a short card as it is lit");
   // A long first message is given whole, its line breaks folded, for the clamp to cut.
   page.threads = [];
   const long = message({ id: "210", content: "a long first message\n\nthat runs over several lines " + "and on ".repeat(40),
@@ -42452,7 +42456,7 @@ test("`#229 desktop-two-column`: every way into a thread selects it on the right
   assert.equal(page.el("side-close").hidden, true);
   assert.equal(page.el("side-title").textContent, "Threads");
   const reads = page.timelineCalls.length;
-  await cardOf(page, first.id).click();
+  await openerOf(cardRow(page, first.id)).click();
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["201", "202"], "a card did not select its thread");
   // Drawn from what the page holds: All was read, and covers both threads.
@@ -42611,7 +42615,7 @@ test("`#229 desktop-two-column`: the search and Links reach both columns, and th
   assert.deepStrictEqual(visible("side-log"), ["201", "202"], "closing the search left the right column filtered");
 });
 
-test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → selects a Main message's thread on the right, ← goes back, Esc closes the thread, and Enter opens a card", async () => {
+test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → selects a Main message's thread on the right, ← goes back, Esc closes the thread, and → opens a card", async () => {
   const page = await threadPage();
   await twoColumns(page);
   page.el("scroll-area").focus();
@@ -42622,10 +42626,11 @@ test("`#229 desktop-two-column`: [ and ] move the keys between the columns, → 
   assert.equal(focused(page), card, `j did not select the first card: ${focusName(page)}`);
   await press(page, card, "j");
   assert.equal(focused(page), page.el("side-cards").children[1]);
-  await press(page, focused(page), "Enter");
+  // `#277 thread-card-focus`: → goes into a card's thread; Enter highlights the card (its own test, below).
+  await press(page, focused(page), "ArrowRight");
   await page.settle();
   // The second card, the newer thread: the cards have their newest at the foot (`#261`).
-  assert.deepStrictEqual(sideIds(page), ["203", "204"], "Enter on a card did not select its thread");
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "→ on a card did not select its thread");
   await press(page, page.el("side-scroll"), "[");
   assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
     `[ did not give the keys to the left column: ${focusName(page)}`);
@@ -42874,12 +42879,12 @@ test("`#229 desktop-two-column`: keys for the page — another channel, the Pinn
 // hovering mouse, a thread read twice when it was selected under a poll, no guard on the cards'
 // no-op refresh, and a dead declaration.
 
-/** A card's facts without its unread chip: how long since its thread moved, and its reply count. */
-const cardFacts = (page, id) => {
-  const facts = cardPart(page, id, "side-card-facts") || "";
-  const chip = cardPart(page, id, "side-card-unread") || "";
-  return chip && facts.endsWith(chip) ? facts.slice(0, -chip.length) : facts;
-};
+/**
+ * A card's facts without its unread chip: how long since its thread moved, and its reply count — the
+ * second said by its button into the thread since `#277 thread-card-focus`, beside the first.
+ */
+const cardFacts = (page, id) =>
+  [cardPart(page, id, "side-card-facts"), cardPart(page, id, "side-card-replies")].filter(Boolean).join(" · ");
 
 test("`#231 two-column-polish`: a live reply counts on its thread's card at once, with its unread chip, and not a minute later at the thread list's next read", async () => {
   const { page, server, data } = await twoColumnServer();
@@ -43150,7 +43155,7 @@ test("`#231 two-column-polish`: a failed read of the thread list behind the card
   page.setClock(page.clock() + THREAD_DIRECTORY_REFRESH_MS + 1000);
   await pollOnce(page);
   assert.equal(line.hidden, false);
-  await cardOf(page, cardIds(page)[0]).click();
+  await openerOf(cardRow(page, cardIds(page)[0])).click();
   await page.settle();
   assert.equal(line.hidden, true, "the thread on the right says the thread list's failure");
   await page.el("side-close").click();
@@ -43399,7 +43404,7 @@ test("`#261 two-column-connectors`: closing a thread comes back to the card it w
   area.scrollTop = 0;
   const card = page.el("side-cards").children[2];
   const at = card.getBoundingClientRect().top;
-  await card.children[0].click();
+  await openerOf(card).click();
   await page.settle();
   assert.equal(page.el("side-list").hidden, true, "the card did not select its thread");
   await page.el("side-close").click();
@@ -43409,7 +43414,7 @@ test("`#261 two-column-connectors`: closing a thread comes back to the card it w
   // From the foot, back to the foot.
   area.scrollTop = area.scrollHeight;
   const last = page.el("side-cards").children[page.el("side-cards").children.length - 1];
-  await last.children[0].click();
+  await openerOf(last).click();
   await page.settle();
   await page.el("side-close").click();
   await page.settle();
@@ -43462,7 +43467,7 @@ test("`#259 thread-list-unread-filter`: Unread only is a toggle on the right col
   const toggle = page.el("side-unread-only");
   assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
   assert.equal(toggle.getAttribute("aria-pressed"), "false");
-  await cardOf(page, "spaces/A/threads/t1").click();
+  await openerOf(cardRow(page, "spaces/A/threads/t1")).click();
   await page.settle();
   assert.equal(toggle.hidden, true, "the toggle is offered over a thread, where it filters nothing");
   await page.el("side-close").click();
@@ -43623,6 +43628,8 @@ const drawnLinks = (page) => {
       thread: path.getAttribute("data-thread"),
       clip: path.getAttribute("data-link"),
       selected: path.hasAttribute("data-selected"),
+      // `#277 thread-card-focus`: grey beside a highlighted card.
+      dimmed: path.hasAttribute("data-dimmed"),
       hue: path.style.getPropertyValue("--thread-hue"),
       line: path.getAttribute("d").match(/-?\d+(?:\.\d+)?/g).map(Number),
       marks: marks.getAttribute("d").match(/-?\d+(?:\.\d+)?/g).map(Number),
@@ -43684,7 +43691,7 @@ test("`#261 two-column-connectors`: the links are one SVG over the main screen, 
   assert.match(drawn, /position:\s*absolute/);
   assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link"), /stroke:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
     "a link is not drawn in its thread's colour, as the card's edge is");
-  assert.match(cssBlockIn(TWO_COLUMN_QUERY, ".side-card"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, ".side-card-row"), /border-left:\s*3px solid hsl\(var\(--thread-hue, 210\) 55% 50%\)/,
     "the card's edge is no longer the colour a link is drawn in");
   // A reduced-motion reader's glide is a jump: the stylesheet says so, and the script reads it.
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--column-glide: auto;/,
@@ -43735,7 +43742,7 @@ test("`#261 two-column-connectors`: a root on Main and its thread's card are joi
       assert.equal(link.marks[link.marks.length - 6], card.left, "the arrowhead's point is not on the card's edge");
       assert.equal(ty, cardLinkY(threadCard(page, i)), "a link does not arrive at its card's middle");
       assert.ok(lane > 708 && lane < card.left - LINK_HEAD_PX, `a link's lane at ${lane} is not in the gap between the columns`);
-      const hue = threadCard(page, i).children[0].style.getPropertyValue("--thread-hue");
+      const hue = threadCard(page, i).style.getPropertyValue("--thread-hue");
       assert.equal(link.hue, hue, "a link is not the colour of its card's edge");
       assert.equal(link.marksHue, hue);
       assert.equal(threadBadge(rootRow(page, i)).style.getPropertyValue("--thread-hue"), hue, "a link is not the colour of its root's tag");
@@ -43858,7 +43865,7 @@ test("`#261 two-column-connectors`: the glide waits for nothing once the selecti
     ({ page } = await linkedColumns(16));
     page.el("scroll-area").scrollTop = 0;
     await mouseTo(page, rootRow(page, 0), 300, 40);
-    await threadCard(page, 3).children[0].click();
+    await openerOf(threadCard(page, 3)).click();
     await page.settle();
     await page.nextFrame();
     page.expireTimers(COLUMN_GLIDE_MS);
@@ -43996,6 +44003,288 @@ test("the search over the cards finds a thread by the replies the page holds, ea
   assert.equal(replyHint(page, first.id), null);
   assert.equal(replyHint(page, second.id), null, "closing the search left a card saying it was found in its replies");
   assert.equal(page.el("side-cards").children[1].hasAttribute("data-search-in"), false);
+});
+
+// --- one card highlighted (#277 thread-card-focus) ---------------------------------------------------
+//
+// The owner, 2026-10-13, of the thread cards: "It is VERY busy with all the colored lines... Let's make
+// it so when we highlight a thread card all the other lines grey out and we can see what we've
+// highlighted. I also don't like the cards expanding. Let's leave the thread cards contracted. Let's
+// CLICK to put a persistent highlight and expand on one card (NOT enter the thread). To enter the thread
+// you can click the 'N reply M unread' bit let's say or press '->' to go into the thread." These say what
+// the page does; real Chromium measures the grey and the card shown whole at a desk and on a phone
+// (tests/thread_card_focus_browser.py).
+
+/** A card's row on the right, by its thread id. */
+function cardRow(page, id) {
+  return page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id);
+}
+
+/**
+ * The way into a card's thread, its "N replies · M unread": a child of the card's row, by its class —
+ * "side-card-open" on the right, "thread-card-open" on the Threads list.
+ */
+function openerOf(row, name = "side-card-open") {
+  return row ? row.children.find((kid) => kid.hasClass(name)) || null : null;
+}
+
+/** The threads whose cards are drawn highlighted in `list`: the right column's cards, or "thread-list". */
+const litCards = (page, list = "side-cards") => page.el(list).children
+  .filter((li) => li.getAttribute("data-highlighted") === "true")
+  .map((li) => li.getAttribute(list === "side-cards" ? "data-id" : "data-context-id"));
+
+/** Whether the right column shows its cards, not a thread. */
+const cardsUp = (page) => page.el("side-list").hidden === false && page.el("side-pane").hidden === true;
+
+test("`#277 thread-card-focus`: every card stays three lines — under the mouse, the keys' ring and Tab's — and only a highlighted card shows all of it", async () => {
+  const body = mediaBody(TWO_COLUMN_QUERY);
+  for (const lit of ['.side-card-row[data-selected="true"] > .side-card > .side-card-text', ".side-card:focus-visible > .side-card-text"]) {
+    assert.deepStrictEqual(cssRules(body, lit), [], `${lit} still shows the card whole, so the card under the mouse grows`);
+  }
+  const whole = cssBlockIn(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
+  assert.match(whole, /-webkit-line-clamp:\s*none/, "a highlighted card is still clamped");
+  assert.match(whole, /overflow:\s*visible/, "a highlighted card still hides what runs over");
+  assert.match(whole, /(^|[^-])height:\s*auto/, "a highlighted card is still a fixed three lines tall");
+  assert.match(whole, /min-height:\s*calc\(3 \* 1\.35em\)/, "a short card shrinks as it is highlighted");
+  const { page, data } = await twoColumnServer();
+  const [first, second] = data.threads;
+  await mouseTo(page, cardRow(page, first.id), 900, 60);
+  assert.deepStrictEqual(litRows(page), [`side-cards:${first.id}`], "the card under the mouse is not the one selected");
+  assert.deepStrictEqual(litCards(page), [], "the card under the mouse was highlighted");
+  for (const id of [first.id, second.id]) {
+    assert.equal(cardOf(page, id).getAttribute("aria-expanded"), "false", "a card does not say it is contracted");
+  }
+  await press(page, cardRow(page, first.id), "j");
+  assert.deepStrictEqual(litRows(page), [`side-cards:${second.id}`]);
+  assert.deepStrictEqual(litCards(page), [], "the keys walking through the cards highlighted one");
+});
+
+test("`#277 thread-card-focus`: a click highlights a card and shows it whole without entering its thread; another card takes the highlight, the same one again puts it out, and the mouse and a redraw leave it", async () => {
+  const { page, server, data } = await manyThreadColumns(4);
+  const [a, b] = [data.threads[1].id, data.threads[2].id];
+  await cardOf(page, a).click();
+  await page.settle();
+  assert.ok(cardsUp(page), "a click on a card entered its thread");
+  assert.deepStrictEqual(litCards(page), [a], "a click on a card did not highlight it");
+  assert.equal(cardOf(page, a).getAttribute("aria-expanded"), "true", "the highlighted card does not say it is expanded");
+  assert.equal(cardOf(page, b).getAttribute("aria-expanded"), "false");
+  // The mouse over another card selects it; the highlight stays where it was put.
+  await mouseTo(page, cardRow(page, b), 900, 200);
+  assert.deepStrictEqual(litRows(page), [`side-cards:${b}`]);
+  assert.deepStrictEqual(litCards(page), [a], "the mouse moved the highlight");
+  // A redraw of the cards — a reply moving another thread to the foot — keeps it on its thread's card.
+  await liveReply(page, server, data.messages[0], "400");
+  assert.equal(cardIds(page).at(-1), data.threads[0].id, "the thread that moved did not go to the foot, so nothing was redrawn");
+  assert.deepStrictEqual(litCards(page), [a], "a redraw of the cards lost the highlight");
+  assert.equal(cardOf(page, a).getAttribute("aria-expanded"), "true");
+  // Another card pressed takes it; the same one pressed again puts it out.
+  await cardOf(page, b).click();
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [b], "another card did not take the highlight");
+  assert.equal(cardOf(page, a).getAttribute("aria-expanded"), "false");
+  await cardOf(page, b).click();
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [], "the highlighted card pressed again did not put the highlight out");
+  assert.ok(cardsUp(page));
+});
+
+test("`#277 thread-card-focus`: while a card is highlighted every other card's edge and unread count, and every other link between the columns, go grey, and the highlighted card's link is drawn over them", async () => {
+  const others = ".side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted])";
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, others), /border-left-color:\s*var\(--thread-grey\)/, "the other cards keep their colours");
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, `${others} .side-card-unread`), /color:\s*var\(--muted\)/,
+    "the other cards' unread counts keep the accent");
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link[data-dimmed]"), /stroke:\s*var\(--thread-grey\)/,
+    "the other links keep their colours");
+  assert.match(cssBlockIn(TWO_COLUMN_QUERY, "#column-links .column-link-marks[data-dimmed]"), /fill:\s*var\(--thread-grey\)/);
+  // A token of each scheme, as this page's colours are: one declared for a single scheme draws nothing in the other.
+  assert.equal((CSS_CODE.match(/--thread-grey:\s*#[0-9a-f]{6};/g) || []).length, 2, "the grey is not declared for both schemes");
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16);
+    const left = page.el("scroll-area");
+    const right = page.el("side-scroll");
+    left.scrollTop = left.scrollHeight;
+    right.scrollTop = right.scrollHeight;
+    await left.dispatch("scroll");
+    await right.dispatch("scroll");
+    await page.nextFrame();
+    const before = drawnLinks(page);
+    assert.ok(before.length >= 2, `only ${before.length} links are drawn, so this proves nothing`);
+    assert.deepStrictEqual(before.filter((link) => link.dimmed), [], "a link is grey with no card highlighted");
+    const number = (thread) => Number(thread.replace(/^.*t/, ""));
+    const lit = before[1].thread;
+    await threadCard(page, number(lit)).children[0].click();
+    await page.settle();
+    await page.nextFrame();
+    const after = drawnLinks(page);
+    assert.ok(after.length >= 2);
+    for (const link of after) {
+      if (link.thread === lit) {
+        assert.equal(link.dimmed, false, "the highlighted card's link is grey");
+        assert.equal(link.selected, true, "the highlighted card's link is not drawn heavy");
+      } else {
+        assert.equal(link.dimmed, true, `the link of ${link.thread} is not grey beside the highlighted card`);
+        assert.equal(link.selected, false, `the link of ${link.thread} is drawn heavy beside the highlighted card`);
+      }
+    }
+    assert.equal(after.at(-1).thread, lit, "the highlighted card's link is not drawn over the others");
+    // The mouse on another card: its link stays grey, and the highlighted card's stays heavy.
+    const other = after.find((link) => link.thread !== lit).thread;
+    await mouseTo(page, threadCard(page, number(other)), 900, 300);
+    assert.deepStrictEqual(litRows(page), [`side-cards:${other}`]);
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).filter((link) => !link.dimmed).map((link) => link.thread), [lit],
+      "the card under the mouse took the highlighted card's link");
+    // Put out: every link in its colour again.
+    await threadCard(page, number(lit)).children[0].click();
+    await page.settle();
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).filter((link) => link.dimmed), [], "a link stayed grey with the highlight put out");
+  } finally {
+    restore();
+  }
+});
+
+test("`#277 thread-card-focus`: a card's \"N replies · M unread\" is a button of its own, and the way into its thread", async () => {
+  const { page, data } = await twoColumnServer();
+  const [first] = data.threads;
+  const open = openerOf(cardRow(page, first.id));
+  assert.ok(open, "a card has no way into its thread of its own");
+  assert.equal(open.getAttribute("type"), "button");
+  assert.notEqual(open, cardOf(page, first.id), "the way in is the card's own button, which highlights it");
+  assert.match(open.text(), /^1 reply( · 1 unread)?$/, `the way in says ${open.text()}`);
+  assert.equal(open.getAttribute("aria-label"), `Open this thread, ${open.text()}`,
+    "a screen reader is not told the button opens the thread, in the words it shows");
+  assert.match(cardPart(page, first.id, "side-card-facts"), /^(now|\d+[mhdwy]|\d+d\d+h)$/,
+    "the card's facts still give the count its button gives");
+  await open.click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the replies button did not enter its thread");
+  assert.equal(page.el("side-close").hidden, false);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "entering a card's thread changed the left column");
+});
+
+test("`#277 thread-card-focus`: → enters the highlighted card's thread, or with none the card the keys are on; ← comes back to the cards on that card, and Esc puts the highlight out", async () => {
+  const { page, data } = await twoColumnServer();
+  const [first, second] = data.threads;
+  page.el("scroll-area").focus();
+  await press(page, page.el("scroll-area"), "]");
+  await press(page, focused(page), "j");
+  assert.equal(focused(page), cardRow(page, first.id), `j did not select the first card: ${focusName(page)}`);
+  // Enter on a card is a press on it: highlighted, and not entered.
+  await press(page, focused(page), "Enter");
+  assert.ok(cardsUp(page), "Enter on a card entered its thread");
+  assert.deepStrictEqual(litCards(page), [first.id], "Enter on a card did not highlight it");
+  // The keys move on; → goes into the highlighted card's thread.
+  await press(page, focused(page), "j");
+  assert.equal(focused(page), cardRow(page, second.id));
+  await press(page, focused(page), "ArrowRight");
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "→ did not enter the highlighted card's thread");
+  assert.ok(focused(page) === page.el("side-scroll") || page.el("side-log").children.includes(focused(page)),
+    `→ did not take the keys into the thread: ${focusName(page)}`);
+  // ← out of a thread entered from a card: back to the cards, the keys on the card entered, still highlighted.
+  await press(page, focused(page), "ArrowLeft");
+  await page.settle();
+  assert.ok(cardsUp(page), "← from a thread entered from its card did not come back to the cards");
+  assert.equal(focused(page), cardRow(page, first.id), `← did not come back to the card entered: ${focusName(page)}`);
+  assert.deepStrictEqual(litCards(page), [first.id], "coming back out lost the highlight");
+  // Esc puts the highlight out and leaves the cards up.
+  await press(page, focused(page), "Escape");
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [], "Esc did not put the highlight out");
+  assert.ok(cardsUp(page));
+  // With none highlighted, → enters the card the keys are on.
+  await press(page, focused(page), "j");
+  assert.equal(focused(page), cardRow(page, second.id));
+  await press(page, focused(page), "ArrowRight");
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "→ did not enter the thread of the card the keys are on");
+  // Esc there is the X, as it was: back to the cards, on that card.
+  await press(page, focused(page), "Escape");
+  await page.settle();
+  assert.ok(cardsUp(page), "Esc in a thread entered from its card did not come back to the cards");
+  // A thread selected from Main is left by ← for Main, as it was.
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await press(page, page.el("scroll-area"), "]");
+  assert.ok(focused(page) === page.el("side-scroll") || page.el("side-log").children.includes(focused(page)));
+  await press(page, focused(page), "ArrowLeft");
+  assert.ok(focused(page) === page.el("scroll-area") || page.el("discord-log").children.includes(focused(page)),
+    `← from a thread selected from Main did not go back to Main: ${focusName(page)}`);
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "← closed a thread selected from Main");
+});
+
+test("`#277 thread-card-focus`: → on a card's own button, where Tab leaves the focus, enters that card's thread, whichever card is highlighted", async () => {
+  const { page, data } = await twoColumnServer();
+  const [first, second] = data.threads;
+  await cardOf(page, first.id).click();
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [first.id]);
+  await press(page, openerOf(cardRow(page, second.id)), "ArrowRight");
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "→ on a card's replies button entered the highlighted card's thread instead");
+});
+
+test("`#277 thread-card-focus`: Esc with no card highlighted leaves the cards where the reader has them", async () => {
+  const { page } = await manyThreadColumns(16);
+  const area = page.el("side-scroll");
+  area.scrollTop = 120;
+  await area.dispatch("scroll");
+  const card = firstCardInView(page);
+  await press(page, card, "Escape");
+  await page.settle();
+  assert.ok(cardsUp(page));
+  assert.equal(area.scrollTop, 120, "Esc on the cards moved them");
+});
+
+test("`#277 thread-card-focus`: the Threads list in one column is the same — contracted, a click highlights a card and greys the rest, its replies button or → enters it, ← comes back to it, Esc puts it out", async () => {
+  const others = "#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted])";
+  assert.match(cssBlock(others), /border-inline-start-color:\s*var\(--thread-grey\)/, "the other cards keep their colours");
+  assert.match(cssBlock(".thread-card-text"), /display:\s*none/, "a card that is not highlighted shows what its thread is about");
+  assert.match(cssBlock(".thread-card[data-highlighted] .thread-card-text"), /display:\s*block/, "a highlighted card does not show it");
+  const page = await threadPage();
+  const [first, second] = threadData().threads;
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  const list = page.el("thread-list");
+  const row = (id) => list.children.find((li) => li.getAttribute("data-context-id") === id);
+  assert.equal(list.hidden, false, "the Threads list is not on screen");
+  assert.equal(row(first.id).children[0].getAttribute("aria-expanded"), "false");
+  await row(first.id).children[0].click();
+  await page.settle();
+  assert.equal(list.hidden, false, "a click on a card entered its thread");
+  assert.deepStrictEqual(litCards(page, "thread-list"), [first.id], "a click did not highlight the card");
+  assert.equal(row(first.id).children[0].getAttribute("aria-expanded"), "true");
+  // → enters it, and ← comes back to the list, the card still highlighted.
+  page.el("scroll-area").focus();
+  await press(page, page.el("scroll-area"), "ArrowRight");
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${first.id}`, "→ did not enter the highlighted card's thread");
+  await press(page, page.el("scroll-area"), "ArrowLeft");
+  await page.settle();
+  assert.equal(page.el("thread-list").hidden, false, "← did not come back to the Threads list");
+  assert.deepStrictEqual(litCards(page, "thread-list"), [first.id], "coming back lost the highlight");
+  // Esc puts it out.
+  await press(page, page.el("scroll-area"), "Escape");
+  assert.deepStrictEqual(litCards(page, "thread-list"), [], "Esc did not put the highlight out");
+  assert.equal(page.el("thread-list").hidden, false);
+  // The other card's replies button enters its thread.
+  const open = openerOf(row(second.id), "thread-card-open");
+  assert.ok(open, "a card of the Threads list has no way into its thread of its own");
+  assert.match(open.text(), /^(about )?1 reply/);
+  await open.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${second.id}`, "the replies button did not enter its thread");
+});
+
+test("`#277 thread-card-focus`: the list of keys says Enter highlights a card, → enters the highlighted card's thread, and Esc puts the highlight out", async () => {
+  const page = newPage();
+  await signIn(page);
+  const keys = page.el("keyboard-keys").text();
+  assert.match(keys, /On a thread card, highlight it and show all of it/, "the list of keys does not say what Enter does to a card");
+  assert.match(keys, /On the thread cards, into the highlighted card's thread/, "the list of keys does not say what → does on the cards");
+  assert.match(keys, /takes the highlight off a thread card/, "the list of keys does not say Esc puts a highlight out");
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------
@@ -49081,7 +49370,7 @@ async function sideThreadPage(options = {}) {
   await signIn(page);
   await showDiscord(page, page.messages);
   await twoColumns(page);
-  await cardOf(page, page.threads[0].id).click();
+  await openerOf(cardRow(page, page.threads[0].id)).click();
   await page.settle();
   assert.equal(page.el("side-pane").hidden, false, "the thread did not open on the right");
   return { page, all };
@@ -49488,7 +49777,7 @@ test("`#262 search-load-older`: a walk in the other column ends this one, and re
   await signIn(page);
   await showDiscord(page, page.messages);
   await twoColumns(page);
-  await cardOf(page, page.threads[0].id).click();
+  await openerOf(cardRow(page, page.threads[0].id)).click();
   await page.settle();
   await search(page, "engine");
   await page.settle();
@@ -49551,7 +49840,7 @@ test("`#262 search-load-older`: a filter's walk back to an old pin ends a walk i
   await signIn(page);
   await showDiscord(page, page.messages);
   await twoColumns(page);
-  await cardOf(page, page.threads[0].id).click();
+  await openerOf(cardRow(page, page.threads[0].id)).click();
   await page.settle();
   // Every post matches, on the left; no reply does, on the right, whose step back offers the walk.
   await search(page, "post");

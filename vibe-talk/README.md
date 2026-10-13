@@ -5317,28 +5317,39 @@ cards to the threads with unread replies, by the rule of the card's "N unread" o
 kept per device, works with the search, keeps the selected card where it was as it goes on and off,
 and says "No unread threads." over a list it empties. The search over the cards also reads the
 replies the page already holds for each thread — each term in the card's words or in its replies —
-and a card found only with its replies says "in replies"; nothing is fetched for it. Over the cards,
+and a card found only with its replies says "in replies"; nothing is fetched for it. **Every card stays
+contracted** (`#277 thread-card-focus`): a click on one, or Enter with the keys on it, highlights it —
+tinted and ringed in its thread's colour and shown whole — and while it shows, every other card's edge
+and unread count and every other link go grey; another card takes the highlight, and the same card
+again or Esc puts it out. It is kept per channel for the session, through the mouse moving over the
+cards, the keys walking them and the cards redrawn. The way into a thread is the card's own
+"N replies · M unread" button, or → on the highlighted card (else the one the keys are on); ← from a
+thread entered so comes back out to the cards, the keys on that card. The one-column Threads list's
+cards work the same way. Over the cards,
 **links** join each root on
 Main to its thread's card (`#261 two-column-connectors`), as a diff tool joins a hunk on the left to
 its counterpart on the right: a right-angled line in the thread's colour (its Thread(N) tag's and
 the card's edge's), out of the root's right edge level with its tag, through a lane of its own in the
 gap between the columns, into the card's left edge, drawn while both ends are on screen. The
 selected message or card draws its link even with the other end off screen, clipped at the columns'
-edge with an arrowhead pointing up or down to it, and if the selection stays 1.5 s the other column
+edge with an arrowhead pointing up or down to it (the highlighted card's, while one is highlighted,
+whatever is selected), and if the selection stays 1.5 s the other column
 glides that end level with it — cancelled if the selection moves or the reader scrolls that column
 first, and a jump instead of a glide where the reader asks for reduced motion (the stylesheet's
 `--column-glide`; the script asks no media query). The links are one SVG drawn at most once per
 animation frame, from passive scroll listeners, resizes and redraws, every rectangle read before
 anything is written and only what changed written; nothing is drawn or measured in one column, on a
 phone, over a thread, or while the page is hidden (`#226 page-energy-profile`). Thread(N), the
-unread count, N replies, the Threads screen and the cards select a thread there, and a plain tap on
+unread count, N replies, the Threads screen and a card's replies button select a thread there, and a plain tap on
 a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
 in for the left column's list. The poll reads Main and the selected thread (two views, one delta
 each), a live reply in that thread is read once as the thread, and a refresh that brings nothing
 draws nothing in either column. The thread is drawn by the same code as a thread in one column: the
 right column's elements stand in for the channel pane's while the code works on that column, and
 its state is swapped in around that work (`COLUMN_IDS`, `COLUMN_STATE` and `inColumn` in
-`web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800.
+`web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800,
+and `tests/thread_card_focus_browser.py` the highlight and the grey, by computed colour and by the
+pixels drawn, at 1280x800 and on a 412x915 phone.
 
 **The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
 Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and
