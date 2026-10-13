@@ -8322,7 +8322,7 @@ async function sendPostProposal() {
   if (redact(proposal.text) !== proposal.text) return;
   // A tap during a spoken yes's settle window wins, and its result is what the agent is told: it
   // heard the yes and is waiting for the page's word on it. `#264 voice-send-approval`.
-  const announce = spokenYesYieldsToTap(true);
+  const announce = spokenYesYieldsToTap();
   const outcome = await commitShownProposal(proposal, "ui");
   if (announce) reportSpokenOutcome(outcome);
   // Any other tap during a call is told to the agent too: one that asked "Send it?" is waiting for
@@ -8408,7 +8408,7 @@ async function cancelPostProposal(options) {
   const spoken = Boolean(options && options.spoken === true);
   const proposal = postWatch.shown;
   if (!proposal || postWatch.busy) return;
-  spokenYesYieldsToTap(false);
+  const stoppedYes = spokenYesYieldsToTap();
   postWatch.busy = true;
   try {
     await api("/api/v1/post-proposals/cancel", { method: "POST", body: { handle: proposal.handle } });
@@ -8419,6 +8419,10 @@ async function cancelPostProposal(options) {
     // Already settled is still "not sent from this card" — the watch shows whatever came next.
     if (!error.network) settlePostCard(proposal);
     if (error.network) showError(error.message);
+    // The yes this tap stopped still gets its one answer: it was not sent.
+    if (stoppedYes) {
+      reportSpokenOutcome({ kind: "not_armed", proposal, reason: SPOKEN_YES_REASONS.withdrawn });
+    }
   } finally {
     postWatch.busy = false;
     if (postWatch.shown) showPostProposal(postWatch.shown);
@@ -8823,6 +8827,23 @@ function resetSpokenYes(why = "earlier_draft") {
 }
 
 /**
+ * Did the browser say it opened `stream` WITHOUT the echo cancellation it was asked for? A device or
+ * an audio route can ignore the constraint, and then the agent's own "Send it?" can come back as the
+ * answer. Only a track that reports `echoCancellation: false` says so; one that reports nothing is
+ * taken at the request's word, since some browsers report no settings at all.
+ *
+ * @param {{getAudioTracks?: () => any[], getTracks?: () => any[]}} stream
+ */
+function echoCancellationRefused(stream) {
+  const tracks = typeof stream.getAudioTracks === "function"
+    ? stream.getAudioTracks()
+    : typeof stream.getTracks === "function" ? stream.getTracks() : [];
+  const track = tracks[0];
+  if (!track || typeof track.getSettings !== "function") return false;
+  return track.getSettings().echoCancellation === false;
+}
+
+/**
  * The provider said this socket's session started. A SECOND time means a replacement session that
  * never saw the draft on the card — a yes it hears is not agreement to text the owner heard.
  */
@@ -9070,18 +9091,15 @@ function abortSpokenYes(reason) {
 }
 
 /**
- * The owner tapped while a yes was settling. Send wins and its result is the one reported; Don't
- * send stops the yes and says so.
+ * The owner tapped the card while a yes to it was settling. The tap wins, and the yes stops
+ * without a word of its own: the tap's result is what the agent is told, once — Send's in full, as
+ * the yes's would have been, and Don't send's as a tap.
  *
- * @returns {boolean} whether the tap's own result should be reported in full, as the yes's would
+ * @returns {boolean} whether a yes was stopped, so the tap's result must answer it
  */
-function spokenYesYieldsToTap(sending) {
+function spokenYesYieldsToTap() {
   const settling = spokenYes.settling;
   if (!settling || !postWatch.shown || settling.handle !== postWatch.shown.handle) return false;
-  if (!sending) {
-    abortSpokenYes("withdrawn");
-    return false;
-  }
   clearTimeout(settling.timer);
   spokenYes.settling = null;
   return true;
@@ -10699,9 +10717,9 @@ async function openConversation(options) {
     // Read HERE, at the moment the stream opens — which is why a toggle flipped mid-call cannot
     // reach this one, and why `micSettingsChanged` says so out loud.
     const mic = micSettings();
-    // `#264 voice-send-approval`: a spoken yes is taken only with echo cancellation on, as opened.
-    session.echoCancellation = mic.echoCancellation === true;
     session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(mic));
+    // `#264 voice-send-approval`: a spoken yes is taken only with echo cancellation on, as opened.
+    session.echoCancellation = mic.echoCancellation === true && !echoCancellationRefused(session.stream);
     session.audio = new (window.AudioContext || window.webkitAudioContext)();
     await session.audio.resume(); // iOS starts it suspended until a gesture.
     markStartup("microphone_ready");

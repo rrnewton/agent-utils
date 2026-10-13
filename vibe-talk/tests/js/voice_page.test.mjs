@@ -1864,6 +1864,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     voiceSettings: { ask_before_send: true, changeable: true },
     /** Every body the page PUT to the voice settings route, in order. */
     voiceSettingsCalls: [],
+    /**
+     * What the microphone track reports for `echoCancellation` in `getSettings()`, or undefined for
+     * a track that reports no settings at all.
+     */
+    appliedEchoCancellation: undefined,
     /** Set to a status to make the voice settings route refuse, the way a store-less server does. */
     voiceSettingsStatus: null,
     /** How many times the page has read the to-do list. */
@@ -2116,6 +2121,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
             this.stops += 1;
           },
         };
+        // `#264 voice-send-approval`: what the browser says it applied, when a test says so.
+        if (typeof page.appliedEchoCancellation === "boolean") {
+          track.getSettings = () => ({ echoCancellation: page.appliedEchoCancellation });
+        }
         page.tracks.push(track);
         return { getTracks: () => [track] };
       },
@@ -31368,6 +31377,20 @@ test("`#264 voice-send-approval`: a tap during the settle window commits once, a
   assert.match(notices[0], /SENT to lead team/);
 });
 
+test("`#264 voice-send-approval`: Don't send tapped during the settle window withdraws the draft, and the agent is told once", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  hostedHears(socket, "yes");
+  await page.el("post-confirm-cancel").click();
+  await page.settle();
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, []);
+  assert.equal(page.proposalCancels.length, 1);
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./);
+});
+
 test("`#264 voice-send-approval`: a tap while the spoken commit is on its way is ignored, and the post goes once, as the speaker's turn", async () => {
   const page = newPage();
   const socket = await readBackDuringACall(page);
@@ -31481,6 +31504,23 @@ test("`#264 voice-send-approval`: with echo cancellation off, or in a typed call
   await settleSpokenYes(page);
   assert.deepEqual(page.proposalCommits, []);
   assert.match(pageNotices(socket)[0], /needs echo cancellation on/);
+
+  // Asked for, but the browser says the device opened without it: the same.
+  const ignored = newPage();
+  ignored.appliedEchoCancellation = false;
+  const route = await readBackDuringACall(ignored);
+  hostedHears(route, "yes");
+  await settleSpokenYes(ignored);
+  assert.deepEqual(ignored.proposalCommits, [], "a yes counted on a microphone that ignored echo cancellation");
+  assert.match(pageNotices(route)[0], /needs echo cancellation on/);
+
+  // And one that says it applied it is taken at its word.
+  const applied = newPage();
+  applied.appliedEchoCancellation = true;
+  const fine = await readBackDuringACall(applied);
+  hostedHears(fine, "yes");
+  await settleSpokenYes(applied);
+  assert.deepEqual(applied.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"]);
 
   const typed = newPage();
   const chat = await startChatting(typed, "tell lead team I'm on it, rebasing now");
@@ -31702,6 +31742,38 @@ test("`#264 voice-send-approval`: a chat message relayed between the read-back a
   hostedHears(socket, "yes");
   await settleSpokenYes(page);
   assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"]);
+});
+
+test("`#264 voice-send-approval`: a text turn of the page's own ends the read-back even when no speech follows it", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+  await setReadNew(page, "full");
+  await deliver(page, stream, sseMessage(message({ id: "1403", content: "build is green" })));
+  await speakRelay(page);
+  assert.equal(relayed(page).length, 1, "the message was never relayed, so this proves nothing");
+  // The owner answers before the agent says a word about the relayed message.
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a read-back from before a relayed message still armed a yes");
+  assert.match(pageNotices(socket).at(-1) || "", /NOT sent: a message came between the read-back and the yes/);
+});
+
+test("`#264 voice-send-approval`: a replacement draft read back in full is confirmed by its own read-back, whatever was said of the old one before it", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page, { pending: spokenDraft({ text: "merge the PR" }) });
+  // The agent corrects itself before the owner says anything: a new draft, read back in full.
+  const replacement = spokenDraft({ serial: 8, handle: "rEpLaCeD-0123456789abc", text: "merge the PR after the build" });
+  page.propose(replacement);
+  await page.settle();
+  page.setClock(page.clock() + 1000);
+  hostedSays(socket, "To lead team: merge the PR after the build. Send it?");
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.text]), [[replacement.handle, replacement.text]]);
 });
 
 test("`#264 voice-send-approval`: after a digression a fresh read-back arms a yes again, and one with a lead-in counts", async () => {

@@ -1928,8 +1928,10 @@ impl StateStore for SqliteStore {
             transaction
                 .execute("DELETE FROM bookmarks", [])
                 .map_err(backend)?;
-            // Back to the configured default, which is the safe direction: the shipped
-            // configuration asks before the voice agent sends. `#264 voice-send-approval`.
+            // Back to the configured default. That asks before the voice agent sends unless the
+            // operator configured `ask_before_send = false`, in which case a purge turns direct
+            // sends back on for an owner who had chosen to be asked: the purge restores what the
+            // operator chose, not necessarily the safer setting. `#264 voice-send-approval`.
             transaction
                 .execute("DELETE FROM voice_settings", [])
                 .map_err(backend)?;

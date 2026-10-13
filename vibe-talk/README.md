@@ -1671,11 +1671,12 @@ one store, `src/store/`, and it holds these:
   and
 * **the voice send setting** — whether the voice agent asks before it sends, as the owner last
   chose it: one row, one boolean and an instant. No row means the configured default applies, and
-  the purge deletes the row, restoring that default. See "Posting asks first, unless you turn that
-  off". `#264 voice-send-approval`.
+  the purge deletes the row, restoring that default — which asks first unless the operator set
+  `ask_before_send = false`, in which case a purge turns direct sends back on. See "Posting asks
+  first, unless you turn that off". `#264 voice-send-approval`.
 
-The first three are your own record. The last is a derived cache, bounded by the same
-retention as the rest, erased by the same purge, and never filled by a read-scope token.
+The first three are your own record. The cached summaries are a derived cache, bounded by the
+same retention as the rest, erased by the same purge, and never filled by a read-scope token.
 
 **Every table is bounded on write, and one of them is bounded differently on purpose.** The
 "dealt with" marks have a count ceiling and **no age limit**, unlike everything else here. An age
@@ -5011,8 +5012,10 @@ hold, for both wire protocols:
   pending when the call opened, not one from before a replacement voice session on the same socket
   (a second `session_started` or `conversation_initiation_metadata`), and never one from another
   call. It has not lapsed, and holds no sign-in token. Only the newest proposal is ever on the card.
-* **It is a spoken call with echo cancellation on.** A typed call never commits by voice, and
-  neither does a yes typed into a spoken call.
+* **It is a spoken call with echo cancellation on.** On in Settings when the call opened, and not
+  refused by the device: a microphone track that reports `echoCancellation: false` in its settings
+  counts as off, though one that reports nothing is taken at the request's word. A typed call never
+  commits by voice, and neither does a yes typed into a spoken call.
 * **The read-back was not interrupted.** No `interruption` (hosted protocol), no
   `turn_complete{interrupted: true}`, and on `vibe-talk-v1` the read-back's own `turn_complete`
   arrived before the answer.

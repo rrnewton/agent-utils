@@ -492,10 +492,13 @@ Open the agent in ElevenLabs and start a conversation. Ask, roughly in this orde
    I'll look at it tonight. Send it?" — and nothing is posted until you confirm**. On the voice page
    a card appears with that text and a Send button, and on that page a plain "yes" as your very next
    answer to a read-back that was exactly that sentence also sends it; the agent says "One moment."
-   and then tells you what the page reports. If a message appears in
-   the channel before you confirm, stop: the server is not the one this guide describes. With the
-   setting off, it posts at once and says so only after the server answered `SENT`. Switching the
-   agent to the read token removes the capability rather than gating it.
+   and then tells you what the page reports. **In the ElevenLabs console there is no voice page in
+   the call**, so no card, no spoken yes and no report: a "yes" there gets "One moment." and then
+   silence, and the draft lapses after two minutes. That is expected; confirm from a call on the
+   voice page. If a message appears in the channel before you confirm, stop: the server is not the
+   one this guide describes. With the setting off, it posts at once and says so only after the
+   server answered `SENT`. Switching the agent to the read token removes the capability rather than
+   gating it.
 
 Barge-in is native, so you can interrupt it mid-sentence without a button. That is not the
 same as pausing: mute is what pauses, and it is this page's own doing — it withholds your audio,
