@@ -1936,7 +1936,12 @@ may have delivered it. A change upstream that nobody pushes is invisible for at 
 seconds, and never to pull to refresh or to opening a channel (`reason=pull`, `reason=enter`),
 which are not answered from that memory though they still join a read already running; a page
 load that stands for several refreshes queued behind a read in flight sends the one that asks for
-a fresh read. Nor does an answer from that memory put older text back over a newer copy another
+a fresh read. A pull up released while the page already has a timeline read on the wire waits for
+it, and then reads for itself unless that read was sent as a pull or an opening and read in full
+or as a delta known to be complete: the poll's read, or a live message's, may have been answered
+from that memory, and on a channel whose deltas carry additions only it may have been a delta. A
+pull is a delta only where the channel's deltas are known complete (see "A refresh asks only for
+what changed"). Nor does an answer from that memory put older text back over a newer copy another
 read has since brought into read-ahead memory. A kept answer is dropped when its time is up, and a
 shared read is given up after 150 seconds, longer than any provider's own bound, so a provider call
 that hangs cannot hold the requests waiting on it for longer. Only the provider's answer is shared:

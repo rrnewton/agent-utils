@@ -17484,8 +17484,10 @@ async function loadTimeline(options) {
   /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
   const deltas = [];
   let sent = forwardCursor(options && options.reason);
-  // What a refresh asking for this view again soon after may count as read already. `#231`.
-  const record = { context, read, full: sent === null };
+  const reason = readReasonOf(options && options.reason);
+  // What a refresh asking for this view again soon after may count as read already (`#231`), and
+  // whether the server reads afresh for it, never from the few seconds' memory (`#278`).
+  const record = { context, read, full: sent === null, fresh: FRESH_READ_REASONS.includes(reason || "") };
   columnReadsSent.set(steps.column, record);
   const sameStore = () => canon === channelCanon && canon.channel === channel &&
     String(el("discord-channel").value) === channel;
@@ -17529,7 +17531,7 @@ async function loadTimeline(options) {
   };
   try {
     for (;;) {
-      const path = timelinePath(null, sent, readReasonOf(options && options.reason));
+      const path = timelinePath(null, sent, reason);
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
@@ -25052,7 +25054,11 @@ function takeDeferredOlder() {
 //     happened. The foot has to be offered there all the same. On a weak signal a channel read can
 //     hang for as long as the connection stalls, which is just when the owner bounces against the
 //     bottom, and a pull that showed nothing then would be "I don't get a refresh that shows in
-//     the UI" all over again.
+//     the UI" all over again. On a channel with threads the read waited on answers the pull only if
+//     it is one a pull could have been — sent as a pull or an opening, which the server never answers
+//     from the few seconds it keeps a newest answer, and in full or as a delta known complete. A
+//     poll's or a live message's read is followed by the pull's own (`waitedReadFallsShortOfPull`,
+//     `#278 timeline-single-flight`): correctness over the read saved.
 //   * WHAT IT REPORTS IS ABOUT THE VIEW IT WAS ASKED OVER, AND FROM THE RELEASE ON. A reader on a
 //     slow read taps another tab, another thread or another channel; the read they pulled for is
 //     then folded away for later, and the freshness the page restores belongs to the view they
@@ -25356,6 +25362,14 @@ async function refreshFromNewest() {
       while (discordFetchInFlight) {
         await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
       }
+      // ...unless it was a read the pull could not have been, on a channel with threads: one the
+      // server may answer from the few seconds it keeps a newest answer (the poll's, a live
+      // message's), or one of what changed where the channel's deltas may carry additions alone.
+      // Either could leave a change made upstream and never pushed on screen after the pull, so the
+      // pull reads for itself. `#278 timeline-single-flight`.
+      if (waitedReadFallsShortOfPull(asked.context)) {
+        await loadDiscord({ keepPosition: true, reason: "pull" });
+      }
     } else {
       // A pull as much as the top's, and said so: the server never answers a pull from the few
       // seconds it keeps a newest answer. Unsaid, this read could be given the poll's of a moment
@@ -25370,6 +25384,27 @@ async function refreshFromNewest() {
   if (failure !== null) {
     throw failure;
   }
+}
+
+/**
+ * Whether the read a pull up waited on, the last this column sent of the view the pull was over,
+ * falls short of what the pull asks for — the channel as it stands now. `#278 timeline-single-flight`.
+ * It does if it did not say a reason the server reads afresh for (`FRESH_READ_REASONS`): the poll,
+ * a live message or a return to the page may be answered from the few seconds the server keeps a
+ * newest answer, which a pull never is, and nothing the page sees tells the two apart. And it does
+ * if it read only what changed where a pull itself would read in full (`forwardCursor`), the
+ * channel's deltas not being known to carry edits and deletions. Only a pull's or an opening's read,
+ * in full or as a delta shown complete, answers the pull, and then no second read is sent. An
+ * un-threaded channel's reads go to `/page`, which keeps no answer, and are not asked: there the
+ * read in flight is the refresh, as "A READ ALREADY IN FLIGHT IS THE REFRESH" says.
+ *
+ * @param {string} context the view the pull was over (`channelContextKey`)
+ */
+function waitedReadFallsShortOfPull(context) {
+  if (!threadingSupported || context !== channelContextKey()) return false;
+  const sent = columnReadsSent.get(activeColumn);
+  if (!sent || sent.context !== context) return false;
+  return !sent.fresh || (!sent.full && forwardCursor("pull") === null);
 }
 
 /** Say, at the foot of the list, what the refresh a pull up asked for found — then go. */
@@ -30243,13 +30278,14 @@ async function readSideColumn(reason, since = null) {
 /**
  * The newest timeline read each column sent and that has not failed before landing a page: the view
  * it was for (`channelContextKey`), its number among `timelineReadsStarted`, and whether it read the
- * view in full rather than as what changed. `#231 two-column-polish`. One still on the wire counts,
+ * view in full rather than as what changed, and whether it said a reason the server reads afresh
+ * for (`FRESH_READ_REASONS`). `#231 two-column-polish`. One still on the wire counts,
  * as the read a refresh would send would only queue behind it; if it then fails, the right column's
  * line says so (`renderSideFreshness`) and the next poll reads the view again. A chain of what
  * changed that fails after its first page keeps its record, which no refresh begun before it can
  * act on: the chain ran queued behind that refresh's read of Main, and its failure is that read's.
  *
- * @type {Map<typeof activeColumn, {context: string, read: number, full: boolean}>}
+ * @type {Map<typeof activeColumn, {context: string, read: number, full: boolean, fresh: boolean}>}
  */
 const columnReadsSent = new Map();
 

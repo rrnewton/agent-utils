@@ -51103,3 +51103,113 @@ test("before the channel's deltas are known, a pull up with complete deltas stil
   await page.settle();
   assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up did not show an edit made upstream");
 });
+
+// --- `#278 timeline-single-flight`: a pull up that waits on a read the pull could not have been ----
+//
+// A pull up released while a read is on the wire waits for that read rather than sending its own
+// ("A READ ALREADY IN FLIGHT IS THE REFRESH"). On a channel with threads that saving holds only for a
+// read a pull could have been. A live message's read is a delta even where the channel's deltas
+// carry additions only; and the poll's or a live message's read, not sent as a pull, may be answered
+// from the few seconds the server keeps a newest answer, which a pull never is. Waiting on either
+// alone could leave a change made upstream and never pushed on screen after the pull, so such a read
+// is followed by the pull's own.
+
+test("a pull up that waits on a live message's read of what changed reads in full after it where deltas carry additions only", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  const from = server.reads.length;
+  const held = gate(server.answer);
+  server.hold = held;
+  const arriving = server.post(message({ id: "350", content: "arrived while the pull was down" }));
+  await deliver(page, page.stream(), sseMessage(arriving));
+  await page.settle();
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  page.el("scroll-area").scrollTop = page.el("scroll-area").scrollHeight;
+  const { lifted } = await pullUpAndHold(page);
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  server.hold = null;
+  held.open();
+  await page.settle();
+  page.expireTimers(PULL_WAIT_MS);
+  await lifted;
+  await page.settle();
+  const kinds = forwardReadKinds(server, from);
+  assert.equal(kinds[0], true, `fixture: the live message's read was not a delta: ${JSON.stringify(kinds)}`);
+  assert.deepStrictEqual(kinds, [true, false], `the reads were: ${JSON.stringify(server.reads.slice(from))}`);
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up did not show an edit made upstream");
+  assert.ok(shownIds(page).includes("350"), "the live message is not on screen");
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "done", "the pull up did not say what it found");
+});
+
+test("a pull up that waits on the poll's read sends its own as a pull after it, which the server reads afresh", async () => {
+  const page = await threadPage();
+  const reasonOf = (path) => new URL(path, "http://fixture.test").searchParams.get("reason");
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight;
+  const reads = page.timelineCalls.length;
+  const held = gate(page.timeline);
+  page.timeline = held.respond;
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(reasonOf), ["poll"], "fixture: the poll did not read");
+  area.scrollTop = area.scrollHeight;
+  const { lifted } = await pullUpAndHold(page);
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  assert.equal(page.timelineCalls.length, reads + 1, "the pull up sent a read beside the poll's");
+  held.open();
+  await page.settle();
+  page.expireTimers(PULL_WAIT_MS);
+  await lifted;
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(reasonOf), ["poll", "pull"],
+    "the pull up took the poll's read, which the server may answer from its few seconds' memory");
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "done", "the pull up did not say what it found");
+});
+
+test("a pull up that waits on another pull's read sends nothing more", async () => {
+  // The control: a read sent as a pull, in full, is what the second pull would have sent.
+  const page = await threadPage();
+  const reasonOf = (path) => new URL(path, "http://fixture.test").searchParams.get("reason");
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight;
+  const reads = page.timelineCalls.length;
+  const held = gate(page.timeline);
+  page.timeline = held.respond;
+  const first = await pullUpAndHold(page);
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(reasonOf), ["pull"], "fixture: the first pull did not read");
+  area.scrollTop = area.scrollHeight;
+  const second = await pullUpAndHold(page);
+  held.open();
+  await page.settle();
+  page.expireTimers(PULL_WAIT_MS);
+  await first.lifted;
+  await second.lifted;
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(reasonOf), ["pull"],
+    "a second read followed a pull's read in full");
+});
+
+test("a pull up that waits on a pull's delta over complete deltas sends nothing more and shows an unpushed edit", async () => {
+  // The control where deltas are known complete: a pull's delta carries edits and deletions.
+  const { page, server } = await forwardPage({ complete: true });
+  await pollOnce(page);
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  const from = server.reads.length;
+  const held = gate(server.answer);
+  server.hold = held;
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight;
+  const first = await pullUpAndHold(page);
+  area.scrollTop = area.scrollHeight;
+  const second = await pullUpAndHold(page);
+  server.hold = null;
+  held.open();
+  await page.settle();
+  page.expireTimers(PULL_WAIT_MS);
+  await first.lifted;
+  await second.lifted;
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, from), [true], "a second read followed a pull's complete delta");
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the complete delta did not carry the edit");
+});
