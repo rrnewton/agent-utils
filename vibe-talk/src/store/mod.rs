@@ -1491,6 +1491,29 @@ pub trait StateStore: Send + Sync {
     /// write failure.
     async fn set_noise_rules(&self, rules: &[String]) -> Result<Vec<String>, StoreError>;
 
+    /// The owner's own answer to "Ask me before the voice agent sends", or `None` when he has
+    /// never given one. `#264 voice-send-approval`.
+    ///
+    /// `None` is not "no": it is the configured default's turn, which
+    /// [`crate::send_approval::current`] applies at read time — for the reason
+    /// [`StateStore::noise_rules`] gives, nothing ever writes the default here on his behalf. Not
+    /// covered by [`Retention`]: it is one boolean he chose, and an age limit would silently put
+    /// back a behaviour he turned off.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn ask_before_send(&self) -> Result<Option<bool>, StoreError>;
+
+    /// Record the owner's answer to "Ask me before the voice agent sends", returning it as stored.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_ask_before_send(&self, ask: bool) -> Result<bool, StoreError>;
+
     /// The messages in this channel the owner has said are NOT noise, whatever the rules say.
     ///
     /// The ids alone, for the same reason [`StateStore::dismissals`] returns ids alone.

@@ -19,6 +19,7 @@ use vibe_talk::contract::{
     PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals, TimelineResponse,
     TokenScope, TranscriptRole, UpstreamClearAttemptView, UpstreamClearNowOutcome,
     UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    VoiceSettings,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
@@ -239,6 +240,10 @@ fn client_config(
         noise_rules: full.then(|| NoiseRules {
             rules: vec!["Working…".into(), "Thinking*".into()],
             matching: "a message counts as read when its whole text is one of these",
+        }),
+        voice_settings: full.then_some(VoiceSettings {
+            ask_before_send: true,
+            changeable: true,
         }),
     }
 }
@@ -731,6 +736,13 @@ fn samples() -> Value {
                     unavailable: None,
                 },
             }),
+        ],
+        // `#264 voice-send-approval`: asking and saved, sending at once, and a server that keeps
+        // no settings and so always asks.
+        "VoiceSettings": [
+            to(&VoiceSettings { ask_before_send: true, changeable: true }),
+            to(&VoiceSettings { ask_before_send: false, changeable: true }),
+            to(&VoiceSettings { ask_before_send: true, changeable: false }),
         ],
         "VibeTalkV1ClientFrame": [
             to(&VibeTalkV1ClientFrame::AudioStart),

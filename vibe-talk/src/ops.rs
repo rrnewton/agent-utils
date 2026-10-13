@@ -1423,12 +1423,13 @@ pub fn proposal_notice(info: &ChannelInfo, proposal: &crate::post_gate::Proposal
         "NOT SENT. Proposal {serial} is waiting for the speaker's confirmation.\n\
          Channel: {channel} (id {id}){target}\n\
          Exact text: {text}\n\
-         Read that exact text back to the speaker, then ask them to tap Send on the voice page to \
-         post it. You cannot send it yourself, and nothing you say or call confirms it; a voice \
-         bridge that accepts a spoken confirmation may send it on the speaker's own yes instead. \
-         Do not call post_reply again to confirm; calling it again replaces this proposal with a \
-         new one. If the speaker wants different words, call post_reply with the new text. The \
-         proposal lapses in {seconds} seconds.",
+         Read that exact text back to the speaker, word for word, and end with the question: \
+         Send it? Then wait for the speaker. The voice page sends it when they say yes or tap \
+         Send, and then reports the result in a message that starts with \"Voice page:\"; do not \
+         say it was sent before that. You cannot send it yourself, and nothing you say or call \
+         confirms it. Do not call post_reply again to confirm; calling it again replaces this \
+         proposal with a new one. If the speaker wants different words, call post_reply with the \
+         new text. The proposal lapses in {seconds} seconds.",
         serial = proposal.serial,
         channel = info.display_name(),
         id = info.id,
@@ -1445,10 +1446,11 @@ pub fn proposal_notice(info: &ChannelInfo, proposal: &crate::post_gate::Proposal
 pub enum ConfirmedBy {
     /// The owner tapped Send on the voice page.
     Ui,
-    /// A bridge attributed a separate, final user turn to the speaker as a yes. Only meaningful
+    /// A separate, final user turn was taken as the speaker's yes — by the voice page's own
+    /// judge (`#264 voice-send-approval`), or by a bridge keeping the same rules. Only meaningful
     /// after a read-back that finished normally: a yes following a barge-in, or reaching a model
     /// session that never saw the proposal, is not agreement to text the speaker heard. That rule
-    /// is the bridge's to keep; this server cannot observe it.
+    /// is the confirming client's to keep; this server cannot observe it.
     SpeakerTurn,
 }
 

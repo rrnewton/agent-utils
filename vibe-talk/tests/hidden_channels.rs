@@ -395,7 +395,13 @@ async fn hiding_and_showing_need_the_write_scope_and_no_tool_reaches_either() {
             );
         }
     }
-    for tool in vibe_talk::mcp::tool_manifest(&[]) {
+    for tool in [
+        vibe_talk::send_approval::Approval::Ask,
+        vibe_talk::send_approval::Approval::Direct,
+    ]
+    .into_iter()
+    .flat_map(|approval| vibe_talk::mcp::tool_manifest(&[], approval))
+    {
         assert!(
             !(tool.method == "DELETE" && tool.path.starts_with("/api/v1/channels")),
             "{} reaches a channel-list route",

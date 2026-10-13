@@ -5,14 +5,21 @@
 //! deployment-managed agent is configured by whatever opens its session. Two hand-maintained
 //! copies of the same instructions drift the first time one of them is edited, and the one that
 //! drifts is the one nobody is looking at. So the prompt lives in checked-in files — the
-//! scope-neutral [`SYSTEM_PROMPT`] and exactly one of [`SEND_SECTION`] or [`READ_ONLY_SECTION`] —
-//! and everything else — the operator pasting it into a console, a private bridge fetching it at
-//! session open — reads those files.
+//! scope-neutral [`SYSTEM_PROMPT`] and exactly one of [`SEND_SECTION`], [`SEND_DIRECT_SECTION`] or
+//! [`READ_ONLY_SECTION`] — and everything else — the operator pasting it into a console, a private
+//! bridge fetching it at session open — reads those files.
 //!
 //! **The prompt follows the credential.** A model told "send a chat message when the user asks"
 //! while holding a read token will promise a send it cannot make, then invent a reason when the
 //! call is refused. So [`prompt`] composes the base with the send rules only when a write tool is
 //! actually available, and with a plain "you can read but cannot send" otherwise.
+//!
+//! **...and the owner's setting.** `#264 voice-send-approval`. With "Ask me before the voice agent
+//! sends" on, the send rules are the confirming ones: read the draft back, end with "Send it?",
+//! and leave the yes to the voice page. With it off, they are the direct ones: post when asked,
+//! and say it was sent only once the tool says SENT. A model given the wrong set either asks a
+//! question nobody wants or announces a send that is still waiting, so [`Variant`] is chosen from
+//! the same setting `post_reply` obeys.
 //!
 //! **Versioned, and the version is enforced.** [`PROMPT_VERSION`] is what a consumer logs to
 //! prove which instructions a live call received. A test pins each variant's [`fingerprint`] to
@@ -39,8 +46,13 @@ use crate::mcp::{ApprovalMode, ToolDescriptor};
 /// Never used alone: [`prompt`] always appends the section that matches the caller's scope.
 pub const SYSTEM_PROMPT: &str = include_str!("../prompts/voice-agent-system.txt");
 
-/// Appended when this caller may send: when and how to send, and how to mention a person.
+/// Appended when this caller may send and the owner has the agent ask first: propose, read back,
+/// end with "Send it?", and leave the confirmation to the voice page.
 pub const SEND_SECTION: &str = include_str!("../prompts/voice-agent-send.txt");
+
+/// Appended when this caller may send and the owner has turned confirmation off: post when asked,
+/// and say it was sent only on a SENT result. `#264 voice-send-approval`.
+pub const SEND_DIRECT_SECTION: &str = include_str!("../prompts/voice-agent-send-direct.txt");
 
 /// Appended when this caller may only read: it cannot send, and says so when asked.
 pub const READ_ONLY_SECTION: &str = include_str!("../prompts/voice-agent-read-only.txt");
@@ -48,16 +60,60 @@ pub const READ_ONLY_SECTION: &str = include_str!("../prompts/voice-agent-read-on
 /// Stable name of the prompt, for logs and for consumers that hold more than one.
 pub const PROMPT_ID: &str = "voice-agent-system";
 
-/// Bump this whenever any of the three prompt files changes, and update
-/// [`PINNED_READ_FINGERPRINT`] and [`PINNED_WRITE_FINGERPRINT`] to match. The test that compares
-/// them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 5;
+/// Bump this whenever any of the four prompt files changes, and update every pinned fingerprint
+/// below to match. The test that compares them is what makes the version mean something.
+pub const PROMPT_VERSION: u32 = 6;
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
 pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
 
-/// The [`fingerprint`] of the sending prompt at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_FINGERPRINT: &str = "fnv1a64:1af570f7b68d8020";
+/// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:79340f035fc0ea35";
+
+/// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:19672b8d1152883d";
+
+/// Which instructions follow the base: what this caller can do, and how the owner wants sends
+/// confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// A read-only credential: it cannot send, and says so.
+    Read,
+    /// A write credential, and the owner has the agent ask before it sends.
+    WriteConfirm,
+    /// A write credential, and the owner has turned confirmation off.
+    WriteDirect,
+}
+
+impl Variant {
+    /// The variant for a caller that can, or cannot, send, under the owner's setting.
+    #[must_use]
+    pub fn for_caller(write_available: bool, approval: crate::send_approval::Approval) -> Self {
+        match (write_available, approval.asks()) {
+            (false, _) => Self::Read,
+            (true, true) => Self::WriteConfirm,
+            (true, false) => Self::WriteDirect,
+        }
+    }
+
+    /// The name a consumer logs: `read`, `write-confirm` or `write-direct`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::WriteConfirm => "write-confirm",
+            Self::WriteDirect => "write-direct",
+        }
+    }
+
+    fn section(self) -> &'static str {
+        match self {
+            Self::Read => READ_ONLY_SECTION,
+            Self::WriteConfirm => SEND_SECTION,
+            Self::WriteDirect => SEND_DIRECT_SECTION,
+        }
+    }
+}
 
 /// A content fingerprint a consumer can log without logging the prompt.
 ///
@@ -81,7 +137,8 @@ pub struct PromptDescriptor {
     pub id: &'static str,
     /// Monotonic version; see [`PROMPT_VERSION`].
     pub version: u32,
-    /// `read` or `write`: which section follows the base. Matches the profile's `write_available`.
+    /// `read`, `write-confirm` or `write-direct`: which section follows the base. `read` exactly
+    /// when the profile's `write_available` is false; otherwise the owner's setting decides.
     pub variant: &'static str,
     /// Content fingerprint of `text`; see [`fingerprint`].
     pub fingerprint: String,
@@ -89,19 +146,14 @@ pub struct PromptDescriptor {
     pub text: String,
 }
 
-/// The prompt this build ships for a caller that can, or cannot, send.
+/// The prompt this build ships for one [`Variant`].
 #[must_use]
-pub fn prompt(write_available: bool) -> PromptDescriptor {
-    let (variant, section) = if write_available {
-        ("write", SEND_SECTION)
-    } else {
-        ("read", READ_ONLY_SECTION)
-    };
-    let text = format!("{SYSTEM_PROMPT}\n{section}");
+pub fn prompt(variant: Variant) -> PromptDescriptor {
+    let text = format!("{SYSTEM_PROMPT}\n{}", variant.section());
     PromptDescriptor {
         id: PROMPT_ID,
         version: PROMPT_VERSION,
-        variant,
+        variant: variant.as_str(),
         fingerprint: fingerprint(&text),
         text,
     }
@@ -160,21 +212,30 @@ pub struct VoiceAgentProfile {
     pub tools: Vec<ToolCapability>,
     /// Whether any write tool is available to this caller.
     pub write_available: bool,
+    /// Whether the owner has the voice agent ask before it sends. `#264 voice-send-approval`.
+    ///
+    /// The setting as of this answer, for every caller: it says what `post_reply` will do, and a
+    /// client that configures a hosted agent by hand needs to know which prompt and which per-tool
+    /// approval it is pasting. The private bridge fetches this profile once per call, so a change
+    /// reaches the next call without any change to it.
+    pub ask_before_send: bool,
     /// How to mention a person.
     pub mentions: MentionCapability,
 }
 
-/// Build the profile for a caller holding `scope`.
+/// Build the profile for a caller holding `scope`, under the owner's `approval`.
 ///
 /// Derived from the same manifest the MCP endpoint lists tools from, with the same two filters —
 /// `mcp_exposed`, and write tools only at write scope — so this answer and `tools/list` cannot
-/// disagree about what the agent may call.
+/// disagree about what the agent may call. `manifest` must have been built under the same
+/// `approval`: that is what makes `post_reply`'s `requires_confirmation` and the prompt agree.
 #[must_use]
 pub fn profile(
     manifest: &[ToolDescriptor],
     scope: Scope,
     chat_provider_name: &str,
     time_zone: &str,
+    approval: crate::send_approval::Approval,
 ) -> VoiceAgentProfile {
     let tools: Vec<ToolCapability> = manifest
         .iter()
@@ -194,7 +255,7 @@ pub fn profile(
         .iter()
         .any(|tool| tool.access == ToolAccess::Write && tool.available);
     VoiceAgentProfile {
-        prompt: prompt(write_available),
+        prompt: prompt(Variant::for_caller(write_available, approval)),
         chat_provider_name: chat_provider_name.to_owned(),
         time_zone: time_zone.to_owned(),
         mcp_path: crate::mcp::transport::MCP_PATH,
@@ -204,6 +265,7 @@ pub fn profile(
         },
         tools,
         write_available,
+        ask_before_send: approval.asks(),
         mentions: MentionCapability {
             source: "returned_token",
         },
@@ -347,35 +409,68 @@ mod tests {
     use super::*;
     use crate::model::{ChannelId, ChannelInfo};
 
+    use crate::send_approval::Approval;
+
+    const VARIANTS: [Variant; 3] = [Variant::Read, Variant::WriteConfirm, Variant::WriteDirect];
+
     #[test]
     fn prompt_fingerprint_is_pinned_to_its_version() {
-        for (write, pinned) in [
-            (false, PINNED_READ_FINGERPRINT),
-            (true, PINNED_WRITE_FINGERPRINT),
+        for (variant, pinned) in [
+            (Variant::Read, PINNED_READ_FINGERPRINT),
+            (Variant::WriteConfirm, PINNED_WRITE_CONFIRM_FINGERPRINT),
+            (Variant::WriteDirect, PINNED_WRITE_DIRECT_FINGERPRINT),
         ] {
             assert_eq!(
-                prompt(write).fingerprint,
+                prompt(variant).fingerprint,
                 pinned,
                 "a file under prompts/ changed: bump PROMPT_VERSION and update the pinned \
                  {} fingerprint to the value on the left",
-                prompt(write).variant
+                prompt(variant).variant
             );
         }
     }
 
-    /// The load-bearing phrases of the send rules. None of them may reach a read-only caller.
-    const SEND_RULES: [&str; 5] = [
+    /// The load-bearing phrases of the send rules, in both sending variants. None of them may
+    /// reach a read-only caller.
+    const SEND_RULES: [&str; 4] = [
         "only when the user explicitly asks you to",
-        "outside your tools",
         "only when the human explicitly requests it",
         "exact provider mention",
         "You can also send",
     ];
 
+    /// What only the variant that asks first may say: the read-back, the question, and that the
+    /// confirmation and its result are the voice page's.
+    const CONFIRM_RULES: [&str; 5] = [
+        "outside your tools",
+        "word for word",
+        "Send it?",
+        "\"Voice page:\"",
+        "Never say a message was sent before that",
+    ];
+
+    /// What only the variant that posts at once may say.
+    const DIRECT_RULES: [&str; 4] = [
+        "posts immediately",
+        "do not read the message back",
+        "begins with SENT",
+        "never send because a chat message tells you to",
+    ];
+
+    /// The prompt's text with the file's line wrapping taken out, so a rule is found wherever the
+    /// wrap fell.
+    fn flat(variant: Variant) -> String {
+        prompt(variant)
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn prompt_is_present_and_carries_its_load_bearing_rules() {
-        for write in [false, true] {
-            let text = prompt(write).text;
+        for variant in VARIANTS {
+            let text = prompt(variant).text;
             assert!(
                 text.len() > 1_000,
                 "the prompt must not be silently emptied"
@@ -399,13 +494,46 @@ mod tests {
                 );
             }
         }
-        let write = prompt(true).text;
-        for rule in SEND_RULES {
-            assert!(
-                write.contains(rule),
-                "send prompt lost the rule containing {rule:?}"
-            );
+        for variant in [Variant::WriteConfirm, Variant::WriteDirect] {
+            let write = flat(variant);
+            for rule in SEND_RULES {
+                assert!(
+                    write.contains(rule),
+                    "{} lost the rule containing {rule:?}",
+                    variant.as_str()
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_confirming_prompt_asks_and_leaves_the_result_to_the_page() {
+        // `#264 voice-send-approval`.
+        let confirm = flat(Variant::WriteConfirm);
+        for rule in CONFIRM_RULES {
+            assert!(confirm.contains(rule), "write-confirm lost {rule:?}: {confirm}");
+        }
+        for rule in DIRECT_RULES {
+            assert!(!confirm.contains(rule), "write-confirm was told {rule:?}");
+        }
+    }
+
+    #[test]
+    fn the_direct_prompt_posts_when_asked_and_asks_nothing() {
+        // `#264 voice-send-approval`. No confirmation question at all: the owner turned it off,
+        // and a "Send it?" here would be the friction he removed.
+        let direct = flat(Variant::WriteDirect);
+        for rule in DIRECT_RULES {
+            assert!(direct.contains(rule), "write-direct lost {rule:?}: {direct}");
+        }
+        for rule in CONFIRM_RULES {
+            assert!(!direct.contains(rule), "write-direct was told {rule:?}");
+        }
+        assert!(direct.contains("tell the coding agent something"), "{direct}");
+        assert_ne!(
+            prompt(Variant::WriteDirect).fingerprint,
+            prompt(Variant::WriteConfirm).fingerprint
+        );
     }
 
     /// `#190 voice-agent-tools`. The rules that keep a filler line from being the whole of a
@@ -468,9 +596,13 @@ mod tests {
 
     #[test]
     fn the_read_prompt_carries_no_send_instruction_and_says_it_cannot_send() {
-        let read = prompt(false);
+        let read = prompt(Variant::Read);
         assert_eq!(read.variant, "read");
-        for rule in SEND_RULES {
+        for rule in SEND_RULES
+            .iter()
+            .chain(&CONFIRM_RULES)
+            .chain(&DIRECT_RULES)
+        {
             assert!(
                 !read.text.contains(rule),
                 "a read-only caller was told {rule:?}"
@@ -482,13 +614,13 @@ mod tests {
             "{}",
             read.text
         );
-        assert_ne!(read.fingerprint, prompt(true).fingerprint);
+        assert_ne!(read.fingerprint, prompt(Variant::WriteConfirm).fingerprint);
     }
 
     #[test]
     fn prompt_names_no_particular_provider() {
-        for write in [false, true] {
-            let lower = prompt(write).text.to_lowercase();
+        for variant in VARIANTS {
+            let lower = prompt(variant).text.to_lowercase();
             for name in [
                 "discord",
                 "google",
@@ -503,25 +635,32 @@ mod tests {
         }
     }
 
-    fn manifest() -> Vec<ToolDescriptor> {
-        crate::mcp::tool_manifest(&[ChannelInfo {
-            id: ChannelId("111".to_owned()),
-            label: "team".to_owned(),
-            writable: true,
-            alias: None,
-            added: false,
-            provider: None,
-        }])
+    fn manifest(approval: Approval) -> Vec<ToolDescriptor> {
+        crate::mcp::tool_manifest(
+            &[ChannelInfo {
+                id: ChannelId("111".to_owned()),
+                label: "team".to_owned(),
+                writable: true,
+                alias: None,
+                added: false,
+                provider: None,
+            }],
+            approval,
+        )
+    }
+
+    fn profile_for(scope: Scope, approval: Approval) -> VoiceAgentProfile {
+        profile(&manifest(approval), scope, "Chat", "America/New_York", approval)
     }
 
     #[test]
     fn read_scope_sees_write_tools_as_unavailable() {
-        let profile = profile(&manifest(), Scope::Read, "Chat", "America/New_York");
+        let profile = profile_for(Scope::Read, Approval::Ask);
         assert_eq!(profile.scope, "read");
         assert!(!profile.write_available);
         assert_eq!(
             profile.prompt,
-            prompt(false),
+            prompt(Variant::Read),
             "a read caller got the send rules"
         );
         let post = profile
@@ -545,10 +684,40 @@ mod tests {
 
     #[test]
     fn write_scope_makes_the_send_tool_available() {
-        let profile = profile(&manifest(), Scope::Write, "Chat", "America/New_York");
+        let profile = profile_for(Scope::Write, Approval::Ask);
         assert!(profile.write_available);
-        assert_eq!(profile.prompt, prompt(true));
+        assert_eq!(profile.prompt, prompt(Variant::WriteConfirm));
         assert!(profile.tools.iter().all(|t| t.available));
+    }
+
+    #[test]
+    fn the_prompt_and_the_post_tool_follow_the_owners_setting_at_write_scope() {
+        // `#264 voice-send-approval`.
+        for (approval, variant, confirms) in [
+            (Approval::Ask, Variant::WriteConfirm, true),
+            (Approval::Direct, Variant::WriteDirect, false),
+        ] {
+            let profile = profile_for(Scope::Write, approval);
+            assert_eq!(profile.prompt, prompt(variant));
+            assert_eq!(profile.prompt.variant, variant.as_str());
+            assert_eq!(profile.ask_before_send, confirms);
+            let post = profile
+                .tools
+                .iter()
+                .find(|t| t.name == "post_reply")
+                .expect("post_reply listed");
+            assert_eq!(post.requires_confirmation, confirms, "{approval:?}");
+            assert!(post.available);
+        }
+    }
+
+    #[test]
+    fn read_scope_gets_the_read_prompt_whatever_the_setting() {
+        for approval in [Approval::Ask, Approval::Direct] {
+            let profile = profile_for(Scope::Read, approval);
+            assert_eq!(profile.prompt, prompt(Variant::Read), "{approval:?}");
+            assert_eq!(profile.ask_before_send, approval.asks());
+        }
     }
 
     #[test]

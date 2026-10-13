@@ -294,6 +294,20 @@ pub const MIGRATIONS: &[&str] = &[
         CHECK (message_id IS NOT NULL OR thread_id IS NULL)
     ) STRICT;
     ",
+    // v13 — whether the voice agent must ask before it sends. `#264 voice-send-approval`.
+    //
+    // ONE row or none, for the reason `noise_rules` gives: no row means the owner has never chosen,
+    // so the configuration file's `[conversation] ask_before_send` stands in, and a row holding 1
+    // or 0 is his own choice. Nothing is inserted here, because seeding the default would make
+    // "never chosen" and "chose the default" indistinguishable. One boolean and an instant; no
+    // text of any kind.
+    "
+    CREATE TABLE voice_settings (
+        id              INTEGER PRIMARY KEY CHECK (id = 1),
+        ask_before_send INTEGER NOT NULL CHECK (ask_before_send IN (0, 1)),
+        set_at_ms       INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -1424,6 +1438,37 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn ask_before_send(&self) -> Result<Option<bool>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT ask_before_send FROM voice_settings WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(backend)
+                .map(|stored| stored.map(|value| value != 0))
+        })
+        .await
+    }
+
+    async fn set_ask_before_send(&self, ask: bool) -> Result<bool, StoreError> {
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO voice_settings (id, ask_before_send, set_at_ms) VALUES (1, ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                        ask_before_send = excluded.ask_before_send,
+                        set_at_ms       = excluded.set_at_ms",
+                    rusqlite::params![i64::from(ask), now_ms()],
+                )
+                .map_err(backend)?;
+            Ok(ask)
+        })
+        .await
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
@@ -1882,6 +1927,11 @@ impl StateStore for SqliteStore {
             // clock, past every revision a page may still hold. `#240 reading-bookmark`.
             transaction
                 .execute("DELETE FROM bookmarks", [])
+                .map_err(backend)?;
+            // Back to the configured default, which is the safe direction: the shipped
+            // configuration asks before the voice agent sends. `#264 voice-send-approval`.
+            transaction
+                .execute("DELETE FROM voice_settings", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -4294,5 +4344,64 @@ mod tests {
             &[steps[0], "CREATE TABLE half (x INTEGER) STRICT;"],
         )
         .expect("the fixed ladder applies");
+    }
+
+    #[tokio::test]
+    async fn the_voice_send_choice_starts_unmade_survives_a_restart_and_the_purge_unmakes_it() {
+        // `#264 voice-send-approval`. Two states the file must keep apart: never chosen (the
+        // configured default applies) and chosen — including chosen to ask, which is the default's
+        // value but not "never chosen".
+        let dir = TempDir::new("sqlite-voice-settings");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            assert_eq!(store.ask_before_send().await.expect("read"), None);
+            assert!(!store.set_ask_before_send(false).await.expect("save"));
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(
+            reopened.ask_before_send().await.expect("read back"),
+            Some(false),
+            "the owner's choice did not survive a restart"
+        );
+        assert!(reopened.set_ask_before_send(true).await.expect("save"));
+        assert_eq!(reopened.ask_before_send().await.expect("read"), Some(true));
+        reopened.purge_everything().await.expect("purge");
+        assert_eq!(
+            reopened.ask_before_send().await.expect("read"),
+            None,
+            "the purge left a choice behind instead of restoring the configured default"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_voice_settings_table_arrives_on_a_file_at_the_previous_schema_unchosen() {
+        let dir = TempDir::new("sqlite-voice-settings-migrate");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..12] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO read_marks VALUES ('1111111111', '1000000000000000100',
+                                                    1000000000000000100, 5);",
+                )
+                .expect("an owner's state");
+            connection
+                .pragma_update(None, "user_version", 12_i64)
+                .expect("stamp old schema");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        assert_eq!(store.read_marks().await.expect("read").len(), 1);
+        assert_eq!(
+            store.ask_before_send().await.expect("read"),
+            None,
+            "an upgraded file arrived with a choice nobody made"
+        );
+        assert!(!store.set_ask_before_send(false).await.expect("save"));
     }
 }

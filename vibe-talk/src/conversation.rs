@@ -240,6 +240,7 @@ mod tests {
             backend: ConversationBackend::WebSocket,
             websocket_url: Some(url.to_owned()),
             label: "voice".to_owned(),
+            ask_before_send: true,
         }
     }
 

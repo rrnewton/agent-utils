@@ -168,6 +168,28 @@ pub struct ClientConfigResponse {
     /// a broken store makes the editor disappear rather than show a list that is not in force.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise_rules: Option<NoiseRules>,
+    /// "Ask me before the voice agent sends", as Settings shows it. `#264 voice-send-approval`.
+    ///
+    /// Here so the checkbox is drawn at sign-in, as the noise rules are. Readable at read scope —
+    /// it says how the voice agent behaves, which a reader of the channels may know — and changed
+    /// only by a write-scope `PUT /api/v1/voice-settings`. Absent from an older server, which
+    /// always asked; the page then hides the checkbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_settings: Option<VoiceSettings>,
+}
+
+/// Whether the voice agent must ask before it sends. `#264 voice-send-approval`.
+///
+/// The body of `GET` and `PUT /api/v1/voice-settings`, and `voice_settings` in client-config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct VoiceSettings {
+    /// The value in force: true means `post_reply` proposes and the owner confirms, by a tap or by
+    /// a plain yes the voice page hears; false means `post_reply` posts at once. The owner's saved
+    /// choice, or the configured default until he makes one.
+    pub ask_before_send: bool,
+    /// Whether this server can keep a change. False with no store configured, and when the store
+    /// cannot be read — the server then asks, whatever the configured default says.
+    pub changeable: bool,
 }
 
 /// The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.
@@ -727,6 +749,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<BookmarkResponse>(),
         // `#253 upstream-clear-polish`. Appended, for the same reason.
         generator.subschema_for::<UpstreamClearNowResponse>(),
+        // `#264 voice-send-approval`. Appended, for the same reason.
+        generator.subschema_for::<VoiceSettings>(),
     ]
 }
 

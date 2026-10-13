@@ -152,7 +152,10 @@ async fn the_profile_carries_the_versioned_prompt_verbatim() {
         profile["prompt"]["fingerprint"],
         voice_agent::PINNED_READ_FINGERPRINT
     );
-    assert_eq!(profile["prompt"]["text"], voice_agent::prompt(false).text);
+    assert_eq!(
+        profile["prompt"]["text"],
+        voice_agent::prompt(voice_agent::Variant::Read).text
+    );
 }
 
 #[tokio::test]
@@ -185,10 +188,12 @@ async fn a_read_credential_is_not_told_it_may_send_and_a_write_credential_is() {
     .await;
     let write_text = write["prompt"]["text"].as_str().expect("prompt text");
     assert_eq!(write["write_available"], json!(true));
-    assert_eq!(write["prompt"]["variant"], "write");
+    // The shipped setting asks before the agent sends. `#264 voice-send-approval`.
+    assert_eq!(write["prompt"]["variant"], "write-confirm");
+    assert_eq!(write["ask_before_send"], json!(true));
     assert_eq!(
         write["prompt"]["fingerprint"],
-        voice_agent::PINNED_WRITE_FINGERPRINT
+        voice_agent::PINNED_WRITE_CONFIRM_FINGERPRINT
     );
     assert!(
         write_text.contains(voice_agent::SEND_SECTION.trim()),

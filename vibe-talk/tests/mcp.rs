@@ -443,7 +443,7 @@ async fn a_configured_but_read_only_channel_still_refuses_the_write_token() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["isError"], true, "{body}");
     assert!(
-        tool_text(&body).starts_with("channel_not_writable"),
+        tool_text(&body).starts_with("NOT SENT. channel_not_writable"),
         "{body}"
     );
     assert!(harness.discord.posted().is_empty());

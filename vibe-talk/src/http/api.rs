@@ -721,7 +721,8 @@ pub async fn agent_tools(
     State(state): State<AppState>,
     _scope: ReadScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await);
+    let approval = crate::send_approval::current(&state).await;
+    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await, approval);
     Ok(Json(serde_json::json!({ "tools": manifest })))
 }
 
@@ -786,7 +787,49 @@ pub async fn client_config(
         summaries_unavailable: state.summarizer.unavailable_reason(),
         token_scope: scope.into(),
         noise_rules: noise_rules_view(&state).await,
+        voice_settings: Some(crate::send_approval::view(&state).await),
     }))
+}
+
+/// `GET /api/v1/voice-settings` — whether the voice agent asks before it sends.
+/// `#264 voice-send-approval`.
+///
+/// READ scope: it says how the voice agent behaves, which a reader may know, and it rides on
+/// client-config too. `no-store`, because it changes when the owner flips it.
+pub async fn voice_settings(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Response, ApiError> {
+    Ok(no_store(Json(crate::send_approval::view(&state).await)))
+}
+
+/// The owner's answer to "Ask me before the voice agent sends".
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceSettingsRequest {
+    /// True: `post_reply` proposes and the owner confirms. False: it posts at once.
+    pub ask_before_send: bool,
+}
+
+/// `PUT /api/v1/voice-settings` — turn the voice agent's confirmation on or off.
+/// `#264 voice-send-approval`.
+///
+/// WRITE scope, and — as with [`set_noise_rules`] — **the scope is not what keeps the voice agent
+/// out**: a hosted agent is routinely given the write token for `post_reply`. What keeps a model
+/// from turning its own confirmation off is that NO TOOL reaches this route —
+/// [`crate::mcp::tool_manifest`] offers none and [`crate::mcp::protocol::dispatch`] refuses any name
+/// it cannot find there. Settings is the only caller. With no store configured it answers 503
+/// `storage_not_configured`, and the server keeps asking.
+pub async fn set_voice_settings(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let request: VoiceSettingsRequest = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::bad_request("expected {\"ask_before_send\": true or false} and nothing else")
+    })?;
+    let settings = crate::send_approval::set(&state, request.ask_before_send).await?;
+    Ok(no_store(Json(settings)))
 }
 
 /// The noise rules for client-config, or `None` when a configured store cannot say what they are.
@@ -964,12 +1007,16 @@ pub async fn voice_agent(
     State(state): State<AppState>,
     ReadScope(scope): ReadScope,
 ) -> Result<Response, ApiError> {
-    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await);
+    // One read of the setting for both, so the prompt and `post_reply`'s confirmation flag cannot
+    // straddle a change made between two reads. `#264 voice-send-approval`.
+    let approval = crate::send_approval::current(&state).await;
+    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await, approval);
     let profile = crate::voice_agent::profile(
         &manifest,
         scope,
         state.chat.provider_name(),
         state.config.timezone.name(),
+        approval,
     );
     Ok(no_store(Json(profile)))
 }
@@ -1866,9 +1913,11 @@ pub struct ProposeRequest {
 /// a model's tool, and the handle is the owner's to spend, through `GET` and the commit route.
 #[derive(Debug, Serialize)]
 pub struct ProposedResponse {
-    /// Always `false`: proposing posts nothing.
+    /// `false` when it was proposed, which posts nothing; `true` only when the owner has turned off
+    /// "Ask me before the voice agent sends" and it was posted at once. `#264 voice-send-approval`.
     pub sent: bool,
-    /// The proposal's number, as `GET /api/v1/post-proposals` will report it.
+    /// The proposal's number, as `GET /api/v1/post-proposals` will report it; for a direct send,
+    /// the number its access-log line carries.
     pub serial: u64,
     /// The sentence MCP's `post_reply` answers with, for a caller that relays it to a model.
     pub result: String,
@@ -1947,25 +1996,72 @@ async fn pending_view(
     }
 }
 
-/// `POST /api/v1/post-proposals` — propose a post, and post nothing. The route `post_reply` is
-/// backed by, for a caller that speaks REST rather than MCP.
+/// `POST /api/v1/post-proposals` — what `post_reply` does, for a caller that speaks REST rather
+/// than MCP: propose a post and post nothing, or — when the owner has turned off "Ask me before the
+/// voice agent sends" — post it at once. `#264 voice-send-approval`.
+///
+/// A direct send that fails partway answers like the reply route: 207 with the unsent remainder.
 pub async fn propose_post(
     State(state): State<AppState>,
     _scope: WriteScope,
     Json(request): Json<ProposeRequest>,
-) -> Result<Json<ProposedResponse>, ApiError> {
-    let (channel, proposal) = ops::propose_reply(
+) -> Result<Response, ApiError> {
+    let outcome = crate::send_approval::voice_post(
         &state,
         &request.channel_id,
         &request.text,
         request.reply_to.as_deref(),
     )
-    .await?;
-    Ok(Json(ProposedResponse {
-        sent: false,
-        serial: proposal.serial,
-        result: ops::proposal_notice(&channel, &proposal),
-    }))
+    .await;
+    match outcome {
+        Ok(crate::send_approval::VoicePost::Proposed { channel, proposal }) => {
+            Ok(Json(ProposedResponse {
+                sent: false,
+                serial: proposal.serial,
+                result: ops::proposal_notice(&channel, &proposal),
+            })
+            .into_response())
+        }
+        Ok(crate::send_approval::VoicePost::Sent {
+            channel,
+            serial,
+            parts,
+            text,
+            reply_to,
+            ..
+        }) => Ok(Json(ProposedResponse {
+            sent: true,
+            serial,
+            result: crate::send_approval::sent_notice(
+                &channel,
+                &text,
+                reply_to.as_deref(),
+                parts.len(),
+            ),
+        })
+        .into_response()),
+        Err(OpError::PartiallyPosted {
+            posted,
+            unsent,
+            cause,
+            retryable,
+            resumable,
+            thread_id,
+        }) => Ok((
+            StatusCode::MULTI_STATUS,
+            Json(PartialReplyResponse {
+                error: "partially_posted",
+                detail: cause,
+                posted,
+                unsent,
+                retryable,
+                resumable,
+                thread_id,
+            }),
+        )
+            .into_response()),
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// `GET /api/v1/post-proposals` — the post waiting for confirmation, long-polled.

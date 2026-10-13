@@ -328,6 +328,13 @@ fn routes(state: AppState) -> Router {
             "/api/v1/noise-rules",
             axum::routing::put(api::set_noise_rules),
         )
+        // `#264 voice-send-approval`. Whether the voice agent asks before it sends. READ scope to
+        // see it, WRITE scope to change it — and NO MCP TOOL, because a model that could turn its
+        // own confirmation off could then post whatever a message it read asked for.
+        .route(
+            "/api/v1/voice-settings",
+            get(api::voice_settings).put(api::set_voice_settings),
+        )
         .route(
             "/api/v1/channels/{channel_id}/not-noise",
             post(api::not_noise),

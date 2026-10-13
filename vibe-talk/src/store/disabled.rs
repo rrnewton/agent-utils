@@ -154,6 +154,16 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn ask_before_send(&self) -> Result<Option<bool>, StoreError> {
+        // A refusal, not `Ok(None)`, for the noise rules' reason: Settings must not believe it
+        // could save a choice. `send_approval::current` applies the configured default by name.
+        refuse()
+    }
+
+    async fn set_ask_before_send(&self, _: bool) -> Result<bool, StoreError> {
+        refuse()
+    }
+
     async fn noise_exemptions(&self, _: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         refuse()
     }

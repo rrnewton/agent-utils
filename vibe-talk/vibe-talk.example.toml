@@ -233,6 +233,15 @@ enabled = true
 # A path means the page's own host, which suits a bridge behind the same front door as the page:
 # websocket_url = "/ws?mode=voice"
 # label = "WebSocket voice provider"
+#
+# "Ask me before the voice agent sends" (#264 voice-send-approval). ON by default: the agent's
+# post_reply only proposes a message, reads it back and asks "Send it?", and nothing is posted
+# until you say yes or tap Send on the voice page. Off, post_reply posts at once when you ask —
+# and a chat message the agent reads could also talk it into posting. This is only the SHIPPED
+# default: the checkbox in Settings stores your own choice on the server and wins over it until a
+# purge. A hosted agent whose prompt was pasted into its console by hand must be given the new
+# prompt (GET /api/v1/voice-agent) whenever this changes.
+# ask_before_send = true
 
 [storage]
 # Durable state: the /voice conversation transcript, how far you have read in each channel,

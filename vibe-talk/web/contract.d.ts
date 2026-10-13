@@ -328,6 +328,15 @@ declare namespace VibeTalk {
      * Server version, so a stale cached page is visible.
      */
     version: string;
+    /**
+     * "Ask me before the voice agent sends", as Settings shows it. `#264 voice-send-approval`.
+     *
+     * Here so the checkbox is drawn at sign-in, as the noise rules are. Readable at read scope —
+     * it says how the voice agent behaves, which a reader of the channels may know — and changed
+     * only by a write-scope `PUT /api/v1/voice-settings`. Absent from an older server, which
+     * always asked; the page then hides the checkbox.
+     */
+    voice_settings?: VoiceSettings | null;
   }
 
   /**
@@ -1467,6 +1476,25 @@ declare namespace VibeTalk {
     websocket_url: string;
   }
 
+  /**
+   * Whether the voice agent must ask before it sends. `#264 voice-send-approval`.
+   *
+   * The body of `GET` and `PUT /api/v1/voice-settings`, and `voice_settings` in client-config.
+   */
+  interface VoiceSettings {
+    /**
+     * The value in force: true means `post_reply` proposes and the owner confirms, by a tap or by
+     * a plain yes the voice page hears; false means `post_reply` posts at once. The owner's saved
+     * choice, or the configured default until he makes one.
+     */
+    ask_before_send: boolean;
+    /**
+     * Whether this server can keep a change. False with no store configured, and when the store
+     * cannot be read — the server then asks, whatever the configured default says.
+     */
+    changeable: boolean;
+  }
+
   /** Every type that crosses a boundary on its own, by name. */
   interface Contract {
     ApiErrorBody: ApiErrorBody;
@@ -1487,6 +1515,7 @@ declare namespace VibeTalk {
     UpstreamClearState: UpstreamClearState;
     BookmarkResponse: BookmarkResponse;
     UpstreamClearNowResponse: UpstreamClearNowResponse;
+    VoiceSettings: VoiceSettings;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

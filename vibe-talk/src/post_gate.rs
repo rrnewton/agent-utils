@@ -23,6 +23,14 @@
 //! 4. **Nothing said is logged.** [`crate::access::post_gate`] records the proposal's serial, the
 //!    channel, the text's length and the outcome, never the words.
 //!
+//! # Unless the owner turns it off
+//!
+//! `#264 voice-send-approval`. All of the above is what `post_reply` does while "Ask me before the
+//! voice agent sends" is on, which is the shipped default. The owner may turn it off in Settings,
+//! and then `post_reply` posts at once and nothing here is involved; see [`crate::send_approval`].
+//! The switch is his alone — a write-scope route Settings calls, never a tool — so the rule above
+//! still holds in the form that matters: nothing a model can call decides whether it is asked.
+//!
 //! # Why one pending proposal, not a queue
 //!
 //! A voice conversation proposes one message, reads it back, and waits. A second proposal means
@@ -261,6 +269,16 @@ impl PostGate {
         (proposal, displaced)
     }
 
+    /// Take the next serial for a post that is NOT a proposal: one the owner's setting lets the
+    /// voice agent send at once (`#264 voice-send-approval`). Drawn from the same counter so the
+    /// access log's `proposal=` numbers stay one sequence; nothing pending is touched and no
+    /// watcher is woken, because nothing a watcher shows changed.
+    pub fn number(&self) -> u64 {
+        let mut inner = self.lock();
+        inner.next_serial += 1;
+        inner.next_serial
+    }
+
     /// The pending proposal, if one is still confirmable.
     #[must_use]
     pub fn pending(&self) -> Option<Proposal> {
@@ -484,6 +502,19 @@ mod tests {
             Err(Refusal::Superseded)
         );
         assert_eq!(gate.pending(), Some(second));
+    }
+
+    #[tokio::test]
+    async fn numbering_a_direct_send_shares_the_counter_and_disturbs_nothing_pending() {
+        let gate = PostGate::new();
+        let (first, _) = gate.propose(binding("draft"));
+        let changes = gate.changed.subscribe();
+        let numbered = gate.number();
+        assert!(numbered > first.serial);
+        assert_eq!(gate.pending(), Some(first.clone()));
+        assert!(!changes.has_changed().expect("the gate is alive"), "a watcher was woken");
+        let (second, _) = gate.propose(binding("next"));
+        assert!(second.serial > numbered);
     }
 
     #[tokio::test]

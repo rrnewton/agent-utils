@@ -65,6 +65,9 @@ struct State {
     hidden: BTreeMap<String, i64>,
     /// The owner's saved noise rules; `None` until he saves a list. `#196 auto-read-noise`.
     noise_rules: Option<Vec<String>>,
+    /// The owner's "ask before the voice agent sends"; `None` until he chooses.
+    /// `#264 voice-send-approval`.
+    ask_before_send: Option<bool>,
     /// `(channel, message)` to `(when it was exempted, insertion order)`: the "not noise" list,
     /// with enough of the real table's shape to reproduce its count bound and its eviction order.
     noise_exemptions: BTreeMap<(String, String), (i64, u64)>,
@@ -645,6 +648,19 @@ impl StateStore for FakeStore {
         Ok(rules)
     }
 
+    async fn ask_before_send(&self) -> Result<Option<bool>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.ask_before_send)
+    }
+
+    async fn set_ask_before_send(&self, ask: bool) -> Result<bool, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.ask_before_send = Some(ask);
+        Ok(ask)
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -982,6 +998,7 @@ impl StateStore for FakeStore {
         state.dismissals.clear();
         state.aliases.clear();
         state.noise_rules = None;
+        state.ask_before_send = None;
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();

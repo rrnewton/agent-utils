@@ -294,6 +294,17 @@
         "version": {
           "description": "Server version, so a stale cached page is visible.",
           "type": "string"
+        },
+        "voice_settings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "\"Ask me before the voice agent sends\", as Settings shows it. `#264 voice-send-approval`.\n\nHere so the checkbox is drawn at sign-in, as the noise rules are. Readable at read scope —\nit says how the voice agent behaves, which a reader of the channels may know — and changed\nonly by a write-scope `PUT /api/v1/voice-settings`. Absent from an older server, which\nalways asked; the page then hides the checkbox."
         }
       },
       "required": [
@@ -1968,6 +1979,24 @@
         "output_sample_rate"
       ],
       "type": "object"
+    },
+    "VoiceSettings": {
+      "description": "Whether the voice agent must ask before it sends. `#264 voice-send-approval`.\n\nThe body of `GET` and `PUT /api/v1/voice-settings`, and `voice_settings` in client-config.",
+      "properties": {
+        "ask_before_send": {
+          "description": "The value in force: true means `post_reply` proposes and the owner confirms, by a tap or by\na plain yes the voice page hears; false means `post_reply` posts at once. The owner's saved\nchoice, or the configured default until he makes one.",
+          "type": "boolean"
+        },
+        "changeable": {
+          "description": "Whether this server can keep a change. False with no store configured, and when the store\ncannot be read — the server then asks, whatever the configured default says.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ask_before_send",
+        "changeable"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://github.com/rrnewton/agent-utils/vibe-talk/contract/vibe-talk.schema.json",
@@ -2026,6 +2055,9 @@
     },
     {
       "$ref": "#/$defs/UpstreamClearNowResponse"
+    },
+    {
+      "$ref": "#/$defs/VoiceSettings"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

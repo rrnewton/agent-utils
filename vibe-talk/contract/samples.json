@@ -165,7 +165,11 @@
       "token_scope": "write",
       "upstream_clear_supported": true,
       "upstream_read_mark_supported": true,
-      "version": "0.0.0"
+      "version": "0.0.0",
+      "voice_settings": {
+        "ask_before_send": true,
+        "changeable": true
+      }
     },
     {
       "channel_discovery_supported": false,
@@ -1324,6 +1328,20 @@
       "protocol": "vibe-talk-v1",
       "provider": "Voice",
       "websocket_url": "wss://voice.example/session"
+    }
+  ],
+  "VoiceSettings": [
+    {
+      "ask_before_send": true,
+      "changeable": true
+    },
+    {
+      "ask_before_send": false,
+      "changeable": true
+    },
+    {
+      "ask_before_send": true,
+      "changeable": false
     }
   ]
 }

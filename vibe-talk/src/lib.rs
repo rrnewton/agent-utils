@@ -72,6 +72,7 @@ pub mod recent;
 pub mod render;
 pub mod replay;
 pub mod retrieval;
+pub mod send_approval;
 pub mod slack;
 pub mod speakable;
 pub mod speech;

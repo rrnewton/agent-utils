@@ -756,10 +756,21 @@ pub struct ConversationConfig {
     /// Human-readable label shown in connection details.
     #[serde(default = "default_conversation_label")]
     pub label: String,
+    /// The SHIPPED default of "Ask me before the voice agent sends". `#264 voice-send-approval`.
+    ///
+    /// On unless the operator turns it off here. The owner's own choice, made in Settings, is kept
+    /// in the store and wins over this; this value is what applies until he makes one, and again
+    /// after a purge. See [`crate::send_approval`].
+    #[serde(default = "default_ask_before_send")]
+    pub ask_before_send: bool,
 }
 
 fn default_conversation_label() -> String {
     "WebSocket voice provider".to_owned()
+}
+
+const fn default_ask_before_send() -> bool {
+    true
 }
 
 impl Default for ConversationConfig {
@@ -768,6 +779,7 @@ impl Default for ConversationConfig {
             backend: ConversationBackend::ElevenLabs,
             websocket_url: None,
             label: default_conversation_label(),
+            ask_before_send: default_ask_before_send(),
         }
     }
 }
@@ -3542,6 +3554,20 @@ provider = "slack"
             Some("wss://voice-provider.example/ws")
         );
         assert_eq!(cfg.conversation.label, "Private preview");
+        assert!(
+            cfg.conversation.ask_before_send,
+            "confirmation must be on unless the operator turns it off"
+        );
+    }
+
+    #[test]
+    fn asking_before_a_voice_send_is_on_by_default_and_can_be_turned_off() {
+        // `#264 voice-send-approval`. The shipped default; the owner's saved choice is separate.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(cfg.conversation.ask_before_send);
+        let text = format!("{FULL}\n[conversation]\nask_before_send = false\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(!cfg.conversation.ask_before_send);
     }
 
     #[test]
