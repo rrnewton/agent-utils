@@ -34584,6 +34584,42 @@ test("`#270 voice-transcript-markers`: a tapped Send freezes into a card in the 
   assert.ok(!wordsOf(card).includes("Not kept"), "a filed card says it was not kept");
 });
 
+test("`#270 voice-transcript-markers`: a bug drawing the frozen card never turns a send that posted into 'nothing was posted'", async () => {
+  // The card is drawn inside the commit's `try`, after the server has posted. Were a drawing bug to
+  // reach the commit's `catch`, it would say the send posted nothing and tell the agent it was NOT
+  // sent. It is thrown on its own instead, and the send memory still draws the card.
+  const drawingBug = () => brokenScript(
+    "function freezeSentCard(proposal, confirmedBy, outcome, answer) {\n",
+    "function freezeSentCard(proposal, confirmedBy, outcome, answer) {\n  throw new Error(\"a drawing bug\");\n",
+  );
+  const tapped = newPage(new Map(), drawingBug());
+  await recordingCall(tapped);
+  tapped.propose(proposal({ reply_to: null }));
+  await tapped.settle();
+  tapped.expireTimers(2000);
+  await tapped.el("post-confirm-send").click();
+  await watchTurns(tapped);
+  assert.equal(tapped.el("status").textContent, "Posted to lead team.");
+  assert.doesNotMatch(tapped.el("error").textContent, /Nothing was posted|posted nothing/);
+  assert.equal(tapped.el("post-confirm").hidden, true, "the posted draft stayed on the card");
+  assert.throws(() => tapped.expireTimers(0), /a drawing bug/, "the drawing bug was swallowed");
+  // The send memory reports the send at the watch's next read, and draws its card once.
+  await watchTurns(tapped);
+  assert.equal(sentCards(tapped).length, 1, "the send memory did not draw the card the commit could not");
+  assert.match(wordsOf(sentCards(tapped)[0]), /approved by tap/);
+
+  // A spoken yes: the agent is told the message was SENT.
+  const spoken = newPage(new Map(), drawingBug());
+  const socket = await readBackDuringACall(spoken);
+  hostedHears(socket, "yes");
+  await settleSpokenYes(spoken);
+  assert.equal(spoken.proposalCommits.length, 1);
+  assert.doesNotMatch(spoken.el("error").textContent, /posted nothing/);
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the message you read back was SENT to lead team\./);
+});
+
 test("`#270 voice-transcript-markers`: a send from the send memory is drawn once when it is this page's, and never when it is not", async () => {
   const page = newPage();
   page.setClock(1_700_000_100_000);
