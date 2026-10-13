@@ -33248,6 +33248,24 @@ test("`#269 approval-card-inline`: while a draft is up the message box is one li
     "the card is not at the owner's own inset, so freezing it would move it sideways");
 });
 
+test("`#269 approval-card-inline`: docked, the card clears the home indicator and only its words scroll", () => {
+  // NOT VERIFIABLE BY SCREENSHOT: Chromium's emulation reports a zero inset. Off the main screen the
+  // control pane, which carries the bottom inset everywhere else, is hidden and the docked card is
+  // the last thing on screen, so without its own bottom inset Send sits under the home indicator.
+  const dock = cssBlock("#frame-body > #post-confirm");
+  assert.match(dock, /padding:[^;]*env\(safe-area-inset-bottom\)/, "the docked card ignores the bottom inset");
+  assert.match(dock, /env\(safe-area-inset-left\)/, "the docked card ignores the left inset");
+  assert.match(dock, /env\(safe-area-inset-right\)/, "the docked card ignores the right inset");
+  // Never a scroll box as a whole: that put where it goes, its status, Don't send and Send below its
+  // own fold once More opened a long draft. Its words are what scroll.
+  assert.doesNotMatch(dock, /overflow(-y)?:\s*(auto|scroll)/, "the docked card scrolls as a whole");
+  assert.doesNotMatch(dock, /max-height/, "the docked card is capped, so what is under its words can be cut off");
+  assert.match(cssBlock('#post-confirm[data-place="dock"] #post-confirm-text'), /overflow-y:\s*auto/,
+    "opened, a long docked draft has nowhere to go");
+  assert.match(cssBlock('#post-confirm[data-place="dock"] #post-confirm-text'), /max-height:[^;]*100dvh/,
+    "the docked words are not bounded by the room the screen has");
+});
+
 test("`#269 approval-card-inline`: a long draft is folded with More, and More opens it in place", async () => {
   const page = newPage();
   const text = `${"long words ".repeat(60)}the end`;

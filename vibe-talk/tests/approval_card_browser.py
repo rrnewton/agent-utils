@@ -16,6 +16,10 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      pill, the chips nor the jump, and nothing runs wider than the screen.
   3. Whenever Send is on screen, so are the line saying where the draft goes and the whole of
      Send's label. A long draft is folded, and More opens it without pushing those two off screen.
+     Docked under Settings the card is never a scroll box of its own: folded and after More, the
+     line saying where it goes, the status line, Don't send and Send are all laid out on screen,
+     and opening the words grows the card upward without moving Send — on the three phones, and on
+     two short screens, a phone turned sideways (667x375) and one with the keyboard up (375x330).
   4. The box's own Send is not drawn while the box is empty, and once something is typed it looks
      different from the card's.
   5. The card stands exactly where a turn of the owner's does: the same left and right edges as an
@@ -28,7 +32,8 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      words, and the same boundary line.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
-without the first call's connection banner, and with a short and a 1,500-character draft.
+without the first call's connection banner, and with a short and a 1,500-character draft; and the
+docked card alone at 667x375 and 375x330.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol. Pass --web-root DIR to
@@ -62,6 +67,9 @@ SHORT_DRAFT = "on it, back in ten"
 LONG_DRAFT = ("The release notes for this week, as agreed: the runner fix landed, the cache keys are "
               "versioned, and the nightly is green on every target. ") * 11
 PHONES = ((393, 852), (360, 780), (375, 667))
+# Screens too short to hold the card as an upright phone does: one turned sideways, and one with the
+# keyboard up on Reply, which takes about half of a 375x667 phone. Only the docked card is run there.
+SHORT_SCREENS = ((667, 375), (375, 330))
 # The design's line: Send's centre at least this far down the screen, where a thumb rests.
 REACH = 0.62
 HOLD_MS = 2000
@@ -603,6 +611,79 @@ def placement_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
     page.click("#close-settings")
 
 
+# The docked card, read in one go: its box, whether it scrolls as a whole, and every line under its
+# words. `null` for a part not drawn.
+DOCK_JS = """() => {
+  const shown = (id) => { const n = document.getElementById(id); if (!n || n.hidden) return null;
+    const s = getComputedStyle(n); const r = n.getBoundingClientRect();
+    return s.display !== 'none' && r.width > 0 && r.height > 0 ? r : null; };
+  const card = document.getElementById('post-confirm');
+  return {
+    innerHeight: window.innerHeight, innerWidth: window.innerWidth,
+    parent: card.parentElement ? card.parentElement.id : '',
+    card: card.getBoundingClientRect(), scrollHeight: card.scrollHeight, clientHeight: card.clientHeight,
+    text: shown('post-confirm-text'), more: shown('post-confirm-more'), where: shown('post-confirm-where'),
+    expiry: shown('post-confirm-expiry'), cancel: shown('post-confirm-cancel'), send: shown('post-confirm-send'),
+    folded: card.hasAttribute('data-folded'),
+  };
+}"""
+
+
+def dock_lines_on_screen(m: dict[str, object], where: str) -> None:
+    """Every line under the docked card's words is drawn, inside the card and inside the screen."""
+    inner_height = float(str(m["innerHeight"]))
+    inner_width = float(str(m["innerWidth"]))
+    check(m["parent"] == "frame-body", f"{where}: the card is in #{m['parent']}, not docked")
+    check(float(str(m["scrollHeight"])) <= float(str(m["clientHeight"])) + 1,
+          f"{where}: the docked card scrolls as a whole ({m['scrollHeight']} in {m['clientHeight']}), "
+          "so what is under its words can be below its own fold")
+    check(inside(m["card"], inner_height, inner_width), f"{where}: the docked card runs off the screen")
+    card = m["card"]
+    for part in ("where", "expiry", "cancel", "send"):
+        check(m[part] is not None, f"{where}: the docked card does not draw its {part}")
+        check(inside(m[part], inner_height, inner_width), f"{where}: the docked card's {part} is off the screen")
+        check(rect(m[part], "top") >= rect(card, "top") - 0.5 and rect(m[part], "bottom") <= rect(card, "bottom") + 0.5,
+              f"{where}: the docked card's {part} is outside the card's own box")
+    check(rect(m["send"], "height") >= 43.5, f"{where}: the docked Send is {rect(m['send'], 'height'):.0f}px tall")
+
+
+def dock_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+              screenshots: Path | None) -> None:
+    """Point 3 for the docked card: never a scroll box, every line under its words on screen."""
+    width, height = size
+    where = f"{width}x{height}, docked on Settings"
+    open_call(page, url, voice, api, 30, False)
+    propose(page, api, 13, LONG_DRAFT)
+    page.wait_for_timeout(HOLD_MS + 200)
+    page.click("#open-settings")
+    page.wait_for_selector("#screen-settings", state="visible", timeout=10_000)
+    page.wait_for_timeout(200)
+    folded = page.evaluate(DOCK_JS)
+    check(isinstance(folded, dict), f"{where}: nothing measured")
+    assert isinstance(folded, dict)
+    check(folded["folded"] is True, f"{where}: a long draft is not folded")
+    dock_lines_on_screen(folded, f"{where}, folded")
+    if screenshots:
+        page.screenshot(path=str(screenshots / f"card-dock-{width}x{height}.png"), animations="disabled")
+    if folded["more"] is None:
+        # A short screen: the words are two lines that scroll in place, and nothing opens them.
+        check(height <= 500, f"{where}: a long draft docked on an upright phone has no More")
+        return
+    page.click("#post-confirm-more")
+    page.wait_for_timeout(200)
+    opened = page.evaluate(DOCK_JS)
+    assert isinstance(opened, dict)
+    check(opened["folded"] is False, f"{where}: More did not open the draft")
+    dock_lines_on_screen(opened, f"{where}, after More")
+    check(abs(rect(opened["send"], "top") - rect(folded["send"], "top")) <= 1,
+          f"{where}: opening the words moved Send from {rect(folded['send'], 'top'):.0f} to "
+          f"{rect(opened['send'], 'top'):.0f}; the card should grow upward")
+    if screenshots:
+        page.screenshot(path=str(screenshots / f"card-dock-more-{width}x{height}.png"), animations="disabled")
+    page.click("#post-confirm-more")
+    page.click("#close-settings")
+
+
 FROZEN_JS = """() => {
   const rows = [...document.querySelectorAll('#transcript > li')];
   const cards = rows.filter((li) => li.classList.contains('sent-card'));
@@ -695,11 +776,35 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                     for draft in (SHORT_DRAFT, LONG_DRAFT):
                         lowest = min(lowest, reach_case(page, url, voice, api, size, rows, banner, draft))
             placement_case(page, url, voice, api, size, args.screenshots)
+            dock_case(page, url, voice, api, size, args.screenshots)
             frozen_case(page, url, voice, api, size, args.screenshots)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
     return f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run"
+
+
+def walk_short(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
+               size: tuple[int, int]) -> str:
+    """The docked card alone, on a screen too short to hold it as an upright phone does."""
+    width, height = size
+    voice = FakeVoice()
+    with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
+        context = chromium.launch_persistent_context(
+            directory, headless=True, executable_path=args.browser_executable,
+            viewport={"width": width, "height": height}, is_mobile=True, has_touch=True,
+            device_scale_factor=2.75,
+        )
+        try:
+            context.route_web_socket(re.compile(r"/ws\?mode=voice$"), voice.accept)
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            dock_case(page, url, voice, api, size, args.screenshots)
+            check(not errors, f"{width}x{height}: the page threw: {errors}")
+        finally:
+            context.close()
+    return f"{width}x{height}: the docked card's lines and buttons all on screen"
 
 
 def main() -> int:
@@ -723,6 +828,7 @@ def main() -> int:
     try:
         with sync_playwright() as playwright:
             lines = [walk(playwright.chromium, args, url, api, size) for size in PHONES]
+            lines += [walk_short(playwright.chromium, args, url, api, size) for size in SHORT_SCREENS]
         for line in lines:
             print(line)
         return 0
