@@ -6737,9 +6737,22 @@ box. Under Reply, and while a reply is open in either column, the card's Send is
 filled **Send reply** is never taken for it. It names what it answers in words ("replying to Alex:
 …") and never by id. It is built so that a tap confirms only what the owner read. When a card appears, or a newer
 proposal replaces the text, both its buttons are held for two seconds and a replacement says the
-text changed, so a tap already on its way lands on neither the new words nor Don't send. A draft whose card was showing when a call ended is not offered
-again in the next call on the same page; it lapses on the server. The page remembers that only
-until it is reloaded, so a new call from a reloaded page within the 120 seconds shows it again.
+text changed, so a tap already on its way lands on neither the new words nor Don't send.
+
+**What happens to a draft when the call ends depends on who ended it.** Hang up retires it: the
+card goes, and the next call on the same page does not offer it again; it lapses on the server. The
+page remembers that only until it is reloaded, so a new call from a reloaded page within the 120
+seconds shows it again. A call the owner did not end — the voice service closed it, the connection
+failed, the page was put away — keeps the card, which says "Call dropped · Send still posts" and
+counts down: a tap on Send still posts it, into the conversation it was drafted in, and the next
+call shows it too, tap only. It goes at its lapse.
+
+**A draft that was not sent leaves a line where it was waiting** (`#270 voice-transcript-markers`):
+"Not sent", with one sentence saying why — Don't send, a spoken no, a lapse, or a Hang up with it
+still waiting. Each is drawn only on the server's word: a withdrawal once the server took it, a
+lapse once the server says the draft expired. A draft a newer one replaced, or one somebody else
+settled, leaves none. On a server that keeps records the line is kept as a `not_sent` marker in the
+draft's conversation, so a reload draws it in the same words.
 
 **A spoken yes, judged by the page.** The agent's tool result hands it one sentence to say,
 `To {channel}: {text}. Send it?` (`ops::read_back`), and its prompt tells it to say exactly that,
