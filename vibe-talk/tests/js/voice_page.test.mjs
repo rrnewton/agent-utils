@@ -48572,3 +48572,90 @@ test("`#262 search-load-older`: a tap while the scroll's step back is on the wir
   await settleWalk(page);
   assert.equal(searchReads(page).length, reads - 1 + SEARCH_OLDER_PAGES, "the scroll's step was not the walk's first page");
 });
+
+test("`#262 search-load-older`: a card that shows its thread's summary is found by what the thread's first message says too", async () => {
+  const page = newPage();
+  const data = threadData();
+  const [first] = data.threads;
+  first.display_name = "runner-wedged";
+  first.summary = "The overnight runner hung and was restarted by hand.";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  const shown = () => page.el("side-cards").children.filter((li) => !li.hidden && !li.hasClass("search-hidden"))
+    .map((li) => li.getAttribute("data-id"));
+  await search(page, "first thread root");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [first.id], "a summed-up thread was not found by its first message's words");
+  assert.equal(replyHint(page, first.id), null, "a card found by its first message said it was found in its replies");
+  // The summary still finds it, and a card showing its first message is not searched for it twice.
+  await page.el("search-field").setValue("overnight runner");
+  await page.settle();
+  assert.deepStrictEqual(shown(), [first.id]);
+  assert.equal(page.el("side-cards").children[1].getAttribute("data-search").split("second thread root").length, 2);
+});
+
+test("`#262 search-load-older`: in one column on Main a search nothing matches offers All, which has the replies, and keeps the search", async () => {
+  const page = await threadPage("main");
+  await search(page, "answer");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), []);
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.match(page.el("search-empty").textContent, /^Nothing in .+ matches that search.* Thread replies are not in Main\.$/);
+  const all = page.el("search-in-all");
+  assert.equal(all.hidden, false, "Main offered no way to the replies");
+  assert.equal(all.textContent, "Search All — thread replies too");
+  await all.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "Search All did not open All");
+  assert.equal(page.el("search-field").value, "answer", "Search All dropped the search");
+  assert.deepStrictEqual(matchedIds(page), ["202", "204"], "All did not show the replies the search finds");
+  assert.equal(all.hidden, true, "Search All stayed up once there were matches");
+  // Not offered while something on Main matches, nor with nothing typed.
+  await pickThread(page, "main");
+  await page.el("search-field").setValue("root");
+  await page.settle();
+  assert.equal(all.hidden, true, "Search All was offered over matches");
+  await page.el("search-field").setValue("");
+  await page.settle();
+  assert.equal(all.hidden, true, "Search All was offered with nothing typed");
+});
+
+test("`#262 search-load-older`: a page that fails ends the walk, said where every failed read is and on the status line", async () => {
+  const { page } = await searchPage({ pages: 10 });
+  await search(page, "engine");
+  await page.settle();
+  const serve = page.channelPage;
+  let reads = 0;
+  page.channelPage = async (path, options) => {
+    if (/[?&]before=/.test(String(path)) && ++reads === 2) return json(502, { error: "chat_error", detail: "the provider returned HTTP 502" });
+    return serve(path, options);
+  };
+  await page.el("load-older").click();
+  await settleWalk(page);
+  assert.equal(reads, 2, "the walk read on after a page failed");
+  assert.equal(page.el("error").hidden, false, "the failed page was not reported");
+  assert.equal(page.el("status").textContent, "Could not search further back — try again.");
+  assert.match(page.el("load-older").textContent, /^Search before /);
+  assert.equal(page.el("search-older-note").hidden, true);
+});
+
+test("`#262 search-load-older`: a finger on the glass holds the walk's next page until it lifts", async () => {
+  const { page } = await searchPage({ pages: 10 });
+  await search(page, "engine");
+  await page.settle();
+  const area = page.el("scroll-area");
+  await area.dispatch("touchstart", touchAt(300, 100));
+  void page.el("load-older").click();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 0, "the walk read a page under a finger");
+  assert.ok(page.expireTimers(sourceConstant("PULL_WAIT_MS")) > 0, "the walk is not waiting for the finger");
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 0, "the walk read a page under a finger");
+  await area.dispatch("touchend");
+  page.expireTimers(sourceConstant("PULL_WAIT_MS"));
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "the walk did not go on once the finger lifted");
+});
