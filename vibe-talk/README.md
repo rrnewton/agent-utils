@@ -1080,11 +1080,13 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   root has not changed (no call), and reads only the newer replies of one that has (one call,
   `conversations.replies` with `oldest=`). A thread whose reply count fell or does not add up is
   read in full, and so is every thread not read in full for fifteen minutes. A full read is
-  reused only when it agrees with its root — ending at the latest reply the root names, with as
-  many replies as it counts — so a reply the server had not caught up with, or one posted while
-  the read was under way, is read again on the next flat read rather than kept. The saving
-  depends on the server reporting `latest_reply` on each root: a root without it is read in full
-  on every flat read, as before. An edit to a reply changes nothing on its root, so it can take
+  reused only when it agrees with its root — ending at the latest reply the root names, and
+  counting, over the whole thread, as many replies as the root does — so a reply the server had
+  not caught up with, one it had not yet dropped, or one posted while the read was under way, is
+  read again on the next flat read rather than kept. The saving depends on the server reporting
+  `latest_reply` on each root, and on the thread being short enough to count in one read (ten
+  pages of replies): a root without `latest_reply`, or a longer thread, is read in full on every
+  flat read, as before. An edit to a reply changes nothing on its root, so it can take
   up to those fifteen minutes to show in the flat view, pull-to-refresh included. Opening the
   thread shows it at once, and the flat view's next read then rereads that thread and shows it
   too, at no extra call for the thread view.

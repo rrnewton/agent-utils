@@ -783,3 +783,86 @@ async fn a_full_read_with_a_reply_its_root_no_longer_counts_is_read_again() {
     assert!(third.replies.is_empty(), "{:?}", third.threads());
     assert_eq!(third.messages, second.messages);
 }
+
+/// One message, the root of a thread of `replies` replies, reply `r` at `ts(1000 + r)`. Returns
+/// the root's `ts`.
+fn one_thread(replies: i64) -> (FakeState, String) {
+    let mut state = FakeState::default();
+    let root = ts(0, 0);
+    let mut message = profiled(&root, "UADA00001", "Ada", "root");
+    let list: Vec<(String, String)> = (0..replies)
+        .map(|r| (ts(1000 + r, 0), format!("reply {r}")))
+        .collect();
+    thread(&mut state, CH, &mut message, &list);
+    state.history.insert(CH.to_owned(), vec![message]);
+    (state, root)
+}
+
+/// A thread of more replies than Flat shows is held only when the WHOLE thread, read in the same
+/// calls, holds as many replies as its root counts: comparing the newest fifty Flat keeps with
+/// `min(count, 50)` says nothing at all. Here the root already counts 79 after a deletion its
+/// replies feed still lists; once the feed catches up, the root reads exactly as before, and the
+/// deleted reply must go. Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_long_thread_whose_feed_lags_a_deletion_is_read_again() {
+    let (state, root) = one_thread(80);
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let gone = ts(1000 + 60, 0);
+    set_reply_count(&fake, &root, 79);
+    let first = flat(&fake, &client).await;
+    assert_eq!(
+        first.replies.len(),
+        5,
+        "the root and 80 replies, 20 a call, read whole"
+    );
+    assert!(first.messages.contains(&gone), "the feed lags the deletion");
+
+    delete_from_feed(&fake, &root, &gone);
+    let second = flat(&fake, &client).await;
+    assert_eq!(
+        second.replies.len(),
+        4,
+        "read whole again: the root and 79 replies"
+    );
+    assert!(
+        !second.messages.contains(&gone),
+        "a reply deleted in Slack is still shown"
+    );
+    assert!(second.messages.contains(&ts(1000 + 79, 0)));
+    assert!(
+        !second.messages.contains(&ts(1000 + 28, 0)),
+        "the newest 50"
+    );
+
+    // That read counted what the root counts: held from now on.
+    let third = flat(&fake, &client).await;
+    assert!(third.replies.is_empty(), "{:?}", third.threads());
+    assert_eq!(third.messages, second.messages);
+}
+
+/// A thread too long to read whole in one window (ten pages, here 200 rows) is answered by
+/// narrowing toward its newest replies, which reads only part of it, so there is no count to
+/// compare with its root's: replies ending at the root's latest say nothing about a deletion the
+/// replies feed has not caught up with. Such a thread is never held, and every Flat read reads it
+/// as Flat did before W8. Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_thread_too_long_to_count_is_read_on_every_flat_read() {
+    let (state, root) = one_thread(250);
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let first = flat(&fake, &client).await;
+    assert!(first.replies.len() > 10, "a window, then narrowing");
+    assert!(
+        first.messages.contains(&ts(1000 + 249, 0)),
+        "the newest reply, which the root names"
+    );
+    let second = flat(&fake, &client).await;
+    assert_eq!(
+        second.replies.len(),
+        first.replies.len(),
+        "read again, exactly as before"
+    );
+    assert!(second.threads().iter().all(|thread| *thread == root));
+    assert_eq!(second.messages, first.messages);
+}

@@ -306,6 +306,39 @@ impl HttpSlackClient {
         before: Option<i64>,
         want: usize,
     ) -> Result<Vec<Raw>, ChatError> {
+        Ok(self
+            .replies_newest(conversation, thread_ts, before, want)
+            .await?
+            .0)
+    }
+
+    /// The newest `want` real messages of a thread, as [`Self::replies_newest_before`] with no
+    /// bound, and how many real replies the whole thread holds, root excluded, counted from that
+    /// same read at no further call. `#282 slack-flat-skip`, remote-ops audit W8 review.
+    ///
+    /// The count is `None` unless one window read the thread from its root to the present: a
+    /// thread too long for [`MAX_WINDOW_PAGES`] pages is answered by narrowing, which shows only
+    /// the stretch next to the present, and a walk resumed past a stretch already proven empty
+    /// skipped that stretch this time. Neither says anything about the rest of the thread.
+    pub(super) async fn replies_newest_counted(
+        &self,
+        conversation: &str,
+        thread_ts: &str,
+        want: usize,
+    ) -> Result<(Vec<Raw>, Option<u64>), ChatError> {
+        self.replies_newest(conversation, thread_ts, None, want)
+            .await
+    }
+
+    /// [`Self::replies_newest_before`], and the count [`Self::replies_newest_counted`] describes,
+    /// whenever the read covered the whole of the thread older than `before`.
+    async fn replies_newest(
+        &self,
+        conversation: &str,
+        thread_ts: &str,
+        before: Option<i64>,
+        want: usize,
+    ) -> Result<(Vec<Raw>, Option<u64>), ChatError> {
         let feed = Feed::Replies(conversation, thread_ts);
         let key = format!("replies:{conversation}:{thread_ts}");
         let cursor = before.unwrap_or(i64::MAX);
@@ -319,16 +352,26 @@ impl HttpSlackClient {
         };
         let (primary, complete) = self.window(feed, None, Some(start), pages).await?;
         if complete {
-            return Ok(nearest(&primary, want, Toward::Older));
+            let whole = proven.is_none().then(|| {
+                let mut real: Vec<i64> = primary
+                    .iter()
+                    .filter(|raw| raw.is_real() && raw.ts != thread_ts)
+                    .map(|raw| raw.micros)
+                    .collect();
+                real.sort_unstable();
+                real.dedup();
+                u64::try_from(real.len()).unwrap_or(u64::MAX)
+            });
+            return Ok((nearest(&primary, want, Toward::Older), whole));
         }
         match self
             .narrow(feed, Toward::Older, start, &primary, want)
             .await?
         {
-            Narrowed::Found(found) => Ok(found),
+            Narrowed::Found(found) => Ok((found, None)),
             Narrowed::Proven(to) => {
                 self.remember_proven(&key, cursor, to);
-                Ok(Vec::new())
+                Ok((Vec::new(), None))
             }
         }
     }

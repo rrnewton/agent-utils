@@ -685,7 +685,9 @@ impl HttpSlackClient {
     /// shows of a thread, a thread never read, or one last read in full [`FLAT_RECONCILE`] ago or
     /// longer. A full read is held only when it agrees with the root: see the comment at the end.
     /// So a root that names no `latest_reply` is read in full on every Flat read, as it was before
-    /// any of this; the saving depends on the server reporting it.
+    /// any of this, and so is a thread too long to count in one window (more than
+    /// [`super::history::MAX_WINDOW_PAGES`] pages of replies); the saving depends on the server
+    /// reporting `latest_reply`, and on the thread being short enough to count.
     ///
     /// An edit to a reply changes nothing on its root, so Flat shows it when that period runs out;
     /// the thread view, which reads the thread itself, shows it at once, and once it has, the next
@@ -737,22 +739,25 @@ impl HttpSlackClient {
                 }
             }
         }
-        let mut replies = self
-            .replies_newest_before(conversation, &root.ts, None, FLAT_MAX_REPLIES)
+        let (mut replies, whole) = self
+            .replies_newest_counted(conversation, &root.ts, FLAT_MAX_REPLIES)
             .await?;
         replies.retain(|raw| raw.micros != root.micros);
         // Held only when the read agrees with the root this Flat read fetched: it ends at the
-        // latest reply the root names and holds as many replies as the root counts, or a full
-        // Flat share of them. A feed that lagged the root leaves a reply out; a reply posted
-        // after history was read, and perhaps deleted before the next read, ends past it; a root
-        // that names no latest reply makes the count the only sign of change, which one reply
-        // deleted and another added hide. Each is read in full again on the next Flat read, as
-        // before. So is a walk that could not get past a run of system events and returned none:
-        // it resumes on the next read (`super::history`).
-        let agrees = latest != root.micros
-            && replies.last().is_some_and(|raw| raw.micros == latest)
-            && u64::try_from(replies.len())
-                .is_ok_and(|held| held == count.min(FLAT_MAX_REPLIES as u64));
+        // latest reply the root names, and the whole thread, counted from the same calls, holds
+        // exactly as many replies as the root counts. Counting the whole thread rather than the
+        // newest FLAT_MAX_REPLIES kept makes the count mean as much for a thread of eighty
+        // replies as for one of eight. A feed that lagged the root leaves a reply out, or still
+        // lists one the root no longer counts; a reply posted after history was read, and perhaps
+        // deleted before the next read, ends past the root's latest. A root that names no latest
+        // reply is never held, since its `latest` is the root itself and the root is not among
+        // `replies`: its count alone, which one reply deleted and another added leave unchanged,
+        // is never trusted. Nor is a thread that could not be counted (`replies_newest_counted`:
+        // too long to read in one window, or a walk resumed past a run of system events, which
+        // may have returned nothing at all), or one whose count includes replies that are not
+        // kept, system events in the thread. Each is read in full again on the next Flat read,
+        // as before W8: no saving for it, and nothing stale.
+        let agrees = replies.last().is_some_and(|raw| raw.micros == latest) && whole == Some(count);
         if agrees {
             self.remember_flat(
                 key,
