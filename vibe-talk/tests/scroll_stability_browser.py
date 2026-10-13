@@ -25,7 +25,12 @@ which must not move it by more than a pixel:
   on the wire, the reader scrolling up while it is out, and the read let go -- before, it threw them back
   to the bottom -> Summaries turned on, each long row's summary answering a moment later, and off again
   -> the focus moved: at the desk the mouse over Main's rows, ] and [ between the columns, Tab and
-  Shift+Tab, and a card clicked, its thread opening on the right; on the phone Tab and Shift+Tab.
+  Shift+Tab, each held 2.5 s, and a card clicked, its thread opening on the right; on the phone Tab and
+  Shift+Tab -> at the desk, sampled at every frame for 2.5 s, longer than the 1.5 s wait before the glide
+  between the columns (`#261 two-column-connectors`), with Main scrolled so the card's root is a screen
+  off it: THE OWNER'S 19:08, the mouse crossing the cards with nothing pressed on its way to the dock and
+  resting there, the last card it passed left selected; the same up to the top bar; and [ then ] on its
+  own, handing the keys to the right column onto a card on screen whose root is off Main's screen.
 
 and then, at each size:
 
@@ -85,6 +90,9 @@ THREAD_PAGE = 8
 FLAT_PAGE = 60
 # How far a row may move and still be said to have stood still: sub-pixel layout, never a jump.
 STILL_PX = 1.0
+# How long a step that could start the page's glide between the columns (`#261 two-column-connectors`,
+# COLUMN_GLIDE_MS = 1500 in web/voice.js) is held before it is judged: longer than that wait, with room.
+GLIDE_HOLD_MS = 2500
 
 # The first row of a list whose foot is below the top of its scroller: the row the reader is on.
 FIRST_ROW_JS = """(list) => {
@@ -101,6 +109,68 @@ FIRST_ROW_JS = """(list) => {
 # How far the list runs below what its scroller shows: 0 at its foot.
 GAP_JS = """(id) => { const area = document.getElementById(id);
     return area.scrollHeight - area.scrollTop - area.clientHeight; }"""
+
+# Main's first row on screen and its offset, sampled at every frame until UNWATCH_JS: a jump that snaps
+# back between two measurements shows here.
+WATCH_JS = """() => {
+    const area = document.getElementById('scroll-area');
+    const list = document.getElementById('discord-log');
+    const first = () => {
+        const top = area.getBoundingClientRect().top;
+        for (const row of list.children) {
+            if (!row.hasAttribute('data-id') || !row.getClientRects().length) continue;
+            const box = row.getBoundingClientRect();
+            if (box.bottom > top) return [row.getAttribute('data-id'), box.top - top];
+        }
+        return [null, 0];
+    };
+    const watch = {samples: [], on: true};
+    window.__scrollWatch = watch;
+    const tick = () => { if (!watch.on) return; watch.samples.push(first()); requestAnimationFrame(tick); };
+    tick();
+}"""
+UNWATCH_JS = "() => { const watch = window.__scrollWatch; watch.on = false; return watch.samples; }"
+
+# The card of a thread: where the middle of what shows of it is, and how much of it shows.
+CARD_AT_JS = """(id) => {
+    const card = document.querySelector(`#side-cards > li[data-id='${id}']`);
+    if (!card) return null;
+    const box = (card.querySelector('.side-card') || card).getBoundingClientRect();
+    const side = document.getElementById('side-scroll').getBoundingClientRect();
+    const top = Math.max(box.top, side.top);
+    const bottom = Math.min(box.bottom, side.bottom);
+    return {x: (box.left + box.right) / 2, y: (top + bottom) / 2, shown: bottom - top};
+}"""
+
+# Main scrolled so that the row `id` is a screen off it: below, where Main reaches that far, else above.
+ROOT_AWAY_JS = """(id) => {
+    const area = document.getElementById('scroll-area');
+    const row = document.querySelector(`#discord-log > li[data-id='${id}']`);
+    const room = area.clientHeight;
+    const at = row.getBoundingClientRect().top - area.getBoundingClientRect().top + area.scrollTop;
+    let top = at - 2 * room;
+    if (top < 200) top = at + row.getBoundingClientRect().height + room;
+    area.scrollTop = Math.round(Math.min(top, area.scrollHeight - room - 500));
+    return area.scrollTop;
+}"""
+
+# Whether Main's row `id` is off its screen.
+ROW_AWAY_JS = """(id) => {
+    const area = document.getElementById('scroll-area').getBoundingClientRect();
+    const row = document.querySelector(`#discord-log > li[data-id='${id}']`);
+    if (!row) return true;
+    const box = row.getBoundingClientRect();
+    return box.bottom < area.top || box.top > area.bottom;
+}"""
+
+# The card drawn selected in the right column, or null.
+LIT_CARD_JS = """() => { const lit = document.querySelector('#side-cards > li[data-selected]');
+    return lit ? lit.getAttribute('data-id') : null; }"""
+
+
+def root_of(thread_id: str) -> str:
+    """The id of the message heading `thread_id`, which is its row in Main."""
+    return str(200 + (LONG_ROOT if thread_id == LONG else int(thread_id.rsplit("t", 1)[1])))
 
 
 def thread_record(thread_id: str, root: int, replies: int, is_root: bool) -> Json:
@@ -361,6 +431,23 @@ class Reader:
         self.check(after[0] == before[0] and abs(after[1] - before[1]) <= STILL_PX,
                    f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {after[0]} at {after[1]:.1f}px")
 
+    def watch(self) -> None:
+        """Start sampling Main's first row on screen and its offset at every frame."""
+        self.page.evaluate(WATCH_JS)
+
+    def held(self, before: tuple[str, float], why: str, hold_ms: int = GLIDE_HOLD_MS) -> None:
+        """Wait `hold_ms`, then: at every frame since `watch`, the row the reader was on was the first on
+        screen, within a pixel of where it was."""
+        self.page.wait_for_timeout(hold_ms)
+        self.frames(2)
+        samples = self.page.evaluate(UNWATCH_JS)
+        self.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
+        for row, offset in samples:
+            self.check(row == before[0] and abs(float(offset) - before[1]) <= STILL_PX,
+                       f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {row} at "
+                       f"{float(offset):.1f}px within {hold_ms}ms")
+        self.still(before, why)
+
     def overflow(self) -> None:
         wide = float(self.page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth"))
         self.check(wide <= 0, f"the page scrolls sideways by {wide}px")
@@ -394,6 +481,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
             open_main(reader)
             main_walk(reader)
+            if not touch:
+                glide_walk(reader)
             follow_walk(reader)
             if not touch:
                 cards_walk(reader)
@@ -537,9 +626,9 @@ def main_walk(reader: Reader) -> None:
     reader.quiet(200)
     reader.still(before, "the mouse moving over Main's rows")
     for key in ("]", "[", "Tab", "Shift+Tab"):
+        reader.watch()
         page.keyboard.press(key)
-        reader.quiet(200)
-        reader.still(before, f"{key}")
+        reader.held(before, f"{key}, held {GLIDE_HOLD_MS}ms")
     card = page.locator(f"#side-cards > li[data-id='spaces/A/threads/t{SMALL_ROOTS[2]}'] .side-card")
     card.click()
     reader.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length > 0",
@@ -551,6 +640,92 @@ def main_walk(reader: Reader) -> None:
     reader.quiet(300)
     reader.still(before, "Esc back to the cards")
     reader.notes.append("the mouse over Main, ] [ Tab Shift+Tab, a card opening its thread and Esc left it where it was")
+
+
+def side_to_foot(reader: Reader) -> None:
+    """The list of threads on the right scrolled to its foot, where it opens."""
+    reader.page.evaluate("() => { const area = document.getElementById('side-scroll'); area.scrollTop = area.scrollHeight; }")
+    reader.quiet(250)
+
+
+def cross_card(reader: Reader, thread_id: str, start: tuple[float, float], end: tuple[float, float], why: str) -> None:
+    """The mouse from `start` in Main across the right column to `thread_id`'s card and on to `end`, which is no
+    card; nothing pressed. Main, scrolled with that card's root a screen off it, holds still for the glide's
+    wait and more, though the card stays selected."""
+    page = reader.page
+    root = root_of(thread_id)
+    page.mouse.move(*start)
+    page.evaluate(ROOT_AWAY_JS, root)
+    reader.quiet(250)
+    card = page.evaluate(CARD_AT_JS, thread_id)
+    reader.check(isinstance(card, dict) and float(card["shown"]) > 30, f"the card of {thread_id} is not on screen: {card}")
+    assert isinstance(card, dict)
+    before = reader.first()
+    reader.watch()
+    page.mouse.move(float(card["x"]), float(card["y"]), steps=8)
+    page.mouse.move(*end, steps=4)
+    reader.held(before, why)
+    # It proves something only with the card the pointer passed over left selected, its root off Main's
+    # screen: before the fix, the glide brought that root on screen 1.5 s after the pointer had gone.
+    lit = page.evaluate(LIT_CARD_JS)
+    reader.check(lit == thread_id, f"{why}: the card left selected is {lit}, not {thread_id}, so this proves less")
+    reader.check(bool(page.evaluate(ROW_AWAY_JS, root)), f"{why}: the card's root came on screen")
+
+
+def glide_walk(reader: Reader) -> None:
+    """At the desk: the mouse crossing the cards with nothing pressed, and ] handing the keys to the right column,
+    each held past the 1.5 s glide between the columns (`#261 two-column-connectors`), never move Main."""
+    page = reader.page
+    reader.wait_for("() => !document.getElementById('side-list').hidden", "the right column is not its cards")
+    size = page.viewport_size
+    assert size is not None
+    width, height = size["width"], size["height"]
+    cards = [str(card) for card in page.evaluate("() => [...document.querySelectorAll('#side-cards > li[data-id]')]"
+                                                 ".map((li) => li.getAttribute('data-id'))")]
+    reader.check(len(cards) >= 3, f"too few cards to cross: {cards}")
+
+    # THE OWNER'S 19:08: down across the cards to the dock, the last card the pointer passes at the foot.
+    side_to_foot(reader)
+    cross_card(reader, cards[-1], (300, 300), (width - 180, height - 5),
+               "the mouse crossing the cards to the dock, nothing pressed, then resting there")
+    reader.notes.append(f"the mouse crossing the cards to the dock and resting there {GLIDE_HOLD_MS}ms left Main still")
+
+    # Up across them to the top bar, the last card passed the first, the list scrolled to its head.
+    page.evaluate("() => { document.getElementById('side-scroll').scrollTop = 0; }")
+    reader.quiet(250)
+    cross_card(reader, cards[0], (400, 500), (width - 10, 10),
+               "the mouse crossing the cards to the top bar, nothing pressed, then resting there")
+    reader.notes.append("so did crossing them to the top bar")
+
+    # ] on its own: the right column's selection a card on screen whose root is off Main's screen, the
+    # pointer resting on neither column.
+    side_to_foot(reader)
+    page.mouse.move(5, height - 5)
+    card = page.evaluate(CARD_AT_JS, cards[-1])
+    assert isinstance(card, dict)
+    page.mouse.move(float(card["x"]) - 4, float(card["y"]) - 4)
+    page.mouse.move(float(card["x"]), float(card["y"]), steps=2)
+    page.mouse.move(5, height - 5)
+    reader.check(page.evaluate(LIT_CARD_JS) == cards[-1], "the mouse did not leave the last card selected")
+    reader.quiet(GLIDE_HOLD_MS)
+    page.evaluate(ROOT_AWAY_JS, root_of(cards[-1]))
+    reader.quiet(250)
+    before = reader.first()
+    reader.watch()
+    page.keyboard.press("[")
+    reader.held(before, f"[ to Main, held {GLIDE_HOLD_MS}ms")
+    side_to_foot(reader)
+    before = reader.first()
+    reader.watch()
+    page.keyboard.press("]")
+    reader.held(before, f"] to the right column on its own, held {GLIDE_HOLD_MS}ms")
+    lit = page.evaluate(LIT_CARD_JS)
+    reader.check(lit == cards[-1], f"] lit {lit}, not {cards[-1]}, so this proves less")
+    reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(cards[-1]))), "] brought the card's root on screen")
+    reader.notes.append(f"[ and then ] onto a card whose root is off screen, each held {GLIDE_HOLD_MS}ms, left Main still")
+    page.keyboard.press("[")
+    side_to_foot(reader)
+    reader.quiet(300)
 
 
 def follow_walk(reader: Reader) -> None:
