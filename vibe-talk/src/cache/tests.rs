@@ -1443,13 +1443,19 @@ fn eviction_converges_below_the_size_limit_in_a_bounded_number_of_chunks() {
         "{} > {limit}",
         cache.bytes_on_disk()
     );
-    let bound = u64::try_from(rows).unwrap_or(0) / u64::try_from(DELETE_CHUNK).unwrap_or(1) + 1;
-    assert!(
-        stats.eviction_chunks <= bound,
-        "{} chunks",
-        stats.eviction_chunks
-    );
+    // Bounded: every chunk deletes at least one row and at most a thousand, and the rounds that
+    // measure, delete and compact stop at a handful, so the chunks are bounded by the rows.
+    let rows = u64::try_from(rows).unwrap_or(0);
     assert!(stats.evicted_rows > 0);
+    assert!(stats.evicted_rows < rows, "evicted everything: {stats:?}");
+    assert!(
+        stats.eviction_chunks <= stats.evicted_rows,
+        "{} chunks for {} rows",
+        stats.eviction_chunks,
+        stats.evicted_rows
+    );
+    assert!(stats.eviction_chunks >= stats.evicted_rows / u64::try_from(DELETE_CHUNK).unwrap_or(1));
+    assert!(stats.compactions >= 1, "eviction compacts the index");
     // Coverage never claims what eviction removed.
     let oldest: i64 = cache
         .read(None, |c| {

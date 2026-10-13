@@ -46,9 +46,13 @@ const CHUNK_LIMIT: i64 = DELETE_CHUNK as i64;
 /// A deletion of at least one row in this many takes the marker-and-compact way.
 const MARKER_RATIO: usize = 75;
 /// Pages of full-text index each compaction slice rewrites: tens of milliseconds of work.
-const COMPACT_PAGES: u32 = 200;
+const COMPACT_PAGES: u32 = 100;
+/// How long one deletion chunk may run before it commits, whatever is left of its rows.
+const CHUNK_BUDGET: Duration = Duration::from_millis(25);
 /// A ceiling on slices, so a compaction cannot spin.
 const MAX_COMPACT_SLICES: u32 = 1_000_000;
+/// The writer's page cache, as SQLite spells a size in KiB: negative.
+const WRITER_CACHE_KIB: i64 = -32_768;
 /// The most measure-delete-compact rounds one size check runs.
 const EVICTION_ROUNDS: usize = 6;
 
@@ -1237,8 +1241,9 @@ impl Writer<'_> {
         } else {
             ""
         };
-        let chunk_sql =
-            format!("SELECT row_id FROM message WHERE {filter} {order} LIMIT {CHUNK_LIMIT}");
+        let chunk_sql = format!(
+            "SELECT row_id, chan, created_ms FROM message WHERE {filter} {order} LIMIT {CHUNK_LIMIT}"
+        );
         let mut deleted = 0;
         let outcome = loop {
             if deleted >= wanted {
@@ -1250,19 +1255,37 @@ impl Writer<'_> {
                 let mut select = w.conn.prepare(&chunk_sql)?;
                 let picked = select
                     .query_map(rusqlite::params_from_iter(args.iter()), |row| {
-                        row.get::<_, i64>(0)
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
                     })?
                     .take(take)
-                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                    .collect::<rusqlite::Result<Vec<(i64, i64, i64)>>>()?;
                 drop(select);
-                if purpose == Purpose::Evict {
-                    w.raise_floors_for(&picked)?;
-                }
+                // A chunk is bounded by time as well as by rows, so no one transaction holds
+                // the writer for long, however costly each row's index entries are to remove.
                 let mut delete = w.conn.prepare("DELETE FROM message WHERE row_id = ?1")?;
-                for row_id in &picked {
+                let mut floors: std::collections::HashMap<i64, i64> =
+                    std::collections::HashMap::new();
+                let mut done = 0;
+                for (row_id, chan, created) in &picked {
                     delete.execute([row_id])?;
+                    let floor = floors.entry(*chan).or_insert(*created);
+                    *floor = (*floor).max(*created);
+                    done += 1;
+                    if started.elapsed() >= CHUNK_BUDGET {
+                        break;
+                    }
                 }
-                Ok(picked.len())
+                drop(delete);
+                if purpose == Purpose::Evict {
+                    for (chan, newest) in floors {
+                        w.raise_floor(chan, newest.saturating_add(1))?;
+                    }
+                }
+                Ok(done)
             });
             if purpose == Purpose::Evict {
                 Stats::add(&self.shared.stats.eviction_chunks, 1);
@@ -1284,27 +1307,6 @@ impl Writer<'_> {
         }
         self.checkpoint_due = true;
         outcome.map(|()| deleted)
-    }
-
-    /// Before evicting rows, raise each touched channel's coverage above the newest of them:
-    /// coverage never claims rows the cache no longer holds.
-    fn raise_floors_for(&self, row_ids: &[i64]) -> rusqlite::Result<()> {
-        let mut newest: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        {
-            let mut statement = self
-                .conn
-                .prepare("SELECT chan, created_ms FROM message WHERE row_id = ?1")?;
-            for row_id in row_ids {
-                let (chan, created): (i64, i64) =
-                    statement.query_row([row_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                let entry = newest.entry(chan).or_insert(created);
-                *entry = (*entry).max(created);
-            }
-        }
-        for (chan, created) in newest {
-            self.raise_floor(chan, created.saturating_add(1))?;
-        }
-        Ok(())
     }
 
     /// Turn FTS5 `secure-delete` on or off. Off marks the file as needing compaction until
@@ -1379,6 +1381,12 @@ impl Writer<'_> {
     /// What every new writer does first: make sure `secure-delete` is on whatever a crash left,
     /// make its scratch tables, and finish a compaction a crash interrupted.
     fn start(&mut self) {
+        // The writer alone gets a larger page cache: it walks the index's segments on every
+        // insert, merge and delete, and re-reading them from the file was a tenth of its time.
+        let cache = self
+            .conn
+            .pragma_update(None, "cache_size", WRITER_CACHE_KIB.to_string());
+        self.report("page cache", cache);
         let prepared = self.conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS doomed (chan INTEGER PRIMARY KEY);
              CREATE TEMP TABLE IF NOT EXISTS cutoff (chan INTEGER PRIMARY KEY, ms INTEGER NOT NULL);",
