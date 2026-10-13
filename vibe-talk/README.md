@@ -6698,14 +6698,18 @@ length. There is no card and no read-back. A read credential is still refused.
 with the channel, the exact text, and the one sentence to read it back with. The owner confirms
 it outside anything a model can call:
 
-* **on the voice page**, where a card shows the server's own copy — channel, reply target, text —
-  with **Send** and **Don't send**; or
+* **on the voice page**, where a card shows the server's own copy — channel, what it answers, text
+  — with **Send to {channel}** and **Don't send**; or
 * **by saying yes**, which the voice page — never the model — judges, and turns into a commit
   naming `confirmed_by: "speaker_turn"` (below). A bridge may do the same under the same rules.
 
-The card is built so that a tap confirms only what the owner read. When a newer proposal replaces
-the text, Send is held for two seconds and the card says the text changed, so a tap already on its
-way does not land on the new words. A draft whose card was showing when a call ended is not offered
+The card is the tentative next message (`#269 approval-card-inline`): the owner's own outgoing tile
+at the foot of the list he is looking at — under the call's transcript or the channel's messages,
+above that list's box, which shrinks to one line under it — and docked at the foot of Reply,
+Threads, Settings and Help. It names what it answers in words ("replying to Alex: …") and never by
+id. It is built so that a tap confirms only what the owner read. When a card appears, or a newer
+proposal replaces the text, both its buttons are held for two seconds and a replacement says the
+text changed, so a tap already on its way lands on neither the new words nor Don't send. A draft whose card was showing when a call ended is not offered
 again in the next call on the same page; it lapses on the server. The page remembers that only
 until it is reloaded, so a new call from a reloaded page within the 120 seconds shows it again.
 
