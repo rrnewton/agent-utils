@@ -1035,8 +1035,18 @@ class FakeElement {
     FakeElement.focusVisible = how === "keyboard";
   }
 
-  /** The one selector the page asks an element about. */
+  /**
+   * The selectors the page asks an element about: `:focus-visible`, and `:hover`, which is this element
+   * or one inside it being where the pointer last moved to or came over (`FakeElement.hovered`, kept by
+   * `page.documentEvent`), as a browser keeps it.
+   */
   matches(selector) {
+    if (selector === ":hover") {
+      for (let at = FakeElement.hovered; at; at = at.parentNode) {
+        if (at === this) return true;
+      }
+      return false;
+    }
     if (selector !== ":focus-visible") throw new Error(`this fixture cannot match ${selector}`);
     return FakeElement.focused === this && FakeElement.focusVisible === true;
   }
@@ -2146,6 +2156,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const documentListeners = new Map();
   FakeElement.focused = null;
   FakeElement.focusVisible = false;
+  FakeElement.hovered = null;
   FakeElement.detachBlurs = false;
   FakeElement.focusLost = 0;
   const document = {
@@ -2183,8 +2194,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
   };
   page.document = document;
-  /** Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. */
+  /**
+   * Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. A mouse's
+   * `pointermove` or `pointerover` puts the pointer on its target, which is what `:hover` answers from
+   * (`FakeElement.matches`).
+   */
   page.documentEvent = async (type, event) => {
+    if (event && (type === "pointermove" || type === "pointerover") && (event.pointerType || "mouse") === "mouse") {
+      FakeElement.hovered = event.target || null;
+    }
     for (const fn of documentListeners.get(type) || []) {
       await fn(event);
     }
@@ -3921,6 +3939,12 @@ const TUNING_BANDS = {
     "how far inside a column a glide brings the end it goes to, at least. Under eight the end lands " +
     "under the column's edge, as if still off screen; past eighty a selection near the edge has its " +
     "counterpart brought well away from level with it"],
+  // `#280 scroll-stability`. Only a mouse resting on the selection glides the other column.
+  GLIDE_REST_PX: [4, 24,
+    "how far the mouse may drift from where it last moved on the selection and still be resting there. " +
+    "Under four, a hand on the mouse settling, or a pointer standing still as the card drawn whole moves " +
+    "from under it, drops the glide the reader waits for; past twenty-four, a mouse that crossed a card " +
+    "and stopped in the gap beside it counts as resting on it, and Main moves after the pointer has gone"],
   // `#264 voice-send-approval`.
   SPOKEN_YES_SETTLE_MS: [800, 2000,
     "how long a heard yes waits for more before it sends. Under about a second, 'yes... wait' has " +
@@ -23670,7 +23694,7 @@ test("live updates and deletes re-read the authoritative channel without losing 
   );
 });
 
-// --- `#277 scroll-stability`: a read that lands, or a message that arrives, never moves the reader
+// --- `#280 scroll-stability`: a read that lands, or a message that arrives, never moves the reader
 //
 // The owner, 2026-10-13: "I swear I just saw an instance where it jumped me to the bottom of the screen
 // in the main message view (two column mode)... I don't think I touched anything. I think it was
@@ -43968,14 +43992,14 @@ test("`#261 two-column-connectors`: the glide waits for nothing once the selecti
   }
 });
 
-test("`#277 scroll-stability` x `#261`: a selection a redraw hands on, its card gone under Unread only, glides nothing", async () => {
+test("`#280 scroll-stability` x `#261`: a selection a redraw hands on, its card gone under Unread only, glides nothing", async () => {
   const restore = layColumnsOut();
   try {
-    const run = async (script) => {
+    const run = async (rest) => {
       // The fixture's own timeline, kept from before the change record replaces it: its newest page of
       // Main says which replies are Done (`reply_dismissals`), which is how a Done made on another device
       // reaches this one.
-      const { page } = await linkedColumns(16, (p) => { p.plainTimeline = p.timeline; }, script);
+      const { page } = await linkedColumns(16, (p) => { p.plainTimeline = p.timeline; });
       await page.el("side-unread-only").click();
       await page.settle();
       const left = page.el("scroll-area");
@@ -44002,16 +44026,143 @@ test("`#277 scroll-stability` x `#261`: a selection a redraw hands on, its card 
       await page.nextFrame();
       const handed = litRows(page);
       assert.ok(!shownCardIds(page).includes("spaces/A/threads/t0"), "the read card is still shown, so this proves nothing");
+      const armed = [...page.timers.values()].filter((timer) => timer.ms === COLUMN_GLIDE_MS).length;
+      // The control's reader then moves the mouse onto the card handed the selection, and rests there.
+      if (rest) await mouseTo(page, threadCard(page, 1), 900, 80);
       page.expireTimers(COLUMN_GLIDE_MS);
-      return { handed, glides: left.glides, at: left.scrollTop, foot: left.scrollHeight - left.clientHeight };
+      return { handed, armed, glides: left.glides, at: left.scrollTop, foot: left.scrollHeight - left.clientHeight };
     };
-    const kept = await run(SCRIPT);
+    const kept = await run(false);
+    assert.equal(kept.armed, 0, "a selection nobody chose armed a glide");
     assert.equal(kept.glides, undefined, "a selection nobody chose glided Main away from the reader");
     assert.equal(kept.at, kept.foot, "Main moved from where the reader put it");
-    // THE CONTROL: arming the glide for a handed-on selection too glides Main up, so the test can tell.
-    const control = await run(brokenScript("armColumnGlide(selectionRedrawn ? null : pane, lit);", "armColumnGlide(pane, lit);"));
+    // THE CONTROL: the mouse resting on that same card glides Main up to its root, so the test can tell.
+    const control = await run(true);
     assert.deepStrictEqual(control.handed, ["side-cards:spaces/A/threads/t1"], "the selection was not handed to the next card");
     assert.ok(control.glides && control.glides.length === 1, "the control did not glide, so the test cannot tell");
+  } finally {
+    restore();
+  }
+});
+
+/** The mouse leaving the window: nothing under it, and the root element's `pointerleave`. */
+async function mouseOutOfWindow(page) {
+  FakeElement.hovered = null;
+  await page.documentElement.dispatch("pointerleave", { pointerType: "mouse", target: page.documentElement, relatedTarget: null });
+  await page.settle();
+}
+
+test("`#280 scroll-stability` x `#261`: the mouse crossing a card on its way elsewhere glides nothing, though the card stays selected; resting on it glides, even with the card moved out from under it, and coming back to it waits again", async () => {
+  // The owner, in two columns: "it jumped me to the bottom of the screen in the main message view... I
+  // don't think I touched anything." The mouse crossed the cards on its way to the dock, the last card
+  // it passed stayed selected, and 1.5 s later Main slid to that card's root near its foot.
+  const restore = layColumnsOut();
+  try {
+    /** Main at its head, the cards at their foot: the last card on screen, its root far below Main's foot. */
+    const crossing = async (script = SCRIPT) => {
+      const { page } = await linkedColumns(16, null, script);
+      const left = page.el("scroll-area");
+      const right = page.el("side-scroll");
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      right.scrollTop = right.scrollHeight;
+      await right.dispatch("scroll");
+      await page.nextFrame();
+      assert.ok(!inColumnView(left, rootLinkY(rootRow(page, 15))), "the card's root is on screen, so this proves nothing");
+      assert.ok(inColumnView(right, cardLinkY(threadCard(page, 15))), "the card is off screen, so this proves nothing");
+      return { page, left, right };
+    };
+    const armed = (page) => [...page.timers.values()].filter((timer) => timer.ms === COLUMN_GLIDE_MS).length;
+    const dock = (page) => page.el("compose-text");
+
+    // Across the card and on to the dock.
+    let { page, left, right } = await crossing();
+    await mouseTo(page, threadCard(page, 15), 900, 300);
+    assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t15"]);
+    assert.equal(armed(page), 1, "the mouse arriving on the card armed no wait, so this proves nothing");
+    await mouseTo(page, dock(page), 1100, 795);
+    assert.equal(armed(page), 0, "the wait outlived the mouse moving on from the card");
+    assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t15"], "the card did not stay selected, so this proves less");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(left.glides, undefined, "the mouse crossing a card on its way to the dock glided Main");
+    assert.equal(left.scrollTop, 0, "Main moved with nothing touched");
+    // Back onto the card and resting there: that is a dwell, and it glides.
+    await mouseTo(page, threadCard(page, 15), 905, 302);
+    assert.equal(armed(page), 1, "the mouse coming back to the selected card armed no wait");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.deepStrictEqual((left.glides || []).map((glide) => glide.behavior), ["smooth"], "the mouse resting on the card did not glide Main");
+    // Moving about inside the card after its glide arms nothing more.
+    await mouseTo(page, threadCard(page, 15), 910, 306);
+    assert.equal(armed(page), 0, "the mouse moving inside a card whose glide ran armed another");
+
+    // Out of the window straight from the card, with no move outside it to say so.
+    ({ page, left } = await crossing());
+    await mouseTo(page, threadCard(page, 15), 900, 300);
+    await mouseOutOfWindow(page);
+    assert.equal(armed(page), 0, "the wait outlived the mouse leaving the window");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(left.glides, undefined, "the mouse leaving the window from a card glided Main");
+
+    // The card moving out from under a pointer standing still — drawn whole, the cards above it shorter —
+    // and the hand on the mouse moving it a few pixels, over the column's own background: not left.
+    ({ page, left, right } = await crossing());
+    await mouseTo(page, threadCard(page, 15), 900, 300);
+    await mouseTo(page, right, 903, 303);
+    assert.equal(armed(page), 1, "a few pixels off a card that moved dropped the wait");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.deepStrictEqual((left.glides || []).map((glide) => glide.behavior), ["smooth"],
+      "the mouse resting where it chose a card that then moved did not glide Main");
+
+    // THE CONTROL: with a mouse that moved on still counted as staying, the crossing glides.
+    const loose = await crossing(brokenScript("  if (pointerOn(followed ? followed.row : null)) return true;", "  return true;"));
+    await mouseTo(loose.page, threadCard(loose.page, 15), 900, 300);
+    await mouseTo(loose.page, dock(loose.page), 1100, 795);
+    loose.page.expireTimers(COLUMN_GLIDE_MS);
+    assert.ok(loose.left.glides && loose.left.glides.length === 1, "the control did not glide, so the test cannot tell");
+  } finally {
+    restore();
+  }
+});
+
+test("`#280 scroll-stability` x `#261`: ] and [ handing the keys to a column glide nothing, even onto a card whose root is off screen", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16);
+    const left = page.el("scroll-area");
+    const right = page.el("side-scroll");
+    left.scrollTop = 0;
+    await left.dispatch("scroll");
+    right.scrollTop = right.scrollHeight;
+    await right.dispatch("scroll");
+    await page.nextFrame();
+    const armed = () => [...page.timers.values()].filter((timer) => timer.ms === COLUMN_GLIDE_MS).length;
+    // The mouse once over the last card, then away to the dock: the card is the right column's selection.
+    await mouseTo(page, threadCard(page, 15), 900, 300);
+    await mouseTo(page, page.el("compose-text"), 5, 790);
+    // Whatever that did is the test above's; Main is put back at its head.
+    page.expireTimers(COLUMN_GLIDE_MS);
+    left.glides = undefined;
+    left.scrollTop = 0;
+    await left.dispatch("scroll");
+    await page.nextFrame();
+    // [ gives the keys to Main and ] back to the right column, whose selection is that card again.
+    await pressHere(page, "[");
+    assert.equal(armed(), 0, "[ armed a glide");
+    await pressHere(page, "]");
+    assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t15"], "] did not light the card, so this proves nothing");
+    assert.ok(!inColumnView(left, rootLinkY(rootRow(page, 15))), "the card's root is on screen, so this proves nothing");
+    assert.equal(armed(), 0, "] onto a card armed a glide of Main");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(left.glides, undefined, "] glided Main to the card's root");
+    assert.equal(left.scrollTop, 0, "Main moved for a key that only handed the keys across");
+    // The keys moving the selection, j and k, glide nothing either.
+    await pressHere(page, "k");
+    await pressHere(page, "j");
+    assert.equal(armed(), 0, "j or k armed a glide");
+    // THE CONTROL: the mouse resting on that card is a dwell, and Main glides, so the case is one that can.
+    await mouseTo(page, threadCard(page, 15), 905, 302);
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.ok(left.glides && left.glides.length === 1, "the mouse resting on the card did not glide Main, so the test cannot tell");
   } finally {
     restore();
   }
@@ -44419,6 +44570,104 @@ test("`#277 thread-card-focus`: the list of keys says Enter highlights a card, �
   assert.match(keys, /On a thread card, highlight it and show all of it/, "the list of keys does not say what Enter does to a card");
   assert.match(keys, /On the thread cards, into the highlighted card's thread/, "the list of keys does not say what → does on the cards");
   assert.match(keys, /takes the highlight off a thread card/, "the list of keys does not say Esc puts a highlight out");
+});
+
+test("`#280 scroll-stability` x `#277 thread-card-focus`: a card highlighted by a click under the mouse glides Main to its root while the mouse rests on it; the mouse crossing other cards or moving on, and Enter on a card, glide nothing", async () => {
+  // The highlighted card is what the glide follows (`#277 thread-card-focus`), and only the mouse resting
+  // on it starts the wait (`#280 scroll-stability`): the owner's jump with nothing touched was the mouse
+  // crossing the cards, and a highlight must not bring it back.
+  const restore = layColumnsOut();
+  try {
+    /** Main at its head, the cards at their foot: the last two cards on screen, their roots far below Main's foot. */
+    const cardsAtFoot = async (script = SCRIPT) => {
+      const { page } = await linkedColumns(16, null, script);
+      const left = page.el("scroll-area");
+      const right = page.el("side-scroll");
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      right.scrollTop = right.scrollHeight;
+      await right.dispatch("scroll");
+      await page.nextFrame();
+      for (const i of [14, 15]) {
+        assert.ok(!inColumnView(left, rootLinkY(rootRow(page, i))), `t${i}'s root is on screen, so this proves nothing`);
+        assert.ok(inColumnView(right, cardLinkY(threadCard(page, i))), `t${i}'s card is off screen, so this proves nothing`);
+      }
+      return { page, left };
+    };
+    const armed = (page) => [...page.timers.values()].filter((timer) => timer.ms === COLUMN_GLIDE_MS).length;
+    /** The mouse onto card `t<i>`'s button at (`x`, `y`), and a click there, the mouse staying. */
+    const clickCard = async (page, i, x, y) => {
+      const button = threadCard(page, i).children[0];
+      await mouseTo(page, button, x, y);
+      await page.documentEvent("pointerdown", { target: button, pointerType: "mouse" });
+      await button.click();
+      await page.settle();
+    };
+    /** Enter on card `t<i>` with the keys, the mouse having crossed it on the way to the dock. */
+    const enterCard = async (page, i) => {
+      await mouseTo(page, threadCard(page, i), 900, 300);
+      await mouseTo(page, page.el("compose-text"), 5, 790);
+      await pressHere(page, "[");
+      await pressHere(page, "]");
+      assert.deepStrictEqual(litRows(page), [`side-cards:spaces/A/threads/t${i}`], "] did not light the card, so this proves nothing");
+      await pressHere(page, "Enter");
+      await page.settle();
+      assert.deepStrictEqual(litCards(page), [`spaces/A/threads/t${i}`], "Enter did not highlight the card, so this proves nothing");
+    };
+
+    // A click highlights the card under the mouse, and the mouse resting there glides Main to its root.
+    let { page, left } = await cardsAtFoot();
+    await clickCard(page, 15, 900, 300);
+    assert.deepStrictEqual(litCards(page), ["spaces/A/threads/t15"], "the click did not highlight the card");
+    assert.equal(armed(page), 1, "a card highlighted under the mouse armed no wait");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.deepStrictEqual((left.glides || []).map((glide) => glide.behavior), ["smooth"],
+      "the mouse resting on the card it highlighted did not glide Main to its root");
+
+    // Highlighted, the mouse goes on to another card and rests there: that card is selected, the
+    // highlight stays, and nothing glides, though that card's root is off screen too.
+    ({ page, left } = await cardsAtFoot());
+    await clickCard(page, 15, 900, 300);
+    await mouseTo(page, threadCard(page, 14), 900, 200);
+    assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t14"], "the mouse did not select the other card, so this proves less");
+    assert.deepStrictEqual(litCards(page), ["spaces/A/threads/t15"], "the mouse moved the highlight");
+    assert.equal(armed(page), 0, "a wait outlived the mouse leaving the highlighted card, or the card beside it armed one");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(left.glides, undefined, "the mouse resting on a card beside the highlighted one glided Main");
+    assert.equal(left.scrollTop, 0, "Main moved with the mouse on another card");
+    // Back onto the highlighted card, resting: that waits again, and glides.
+    await mouseTo(page, threadCard(page, 15), 905, 302);
+    assert.equal(armed(page), 1, "the mouse coming back to the highlighted card armed no wait");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.ok(left.glides && left.glides.length === 1, "the mouse resting on the highlighted card again did not glide Main");
+
+    // Highlighted, and the mouse crossing on to the dock: nothing glides.
+    ({ page, left } = await cardsAtFoot());
+    await clickCard(page, 15, 900, 300);
+    await mouseTo(page, page.el("compose-text"), 1100, 795);
+    assert.equal(armed(page), 0, "the wait outlived the mouse moving on from the highlighted card");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(left.glides, undefined, "the mouse leaving the highlighted card for the dock glided Main");
+    assert.equal(left.scrollTop, 0, "Main moved with the mouse on the dock");
+
+    // Enter highlighting a card glides nothing: the keys chose it, not a mouse resting on it.
+    ({ page, left } = await cardsAtFoot());
+    await enterCard(page, 15);
+    assert.equal(armed(page), 0, "Enter on a card armed a glide of Main");
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(left.glides, undefined, "Enter on a card glided Main to its root");
+    assert.equal(left.scrollTop, 0, "Main moved for a key");
+
+    // THE CONTROL: a highlight that arms whoever made it glides on Enter, so the test can tell.
+    const loose = await cardsAtFoot(brokenScript(
+      "if (litCards.get(channel) === id && inputKind === \"mouse\" && pointerOn(row)) dwellColumnGlide(pane, row);",
+      "if (litCards.get(channel) === id) dwellColumnGlide(pane, row);"));
+    await enterCard(loose.page, 15);
+    loose.page.expireTimers(COLUMN_GLIDE_MS);
+    assert.ok(loose.left.glides && loose.left.glides.length === 1, "the control did not glide, so the test cannot tell");
+  } finally {
+    restore();
+  }
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------

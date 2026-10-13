@@ -6496,13 +6496,6 @@ function bringIntoView(pane, row, from = 1) {
 }
 
 /**
- * True while `keepSelection` draws the selection again after a redraw: a selection handed on to another
- * row because its message went, which nobody chose. `#280 scroll-stability`: it arms no glide of the
- * other column (`noteLinkedSelection`).
- */
-let selectionRedrawn = false;
-
-/**
  * Put the keyboard's selection back after a redraw took its row away. Called at the end of every
  * pass over the scroll tools, which every bulk redraw of the lists ends with.
  *
@@ -6529,13 +6522,10 @@ function keepSelection() {
     row.setAttribute("tabindex", "0");
     if (lost) row.focus({ preventScroll: true });
   }
-  // The new row of the selected message is lit, the old one having gone with the redraw.
-  selectionRedrawn = true;
-  try {
-    drawSelection();
-  } finally {
-    selectionRedrawn = false;
-  }
+  // The new row of the selected message is lit, the old one having gone with the redraw. A selection
+  // handed on here was nobody's choice, and glides nothing: only the pointer resting on a selection arms
+  // a glide (`dwellColumnGlide`). `#280 scroll-stability`.
+  drawSelection();
 }
 
 // --- the mouse and the keys move one selection (`#239 single-selection`)
@@ -6639,6 +6629,9 @@ function keyboardFocused(node) {
  * other column, from wherever it was. The focus goes with it while it is on a list (and stays on a
  * control of the row already holding it); the ring and the tint go with `data-selected`. Not while a
  * ⋯ menu is open: the menu holds the focus and its arrows, and a click outside it closes it first.
+ *
+ * The pointer on the selection is also what starts the wait before the other column glides to its
+ * counterpart, and nothing else does (`dwellColumnGlide`, `#261 two-column-connectors`).
  */
 function pointRow(pane, row) {
   if (openRowMenu) return;
@@ -6646,14 +6639,17 @@ function pointRow(pane, row) {
   // Lit is drawn selected (`drawSelection` lights only that), so a move within the row already lit
   // asks no more: not the pane's kept selection, which in the right column swaps the column's state
   // twice on every move to read.
-  if (lastPane === pane && pane.lit === row && (holding || !focusFollowsSelection())) return;
-  takeRow(pane, row, !holding && focusFollowsSelection());
+  if (!(lastPane === pane && pane.lit === row && (holding || !focusFollowsSelection()))) {
+    takeRow(pane, row, !holding && focusFollowsSelection());
+  }
+  dwellColumnGlide(pane, row);
 }
 
 /** Every `pointermove` on the page: a real mouse move puts the keys' look away and, over a row, selects it. */
 function onPointerMove(event) {
   if (!mouseMoved(event)) return;
   mouseInUse();
+  driftFromColumnGlide();
   // A button held is a drag (text being selected, a scrollbar dragged), not a message being chosen.
   if (event.buttons) return;
   if (currentScreen !== "main") return;
@@ -30544,6 +30540,10 @@ function toggleLitCard(id, row) {
   const pane = row.parentNode === leftEl("side-cards") ? sidePane : channelPane;
   const before = rowShown(row) ? row.getBoundingClientRect().top : null;
   paintLitCards();
+  // `#280 scroll-stability`. A card highlighted by a click, the mouse resting on it, waits to glide Main
+  // to its root, as the mouse resting on a selection does; Enter on it, as every selection the keys make,
+  // glides nothing.
+  if (litCards.get(channel) === id && inputKind === "mouse" && pointerOn(row)) dwellColumnGlide(pane, row);
   if (before === null || !row.parentNode) return;
   pane.scroller().scrollTop += row.getBoundingClientRect().top - before;
   bringIntoView(pane, row);
@@ -30829,10 +30829,25 @@ function inSideThread(message) {
 //     of the other column, where an arrowhead points the way to it. Drawn over the others, heavier.
 //   * A HIGHLIGHTED card (`#277 thread-card-focus`) takes the selection's place while it shows: its
 //     link is the one drawn so, whatever the mouse is over, and every other link is grey.
-//   * And if it stays selected for COLUMN_GLIDE_MS with the other end off screen, the other column
-//     scrolls smoothly until that end is level with it (`glideToCounterpart`) — unless the selection
-//     moves or the reader scrolls that column first. Where the reader's system asks for reduced
-//     motion (the stylesheet's `--column-glide`), it jumps instead.
+//   * And if the mouse RESTS on the selected message or card — on the highlighted card, while one is
+//     highlighted — for COLUMN_GLIDE_MS with the other end off screen, the other column scrolls
+//     smoothly until that end is level with it (`glideToCounterpart`) — unless the pointer leaves it,
+//     the selection or the highlight moves or the reader scrolls that column first. Where the reader's
+//     system asks for reduced motion (the stylesheet's `--column-glide`), it jumps instead.
+//   * ONLY A DWELL GLIDES (`#280 scroll-stability`). The owner: "it jumped me to the bottom of the
+//     screen in the main message view (two column mode)... I don't think I touched anything". The
+//     selection outlives the pointer: a mouse crossing the cards on its way to the dock or the top bar
+//     selects each card it passes over and leaves the last one selected, and when the glide waited on
+//     the selection alone, Main slid 3000px 1.5 s after the pointer had gone. So the wait is armed by a
+//     real mouse move over what the glide follows (`pointRow` -> `dwellColumnGlide`, `glideFollows`),
+//     or by a click highlighting a card under the mouse (`toggleLitCard`), dropped when the mouse moves
+//     on from it or leaves the window (`driftFromColumnGlide`, `onPointerLeavePage`), armed again if it
+//     comes back, and runs only if the mouse is still there (`pointerStays`). A selection drawn whole
+//     that the list then moves out from under a pointer standing still has not been left: the pointer
+//     is resting where it chose it. While a card is highlighted, the mouse over any other card or over
+//     Main arms nothing. A selection or a highlight made any other way — ] or [ handing the keys to a
+//     column, j or k, Tab, Enter on a card, a redraw handing it on — never glides: moving the focus
+//     scrolls no list but the one the focus is in, and that only to show it.
 //
 // WHAT IT COSTS (`#226 page-energy-profile`). Nothing in one column, on a phone, over a thread on the
 // right, or while the page is hidden. Otherwise one pass per animation frame at most, asked for by a
@@ -30858,6 +30873,13 @@ const LINK_ROW_INSET_PX = 18;
 
 /** How far inside the other column a glide brings the end it goes to, at least, in px. */
 const LINK_GLIDE_MARGIN_PX = 24;
+
+/**
+ * How far the mouse may be from where it last moved on the selection a glide waits on, across or down,
+ * and still be resting there, in px: a hand on a mouse, or the selection drawn whole and moving out from
+ * under a pointer standing still. `#280 scroll-stability`.
+ */
+const GLIDE_REST_PX = 8;
 
 /** Whether the links have a place: two columns, the cards on the right, the channel on the main screen. */
 function columnLinksShown() {
@@ -31155,15 +31177,33 @@ function scheduleColumnLinks() {
 /** The selection the links were last told of, as "pane:id", or "". */
 let linkedSelection = "";
 
-/** The wait before a glide, while one is armed: the selection it is for, the column, and where that column was. */
-let columnGlide = /** @type {{key: string, other: HTMLElement, at: number, timer: any} | null} */ (null);
+/**
+ * The wait before a glide, while one is armed: the selection it is for, the column and where that column
+ * was, where the mouse last moved on the selection, and the timer.
+ */
+let columnGlide = /** @type {{key: string, other: HTMLElement, at: number, rest: {x: number, y: number} | null, timer: any} | null} */ (null);
+
+/**
+ * The selection, as "pane:id", whose glide has had its turn — its wait ran out with the mouse still on
+ * it, whatever it then found — so that the mouse resting on it, or moving about inside it, does not arm
+ * it again: once a selection, as before. "" when the selection moves.
+ */
+let columnGlideSpent = "";
 
 /**
  * The selection was drawn again (`drawSelection`): the links follow it, and a selection that is new
- * arms the wait before its other end is brought on screen, which the old one's no longer is.
+ * drops the wait for the old one, whose other end is no longer the one to bring on screen.
  *
- * `#277 thread-card-focus`. While a card is highlighted, it is what the links follow instead: a card
- * highlighted arms the wait for its own root, and the mouse passing over other cards arms nothing.
+ * `#277 thread-card-focus`. While a card is highlighted, it is what the links follow instead, and what
+ * the glide follows (`glideFollows`): its root is the end brought on screen, and the mouse passing over
+ * other cards neither moves the links nor arms a wait.
+ *
+ * It arms none of its own. `#280 scroll-stability`: only the mouse resting on what the glide follows
+ * does (`dwellColumnGlide`, from `pointRow`, and from `toggleLitCard` for a click highlighting the card
+ * under the mouse). A selection or a highlight made any other way — the keys handed to a column by ] or
+ * [, j or k, Tab, Enter on a card, a redraw handing it on because its message went under Hide read or its
+ * card under Unread only — was not followed by the reader's eye to the other column, and that column
+ * moving 1.5 s later was "something updating underneath".
  */
 function noteLinkedSelection() {
   const card = litCardOnRight();
@@ -31172,49 +31212,126 @@ function noteLinkedSelection() {
   const key = card !== null ? `card:${card}` : pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
   if (key !== linkedSelection) {
     linkedSelection = key;
-    // `#280 scroll-stability`. Only a selection the reader made glides the other column to its other end.
-    // One a redraw handed on — its message gone under Hide read, its card filtered out by Unread only —
-    // was nobody's choice, and the other column moving 1.5 s later was "something updating underneath":
-    // the wait for the selection that went is dropped, and none is armed.
-    if (selectionRedrawn) armColumnGlide(null, lit);
-    else if (card !== null) armColumnGlide(sidePane, cardRowOnRight(card));
-    else armColumnGlide(pane, lit);
+    columnGlideSpent = "";
+    dropColumnGlide();
   }
   scheduleColumnLinks();
 }
 
-/**
- * Wait COLUMN_GLIDE_MS on the selection `lit` in `pane`, when it is a root with a card or a card, and
- * note where the other column is, which the reader scrolling it in the meantime changes.
- *
- * @param {KeyPane | null} pane
- * @param {HTMLElement | null} lit
- */
-function armColumnGlide(pane, lit) {
-  if (columnGlide !== null) {
-    clearTimeout(columnGlide.timer);
-    columnGlide = null;
-  }
-  if (!pane || !lit || !columnLinksShown()) return;
-  const linked = pane === sidePane ? lit.hasAttribute("data-card") : linkedRootThread(lit) !== null;
-  if (!linked) return;
-  const other = leftEl(pane === sidePane ? "scroll-area" : "side-scroll");
-  columnGlide = { key: linkedSelection, other, at: other.scrollTop, timer: setTimeout(glideToCounterpart, COLUMN_GLIDE_MS) };
+/** Drop the wait before a glide, if one is armed. */
+function dropColumnGlide() {
+  if (columnGlide === null) return;
+  clearTimeout(columnGlide.timer);
+  columnGlide = null;
 }
 
 /**
- * The wait is up: if the selection is the same, its end on screen and the other end off it, and the
- * reader has not scrolled the other column since, scroll that column until the other end is level with
- * the selection — kept inside it — smoothly, or at once where the reader's system asks for less motion.
+ * What the glide follows, and its column: the highlighted card while it shows on the right beside Main
+ * (`#277 thread-card-focus`), whatever is selected; else the selection drawn. Null with neither.
+ *
+ * @returns {{pane: KeyPane, row: HTMLElement} | null}
+ */
+function glideFollows() {
+  const card = litCardOnRight();
+  if (card !== null) {
+    const row = cardRowOnRight(card);
+    return row ? { pane: sidePane, row } : null;
+  }
+  const pane = activePane();
+  return pane && pane.lit ? { pane, row: pane.lit } : null;
+}
+
+/**
+ * A real mouse move over `row` of `pane` (`pointRow`), the selection having followed it there, or a
+ * click that has just highlighted the card `row` under the mouse (`toggleLitCard`): when `row` is what
+ * the glide follows (`glideFollows`) — a root with a card, or a card; the highlighted card while one is
+ * — and no wait is armed for it and its glide has not had its turn, wait COLUMN_GLIDE_MS, noting where
+ * the other column is, which the reader scrolling it in the meantime changes, and where the mouse is.
+ * The mouse arriving on it, or coming back to it after moving on, starts the wait; moving about inside
+ * it only notes where it is. While a card is highlighted, the mouse on any other card, or on Main, arms
+ * nothing.
+ *
+ * @param {KeyPane} pane
+ * @param {HTMLElement} row
+ */
+function dwellColumnGlide(pane, row) {
+  const here = mouseAt ? { x: mouseAt.x, y: mouseAt.y } : null;
+  const followed = glideFollows();
+  const on = followed !== null && followed.pane === pane && followed.row === row;
+  if (columnGlide !== null) {
+    if (columnGlide.key === linkedSelection && on) columnGlide.rest = here;
+    return;
+  }
+  if (linkedSelection === "" || columnGlideSpent === linkedSelection) return;
+  if (!on || !columnLinksShown()) return;
+  const linked = pane === sidePane ? row.hasAttribute("data-card") : linkedRootThread(row) !== null;
+  if (!linked) return;
+  const other = leftEl(pane === sidePane ? "scroll-area" : "side-scroll");
+  columnGlide = { key: linkedSelection, other, at: other.scrollTop, rest: here,
+    timer: setTimeout(glideToCounterpart, COLUMN_GLIDE_MS) };
+}
+
+/**
+ * Whether the mouse stays on what a glide waits on (`glideFollows`): on it, as the browser says by
+ * `:hover`, or within GLIDE_REST_PX of where it last moved on it — a hand resting on the mouse, or the
+ * selection drawn whole (`#257 summary-truncation`), or a card highlighted and shown whole (`#277
+ * thread-card-focus`), and the list moving it out from under a pointer standing still.
+ *
+ * @param {{rest: {x: number, y: number} | null}} glide
+ */
+function pointerStays(glide) {
+  const followed = glideFollows();
+  if (pointerOn(followed ? followed.row : null)) return true;
+  return glide.rest !== null && mouseAt !== null &&
+    Math.abs(mouseAt.x - glide.rest.x) <= GLIDE_REST_PX && Math.abs(mouseAt.y - glide.rest.y) <= GLIDE_REST_PX;
+}
+
+/**
+ * A real mouse move (`onPointerMove`): one that has taken the pointer off the selection a glide waits
+ * on, and away from where it rested there, drops the wait. `#280 scroll-stability`: the mouse crossing
+ * the cards on its way to the dock or the top bar leaves the last one selected, and glides nothing.
+ */
+function driftFromColumnGlide() {
+  if (columnGlide !== null && !pointerStays(columnGlide)) dropColumnGlide();
+}
+
+/** The mouse leaving the window, which no move inside it says: the wait before a glide is dropped. */
+function onPointerLeavePage(event) {
+  if (!event || event.pointerType === "mouse") dropColumnGlide();
+}
+
+/**
+ * Whether the mouse is on `node` now, as the browser says by `:hover`, which it keeps right as the
+ * pointer moves, as the list scrolls under it and as it leaves the window. A browser that cannot say
+ * counts as no.
+ */
+function pointerOn(node) {
+  if (!node || typeof node.matches !== "function") return false;
+  try {
+    return node.matches(":hover");
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * The wait is up: if the selection is the same — the highlighted card, while one is — and the mouse
+ * still rests on it (`pointerStays`), its end on screen and the other end off it, and the reader has not
+ * scrolled the other column since, scroll that column until the other end is level with the selection —
+ * kept inside it — smoothly, or at once where the reader's system asks for less motion.
  */
 function glideToCounterpart() {
   const glide = columnGlide;
   columnGlide = null;
   if (!glide || glide.key !== linkedSelection || document.hidden || !columnLinksShown()) return;
-  if (Math.abs(glide.other.scrollTop - glide.at) > 1) return;
   const pairs = columnLinkPairs();
   const chosen = chosenLinkPair(pairs);
   if (!chosen) return;
+  // `#280 scroll-stability`. Only a dwell: a mouse that has moved on glides nothing, and coming back to
+  // the selection waits again.
+  if (!pointerStays(glide)) return;
+  columnGlideSpent = glide.key;
+  if (Math.abs(glide.other.scrollTop - glide.at) > 1) return;
   const measured = measureColumnLinks([chosen]);
   const [end] = measured.ends;
   const onMain = glide.other === leftEl("side-scroll");
@@ -34221,6 +34338,8 @@ for (const pane of KEY_PANES) {
 }
 document.addEventListener("pointermove", onPointerMove);
 document.addEventListener("pointerdown", onPointerDown);
+// `#280 scroll-stability`. The mouse leaving the window drops the wait before a glide between the columns.
+document.documentElement.addEventListener("pointerleave", onPointerLeavePage);
 // `#267 quote-reply`. Words selected in one message make its Reply a Quote reply.
 document.addEventListener("selectionchange", noteQuoteSelection);
 // `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.

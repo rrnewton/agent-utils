@@ -3988,7 +3988,7 @@ page has never loaded, in two columns, needs a server search, which waits on the
 
 ### Nothing moves the list but the reader
 
-`#277 scroll-stability`. The owner: *"I swear I just saw an instance where it jumped me to the bottom of
+`#280 scroll-stability`. The owner: *"I swear I just saw an instance where it jumped me to the bottom of
 the screen in the main message view (two column mode)... I don't think I touched anything. I think it
 was something updating underneath."* It was a read: every refresh took the reader's place as it went
 out and settled to it when it landed, seconds later behind a bridge, so a reader on the newest line who
@@ -4007,13 +4007,26 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   that message is taller than the screen, when its head shows); one with older unread messages still
   opens on the first of them (`#221 read-modes`). The list of threads opens at its foot and stays there.
 - **Moving the focus never scrolls a list** unless what takes it is off screen, and then the least that
-  shows it. The other column glides to a selection's counterpart (`#261 two-column-connectors`) only
-  for a selection the reader made, never for one a redraw handed on.
+  shows it. ] and [, j and k, and Tab glide nothing in the other column.
+- **The other column glides to a selection's counterpart (`#261 two-column-connectors`) only when the
+  mouse rests on it.** The selection outlives the pointer: a mouse crossing the cards on its way to the
+  dock or the top bar leaves the last card it passed selected, and Main used to slide thousands of
+  pixels to that card's root 1.5 s after the pointer had gone — the owner's jump in two columns with
+  nothing touched. The wait starts when a real mouse move lands on the selection, ends when the mouse
+  moves on from it or leaves the window, starts again if it comes back, and glides only if the mouse
+  is still there: on it, or within 8px of where it last moved on it, which a card drawn whole moving
+  out from under a still pointer does not count as leaving. A selection a redraw hands on never glides.
+  While a card is highlighted (`#277 thread-card-focus`), the glide follows it instead of the
+  selection: the click that highlighted it, or the mouse coming to rest on it, starts the wait for its
+  root, and the mouse over any other card, or over Main, starts none. Enter highlighting a card glides
+  nothing, as no key does.
 
 `tests/scroll_stability_browser.py` (DAG step `scroll-stability-browser`) measures them in Chromium at
 1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
 messages, a refresh, the read sent from the newest line and landing after a scroll, summaries and focus
-moves; a reader on the newest line following; the threads and their list opening at the foot.
+moves, and at the desk, sampled at every frame for 2.5 s, the mouse crossing the cards to the dock and to
+the top bar and ] on its own; a reader on the newest line following; the threads and their list opening
+at the foot.
 
 ### A filter keeps your place
 
@@ -5362,9 +5375,11 @@ the card's edge's), out of the root's right edge level with its tag, through a l
 gap between the columns, into the card's left edge, drawn while both ends are on screen. The
 selected message or card draws its link even with the other end off screen, clipped at the columns'
 edge with an arrowhead pointing up or down to it (the highlighted card's, while one is highlighted,
-whatever is selected), and if the selection stays 1.5 s the other column
-glides that end level with it — cancelled if the selection moves or the reader scrolls that column
-first, and a jump instead of a glide where the reader asks for reduced motion (the stylesheet's
+whatever is selected), and if the mouse rests 1.5 s on the selection — on the highlighted card, while
+one is highlighted, which a click on it starts — the other column glides that end level with it —
+cancelled if the mouse moves on, the selection or the highlight moves or the reader scrolls that column
+first; the mouse crossing other cards, and a selection or a highlight the keys or a redraw made, never
+glide (`#280 scroll-stability`) — and a jump instead of a glide where the reader asks for reduced motion (the stylesheet's
 `--column-glide`; the script asks no media query). The links are one SVG drawn at most once per
 animation frame, from passive scroll listeners, resizes and redraws, every rectangle read before
 anything is written and only what changed written; nothing is drawn or measured in one column, on a
