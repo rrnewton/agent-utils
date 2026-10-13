@@ -1006,14 +1006,14 @@ function stamp(atMs) {
 // `#260 timestamp-hover`. The owner: "On an old thread a message says 5:25 PM but it is 3:56 PM now,
 // so it must be yesterday." A row's time is the hour and minute and nothing else, because that is all
 // a row has room for, and on its own it cannot say which day. Hovering it now says: "Yesterday,
-// Oct 11, Mon, 5:25 PM".
+// Oct 11, Sun, 5:25 PM".
 //
 // `dayLabel` is THE ONE DAY FORMATTER on this page. The tooltip over every message's time and the
 // details sheet ask it, and `#250 date-separators` — the lines between days in a list, in flight
 // separately — must ask it too rather than make a second wording that drifts from this one:
 //
 //   the day the reader is in     Today, Oct 12, Mon
-//   the day before it            Yesterday, Oct 11, Mon
+//   the day before it            Yesterday, Oct 11, Sun
 //   any other day this year      Oct 9, Fri
 //   a day in another year        Oct 9, 2025, Thu
 //
@@ -1039,7 +1039,7 @@ const sameLocalDay = (a, b) =>
 
 /**
  * The day `when` falls on, as the reader says it standing at `now`: "Today, Oct 12, Mon",
- * "Yesterday, Oct 11, Mon", "Oct 9, Fri", "Oct 9, 2025, Thu". Both are Dates, read in local time.
+ * "Yesterday, Oct 11, Sun", "Oct 9, Fri", "Oct 9, 2025, Thu". Both are Dates, read in local time.
  * See the section note above: this is the only place a day is worded.
  *
  * @param {Date} when
@@ -1057,7 +1057,7 @@ function dayLabel(when, now = new Date()) {
 
 /**
  * What hovering a message's time says: its day, then the time exactly as it is shown —
- * "Yesterday, Oct 11, Mon, 5:25 PM".
+ * "Yesterday, Oct 11, Sun, 5:25 PM".
  *
  * @param {Date} at
  * @param {string} shown
@@ -3474,7 +3474,7 @@ function turnNode(who, text, atMs) {
   // durable transcript lies about itself. Restored lines can be days old, so the day is on hover,
   // as on a channel row (`#260 timestamp-hover`).
   const when = atMs === undefined ? new Date() : new Date(atMs);
-  const at = timeNode("at", Number.isNaN(when.getTime()) ? null : when, atMs === undefined ? stamp() : stamp(atMs));
+  const at = timeNode("at", Number.isNaN(when.getTime()) ? null : when, stamp(when.getTime()));
   meta.append(author, at);
   const body = document.createElement("div");
   body.className = "body";
@@ -19720,7 +19720,7 @@ function shortTimeFormat() {
 }
 
 /**
- * The whole truth, for the details sheet: day, time and zone, all local — "Yesterday, Oct 11, Mon,
+ * The whole truth, for the details sheet: day, time and zone, all local — "Yesterday, Oct 11, Sun,
  * 05:25 PM PDT". The day is `dayLabel`'s, so the sheet a phone opens with a press-and-hold says it in
  * the words a desk's tooltip uses (`#260 timestamp-hover`), and it is worded as the sheet opens.
  */
