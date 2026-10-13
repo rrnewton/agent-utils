@@ -10451,13 +10451,39 @@ function showPostProposal(proposal) {
   el("post-confirm-send").setAttribute("aria-label", sendLabel);
   el("post-confirm-send").disabled =
     postWatch.busy || postWatch.hold !== null || shown !== proposal.text;
-  el("post-confirm-cancel").disabled = postWatch.busy || postWatch.hold !== null;
+  renderPostCancel();
   renderPostExpiry();
   placePostCard();
   // Only over the list on screen: a draft that arrives while the owner is in Settings waits docked
   // there, and must not move the list he left.
   if (fresh && currentScreen === "main") followIfPinned(pinned, 0, currentView);
   renderJumpNewest();
+}
+
+/**
+ * Whether a spoken yes to `proposal` is settling. `#269 approval-card-inline`.
+ *
+ * @param {VibeTalk.PendingPost | null} proposal
+ */
+function yesSettlingOn(proposal) {
+  const settling = spokenYes.settling;
+  return Boolean(settling && proposal && settling.handle === proposal.handle);
+}
+
+/**
+ * Hold Don't send, or let it go, for what the card shows now. `#269 approval-card-inline`.
+ *
+ * Held while a request is on its way, and during the hold after the card appears or changes — but
+ * NEVER while a spoken yes to this card settles. Then the card's own line says "tap Don't send to
+ * stop", and Don't send is the one thing that stops the message going. A yes can settle inside the
+ * hold: the card reached the page after the read-back, on a slow or reconnecting long poll, and the
+ * owner answered at once. A Don't send held then turned a tap meant to stop the send into nothing,
+ * and the message posted.
+ */
+function renderPostCancel() {
+  const proposal = postWatch.shown;
+  if (!proposal) return;
+  el("post-confirm-cancel").disabled = postWatch.busy || (postWatch.hold !== null && !yesSettlingOn(proposal));
 }
 
 /**
@@ -10762,8 +10788,9 @@ async function cancelPostProposal(options) {
   const proposal = postWatch.shown;
   if (!proposal || postWatch.busy) return;
   // A tap during the hold is one aimed at what was under that spot before the card was. A spoken
-  // no is not a tap and is never held. `#269 approval-card-inline`.
-  if (!spoken && postWatch.hold !== null) return;
+  // no is not a tap and is never held, and nor is a tap that stops a spoken yes settling on this
+  // card: the card asked for that one (`renderPostCancel`). `#269 approval-card-inline`.
+  if (!spoken && postWatch.hold !== null && !yesSettlingOn(proposal)) return;
   const stoppedYes = spokenYesYieldsToTap();
   postWatch.busy = true;
   try {
@@ -11765,6 +11792,8 @@ function resetSpokenYes(why = "earlier_draft") {
   const settling = spokenYes.settling;
   if (settling) clearTimeout(settling.timer);
   spokenYes.settling = null;
+  // A Don't send let through the card's hold for that yes is held again until the hold is over.
+  if (settling) renderPostCancel();
   spokenYes.epoch += 1;
   spokenYes.said = new Map();
   spokenYes.sinceUser = new Map();
@@ -12231,6 +12260,7 @@ function judgeSpokenAnswer(text, heard, refused = null) {
   settling.timer = setTimeout(() => {
     if (spokenYes.settling !== settling || spokenYes.epoch !== epoch) return;
     spokenYes.settling = null;
+    renderPostCancel();
     void commitBySpokenYes(settling.proposal, epoch, settling.hold);
   }, SPOKEN_YES_SETTLE_MS);
   spokenYes.settling = settling;
@@ -12238,7 +12268,9 @@ function judgeSpokenAnswer(text, heard, refused = null) {
   // hidden while it settles and sends.
   settling.hold = acceptYesHold(spokenYes.answered, shown.serial);
   setStatus("Heard yes — sending…");
-  // `#269 approval-card-inline`. The card's own line says so too, with how to stop it.
+  // `#269 approval-card-inline`. The card's own line says so too, with how to stop it — and the way
+  // to stop it is live, even inside the hold of a card that has only just appeared.
+  renderPostCancel();
   renderPostExpiry();
 }
 
@@ -12309,6 +12341,7 @@ function abortSpokenYes(reason) {
   clearTimeout(settling.timer);
   spokenYes.settling = null;
   releaseYesHold(settling.hold || null);
+  renderPostCancel();
   renderPostExpiry();
   reportSpokenOutcome({ kind: "not_armed", proposal: settling.proposal, reason: SPOKEN_YES_REASONS[reason] });
 }
@@ -12327,6 +12360,7 @@ function spokenYesYieldsToTap() {
   spokenYes.settling = null;
   // The tap is what approves it, and its card says so: the yes is a turn of its own again.
   releaseYesHold(settling.hold || null);
+  renderPostCancel();
   renderPostExpiry();
   return true;
 }

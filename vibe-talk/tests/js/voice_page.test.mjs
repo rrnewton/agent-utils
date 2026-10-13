@@ -35840,6 +35840,84 @@ test("`#264 voice-send-approval`: Don't send tapped during the settle window wit
   assert.match(notices[0], /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./);
 });
 
+// `#269 approval-card-inline`. Both buttons are held for a moment after a card appears, so a tap aimed
+// at the row that was there lands on neither. A spoken yes can settle inside that moment — the card
+// reached the page after its read-back, on a slow or reconnecting long poll, and the owner answered
+// at once — and then the card says "tap Don't send to stop". Held, that tap was eaten and the message
+// posted. Never held while a yes to the card settles; held again once it stops, until the hold is over.
+const CARD_HOLD_MS = sourceConstant("POST_CHANGE_HOLD_MS");
+/** Whether the card's hold after it appeared or changed is still running. */
+const cardHeld = (page) => [...page.timers.values()].some((timer) => timer.ms === CARD_HOLD_MS);
+
+/** Tap Don't send while the yes settles inside the hold, and check that it stopped the send. */
+async function dontSendStopsTheYes(page, socket, pending) {
+  assert.ok(cardHeld(page), "the card's hold was over: this tests nothing");
+  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — tap Don't send to stop");
+  assert.equal(page.el("post-confirm-cancel").disabled, false, "Don't send was held while the card said to tap it");
+  assert.equal(page.el("post-confirm-send").disabled, true, "Send was let through the hold too");
+  await page.el("post-confirm-cancel").click();
+  await page.settle();
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "the tap meant to stop the send was eaten, and the yes posted");
+  assert.deepEqual(page.proposalCancels, [{ handle: pending.handle }]);
+  assert.equal(page.el("post-confirm").hidden, true, "the withdrawn draft stayed on the card");
+  assert.ok(
+    page.el("transcript").children.some((li) => li.className === "seam" && li.text().includes("Not sent")),
+    "the withdrawal left no 'Not sent' line",
+  );
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./);
+}
+
+test("`#269 approval-card-inline`: Don't send stops a spoken yes that settles inside the card's hold", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await readBackDuringACall(page, { pending });
+  // A card that has just appeared, with no yes settling, holds both buttons.
+  assert.equal(page.el("post-confirm-cancel").disabled, true, "Don't send was live on a card that had just appeared");
+  hostedHears(socket, "yes");
+  await dontSendStopsTheYes(page, socket, pending);
+});
+
+test("`#269 approval-card-inline`: Don't send stops a yes to a card that reached the page after its read-back, inside the hold", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await startTalking(page);
+  await page.settle();
+  hostedHears(socket, "tell lead team I'm on it, rebasing now");
+  hostedSays(socket, `To lead team: ${pending.text}. Send it?`);
+  // The long poll brings the card a moment after the read-back's transcript: a read-back that beat
+  // its card to the page still counts.
+  page.propose(pending);
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false, "the proposal never reached the card");
+  assert.equal(page.el("post-confirm-cancel").disabled, true, "Don't send was live on a card that had just appeared");
+  hostedHears(socket, "yes");
+  await dontSendStopsTheYes(page, socket, pending);
+});
+
+test("`#269 approval-card-inline`: a yes that stops settling inside the hold holds Don't send again until the hold is over", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await readBackDuringACall(page, { pending });
+  hostedHears(socket, "yes");
+  assert.equal(page.el("post-confirm-cancel").disabled, false, "Don't send was held while a yes settled");
+  hostedHears(socket, "wait");
+  await page.settle();
+  assert.ok(cardHeld(page), "the card's hold was over: this tests nothing");
+  assert.equal(page.el("post-confirm-cancel").disabled, true, "Don't send stayed live inside the hold with no yes settling");
+  await page.el("post-confirm-cancel").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCancels, [], "a tap inside the hold, with no yes settling, withdrew the draft");
+  assert.equal(page.expireTimers(CARD_HOLD_MS), 1, "no hold was running");
+  assert.equal(page.el("post-confirm-cancel").disabled, false, "Don't send stayed held after the hold");
+  await page.el("post-confirm-cancel").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCancels, [{ handle: pending.handle }]);
+  assert.deepEqual(page.proposalCommits, []);
+});
+
 test("`#264 voice-send-approval`: a tap while the spoken commit is on its way is ignored, and the post goes once, as the speaker's turn", async () => {
   const page = newPage();
   const socket = await readBackDuringACall(page);
