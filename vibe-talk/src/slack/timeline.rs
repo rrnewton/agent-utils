@@ -595,6 +595,7 @@ impl HttpSlackClient {
         if has_more {
             raws.drain(..raws.len() - limit);
         }
+        self.check_flat_against_thread(conversation, thread, &raws);
         let next_before = if has_more {
             Some(self.cursor(channel, request, raws[0].ts.clone())?)
         } else {
@@ -687,7 +688,8 @@ impl HttpSlackClient {
     /// any of this; the saving depends on the server reporting it.
     ///
     /// An edit to a reply changes nothing on its root, so Flat shows it when that period runs out;
-    /// the thread view, which reads the thread itself, shows it at once.
+    /// the thread view, which reads the thread itself, shows it at once, and once it has, the next
+    /// Flat read reads that thread in full (`check_flat_against_thread`).
     ///
     /// One hole is known, and left to the reconcile: an older reply deleted while two new ones are
     /// posted, one of them a system event that is not kept, raises the count by one and brings one
@@ -773,6 +775,48 @@ impl HttpSlackClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
+    }
+
+    /// Forget the replies a Flat read holds for `thread` when a read of the thread itself shows
+    /// them otherwise, so the next Flat read reads that thread in full and shows what the thread
+    /// view just showed: an edited reply above all, which changes nothing on its root. Costs no
+    /// call. `#282 slack-flat-skip`, remote-ops audit W8 review.
+    ///
+    /// `raws` is one gap-free stretch of the thread, root included when it reached that far, and
+    /// what is held is another. Only where the two overlap are they compared, message by message
+    /// as Slack sent them, so a thread view of the newest replies says nothing about older ones,
+    /// and a reply newer than what is held is left to the root's count.
+    fn check_flat_against_thread(&self, conversation: &str, thread: &str, raws: &[Raw]) {
+        let key = (conversation.to_owned(), thread.to_owned());
+        let mut held = self
+            .flat_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = held.get(&key) else {
+            return;
+        };
+        let read: Vec<&Raw> = raws.iter().filter(|raw| raw.ts != thread).collect();
+        let (Some(first_read), Some(last_read)) = (read.first(), read.last()) else {
+            return;
+        };
+        let (Some(first_held), Some(last_held)) = (entry.replies.first(), entry.replies.last())
+        else {
+            return;
+        };
+        let overlap =
+            first_read.micros.max(first_held.micros)..=last_read.micros.min(last_held.micros);
+        let shown = read
+            .iter()
+            .filter(|raw| overlap.contains(&raw.micros))
+            .map(|raw| (raw.micros, &raw.value));
+        let kept = entry
+            .replies
+            .iter()
+            .filter(|raw| overlap.contains(&raw.micros))
+            .map(|raw| (raw.micros, &raw.value));
+        if !shown.eq(kept) {
+            held.remove(&key);
+        }
     }
 
     /// The replies held for a thread, unless they were read in full a reconcile period ago.

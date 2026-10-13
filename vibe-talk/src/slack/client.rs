@@ -213,10 +213,11 @@ impl HttpSlackClient {
     ///
     /// Until then a thread whose root reports the same reply count and latest reply costs no call,
     /// and one with new replies costs one. An edit to a reply changes nothing on its root, so it
-    /// reaches Flat when this period runs out (the thread view shows it at once). That holds for
-    /// every reader of Flat, not only the page: a summary, or a recent window where `recent_view`
-    /// is `"flat"`, may also see a reply's text as it was up to this long ago.
-    /// `Duration::ZERO` reads every thread in full on every Flat read.
+    /// reaches Flat when this period runs out, or on the next Flat read after the thread view has
+    /// shown it (the thread view shows it at once). That holds for every reader of Flat, not only
+    /// the page: a summary, or a recent window where `recent_view` is `"flat"`, may also see a
+    /// reply's text as it was up to this long ago. `Duration::ZERO` reads every thread in full on
+    /// every Flat read.
     #[must_use]
     pub fn with_flat_reconcile(mut self, period: Duration) -> Self {
         self.flat_reconcile = period;

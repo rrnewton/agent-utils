@@ -99,6 +99,8 @@ fn add_reply(fake: &Fake, root: &str, at: &str) {
 /// What one Flat read returned, and the Web API calls it made.
 struct Read {
     messages: Vec<String>,
+    /// Each message's text, in the same order.
+    texts: Vec<String>,
     history: usize,
     /// Every `conversations.replies` request the read sent, in order.
     replies: Vec<HashMap<String, String>>,
@@ -141,6 +143,11 @@ async fn flat(fake: &Fake, client: &HttpSlackClient) -> Read {
     );
     Read {
         messages,
+        texts: page
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect(),
         history: fake.calls("conversations.history") - history,
         replies: fake.requests("conversations.replies")[replies..].to_vec(),
     }
@@ -481,4 +488,109 @@ async fn a_root_without_latest_reply_is_read_in_full_every_time() {
         !second.messages.contains(&gone),
         "the deleted reply is gone"
     );
+}
+
+/// Open `root`'s thread, its newest `limit` messages, as the page's thread view does. Returns the
+/// texts it shows and the `conversations.replies` calls it made.
+async fn open_thread(
+    fake: &Fake,
+    client: &HttpSlackClient,
+    root: &str,
+    limit: u16,
+) -> (Vec<String>, usize) {
+    let before = fake.requests("conversations.replies").len();
+    let page = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                view: TimelineView::Thread,
+                thread_id: Some(root.to_owned()),
+                before: None,
+                after: None,
+                limit,
+            },
+        )
+        .await
+        .expect("thread");
+    let texts = page
+        .messages
+        .iter()
+        .map(|message| message.content.clone())
+        .collect();
+    (texts, fake.requests("conversations.replies").len() - before)
+}
+
+/// An edit to a reply changes nothing on its root, so Flat keeps the text it holds. Once the
+/// thread view has read the thread and shown the edit, the next Flat read reads that thread in
+/// full and shows it too; a thread view that shows what Flat holds changes nothing, at no call.
+/// Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_thread_view_that_shows_an_edit_brings_it_into_flat() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+
+    // Read as Flat holds it: Flat still reads no thread afterwards. A thread view of thirty
+    // replies costs its root and two pages, compared with what Flat holds or not.
+    let (opened, index) = roots[0].clone();
+    let (_, thread_calls) = open_thread(&fake, &client, &opened, 20).await;
+    assert_eq!(thread_calls, 1 + 2);
+    let same = flat(&fake, &client).await;
+    assert!(same.replies.is_empty(), "{:?}", same.threads());
+
+    let target = reply_ts(index, REPLIES - 2);
+    fake.with(|state| {
+        let reply = state
+            .replies
+            .get_mut(&(CH.to_owned(), opened.clone()))
+            .expect("thread")
+            .iter_mut()
+            .find(|reply| reply["ts"] == json!(target))
+            .expect("reply");
+        reply["text"] = json!("edited after the read");
+        reply["edited"] = json!({"user": "UREPLIER1", "ts": ts(9800, 0)});
+    });
+    let held = flat(&fake, &client).await;
+    assert!(held.replies.is_empty(), "the root did not move");
+    assert!(!held
+        .texts
+        .iter()
+        .any(|text| text == "edited after the read"));
+
+    let (shown, thread_calls) = open_thread(&fake, &client, &opened, 20).await;
+    assert_eq!(thread_calls, 1 + 2, "noticing the edit costs no call");
+    assert!(shown.iter().any(|text| text == "edited after the read"));
+    let next = flat(&fake, &client).await;
+    assert_eq!(
+        next.threads(),
+        [opened.clone(), opened.clone()],
+        "that thread, read in full"
+    );
+    assert!(next
+        .texts
+        .iter()
+        .any(|text| text == "edited after the read"));
+    let settled = flat(&fake, &client).await;
+    assert!(settled.replies.is_empty(), "{:?}", settled.threads());
+
+    // A thread view of the newest replies only does not see an edit further back, and changes
+    // nothing for it.
+    let (back, back_index) = roots[5].clone();
+    let early = reply_ts(back_index, 2);
+    fake.with(|state| {
+        let reply = state
+            .replies
+            .get_mut(&(CH.to_owned(), back.clone()))
+            .expect("thread")
+            .iter_mut()
+            .find(|reply| reply["ts"] == json!(early))
+            .expect("reply");
+        reply["text"] = json!("edited far back");
+    });
+    let (shown, thread_calls) = open_thread(&fake, &client, &back, 10).await;
+    assert_eq!(thread_calls, 1 + 2);
+    assert!(!shown.iter().any(|text| text == "edited far back"));
+    assert!(flat(&fake, &client).await.replies.is_empty());
 }
