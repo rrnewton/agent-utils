@@ -1231,8 +1231,16 @@ impl ChatClient for ProfiledClient {
         limit: u16,
         cursor: Option<&str>,
     ) -> Result<crate::chat::RangeRead, ChatError> {
+        // Timed under what it costs upstream. A provider without a range read of its own answers
+        // with one `fetch_page` (`crate::chat::emulated_range`) and is counted as that, exactly as
+        // `/page?since=` was before range reads existed; only a native one is `fetch_range`, so
+        // the two can be told apart here. remote-ops-audit W10 `#287 bulk-reads`.
+        let operation = match self.inner.read_caps(channel).range {
+            crate::chat::Support::Native => "fetch_range",
+            crate::chat::Support::Emulated => "fetch_page",
+        };
         self.timed(
-            "fetch_range",
+            operation,
             Direction::Read,
             self.inner
                 .fetch_range(channel, scope, range, order, limit, cursor),

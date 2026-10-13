@@ -454,16 +454,23 @@ async fn the_router_asks_each_channels_own_provider_whether_and_how_it_reads_by_
         .expect_err("unrouted");
     assert!(matches!(error.cause(), ChatError::Refused(_)), "{error}");
 
+    // Each read is timed under its own provider, and under what it cost there: the native one as
+    // a range read, the plain one as the one page it was, as `/page?since=` always was.
     let report = router.profile().report();
-    for provider in &report.providers {
-        let timed = provider
-            .operations
+    let timed = |key: &str, name: &str| {
+        report
+            .providers
             .iter()
-            .filter(|row| row.name == "fetch_range")
+            .filter(|provider| provider.provider == key)
+            .flat_map(|provider| &provider.operations)
+            .filter(|row| row.name == name)
             .map(|row| row.count)
-            .sum::<u64>();
-        assert_eq!(timed, 1, "{} timed its range read", provider.provider);
-    }
+            .sum::<u64>()
+    };
+    assert_eq!(timed("native", "fetch_range"), 1);
+    assert_eq!(timed("native", "fetch_page"), 0);
+    assert_eq!(timed("plain", "fetch_page"), 1);
+    assert_eq!(timed("plain", "fetch_range"), 0);
 }
 
 const SLACK_CH: &str = "C0000MAIN1";
@@ -824,4 +831,181 @@ async fn slack_reads_a_threads_window_through_its_replies() {
         .await
         .expect_err("refused");
     assert!(matches!(error.cause(), ChatError::Refused(_)), "{error}");
+}
+
+/// A Slack deployment built from configuration exactly as `main` builds one, its one channel the
+/// conversation the Slack fixtures fill.
+fn slack_deployment(fake: &Fake) -> vibe_talk::state::AppState {
+    let text = format!(
+        r#"
+[auth]
+read_token = "{read}"
+write_token = "{write}"
+
+[[providers]]
+key = "slack"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = false
+"#,
+        read = READ_TOKEN,
+        write = vibe_talk::testing::WRITE_TOKEN,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    state
+}
+
+fn slack_id(ts: &str) -> Value {
+    json!(vibe_talk::slack::message_id_from_ts(ts)
+        .expect("encodable")
+        .as_str())
+}
+
+/// remote-ops-audit W10 proof: `/count` since an instant on Slack, with 150 messages since then
+/// and 400 before, is eight `conversations.history` calls, every one with `oldest` at that instant
+/// and `latest` pinned, and stops exactly there. It was ten before, walking back past the instant
+/// a hundred at a time.
+#[tokio::test]
+async fn a_slack_count_since_an_instant_reads_that_window_and_nothing_older() {
+    let fake = Fake::start(slack_history(400, 150, 0), 20).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let base = format!("/api/v1/channels/{SLACK_CH}");
+    let (status, body) = get(
+        &router,
+        &format!("{base}/count?since={}", iso(slack_ms(10_000))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 150, "{body}");
+    assert_eq!(body["at_least"], false, "Slack said has_more: false");
+    assert_eq!(body["newest_seen"], slack_id(&ts(10_149, 0)));
+    assert_eq!(body["oldest_seen"], slack_id(&ts(10_000, 0)));
+    let calls = fake.requests("conversations.history");
+    assert_eq!(calls.len(), 8, "{calls:?}");
+    let latest = calls[0].get("latest").cloned().expect("latest is set");
+    for call in &calls {
+        assert_eq!(
+            call.get("oldest").map(String::as_str),
+            Some(ts(10_000, 0).as_str())
+        );
+        assert_eq!(call.get("latest"), Some(&latest));
+        assert_eq!(call.get("inclusive").map(String::as_str), Some("true"));
+    }
+
+    // The cap still bounds what is read, and says the answer is a lower bound.
+    let (status, body) = get(
+        &router,
+        &format!("{base}/count?since={}&cap=50", iso(slack_ms(10_000))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 50, "{body}");
+    assert_eq!(body["at_least"], true);
+    assert_eq!(
+        fake.calls("conversations.history"),
+        8 + 3,
+        "20, 20 and the 10 still wanted"
+    );
+}
+
+/// remote-ops-audit W10: `/page` through a span with an end on Slack reads the span, never what
+/// came after it. Before, each step read from `since` to now — up to ten pages and then narrowing
+/// probes — and trimmed the rest away.
+#[tokio::test]
+async fn a_slack_page_walk_through_a_span_reads_the_span_and_nothing_after_it() {
+    let fake = Fake::start(slack_history(10, 30, 400), 20).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let until = iso(slack_ms(20_000));
+    let mut query = format!(
+        "/api/v1/channels/{SLACK_CH}/page?since={}&until={until}&limit=10",
+        iso(slack_ms(10_000))
+    );
+    let mut walked: Vec<String> = Vec::new();
+    for step in 0..10 {
+        let (status, body) = get(&router, &query).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        walked.extend(
+            body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|m| m["content"].as_str().expect("content").to_owned()),
+        );
+        if step == 0 {
+            assert_eq!(body["has_more"], true);
+            assert_eq!(
+                fake.calls("conversations.history"),
+                2,
+                "30 rows at 20 a page, none of the 400 after the span"
+            );
+        }
+        let Some(next) = body["next_since"].as_str() else {
+            break;
+        };
+        query = format!(
+            "/api/v1/channels/{SLACK_CH}/page?since={}&until={until}&limit=10",
+            next.replace(':', "%3A")
+        );
+    }
+    assert_eq!(
+        walked,
+        (0..30).map(|i| format!("in {i}")).collect::<Vec<_>>()
+    );
+    let calls = fake.requests("conversations.history");
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    assert!(calls
+        .iter()
+        .all(|call| call.get("latest").map(String::as_str) == Some(ts(20_000, 0).as_str())));
+}
+
+/// remote-ops-audit W10: a span with no end on Slack is read from `since` to now, and when that is
+/// more than one window, a step can stop short of what follows. Such a step says there may be more,
+/// so the walk reaches every message instead of ending early. Before, a step of three messages out
+/// of a window of 430 answered `has_more: false`.
+#[tokio::test]
+async fn a_slack_page_walk_with_no_end_never_stops_short_of_the_newest_message() {
+    let fake = Fake::start(slack_history(10, 30, 400), 20).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let mut query = format!(
+        "/api/v1/channels/{SLACK_CH}/page?since={}&limit=50",
+        iso(slack_ms(10_000))
+    );
+    let mut walked: Vec<String> = Vec::new();
+    let mut steps = 0;
+    loop {
+        let (status, body) = get(&router, &query).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        steps += 1;
+        walked.extend(
+            body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|m| m["content"].as_str().expect("content").to_owned()),
+        );
+        let Some(next) = body["next_since"].as_str() else {
+            assert_eq!(body["has_more"], false);
+            break;
+        };
+        assert!(steps < 200, "the walk ends");
+        query = format!(
+            "/api/v1/channels/{SLACK_CH}/page?since={}&limit=50",
+            next.replace(':', "%3A")
+        );
+    }
+    let expected: Vec<String> = (0..30)
+        .map(|i| format!("in {i}"))
+        .chain((0..400).map(|i| format!("new {i}")))
+        .collect();
+    assert_eq!(walked.len(), expected.len(), "after {steps} steps");
+    assert_eq!(walked, expected);
 }

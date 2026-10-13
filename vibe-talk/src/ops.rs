@@ -1041,7 +1041,10 @@ pub struct Page {
     /// Whether messages exist beyond this page in the direction of travel.
     ///
     /// Decided by over-fetching one and dropping it, so it is a fact rather than an inference from
-    /// a full window.
+    /// a full window. A time span read from a provider that reads by time is also `true` when the
+    /// provider could not prove the span ends after this page: the next step may come back empty,
+    /// which is better than a walk that silently stops short. remote-ops-audit W10
+    /// `#287 bulk-reads`.
     pub has_more: bool,
     /// The `before` cursor for the next step back. Set only when [`Page::has_more`].
     pub next_before: Option<MessageId>,
@@ -1135,34 +1138,55 @@ pub async fn page(
 
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
-    let (mut messages, forward) = match since {
+    let (mut messages, forward, unproven) = match since {
         Some(from) => {
-            // Discord's `after` is EXCLUSIVE, and the `since` edge is inclusive, so the cursor
-            // goes one millisecond earlier. Off by one here silently drops a message that sits
+            // One step of a range read, oldest first: remote-ops-audit W10 `#287 bulk-reads`. A
+            // provider that reads by time itself reads the span and nothing after it. One that
+            // does not answers with the read this route always made (`chat::emulated_range`):
+            // `after` the millisecond before `since`, because Discord's `after` is EXCLUSIVE and
+            // the `since` edge inclusive. Off by one there silently drops a message that sits
             // exactly on the boundary — the edge the issue asks be tested.
-            let after = MessageId::at_time_ms(from - 1);
-            let mut fetched = state
+            let native = state.chat.read_caps(&channel.id).range == crate::chat::Support::Native;
+            let read = state
                 .chat
-                .fetch_page(&channel.id, probe, None, Some(&after))
+                .fetch_range(
+                    &channel.id,
+                    &crate::chat::ReadScope::Main,
+                    crate::chat::TimeRange {
+                        since_ms: from,
+                        until_ms: until,
+                    },
+                    crate::chat::RangeOrder::OldestFirst,
+                    probe,
+                    None,
+                )
                 .await?;
+            // A native read says whether it reached the span's end. One that did not, and came
+            // back no longer than a page, may have stopped short of more: Slack's, narrowing a
+            // window too large to read whole, returns the run next to `since` that it could
+            // isolate. That is "there may be more", never "there is no more".
+            let unproven = native && !read.exhausted;
+            let mut fetched = read.messages;
             // Both edges applied to the message's own creation instant, because the boundary
             // cursor is only millisecond-accurate: the extra millisecond it lets through at the
             // bottom is trimmed here, and a message exactly at `until` is deterministically OUT.
+            // The range read has trimmed already; this holds every provider to the same edges.
             fetched.retain(|m| {
                 message_ms(m).is_none_or(|ms| ms >= from && until.is_none_or(|to| ms < to))
             });
-            (fetched, true)
+            (fetched, true, unproven)
         }
         None => {
             let fetched = state
                 .chat
                 .fetch_page(&channel.id, probe, before.as_ref(), None)
                 .await?;
-            (fetched, false)
+            (fetched, false, false)
         }
     };
 
-    let has_more = messages.len() > usize::from(limit);
+    let has_more = messages.len() > usize::from(limit)
+        || (unproven && messages.last().is_some_and(|m| message_ms(m).is_some()));
     if has_more {
         if forward {
             // Walking forward, the extra one is the NEWEST; drop it from that end.
@@ -1229,6 +1253,10 @@ pub struct MessageCount {
     /// The ceiling that applied.
     pub cap: u32,
     /// Oldest message reached, so a caller can carry on from there if it wants to.
+    ///
+    /// A count since an instant on a provider that reads by time reads only that window
+    /// ([`count_range`]), so this and [`MessageCount::newest_seen`] are then the oldest and newest
+    /// messages inside it.
     pub oldest_seen: Option<MessageId>,
     /// Newest message the walk started from.
     pub newest_seen: Option<MessageId>,
@@ -1280,6 +1308,13 @@ pub async fn count_within(
     };
     let cap = state.effective_count_cap(cap);
 
+    let filter = crate::noise::filter_for(state, &channel.id).await;
+    if let Some(from) = since {
+        if state.chat.read_caps(&channel.id).range == crate::chat::Support::Native {
+            return count_range(state, channel, from, cap, &filter).await;
+        }
+    }
+
     let stride = crate::discord::http::DISCORD_MAX_LIMIT;
     let mut counted: usize = 0;
     let mut at_least = false;
@@ -1287,7 +1322,6 @@ pub async fn count_within(
     let mut newest_seen: Option<MessageId> = None;
     let mut before: Option<MessageId> = None;
     let mut noise: usize = 0;
-    let filter = crate::noise::filter_for(state, &channel.id).await;
 
     loop {
         let batch = state
@@ -1330,6 +1364,81 @@ pub async fn count_within(
         before = Some(oldest.id);
     }
 
+    Ok(MessageCount {
+        channel,
+        counted,
+        at_least,
+        cap,
+        oldest_seen,
+        newest_seen,
+        noise,
+    })
+}
+
+/// Most range reads one [`count_range`] makes before it answers with a lower bound.
+const MAX_COUNT_STEPS: usize = 16;
+
+/// [`count_within`] since an instant, on a provider that reads by time itself
+/// ([`crate::chat::ReadCaps::range`]). remote-ops-audit W10 `#287 bulk-reads`.
+///
+/// The window from `since_ms` to now is read newest first, one range read after another, until
+/// the provider PROVES the window has nothing more ([`crate::chat::RangeRead::exhausted`]) or the
+/// cap stops it. Nothing older than `since_ms` is ever read, so a count since this morning costs
+/// what this morning holds rather than a walk back past it. `newest_seen` and `oldest_seen` are
+/// the newest and oldest messages read inside the window. The count is exact only on that proof:
+/// a provider that stops without one leaves `at_least` set, as the cap does.
+async fn count_range(
+    state: &AppState,
+    channel: ChannelInfo,
+    since_ms: i64,
+    cap: u32,
+    filter: &crate::noise::NoiseFilter,
+) -> Result<MessageCount, OpError> {
+    let ceiling = usize::try_from(cap).unwrap_or(usize::MAX);
+    let range = crate::chat::TimeRange {
+        since_ms,
+        until_ms: None,
+    };
+    let (mut counted, mut noise) = (0_usize, 0_usize);
+    let (mut newest_seen, mut oldest_seen): (Option<MessageId>, Option<MessageId>) = (None, None);
+    let mut cursor: Option<String> = None;
+    let mut at_least = true;
+    for _ in 0..MAX_COUNT_STEPS {
+        let want = u16::try_from(ceiling.saturating_sub(counted + noise))
+            .unwrap_or(u16::MAX)
+            .max(1);
+        let read = state
+            .chat
+            .fetch_range(
+                &channel.id,
+                &crate::chat::ReadScope::Main,
+                range,
+                crate::chat::RangeOrder::NewestFirst,
+                want,
+                cursor.as_deref(),
+            )
+            .await?;
+        if newest_seen.is_none() {
+            newest_seen = read.messages.last().map(|m| m.id.clone());
+        }
+        if let Some(oldest) = read.messages.first() {
+            oldest_seen = Some(oldest.id.clone());
+        }
+        let placeholders = read.messages.iter().filter(|m| filter.is_noise(m)).count();
+        counted += read.messages.len() - placeholders;
+        noise += placeholders;
+        if read.exhausted {
+            at_least = false;
+            break;
+        }
+        if counted + noise >= ceiling {
+            break;
+        }
+        match read.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
     Ok(MessageCount {
         channel,
         counted,

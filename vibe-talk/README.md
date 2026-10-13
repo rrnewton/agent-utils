@@ -1109,6 +1109,15 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   where before every flat read showed it at once. Behind a bridge that keeps no cache of its own,
   only Slack itself can lag like that, so it should be brief; opening the thread shows the reply
   at once.
+* **Reads by time.** `/count` (and the `count_messages` tool) since an instant, or over the last
+  `hours`, reads only that window: `conversations.history` with `oldest` at its start, `latest`
+  pinned at the moment the count began, and `inclusive`, newest first, one call per page of
+  messages the window holds, following Slack's cursor. The count is exact only when Slack answers
+  `has_more: false`; the cap still stops it, and then says "at least". `/page` with `since` and
+  `until` reads that span and nothing after it. A span with no end runs to now: a step forward
+  from `since` still reads from there to now, as it always did, and when that is more than ten
+  pages it narrows by time to the messages next to `since`; such a step answers `has_more: true`
+  unless Slack proved the span ends, so a walk never stops short.
 * **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.
@@ -1403,7 +1412,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   (`fetch_timeline`, `fetch_recent`, `post_message`, …). The page, the digest and the voice
   catch-up read a channel's newest messages as `fetch_recent_dated`, the same read with the
   provider's `as_of` (see "A bridge's recent read through Flat"); a few smaller reads, such as the
-  live poll's first, still count as `fetch_recent`. Operations are timed around each provider's
+  live poll's first, still count as `fetch_recent`. A provider that reads a channel by time
+  itself (Slack) counts `/page` through a span and `/count` since an instant as `fetch_range`;
+  on any other those reads are one `fetch_page` each, and count as that, as they always did.
+  Operations are timed around each provider's
   own client, so the live poller and this report's own token check count as well as the page and
   the voice agent. Questions a provider answers from memory, such as whether it supports threads,
   are not counted. `rows` is what the operations returned, in total.

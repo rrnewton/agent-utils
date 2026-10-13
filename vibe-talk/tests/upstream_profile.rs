@@ -643,6 +643,12 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         .await
         .expect("range");
     assert!(range.exhausted && range.next.as_deref() == Some("next"));
+    // The profiler asks the provider whether the read is its own, to time it under what it costs.
+    {
+        let mut calls = recorder.calls.lock().expect("calls");
+        assert_eq!(calls.first(), Some(&"read_caps"), "{calls:?}");
+        calls.remove(0);
+    }
     ran("fetch_range");
     client
         .post_message(&channel, "hi", None)
