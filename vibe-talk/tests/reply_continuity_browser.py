@@ -34,6 +34,13 @@ newest, untinted.
 Then once more in the light scheme, to measure the tint there and keep a picture of it. No
 horizontal overflow and no page error at any step.
 
+`#185 reply-new-thread`. Last, at both sizes, a channel where every message heads a thread nobody
+has answered, as on Google Chat: Reply offers "Start a new thread from this message" under the box,
+unticked, inside the window and above Send -> a press ticks it, the title and the note under the box
+say where the reply now goes, the message stays where Reply put it with the box directly under it
+(one low on the screen too), and Send is on screen -> Send posts the reply into that message's
+thread.
+
 Pass --screenshots DIR to keep a PNG of the reply screen for each case; --web-root DIR to run the
 same walk against another copy of the page.
 """
@@ -78,6 +85,11 @@ def message_id(index: int) -> str:
     return f"89000000000000000{index:02d}"
 
 
+def thread_of(message_id_text: str) -> str:
+    """The thread a message heads, in the empty-thread runs: a Google Chat thread name."""
+    return f"spaces/AAAA/threads/{message_id_text}"
+
+
 def message(index: int) -> Json:
     if index == TALL:
         text = f"Message {index}, the long one. " + FILLER * 40
@@ -102,6 +114,14 @@ class FakeApi:
     messages: list[Json] = field(default_factory=lambda: [message(index) for index in range(COUNT)])
     replies: list[Json] = field(default_factory=list)
     dismissed: set[str] = field(default_factory=set)
+    # Every message heads a thread nobody has answered, as on Google Chat. `#185 reply-new-thread`.
+    empty_threads: bool = False
+
+    def __post_init__(self) -> None:
+        if self.empty_threads:
+            for held in self.messages:
+                held["thread"] = {"id": thread_of(str(held["id"])), "root_message_id": held["id"],
+                                  "is_root": True, "reply_count": 0, "reply_count_exact": True}
 
     def client_config(self) -> Json:
         return {
@@ -175,6 +195,9 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                     api.replies.append(body)
                     posted = {**message(len(api.messages)), "content": str(body.get("text", "")),
                               "reply_to": body.get("reply_to")}
+                    if body.get("thread_id"):
+                        posted["thread"] = {"id": body.get("thread_id"), "root_message_id": body.get("reply_to"),
+                                            "is_root": False, "reply_count": None, "reply_count_exact": False}
                     api.messages.append(posted)
                 self.json(200, {"posted": posted, "parts": [posted]})
             elif path.endswith("/dismiss"):
@@ -549,6 +572,104 @@ def send_case(walk: Walk) -> None:
     walk.notes.append("Send posted the reply to its message, marked that message Done, and left the list at its newest")
 
 
+# The new-thread box and what is around it, measured by the engine. `#185 reply-new-thread`.
+BRANCH_JS = """() => {
+  const box = (node) => {
+    if (!node || node.hidden || !node.getClientRects().length) return null;
+    const r = node.getBoundingClientRect();
+    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height};
+  };
+  return {
+    row: box(document.getElementById('reply-branch-row')),
+    checked: document.getElementById('reply-branch').checked,
+    note: document.getElementById('reply-destination').hidden ? null
+      : document.getElementById('reply-destination').textContent,
+    title: document.getElementById('topbar-title').textContent,
+    width: window.innerWidth,
+  };
+}"""
+
+
+def branch_state(walk: Walk) -> Measured:
+    found: object = walk.page.evaluate(BRANCH_JS)
+    walk.check(isinstance(found, dict), f"the page measured nothing: {found!r}")
+    assert isinstance(found, dict)
+    return Measured({str(key): value for key, value in found.items()})
+
+
+def tick_branch(walk: Walk, case: str) -> None:
+    walk.press("#reply-branch-row")
+    walk.wait_for("() => document.getElementById('reply-branch').checked", f"{case}: a press did not tick the box")
+    walk.settled()
+
+
+def new_thread_walk(walk: Walk) -> None:
+    """The new-thread box on Reply, on a channel whose messages each head an empty thread. `#185`."""
+    page = walk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
+                  "the channel did not open")
+    walk.settled()
+    # Low on the screen first, where the message ends at the foot of the room: what ticking the box
+    # changes under it must not push the message's foot under the box.
+    low = 34
+    list_box = walk.measure(low).box("list")
+    open_reply(walk, low, list_box["top"] + list_box["height"] * 0.86, "new-thread low")
+    tick_branch(walk, "new-thread low")
+    after = walk.measure(low)
+    walk.check(after.found["fit"] == "message" and abs(after.box("pane")["bottom"] - after.box("target")["bottom"]) <= 1,
+               f"new-thread low: ticked, the message's foot is not at the box: {after.box('target')} {after.box('pane')}")
+    walk.check(after.box("send")["bottom"] <= after.number("height") + 1, "new-thread low: ticked, Send is below the window")
+    walk.press("#reply-cancel")
+    walk.wait_for("() => !document.getElementById('screen-main').hidden", "new-thread low: Cancel did not go back")
+    walk.settled()
+
+    index = 30
+    list_box = walk.measure(index).box("list")
+    opened = open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "new-thread")
+    branch = branch_state(walk)
+    row, text, send = branch.box("row"), opened.box("text"), opened.box("send")
+    walk.check(branch.found["checked"] is False, "new-thread: the box was ticked before anyone ticked it")
+    walk.check(row["left"] >= 0 and row["right"] <= branch.number("width") + 0.5,
+               f"new-thread: the box runs off the side of the window: {row}")
+    walk.check(row["top"] >= text["bottom"] - 1 and row["bottom"] <= send["top"] + 1,
+               f"new-thread: the box is not between the reply box and Send: {row} {text} {send}")
+    walk.check(branch.text("note") == "Posts in the main channel as a reply to this message.",
+               f"new-thread: unticked, the note says {branch.found['note']!r}")
+    walk.shot("offered")
+    tick_branch(walk, "new-thread")
+    ticked = branch_state(walk)
+    after = walk.measure(index)
+    target, pane = after.box("target"), after.box("pane")
+    walk.check(ticked.text("title").startswith("Reply · New thread"),
+               f"new-thread: the title did not follow the box: {ticked.text('title')!r}")
+    walk.check(ticked.text("note") == "Posts in a new thread on this message, as its first reply.",
+               f"new-thread: ticked, the note says {ticked.found['note']!r}")
+    walk.check(abs(target["top"] - opened.box("target")["top"]) <= 1,
+               f"new-thread: ticking moved the message from {opened.box('target')['top']:.1f} to {target['top']:.1f}")
+    walk.check(after.found["fit"] == "message" and abs(pane["bottom"] - target["bottom"]) <= 1,
+               f"new-thread: ticked, the conversation does not end at the message's foot: {target} {pane}")
+    walk.check(after.box("send")["bottom"] <= after.number("height") + 1,
+               f"new-thread: ticked, Send is below the window: {after.box('send')}")
+    walk.check(after.number("overflow") <= 0, "new-thread: the page scrolls sideways")
+    walk.shot("ticked")
+    page.fill("#reply-text", "the first answer in its thread, from the reply continuity check")
+    sent = len(walk.api.replies)
+    walk.press("#reply-send")
+    walk.wait_for("() => !document.getElementById('screen-main').hidden", "new-thread: Send did not go back to the list")
+    walk.page.wait_for_timeout(200)
+    with walk.api.lock:
+        posted = list(walk.api.replies[sent:])
+    walk.check(len(posted) == 1 and posted[0].get("thread_id") == thread_of(message_id(index))
+               and posted[0].get("reply_to") == message_id(index),
+               f"new-thread: what left the browser was {posted}")
+    walk.notes.append(f"the new-thread box {row['width']:.0f}x{row['height']:.0f} between the reply box and Send; "
+                      f"ticked, the title and note followed, the message stayed, and Send posted into its thread")
+
+
 def light_walk(walk: Walk) -> None:
     """The light scheme: the tint is there too, and differs from the page; a picture of it."""
     page = walk.page
@@ -610,11 +731,14 @@ def main() -> int:
         ("412x915-dark", 412, 915, True, "dark"),
         ("1280x800-light", 1280, 800, False, "light"),
         ("412x915-light", 412, 915, True, "light"),
+        # `#185 reply-new-thread`, on a channel whose messages each head a thread nobody has answered.
+        ("1280x800-new-thread", 1280, 800, False, "dark"),
+        ("412x915-new-thread", 412, 915, True, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
-            api = FakeApi()
+            api = FakeApi(empty_threads=label.endswith("new-thread"))
             server, thread, url = serve(api, web_root)
             try:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-reply-") as profile:
@@ -636,7 +760,9 @@ def main() -> int:
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url, wait_until="load")
                     walk = Walk(page, api, phone, label, args.screenshots)
-                    if scheme == "dark":
+                    if api.empty_threads:
+                        new_thread_walk(walk)
+                    elif scheme == "dark":
                         continuity_walk(walk, (100, 80, 130))
                         # Back at the reader's own size for the rest: a phone turned and back, a
                         # desk window made shorter, narrower and as it was.

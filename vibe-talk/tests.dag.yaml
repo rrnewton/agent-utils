@@ -474,7 +474,11 @@ steps:
   # than the screen. Its words are the list's computed size and width, its top stays where the row's was
   # (within 1px) or is clamped to the top, the box comes up directly under it, a low one moves up only as
   # far as shows it whole, a tall one keeps its top, and Cancel comes back to the pixel; the reply screen
-  # is tinted in the dark scheme and the light. Measured on 2026-10-12: about 18s wall.
+  # is tinted in the dark scheme and the light. Measured on 2026-10-12: about 18s wall. `#185
+  # reply-new-thread` added two short runs at both sizes on a channel whose messages each head an empty
+  # thread: "Start a new thread" offered between the box and Send, ticking it keeping the message where
+  # Reply put it (one low on the screen too), and Send posting into the message's thread. With them:
+  # about 27s wall.
   - group: check
     job: reply-continuity-browser
     desc: the replied message kept at the list's size and place, the box under it, and the tint, in current Chromium at 1280x800 and 412x915
@@ -482,10 +486,10 @@ steps:
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
     timeout: 150
-    cpu_timeout: 75
+    cpu_timeout: 110
     hint:
       resources: {browser: 1}
-      est_duration_s: 18
+      est_duration_s: 27
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
