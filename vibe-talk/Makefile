@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -222,6 +222,17 @@ two-column-browser:
 # SCREENSHOTS=dir to keep a PNG of each state.
 thread-card-focus-browser:
 	python3 tests/thread_card_focus_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#280 scroll-stability` in a real Chromium at 1280x800 in two columns (mouse) and 412x915 in one (touch):
+# the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive
+# live, a refresh redraws the list with a message above them grown, a read sent while they were on the
+# newest line lands after they scrolled up (the owner's jump), summaries arrive, and the focus moves; a
+# reader on the newest line follows a live message to the foot; the list of threads and a thread open at
+# their foot and stay there, older replies coming in under a reader at a thread's head; and after a
+# reload the read behind the saved rows leaves the reader where they scrolled. Pass WEB_ROOT=dir to run it
+# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each stage.
+scroll-stability-browser:
+	python3 tests/scroll_stability_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#240 reading-bookmark` in a real Chromium at 1280x800 (mouse and keys) and 412x915 (touch): the
 # bookmark set on a message (Shift+B, or the row's menu) is a line in the accent drawn in the room

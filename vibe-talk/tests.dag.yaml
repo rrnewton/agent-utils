@@ -440,6 +440,28 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 5
+
+  # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
+  # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
+  # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message
+  # above grown, a read sent while the reader was on the newest line lands after they scrolled up (the
+  # owner's jump to the bottom), summaries arrive, and the focus moves (the mouse, ] [ Tab, a card opening
+  # its thread); a reader on the newest line follows a live message to the foot; the list of threads opens
+  # at its foot and stays there under the mouse and a moved thread; a thread with nothing unread, and one
+  # whose newest reply alone is unread, open at their foot, and older replies coming in keep the row at
+  # the head; and after a reload the read behind the saved rows leaves the reader where they scrolled.
+  # Measured on 2026-10-13: about 40s wall.
+  - group: check
+    job: scroll-stability-browser
+    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries and focus moves, follow only a reader on the newest line, and open threads at their foot, in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 40
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
