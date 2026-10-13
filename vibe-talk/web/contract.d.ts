@@ -259,6 +259,16 @@ declare namespace VibeTalk {
      */
     replay_enabled: boolean;
     /**
+     * Why replay is off although the operator turned it on, when that is the reason. `#270
+     * voice-transcript-markers`.
+     *
+     * `backend`: the voice backend has no way to carry a recap (a `vibe-talk-v1` socket; see
+     * `replay::offered`). The page then marks each new conversation "recap unsupported" rather than
+     * saying nothing, which would read as "nothing to recap". Absent otherwise, and from an older
+     * server.
+     */
+    replay_unavailable?: ReplayUnavailable | null;
+    /**
      * Whether a reply to a main-channel message is posted in that message's thread, starting one
      * when it has none, because the provider has no reply pointer of its own (Slack).
      *
@@ -308,6 +318,14 @@ declare namespace VibeTalk {
      * console error on every load. `#38 read-token-conversation-probe`.
      */
     token_scope: TokenScope;
+    /**
+     * Whether this server records the voice page's transcript records: a `sent` row for each
+     * message the voice agent posted, markers for a conversation's start and a draft not sent,
+     * and the tag on a spoken yes, read back with `records=1`, and the send memory read with
+     * `sent_after`. `#270 voice-transcript-markers`. Absent, from an older server, means none of
+     * those may be sent.
+     */
+    transcript_records_supported?: boolean;
     /**
      * Whether the selected provider can clear its own unread state as this server ingests
      * messages, for a channel the owner turns that on for. `#232 upstream-mark-read`.
@@ -1122,6 +1140,11 @@ declare namespace VibeTalk {
      */
     emoji: string;
   }
+
+  /**
+   * Why replay is off although the operator turned it on. `#270 voice-transcript-markers`.
+   */
+  type ReplayUnavailable = "backend";
 
   /**
    * Every message marked Done at or after one position in a channel. `#222 unread-replies`.

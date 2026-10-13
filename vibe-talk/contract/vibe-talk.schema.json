@@ -246,6 +246,17 @@
           "description": "Whether a new call will be handed the earlier transcript: the operator allowed it AND the\nvoice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
           "type": "boolean"
         },
+        "replay_unavailable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplayUnavailable"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why replay is off although the operator turned it on, when that is the reason. `#270\nvoice-transcript-markers`.\n\n`backend`: the voice backend has no way to carry a recap (a `vibe-talk-v1` socket; see\n`replay::offered`). The page then marks each new conversation \"recap unsupported\" rather than\nsaying nothing, which would read as \"nothing to recap\". Absent otherwise, and from an older\nserver."
+        },
         "replies_in_thread": {
           "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because the provider has no reply pointer of its own (Slack).\n\n`#252 thread-button-state`. Such a reply already starts the message's thread, so the reply\nscreen offers no separate \"start a new thread\" choice when this is true. Sent only when\ntrue: absent, from this server or an older one, means false.",
           "type": "boolean"
@@ -275,6 +286,10 @@
         "token_scope": {
           "$ref": "#/$defs/TokenScope",
           "description": "The scope of the token that asked.\n\nThe caller's own scope, so it discloses nothing it did not already hold. The page needs it\nto avoid asking for what this token cannot have: stored conversations are write-only (see\nthe conversation routes), and a read-scope page that probed them anyway got a 403 and a\nconsole error on every load. `#38 read-token-conversation-probe`."
+        },
+        "transcript_records_supported": {
+          "description": "Whether this server records the voice page's transcript records: a `sent` row for each\nmessage the voice agent posted, markers for a conversation's start and a draft not sent,\nand the tag on a spoken yes, read back with `records=1`, and the send memory read with\n`sent_after`. `#270 voice-transcript-markers`. Absent, from an older server, means none of\nthose may be sent.",
+          "type": "boolean"
         },
         "upstream_clear_supported": {
           "description": "Whether the selected provider can clear its own unread state as this server ingests\nmessages, for a channel the owner turns that on for. `#232 upstream-mark-read`.\n\nSettings offers the per-channel control only when this is true. Sent only when true:\nabsent, from this server or an older one, means false.",
@@ -1279,6 +1294,16 @@
         "count"
       ],
       "type": "object"
+    },
+    "ReplayUnavailable": {
+      "description": "Why replay is off although the operator turned it on. `#270 voice-transcript-markers`.",
+      "oneOf": [
+        {
+          "const": "backend",
+          "description": "The configured voice backend has no way to hand a new call the earlier transcript.",
+          "type": "string"
+        }
+      ]
     },
     "ReplyDismissals": {
       "description": "Every message marked Done at or after one position in a channel. `#222 unread-replies`.\n\nCOMPLETE FROM `from` UP, which is the whole of its use: a message at or after `from` that is\nnot in `messages` is not Done, so a reply put back on another device leaves the list as surely\nas one marked Done joins it. Below `from` it says nothing. A position is a message id read as a\nnumber, which every provider here orders by time, so a reply is never before its thread's root\nand every reply to a root at or after `from` is covered.\n\n`from` is the page's oldest row, raised to the oldest mark kept when more than\n[`crate::ops::MAX_REPLY_DISMISSALS`] marks lie above it: the newest are kept, because unread\nreplies are the recent ones. Ids and no text, as `dismissed` is.",
