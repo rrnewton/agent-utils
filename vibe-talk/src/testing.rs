@@ -430,6 +430,455 @@ impl crate::chat::ChatClient for SlowChat {
     }
 }
 
+/// One call [`CountingChat`] passed on, or answered with a scripted failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CountedCall {
+    /// The `ChatClient` method, by name: `fetch_timeline`, `fetch_page`, `post_message`, ...
+    pub method: &'static str,
+    /// The channel the call named, when it named one.
+    pub channel: Option<crate::model::ChannelId>,
+    /// The timeline view, for `fetch_timeline` and `fetch_timeline_since`.
+    pub view: Option<crate::threads::TimelineView>,
+    /// The thread, for a call scoped to one.
+    pub thread: Option<String>,
+}
+
+/// A failure [`CountingChat`] answers in place of the provider, once.
+struct ScriptedFailure {
+    method: &'static str,
+    view: Option<crate::threads::TimelineView>,
+    error: crate::chat::ChatError,
+}
+
+/// A chat provider that COUNTS every upstream call made through it: the common fixture of the
+/// remote-ops audit (2026-10-13, section 5), so a test can assert how many calls one user-visible
+/// action costs, per method, channel and timeline view.
+///
+/// Wraps any [`crate::chat::ChatClient`] and forwards every method to it, the capability flags
+/// included, so the wrapped provider behaves exactly as it would unwrapped. Each async method (the
+/// ones that may reach a provider) is recorded as a [`CountedCall`] when it is made, before it
+/// answers. Optionally every such call waits a delay first ([`CountingChat::with_delay`]; tokio's
+/// clock, so a paused test spends none of it), and a call can be scripted to fail
+/// ([`CountingChat::fail_next`]), still counted, without reaching the wrapped provider.
+pub struct CountingChat {
+    inner: Arc<dyn crate::chat::ChatClient>,
+    calls: Mutex<Vec<CountedCall>>,
+    failures: Mutex<Vec<ScriptedFailure>>,
+    delay: Duration,
+}
+
+impl CountingChat {
+    /// Count every call made to `inner`, answering at once.
+    #[must_use]
+    pub fn new(inner: Arc<dyn crate::chat::ChatClient>) -> Self {
+        Self {
+            inner,
+            calls: Mutex::new(Vec::new()),
+            failures: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// Make every counted call wait `delay` before it answers.
+    #[must_use]
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// Answer the next call of `method` (of `view`, when one is given) with `error`, without
+    /// reaching the wrapped provider. Each scripted failure is used once, oldest first.
+    pub fn fail_next(
+        &self,
+        method: &'static str,
+        view: Option<crate::threads::TimelineView>,
+        error: crate::chat::ChatError,
+    ) {
+        lock(&self.failures).push(ScriptedFailure {
+            method,
+            view,
+            error,
+        });
+    }
+
+    /// Every call made so far, oldest first.
+    #[must_use]
+    pub fn calls(&self) -> Vec<CountedCall> {
+        lock(&self.calls).clone()
+    }
+
+    /// How many calls of `method` were made, to any channel.
+    #[must_use]
+    pub fn count(&self, method: &str) -> usize {
+        lock(&self.calls)
+            .iter()
+            .filter(|call| call.method == method)
+            .count()
+    }
+
+    /// How many `fetch_timeline` reads of `view` were made in `channel`.
+    #[must_use]
+    pub fn timeline_reads(
+        &self,
+        channel: &crate::model::ChannelId,
+        view: crate::threads::TimelineView,
+    ) -> usize {
+        lock(&self.calls)
+            .iter()
+            .filter(|call| {
+                call.method == "fetch_timeline"
+                    && call.channel.as_ref() == Some(channel)
+                    && call.view == Some(view)
+            })
+            .count()
+    }
+
+    /// Record `call`, wait the delay, and answer with a scripted failure or with `forward`.
+    async fn counted<T, F>(
+        &self,
+        call: CountedCall,
+        forward: F,
+    ) -> Result<T, crate::chat::ChatError>
+    where
+        F: std::future::Future<Output = Result<T, crate::chat::ChatError>>,
+    {
+        let scripted = {
+            let mut failures = lock(&self.failures);
+            failures
+                .iter()
+                .position(|failure| {
+                    failure.method == call.method
+                        && failure.view.is_none_or(|view| call.view == Some(view))
+                })
+                .map(|at| failures.remove(at).error)
+        };
+        lock(&self.calls).push(call);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        match scripted {
+            Some(error) => Err(error),
+            None => forward.await,
+        }
+    }
+}
+
+/// A [`CountedCall`] of `method` in `channel`.
+fn call_in(method: &'static str, channel: &crate::model::ChannelId) -> CountedCall {
+    CountedCall {
+        method,
+        channel: Some(channel.clone()),
+        view: None,
+        thread: None,
+    }
+}
+
+/// A [`CountedCall`] of `method` that names no channel.
+fn call_without_channel(method: &'static str) -> CountedCall {
+    CountedCall {
+        method,
+        channel: None,
+        view: None,
+        thread: None,
+    }
+}
+
+/// A [`CountedCall`] of `method` on `request`'s view and thread in `channel`.
+fn timeline_call(
+    method: &'static str,
+    channel: &crate::model::ChannelId,
+    request: &crate::threads::TimelineRequest,
+) -> CountedCall {
+    CountedCall {
+        view: Some(request.view),
+        thread: request.thread_id.clone(),
+        ..call_in(method, channel)
+    }
+}
+
+/// A [`CountedCall`] of `method` in `thread` of `channel`.
+fn thread_call(
+    method: &'static str,
+    channel: &crate::model::ChannelId,
+    thread: &str,
+) -> CountedCall {
+    CountedCall {
+        thread: Some(thread.to_owned()),
+        ..call_in(method, channel)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::chat::ChatClient for CountingChat {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn claims_source(&self, source: &str) -> crate::chat::SourceClaim {
+        self.inner.claims_source(source)
+    }
+
+    fn self_author_id(&self) -> Option<String> {
+        self.inner.self_author_id()
+    }
+
+    fn owner_author_id(&self) -> Option<String> {
+        self.inner.owner_author_id()
+    }
+
+    fn supports_threading(&self) -> bool {
+        self.inner.supports_threading()
+    }
+
+    fn replies_in_thread(&self) -> bool {
+        self.inner.replies_in_thread()
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &crate::model::ChannelId,
+        request: &crate::threads::TimelineRequest,
+    ) -> Result<crate::threads::TimelinePage, crate::chat::ChatError> {
+        self.counted(
+            timeline_call("fetch_timeline", channel, request),
+            self.inner.fetch_timeline(channel, request),
+        )
+        .await
+    }
+
+    async fn fetch_timeline_since(
+        &self,
+        channel: &crate::model::ChannelId,
+        request: &crate::threads::TimelineRequest,
+        since: &crate::timeline_forward::GenericPosition,
+    ) -> Result<crate::timeline_forward::GenericDelta, crate::chat::ChatError> {
+        self.counted(
+            timeline_call("fetch_timeline_since", channel, request),
+            self.inner.fetch_timeline_since(channel, request, since),
+        )
+        .await
+    }
+
+    async fn post_in_thread(
+        &self,
+        channel: &crate::model::ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            thread_call("post_in_thread", channel, thread_id),
+            self.inner
+                .post_in_thread(channel, thread_id, content, reply_to),
+        )
+        .await
+    }
+
+    async fn fetch_thread_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        thread_id: &str,
+        message_id: &crate::model::MessageId,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            thread_call("fetch_thread_message", channel, thread_id),
+            self.inner
+                .fetch_thread_message(channel, thread_id, message_id),
+        )
+        .await
+    }
+
+    fn supports_channel_registration(&self) -> bool {
+        self.inner.supports_channel_registration()
+    }
+
+    async fn register_channel(
+        &self,
+        source: &str,
+        label: &str,
+    ) -> Result<crate::chat::RegisteredChannel, crate::chat::ChatError> {
+        self.counted(
+            call_without_channel("register_channel"),
+            self.inner.register_channel(source, label),
+        )
+        .await
+    }
+
+    async fn unregister_channel(
+        &self,
+        channel: &crate::model::ChannelId,
+    ) -> Result<(), crate::chat::ChatError> {
+        self.counted(
+            call_in("unregister_channel", channel),
+            self.inner.unregister_channel(channel),
+        )
+        .await
+    }
+
+    fn supports_channel_discovery(&self) -> bool {
+        self.inner.supports_channel_discovery()
+    }
+
+    async fn discover_channels(
+        &self,
+        request: &crate::directory::DirectoryRequest,
+    ) -> Result<crate::directory::DirectoryPage, crate::chat::ChatError> {
+        self.counted(
+            call_without_channel("discover_channels"),
+            self.inner.discover_channels(request),
+        )
+        .await
+    }
+
+    fn supports_upstream_read_mark(&self) -> bool {
+        self.inner.supports_upstream_read_mark()
+    }
+
+    async fn identity(&self) -> Result<crate::chat::ChatIdentity, crate::chat::ChatError> {
+        self.counted(call_without_channel("identity"), self.inner.identity())
+            .await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+        before: Option<&crate::model::MessageId>,
+        after: Option<&crate::model::MessageId>,
+    ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+        self.counted(
+            call_in("fetch_page", channel),
+            self.inner.fetch_page(channel, limit, before, after),
+        )
+        .await
+    }
+
+    async fn probe_channel(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+    ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+        self.counted(
+            call_in("probe_channel", channel),
+            self.inner.probe_channel(channel, limit),
+        )
+        .await
+    }
+
+    async fn fetch_recent(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+    ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+        self.counted(
+            call_in("fetch_recent", channel),
+            self.inner.fetch_recent(channel, limit),
+        )
+        .await
+    }
+
+    async fn fetch_recent_dated(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+    ) -> Result<crate::chat::RecentRead, crate::chat::ChatError> {
+        self.counted(
+            call_in("fetch_recent_dated", channel),
+            self.inner.fetch_recent_dated(channel, limit),
+        )
+        .await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            call_in("post_message", channel),
+            self.inner.post_message(channel, content, reply_to),
+        )
+        .await
+    }
+
+    fn supports_idempotent_posts(&self) -> bool {
+        self.inner.supports_idempotent_posts()
+    }
+
+    async fn post_message_keyed(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+        key: Option<&str>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            call_in("post_message_keyed", channel),
+            self.inner
+                .post_message_keyed(channel, content, reply_to, key),
+        )
+        .await
+    }
+
+    async fn post_in_thread_keyed(
+        &self,
+        channel: &crate::model::ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+        key: Option<&str>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            thread_call("post_in_thread_keyed", channel, thread_id),
+            self.inner
+                .post_in_thread_keyed(channel, thread_id, content, reply_to, key),
+        )
+        .await
+    }
+
+    fn post_limit(&self, channel: &crate::model::ChannelId) -> crate::chat::PostLimit {
+        self.inner.post_limit(channel)
+    }
+
+    fn continuation_thread(
+        &self,
+        channel: &crate::model::ChannelId,
+        first: &crate::model::Message,
+    ) -> Option<String> {
+        self.inner.continuation_thread(channel, first)
+    }
+
+    async fn mark_read_upstream(
+        &self,
+        channel: &crate::model::ChannelId,
+        through: &crate::model::MessageId,
+    ) -> Result<(), crate::chat::ChatError> {
+        self.counted(
+            call_in("mark_read_upstream", channel),
+            self.inner.mark_read_upstream(channel, through),
+        )
+        .await
+    }
+
+    fn supports_upstream_clear(&self) -> bool {
+        self.inner.supports_upstream_clear()
+    }
+
+    async fn clear_upstream_through(
+        &self,
+        channel: &crate::model::ChannelId,
+        through: &crate::model::MessageId,
+        dry_run: bool,
+    ) -> Result<crate::chat::UpstreamClearOutcome, crate::chat::ChatError> {
+        self.counted(
+            call_in("clear_upstream_through", channel),
+            self.inner.clear_upstream_through(channel, through, dry_run),
+        )
+        .await
+    }
+}
+
 /// `state` with its channel windows kept to `timing` rather than the production durations.
 /// `#210 voice-catchup-speed`. A fresh hub, so call it before anything is published.
 #[must_use]
