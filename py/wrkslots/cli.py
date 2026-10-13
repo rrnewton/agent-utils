@@ -10456,14 +10456,14 @@ class _RemoteContainmentEvidence:
 
 # Set only while one agent-slot removal runs (see
 # _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS).  Maps (object directory,
-# remote URL, commit) to the containment answer that removal obtained before
+# remote URL, commit, shallow) to the containment answer that removal obtained before
 # it took the registry lock, so the checks made under the lock reuse it
 # instead of contacting the remote.  An empty answer is reused too: it leads
 # only to a salvage push or a local archive, which keep the work either way.
 # So is a refusal, which removal reports exactly as if it were asked again (a
 # transport outage still gets its redirect-free confirmation under the lock).
 _REMOTE_CONTAINMENT_MEMO: contextvars.ContextVar[
-    dict[tuple[str, str, str], _RemoteContainmentEvidence] | None
+    dict[tuple[str, str, str, bool], _RemoteContainmentEvidence] | None
 ] = contextvars.ContextVar("wrkslots_remote_containment_memo", default=None)
 
 
@@ -10477,15 +10477,76 @@ _VERIFIED_SALVAGE_BUNDLES: contextvars.ContextVar[
 ] = contextvars.ContextVar("wrkslots_verified_salvage_bundles", default=None)
 
 
+@dataclasses.dataclass(frozen=True)
+class _SalvageFactsEvidence:
+    """Facts _salvage_candidate derived for one clean checkout, and how to recheck them.
+
+    ``fingerprint`` is _salvage_fingerprint of the checkout, read before and
+    again after those facts were derived and found equal both times;
+    ``observed_at`` is when (time.monotonic()).
+    """
+
+    facts: _SalvageCandidate
+    fingerprint: tuple[object, ...]
+    observed_at: float
+
+
+# Set only while one agent-slot removal runs.  Removal derives the salvage
+# facts of every checkout and initialized submodule (_salvage_candidate) once
+# before the registry lock (_prefetch_remote_containment) and three more times
+# under it: to salvage, and twice to show nothing changed since.  Each
+# derivation runs about twenty Git commands per repository; with a dozen
+# nested submodules that alone used up most of a remove-agent-batch item's
+# budget.  A clean checkout's facts are kept here, keyed by everything the
+# derivation is given, and reused only when a fresh _salvage_fingerprint (HEAD,
+# branch, configuration, index, status, unfinished operations and history
+# state, about eight Git commands) equals the one read when they were derived,
+# and for at most _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS.  A dirty
+# checkout is always derived again: its status lines do not change when the
+# content of an already modified file does, and its salvage commit must hold
+# that content.
+_SALVAGE_FACTS_MEMO: contextvars.ContextVar[
+    dict[tuple[object, ...], _SalvageFactsEvidence] | None
+] = contextvars.ContextVar("wrkslots_salvage_facts_memo", default=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _SubmoduleInventoryEvidence:
+    """What _submodule_salvage_checkouts returned for one checkout, and how to recheck it.
+
+    ``inventory`` is the initialized-submodule listing it was derived from,
+    and ``sources`` the device and inode of each source submodule directory.
+    """
+
+    result: tuple[tuple[Checkout, Path], ...]
+    inventory: tuple[str, ...]
+    sources: tuple[tuple[int, int], ...]
+    observed_at: float
+
+
+# Set only while one agent-slot removal runs: the submodule checkouts of each
+# checkout (_submodule_salvage_checkouts), reused when the listing of
+# initialized submodules and the source directories are unchanged.  What the
+# reuse skips (each submodule's HEAD, remote URL and the source's remote) is
+# read again by the salvage-facts check of that submodule that always follows.
+_SUBMODULE_INVENTORY_MEMO: contextvars.ContextVar[
+    dict[tuple[object, ...], _SubmoduleInventoryEvidence] | None
+] = contextvars.ContextVar("wrkslots_submodule_inventory_memo", default=None)
+
+
 @contextlib.contextmanager
 def _remote_containment_scope() -> Iterator[None]:
-    """Keep remote containment answers and bundle verifications for one removal."""
+    """Keep remote containment answers, salvage facts and bundle verifications for one removal."""
 
     token = _REMOTE_CONTAINMENT_MEMO.set({})
     bundles = _VERIFIED_SALVAGE_BUNDLES.set(set())
+    facts = _SALVAGE_FACTS_MEMO.set({})
+    inventories = _SUBMODULE_INVENTORY_MEMO.set({})
     try:
         yield
     finally:
+        _SUBMODULE_INVENTORY_MEMO.reset(inventories)
+        _SALVAGE_FACTS_MEMO.reset(facts)
         _VERIFIED_SALVAGE_BUNDLES.reset(bundles)
         _REMOTE_CONTAINMENT_MEMO.reset(token)
 
@@ -14468,13 +14529,24 @@ class _GitVcs:
             if line.startswith("S "):
                 raise Refusal(f"checkout has skip-worktree index state: {line[2:]}")
 
-    def assert_ordinary_history(self, checkout: Path) -> None:
+    def assert_ordinary_history(
+        self, checkout: Path, *, allow_shallow: bool = False
+    ) -> Path | None:
+        """Refuse grafts, replacement refs and, unless ``allow_shallow``, shallow history.
+
+        Returns the shallow file when ``allow_shallow`` lets one pass, else
+        None. A shallow repository's history stops at its boundary, so the
+        caller must then neither bundle it nor push from it; it may only show
+        that its HEAD is already published (see _shallow_history_refusal).
+        """
+
         common = self.common_directory(checkout)
         grafts = common / "info" / "grafts"
         shallow = common / "shallow"
         if grafts.exists() or grafts.is_symlink():
             raise Refusal(f"checkout uses graft history: {grafts}")
-        if shallow.exists() or shallow.is_symlink():
+        shallow_present = shallow.exists() or shallow.is_symlink()
+        if shallow_present and (not allow_shallow or shallow.is_symlink()):
             raise Refusal(f"checkout uses shallow history: {shallow}")
         replacements = self._run(
             checkout,
@@ -14484,6 +14556,7 @@ class _GitVcs:
             raise Refusal(
                 f"checkout contains replacement refs: {replacements.stdout.splitlines()[0]}"
             )
+        return shallow if shallow_present else None
 
     def fetch_remote(
         self,
@@ -15027,8 +15100,16 @@ class _GitVcs:
         authority: _RemoteAuthority,
         *,
         network_authority: _RemoteAuthority | None = None,
+        shallow: bool = False,
     ) -> tuple[str, ...]:
         """Return refs/remotes/``remote``/<branch> for each remote branch containing ``head``.
+
+        ``shallow`` says the checkout's history stops at a shallow boundary.
+        Git then reports a branch tip whose parents are missing as containing
+        any commit at all (it notes the missing parents on stderr and exits
+        0), so no branch is compared in the checkout's object store: every
+        tip is fetched, commits only, into the empty store described below,
+        where only commits the remote sent are walked.
 
         ``authority`` is the checkout's own recorded remote and is rechecked
         first, every time. The branches are listed at ``network_authority``
@@ -15065,7 +15146,7 @@ class _GitVcs:
         common = self.common_directory(checkout)
         objects = common / "objects"
         memo = _REMOTE_CONTAINMENT_MEMO.get()
-        key = (str(objects.resolve()), target.url, head)
+        key = (str(objects.resolve()), target.url, head, shallow)
         if memo is not None:
             cached = memo.get(key)
             if (
@@ -15078,7 +15159,7 @@ class _GitVcs:
                 return cached.refs
         try:
             refs = self._remote_heads_containing_uncached(
-                checkout, remote, head, target, common
+                checkout, remote, head, target, common, shallow=shallow
             )
         except Refusal as exc:
             if memo is not None:
@@ -15095,6 +15176,8 @@ class _GitVcs:
         head: str,
         target: _RemoteAuthority,
         common: Path,
+        *,
+        shallow: bool = False,
     ) -> tuple[str, ...]:
         """Ask the remote at ``target``; see remote_heads_containing."""
 
@@ -15111,8 +15194,12 @@ class _GitVcs:
             for ref in advertised:
                 if not ref.startswith(heads_prefix):
                     raise Refusal(f"Git listed a non-head ref as a branch: {ref}")
-            present = self._present_commits(
-                isolated, set(advertised.values()), object_env
+            present = (
+                frozenset()
+                if shallow
+                else self._present_commits(
+                    isolated, set(advertised.values()), object_env
+                )
             )
             local = {ref: tip for ref, tip in advertised.items() if tip in present}
             containing = self._isolated_refs_containing(
@@ -15986,11 +16073,16 @@ class _AuditGitVcs(_GitVcs):
             )
         return self._verified_worktrees[key]
 
-    def assert_ordinary_history(self, checkout: Path) -> None:
+    def assert_ordinary_history(
+        self, checkout: Path, *, allow_shallow: bool = False
+    ) -> Path | None:
+        if allow_shallow:
+            return super().assert_ordinary_history(checkout, allow_shallow=True)
         common = self.common_directory(checkout)
         if common not in self._ordinary_histories:
             super().assert_ordinary_history(checkout)
             self._ordinary_histories.add(common)
+        return None
 
     def tracked_cache_paths(
         self, checkout: Path, cache_globs: Sequence[str]
@@ -19544,6 +19636,9 @@ class _SalvageCandidate:
     # submodule whose remote is its source repository's own Git directory is
     # judged at that source's remote (see _submodule_network_authority).
     network_authority: _RemoteAuthority | None = None
+    # The shallow file of a submodule repository that was let through
+    # (_salvage_candidate's allow_shallow); see _shallow_history_refusal.
+    shallow: Path | None = None
 
     @property
     def aliased(self) -> bool:
@@ -19552,6 +19647,186 @@ class _SalvageCandidate:
             self.network_authority is not None
             and self.network_authority != self.remote_authority
         )
+
+
+def _shallow_history_refusal(facts: _SalvageCandidate) -> Refusal:
+    """The refusal for a shallow checkout whose HEAD is not already published, clean.
+
+    A shallow repository holds no history below its boundary, so no bundle
+    of it is complete and nothing can be pushed from it soundly. Its HEAD is
+    preserved only when a remote branch already contains it and nothing in
+    the checkout differs from it; anything else refuses, as every shallow
+    checkout used to.
+    """
+
+    return Refusal(f"checkout uses shallow history: {facts.shallow}")
+
+
+_EMPTY_STATUS_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+def _repository_config_sha256(vcs: _GitVcs, repository: Path) -> str:
+    """Digest of every configuration value Git applies in ``repository``, with its origin."""
+
+    listed = vcs._run_bytes(
+        repository,
+        ["config", "--list", "--null", "--show-origin", "--show-scope"],
+        timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+        timeout_refusal=(
+            f"Git did not list the configuration of {repository} within "
+            f"{_REMOTE_CONTAINMENT_LIST_SECONDS:g} seconds; nothing was removed"
+        ),
+    )
+    if listed.returncode != 0:
+        raise Refusal(
+            f"cannot read the Git configuration of {repository}"
+            + _git_bytes_failure_detail(listed)
+        )
+    fields = listed.stdout.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    # Each value is three fields: scope, origin, and "key\nvalue".
+    if len(fields) % 3:
+        raise Refusal(f"Git returned a malformed configuration listing for {repository}")
+    digest = hashlib.sha256()
+    for scope, origin, entry in zip(fields[0::3], fields[1::3], fields[2::3]):
+        # Command-scope values are this invocation's own -c settings and those
+        # a Git wrapper adds per command (a request correlator, for one), not
+        # state of the repository or of the files Git reads.
+        if scope == b"command":
+            continue
+        digest.update(scope + b"\0" + origin + b"\0" + entry + b"\0")
+    return digest.hexdigest()
+
+
+def _path_state(path: Path) -> tuple[int, int, int, int, int] | None:
+    """Device, inode, size, mtime and ctime (ns) of ``path`` itself, or None if absent."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refusal(f"cannot inspect {path}: {exc}") from exc
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+# The positions in a _salvage_fingerprint of the two entries that describe the
+# local mirror a submodule's remote names, known only once its facts are.
+_FINGERPRINT_MIRROR_FIELDS = (12, 13)
+
+
+def _fingerprint_without_mirror(fingerprint: tuple[object, ...]) -> tuple[object, ...]:
+    return tuple(
+        value
+        for index, value in enumerate(fingerprint)
+        if index not in _FINGERPRINT_MIRROR_FIELDS
+    )
+
+
+def _salvage_fingerprint(
+    config: Config,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+    *,
+    source: Path | None,
+    mirror: Path | None,
+) -> tuple[object, ...]:
+    """Read cheaply what _salvage_candidate's answer for a clean checkout depends on.
+
+    That is the worktree root and Git directories, HEAD and the branch, every
+    configuration value (remote URLs, push URLs and URL rewrites among them)
+    of the checkout and, for a submodule, of its source repository and of the
+    local mirror its remote names, the index file's identity and times
+    (assume-unchanged and skip-worktree bits, staged content), the status
+    _salvage_candidate digests, unfinished operations, and grafts, shallow
+    boundaries and replacement refs. The status is read without refreshing
+    the index, so reading it does not itself change the index.
+    """
+
+    # One rev-parse names the worktree root, both Git directories, the index,
+    # each unfinished-operation path (_GitVcs.operation_paths), HEAD's commit
+    # (_GitVcs.head) and the ref HEAD names, or "HEAD" when it is detached.
+    names = _GIT_OPERATION_STATE_NAMES
+    arguments = [
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-dir",
+        "--git-common-dir",
+        "--git-path",
+        "index",
+    ]
+    for name in names:
+        arguments.extend(("--git-path", name))
+    arguments.extend(("HEAD^{commit}", "--symbolic-full-name", "HEAD"))
+    located = vcs._run(path, arguments).stdout.splitlines()
+    if len(located) != 6 + len(names):
+        raise Refusal(f"Git returned an incomplete location inventory for {path}")
+    toplevel, git_directory, common, index = located[:4]
+    operations = located[4 : 4 + len(names)]
+    head, branch = located[4 + len(names) :]
+    if not SHA_RE.fullmatch(head):
+        raise Refusal(f"checkout HEAD is not a full commit: {path}")
+    common_path = Path(common)
+    replacements = vcs._run(
+        path, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/"]
+    ).stdout
+    return (
+        toplevel,
+        git_directory,
+        common,
+        head,
+        branch,
+        tuple(_path_state(Path(operation)) for operation in operations),
+        _path_state(common_path / "info" / "grafts"),
+        _path_state(common_path / "shallow"),
+        replacements,
+        _path_state(Path(index)),
+        _repository_config_sha256(vcs, path),
+        None if source is None else _repository_config_sha256(vcs, source),
+        # _FINGERPRINT_MIRROR_FIELDS: these two must stay at that position.
+        None if mirror is None else _repository_config_sha256(vcs, mirror),
+        None if mirror is None else _path_state(mirror),
+        hashlib.sha256(
+            vcs.status(
+                path,
+                _cache_globs_for(config, checkout.name),
+                include_ignored=False,
+                refresh_index=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def _salvage_fingerprint_or_none(
+    config: Config,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+    *,
+    source: Path | None,
+    mirror: Path | None,
+) -> tuple[object, ...] | None:
+    """_salvage_fingerprint, or None when it cannot be read.
+
+    The facts are then derived in full, and any refusal is the one that
+    derivation gives.
+    """
+
+    try:
+        return _salvage_fingerprint(
+            config, checkout, path, vcs, source=source, mirror=mirror
+        )
+    except Refusal:
+        return None
 
 
 def _salvage_candidate(
@@ -19565,6 +19840,109 @@ def _salvage_candidate(
     verify_repository_membership: bool = True,
     ownerless_slot: str | None = None,
     ownerless_recorded_at: str | None = None,
+    allow_shallow: bool = False,
+) -> _SalvageCandidate:
+    """Return HEAD, status digest, durable commit candidate, and dirty state.
+
+    See _salvage_candidate_uncached. While an agent-slot removal runs
+    (_SALVAGE_FACTS_MEMO), the facts of a clean checkout are derived once and
+    returned again while _salvage_fingerprint shows the checkout unchanged.
+    """
+
+    memo = _SALVAGE_FACTS_MEMO.get()
+    if memo is None or record is None or ownerless_slot is not None:
+        return _salvage_candidate_uncached(
+            config,
+            record,
+            checkout,
+            vcs,
+            path_override=path_override,
+            allow_detached=allow_detached,
+            verify_repository_membership=verify_repository_membership,
+            ownerless_slot=ownerless_slot,
+            ownerless_recorded_at=ownerless_recorded_at,
+            allow_shallow=allow_shallow,
+        )
+    path = path_override or _stored_path(config, checkout.path, "checkout path")
+    _relative, repository = _stored_repository_path(config, checkout.repository)
+    # Only a submodule candidate is detached; its repository is the source
+    # submodule, whose remote decides where publication is judged.
+    source = repository if allow_detached else None
+    key: tuple[object, ...] = (
+        str(path.absolute()),
+        repr(checkout),
+        allow_detached,
+        verify_repository_membership,
+        allow_shallow,
+        record.machine,
+        record.slot,
+        record.generation,
+        record.heartbeat_at,
+        tuple(_cache_globs_for(config, checkout.name)),
+    )
+    cached = memo.get(key)
+    if cached is not None and (
+        time.monotonic() - cached.observed_at
+        <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+    ):
+        mirror = (
+            _absolute_local_remote_directory(path, cached.facts.remote_authority)
+            if cached.facts.aliased
+            else None
+        )
+        if (
+            _salvage_fingerprint_or_none(
+                config, checkout, path, vcs, source=source, mirror=mirror
+            )
+            == cached.fingerprint
+        ):
+            return cached.facts
+    memo.pop(key, None)
+    before = _salvage_fingerprint_or_none(
+        config, checkout, path, vcs, source=source, mirror=None
+    )
+    facts = _salvage_candidate_uncached(
+        config,
+        record,
+        checkout,
+        vcs,
+        path_override=path,
+        allow_detached=allow_detached,
+        verify_repository_membership=verify_repository_membership,
+        allow_shallow=allow_shallow,
+    )
+    if facts.dirty or facts.status_digest != _EMPTY_STATUS_SHA256:
+        return facts
+    mirror = (
+        _absolute_local_remote_directory(path, facts.remote_authority)
+        if facts.aliased
+        else None
+    )
+    if before is None or (facts.aliased and mirror is None):
+        return facts
+    after = _salvage_fingerprint_or_none(
+        config, checkout, path, vcs, source=source, mirror=mirror
+    )
+    # The mirror's two entries are read only afterwards, once the facts name it.
+    if after is not None and _fingerprint_without_mirror(
+        before
+    ) == _fingerprint_without_mirror(after):
+        memo[key] = _SalvageFactsEvidence(facts, after, time.monotonic())
+    return facts
+
+
+def _salvage_candidate_uncached(
+    config: Config,
+    record: ActiveRecord | None,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+    allow_detached: bool = False,
+    verify_repository_membership: bool = True,
+    ownerless_slot: str | None = None,
+    ownerless_recorded_at: str | None = None,
+    allow_shallow: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
@@ -19572,6 +19950,11 @@ def _salvage_candidate(
     configured regenerable caches. Gitignored content is never uploaded. The
     temporary index never changes the checkout's branch or ordinary index, so a
     failed push leaves the author's tree untouched.
+
+    ``allow_shallow`` lets a shallow repository through only when its status
+    is empty, and records its shallow file in the result; the caller must
+    then refuse unless a remote branch already contains HEAD
+    (_shallow_history_refusal).
     """
 
     path = path_override or _stored_path(config, checkout.path, "checkout path")
@@ -19604,7 +19987,7 @@ def _salvage_candidate(
             f"checkout {checkout.name} has an unfinished Git operation at {operations[0]}; "
             "complete or abort that Git operation before reclaim"
         )
-    vcs.assert_ordinary_history(path)
+    shallow = vcs.assert_ordinary_history(path, allow_shallow=allow_shallow)
     vcs.assert_ordinary_index(path)
     _assert_cache_policy_untracked_path(
         config,
@@ -19640,7 +20023,12 @@ def _salvage_candidate(
             dirty=False,
             remote_authority=remote_authority,
             network_authority=network_authority,
+            shallow=shallow,
         )
+    if shallow is not None:
+        # Changed files in a shallow checkout could be kept only in a salvage
+        # commit on top of a history the repository does not hold.
+        raise Refusal(f"checkout uses shallow history: {shallow}")
 
     with tempfile.TemporaryDirectory(prefix="wrkslots-salvage-") as temporary:
         index = str(Path(temporary) / "index")
@@ -19733,14 +20121,110 @@ def _submodule_salvage_checkouts(
     *,
     path_override: Path | None = None,
 ) -> tuple[tuple[Checkout, Path], ...]:
+    """Return a salvage checkout for each initialized submodule of ``checkout``.
+
+    While an agent-slot removal runs (_SUBMODULE_INVENTORY_MEMO), the answer
+    is derived once and returned again while Git lists the same initialized
+    submodules and every source submodule directory is the same directory.
+    Each submodule's HEAD and remote URL, which the reuse does not reread, are
+    reread by the salvage-facts check (_salvage_candidate) every caller makes
+    of each returned checkout next, which refuses a remote URL that differs
+    from the one recorded here.
+    """
+
     checkout_path = path_override or _stored_path(
         config, checkout.path, "checkout path"
     )
     _repository_relative, source_repository = _stored_repository_path(
         config, checkout.repository
     )
+    memo = _SUBMODULE_INVENTORY_MEMO.get()
+    if memo is None:
+        return _submodule_salvage_checkouts_uncached(
+            config, checkout, vcs, checkout_path, source_repository
+        )
+    key: tuple[object, ...] = (
+        repr(checkout),
+        str(checkout_path.absolute()),
+        str(source_repository),
+        config.default_remote,
+    )
+    inventory = vcs.initialized_submodules(checkout_path)
+    cached = memo.get(key)
+    if (
+        cached is not None
+        and cached.inventory == inventory
+        and time.monotonic() - cached.observed_at
+        <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+    ):
+        try:
+            sources = _submodule_source_identities(
+                config, checkout_path, source_repository, inventory
+            )
+        except Refusal:
+            sources = None
+        if sources == cached.sources:
+            return cached.result
+    memo.pop(key, None)
+    result = _submodule_salvage_checkouts_uncached(
+        config, checkout, vcs, checkout_path, source_repository, inventory=inventory
+    )
+    if vcs.initialized_submodules(checkout_path) == inventory:
+        memo[key] = _SubmoduleInventoryEvidence(
+            result,
+            inventory,
+            _submodule_source_identities(
+                config, checkout_path, source_repository, inventory
+            ),
+            time.monotonic(),
+        )
+    return result
+
+
+def _submodule_source_identities(
+    config: Config,
+    checkout_path: Path,
+    source_repository: Path,
+    inventory: Sequence[str],
+) -> tuple[tuple[int, int], ...]:
+    """Device and inode of each source submodule directory named by ``inventory``.
+
+    Refuses as _submodule_salvage_checkouts does for a symbolic link on
+    either path or a source that is not a directory.
+    """
+
+    identities: list[tuple[int, int]] = []
+    for relative_value in inventory:
+        relative = Path(relative_value)
+        managed = checkout_path / relative
+        source = source_repository / relative
+        _ensure_no_symlink_components(checkout_path, managed, "submodule checkout")
+        _ensure_no_symlink_components(config.root, source, "source submodule")
+        if not source.is_dir() or source.is_symlink():
+            raise Refusal(
+                f"source submodule is unavailable: {source}. Preserve the slot until "
+                "its remote authority can be established"
+            )
+        try:
+            identities.append(_directory_device_inode(source))
+        except OSError as exc:
+            raise Refusal(f"cannot inspect source submodule {source}: {exc}") from exc
+    return tuple(identities)
+
+
+def _submodule_salvage_checkouts_uncached(
+    config: Config,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    checkout_path: Path,
+    source_repository: Path,
+    *,
+    inventory: Sequence[str] | None = None,
+) -> tuple[tuple[Checkout, Path], ...]:
     result: list[tuple[Checkout, Path]] = []
-    for relative_value in vcs.initialized_submodules(checkout_path):
+    for relative_value in (
+        vcs.initialized_submodules(checkout_path) if inventory is None else inventory
+    ):
         relative = Path(relative_value)
         managed = checkout_path / relative
         source = source_repository / relative
@@ -20005,9 +20489,10 @@ def _salvage_one_checkout(
             facts.head,
             facts.remote_authority,
             network_authority=facts.network_authority,
+            shallow=facts.shallow is not None,
         )
     except _RemoteTransportUnavailable as exc:
-        if archive_root is None:
+        if archive_root is None or facts.shallow is not None:
             raise
         # With no connection there is no remote answer to publish to or to
         # trust, so archive locally. The outage must repeat when the recorded
@@ -20045,6 +20530,8 @@ def _salvage_one_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
+    if facts.shallow is not None:
+        raise _shallow_history_refusal(facts)
     # A submodule whose remote is its source repository is never pushed
     # through that alias (see _submodule_network_authority).
     if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
@@ -20133,6 +20620,7 @@ def _salvage_agent_slot(
                 path_override=path,
                 allow_detached=detached,
                 verify_repository_membership=not detached,
+                allow_shallow=detached,
             ),
         )
         for checkout, path, detached in candidates
@@ -20339,6 +20827,7 @@ def _assert_salvage_still_matches(
                 path_override=path,
                 allow_detached=allow_detached,
                 verify_repository_membership=not allow_detached,
+                allow_shallow=allow_detached,
             ),
         )
         for checkout, path, allow_detached in targets
@@ -20358,6 +20847,8 @@ def _assert_salvage_still_matches(
         disposition = _as_str(
             receipt.get("disposition"), "salvage receipt.disposition"
         )
+        if facts.shallow is not None and disposition != "already-published":
+            raise _shallow_history_refusal(facts)
         if disposition == "salvaged":
             remote_ref = _as_str(receipt.get("remote_ref"), "salvage receipt.remote_ref")
             if (
@@ -20380,6 +20871,7 @@ def _assert_salvage_still_matches(
                 facts.head,
                 facts.remote_authority,
                 network_authority=facts.network_authority,
+                shallow=facts.shallow is not None,
             ):
                 raise Refusal(
                     f"checkout {checkout.name} is no longer present on its recorded remote; "
@@ -21129,7 +21621,17 @@ def _reclaim_preconditions(
     record: ActiveRecord,
     vcs: _GitVcs,
     finish: _FinishContext,
+    *,
+    check_use: bool = True,
 ) -> tuple[Path, tuple[Checkout, ...]]:
+    """Recheck everything a reclaim depends on; return the slot path and current checkouts.
+
+    ``check_use`` False omits only the direct-use check of the slot, for a
+    caller that runs this whole check again, use check included, before the
+    path fence under the same registry-lock hold (_begin_finish, whose
+    _begin_or_resume_path_fence does).
+    """
+
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
     _assert_no_uncommitted_handoffs(config, record, slot_path, vcs)
@@ -21152,7 +21654,7 @@ def _reclaim_preconditions(
                 f"private cleanup path identity changed after its shared census: "
                 f"{slot_path}"
             )
-    else:
+    elif check_use:
         _assert_slot_unused(
             slot_path,
             use_check_record,
@@ -32572,11 +33074,16 @@ def _begin_finish(
     vcs = _GitVcs()
     _load_archive(config, require_repository=False)
     _assert_not_held(config, record)
+    # The path fence below always runs _reclaim_preconditions again, use
+    # check included, before it renames the slot (_begin_or_resume_path_fence),
+    # within this registry-lock hold; a /proc scan here, seconds earlier,
+    # would decide nothing that one does not.
     _slot_path, final_checkouts = _reclaim_preconditions(
         config,
         record,
         vcs,
         finish,
+        check_use=False,
     )
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
     state = _replace_record(state, final_record)
@@ -32959,6 +33466,7 @@ def _prefetch_remote_containment(
                             path_override=candidate_path,
                             allow_detached=detached,
                             verify_repository_membership=not detached,
+                            allow_shallow=detached,
                         ),
                     )
                 )
@@ -32972,15 +33480,19 @@ def _prefetch_remote_containment(
                 facts.head,
                 facts.remote_authority,
                 network_authority=facts.network_authority,
+                shallow=facts.shallow is not None,
             )
             if published and not facts.dirty:
+                continue
+            if facts.shallow is not None:
+                # Refused under the lock (_shallow_history_refusal).
                 continue
             if not facts.aliased and _salvage_push_allowed(
                 config, facts.remote_authority
             ):
                 # A push is decided, and made, under the lock as before.
                 continue
-            _ensure_local_salvage_bundle(
+            _checked_root, bundle, _receipt, archive_ref = _ensure_local_salvage_bundle(
                 config,
                 record.machine,
                 record.slot,
@@ -32990,6 +33502,13 @@ def _prefetch_remote_containment(
                 facts,
                 archive_root,
                 vcs,
+            )
+            # A bundle an earlier, refused removal left is restored and fully
+            # checked here, once; under the lock its bytes are only rehashed
+            # (_VERIFIED_SALVAGE_BUNDLES). One just made was checked already.
+            digest, size = _sha256_regular_file(bundle, "local salvage bundle")
+            _verify_local_salvage_bundle(
+                bundle, digest, size, archive_ref, facts.commit, vcs
             )
         except Refusal:
             continue

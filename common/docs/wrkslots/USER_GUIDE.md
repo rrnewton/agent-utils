@@ -891,6 +891,25 @@ reuses each answer (or refusal) under the lock for at most 300 seconds for the s
 store, and remote URL, so the lock is not held across that network traffic. The local facts (HEAD,
 status, remote URL) are always read again under the lock.
 
+Those local checks run about twenty Git commands per checkout or submodule, and removal used to
+repeat them three times under the lock. Within one removal, the facts of a clean checkout or
+submodule found before the lock are now reused under it only while a fingerprint read again under
+the lock is unchanged: the worktree root and Git directories, HEAD and the branch, every
+configuration value Git applies there (and, for a submodule, in its source repository and in a local
+mirror its remote names), the index file's identity and times, the status, unfinished operations,
+and grafts, shallow boundaries and replacement refs; and for at most 300 seconds. A checkout with
+changes is always checked again in full, so its salvage commit holds the content present under the
+lock. The list of initialized submodules is likewise read again under the lock. Under the lock a
+removal checks the slot for direct use twice before the path fence (before salvage and immediately
+before the fence) and once after it.
+
+A submodule that is a shallow clone, whose history stops at a boundary, is accepted only when it has
+no changes and a branch of its remote already contains its HEAD. That is decided by fetching the
+remote's branch commits into an empty repository and finding HEAD among the commits the remote sent,
+never by walking the shallow history, in which Git reports a branch tip with missing parents as
+containing any commit. Such a submodule is never bundled or pushed from; anything else about it
+refuses ("checkout uses shallow history"), and a shallow top-level checkout still refuses.
+
 When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
 readback, and post-provision hooks. The hook's children, including recursive submodule commands,
 inherit the wrapper's environment. A wrapper failure stops the operation; Wrkslots does not retry
@@ -959,7 +978,8 @@ SHA-256 and size match a bundle that removal already restored and checked are no
 again. When the slot's owner is already gone (dead or never recorded, heartbeat expired, no hold,
 handoff read) and the checkout would be archived because its remote is not in
 `salvage_push_remotes`, removal makes and verifies the bundle before it takes the registry lock;
-under the lock it finds that bundle, rereads its bytes, and writes the receipt.
+under the lock it finds that bundle, rereads its bytes, and writes the receipt. A bundle that an
+earlier, refused removal already made is restored and checked again before the lock, not under it.
 
 An interrupted removal can be resumed with ordinary `wrkslots recover`; its finish journal carries
 the verified local receipt. If interruption occurred just before the finish journal was created,

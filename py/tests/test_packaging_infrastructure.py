@@ -861,9 +861,13 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # refusal, the lock-free publication check, the archive made before the
     # lock, the rewritten-branch check, and five recorded-remote-digest
     # cases) are mapped.
-    assert len(all_tests) == 1940
+    # The seven salvage cases of its lock-hold follow-up (the existing archive
+    # checked before the lock, submodule facts derived before the lock, a file
+    # written and index flags set after that check, one clean published
+    # shallow submodule, and two refused shallow submodules) are mapped.
+    assert len(all_tests) == 1947
     assert len(ordinary) == 336
-    assert len(mapped) == 1604
+    assert len(mapped) == 1611
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

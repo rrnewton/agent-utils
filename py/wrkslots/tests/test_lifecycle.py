@@ -23755,8 +23755,9 @@ def test_retire_pending_stops_at_a_storage_drift_found_after_a_change(
         record: wrkslots.ActiveRecord,
         vcs: wrkslots._GitVcs,
         finish_context: wrkslots._FinishContext,
+        **options: bool,
     ) -> tuple[Path, tuple[wrkslots.Checkout, ...]]:
-        found = original(config, record, vcs, finish_context)
+        found = original(config, record, vcs, finish_context, **options)
         if record.slot == "slot01" and not nested.exists():
             git(repository, "worktree", "add", "-b", "nested", str(nested))
         return found
@@ -24371,10 +24372,13 @@ def test_reclaim_shares_live_use_recheck_across_pre_and_post_fence(
     )
 
     assert rc == 0, capsys.readouterr().err
-    assert len(observed) == 4
-    assert [path for path, _budget in observed[:3]] == [canonical] * 3
-    assert observed[3][0].parent == canonical.parent
-    assert observed[3][0].name.startswith(".slot01.fenced.1.")
+    # Before the fence: once before salvage and once immediately before the
+    # fence (the check _begin_finish used to repeat seconds earlier, within
+    # the same lock hold, is gone); after it: once at the fenced path.
+    assert len(observed) == 3
+    assert [path for path, _budget in observed[:2]] == [canonical] * 2
+    assert observed[2][0].parent == canonical.parent
+    assert observed[2][0].name.startswith(".slot01.fenced.1.")
     assert all(budget is observed[0][1] for _path, budget in observed)
 
 
@@ -33336,6 +33340,408 @@ def test_agent_remove_builds_and_verifies_a_local_archive_before_the_lock(
         "receipt.json",
         "repository.bundle",
     ]
+
+
+def _git_call_probe(
+    tmp_path: Path,
+    lock: Path,
+    logged: Sequence[tuple[str, str]],
+    *,
+    on_first_ls_remote: str = "",
+) -> tuple[Path, Path]:
+    """Return a PATH directory whose git logs selected calls and whether ``lock`` is held.
+
+    Each call whose subcommand and first argument after it match one of
+    ``logged`` (an empty argument matches any) is logged as one line,
+    "<held|free>\\t<subcommand> <argument>\\t<-C path>". ``on_first_ls_remote``
+    is a shell command run, once, by the first ls-remote, which removal
+    makes before it takes the registry lock.
+    """
+
+    fake_bin = tmp_path / "call-probe-bin"
+    fake_bin.mkdir()
+    log = tmp_path / "git-calls.log"
+    marker = tmp_path / "git-calls.first-ls-remote"
+    system_git = SYSTEM_GIT if SYSTEM_GIT.exists() else Path(str(shutil.which("git")))
+    patterns = "\n".join(
+        f"  {shlex.quote(sub)}:{shlex.quote(argument) if argument else '*'}) log=1 ;;"
+        for sub, argument in logged
+    )
+    script = fake_bin / "git"
+    script.write_text(
+        "#!/bin/bash\n"
+        "path=; sub=; next=; arguments=(\"$@\"); index=0\n"
+        "while [ $index -lt ${#arguments[@]} ]; do\n"
+        "  value=${arguments[$index]}\n"
+        "  case \"$value\" in\n"
+        "    -C) index=$((index + 1)); path=${arguments[$index]} ;;\n"
+        "    -c) index=$((index + 1)) ;;\n"
+        "    -*) ;;\n"
+        "    *) sub=$value; next=${arguments[$((index + 1))]:-}; break ;;\n"
+        "  esac\n"
+        "  index=$((index + 1))\n"
+        "done\n"
+        "log=0\n"
+        "case \"$sub:$next\" in\n"
+        f"{patterns}\n"
+        "esac\n"
+        "if [ $log = 1 ]; then\n"
+        f"  if flock -n -x {shlex.quote(str(lock))} true; then state=free; else state=held; fi\n"
+        f"  printf '%s\\t%s %s\\t%s\\n' \"$state\" \"$sub\" \"$next\" \"$path\" >> {shlex.quote(str(log))}\n"
+        "fi\n"
+        + (
+            f"if [ \"$sub\" = ls-remote ] && [ ! -e {shlex.quote(str(marker))} ]; then\n"
+            f"  : > {shlex.quote(str(marker))}\n"
+            f"  {on_first_ls_remote}\n"
+            "fi\n"
+            if on_first_ls_remote
+            else ""
+        )
+        + f'exec {shlex.quote(str(system_git))} "$@"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return fake_bin, log
+
+
+def _probe_calls(log: Path) -> list[tuple[str, str, str]]:
+    if not log.exists():
+        return []
+    return [
+        cast(tuple[str, str, str], tuple(line.split("\t")))
+        for line in log.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_verifies_an_existing_local_archive_before_the_lock(
+    tmp_path: Path,
+) -> None:
+    """A bundle an earlier, refused removal left is restored and checked before the lock.
+
+    https://github.com/rrnewton/agent-utils/issues/237: a remove-agent-batch
+    item that had made its bundle and was then refused found the bundle on
+    its next attempt and cloned and fsck'd it under the registry lock, which
+    for a 45 MB bundle took 24 s of its 60-second budget.
+    """
+
+    project, _repository, _remote = make_project(tmp_path, allow_salvage_push=False)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    (tree / "unpublished.txt").write_text("keep me\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    # A process still using the slot: removal makes and checks the bundle
+    # before the lock, then refuses under it.
+    user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    try:
+        refused = remove(project)
+    finally:
+        user.kill()
+        user.wait()
+    assert refused.returncode == 3, refused.stderr
+    assert tree.is_dir()
+    (bundle,) = list(project.rglob("repository.bundle"))
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    fake_bin, log = _network_lock_probe_git(tmp_path, lock)
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    (receipt,) = archive["records"][0]["salvage"]
+    assert receipt["disposition"] == "archived-local"
+    assert Path(receipt["archive_bundle"]) == bundle
+    calls = log.read_text(encoding="utf-8").splitlines()
+    # The existing bundle is not made again; it is restored and checked once,
+    # before the lock, and under the lock only its bytes are reread.
+    assert [line for line in calls if line.split()[0] in {"bundle", "clone", "fsck"}] == [
+        "clone free",
+        "fsck free",
+    ], calls
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_derives_submodule_salvage_facts_before_the_lock(
+    tmp_path: Path,
+) -> None:
+    """Removal derives each submodule's salvage facts once, before the lock.
+
+    https://github.com/rrnewton/agent-utils/issues/237: removal derived the
+    facts of every checkout and initialized submodule (about twenty Git
+    commands each) once before the registry lock and three more times under
+    it; with a dozen nested submodules that used up most of a
+    remove-agent-batch item's 60-second budget. Under the lock each is now
+    rechecked by its fingerprint, which runs no `ls-files -v`.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    fake_bin, log = _git_call_probe(tmp_path, lock, [("ls-files", "-v")])
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    dispositions = {
+        receipt["checkout"]: receipt["disposition"]
+        for receipt in archive["records"][0]["salvage"]
+    }
+    assert dispositions == {
+        "product": "already-published",
+        "product/component": "already-published",
+        "product/component/leaf": "already-published",
+    }
+    calls = _probe_calls(log)
+    for nested in (tree / "component", tree / "component" / "leaf"):
+        at_nested = [state for state, _call, path in calls if Path(path) == nested]
+        assert "free" in at_nested, calls
+        assert "held" not in at_nested, calls
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_salvages_a_file_written_after_its_check_before_the_lock(
+    tmp_path: Path,
+) -> None:
+    """A checkout that changed after the check before the lock is derived again under it."""
+
+    project, _repository, remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    late = tree / "late.txt"
+    fake_bin, _log = _git_call_probe(
+        tmp_path,
+        lock,
+        [],
+        on_first_ls_remote=f"printf 'late work\\n' > {shlex.quote(str(late))}",
+    )
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    (receipt,) = archive["records"][0]["salvage"]
+    assert receipt["disposition"] == "salvaged"
+    shown = git(remote, "show", f"{receipt['salvage_commit']}:late.txt")
+    assert shown.stdout == "late work\n"
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_refuses_index_flags_set_after_its_check_before_the_lock(
+    tmp_path: Path,
+) -> None:
+    """A submodule change status cannot show, made after the check before the lock, refuses.
+
+    An assume-unchanged bit hides a modified file from status. Setting it
+    rewrites the submodule's index, whose identity and times are part of the
+    fingerprint, so the facts derived before the lock are not reused; the
+    removal refuses and keeps the edit. (The checks of nested repositories
+    made after the path fence would also refuse it.)
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    # Refresh the submodule's index once, past Git's racy-timestamp window,
+    # so the status reads made before the lock leave it unchanged and the
+    # facts derived there are kept for reuse under the lock.
+    time.sleep(1.1)
+    git(nested, "status", "--porcelain")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    system_git = SYSTEM_GIT if SYSTEM_GIT.exists() else Path(str(shutil.which("git")))
+    # The probe runs inside a Git call removal made in a scratch repository,
+    # so the hook drops that call's environment (GIT_DIR and the like).
+    hide = (
+        f"printf 'hidden edit\\n' > {shlex.quote(str(nested / 'component.txt'))}; "
+        f"env -i PATH=/usr/bin:/bin {shlex.quote(str(system_git))} "
+        f"-C {shlex.quote(str(nested))} update-index --assume-unchanged component.txt"
+    )
+    fake_bin, _log = _git_call_probe(tmp_path, lock, [], on_first_ls_remote=hide)
+
+    refused = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert refused.returncode == 3, refused.stderr
+    assert "assume-unchanged" in refused.stderr
+    assert git(nested, "ls-files", "-v", "component.txt").stdout.startswith("h ")
+    assert (nested / "component.txt").read_text(encoding="utf-8") == "hidden edit\n"
+    assert len(active_slots(project)) == 1
+
+
+def add_shallow_component(tmp_path: Path, project: Path, repository: Path) -> Path:
+    """Add submodule ``component`` that each slot clones with --depth 1.
+
+    The component's remote holds two commits, so the slot's copy, which
+    holds only the second, is shallow. Returns the component's remote.
+    """
+
+    component_remote = tmp_path / "component.git"
+    component_source = tmp_path / "component-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(component_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(component_remote), str(component_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(component_source, "config", "user.name", "Wrkslots Test")
+    git(component_source, "config", "user.email", "wrkslots@example.invalid")
+    for name in ("first.txt", "second.txt"):
+        (component_source / name).write_text(f"{name}\n", encoding="utf-8")
+        git(component_source, "add", name)
+        git(component_source, "commit", "-m", name)
+    git(component_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        f"file://{component_remote}",
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --depth 1"
+        ],
+    )
+    return component_remote
+
+
+def test_agent_remove_accepts_a_clean_published_shallow_submodule(
+    tmp_path: Path,
+) -> None:
+    """A shallow submodule whose HEAD a remote branch holds loses nothing when removed.
+
+    https://github.com/rrnewton/agent-utils/issues/237: a slot whose nested
+    e9patch submodule was a shallow clone refused ("checkout uses shallow
+    history") although its HEAD was published and nothing in it had changed.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    add_shallow_component(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    assert git(nested, "rev-parse", "--is-shallow-repository").stdout.strip() == "true"
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = {
+        receipt["checkout"]: receipt for receipt in archive["records"][0]["salvage"]
+    }
+    assert receipts["product/component"]["disposition"] == "already-published"
+    assert receipts["product/component"]["containing_remote_refs"] == [
+        "refs/remotes/origin/main"
+    ]
+
+
+@pytest.mark.parametrize("change", ["commit", "edit"])
+def test_agent_remove_refuses_a_shallow_submodule_with_unpublished_work(
+    tmp_path: Path, change: str
+) -> None:
+    """Work in a shallow submodule cannot be bundled completely, so removal still refuses."""
+
+    project, repository, _remote = make_project(tmp_path)
+    component_remote = add_shallow_component(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    git(nested, "config", "user.name", "Wrkslots Test")
+    git(nested, "config", "user.email", "wrkslots@example.invalid")
+    if change == "commit":
+        unpublished = commit_local(nested, "work.txt", "work\n", "unpublished")
+        assert (
+            git(component_remote, "cat-file", "-e", unpublished, check=False).returncode
+            != 0
+        )
+    else:
+        (nested / "second.txt").write_text("edited\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    refused = remove(project)
+
+    assert refused.returncode == 3, refused.stderr
+    assert "checkout uses shallow history" in refused.stderr
+    assert nested.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(project.rglob("repository.bundle")) == []
 
 
 def test_remote_heads_containing_refuses_a_head_only_on_a_rewritten_branch(
@@ -52002,7 +52408,13 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
     serial_fenced = [path for path in ordinary_calls if fenced(path, "slot01")]
     unfenced_per_slot = len(ordinary_calls) - len(serial_fenced)
     assert len(serial_fenced) == 1
-    assert unfenced_per_slot >= 3
+    # Before the fence a removal checks for use twice under the lock: before
+    # salvage, and immediately before the fence. A third check, which
+    # _begin_finish made seconds before the second within the same lock hold,
+    # cost a /proc scan of about 4 s per item on a loaded host and decided
+    # nothing the second does not
+    # (https://github.com/rrnewton/agent-utils/issues/237).
+    assert unfenced_per_slot == 2
     assert shared_calls == []
 
     ordinary_calls.clear()
@@ -52047,7 +52459,7 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
     assert len(shared_calls) == 1
     assert len(shared_calls[0]) == 3
     assert payload["shared_process_censuses"] == 1
-    assert payload["fresh_process_scans"] == unfenced_per_slot * 3
+    assert payload["fresh_process_scans"] == 2 * 3
 
 
 def single_remove(project: Path, slot: str, *extra: str) -> tuple[int, str]:
@@ -52426,7 +52838,8 @@ def test_remove_checks_an_image_backed_agent_slot_under_the_lock(
 
         assert returncode == 0, stderr
         assert shared_calls == []
-        assert len(ordinary_calls) >= 4
+        # Two ordinary checks before the fence and one after it.
+        assert len(ordinary_calls) >= 3
         assert active_slot_names(project) == []
         assert slotimage.all_images(control) == []
     finally:
