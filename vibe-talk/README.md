@@ -3070,8 +3070,10 @@ of them. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
 alone do not say whether it is barely over the fold or a wall. So the line under them says how many
 words the fold keeps back: `(~240 more words)`. Opening the message takes the line away; folding it
 again brings it back. It is under the message text in the transcript and in the channel, on a row
-combined from several messages, and on a body the server rendered, where the words counted are the
-ones on the screen (a link counts as its text, never as its address).
+combined from several messages, on the reply screen's earlier messages (drawn as the list drew them,
+`#247 reply-continuity`, so none is a line shorter there than on the list), and on a body the server
+rendered, where the words counted are the ones on the screen (a link counts as its text, never as its
+address).
 
 The number is a **floor**, and the `~` says it is an estimate. The fold is a three-line CSS clamp, so
 where the cut falls depends on the row's width, the text size and the browser's line breaking; asking

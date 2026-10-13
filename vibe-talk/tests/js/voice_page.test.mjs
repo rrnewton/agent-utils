@@ -27630,12 +27630,25 @@ test("a long earlier message is folded as on the channel, and the message opens 
   const [row] = page.el("reply-context").children;
   const body = row.descendants().find((node) => node.hasClass("body"));
   assert.equal(body.className, "body clamped", "a long earlier message is drawn in full");
+  // `#244 elision-word-count` with `#247 reply-continuity`: drawn as the list drew it, the line saying
+  // what the fold keeps back included, straight under the text — without it the message over the one
+  // being answered was a line shorter here than on the list, and everything over it moved.
+  const line = elidedOf(row);
+  assert.ok(line, "a folded earlier message has no line saying what it hides");
+  assert.equal(row.children.indexOf(line), row.children.indexOf(body) + 1, "the line is not straight under the text");
+  const listed = elidedOf(channelRow(page, "401"));
+  assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(row, at)),
+    FOLD_WIDTHS_EM.map((_width, at) => labelAt(channelRow(page, "401"), at)), "the line says something else than the list's");
+  assert.ok(listed, "the fixture's message carries no line on the list");
+  assert.equal(line.hidden, false);
   await row.click();
   assert.equal(body.className, "body", "the message did not open");
+  assert.equal(line.hidden, true, "an open earlier message still says words are hidden");
   assert.equal(foldButton(row).getAttribute("aria-expanded"), "true");
   // Its control is the keyboard's way in, and it closes it again.
   await foldButton(row).click();
   assert.equal(body.className, "body clamped");
+  assert.equal(line.hidden, false, "folded again, the line did not come back");
 });
 
 // --- the reply screen keeps the message where it was (#247 reply-continuity) ------------------------

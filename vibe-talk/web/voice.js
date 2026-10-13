@@ -1616,6 +1616,22 @@ function elisionLine(versions) {
   return line;
 }
 
+/**
+ * `#244 elision-word-count`. The line under a folded row's text (`elisionLine`), from what `body`
+ * draws: a channel row's body is drawn (`.md` boxes), and is read for its blocks as well as its
+ * words (`foldRuns`); a spoken turn's is its text. A rich header's row (`#242 rich-headers`) shows
+ * its text without the words the header restates while the header shows. Null when no width has
+ * anything to say.
+ */
+function foldedTextLine(body, text) {
+  const first = body.children[0];
+  const headed = Boolean(first && first.hasAttribute && first.hasAttribute("data-rh"));
+  const drawn = (skipClass) => (first ? foldRuns(body, skipClass) : String(text === null || text === undefined ? "" : text));
+  return elisionLine(headed
+    ? [{ runs: drawn(RESTATED_CLASS), rh: "on" }, { runs: drawn(""), rh: "off" }]
+    : [{ runs: drawn(""), rh: null }]);
+}
+
 // Every message that has a fold control, in the order it was rendered. Kept rather than re-queried
 // so that "collapse all" is one pass over what exists; `liveFolds` drops the entries whose <li> has
 // left the document, which is what a cleared transcript and a re-read channel both do.
@@ -1729,18 +1745,10 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     said: null,
     elided: null,
   };
-  // `#244 elision-word-count`. Counted once, here, from what the row shows; see `elisionLine`.
+  // `#244 elision-word-count`. Counted once, here, from what the row shows; see `foldedTextLine`.
   // Straight after the text, ahead of the summary line below and of the reactions the channel row
-  // moves under both, so it reads as the end of the folded message. A channel row's body is drawn
-  // (`.md` boxes), and is read for its blocks as well as its words (`foldRuns`); a spoken turn's is
-  // its text. A rich header's row (`#242 rich-headers`) shows its text without the words the header
-  // restates while the header shows.
-  const first = body.children[0];
-  const headed = Boolean(first && first.hasAttribute && first.hasAttribute("data-rh"));
-  const drawn = (skipClass) => (first ? foldRuns(body, skipClass) : String(text === null || text === undefined ? "" : text));
-  entry.elided = elisionLine(headed
-    ? [{ runs: drawn(RESTATED_CLASS), rh: "on" }, { runs: drawn(""), rh: "off" }]
-    : [{ runs: drawn(""), rh: null }]);
+  // moves under both, so it reads as the end of the folded message.
+  entry.elided = foldedTextLine(body, text);
   if (entry.elided) li.append(entry.elided);
   if (entry.id) {
     entry.note = document.createElement("div");
@@ -15263,12 +15271,19 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     outgoingObservations.set(entry.id, new Set(entry.observedParts));
     entry.state = "sent";
     entry.detail = "";
+    // Whether the reader follows is decided BEFORE anything this answer changes is drawn. The first
+    // message sent can tell the page who "me" is, and then every row of mine is drawn again as mine
+    // (`noteSelfAuthor`), narrower, where a line may wrap onto one more: a reader on the newest line
+    // was left that much above it, and the message they had just sent arrived below them, unseen.
+    // The reply screen's Send in tests/reply_continuity_browser.py (`#247 reply-continuity`) caught
+    // it, on a channel whose folded rows carry the `#244 elision-word-count` line. Not while a filter
+    // change holds a message in place (`#243 filter-keeps-selection`).
+    const here = entry.channel === el("discord-channel").value;
+    const pinned = here && currentView === "discord" && followsNewest(el("scroll-area"));
+    // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
+    const sidePinned = here && sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
     noteSelfAuthor(parts[0].author_id);
-    if (entry.channel === el("discord-channel").value) {
-      // Not while a filter change holds a message in place. `#243 filter-keeps-selection`.
-      const pinned = currentView === "discord" && followsNewest(el("scroll-area"));
-      // `#229 desktop-two-column`. The right column's reader on its newest line follows it too.
-      const sidePinned = sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")));
+    if (here) {
       for (const part of entry.parts) appendToColumns(part);
       if (pinned) scrollToNewest();
       if (sidePinned) inColumn(columns.side, scrollToNewest);
@@ -24194,16 +24209,26 @@ function renderReplyContext() {
  * summarised.
  */
 function replyContextRow(messages) {
-  const { li, meta, body, text } = replyRowFrame(messages);
+  const { li, meta, body, text, reactions } = replyRowFrame(messages);
   const message = messages[0];
   if (text.length <= COLLAPSE_OVER_CHARS) return li;
   const id = String(message.id);
   const fold = document.createElement("button");
   fold.className = "fold";
   fold.setAttribute("type", "button");
+  // `#244 elision-word-count`. What the fold keeps back, said under it as the channel's row says it:
+  // these rows are drawn as the list drew them (`#247 reply-continuity`), the line included, or the
+  // message over the one being answered is a line shorter here than it was on the list. Under the
+  // text and over the reactions, as there.
+  const elided = foldedTextLine(body, text);
+  if (elided) {
+    li.append(elided);
+    if (reactions) li.append(reactions);
+  }
   const draw = () => {
     const open = replyContext.opened.has(id);
     body.className = open ? "body" : "body clamped";
+    if (elided) elided.hidden = open;
     li.setAttribute("data-collapsed", open ? "false" : "true");
     fold.textContent = open ? FOLD_LESS : FOLD_MORE;
     fold.setAttribute("aria-expanded", open ? "true" : "false");
