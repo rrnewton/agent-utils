@@ -675,7 +675,16 @@ pub struct BookmarkResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PendingPost {
     /// Correlates this proposal's steps in the access log. Increases with every proposal.
+    ///
+    /// Within one server process only: a restarted server numbers its proposals from one again.
+    /// `instance` says which process numbered this one.
     pub serial: u64,
+    /// Which run of this server numbered `serial`: a token minted when the process started, the same
+    /// on every answer until it stops. `#270 voice-transcript-markers`. A page that stays open
+    /// across a restart sees the serials it has drawn come round again, and tells them apart by this.
+    /// Absent from an older server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
     /// The single-use confirmation handle.
     pub handle: String,
     /// The channel it would be posted to.
@@ -714,22 +723,33 @@ pub struct PendingPost {
 /// posted in the last [`crate::post_gate::SEND_MEMORY_TTL`], however it was approved, published
 /// once it settled. A page reads it with `sent_after`, the newest `send_seq` it has seen; without
 /// that it gets no sends and waits as it always did.
+///
+/// The fields this adds are optional in the contract, though this server always sends them, so a
+/// page left open across a rollback to an older server still reads the proposal it is shown: a
+/// field the contract required would make the page refuse every answer from that server.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PendingPostResponse {
     /// The pending proposal. At most one exists: a new proposal supersedes the old.
     pub proposal: Option<PendingPost>,
+    /// Which run of this server answered: see [`PendingPost::instance`]. Its `send_seq` numbers
+    /// only go forward within one run; a different run numbers its own, from its clock.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
     /// The sends that settled after `sent_after`, oldest first. Absent when there are none, and
     /// whenever the request carried no `sent_after`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sends: Vec<VoiceSend>,
-    /// The newest `send_seq` this server has handed out: the page's next `sent_after`.
-    pub sends_through: u64,
+    /// The newest `send_seq` this server has handed out: the page's next `sent_after`. Always sent
+    /// by this server; absent only from an older one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sends_through: Option<u64>,
     /// What became of the proposals this server still remembers, oldest first. Absent when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settled: Vec<ProposalSettled>,
     /// The server's clock, in milliseconds since the Unix epoch, for placing a send's
-    /// `begun_at_ms` in a call.
-    pub now_ms: i64,
+    /// `begun_at_ms` in a call. Always sent by this server; absent only from an older one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_ms: Option<i64>,
 }
 
 /// One message the voice agent posted, as the send memory publishes it. `#270
@@ -743,13 +763,20 @@ pub struct VoiceSend {
     pub text: String,
     /// Where it went, how it was approved, and what is known to have been posted.
     pub detail: crate::store::SentRecord,
+    /// Which run of this server numbered `detail.serial`: see [`PendingPost::instance`]. Not
+    /// stored with a transcript row, which names its send by `send_seq` alone.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance: String,
 }
 
-impl From<crate::post_gate::VoiceSendRecord> for VoiceSend {
-    fn from(send: crate::post_gate::VoiceSendRecord) -> Self {
+impl VoiceSend {
+    /// The send memory's record of one send, as the run `instance` publishes it.
+    #[must_use]
+    pub fn published(send: crate::post_gate::VoiceSendRecord, instance: &str) -> Self {
         Self {
             text: send.text,
             detail: send.record,
+            instance: instance.to_owned(),
         }
     }
 }

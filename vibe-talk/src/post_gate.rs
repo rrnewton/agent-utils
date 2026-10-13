@@ -585,6 +585,8 @@ pub struct PostGate {
     ttl: Duration,
     /// Bumped on every change, so a long poll wakes without polling.
     changed: watch::Sender<u64>,
+    /// Which run of the server this gate belongs to. `#270 voice-transcript-markers`.
+    instance: String,
 }
 
 impl Default for PostGate {
@@ -632,7 +634,20 @@ impl PostGate {
             }),
             ttl,
             changed,
+            instance: fresh_instance(),
         }
+    }
+
+    /// Which run of the server this gate belongs to: a token minted when the gate was made, so a
+    /// new one for every start of the process. `#270 voice-transcript-markers`.
+    ///
+    /// Proposal serials start again at one in every run, so a serial alone does not name a
+    /// proposal to a page that stays open across a restart: it has drawn a card for "serial 3"
+    /// already, and the next run's serial 3 is another message, maybe in another conversation.
+    /// The pair does. Not a secret and not a capability — it only tells runs apart.
+    #[must_use]
+    pub fn instance(&self) -> &str {
+        &self.instance
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1110,6 +1125,16 @@ impl PostGate {
     }
 }
 
+/// A short random token naming one run of the server. Twelve bytes from the system CSPRNG would
+/// be more than enough to never repeat; eight are, too, for a token that only has to differ from
+/// the last few runs a page saw.
+fn fresh_instance() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the system CSPRNG must be available to name a run");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 fn fresh_handle() -> String {
     use base64::Engine as _;
     let mut bytes = [0u8; 16];
@@ -1553,6 +1578,23 @@ mod tests {
             "the restarted server's send fell under the old cursor"
         );
         assert_eq!(sends[0].text, "words");
+    }
+
+    #[test]
+    fn each_run_names_itself_differently_and_keeps_its_name() {
+        // Serials start again at one in every run: what tells a page this run's serial 3 from the
+        // last run's is the run's name, which must stay put for the life of one gate.
+        let first = PostGate::new();
+        let next = PostGate::new();
+        assert!(!first.instance().is_empty());
+        assert_ne!(first.instance(), next.instance(), "two runs share a name");
+        assert_eq!(first.instance(), first.instance());
+        let (proposal, _) = first.propose(binding("one"));
+        let (again, _) = next.propose(binding("one"));
+        assert_eq!(
+            proposal.serial, again.serial,
+            "the serials really do come round again, which is why the name is needed"
+        );
     }
 
     #[tokio::test]

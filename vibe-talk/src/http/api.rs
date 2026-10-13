@@ -2156,6 +2156,7 @@ async fn pending_view(
     );
     crate::contract::PendingPost {
         serial: proposal.serial,
+        instance: state.post_gate.instance().to_owned(),
         expires_in_ms: proposal.expires_in_ms(tokio::time::Instant::now()),
         handle: proposal.handle,
         channel_id: ChannelId(proposal.binding.channel_id),
@@ -2261,10 +2262,17 @@ pub async fn pending_post(
                 .await
         }
     };
+    let instance = state.post_gate.instance();
     let (sends, sends_through) = match query.sent_after {
         Some(after) => {
             let (sends, through) = state.post_gate.sends_after(after);
-            (sends.into_iter().map(Into::into).collect(), through)
+            (
+                sends
+                    .into_iter()
+                    .map(|send| crate::contract::VoiceSend::published(send, instance))
+                    .collect(),
+                through,
+            )
         }
         None => (Vec::new(), state.post_gate.sends_through()),
     };
@@ -2274,15 +2282,16 @@ pub async fn pending_post(
     };
     Ok(Json(crate::contract::PendingPostResponse {
         proposal,
+        instance: instance.to_owned(),
         sends,
-        sends_through,
+        sends_through: Some(sends_through),
         settled: state
             .post_gate
             .fates()
             .into_iter()
             .map(|(serial, fate)| crate::contract::ProposalSettled { serial, fate })
             .collect(),
-        now_ms: crate::store::now_ms(),
+        now_ms: Some(crate::store::now_ms()),
     }))
 }
 
