@@ -422,7 +422,9 @@ under `vibe-talk.voice.ui-state` and reopens on it:
   window has not chosen one in. What the right column shows in two columns is not kept across a
   reload, as before. The layout — one column, the thread list or two columns (`#281 view-keys`) — is
   kept the same way, under `vibe-talk.voice.columns`: each window reloads in its own of the four
-  views, and a new window opens in the one chosen last.
+  views, and a new window opens in the one chosen last. What a window's thread list and two columns
+  were chosen from — where Esc and the layout button go back to — is its own alone, under
+  `vibe-talk.voice.columns-before` in its `sessionStorage`.
 
 `make -C vibe-talk offline-cache-browser` walks that whole sequence in a real Chromium at an
 Android phone's size, against a loopback fake API. Pass `SCREENSHOTS=/tmp/shots` to keep one PNG
@@ -4205,7 +4207,14 @@ read says so over the cards it left as they were, the button staying to try agai
 the right column's do in two columns (`#279 thread-card-focus`): a click, a tap, or Enter on one
 highlights it, shown whole, and greys every other card's edge; its own **N replies · M unread**
 button, or → on the highlighted card (else the one the keys are on), opens its thread across the
-window, and Back, Esc or ← comes back to the list. The search filters the cards, and its count says how many threads it left; Pinned, Links and
+window, and Back, Esc or ← comes back to the list. Esc on the list itself, with nothing smaller open
+(the search, a menu, a box with text in it, a picker, a highlighted card, whose highlight the first
+Esc takes off), goes back to what the list was chosen from: one column on the view it showed — Main,
+All, or a thread, in the channel it was chosen in — or two columns, where the window still draws them,
+their button going back to what it did then. A thread opened from the list is never what Esc goes
+back to, since its own Esc is the list. What the list and two columns were chosen from is kept for
+the window (`vibe-talk.voice.columns-before` in its `sessionStorage`, beside the layout), so a reload
+keeps both ways back. The search filters the cards, and its count says how many threads it left; Pinned, Links and
 whose messages, which have nothing to filter among cards, are not shown over it. It replaced the
 Threads screen that **… Older threads** in the picker used to open, which listed the same threads a
 second way and took no view key to leave. It only reads, so a read-scope token can use it.
@@ -4736,7 +4745,7 @@ scrolls from the keyboard the way any web page does:
 | `/` | Open the search with its field ready; pressed again, back to what you typed |
 | Enter, in the search field | Search older messages, a few pages at a time; the button at the head of the list says Stop meanwhile |
 | `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
-| Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply or a thread (one opened from the thread list goes back to it); never marks anything read |
+| Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply or a thread (one opened from the thread list goes back to it); leaves the thread list for the view it was chosen from; never marks anything read |
 
 These keys did nothing before, and nothing was eating them. A browser scrolls the box that holds
 the focus, or else the document, and this page's document never scrolls: the frame is fixed and each

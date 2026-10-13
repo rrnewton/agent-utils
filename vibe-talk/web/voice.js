@@ -7222,6 +7222,8 @@ function threadOutFromKeyboard() {
     focusList(channelPane);
     return true;
   }
+  // The thread list shows cards, not a thread: there is none on screen to leave. `#281 view-keys`.
+  if (threadListOnScreen()) return false;
   if (currentScreen !== "main" || currentView !== "discord" || channelView !== "thread") return false;
   leaveThread();
   return true;
@@ -7552,7 +7554,9 @@ function replyOnScreen() {
 }
 
 /**
- * Where Back goes from the screen that is up, taken; false when there is no Back to take.
+ * Where Back goes from the screen that is up, taken; false when there is no Back to take. The thread
+ * list's is what it was chosen from (`threadListBack`, `#281 view-keys`): it covers the left column,
+ * so a thread there is not on screen to leave.
  *
  * `#277 reply-in-column`. A reply open in a column is that column's Back, not the other's: Escape on
  * the other column's list does there what it does with no reply open, and leaves the reply, out of
@@ -7562,6 +7566,7 @@ function goBack() {
   if (currentScreen === "settings") closeSettings();
   else if (currentScreen === "help") closeHelp();
   else if (replyOnScreen() && (currentScreen === "reply" || activeColumn === replyColumn)) closeReply();
+  else if (threadListOnScreen()) threadListBack();
   // Not over the right column's cards, whose column still holds the thread it showed last: that Back
   // was the X with nothing to close, and put the cards back at their foot. `#277 thread-card-focus`.
   else if (channelOnScreen() && channelView === "thread" && !(sideActive && columns.side.mode === "list")) leaveThread();
@@ -7586,9 +7591,9 @@ function closeDetailsOn(target) {
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
  * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
- * thread-card-focus`); then Back: out of Settings, Help or Reply, or out of a thread — to the thread
- * list, for one opened from it (`#281 view-keys`). Returns whether it did anything. With none of those
- * it does nothing:
+ * thread-card-focus`); then Back: out of Settings, Help or Reply, out of the thread list to what it
+ * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
+ * Returns whether it did anything. With none of those it does nothing:
  * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
  */
 function onEscape(event, target) {
@@ -7723,8 +7728,9 @@ const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
     does: "Back: closes a menu, the search or a sheet, takes the highlight off a thread card, leaves Settings, " +
-      "Help, Reply or a thread — one opened from the thread list goes back to it. In a message box with text " +
-      "in it, leaves the box first and keeps the draft; on the channel or view picker, back to the messages",
+      "Help, Reply or a thread — one opened from the thread list goes back to it — and leaves the thread list for " +
+      "the view it was chosen from. In a message box with text in it, leaves the box first and keeps the draft; " +
+      "on the channel or view picker, back to the messages",
     controls: ["close-settings", "close-reply", "close-help", "thread-back", "side-close"],
     run: (event, target) => onEscape(event, target),
   },
@@ -7825,7 +7831,8 @@ const KEYMAP = [
   {
     group: KEYS_VIEW, chords: [{ key: "3", mod: true }], repeats: true,
     does: "Thread list: a card for each thread, across the window. Enter or a click highlights one; its replies " +
-      "button or → opens it, and Esc comes back to the list",
+      "button or → opens it, and Esc comes back to the list. Esc on the list takes the highlight off, then goes " +
+      "back to the view it was chosen from",
     controls: ["thread-select"],
     run: (event) => viewFromKeyboard("threads", event.repeat),
   },
@@ -16093,13 +16100,14 @@ function openThread(id, summary = null) {
 }
 
 function closeThread() {
-  // In two columns, leaving the thread on the right is its X. `#229 desktop-two-column`.
-  if (columnsShown && sideActive) return closeSideThread();
+  // In two columns, leaving the thread on the right is its X. `#229 desktop-two-column`. The thread
+  // list on its own shows cards only, never a thread, so from it there is none to leave. `#281 view-keys`.
+  if (sideActive) return columnsShown ? closeSideThread() : undefined;
   if (channelView !== "thread") return;
   // `#281 view-keys`. A thread opened from the thread list goes back to the list — or, where the
   // channel has none to show any more, to the view it opens in.
   if (threadOrigin === "list") {
-    if (threadListOffered()) return setLayout("list");
+    if (threadListOffered()) return setLayout("list", true);
     return changeChannelView(defaultChannelView());
   }
   return changeChannelView(threadOrigin);
@@ -29719,11 +29727,56 @@ function storedLayoutChoice() {
 let layoutChosen = storedLayoutChoice();
 
 /**
+ * What the thread list was chosen from, which Esc on it goes back to (`threadListBack`): two columns,
+ * with the layout their button went back to then, or one column and the view it showed — a channel's
+ * Main, All, or a thread with where that was opened from.
+ *
+ * @typedef {{layout: "one" | "two", columns?: string, channel?: string, view?: string,
+ *   thread?: string | null, origin?: string | null}} ListBefore
+ */
+
+/**
+ * Where this window's layouts were chosen from: the layout two columns' button goes back to
+ * (`layoutBeforeColumns`), and the view Esc on the thread list goes back to (`listBefore`). `#281
+ * view-keys`. The window's own, as its layout is (`COLUMNS_KEY`), so a reload of either still has its
+ * way back: two columns in a window too narrow for them still show the thread list they came from, and
+ * the list still goes back to Main or All.
+ */
+const LAYOUT_BEFORE_KEY = "vibe-talk.voice.columns-before";
+
+/** What `LAYOUT_BEFORE_KEY` holds for this window, or an empty record where it holds nothing usable. */
+function storedLayoutBefore() {
+  try {
+    const held = JSON.parse(windowItem(LAYOUT_BEFORE_KEY) || "null");
+    return held !== null && typeof held === "object" ? held : {};
+  } catch (_error) {
+    return {};
+  }
+}
+
+/** Whether `before` is something the thread list can go back to (see `ListBefore`). */
+const validListBefore = (before) => before !== null && typeof before === "object" &&
+  (before.layout === "two" || (before.layout === "one" && typeof before.channel === "string" &&
+    REOPENED_VIEWS.includes(before.view) && (before.view !== "thread" ||
+      (typeof before.thread === "string" && before.thread !== "" && ["main", "flat"].includes(before.origin)))));
+
+const layoutBefore = storedLayoutBefore();
+
+/**
  * The one-column layout two columns were chosen from, "one" or "list": what the layout button goes back to.
  *
  * @type {"one" | "list" | "two"}
  */
-let layoutBeforeColumns = layoutChosen === "list" ? "list" : "one";
+let layoutBeforeColumns = ["one", "list"].includes(layoutBefore.columns) ? layoutBefore.columns
+  : layoutChosen === "list" ? "list" : "one";
+
+/**
+ * What the thread list was chosen from, for Esc on it. One column on the view its channel opens in
+ * where nothing says otherwise.
+ *
+ * @type {ListBefore}
+ */
+let listBefore = validListBefore(layoutBefore.list) ? layoutBefore.list : { layout: "one" };
 
 /** Whether two columns are on screen now. */
 let columnsShown = false;
@@ -30041,20 +30094,93 @@ function keepLayoutChoice(layout) {
   keepWindowItem(COLUMNS_KEY, layout);
 }
 
+/** Keep where this window's layouts were chosen from, for its next reload (`LAYOUT_BEFORE_KEY`). */
+function keepLayoutBefore() {
+  keepWindowItem(LAYOUT_BEFORE_KEY, JSON.stringify({ columns: layoutBeforeColumns, list: listBefore }));
+}
+
 /**
  * Choose layout `layout`, keep the choice, and show it where it can be shown. Two columns chosen in a
  * window too narrow for them are kept for when it is wider, as the layout button always kept them.
+ * `back` for a way back to the thread list — out of two columns by their button, out of a thread
+ * opened from it — rather than a choice of it: what it was chosen from stays what Esc goes back to.
  *
  * @param {"one" | "list" | "two"} layout
+ * @param {boolean} [back]
  */
-function setLayout(layout) {
+function setLayout(layout, back = false) {
   // From the left column, whichever column asked: the layout changes what the left column shows.
-  if (sideActive) return inColumn(columns.main, () => setLayout(layout));
+  if (sideActive) return inColumn(columns.main, () => setLayout(layout, back));
+  if (layout === "list" && layoutChosen !== "list" && !back) noteListBefore();
   if (layout !== "two") layoutBeforeColumns = layout;
   layoutChosen = layout;
   keepLayoutChoice(layout);
+  keepLayoutBefore();
   renderColumns();
   renderThreadSelect();
+}
+
+/**
+ * The thread list is being chosen: note what from, for Esc on it to go back to (`listBefore`). `#281
+ * view-keys`. Two columns, and the layout their button went back to then; or one column and the view it
+ * shows. Never a thread opened from the list itself, which the list is being come back to: the list's
+ * Esc would be that thread, and the thread's the list, round and round.
+ */
+function noteListBefore() {
+  if (layoutChosen === "two") {
+    listBefore = { layout: "two", columns: layoutBeforeColumns };
+    return;
+  }
+  if (channelView === "thread" && threadOrigin === "list") return;
+  const thread = channelView === "thread" && selectedThreadId ? String(selectedThreadId) : null;
+  listBefore = {
+    layout: "one", channel: String(el("discord-channel").value || ""),
+    view: thread ? "thread" : channelView, thread, origin: thread ? threadOrigin : null,
+  };
+}
+
+/**
+ * Esc on the thread list, with nothing smaller open: back to what the list was chosen from
+ * (`listBefore`). `#281 view-keys`. The owner, of the Threads screen it replaced: "rather ESC works".
+ * Two columns, where the window still draws them, their button going back to what it went back to
+ * then; else one column, on the view it showed (`oneColumnBeforeList`).
+ */
+function threadListBack() {
+  if (sideActive) return inColumn(columns.main, threadListBack);
+  const before = listBefore;
+  if (before.layout === "two" && columnsFit) {
+    if (before.columns === "one" || before.columns === "list") layoutBeforeColumns = before.columns;
+    setLayout("two");
+  } else {
+    chooseOneColumn(oneColumnBeforeList(before));
+  }
+  settleFocus();
+  return undefined;
+}
+
+/**
+ * The one-column view Esc on the thread list goes back to: the one it was chosen from, in the channel
+ * it was chosen in, while that view can still be shown; else the view the channel opens in — but never
+ * a thread opened from the list, whose Esc is the list again, and in its place the channel's default.
+ *
+ * @param {ListBefore} before
+ * @returns {{view: string, thread: string | null, summary: any, origin: string | null}}
+ */
+function oneColumnBeforeList(before) {
+  const channel = String(el("discord-channel").value || "");
+  if (before.layout === "one" && before.channel === channel && REOPENED_VIEWS.includes(String(before.view))) {
+    if (before.view !== "thread") return { view: String(before.view), thread: null, summary: null, origin: null };
+    const id = String(before.thread || "");
+    if (id !== "" && threadStillKnown(id)) {
+      const summary = channelCanon.threads.find((held) => String(held.id) === id) || null;
+      return { view: "thread", thread: id, summary, origin: before.origin || defaultChannelView() };
+    }
+  }
+  const opening = openingChannelView();
+  if (opening.view === "thread" && opening.origin === "list") {
+    return { view: defaultChannelView(), thread: null, summary: null, origin: null };
+  }
+  return opening;
 }
 
 /** Ctrl/Cmd+\: the layout button. */
@@ -30071,7 +30197,9 @@ const COLUMNS_TOO_NARROW = "Two columns need a wider window; they come back when
 
 /** The reader pressed the layout button: two columns, or back to the layout they were chosen from. */
 function toggleColumns() {
-  setLayout(layoutChosen === "two" ? layoutBeforeColumns : "two");
+  // Back to the thread list, out of two columns, is not a choice of it: its Esc still goes where it did.
+  if (layoutChosen === "two") setLayout(layoutBeforeColumns, true);
+  else setLayout("two");
   settleFocus();
 }
 

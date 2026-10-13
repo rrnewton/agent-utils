@@ -21208,6 +21208,207 @@ test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and t
   assert.ok(shut() > 0, ": typed on Dvorak's KeyZ did not collapse them again");
 });
 
+test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chosen from — Main, All or a thread in one column, or two columns — and never to a thread opened from it", async () => {
+  // The owner, of the Threads screen the list replaced: "rather ESC works". A view is left the way it was come to.
+  const page = await threadPage();
+  page.wideDesk = true;
+  const picker = page.el("thread-select");
+  const layout = () => page.el("screen-main").getAttribute("data-columns");
+  const choose = async (key, from = focused(page) || page.el("scroll-area")) => {
+    const event = await press(page, from, key, { ctrlKey: true });
+    await page.settle();
+    assert.equal(event.defaulted, false, `Ctrl+${key} was left to the browser`);
+  };
+  const escape = async (from = focused(page) || page.el("side-scroll")) => {
+    const event = await press(page, from, "Escape");
+    await page.settle();
+    return event;
+  };
+  const toCard = async () => {
+    await press(page, page.el("side-scroll"), "ArrowDown");
+    const card = focused(page);
+    assert.ok(card && card.hasAttribute("data-card"), `↓ in the thread list did not select a card: ${focusName(page)}`);
+    return card;
+  };
+  const onTheList = (what) => {
+    assert.equal(layout(), "list", `${what}: not on the thread list`);
+    assert.equal(picker.value, "threads", `${what}: the picker does not say the thread list`);
+  };
+  const keysOnTheLeft = (what) => assert.ok(focused(page) && nodeWithinFixture(page.el("scroll-area"), focused(page)),
+    `${what}: the focus is on ${focusName(page)}, not on the list on screen`);
+
+  // From All: Esc on a card, and on the list's own scroller, is All again in one column, the keys on its list.
+  await choose("2", page.el("scroll-area"));
+  assert.equal(picker.value, "flat");
+  for (const where of ["a card", "the scroller"]) {
+    await choose("3");
+    onTheList(`Ctrl+3 from All, for ${where}`);
+    const from = where === "a card" ? await toCard() : page.el("side-scroll");
+    const event = await escape(from);
+    assert.equal(event.defaulted, false, `Esc on ${where} of the thread list was left to the browser`);
+    assert.equal(layout(), null, `Esc on ${where} of the thread list did not leave it`);
+    assert.equal(picker.value, "flat", `Esc on ${where} of the thread list did not go back to All`);
+    keysOnTheLeft(`Esc on ${where} of the thread list`);
+  }
+
+  // ← on a card is nobody's: there is no thread on screen to leave, and the cards stay as they were. It
+  // was taken, and opened Main in the list's own column, out of sight.
+  await choose("3");
+  const card = await toCard();
+  const cards = cardIds(page);
+  const reads = page.timelineCalls.length;
+  const left = await press(page, card, "ArrowLeft");
+  await page.settle();
+  assert.equal(left.defaulted, true, "← on a card of the thread list was taken");
+  onTheList("← on a card");
+  assert.equal(focused(page), card, `← on a card moved the focus to ${focusName(page)}`);
+  assert.deepStrictEqual(cardIds(page), cards, "← on a card changed the cards");
+  assert.equal(page.el("side-list").hidden, false, "← on a card took the cards away");
+  assert.equal(page.timelineCalls.length, reads, "← on a card read something");
+
+  // The search over the list is smaller than it: the first Esc closes it, the second leaves the list.
+  await press(page, page.el("side-scroll"), "/");
+  assert.equal(page.el("search-field").hidden, false, "/ on the thread list did not open the search");
+  await escape(page.el("search-field"));
+  assert.equal(page.el("search-field").hidden, true, "Esc did not close the search first");
+  onTheList("Esc in the search over the list");
+  await escape();
+  assert.equal(picker.value, "flat", "Esc after the search did not go back to All");
+
+  // From Main, through a thread opened from the list: its Esc is the list, and the list's is Main —
+  // not the thread again, which would go round and round.
+  // `#279 thread-card-focus`: Enter on a card highlights it, and → goes into its thread. Back on the list,
+  // the card is still highlighted: the first Esc takes that off, there, and only the next leaves the list.
+  await choose("1", page.el("scroll-area"));
+  await choose("3");
+  const opened = await toCard();
+  await press(page, opened, "Enter");
+  await page.settle();
+  onTheList("Enter on a card");
+  assert.deepStrictEqual(litCards(page), [opened.getAttribute("data-id")], "Enter on a card did not highlight it");
+  await press(page, opened, "ArrowRight");
+  await page.settle();
+  assert.equal(picker.value, `thread:${opened.getAttribute("data-id")}`, "→ on a card did not open its thread");
+  await escape(focused(page) || page.el("scroll-area"));
+  onTheList("Esc from a thread opened from the list");
+  assert.deepStrictEqual(litCards(page), [opened.getAttribute("data-id")], "coming back to the list lost the highlight");
+  const putOut = await escape();
+  assert.equal(putOut.defaulted, false, "Esc on the highlighted card's list was left to the browser");
+  onTheList("Esc with a card highlighted");
+  assert.deepStrictEqual(litCards(page), [], "the first Esc on the list did not take the highlight off");
+  await escape();
+  assert.equal(layout(), null);
+  assert.equal(picker.value, "main", "Esc on the list went back to the thread opened from it, not to Main");
+  // And so with the list chosen again by Ctrl+3 from such a thread, rather than by its Esc.
+  await choose("3");
+  const reopened = await toCard();
+  await press(page, reopened, "Enter");
+  await press(page, reopened, "ArrowRight");
+  await page.settle();
+  assert.equal(picker.value, `thread:${reopened.getAttribute("data-id")}`);
+  await choose("3", focused(page) || page.el("scroll-area"));
+  onTheList("Ctrl+3 from a thread opened from the list");
+  await escape();
+  assert.deepStrictEqual(litCards(page), [], "Esc did not take the highlight off first");
+  onTheList("Esc with a card highlighted, after Ctrl+3");
+  await escape();
+  assert.equal(picker.value, "main", "Ctrl+3 from a thread opened from the list made that thread the list's way back");
+
+  // A thread opened in one column from Main: Esc on the list is that thread again, whose own Esc is Main.
+  const thread = page.threads[0];
+  await pickThread(page, `thread:${thread.id}`);
+  assert.equal(picker.value, `thread:${thread.id}`);
+  await choose("3");
+  onTheList("Ctrl+3 from a thread");
+  await escape();
+  assert.equal(layout(), null);
+  assert.equal(picker.value, `thread:${thread.id}`, "Esc on the list did not go back to the thread it was chosen from");
+  await escape(page.el("scroll-area"));
+  assert.equal(picker.value, "main", "the thread Esc went back to forgot it was opened from Main");
+
+  // From two columns: Esc is two columns again, and their button goes back to one column, as it did.
+  await choose("4", page.el("scroll-area"));
+  assert.equal(layout(), "two");
+  assert.equal(page.el("column-toggle").title, "Back to one column");
+  await choose("3");
+  onTheList("Ctrl+3 from two columns");
+  assert.equal(page.el("column-toggle").title, "Show Main and a thread side by side");
+  await escape(await toCard());
+  assert.equal(layout(), "two", "Esc on the list chosen from two columns did not go back to them");
+  assert.equal(picker.value, "columns");
+  assert.equal(page.el("column-toggle").title, "Back to one column", "two columns came back with another way out");
+
+  // Back to the list by two columns' button is not a choice of it: Esc still goes to what it was chosen from.
+  await choose("1", page.el("scroll-area"));
+  await choose("3");
+  await choose("4");
+  assert.equal(page.el("column-toggle").title, "Back to the thread list");
+  await press(page, page.el("scroll-area"), "\\", { ctrlKey: true });
+  await page.settle();
+  onTheList("Ctrl+\\ out of two columns");
+  await escape();
+  assert.equal(layout(), null, "Esc went back to two columns, which the list was not chosen from");
+  assert.equal(picker.value, "main");
+
+  // The list of keys says so, under Esc and under Ctrl+3, and so does Help's paragraph on the four views.
+  const keys = page.el("keyboard-keys").text();
+  assert.ok(keys.includes("and leaves the thread list for the view it was chosen from"), "Esc's entry does not say it leaves the list");
+  assert.ok(keys.includes("Esc on the list takes the highlight off, then goes back to the view it was chosen from"),
+    "Ctrl+3's entry does not say how to leave the list");
+  assert.match(HTML_CODE, /<kbd>Esc<\/kbd> on the list itself, once no card is highlighted, goes back to\s+the view you chose it from/);
+});
+
+test("`#281 view-keys` x `#265 window-channel-memory`: a reloaded window keeps where its thread list and two columns were chosen from", async () => {
+  /** A window over the device's `store`, on a wide desk or not: a reload when handed its own `session`. */
+  const deskWindow = (store, session = null, wide = true) => newPage(store, SCRIPT, (p) => {
+    if (session) p.session = session;
+    p.wideDesk = wide;
+    p.messages = threadData().messages;
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  const view = (page) => page.el("thread-select").value;
+  const layout = (page) => page.el("screen-main").getAttribute("data-columns");
+  // On a desk: All, then the list. A reload is still the list, and its Esc still All.
+  const desk = deskWindow(new Map());
+  await signIn(desk);
+  await showDiscord(desk, threadData().messages);
+  await press(desk, desk.el("scroll-area"), "2", { ctrlKey: true });
+  await press(desk, desk.el("scroll-area"), "3", { ctrlKey: true });
+  await desk.settle();
+  assert.equal(view(desk), "threads");
+  await desk.setVisibility("hidden");
+  const deskAgain = deskWindow(desk.storage, desk.session);
+  await reopenedChannel(deskAgain);
+  await deskAgain.settle();
+  assert.equal(layout(deskAgain), "list");
+  await press(deskAgain, deskAgain.el("side-scroll"), "Escape");
+  await deskAgain.settle();
+  assert.equal(layout(deskAgain), null, "Esc on a reloaded thread list did not leave it");
+  assert.equal(view(deskAgain), "flat", "Esc on a reloaded thread list forgot it was chosen from All");
+
+  // In a window too narrow for two columns: the list, then Ctrl+4, which keeps the list on screen. A
+  // reload is the list still — the layout two columns were chosen from — and not one column.
+  const narrow = deskWindow(new Map(), null, false);
+  await signIn(narrow);
+  await showDiscord(narrow, threadData().messages);
+  await press(narrow, narrow.el("scroll-area"), "1", { ctrlKey: true });
+  await press(narrow, narrow.el("scroll-area"), "3", { ctrlKey: true });
+  await press(narrow, narrow.el("side-scroll"), "4", { ctrlKey: true });
+  await narrow.settle();
+  assert.equal(layout(narrow), "list", "Ctrl+4 in a narrow window did not keep the thread list on screen");
+  await narrow.setVisibility("hidden");
+  const narrowAgain = deskWindow(narrow.storage, narrow.session, false);
+  await reopenedChannel(narrowAgain);
+  await narrowAgain.settle();
+  assert.equal(layout(narrowAgain), "list", "a reload of two columns chosen from the thread list, in a narrow window, lost the list");
+  // Its Esc is Main, which the list was chosen from: two columns cannot be drawn here.
+  await press(narrowAgain, narrowAgain.el("side-scroll"), "Escape");
+  await narrowAgain.settle();
+  assert.equal(layout(narrowAgain), null);
+  assert.equal(view(narrowAgain), "main", "Esc on the reloaded list did not go back to Main");
+});
+
 test("Shift+P AND Shift+L turn the Pinned and Links filters on and off, with the search bar that holds them", async () => {
   const page = await keyboardPage();
   await press(page, page.el("scroll-area"), "P", { shiftKey: true });

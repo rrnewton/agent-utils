@@ -199,8 +199,8 @@ read-modes-browser:
 # folds, and -> enters a thread that <- and Esc leave; Ctrl+K and a channel chosen give the keys back to
 # the list, and Esc leaves the picker; `#281 view-keys`: Ctrl+1 to Ctrl+4, and Cmd on an emulated Mac,
 # choose Main, All, the thread list and two columns from the message box, the search and a card, the
-# browser's default refused and no digit typed. Pass WEB_ROOT=dir to run it against another copy of
-# the page, and SCREENSHOTS=dir to keep a PNG of each step.
+# browser's default refused, and Esc on the thread list goes back to what it was chosen from. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
 keyboard-browser:
 	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

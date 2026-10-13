@@ -35,10 +35,14 @@ under a person's fingers, and measures the list that is on screen:
 `#281 view-keys`: Ctrl+1 to Ctrl+4 choose Main, All, the thread list and two columns, pressed with the
 focus in the channel's message box with a draft in it, in the search field with words typed, and inside
 the thread list on a card — and, in a second tab whose `navigator.platform` is emulated as a Mac's, the
-same with Cmd (Meta) — each changing the view the picker and the layout say, its default refused, and
-no digit typed into either field; Enter on a card highlights it, still in the thread list (`#279
-thread-card-focus`), -> opens its thread across the window, and Esc comes back to the list; the bare 1,
-2 and 3 change nothing.
+same with Cmd (Meta) — each changing the view the picker and the layout say, with its default refused
+(`defaultPrevented`, read by a listener on the window after the page's own). That refusal is what keeps
+the browser's own tab switch away. The fields' values are checked as well, but this check could not
+show a digit typed there: a chord with Ctrl or Cmd held is sent with no text (`hold`), as a keyboard
+sends it. Enter on a card highlights it, still in the thread list (`#279 thread-card-focus`), -> opens
+its thread across the window and Esc comes back to the list; Esc on the list itself goes back to what
+it was chosen from — two columns, and All in one column, from a card and from the list's own scroller;
+the bare 1, 2 and 3 change nothing.
 
 `#239 single-selection` adds real mouse moves (CDP `Input.dispatchMouseEvent`) to the keys, and after
 every step counts the rows the browser DRAWS lit, by computed style (the selected surface or a ring),
@@ -1056,6 +1060,7 @@ VIEW_JS = """() => ({
   focus: document.activeElement ? (document.activeElement.id || document.activeElement.tagName.toLowerCase()
     + (document.activeElement.dataset && document.activeElement.dataset.id ? '#' + document.activeElement.dataset.id : '')) : null,
   card: Boolean(document.activeElement && document.activeElement.matches('#side-cards > li[data-id]')),
+  left: Boolean(document.activeElement && document.getElementById('scroll-area').contains(document.activeElement)),
   heading: !document.getElementById('thread-heading').hidden,
   keys: document.getElementById('keyboard-keys').textContent,
 })"""
@@ -1086,6 +1091,21 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
         now = view()
         check(now["side"] is (layout is not None), f"{words}+{digit} {where} drew the right column wrongly: {now}")
         return now
+
+    def escape_to(picker: str, layout: str | None, where: str) -> None:
+        """Esc on the thread list goes back to the view `picker`, in `layout`, the keys on the list on screen."""
+        press(walk.cdp, "Escape")
+        walk.page.wait_for_function(
+            "([picker, layout]) => document.getElementById('thread-select').value === picker"
+            " && document.getElementById('screen-main').getAttribute('data-columns') === layout",
+            arg=[picker, layout], timeout=10_000)
+        walk.settled()
+        last = walk.last_key()
+        check(last["key"] == "Escape" and last["prevented"] is True, f"Esc on the thread list {where} was not the page's: {last}")
+        now = view()
+        check(now["side"] is (layout is not None), f"Esc on the thread list {where} drew the right column wrongly: {now}")
+        if layout is None:
+            check(now["left"] is True, f"Esc on the thread list {where} left the focus on {now['focus']!r}")
 
     choose("1", "from the list")
     # The message box, a draft in it — this one alone: the device keeps drafts, and another tab's is cleared.
@@ -1141,7 +1161,29 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
     walk.page.wait_for_function("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'",
                                 timeout=10_000)
     walk.shot(f"view-keys-{words.lower()}-back-to-list")
-    choose("1", "back in the thread list")
+    # The card entered is still highlighted, and Esc on the list takes that off first, there.
+    lit = "() => document.querySelectorAll('#side-cards > li[data-highlighted]').length"
+    check(walk.page.evaluate(lit) == 1, f"coming back to the thread list lost the card's highlight: {view()}")
+    press(walk.cdp, "Escape")
+    walk.page.wait_for_function(f"() => ({lit})() === 0", timeout=5000)
+    walk.settled()
+    check(view()["layout"] == "list", f"Esc on a highlighted card left the thread list: {view()}")
+    check(walk.last_key()["prevented"] is True, f"Esc on a highlighted card was not the page's: {walk.last_key()}")
+    # Then Esc on the list itself: back to what it was chosen from. That list came from two columns.
+    escape_to("columns", "two", "chosen from two columns")
+    # From All, on a card and on the list's own scroller: All again, in one column.
+    choose("2", "from two columns")
+    for where in ("a card", "the scroller"):
+        choose("3", "from All")
+        if where == "a card":
+            press(walk.cdp, "ArrowDown")
+            walk.page.wait_for_function("() => document.activeElement"
+                                        " && document.activeElement.matches('#side-cards > li[data-id]')", timeout=5000)
+        else:
+            walk.page.evaluate("() => document.getElementById('side-scroll').focus()")
+        escape_to("flat", None, f"chosen from All, on {where}")
+    walk.shot(f"view-keys-{words.lower()}-escaped-list")
+    choose("1", "back in one column")
     # The bare digits are retired: on the list they change nothing.
     for digit in ("1", "2", "3"):
         press(walk.cdp, digit)
@@ -1150,8 +1192,9 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
     check(f"{words}+1" in str(view()["keys"]), f"the list of keys does not name {words}+1")
     walk.page.evaluate(clear)
     walk.notes.append(f"{words}+1 to {words}+4 chose Main, All, the thread list and two columns from the message "
-                      "box, the search field and a card in the thread list, the browser's default refused and no "
-                      "digit typed; Enter on a card highlighted it, -> opened its thread and Esc came back to the list")
+                      "box, the search field and a card in the thread list, the browser's default refused; Enter "
+                      "on a card highlighted it, -> opened its thread and Esc came back to the list; Esc there took the "
+                      "highlight off, and then went back to two columns, and to All from a card and from its scroller")
 
 
 def picker_and_help_keys(walk: Walk) -> None:
