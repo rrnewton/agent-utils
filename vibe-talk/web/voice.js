@@ -5638,16 +5638,23 @@ const startMarkers = new Map();
  * What a new call was handed, as the marker records it: a recap sent — its words, lines, the older
  * lines left out, and how it went — or why none was.
  *
+ * `words` is null when the server's replay did not say how many words it held — an older one —
+ * which is a recap whose size nobody can state, never a recap of none.
+ *
  * @param {any} resume what `fetchResume` answered, null for nothing
  * @param {"contextual_update" | "client_data" | null} transport how it went, null when it did not
- * @returns {{state: "sent", words: number, lines: number, dropped: number, transport: string} | {state: "none", why: string, dropped: number}}
+ * @returns {{state: "sent", words: number | null, lines: number, dropped: number, transport: string} | {state: "none", why: string, dropped: number}}
  */
 function recapFor(resume, transport) {
   const capped = (value) => Math.min(MARKER_NUMBER_MAX, Math.max(0, Math.round(Number(value) || 0)));
   const dropped = capped(resumeLast.dropped);
   if (resume && transport) {
     return {
-      state: "sent", words: capped(resume.words), lines: capped(resume.included), dropped: capped(resume.dropped), transport,
+      state: "sent",
+      words: typeof resume.words === "number" ? capped(resume.words) : null,
+      lines: capped(resume.included),
+      dropped: capped(resume.dropped),
+      transport,
     };
   }
   const wanted = resumeLast.attempted || (resumeAllowed && resumeWanted());
@@ -5660,10 +5667,22 @@ function recapFor(resume, transport) {
   return { state: "none", why: "off", dropped: 0 };
 }
 
+/**
+ * How many words a sent recap held, or null when nobody can say: an older server's replay names no
+ * count, and a recap of lines with no words in them is one whose count was not known when it was filed.
+ */
+function recapWords(recap) {
+  const words = recap.words;
+  return typeof words === "number" && !(words === 0 && Number(recap.lines) > 0) ? words : null;
+}
+
 /** The chip a seam shows for `recap`, or null for none. */
 function recapChip(recap) {
   if (!recap || (recap.state === "none" && recap.why === "off")) return null;
-  if (recap.state === "sent") return `${Number(recap.words).toLocaleString("en-US")}-word recap sent`;
+  if (recap.state === "sent") {
+    const words = recapWords(recap);
+    return words === null ? "recap sent" : `${words.toLocaleString("en-US")}-word recap sent`;
+  }
   return recap.why === "unsupported" ? "recap unsupported" : "no recap sent";
 }
 
@@ -5672,7 +5691,11 @@ function recapSentence(recap) {
   if (!recap || (recap.state === "none" && recap.why === "off")) return null;
   if (recap.state === "sent") {
     const which = recap.transport === "client_data" ? "client_data" : recap.dropped > 0 ? "dropped" : "sent";
-    return RECAP_DETAILS[which].replace("{n}", Number(recap.words).toLocaleString("en-US")).replace("{d}", String(recap.dropped));
+    // A count nobody can state is said as lines, not as a number of words.
+    const words = recapWords(recap);
+    const count = words !== null ? `${words.toLocaleString("en-US")} words` : which === "dropped" ? "lines" : "the lines";
+    const older = `${recap.dropped} older line${recap.dropped === 1 ? "" : "s"}`;
+    return RECAP_DETAILS[which].replace("{n} words", count).replace("{d} older lines", older);
   }
   return RECAP_DETAILS[recap.why] || null;
 }
@@ -5820,8 +5843,13 @@ function fileStartMarker(conversationId) {
   if (!start) return;
   startMarkers.delete(conversationId);
   if (!transcriptRecordsSupported) return;
+  // A server that keeps records says how many words its replay held. Were one not to, the marker
+  // still needs a number: 0 over lines that hold words, which `recapWords` reads back as unknown.
+  const recap = start.recap && start.recap.state === "sent" && start.recap.words === null
+    ? { ...start.recap, words: 0 }
+    : start.recap;
   /** @type {Record<string, unknown>} */
-  const marker = { kind: "conversation_start", recap: start.recap };
+  const marker = { kind: "conversation_start", recap };
   if (start.previous_end) marker.previous_end = start.previous_end;
   void postRecord(conversationId, { speaker: "marker", text: "", marker });
 }
