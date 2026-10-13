@@ -5754,6 +5754,50 @@ a.search-hit-link {
     calc(0.75rem + env(safe-area-inset-left));
 }
 
+/* ------------------------------------------------------------------- frozen send cards --- */
+/*
+ * `#270 voice-transcript-markers`. Every message the voice agent posted stays in the transcript as
+ * the card it was sent from, frozen: a turn of the owner's (`li.mine`, so exactly the live card's
+ * place and tile) whose head says what went where and how it was approved. It differs from the live
+ * card in its words, a tick and its lack of buttons, never in where it stands.
+ */
+.messages li.sent-card .sent-meta {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.45rem;
+}
+
+.sent-mark {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.messages li.sent-card[data-outcome="partial"] .sent-mark,
+.messages li.sent-card[data-outcome="unconfirmed"] .sent-mark {
+  color: var(--warn);
+}
+
+.sent-how {
+  color: var(--muted);
+}
+
+.sent-where,
+.sent-note {
+  margin: 0.3rem 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.messages li.sent-card[data-outcome="partial"] .sent-note,
+.messages li.sent-card[data-outcome="unconfirmed"] .sent-note {
+  color: var(--warn);
+}
+
+.sent-open {
+  margin-top: 0.4rem;
+}
+
 /* ----------------------------------------------------------------------- the control bar --- */
 /*
  * `#58 control-bar`. The strip carrying the gear, the Voice/Discord switch, and — from `#59` and
