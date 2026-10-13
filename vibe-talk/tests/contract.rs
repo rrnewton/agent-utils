@@ -16,18 +16,19 @@ use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
     LiveDelivery, LiveMessageEvent, LiveResetEvent, MessagesResponse, NoiseRules, PendingPost,
-    PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals,
-    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
+    PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription,
+    ReplyDismissals, TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSettings,
+    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
+use vibe_talk::post_gate::ProposalFate;
 use vibe_talk::speech::{Description, Playback};
 use vibe_talk::store::{
-    Bookmark, BookmarkAnchor, BookmarkPlace, Pin, PinSnapshot, UpstreamClearMode,
-    UpstreamClearResult,
+    Bookmark, BookmarkAnchor, BookmarkPlace, Pin, PinSnapshot, SendHow, SendOrigin, SendOutcome,
+    SentRecord, UpstreamClearMode, UpstreamClearResult,
 };
 use vibe_talk::threads::{MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineView};
 
@@ -347,6 +348,33 @@ fn pin(id: &str, threaded: bool) -> Pin {
     }
 }
 
+/// One send as the post gate's send memory files it. `#270 voice-transcript-markers`.
+fn sent_record(outcome: SendOutcome, how: SendHow) -> SentRecord {
+    SentRecord {
+        serial: 5,
+        send_seq: 3,
+        channel_id: "111".into(),
+        channel_name: "lead team".into(),
+        reply_to: None,
+        reply_to_author: None,
+        reply_to_excerpt: None,
+        thread_id: None,
+        thread_name: None,
+        message_id: Some("900".into()),
+        parts_posted: 1,
+        parts_total: 1,
+        uncertain_part: None,
+        unsent_chars: 0,
+        outcome,
+        how,
+        origin: SendOrigin::Commit,
+        text_truncated: false,
+        text_chars: 9,
+        begun_at_ms: 1_699_999_999_000,
+        sent_at_ms: 1_699_999_999_400,
+    }
+}
+
 fn to<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).expect("a sample serializes")
 }
@@ -440,8 +468,15 @@ fn samples() -> Value {
                     text: "(Voice-agent relayed, from user) on my way".into(),
                     prefix: "(Voice-agent relayed, from user) ".into(),
                     reply_to: Some(MessageId("300".into())),
+                    reply_to_author: Some("Alex".into()),
+                    reply_to_excerpt: Some("is the build green yet…".into()),
+                    thread_name: Some("release".into()),
                     expires_in_ms: 120_000,
                 }),
+                sends: Vec::new(),
+                sends_through: 0,
+                settled: Vec::new(),
+                now_ms: 1_700_000_000_000,
             }),
             to(&PendingPostResponse {
                 proposal: Some(PendingPost {
@@ -452,16 +487,85 @@ fn samples() -> Value {
                     text: "on my way".into(),
                     prefix: String::new(),
                     reply_to: None,
+                    reply_to_author: None,
+                    reply_to_excerpt: None,
+                    thread_name: None,
                     expires_in_ms: 1,
                 }),
+                sends: Vec::new(),
+                sends_through: 2,
+                settled: vec![ProposalSettled {
+                    serial: 3,
+                    fate: ProposalFate::Superseded,
+                }],
+                now_ms: 1_700_000_000_000,
             }),
-            to(&PendingPostResponse { proposal: None }),
+            to(&PendingPostResponse {
+                proposal: None,
+                sends: vec![
+                    VoiceSend {
+                        text: "on my way".into(),
+                        detail: sent_record(SendOutcome::Sent, SendHow::Tap),
+                    },
+                    VoiceSend {
+                        text: "the first part".into(),
+                        detail: SentRecord {
+                            serial: 6,
+                            send_seq: 4,
+                            reply_to: Some("300".into()),
+                            reply_to_author: Some("Alex".into()),
+                            reply_to_excerpt: Some("is the build green yet…".into()),
+                            thread_id: Some("t1".into()),
+                            thread_name: Some("release".into()),
+                            parts_posted: 1,
+                            parts_total: 3,
+                            uncertain_part: Some(2),
+                            unsent_chars: 1_900,
+                            text_truncated: true,
+                            ..sent_record(SendOutcome::Partial, SendHow::Voice)
+                        },
+                    },
+                    VoiceSend {
+                        text: "rebase onto main".into(),
+                        detail: SentRecord {
+                            serial: 7,
+                            send_seq: 5,
+                            message_id: None,
+                            parts_posted: 0,
+                            origin: SendOrigin::Rest,
+                            ..sent_record(SendOutcome::Unconfirmed, SendHow::Direct)
+                        },
+                    },
+                ],
+                sends_through: 5,
+                settled: [
+                    ProposalFate::Committed,
+                    ProposalFate::Cancelled,
+                    ProposalFate::Expired,
+                    ProposalFate::Superseded,
+                    ProposalFate::Refused,
+                ]
+                .into_iter()
+                .zip(1..)
+                .map(|(fate, serial)| ProposalSettled { serial, fate })
+                .collect(),
+                now_ms: 1_700_000_000_000,
+            }),
         ],
-        "CommittedPostResponse": [to(&CommittedPostResponse {
-            serial: 3,
-            posted: plain.clone(),
-            parts: vec![plain.clone()],
-        })],
+        "CommittedPostResponse": [
+            to(&CommittedPostResponse {
+                serial: 3,
+                send_seq: Some(3),
+                posted: plain.clone(),
+                parts: vec![plain.clone()],
+            }),
+            to(&CommittedPostResponse {
+                serial: 3,
+                send_seq: None,
+                posted: plain.clone(),
+                parts: vec![plain.clone()],
+            }),
+        ],
         "TimelineResponse": [
             to(&timeline(TimelineView::Main, TimelinePage {
                 messages: vec![plain.clone(), threaded.clone()],

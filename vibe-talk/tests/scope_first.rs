@@ -181,7 +181,8 @@ fn inventory() -> Vec<Route> {
             "GET",
             "/api/v1/post-proposals",
             Write,
-            Query("?wait=0", "?wait=soon"),
+            // `#270 voice-transcript-markers`: the send memory's cursor is a query parameter too.
+            Query("?wait=0&sent_after=0", "?wait=0&sent_after=soon"),
         ),
         route(
             "POST",

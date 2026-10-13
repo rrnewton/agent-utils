@@ -1967,6 +1967,47 @@ pub struct PartialReplyResponse {
     /// parts already posted went. Absent for the conversation itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Whether the part that failed may have been posted anyway — its answer was lost — so
+    /// `posted` counts only the parts known to have landed. `#270 voice-transcript-markers`: with
+    /// `posted` 0 this is a post nobody can confirm, not one that certainly failed.
+    pub uncertain: bool,
+    /// On the commit route only: which proposal this was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<u64>,
+    /// On the commit route only: the send memory's number for this send, under which the voice
+    /// page records it. Absent when certainly nothing was posted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_seq: Option<u64>,
+}
+
+impl PartialReplyResponse {
+    /// The 207 body for a [`OpError::PartiallyPosted`], or the error back when it is another.
+    fn from_error(error: OpError) -> Result<Self, OpError> {
+        match error {
+            OpError::PartiallyPosted {
+                posted,
+                unsent,
+                cause,
+                retryable,
+                resumable,
+                thread_id,
+                uncertain,
+                ..
+            } => Ok(Self {
+                error: "partially_posted",
+                detail: cause,
+                posted,
+                unsent,
+                retryable,
+                resumable,
+                thread_id,
+                uncertain,
+                serial: None,
+                send_seq: None,
+            }),
+            other => Err(other),
+        }
+    }
 }
 
 /// `POST /api/v1/channels/{channel_id}/reply` — the only route that speaks in the owner's name.
@@ -2000,28 +2041,10 @@ pub async fn reply(
         // 207, not 200 and not 502. A machine caller reading only the status must not conclude
         // "sent" — nor "nothing happened", which would have them send the whole thing again and
         // post the first half twice. Multi-Status says exactly what is true: look inside.
-        Err(OpError::PartiallyPosted {
-            posted,
-            unsent,
-            cause,
-            retryable,
-            resumable,
-            thread_id,
-            ..
-        }) => Ok((
-            StatusCode::MULTI_STATUS,
-            Json(PartialReplyResponse {
-                error: "partially_posted",
-                detail: cause,
-                posted,
-                unsent,
-                retryable,
-                resumable,
-                thread_id,
-            }),
-        )
-            .into_response()),
-        Err(other) => Err(other.into()),
+        Err(error) => match PartialReplyResponse::from_error(error) {
+            Ok(partial) => Ok((StatusCode::MULTI_STATUS, Json(partial)).into_response()),
+            Err(other) => Err(other.into()),
+        },
     }
 }
 
@@ -2073,6 +2096,10 @@ pub struct PendingQuery {
     /// The serial the caller already shows, so the wait ends when the pending proposal differs.
     /// Absent means the caller shows none.
     pub seen: Option<u64>,
+    /// The newest `send_seq` the caller has seen. `#270 voice-transcript-markers`: present, the
+    /// answer carries the sends that settled after it and the wait also ends when one does;
+    /// absent, the answer carries no sends and waits only on the pending proposal.
+    pub sent_after: Option<u64>,
 }
 
 /// A commit: the handle, the binding restated, and who confirmed it.
@@ -2111,31 +2138,29 @@ impl From<crate::post_gate::Refusal> for ApiError {
 
 async fn pending_view(
     state: &AppState,
-    proposal: Option<crate::post_gate::Proposal>,
-) -> crate::contract::PendingPostResponse {
-    let Some(proposal) = proposal else {
-        return crate::contract::PendingPostResponse { proposal: None };
-    };
-    let channel_id = ChannelId(proposal.binding.channel_id.clone());
-    let channel_name = ops::channels(state)
-        .await
-        .into_iter()
-        .find(|channel| channel.id == channel_id)
-        .map_or_else(
-            || proposal.binding.channel_id.clone(),
-            |channel| channel.display_name().to_owned(),
-        );
-    crate::contract::PendingPostResponse {
-        proposal: Some(crate::contract::PendingPost {
-            serial: proposal.serial,
-            expires_in_ms: proposal.expires_in_ms(tokio::time::Instant::now()),
-            handle: proposal.handle,
-            channel_id,
-            channel_name,
-            text: proposal.binding.text,
-            prefix: proposal.prefix,
-            reply_to: proposal.binding.reply_to.map(MessageId),
-        }),
+    proposal: crate::post_gate::Proposal,
+) -> crate::contract::PendingPost {
+    let channel_name =
+        crate::send_approval::channel_name(state, &proposal.binding.channel_id).await;
+    // `#269 approval-card-inline`: what the card says it answers, in the same words the frozen
+    // card will use, from what this server already holds.
+    let context = crate::send_approval::reply_context(
+        state,
+        &proposal.binding.channel_id,
+        proposal.binding.reply_to.as_deref(),
+    );
+    crate::contract::PendingPost {
+        serial: proposal.serial,
+        expires_in_ms: proposal.expires_in_ms(tokio::time::Instant::now()),
+        handle: proposal.handle,
+        channel_id: ChannelId(proposal.binding.channel_id),
+        channel_name,
+        text: proposal.binding.text,
+        prefix: proposal.prefix,
+        reply_to: proposal.binding.reply_to.map(MessageId),
+        reply_to_author: context.author,
+        reply_to_excerpt: context.excerpt,
+        thread_name: context.thread_name,
     }
 }
 
@@ -2154,6 +2179,7 @@ pub async fn propose_post(
         &request.channel_id,
         &request.text,
         request.reply_to.as_deref(),
+        crate::store::SendOrigin::Rest,
     )
     .await;
     match outcome {
@@ -2198,28 +2224,10 @@ pub async fn propose_post(
                 Err(ApiError::new(StatusCode::CONFLICT, "post_repeated", result))
             }
         }
-        Err(OpError::PartiallyPosted {
-            posted,
-            unsent,
-            cause,
-            retryable,
-            resumable,
-            thread_id,
-            ..
-        }) => Ok((
-            StatusCode::MULTI_STATUS,
-            Json(PartialReplyResponse {
-                error: "partially_posted",
-                detail: cause,
-                posted,
-                unsent,
-                retryable,
-                resumable,
-                thread_id,
-            }),
-        )
-            .into_response()),
-        Err(other) => Err(other.into()),
+        Err(error) => match PartialReplyResponse::from_error(error) {
+            Ok(partial) => Ok((StatusCode::MULTI_STATUS, Json(partial)).into_response()),
+            Err(other) => Err(other.into()),
+        },
     }
 }
 
@@ -2228,6 +2236,11 @@ pub async fn propose_post(
 /// Without `wait` it answers at once. With it, the answer waits until the pending proposal is no
 /// longer the one numbered `seen` — a new one, or none because it was sent, cancelled, or expired
 /// — or until `wait` seconds pass.
+///
+/// `#270 voice-transcript-markers`: with `sent_after`, the answer also carries the send memory's
+/// sends past that number, and the wait ends when one settles. Every answer says how far the
+/// memory has numbered (`sends_through`), what became of the proposals the gate remembers
+/// (`settled`), and the server's clock (`now_ms`).
 pub async fn pending_post(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -2237,10 +2250,35 @@ pub async fn pending_post(
         None | Some(0) => state.post_gate.pending(),
         Some(seconds) => {
             let wait = std::time::Duration::from_secs(seconds.min(PROPOSAL_WAIT_MAX_SECONDS));
-            state.post_gate.wait_for_change(query.seen, wait).await
+            state
+                .post_gate
+                .wait_for_change(query.seen, query.sent_after, wait)
+                .await
         }
     };
-    Ok(Json(pending_view(&state, proposal).await))
+    let (sends, sends_through) = match query.sent_after {
+        Some(after) => {
+            let (sends, through) = state.post_gate.sends_after(after);
+            (sends.into_iter().map(Into::into).collect(), through)
+        }
+        None => (Vec::new(), state.post_gate.sends_through()),
+    };
+    let proposal = match proposal {
+        Some(proposal) => Some(pending_view(&state, proposal).await),
+        None => None,
+    };
+    Ok(Json(crate::contract::PendingPostResponse {
+        proposal,
+        sends,
+        sends_through,
+        settled: state
+            .post_gate
+            .fates()
+            .into_iter()
+            .map(|(serial, fate)| crate::contract::ProposalSettled { serial, fate })
+            .collect(),
+        now_ms: crate::store::now_ms(),
+    }))
 }
 
 /// `POST /api/v1/post-proposals/commit` — the owner confirmed; post it, once.
@@ -2259,7 +2297,12 @@ pub async fn commit_post(
         reply_to: request.reply_to,
     };
     match ops::commit_proposal(&state, &request.handle, &restated, request.confirmed_by).await {
-        Ok((serial, mut posted, mut parts)) => {
+        Ok(ops::Committed {
+            serial,
+            send_seq,
+            mut posted,
+            mut parts,
+        }) => {
             if let Some(channel) = state.channel(&restated.channel_id) {
                 crate::render::fill(
                     &state.config,
@@ -2271,34 +2314,29 @@ pub async fn commit_post(
             }
             Ok(Json(crate::contract::CommittedPostResponse {
                 serial,
+                send_seq,
                 posted,
                 parts,
             })
             .into_response())
         }
         Err(ops::CommitError::Refused(why)) => Err(why.into()),
-        Err(ops::CommitError::Post(OpError::PartiallyPosted {
-            posted,
-            unsent,
-            cause,
-            retryable,
-            resumable,
-            thread_id,
-            ..
-        })) => Ok((
-            StatusCode::MULTI_STATUS,
-            Json(PartialReplyResponse {
-                error: "partially_posted",
-                detail: cause,
-                posted,
-                unsent,
-                retryable,
-                resumable,
-                thread_id,
-            }),
-        )
-            .into_response()),
-        Err(ops::CommitError::Post(other)) => Err(other.into()),
+        Err(ops::CommitError::Post {
+            error,
+            serial,
+            send_seq,
+        }) => match PartialReplyResponse::from_error(*error) {
+            Ok(partial) => Ok((
+                StatusCode::MULTI_STATUS,
+                Json(PartialReplyResponse {
+                    serial: Some(serial),
+                    send_seq,
+                    ..partial
+                }),
+            )
+                .into_response()),
+            Err(other) => Err(other.into()),
+        },
     }
 }
 
@@ -2980,11 +3018,16 @@ pub async fn forget_conversation(
 }
 
 /// `DELETE /api/v1/conversations`
+///
+/// It also empties the post gate's send memory (`#270 voice-transcript-markers`): the messages the
+/// voice agent sent in the last quarter of an hour, which a page files into the transcript, are
+/// part of the record the owner just asked to forget.
 pub async fn forget_conversations(
     State(state): State<AppState>,
     _scope: WriteScope,
 ) -> Result<Response, ApiError> {
     let forgotten = state.store.forget_all_conversations().await?;
+    state.post_gate.forget_sends();
     Ok(no_store(Json(
         serde_json::json!({ "forgotten": forgotten }),
     )))
@@ -3008,14 +3051,16 @@ pub async fn forget_conversations(
 /// the running loop as well as in the store, so nothing more is marked read at a provider once
 /// Settings says Off.
 ///
-/// And it empties three of the copies of channel text held in memory: read-aloud's recently
+/// And it empties four of the copies of channel text held in memory: read-aloud's recently
 /// fetched messages ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`), the
 /// voice catch-up's channel windows with their journalled pushes
-/// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`), and the recent reads a
+/// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`), the recent reads a
 /// bridge's recent-view shadow holds waiting for their check ([`crate::recent_view::Shadow::clear`],
-/// `#208 persistent-cache`). All three refuse what a read already running when the purge came
-/// brings back, so none can be refilled from before it; a shadow check already running keeps only
-/// counts from its read.
+/// `#208 persistent-cache`), and the voice agent's recent sends
+/// ([`crate::post_gate::PostGate::forget_sends`], `#270 voice-transcript-markers`). The first
+/// three refuse what a read already running when the purge came brings back, so none can be
+/// refilled from before it; a shadow check already running keeps only counts from its read; and a
+/// send still on its way when the purge came is filed nowhere when it settles.
 ///
 /// **It does not empty every copy in memory**, and nothing written about it may say it does. These
 /// outlive it until they age out, are evicted, or the process restarts:
@@ -3044,6 +3089,7 @@ pub async fn purge_storage(
     state.read_ahead.clear();
     state.live.recent().clear();
     state.recent_view_shadow.clear();
+    state.post_gate.forget_sends();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,
