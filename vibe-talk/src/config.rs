@@ -3649,6 +3649,47 @@ provider = "slack"
     }
 
     #[test]
+    fn the_summary_age_limit_is_its_own_setting_and_defaults_to_the_record_age_limit() {
+        // `#208 persistent-cache`. Unset, a summary lives as long as it always did: `retain_days`,
+        // so a host that lowered that for privacy keeps summaries no longer than before.
+        let unset = format!("{FULL}\n[storage]\nretain_days = 9\n");
+        let cfg = Config::from_toml_and_env(&unset, &env(&[])).expect("valid config");
+        assert_eq!(cfg.storage.retention.summary_retain_days, 9);
+        let set = format!("{FULL}\n[storage]\nretain_days = 9\nsummary_retain_days = 4\n");
+        let cfg = Config::from_toml_and_env(&set, &env(&[])).expect("valid config");
+        assert_eq!(cfg.storage.retention.summary_retain_days, 4);
+        assert_eq!(cfg.storage.retention.retain_days, 9, "the two are separate");
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(
+            cfg.storage.retention.summary_retain_days,
+            crate::store::DEFAULT_RETAIN_DAYS
+        );
+    }
+
+    #[test]
+    fn a_message_cache_table_is_accepted_and_ignored_whatever_it_holds() {
+        // `#208 persistent-cache`. A later build reads `[message_cache]`; this one must still start
+        // with a host overlay that has one, or a rollback past that build would not boot.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(!cfg.message_cache_ignored);
+        let text = format!(
+            "{FULL}\n[message_cache]\nenabled = true\nmax_days = 14\nmax_megabytes = 256\n\
+             backfill = \"adaptive\"\nsomething_a_later_build_adds = [1, 2]\n\
+             [message_cache.nested]\nanything = \"at all\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("accepted");
+        assert!(cfg.message_cache_ignored);
+        // ...and the rest of the configuration is read exactly as without it.
+        assert_eq!(
+            cfg.storage.retention,
+            Config::from_toml_and_env(FULL, &env(&[]))
+                .expect("valid config")
+                .storage
+                .retention
+        );
+    }
+
+    #[test]
     fn retention_bounds_are_configurable_and_must_be_usable() {
         let text = format!(
             "{FULL}\n[storage]\npath = \"/data/s.sqlite3\"\nmax_conversations = 3\n\

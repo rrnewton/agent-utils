@@ -801,6 +801,45 @@ mod tests {
     }
 
     #[test]
+    fn a_window_is_rebuilt_in_order_only_while_every_message_of_it_is_held() {
+        // `#208 persistent-cache`: a summary's context is the messages just before its target, so
+        // a window with a hole where a forgotten message was is not the window.
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let window = vec![
+            message("10", None),
+            message("11", None),
+            message("12", None),
+        ];
+        read_ahead.remember(&channel, None, &window, Instant::now());
+        let read = WindowRead::of(&ops::Window {
+            channel: crate::model::ChannelInfo {
+                id: channel.clone(),
+                label: String::new(),
+                writable: false,
+                alias: None,
+                added: false,
+                provider: None,
+            },
+            messages: window,
+            limit: 50,
+        });
+        let rebuilt = read_ahead.recall_window(&channel, &read).expect("all held");
+        assert_eq!(
+            rebuilt.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["10", "11", "12"]
+        );
+        assert!(read_ahead
+            .recall_window(&ChannelId("2".to_owned()), &read)
+            .is_none());
+        read_ahead.forget(&channel, &MessageId("11".to_owned()));
+        assert!(
+            read_ahead.recall_window(&channel, &read).is_none(),
+            "a window missing a forgotten message was answered as the window"
+        );
+    }
+
+    #[test]
     fn expired_messages_are_dropped_when_more_arrive() {
         let read_ahead = ReadAhead::new();
         let channel = ChannelId("1".to_owned());

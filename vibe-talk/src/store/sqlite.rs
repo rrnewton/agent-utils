@@ -4570,4 +4570,483 @@ mod tests {
         );
         assert!(!store.set_ask_before_send(false).await.expect("save"));
     }
+
+    // --- #208 persistent-cache, milestone summary-keep --------------------------------------------
+
+    /// Where the `cut_at` step sits in the ladder, found by what it does rather than by its index,
+    /// so a step landed before it moves nothing here.
+    fn cut_at_step() -> usize {
+        MIGRATIONS
+            .iter()
+            .position(|step| step.contains("ADD COLUMN cut_at"))
+            .expect("the cut_at step is in the ladder")
+    }
+
+    /// Every summary row as `(version, channel, message, summary, cut_at)`, in a stable order.
+    fn summary_table(store: &SqliteStore) -> Vec<(String, String, String, String, Option<i64>)> {
+        let guard = store
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut statement = guard
+            .prepare(
+                "SELECT version, channel_id, message_id, summary, cut_at FROM summaries
+                 ORDER BY version, channel_id, message_id",
+            )
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("query");
+        rows.collect::<Result<_, _>>().expect("rows")
+    }
+
+    #[tokio::test]
+    async fn the_first_start_re_keys_the_previous_versions_rows_and_marks_the_cut_ones() {
+        // A file at the schema before `cut_at`, holding what a deployment really holds: whole
+        // summaries, summaries cut with "…", thread sentences (JSON) cut and not, thread names, and
+        // rows of an older version that no longer applies.
+        let dir = TempDir::new("sqlite-summary-rekey");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        let previous = "v1-elevenlabs-agent-w3-c160-75ba8b1506ab0af4";
+        let older = "v1-elevenlabs-agent-w3-c160-0000000000000000";
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..cut_at_step()] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            let row = |version: &str, message: &str, summary: &str| {
+                connection
+                    .execute(
+                        "INSERT INTO summaries VALUES (?1, '1111111111', ?2, '0000000000000007', ?3, 5)",
+                        [version, message, summary],
+                    )
+                    .expect("a row");
+            };
+            row(previous, "1000000000000000100", "A whole answer.");
+            row(previous, "1000000000000000101", "An answer cut at the cap…");
+            row(
+                previous,
+                "thread-sentence:spaces/A/threads/one",
+                r#"{"summary":"A sentence cut at the cap…","at":4}"#,
+            );
+            row(
+                previous,
+                "thread-sentence:spaces/A/threads/two",
+                r#"{"summary":"A whole sentence.","at":2}"#,
+            );
+            row(
+                KEPT_VERSION_FOR_TESTS,
+                "thread-name:spaces/A/threads/one",
+                r#"{"name":"runner-wedged","touched":1}"#,
+            );
+            row(
+                older,
+                "1000000000000000102",
+                "Under a wording that no longer applies.",
+            );
+            connection
+                .pragma_update(
+                    None,
+                    "user_version",
+                    i64::try_from(cut_at_step()).expect("small"),
+                )
+                .expect("stamp old schema");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        assert!(
+            summary_table(&store).iter().all(|row| row.4.is_none()),
+            "the new column reads whole until the re-key says otherwise"
+        );
+
+        let current = "v2-elevenlabs-agent-w3-c160-1111111111111111";
+        assert_eq!(
+            store
+                .rekey_summaries(previous, current, 640)
+                .await
+                .expect("re-key"),
+            4,
+            "every row of the previous version moves"
+        );
+        assert_eq!(
+            store.forget_summaries_except(current).await.expect("sweep"),
+            1,
+            "only the row of the older wording is swept"
+        );
+        let cut_of = |message: &str| {
+            summary_table(&store)
+                .into_iter()
+                .find(|row| row.2 == message)
+                .unwrap_or_else(|| panic!("{message} is gone"))
+        };
+        assert_eq!(cut_of("1000000000000000100").0, current);
+        assert_eq!(
+            cut_of("1000000000000000100").4,
+            None,
+            "a whole answer is whole"
+        );
+        assert_eq!(
+            cut_of("1000000000000000101").4,
+            Some(640),
+            "a cut answer says where"
+        );
+        assert_eq!(cut_of("thread-sentence:spaces/A/threads/one").4, Some(640));
+        assert_eq!(cut_of("thread-sentence:spaces/A/threads/two").4, None);
+        let name = cut_of("thread-name:spaces/A/threads/one");
+        assert_eq!(
+            name.0, KEPT_VERSION_FOR_TESTS,
+            "a thread name is not re-keyed"
+        );
+        assert_eq!(name.4, None);
+        assert_eq!(summary_rows(&store), 5);
+        // The text itself is untouched, and reachable under the new version.
+        let hit = store
+            .cached_summary(&SummaryKey {
+                channel: ChannelId("1111111111".to_owned()),
+                message: MessageId("1000000000000000101".to_owned()),
+                content_hash: 7,
+                version: current.to_owned(),
+            })
+            .await
+            .expect("read")
+            .expect("re-keyed");
+        assert_eq!(hit.text, "An answer cut at the cap…");
+        assert_eq!(hit.cut_at, Some(640));
+        assert_eq!(hit.made_at_ms, 5, "the age is kept, not restarted");
+
+        // Every later start finds nothing to move and nothing to sweep.
+        assert_eq!(
+            store
+                .rekey_summaries(previous, current, 640)
+                .await
+                .expect("re-key"),
+            0
+        );
+        assert_eq!(
+            store.forget_summaries_except(current).await.expect("sweep"),
+            0
+        );
+        assert_eq!(summary_rows(&store), 5);
+    }
+
+    const KEPT_VERSION_FOR_TESTS: &str = super::super::KEPT_VERSION;
+
+    #[tokio::test]
+    async fn a_row_already_filed_under_the_new_version_wins_over_the_old_one() {
+        let dir = TempDir::new("sqlite-summary-rekey-collide");
+        let store = store(&dir, Retention::default());
+        let old = SummaryKey {
+            version: "v1-old".to_owned(),
+            ..summary_key("1000000000000000100", 7)
+        };
+        let new = SummaryKey {
+            version: "v2-new".to_owned(),
+            ..old.clone()
+        };
+        store.cache_summary(&old, "old…", None).await.expect("file");
+        store.cache_summary(&new, "new", None).await.expect("file");
+        assert_eq!(
+            store
+                .rekey_summaries("v1-old", "v2-new", 640)
+                .await
+                .expect("re-key"),
+            0
+        );
+        assert_eq!(summary_rows(&store), 1);
+        let hit = store
+            .cached_summary(&new)
+            .await
+            .expect("read")
+            .expect("kept");
+        assert_eq!((hit.text.as_str(), hit.cut_at), ("new", None));
+    }
+
+    /// Age one row by hand.
+    fn age(store: &SqliteStore, message: &str, made_at_ms: i64) {
+        let guard = store
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard
+            .execute(
+                "UPDATE summaries SET made_at_ms = ?1 WHERE message_id = ?2",
+                rusqlite::params![made_at_ms, message],
+            )
+            .expect("age it");
+    }
+
+    #[tokio::test]
+    async fn keeping_a_summary_alive_rewrites_only_one_more_than_a_day_old() {
+        let dir = TempDir::new("sqlite-summary-touch");
+        let store = store(&dir, Retention::default());
+        let fresh = summary_key("1000000000000000100", 1);
+        let stale = summary_key("1000000000000000101", 2);
+        store
+            .cache_summary(&fresh, "fresh", None)
+            .await
+            .expect("file");
+        store
+            .cache_summary(&stale, "stale", None)
+            .await
+            .expect("file");
+        let hour_ago = now_ms() - 3_600_000;
+        let two_days_ago = now_ms() - 2 * 86_400_000;
+        age(&store, "1000000000000000100", hour_ago);
+        age(&store, "1000000000000000101", two_days_ago);
+
+        assert!(!store.touch_summary(&fresh).await.expect("touch"));
+        assert!(store.touch_summary(&stale).await.expect("touch"));
+        let made = |key: &SummaryKey| {
+            let store = &store;
+            let key = key.clone();
+            async move {
+                store
+                    .cached_summary(&key)
+                    .await
+                    .expect("read")
+                    .expect("there")
+                    .made_at_ms
+            }
+        };
+        assert_eq!(
+            made(&fresh).await,
+            hour_ago,
+            "a row used within the day is not rewritten"
+        );
+        assert!(
+            made(&stale).await > now_ms() - 60_000,
+            "an old row in use is kept alive"
+        );
+        assert!(
+            !store
+                .touch_summary(&summary_key("1000000000000000199", 3))
+                .await
+                .expect("touch"),
+            "nothing is written for a key with no entry"
+        );
+        assert_eq!(summary_rows(&store), 2);
+    }
+
+    #[tokio::test]
+    async fn the_summary_age_limit_is_its_own_setting_and_counts_from_the_last_use() {
+        let dir = TempDir::new("sqlite-summary-retain");
+        let store = store(
+            &dir,
+            Retention {
+                retain_days: 365,
+                summary_retain_days: 2,
+                ..Retention::default()
+            },
+        );
+        let used = summary_key("1000000000000000100", 1);
+        let unused = summary_key("1000000000000000101", 2);
+        store
+            .cache_summary(&used, "used", None)
+            .await
+            .expect("file");
+        store
+            .cache_summary(&unused, "unused", None)
+            .await
+            .expect("file");
+        let three_days_ago = now_ms() - 3 * 86_400_000;
+        age(&store, "1000000000000000100", three_days_ago);
+        age(&store, "1000000000000000101", three_days_ago);
+        // A write-scope hit keeps the used one alive; the next write prunes the other.
+        assert!(store.touch_summary(&used).await.expect("touch"));
+        store
+            .cache_summary(&summary_key("1000000000000000102", 3), "new", None)
+            .await
+            .expect("file");
+        assert!(store.cached_summary(&used).await.expect("read").is_some());
+        assert_eq!(
+            store.cached_summary(&unused).await.expect("read"),
+            None,
+            "past summary_retain_days, though well within retain_days"
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_a_channel_off_the_list_forgets_its_summaries_and_keeps_its_thread_names() {
+        let dir = TempDir::new("sqlite-summary-forget-channel");
+        let store = store(&dir, Retention::default());
+        let elsewhere = SummaryKey {
+            channel: ChannelId("2222222222".to_owned()),
+            ..summary_key("1000000000000000100", 1)
+        };
+        let name = SummaryKey {
+            version: KEPT_VERSION_FOR_TESTS.to_owned(),
+            ..summary_key("thread-name:t", 0)
+        };
+        let sentence = summary_key("thread-sentence:t", 0);
+        let older = SummaryKey {
+            version: "an-older-version".to_owned(),
+            ..summary_key("1000000000000000101", 2)
+        };
+        for key in [
+            &summary_key("1000000000000000100", 1),
+            &sentence,
+            &older,
+            &name,
+            &elsewhere,
+        ] {
+            store.cache_summary(key, "text", None).await.expect("file");
+        }
+        assert_eq!(
+            store
+                .forget_channel_summaries(&ChannelId("1111111111".to_owned()))
+                .await
+                .expect("forget"),
+            3,
+            "the summary, the sentence and the row of an older version"
+        );
+        assert!(
+            store.cached_summary(&name).await.expect("read").is_some(),
+            "the name is kept"
+        );
+        assert!(
+            store
+                .cached_summary(&elsewhere)
+                .await
+                .expect("read")
+                .is_some(),
+            "another channel is untouched"
+        );
+        assert_eq!(summary_rows(&store), 2);
+    }
+
+    #[tokio::test]
+    async fn the_purge_leaves_no_copy_of_a_summary_in_the_file() {
+        // `secure_delete`: what is deleted is overwritten, not left in a free page for anyone who
+        // reads the file. THE CONTROL first: the same steps on a connection with it turned off
+        // leave the text in the file, so the assertion after it can fail.
+        let unique = "a-summary-nobody-else-would-write-7f3a9c";
+        for secure in [false, true] {
+            let dir = TempDir::new("sqlite-secure-delete");
+            let file = dir.path().join("vibe-talk.sqlite3");
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            if !secure {
+                store
+                    .connection
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pragma_update(None, "secure_delete", "OFF")
+                    .expect("turn it off");
+            }
+            store
+                .cache_summary(&summary_key("1000000000000000100", 1), unique, None)
+                .await
+                .expect("file");
+            store.purge_everything().await.expect("purge");
+            drop(store);
+            let bytes = std::fs::read(&file).expect("read the file");
+            let present = bytes
+                .windows(unique.len())
+                .any(|window| window == unique.as_bytes());
+            assert_eq!(
+                present,
+                !secure,
+                "secure_delete {secure}: the purged summary is {} the file",
+                if present { "still in" } else { "absent from" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fake_store_agrees_with_the_real_one_on_the_summary_methods() {
+        // One script, both stores, the same answers: a test that passes against the fake must mean
+        // the same thing against the file a deployment runs.
+        async fn script(store: &dyn StateStore) -> Vec<String> {
+            let mut said = Vec::new();
+            let key = |message: &str, version: &str| SummaryKey {
+                version: version.to_owned(),
+                ..summary_key(message, 7)
+            };
+            let sentence = r#"{"summary":"cut…","at":1}"#;
+            for (message, version, text) in [
+                ("1000000000000000100", "v1", "whole"),
+                ("1000000000000000101", "v1", "cut…"),
+                ("thread-sentence:t", "v1", sentence),
+                ("thread-name:t", KEPT_VERSION_FOR_TESTS, "{}"),
+                ("1000000000000000102", "v0", "older"),
+            ] {
+                store
+                    .cache_summary(&key(message, version), text, None)
+                    .await
+                    .expect("file");
+            }
+            said.push(format!(
+                "{:?}",
+                store.rekey_summaries("v1", "v2", 640).await
+            ));
+            said.push(format!(
+                "{:?}",
+                store.rekey_summaries("v1", "v2", 640).await
+            ));
+            said.push(format!("{:?}", store.forget_summaries_except("v2").await));
+            for (message, version) in [
+                ("1000000000000000100", "v2"),
+                ("1000000000000000101", "v2"),
+                ("thread-sentence:t", "v2"),
+                ("thread-name:t", KEPT_VERSION_FOR_TESTS),
+                ("1000000000000000100", "v1"),
+            ] {
+                let hit = store
+                    .cached_summary(&key(message, version))
+                    .await
+                    .expect("read");
+                said.push(format!(
+                    "{message} {version} {:?}",
+                    hit.map(|h| (h.text, h.cut_at))
+                ));
+            }
+            said.push(format!(
+                "{:?}",
+                store.touch_summary(&key("1000000000000000100", "v2")).await
+            ));
+            said.push(format!(
+                "{:?}",
+                store
+                    .forget_channel_summaries(&ChannelId("1111111111".to_owned()))
+                    .await
+            ));
+            said.push(format!(
+                "{:?}",
+                store
+                    .cached_summary(&key("thread-name:t", KEPT_VERSION_FOR_TESTS))
+                    .await
+                    .map(|hit| hit.map(|h| h.text))
+            ));
+            said
+        }
+        let dir = TempDir::new("sqlite-summary-parity");
+        let real = store(&dir, Retention::default());
+        let fake = crate::store::fake::FakeStore::new();
+        assert_eq!(script(&real).await, script(&fake).await);
+        // And the store with nothing configured refuses every one of them by name.
+        let disabled = crate::store::disabled::DisabledStore;
+        let key = summary_key("1000000000000000100", 7);
+        assert!(matches!(
+            disabled.touch_summary(&key).await,
+            Err(StoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            disabled.rekey_summaries("v1", "v2", 640).await,
+            Err(StoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            disabled
+                .forget_channel_summaries(&ChannelId("1111111111".to_owned()))
+                .await,
+            Err(StoreError::Unavailable(_))
+        ));
+    }
 }

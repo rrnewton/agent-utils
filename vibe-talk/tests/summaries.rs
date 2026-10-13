@@ -12,6 +12,7 @@ use vibe_talk::model::{ChannelId, MessageId};
 use vibe_talk::ops::{self, SummaryOutcome};
 use vibe_talk::state::AppState;
 use vibe_talk::store::fake::FakeStore;
+use vibe_talk::store::StateStore as _;
 use vibe_talk::summarize::fake::FakeSummarizer;
 use vibe_talk::testing::{self, READ_CHANNEL};
 
@@ -580,4 +581,500 @@ async fn the_cache_tests_exercise_the_key_a_real_deployment_writes() {
          deployment writes ({prefix})",
         server.state.summary_version
     );
+}
+
+// --- #208 persistent-cache, milestone summary-keep ------------------------------------------------
+//
+// What a summary request does NOT cost: a chat call for a row the page has just read, a second
+// window fetch for rows asked about together, a model call after a restart or a change of a
+// setting that changes no word of a summary. Each asserted against `FakeDiscord::fetch_count` and
+// the summariser's own count, with the counters diagnostics reports checked beside them.
+
+/// The key a summary of `id`, whose text is `content`, is filed under on `server`.
+fn key_of(server: &Server, id: &str, content: &str) -> vibe_talk::store::SummaryKey {
+    vibe_talk::store::SummaryKey {
+        channel: server.channel.clone(),
+        message: MessageId(id.to_owned()),
+        content_hash: vibe_talk::summarize::content_hash(content),
+        version: server.state.summary_version.to_string(),
+    }
+}
+
+async fn summarise(server: &Server, scope: Scope, id: &str) -> ops::Summarised {
+    ops::summarize_message(&server.state, scope, READ_CHANNEL, id, &[], None)
+        .await
+        .expect("summarises")
+}
+
+#[tokio::test]
+async fn a_summary_asked_right_after_the_page_read_costs_no_fetch() {
+    let server = new_server(400, 160, 3);
+    server.seed(&long_text("deploy"));
+    // The page reads the channel: one fetch, and the rows are now in the read-ahead memory.
+    let id = server.newest_id().await;
+    let after_page = server.discord.fetch_count();
+
+    // The first summary generates. The target is recalled; the store misses; the context needs the
+    // window in order, so one fetch is made (the page's own read did not go through the turn).
+    let first = summarise(&server, Scope::Write, &id).await;
+    assert!(
+        matches!(first.outcome, SummaryOutcome::Generated(_)),
+        "{first:?}"
+    );
+    assert_eq!(server.summarizer.calls(), 1);
+    let after_first = server.discord.fetch_count();
+    assert!(
+        after_first <= after_page + 1,
+        "{after_page} then {after_first}"
+    );
+
+    // Asked again within thirty seconds — a page reload in summary mode — it is a hit with no
+    // chat call at all, for either scope.
+    for scope in [Scope::Write, Scope::Read] {
+        let again = summarise(&server, scope, &id).await;
+        assert!(
+            matches!(again.outcome, SummaryOutcome::Cached(_)),
+            "{again:?}"
+        );
+        assert_eq!(again.outcome.text(), first.outcome.text());
+    }
+    assert_eq!(
+        server.discord.fetch_count(),
+        after_first,
+        "a hit on a row the page had just read went back to the chat provider"
+    );
+    assert_eq!(server.summarizer.calls(), 1);
+    let counts = server.state.summary_counters.snapshot();
+    assert_eq!(counts.requests, 3);
+    assert_eq!(counts.hits, 2);
+    assert_eq!(counts.hits_without_upstream, 2);
+    assert_eq!(counts.misses, 1);
+    assert_eq!(counts.generated, 1);
+    assert_eq!(counts.upstream_window_fetches, 1);
+
+    // THE CONTROL: with the memory gone (the purge clears it), the same hit reads the window.
+    server.state.read_ahead.clear();
+    let cold = summarise(&server, Scope::Write, &id).await;
+    assert!(
+        matches!(cold.outcome, SummaryOutcome::Cached(_)),
+        "{cold:?}"
+    );
+    assert_eq!(server.discord.fetch_count(), after_first + 1);
+    assert_eq!(
+        server
+            .state
+            .summary_counters
+            .snapshot()
+            .hits_without_upstream,
+        2
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn summaries_that_miss_together_share_one_window_fetch() {
+    // Ten long rows on screen, none of them in memory, none of them summarised: the page asks for
+    // all ten at once. One window read answers every one of them.
+    let server = new_server(400, 160, 3);
+    let ids: Vec<String> = (0..10)
+        .map(|n| {
+            server
+                .discord
+                .seed(&server.channel, "codex-eng", &long_text(&format!("row{n}")))
+                .0
+        })
+        .collect();
+    let slow = Arc::new(testing::SlowChat::new(
+        server.discord.clone(),
+        std::time::Duration::from_millis(1_000),
+    ));
+    let mut state = server.state.clone();
+    state.replace_chat(slow.clone());
+    let answers = futures_util::future::join_all(
+        ids.iter()
+            .map(|id| ops::summarize_message(&state, Scope::Write, READ_CHANNEL, id, &[], None)),
+    )
+    .await;
+    for answer in answers {
+        let answer = answer.expect("summarises");
+        assert!(
+            matches!(answer.outcome, SummaryOutcome::Generated(_)),
+            "{answer:?}"
+        );
+    }
+    assert_eq!(
+        slow.reads(),
+        1,
+        "ten summaries that missed together read the window apart"
+    );
+    assert_eq!(server.summarizer.calls(), 10);
+    // Each was summarised with its own context, taken from the one window.
+    assert!(server
+        .summarizer
+        .requests()
+        .iter()
+        .all(|asked| asked.context == 3));
+    let counts = state.summary_counters.snapshot();
+    assert_eq!(counts.upstream_window_fetches, 1);
+    assert_eq!(counts.shared_fetch_joins, 9);
+}
+
+#[tokio::test]
+async fn a_pushed_delete_is_not_summarised_from_memory() {
+    const INGEST_TOKEN: &str = "summaries-ingest-token-000000000";
+    let (state, discord, _store, summarizer) = testing::state_with_summarizer(&format!(
+        "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n",
+        toml_with(400, 160, 3)
+    ));
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let deleted = discord.seed(&channel, "codex-eng", &long_text("deleted")).0;
+    let unpushed = discord
+        .seed(&channel, "codex-eng", &long_text("unpushed"))
+        .0;
+    // The page reads the channel, and both rows are summarised and filed.
+    newest_id(&state).await;
+    for id in [&deleted, &unpushed] {
+        ops::summarize_message(&state, Scope::Write, READ_CHANNEL, id, &[], None)
+            .await
+            .expect("summarises");
+    }
+    assert_eq!(summarizer.calls(), 2);
+
+    // Both are deleted upstream; an adapter pushes the deletion of one.
+    discord.delete(&MessageId(deleted.clone()));
+    discord.delete(&MessageId(unpushed.clone()));
+    let push = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/live/events")
+        .header("authorization", format!("Bearer {INGEST_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "event_id": "delete-one",
+                "historical": false,
+                "kind": "delete",
+                "channel_id": READ_CHANNEL,
+                "message_id": deleted,
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let pushed = tower::ServiceExt::oneshot(vibe_talk::http::router(state.clone()), push)
+        .await
+        .expect("router");
+    assert_eq!(pushed.status(), axum::http::StatusCode::ACCEPTED);
+
+    // The pushed one goes upstream and is not there.
+    let error = ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &deleted, &[], None)
+        .await
+        .expect_err("a pushed delete was summarised from memory");
+    assert_eq!(error.code(), "unknown_message", "{error}");
+    // THE CONTROL: the one nobody pushed is still answered from the page's thirty-second memory,
+    // which is the window speech preparation accepts. The push is what made the difference.
+    let unpushed_answer =
+        ops::summarize_message(&state, Scope::Write, READ_CHANNEL, &unpushed, &[], None)
+            .await
+            .expect("served from memory");
+    assert!(
+        matches!(unpushed_answer.outcome, SummaryOutcome::Cached(_)),
+        "{unpushed_answer:?}"
+    );
+    assert_eq!(summarizer.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_thread_summary_recalls_only_from_that_thread() {
+    let server = new_server(400, 160, 3);
+    let content = long_text("threaded");
+    let id = server
+        .discord
+        .seed(&server.channel, "codex-eng", &content)
+        .0;
+    // What a thread view read in thread T, and a summary of it filed.
+    let window = ops::messages(&server.state, READ_CHANNEL, None)
+        .await
+        .expect("reads");
+    let message = window
+        .messages
+        .iter()
+        .find(|m| m.id.0 == id)
+        .expect("seeded")
+        .clone();
+    server.state.read_ahead.clear();
+    server.state.read_ahead.remember(
+        &server.channel,
+        Some("opaque/thread-T"),
+        std::slice::from_ref(&message),
+        std::time::Instant::now(),
+    );
+    server
+        .store
+        .cache_summary(&key_of(&server, &id, &content), "filed in thread T", None)
+        .await
+        .expect("file");
+    let fetched = server.discord.fetch_count();
+
+    let in_t = ops::summarize_message_scoped(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &id,
+        &[],
+        None,
+        Some("opaque/thread-T"),
+    )
+    .await
+    .expect("answered from memory");
+    assert_eq!(
+        in_t.outcome,
+        SummaryOutcome::Cached("filed in thread T".to_owned())
+    );
+    assert_eq!(
+        server.discord.fetch_count(),
+        fetched,
+        "a thread hit made a chat call"
+    );
+
+    // Another thread does not see what was read in T: it goes upstream, to a backend with no
+    // thread lookups, and is refused there rather than answered from T's memory.
+    let elsewhere = ops::summarize_message_scoped(
+        &server.state,
+        Scope::Write,
+        READ_CHANNEL,
+        &id,
+        &[],
+        None,
+        Some("opaque/thread-U"),
+    )
+    .await
+    .expect_err("thread U was answered from what thread T read");
+    assert_eq!(elsewhere.code(), "refused", "{elsewhere}");
+    assert_eq!(server.summarizer.calls(), 0);
+}
+
+/// A real SQLite store for `server`, so a row can be aged by hand and a restart reopens the file.
+fn sqlite_store(
+    dir: &testing::TempDir,
+) -> (
+    Arc<vibe_talk::store::sqlite::SqliteStore>,
+    std::path::PathBuf,
+) {
+    let file = dir.path().join("summaries.sqlite3");
+    let store = vibe_talk::store::sqlite::SqliteStore::open(&file, Default::default())
+        .expect("open the store");
+    (Arc::new(store), file)
+}
+
+fn age_every_summary(file: &std::path::Path, made_at_ms: i64) {
+    rusqlite::Connection::open(file)
+        .expect("open")
+        .execute("UPDATE summaries SET made_at_ms = ?1", [made_at_ms])
+        .expect("age");
+}
+
+#[tokio::test]
+async fn a_read_scope_hit_from_memory_writes_nothing() {
+    let dir = testing::TempDir::new("summaries-read-scope-touch");
+    let (store, file) = sqlite_store(&dir);
+    let mut server = new_server(400, 160, 3);
+    server.state.store = store.clone();
+    let content = long_text("deploy");
+    server.seed(&content);
+    let id = server.newest_id().await;
+    summarise(&server, Scope::Write, &id).await;
+    let key = key_of(&server, &id, &content);
+    let two_days_ago = vibe_talk::store::now_ms() - 2 * 86_400_000;
+    age_every_summary(&file, two_days_ago);
+
+    let hit = summarise(&server, Scope::Read, &id).await;
+    assert!(matches!(hit.outcome, SummaryOutcome::Cached(_)), "{hit:?}");
+    let held = store
+        .cached_summary(&key)
+        .await
+        .expect("read")
+        .expect("there");
+    assert_eq!(
+        held.made_at_ms, two_days_ago,
+        "a read-scope hit kept an entry alive"
+    );
+
+    // THE CONTROL: a write-scope hit on the same old row keeps it alive, once.
+    let hit = summarise(&server, Scope::Write, &id).await;
+    assert!(matches!(hit.outcome, SummaryOutcome::Cached(_)), "{hit:?}");
+    let held = store
+        .cached_summary(&key)
+        .await
+        .expect("read")
+        .expect("there");
+    assert!(
+        held.made_at_ms > vibe_talk::store::now_ms() - 60_000,
+        "{held:?}"
+    );
+    assert_eq!(server.summarizer.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_restart_or_a_change_of_a_setting_that_changes_no_word_asks_for_nothing_again() {
+    // `#257 summary-truncation`'s deploy swept every summary on its host, because the version
+    // hashed a setting that changes no word of an answer. Now the threshold and the deadline are
+    // out of the version, so a server started afresh with either changed — over the same file —
+    // finds every summary where the last one left it, and asks the model for none of them.
+    let dir = testing::TempDir::new("summaries-restart");
+    let (store, file) = sqlite_store(&dir);
+    let mut before = new_server(400, 160, 3);
+    before.state.store = store;
+    let content = long_text("deploy");
+    before.seed(&content);
+    let id = before.newest_id().await;
+    summarise(&before, Scope::Write, &id).await;
+    assert_eq!(before.summarizer.calls(), 1);
+
+    let changed = format!(
+        "{}\n[summaries]\nthreshold_chars = 300\ntarget_chars = 160\ncontext_messages = 3\n\
+         reply_timeout_seconds = 45\n",
+        testing::config_toml()
+    );
+    let (mut after, _discord, _store, summarizer) = testing::state_with_summarizer(&changed);
+    assert_eq!(
+        after.summary_version, before.state.summary_version,
+        "the threshold or the deadline moved the cache key"
+    );
+    after.replace_chat(before.discord.clone());
+    after.store = Arc::new(
+        vibe_talk::store::sqlite::SqliteStore::open(&file, Default::default()).expect("reopen"),
+    );
+    let answer = ops::summarize_message(&after, Scope::Write, READ_CHANNEL, &id, &[], None)
+        .await
+        .expect("summarises");
+    assert!(
+        matches!(answer.outcome, SummaryOutcome::Cached(_)),
+        "{answer:?}"
+    );
+    assert_eq!(summarizer.calls(), 0, "the restart asked the model again");
+}
+
+#[tokio::test]
+async fn a_stored_answer_cut_below_a_raised_cap_is_asked_for_again_only_by_a_writer() {
+    // A row filed cut at 100 characters — under a cap smaller than today's, as the rows the first
+    // start re-keys can be. A read token is served the shorter text it has, with no model call; a
+    // write token asks again and files the whole answer.
+    let server = new_server(400, 160, 3);
+    let content = long_text("deploy");
+    server.seed(&content);
+    let id = server.newest_id().await;
+    let key = key_of(&server, &id, &content);
+    server
+        .store
+        .cache_summary(&key, "An answer the old cap cut short…", Some(100))
+        .await
+        .expect("file");
+
+    let read = summarise(&server, Scope::Read, &id).await;
+    assert_eq!(
+        read.outcome,
+        SummaryOutcome::Cached("An answer the old cap cut short…".to_owned())
+    );
+    assert_eq!(
+        server.summarizer.calls(),
+        0,
+        "a read token spent the model on a stored answer"
+    );
+    assert_eq!(
+        server
+            .state
+            .summary_counters
+            .snapshot()
+            .served_below_cap_read_scope,
+        1
+    );
+
+    let write = summarise(&server, Scope::Write, &id).await;
+    assert!(
+        matches!(write.outcome, SummaryOutcome::Generated(_)),
+        "{write:?}"
+    );
+    assert_eq!(server.summarizer.calls(), 1);
+    let refiled = server
+        .store
+        .cached_summary(&key)
+        .await
+        .expect("read")
+        .expect("filed");
+    assert_eq!(
+        refiled.cut_at, None,
+        "the whole answer replaced the cut one"
+    );
+    assert_eq!(
+        server
+            .state
+            .summary_counters
+            .snapshot()
+            .regenerated_below_cap,
+        1
+    );
+
+    let again = summarise(&server, Scope::Write, &id).await;
+    assert!(
+        matches!(again.outcome, SummaryOutcome::Cached(_)),
+        "{again:?}"
+    );
+    assert_eq!(server.summarizer.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_lower_cap_cuts_what_it_serves_and_asks_for_nothing() {
+    // An answer filed whole at well past today's cap (a cap that has since come down): served cut
+    // at the cap in force, at a word boundary, from the store, with no model call.
+    let server = new_server(400, 160, 3);
+    let content = long_text("deploy");
+    server.seed(&content);
+    let id = server.newest_id().await;
+    let long_answer = "The runner stalled overnight and nobody noticed. ".repeat(30);
+    server
+        .store
+        .cache_summary(
+            &key_of(&server, &id, &content),
+            long_answer.trim_end(),
+            None,
+        )
+        .await
+        .expect("file");
+    let served = summarise(&server, Scope::Write, &id).await;
+    let text = served.outcome.text().expect("a summary").to_owned();
+    let cap = vibe_talk::summarize::hard_cap_chars(160);
+    assert!(text.chars().count() <= cap, "{}", text.chars().count());
+    assert!(text.ends_with('…'), "{text:?}");
+    assert!(
+        long_answer.starts_with(text.trim_end_matches('…')),
+        "{text:?}"
+    );
+    assert_eq!(server.summarizer.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_generated_answer_is_filed_whole_and_handed_out_cut() {
+    let server = new_server(400, 160, 3);
+    let answer = "The team found the storage leak in the build cache. ".repeat(20);
+    server.summarizer.answer_with(&answer);
+    let content = long_text("deploy");
+    server.seed(&content);
+    let id = server.newest_id().await;
+    let generated = summarise(&server, Scope::Write, &id).await;
+    let shown = generated.outcome.text().expect("a summary").to_owned();
+    assert!(shown.chars().count() <= vibe_talk::summarize::hard_cap_chars(160));
+    assert!(shown.ends_with('…'), "{shown:?}");
+    let filed = server
+        .store
+        .cached_summary(&key_of(&server, &id, &content))
+        .await
+        .expect("read")
+        .expect("filed");
+    assert_eq!(
+        filed.text,
+        answer.trim_end(),
+        "what is filed is the whole answer"
+    );
+    assert_eq!(filed.cut_at, None);
+    // ...and serving it from the store shows exactly what generating it showed.
+    let cached = summarise(&server, Scope::Write, &id).await;
+    assert_eq!(cached.outcome, SummaryOutcome::Cached(shown));
 }
