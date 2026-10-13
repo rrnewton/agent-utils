@@ -47,6 +47,7 @@
 pub mod access;
 pub mod agent_backend;
 pub mod auth;
+pub mod cache;
 pub mod chat;
 pub mod clock;
 pub mod config;

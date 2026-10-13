@@ -107,6 +107,13 @@ tower-http = { version = "0.6", default-features = false, features = ["compressi
 # ammonia and reqwest; see `render::web_address`.
 url = "2"
 
+# The message cache's file lock and its directory-ownership check (`src/cache/file.rs`): `flock`,
+# the effective user id, and the host name the default cache path carries. Safe wrappers, because
+# this crate forbids `unsafe`, and the standard library's own `File::lock` arrived after the
+# declared Rust 1.85.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "system"] }
+
 [dev-dependencies]
 http-body-util = "0.1"
 # The live ElevenLabs client is exercised against a one-shot loopback HTTP server, which is what
