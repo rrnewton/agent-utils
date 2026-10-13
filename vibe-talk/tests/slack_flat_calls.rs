@@ -866,3 +866,75 @@ async fn a_thread_too_long_to_count_is_read_on_every_flat_read() {
     assert!(second.threads().iter().all(|thread| *thread == root));
     assert_eq!(second.messages, first.messages);
 }
+
+/// One older reply deleted while a system event and a real reply are posted, the root counting
+/// both: the count grows by one, and one real reply came back, ending at the root's latest. Only
+/// counting EVERY message the forward read brought, the system event included, shows that the two
+/// do not add up. The thread is read in full, and the deleted reply goes; and since its root
+/// counts a reply Flat does not keep, it is never held, but read in full on every Flat read, as
+/// before W8. Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_deletion_behind_a_system_event_and_a_reply_is_read_in_full() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+
+    let (churned, index) = roots[3].clone();
+    let gone = reply_ts(index, 5);
+    delete_from_feed(&fake, &churned, &gone);
+    fake.with(|state| {
+        let mut event = slack_fake::system(&ts(9300, 0), "thread_event");
+        event["thread_ts"] = json!(churned);
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), churned.clone()))
+            .expect("thread")
+            .push(event);
+    });
+    add_reply(&fake, &churned, &ts(9301, 0));
+    let read = flat(&fake, &client).await;
+    assert!(!read.messages.contains(&gone), "the deleted reply is gone");
+    assert!(read.messages.contains(&ts(9301, 0)));
+    assert!(!read.messages.contains(&ts(9300, 0)), "a system event");
+    assert!(
+        reads_of(&read, &churned)
+            .iter()
+            .any(|params| !params.contains_key("oldest")),
+        "read in full: {:?}",
+        reads_of(&read, &churned)
+    );
+
+    let again = flat(&fake, &client).await;
+    assert_eq!(
+        again.threads(),
+        [churned.clone(), churned.clone()],
+        "a count that includes a system event is never trusted"
+    );
+    assert_eq!(again.messages, read.messages);
+
+    // A system event and a real reply, nothing deleted: the count grew by as many as came back,
+    // but one of them is not a reply Flat keeps, so nothing is merged; the thread is read in full
+    // and shows the reply alone.
+    let (quiet, _) = roots[4].clone();
+    fake.with(|state| {
+        let mut event = slack_fake::system(&ts(9400, 0), "thread_event");
+        event["thread_ts"] = json!(quiet);
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), quiet.clone()))
+            .expect("thread")
+            .push(event);
+    });
+    add_reply(&fake, &quiet, &ts(9401, 0));
+    let mixed = flat(&fake, &client).await;
+    assert!(mixed.messages.contains(&ts(9401, 0)));
+    assert!(
+        !mixed.messages.contains(&ts(9400, 0)),
+        "a system event merged into Flat"
+    );
+    assert!(reads_of(&mixed, &quiet)
+        .iter()
+        .any(|params| !params.contains_key("oldest")));
+}

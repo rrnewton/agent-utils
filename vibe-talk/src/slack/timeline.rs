@@ -679,8 +679,13 @@ impl HttpSlackClient {
     /// read has nothing new: the replies held are reused, at no call. A thread whose root names a
     /// newer latest reply and a higher count is read forward from the newest reply held
     /// (`conversations.replies oldest=`), one call for up to a page of new replies, and kept only
-    /// when exactly as many new replies came back as the count grew by, ending at the latest the
-    /// root names. Anything else reads the thread's newest replies in full, as every Flat read
+    /// when exactly as many messages came back as the count grew by, every one of them a real
+    /// reply, the last at the latest the root names. Every message newer than the newest held is
+    /// new, so when the count grew by exactly that many, nothing older was deleted: a deletion
+    /// lowers the count, and so would need more new messages than came back to hide. That holds
+    /// only because system events are counted too (`replies_all_after`): one posted alongside a
+    /// real reply, while an older reply was deleted, would otherwise make up the difference.
+    /// Anything else reads the thread's newest replies in full, as every Flat read
     /// used to: a count that fell or did not add up (a deletion), more new replies than a Flat page
     /// shows of a thread, a thread never read, or one last read in full [`FLAT_RECONCILE`] ago or
     /// longer. A full read is held only when it agrees with the root: see the comment at the end.
@@ -693,10 +698,9 @@ impl HttpSlackClient {
     /// the thread view, which reads the thread itself, shows it at once, and once it has, the next
     /// Flat read reads that thread in full (`check_flat_against_thread`).
     ///
-    /// One hole is known, and left to the reconcile: an older reply deleted while two new ones are
-    /// posted, one of them a system event that is not kept, raises the count by one and brings one
-    /// real reply ending at the latest. That adds up, so the deleted reply stays until the thread's
-    /// next full read.
+    /// What a count cannot show is left to the reconcile: two lags in the server's replies feed
+    /// that cancel out, a deletion it still lists and a new reply, not the newest, it does not yet
+    /// show, leave the count and the latest reply as the root reports them.
     async fn flat_replies(&self, conversation: &str, root: &Raw) -> Result<Vec<Raw>, ChatError> {
         let key = (conversation.to_owned(), root.ts.clone());
         let latest = root.activity_micros();
@@ -705,22 +709,19 @@ impl HttpSlackClient {
             if held.latest_reply == latest && held.reply_count == count {
                 return Ok(held.replies);
             }
-            let grew = count.saturating_sub(held.reply_count);
-            if latest > held.latest_reply
-                && grew > 0
-                && usize::try_from(grew).is_ok_and(|grew| grew <= FLAT_MAX_REPLIES)
-            {
+            let grew = usize::try_from(count.saturating_sub(held.reply_count))
+                .ok()
+                .filter(|grew| (1..=FLAT_MAX_REPLIES).contains(grew) && latest > held.latest_reply);
+            if let Some(grew) = grew {
                 let fresh = self
-                    .replies_oldest_after(
-                        conversation,
-                        &root.ts,
-                        Some(held.latest_reply),
-                        FLAT_MAX_REPLIES + 1,
-                    )
-                    .await?;
-                let adds_up = u64::try_from(fresh.len()).is_ok_and(|added| added == grew)
-                    && fresh.last().is_some_and(|raw| raw.micros == latest);
-                if adds_up {
+                    .replies_all_after(conversation, &root.ts, held.latest_reply, grew)
+                    .await?
+                    .filter(|fresh| {
+                        fresh.len() == grew
+                            && fresh.iter().all(Raw::is_real)
+                            && fresh.last().is_some_and(|raw| raw.micros == latest)
+                    });
+                if let Some(fresh) = fresh {
                     let mut replies = held.replies;
                     replies.extend(fresh);
                     replies.sort_by_key(|raw| raw.micros);

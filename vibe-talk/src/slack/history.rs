@@ -297,6 +297,52 @@ impl HttpSlackClient {
         Ok(nearest(&real, want, Toward::Newer))
     }
 
+    /// Every message of a thread strictly newer than `after`, system events included, root
+    /// excluded, oldest first, each once; or `None` when there are more than `most` of them, or
+    /// when the walk ran out of pages before the end of the thread. `#282 slack-flat-skip`,
+    /// remote-ops audit W8 review.
+    ///
+    /// In feed order, so a handful of new replies costs one call, as with
+    /// [`Self::replies_oldest_after`]. Unlike that, it counts what is not kept: a reply count that
+    /// grew by exactly as many messages as came back, every one of them real, is what shows that
+    /// nothing older was deleted meanwhile.
+    pub(super) async fn replies_all_after(
+        &self,
+        conversation: &str,
+        thread_ts: &str,
+        after: i64,
+        most: usize,
+    ) -> Result<Option<Vec<Raw>>, ChatError> {
+        let mut all: Vec<Raw> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_WALK_PAGES {
+            let ask = u16::try_from((most + 1).saturating_sub(all.len()) + 10)
+                .unwrap_or(SCAN_PAGE_LIMIT)
+                .min(SCAN_PAGE_LIMIT);
+            let page = self
+                .page(
+                    Feed::Replies(conversation, thread_ts),
+                    Some(after),
+                    None,
+                    false,
+                    ask,
+                    cursor.as_deref(),
+                )
+                .await?;
+            all.extend(page.raws.into_iter().filter(|raw| raw.ts != thread_ts));
+            all.sort_by_key(|raw| raw.micros);
+            all.dedup_by_key(|raw| raw.micros);
+            if all.len() > most {
+                return Ok(None);
+            }
+            if !page.has_more {
+                return Ok(Some(all));
+            }
+            cursor = advance(cursor, page.next_cursor)?;
+        }
+        Ok(None)
+    }
+
     /// The newest `want` real messages of a thread strictly older than `before`, or the newest
     /// of all when `before` is `None`. The root is part of the thread and appears on its oldest page.
     pub(super) async fn replies_newest_before(
