@@ -11,9 +11,10 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
   1. Where it is: in normal flow (`position: static`) as the element after #transcript on the
      call's view, before #channel-composer on the channel, and docked inside the viewport on
      Settings.
-  2. Reach: at the newest line, Send's centre is at least 0.62 of the way down the screen, Send is
-     at least 44px tall, it ends at or above the message box's top, it is under neither the status
-     pill, the chips nor the jump, and nothing runs wider than the screen.
+  2. Reach: at the newest line, Send's centre is at least 0.62 of the way down the screen (on the
+     call's view in every run, and on the channel), Send is at least 44px tall, it ends at or above
+     the message box's top, it is under neither the status pill, the chips nor the jump, and nothing
+     runs wider than the screen.
   3. Whenever Send is on screen, so are the line saying where the draft goes and the whole of
      Send's label. A long draft is folded, and More opens it without pushing those two off screen.
      Docked under Settings the card is never a scroll box of its own: folded and after More, the
@@ -635,6 +636,10 @@ def placement_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
     check(m["parent"] == "pane-discord" and m["next"] == "channel-composer",
           f"{where}: on the channel the card is not just above the box: {m['parent']}, before {m['next']}")
     check(m["position"] == "static", f"{where}: on the channel the card is positioned")
+    # Point 2's reach on the channel too: the card is the channel's next message there.
+    channel_centre = (rect(m["send"], "top") + rect(m["send"], "bottom")) / 2 / float(str(m["innerHeight"]))
+    check(channel_centre >= REACH,
+          f"{where}: on the channel Send's centre is at {channel_centre:.2f} of the screen, above {REACH}")
     for floating in ("pill", "tools", "jump"):
         check(not overlaps(m["send"], m[floating]), f"{where}: on the channel the {floating} is drawn over Send")
     status_steady(page, f"{where}, channel")
