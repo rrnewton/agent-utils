@@ -450,7 +450,9 @@ and this server deliberately implements only the current one. Choosing SSE will 
 That table is the whole policy: **reading is automatic while you are driving, posting asks first.**
 The one exception is yours to make: the voice page's Settings has **Ask me before the voice agent
 sends** first in the **Voice agent** section, under **Sending**, on by default. Turn it off and the agent posts as soon as you ask, with no
-read-back — then set `post_reply` to **auto** here and paste the matching prompt in step 5.
+read-back — then set `post_reply` to **auto** here and paste the matching prompt in step 5 (no
+re-paste of the prompt if you let the server give the agent its prompt, at the end of step 5; the
+approval here is changed by hand either way).
 
 **Be clear about who enforces that.** Fine-Grained Tool Approval runs on **ElevenLabs' side**.
 This server cannot see it, cannot verify you set it, and cannot tell if it is changed later. What
@@ -475,20 +477,33 @@ and let it be physically incapable of proposing at all.
    a draft still waiting. Called with the same token, `GET /api/v1/voice-agent` returns the
    already-assembled text as `prompt.text`, and its `variant` names which one it is. **This agent
    was configured by hand, so it does not follow a change of the setting: paste the prompt again,
-   and the `post_reply` approval from step 4, whenever you change it.** The files are
+   and the `post_reply` approval from step 4, whenever you change it** — or let the server give it
+   its prompt, below, and change only the approval. The files are
    provider-neutral so a deployment-managed voice bridge and a hosted agent can use the same
    reviewed instructions instead of maintaining separate, drifting copies.
 
-   **Optional: let Settings' Instructions replace this prompt.** The voice page's Settings has
-   **Voice agent → Instructions**: additional instructions, and the system prompt itself to edit.
-   For this agent the page hands them over as each call starts. If the agent's **Security** settings
-   allow the **system prompt** to be overridden, a call is given the server's whole assembled
-   prompt — your edits, your instructions, and the send rules for the write token under the
-   current Sending setting, so it also stops needing a re-paste when that setting changes. Allow it
-   only for an agent holding the **write token**: the page always gives it the write token's rules.
-   Without the override the agent keeps the prompt pasted here, your additional instructions reach
-   it as a note at the start of each call, and an edited system prompt does not reach it at all;
-   Settings says which happened on the last call. With nothing saved there, nothing changes.
+   **Optional: let the server give the agent its prompt.** If the agent's **Security** settings
+   allow the **system prompt** to be overridden, the voice page hands it this server's whole
+   assembled prompt as every call starts, **whether or not anything is saved in Settings**: your
+   edited system prompt from Settings' **Voice agent → Instructions** if you saved one, otherwise
+   the shipped prompt; your additional instructions from there, if any; and always the send rules
+   for the write token under the current **Sending** setting. So the agent follows that setting
+   from its next call with no
+   re-paste, and the prompt pasted here is no longer used at all. What it does not change is the
+   `post_reply` approval from step 4: that lives at ElevenLabs, out of this server's reach, and is
+   still changed by hand when the setting changes.
+
+   Allow it only for an agent holding the **write token**. The page always gives it the write
+   token's rules, because this server cannot see which token you gave the agent here; one holding
+   the read token would be told it may send, and every send would be refused. If you later withdraw
+   the permission, wait two minutes, or restart the server, before the next call: the server keeps
+   the agent's answer that long, and an override the agent does not allow is believed to end the
+   call.
+
+   Without the override the agent keeps the prompt pasted here: your additional instructions reach
+   it as a note at the start of each call, an edited system prompt does not reach it, and a change
+   of the Sending setting needs the prompt pasted again. Settings says which happened on the last
+   call, under Instructions and beside the Sending switch.
 
 ## Step 6 — Talk to it
 
