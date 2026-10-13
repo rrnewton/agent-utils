@@ -32,12 +32,17 @@ What it checks, each proven able to fail by `--self-test`:
   has `role="img"` and an accessible name.
 * **Assets.** Only known file types live in `site/`, `index.html` and `.nojekyll` exist, GIFs are
   at most 3 MB each, other images at most 1.5 MB, text assets at most 256 KB.
+* **What is published.** `site/demos/` holds the tools that record the site's media. It is
+  repository source, not website: its files are not checked as website files, `--stage` leaves it
+  out of what the Pages workflow uploads, and a page link into it is refused, because the target
+  would not exist once published.
 
 The pages' own content, wording and visual quality are a human's job; see `site/README.md`.
 
 Usage:
     python3 scripts/check_site.py
     python3 scripts/check_site.py --self-test
+    python3 scripts/check_site.py --stage DIR    # check, then copy the published files into DIR
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ import base64
 import hashlib
 import html
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,6 +96,9 @@ IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".avif", ".ico"})
 TEXT_SUFFIXES = frozenset({".html", ".css", ".svg", ".js", ".txt", ".md"})
 #: `.nojekyll` and `README.md` are named; anything else needs a known suffix.
 NAMED_FILES = frozenset({".nojekyll"})
+#: Top-level directories of `site/` that are repository source, never published: `demos/` holds
+#: the tools that record the site's media (a Python recorder, a mock server, a config template).
+UNPUBLISHED = frozenset({"demos"})
 
 #: CSP source expressions that keep every load on this origin.
 CSP_ALLOWED_SOURCE = re.compile(r"^(?:'self'|'none'|'sha256-[A-Za-z0-9+/]+={0,2}')$")
@@ -491,6 +500,26 @@ def _inside(path: Path, directory: Path) -> bool:
     return True
 
 
+def _unpublished(path: Path, site: Path) -> str | None:
+    """The `UNPUBLISHED` directory `path` lies in, or None; both paths resolved or both not."""
+
+    try:
+        parts = path.relative_to(site).parts
+    except ValueError:
+        return None
+    return parts[0] if parts and parts[0] in UNPUBLISHED else None
+
+
+def published_files(site: Path) -> list[Path]:
+    """Every file under `site` that GitHub Pages serves, symlinks included so they are refused."""
+
+    return sorted(
+        path
+        for path in site.rglob("*")
+        if (path.is_file() or path.is_symlink()) and _unpublished(path, site) is None
+    )
+
+
 def _resolve_local(
     base_file: Path, target: str, site: Path
 ) -> tuple[Path | None, str | None]:
@@ -506,6 +535,12 @@ def _resolve_local(
     resolved = (base_file.parent / unquote(target)).resolve()
     if not _inside(resolved, site.resolve()):
         return None, f"{target!r} leaves {SITE}/; link repository files by their GitHub URL"
+    hidden = _unpublished(resolved, site.resolve())
+    if hidden is not None:
+        return None, (
+            f"{target!r} is in {SITE}/{hidden}/, which is repository source and is not "
+            "published; link it by its GitHub URL"
+        )
     if resolved.is_dir():
         resolved = resolved / "index.html"
     if not resolved.is_file():
@@ -770,7 +805,7 @@ def check_site(site: Path, repo: Repo) -> Report:
     if not site.is_dir():
         report.problems.append(f"{site} is not a directory")
         return report
-    files = sorted(path for path in site.rglob("*") if path.is_file() or path.is_symlink())
+    files = published_files(site)
     report.files = len(files)
     root = repo.root
     for path in files:
@@ -805,6 +840,23 @@ def check_site(site: Path, repo: Repo) -> Report:
                 f"{label}: {problem}" for problem in _check_css_or_svg(path, text, site)
             )
     return report
+
+
+def stage(site: Path, destination: Path) -> int:
+    """Copy exactly the published files of `site` into `destination`; return how many.
+
+    Run only after `check_site` passed, so there is no symlink to copy. The destination must be
+    absent or empty: files left over from something else would be published too.
+    """
+
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise SystemExit(f"check-site: --stage {destination} must be absent or an empty directory")
+    files = published_files(site)
+    for path in files:
+        target = destination / path.relative_to(site)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+    return len(files)
 
 
 def _git_lines(argv: Sequence[str]) -> list[str]:
@@ -1076,8 +1128,20 @@ def self_test() -> int:
 
     def add_file(name: str, size: int) -> Callable[[Path, Repo], Repo | None]:
         def mutate(site: Path, repo: Repo) -> Repo | None:
+            (site / name).parent.mkdir(parents=True, exist_ok=True)
             with open(site / name, "wb") as handle:
                 handle.truncate(size)
+            return None
+        return mutate
+
+    def with_demo(markup: str) -> Callable[[Path, Repo], Repo | None]:
+        """A recorder under site/demos/, plus `markup` in the index page's body."""
+        def mutate(site: Path, repo: Repo) -> Repo | None:
+            add_file("demos/clips/record.py", 10)(site, repo)
+            # other.html links back to index.html#part, so the page keeps that heading.
+            (site / "index.html").write_text(
+                _page(body=markup + '\n<h2 id="part">Part</h2>'), encoding="utf-8"
+            )
             return None
         return mutate
 
@@ -1107,6 +1171,12 @@ def self_test() -> int:
         ("an unknown file type", add_file("tool.php", 10), "not a known website file type"),
         ("a missing .nojekyll", remove(".nojekyll"), ".nojekyll is missing"),
         ("a missing index.html", remove("index.html"), "index.html is missing"),
+        ("a page link into the unpublished demos/",
+         with_demo('<p><a href="demos/clips/record.py">x</a></p>'), "is not published"),
+        ("an image loaded from the unpublished demos/",
+         with_demo('<img src="./demos/clips/record.py" alt="a">'), "is not published"),
+        ("an unknown file type beside, not inside, demos/",
+         add_file("demos-old/record.py", 10), "not a known website file type"),
     ]
 
     for why, mutate, needle in cases:
@@ -1119,6 +1189,30 @@ def self_test() -> int:
     # A GIF exactly at the cap is allowed: the cap is inclusive, so this is the boundary control.
     at_cap = run(add_file("demo.gif", GIF_LIMIT))
     expect(at_cap == [], f"a GIF of exactly {GIF_LIMIT:,} bytes must pass, got {at_cap}")
+
+    # The recorder's own files are not website files: no type or size rule applies to them.
+    demo_source = run(with_demo("<p>x</p>"))
+    expect(demo_source == [], f"files under demos/ are not website files, got {demo_source}")
+
+    # --stage publishes exactly what was checked: everything but demos/, nothing extra.
+    with tempfile.TemporaryDirectory(prefix="check-site-self-test-") as raw:
+        root = Path(raw)
+        repo = _fixture(root)
+        site = root / SITE
+        with_demo("<p>x</p>")(site, repo)
+        staged_dir = root / "staged"
+        count = stage(site, staged_dir)
+        staged = sorted(path.relative_to(staged_dir).as_posix()
+                        for path in staged_dir.rglob("*") if path.is_file())
+        want = [".nojekyll", "index.html", "mark.svg", "other.html", "style.css"]
+        expect(staged == want and count == len(want),
+               f"--stage must copy exactly {want}, copied {staged} ({count})")
+        refused = False
+        try:
+            stage(site, staged_dir)
+        except SystemExit:
+            refused = True
+        expect(refused, "--stage into a directory that already holds files must be refused")
 
     for failure in failures:
         print(f"FAIL  {failure}", file=sys.stderr)
@@ -1134,6 +1228,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--self-test", action="store_true", help="prove each check can fail, then exit")
+    parser.add_argument(
+        "--stage",
+        type=Path,
+        metavar="DIR",
+        help="after a passing check, copy exactly the published files (everything under site/ "
+        "except site/demos/) into DIR, which must be absent or empty; the Pages workflow "
+        "uploads DIR. Nothing is copied when the check fails",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.self_test:
         return self_test()
@@ -1150,6 +1252,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         f"check-site: ok — {report.pages} pages, {report.files} files, "
         f"{report.local_links} local links, {report.repo_links} repository links"
     )
+    if args.stage is not None:
+        copied = stage(REPO_ROOT / SITE, args.stage)
+        print(f"check-site: staged {copied} published files in {args.stage}")
     return 0
 
 
