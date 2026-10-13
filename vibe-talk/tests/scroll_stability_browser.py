@@ -41,7 +41,17 @@ and then, at each size:
   with the list at its foot, and is still there a second and a half later; scrolled to its head, the page
   of older replies it reads in keeps the row the reader is on where it was -> the thread whose newest
   reply alone is unread opens at its foot too -> the page reloaded with its read held: the rows this
-  device saved are up at once, the reader scrolls up, and the read let go leaves them where they are.
+  device saved are up at once, the reader scrolls up, and the read let go leaves them where they are ->
+  `#281 view-keys`: the view keys, Ctrl at the desk and Cmd on the phone, each followed by 2.5 s sampled at
+  every frame in which nothing may move: at the desk Ctrl+3 from two columns shows their cards across the
+  window at their foot, Ctrl+4 keeps them there, and Ctrl+1 leaves Main still; then, at each size, with
+  Main scrolled up, the thread list opens at its foot, Main comes back from it on the row and offset the
+  reader left it at, All shows and holds, the thread list opens at its foot from All too, and at the desk
+  the long thread opened from it by its card's replies button opens across the window at its foot and
+  holds, Esc comes back to the list at its foot, and Ctrl+4 brings two columns with the cards at their
+  foot. Without the cards placed after the view picker
+  says the thread list, whose wider name wraps the desk's dock, the list opened 86px above its foot from
+  two columns, and 43px from Main.
 
 and last, at the desk, sampled at every frame for 2.5 s: a card highlighted by a click, whose root is a
 screen off Main, and the mouse going on over another card to the dock leaves Main still; coming back to
@@ -115,19 +125,21 @@ FIRST_ROW_JS = """(list) => {
 GAP_JS = """(id) => { const area = document.getElementById(id);
     return area.scrollHeight - area.scrollTop - area.clientHeight; }"""
 
-# Main's first row on screen and its offset, sampled at every frame until UNWATCH_JS: a jump that snaps
-# back between two measurements shows here.
-WATCH_JS = """() => {
-    const area = document.getElementById('scroll-area');
-    const list = document.getElementById('discord-log');
+# A list's first row on screen, its offset, and how far the list runs below what its scroller shows,
+# sampled at every frame until UNWATCH_JS: a jump that snaps back between two measurements shows here.
+# Main's by default; the cards' (`side-cards`) for the thread list (`#281 view-keys`).
+WATCH_JS = """(listId) => {
+    const area = document.getElementById(listId === 'discord-log' ? 'scroll-area' : 'side-scroll');
+    const list = document.getElementById(listId);
     const first = () => {
         const top = area.getBoundingClientRect().top;
+        const gap = area.scrollHeight - area.scrollTop - area.clientHeight;
         for (const row of list.children) {
             if (!row.hasAttribute('data-id') || !row.getClientRects().length) continue;
             const box = row.getBoundingClientRect();
-            if (box.bottom > top) return [row.getAttribute('data-id'), box.top - top];
+            if (box.bottom > top) return [row.getAttribute('data-id'), box.top - top, gap];
         }
-        return [null, 0];
+        return [null, 0, gap];
     };
     const watch = {samples: [], on: true};
     window.__scrollWatch = watch;
@@ -396,6 +408,11 @@ class Reader:
     def check(self, condition: bool, why: str) -> None:
         check(condition, f"{self.label}: {why}")
 
+    def main_view(self) -> str:
+        """What the view picker says while Main is the list on the left: "main" in one column, and at the desk
+        "columns", since two columns are its fourth view and always have Main on the left (`#281 view-keys`)."""
+        return "main" if self.touch else "columns"
+
     def shot(self, name: str) -> None:
         if self.screenshots:
             self.page.screenshot(path=str(self.screenshots / f"{self.label}-{name}.png"))
@@ -436,22 +453,25 @@ class Reader:
         self.check(after[0] == before[0] and abs(after[1] - before[1]) <= STILL_PX,
                    f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {after[0]} at {after[1]:.1f}px")
 
-    def watch(self) -> None:
-        """Start sampling Main's first row on screen and its offset at every frame."""
-        self.page.evaluate(WATCH_JS)
+    def watch(self, list_id: str = "discord-log") -> None:
+        """Start sampling the first row on screen of `list_id` (Main's by default) and its offset at every frame."""
+        self.page.evaluate(WATCH_JS, list_id)
 
-    def held(self, before: tuple[str, float], why: str, hold_ms: int = GLIDE_HOLD_MS) -> None:
+    def held(self, before: tuple[str, float], why: str, hold_ms: int = GLIDE_HOLD_MS,
+             list_id: str = "discord-log", foot: bool = False) -> None:
         """Wait `hold_ms`, then: at every frame since `watch`, the row the reader was on was the first on
-        screen, within a pixel of where it was."""
+        screen of `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot."""
         self.page.wait_for_timeout(hold_ms)
         self.frames(2)
         samples = self.page.evaluate(UNWATCH_JS)
         self.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
-        for row, offset in samples:
+        for row, offset, gap in samples:
             self.check(row == before[0] and abs(float(offset) - before[1]) <= STILL_PX,
                        f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {row} at "
                        f"{float(offset):.1f}px within {hold_ms}ms")
-        self.still(before, why)
+            self.check(not foot or float(gap) <= 1, f"{why}: the list was {float(gap):.0f}px above its foot "
+                       f"within {hold_ms}ms")
+        self.still(before, why, list_id)
 
     def overflow(self) -> None:
         wide = float(self.page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth"))
@@ -493,6 +513,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 cards_walk(reader)
             thread_walk(reader)
             reload_walk(reader, f"http://127.0.0.1:{server.server_port}/voice")
+            view_keys_walk(reader)
             if not touch:
                 highlight_walk(reader)
             reader.check(not errors, f"the page threw: {errors}")
@@ -522,7 +543,7 @@ def open_main(reader: Reader) -> None:
         reader.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
                         " && document.querySelectorAll('#side-cards > li').length > 0",
                         "pressing the layout button did not draw the right column's cards")
-    reader.wait_for("() => document.getElementById('thread-select').value === 'main'"
+    reader.wait_for(f"() => document.getElementById('thread-select').value === '{reader.main_view()}'"
                     f" && document.querySelectorAll('#discord-log > li[data-id]').length >= {MAIN_TO - MAIN_FROM}",
                     "Main is not the list on the left")
     reader.quiet(800)
@@ -900,7 +921,7 @@ def reload_walk(reader: Reader, url: str) -> None:
     api.timeline_gate.clear()
     reads = api.timeline_requests()
     page.goto(url, wait_until="load")
-    reader.wait_for("() => document.getElementById('thread-select').value === 'main'"
+    reader.wait_for(f"() => document.getElementById('thread-select').value === '{reader.main_view()}'"
                     " && document.querySelectorAll('#discord-log > li[data-id]').length > 30",
                     "the reload did not draw Main's saved rows at once")
     deadline = time.monotonic() + 10
@@ -915,6 +936,112 @@ def reload_walk(reader: Reader, url: str) -> None:
     reader.still(before, "the read behind the saved rows landing")
     reader.overflow()
     reader.notes.append("after a reload, the read behind the saved rows left the reader where they had scrolled")
+
+
+def view_key(reader: Reader, digit: int, view: str, layout: str | None) -> None:
+    """A view key (`#281 view-keys`): Ctrl+`digit` at the desk and Cmd+`digit` on the phone, since the page
+    reads the chord with either key on every platform. The view picker says `view`, the main screen
+    carries `data-columns` `layout` (none for one column), and two frames are drawn."""
+    page = reader.page
+    page.keyboard.press(f"{'Meta' if reader.touch else 'Control'}+{digit}")
+    columns = "null" if layout is None else f"'{layout}'"
+    reader.wait_for(f"() => document.getElementById('thread-select').value === '{view}'"
+                    f" && document.getElementById('screen-main').getAttribute('data-columns') === {columns}",
+                    f"the view key {digit} did not show {view}")
+    reader.frames(2)
+
+
+def list_at_foot(reader: Reader, why: str) -> None:
+    """The thread list on screen at its foot, where it opens, and held there and still for the glide's wait
+    and more."""
+    gap = reader.gap("side-scroll")
+    reader.check(gap <= 1, f"{why}: the thread list opened {gap:.0f}px above its foot")
+    before = reader.first("side-cards")
+    reader.watch("side-cards")
+    reader.held(before, why, list_id="side-cards", foot=True)
+
+
+def main_held(reader: Reader, why: str) -> None:
+    """Main as the view key left it, and nothing moving it after, for the glide's wait and more."""
+    before = reader.first()
+    reader.watch()
+    reader.held(before, why)
+
+
+def view_keys_walk(reader: Reader) -> None:
+    """`#281 view-keys` x `#280 scroll-stability`: the view keys show each view at once where it is to be read
+    -- at its newest, or where the reader left it -- and nothing moves it after, for the glide's wait and
+    more; the thread list opens at its foot. Main left at one width -- one column, and behind the thread
+    list, which is one column too -- comes back exactly where it was."""
+    page = reader.page
+    size = page.viewport_size
+    assert size is not None
+    page.mouse.move(5, size["height"] - 5)
+    key = "Cmd" if reader.touch else "Ctrl"
+    if not reader.touch:
+        # From two columns, the cards at their foot: the thread list is those cards across the window, at
+        # their foot still; and two columns again keep them there, Main beside them still.
+        side_to_foot(reader)
+        view_key(reader, 3, "threads", "list")
+        list_at_foot(reader, "Ctrl+3 from two columns")
+        view_key(reader, 4, "columns", "two")
+        gap = reader.gap("side-scroll")
+        reader.check(gap <= 1, f"Ctrl+4 from the thread list left the cards {gap:.0f}px above their foot")
+        main_held(reader, "Ctrl+4 from the thread list")
+        # Out of two columns, Main widening as they go: nothing after the switch moves it.
+        view_key(reader, 1, "main", None)
+        main_held(reader, "Ctrl+1 from two columns")
+        reader.notes.append("Ctrl+3 from two columns showed their cards at their foot, Ctrl+4 kept them there, "
+                            "and Ctrl+1 left Main still after it")
+    reader.scroll_main(0.4)
+    reader.check(reader.gap("scroll-area") > 400, "Main is too short to scroll up in, so this proves nothing")
+    kept = reader.first()
+    view_key(reader, 3, "threads", "list")
+    reader.shot("6-thread-list")
+    list_at_foot(reader, f"{key}+3 from Main scrolled up")
+    view_key(reader, 1, "main", None)
+    reader.still(kept, f"{key}+1 back from the thread list")
+    reader.watch()
+    reader.held(kept, f"{key}+1 back from the thread list")
+    reader.notes.append(f"{key}+3 opened the thread list at its foot and held it {GLIDE_HOLD_MS}ms; {key}+1 came "
+                        "back to Main where the reader had left it, and held it")
+    view_key(reader, 2, "flat", None)
+    main_held(reader, f"{key}+2 from Main")
+    view_key(reader, 3, "threads", "list")
+    list_at_foot(reader, f"{key}+3 from All")
+    reader.notes.append(f"{key}+2 showed All and nothing moved it after; {key}+3 from it opened the thread list "
+                        "at its foot")
+    if reader.touch:
+        view_key(reader, 1, "main", None)
+        main_held(reader, "Cmd+1 from the thread list")
+        return
+    # A thread opened from the thread list, across the window: the long thread, nothing in it unread and
+    # never opened in this column, at its foot and held there; Esc goes back to the list, at its foot.
+    page.locator(f"#side-cards > li[data-id='{LONG}'] .side-card-open").click()
+    reader.wait_for(f"() => document.getElementById('thread-select').value === 'thread:{LONG}'"
+                    " && !document.getElementById('screen-main').hasAttribute('data-columns')"
+                    " && document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                    "the long thread's replies button in the thread list did not open it across the window")
+    reader.frames(2)
+    gap = reader.gap("scroll-area")
+    reader.check(gap <= 1, f"the long thread opened from the thread list {gap:.0f}px above its foot")
+    reader.check(bool(page.evaluate("() => { const area = document.getElementById('scroll-area');"
+                                    " return area.scrollTop > 200; }")),
+                 "the long thread fits on the screen, so its foot proves nothing")
+    main_held(reader, "the long thread opened from the thread list")
+    page.keyboard.press("Escape")
+    reader.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'",
+                    "Esc in the thread opened from the thread list did not go back to the list")
+    reader.frames(2)
+    list_at_foot(reader, "Esc back to the thread list")
+    reader.notes.append("a thread opened from the thread list opened at its foot and held it, and Esc came back to "
+                        "the list at its foot")
+    view_key(reader, 4, "columns", "two")
+    gap = reader.gap("side-scroll")
+    reader.check(gap <= 1, f"Ctrl+4 from the thread list left the cards {gap:.0f}px above their foot")
+    main_held(reader, "Ctrl+4 from the thread list")
+    reader.check(reader.gap("side-scroll") <= 1, "after Ctrl+4 the cards left their foot")
+    reader.notes.append("Ctrl+4 from it brought two columns with the cards at their foot, and nothing moved Main after")
 
 
 if __name__ == "__main__":

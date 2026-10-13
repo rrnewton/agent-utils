@@ -237,9 +237,12 @@ thread-card-focus-browser:
 # at the desk while the mouse crosses the cards to the dock or the top bar and rests, and ] is pressed on
 # its own, each sampled every frame for 2.5 s; a reader on the newest line follows a live message to the foot; the list of threads and a thread open at
 # their foot and stay there, older replies coming in under a reader at a thread's head; after a
-# reload the read behind the saved rows leaves the reader where they scrolled; and, last, a card
-# highlighted by a click, the mouse going on over another card to the dock, leaves Main still. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each stage.
+# reload the read behind the saved rows leaves the reader where they scrolled; `#281 view-keys`: the view
+# keys show each view where it is read and nothing moves it for 2.5 s after, the thread list opening at its
+# foot from two columns, Main and All, Main coming back from it where the reader left it, and a thread
+# opened from it opening at its foot; and, last, a card highlighted by a click, the mouse going on over
+# another card to the dock, leaves Main still. Pass WEB_ROOT=dir to run it against another copy of the
+# page, and SCREENSHOTS=dir to keep a PNG of each stage.
 scroll-stability-browser:
 	python3 tests/scroll_stability_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

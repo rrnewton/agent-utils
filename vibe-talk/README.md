@@ -4061,13 +4061,23 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   selection: the click that highlighted it, or the mouse coming to rest on it, starts the wait for its
   root, and the mouse over any other card, or over Main, starts none. Enter highlighting a card glides
   nothing, as no key does.
+- **A view key shows the view where it is read, and nothing moves it after** (`#281 view-keys`). Ctrl+3
+  (Cmd+3 on a Mac) opens the thread list at its foot, as two columns open their cards; Ctrl+1 back to Main
+  finds the reader where they left it, since Main stays laid out behind the list; Ctrl+2 and Ctrl+4 show
+  All and two columns at their newest or the reader's place, and the cards keep theirs between the thread
+  list and two columns. The cards are placed once the view picker says the new view: it is as wide as
+  what it says, and "Thread list" wrapped a desk's dock onto a second row after the cards had been put at
+  their foot, which left the list 43px above it. In the thread list, as on the right, a reader at the foot
+  of the cards stays there as they change size.
 
 `tests/scroll_stability_browser.py` (DAG step `scroll-stability-browser`) measures them in Chromium at
 1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
 messages, a refresh, the read sent from the newest line and landing after a scroll, summaries and focus
 moves, and at the desk, sampled at every frame for 2.5 s, the mouse crossing the cards to the dock and to
 the top bar, ] on its own, and the mouse going on from a card it highlighted over another card to the
-dock; a reader on the newest line following; the threads and their list opening at the foot.
+dock; a reader on the newest line following; the threads and their list opening at the foot; and the view
+keys, each held 2.5 s: the thread list at its foot from two columns, Main and All, Main coming back where
+the reader left it, a thread opened from the list at its foot, and nothing moving after any of them.
 
 ### A filter keeps your place
 

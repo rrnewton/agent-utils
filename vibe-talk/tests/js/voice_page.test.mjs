@@ -52632,3 +52632,116 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   await press(control, control.el("reply-text"), "2", { ctrlKey: true });
   assert.equal(control.screen(), "reply", "the control put the reply down, so this test cannot see it handed over");
 });
+
+// --- `#281 view-keys` with `#280 scroll-stability` --------------------------------------------------
+
+test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each view where it is read — the thread list at its foot, Main where the reader left it — and nothing moves it after, the picker's new name wrapping the dock included", async () => {
+  // In Chromium (tests/scroll_stability_browser.py) the view picker is as wide as what it says, and at a
+  // desk "Thread list" in place of "Main" wrapped the dock onto a second row after the cards had been
+  // opened at their foot: the thread list opened 43px above it, and nothing took it the rest of the way.
+  // This fixture lays nothing out, so the test does what the browser did: a picker saying the thread list
+  // or two columns takes a second row, GROWTH px, from the foot of both columns' lists, at once, and what
+  // watches them is told once the page has done (`settled`), as a browser reports sizes after a layout.
+  const GROWTH = 42;
+  /** The picker as wide as what it says, from the page's first line: saying the thread list or two columns
+   * wraps the dock, which takes GROWTH px from the foot of both lists. */
+  const wrapDock = (p) => {
+    const picker = p.el("thread-select");
+    const lay = (value) => {
+      const growth = value === "threads" || value === "columns" ? GROWTH : 0;
+      p.el("dock").offsetHeight = 50 + growth;
+      p.el("scroll-area").clientHeight = SCROLL_VIEWPORT_PX - growth;
+      p.el("side-scroll").clientHeight = SCROLL_VIEWPORT_PX - growth;
+    };
+    let said = String(picker.value);
+    lay(said);
+    Object.defineProperty(picker, "value", {
+      configurable: true,
+      get: () => said,
+      set: (value) => {
+        said = String(value);
+        lay(said);
+      },
+    });
+  };
+  const run = async (script) => {
+    const { page } = await manyThreadColumns(16, (p) => {
+      p.enableResizeObserver();
+      wrapDock(p);
+    }, script);
+    const picker = page.el("thread-select");
+    const main = page.el("scroll-area");
+    const side = page.el("side-scroll");
+    const settled = async () => {
+      for (const box of [main, side, ...main.children, ...side.children]) page.resized(box);
+      page.expireTimers(0);
+      // The glide's wait, were anything waiting: a view key arms none.
+      page.expireTimers(sourceConstant("COLUMN_GLIDE_MS"));
+      await page.settle();
+    };
+    const key = async (digit) => {
+      await press(page, focused(page) || main, digit, { ctrlKey: true });
+      await page.settle();
+    };
+    await settled();
+    assert.ok(sideAtFoot(page), "the premise: two columns opened their cards at the foot");
+    await key("1");
+    await settled();
+    // Up Main, one column: the thread list over it, and back.
+    main.scrollTop = Math.round(main.scrollHeight / 3);
+    await main.dispatch("scroll");
+    const kept = readerOn(page);
+    assert.ok(!atBottomOf(main), "the premise: the reader is up Main");
+    await key("3");
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Ctrl+3 did not show the thread list");
+    const listFoot = sideAtFoot(page);
+    await settled();
+    const listFootAfter = sideAtFoot(page);
+    // A card drawn taller with nothing redrawn, under a reader at the foot of the thread list.
+    const card = page.el("side-cards").children[page.el("side-cards").children.length - 1];
+    card.style.height = "160px";
+    page.resized(page.el("side-list"));
+    await page.settle();
+    const cardGrewFoot = sideAtFoot(page);
+    card.style.height = "";
+    page.resized(page.el("side-list"));
+    await settled();
+    await key("1");
+    const mainKept = JSON.stringify(readerOn(page)) === JSON.stringify(kept);
+    await settled();
+    const mainKeptAfter = JSON.stringify(readerOn(page)) === JSON.stringify(kept);
+    await key("2");
+    assert.equal(picker.value, "flat", "Ctrl+2 did not show All");
+    const all = readerOn(page);
+    await settled();
+    const allHeld = JSON.stringify(readerOn(page)) === JSON.stringify(all);
+    await key("3");
+    const listFromAll = sideAtFoot(page);
+    await settled();
+    await key("4");
+    assert.ok(inTwoColumns(page), "Ctrl+4 did not bring two columns");
+    const cardsFoot = sideAtFoot(page);
+    const left = readerOn(page);
+    await settled();
+    const twoHeld = sideAtFoot(page) && JSON.stringify(readerOn(page)) === JSON.stringify(left);
+    return { listFoot, listFootAfter, cardGrewFoot, mainKept, mainKeptAfter, allHeld, listFromAll, cardsFoot, twoHeld };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, {
+    listFoot: true, listFootAfter: true, cardGrewFoot: true, mainKept: true, mainKeptAfter: true, allHeld: true,
+    listFromAll: true, cardsFoot: true, twoHeld: true,
+  });
+
+  // THE CONTROLS. The cards placed before the picker says the thread list, as before: from Main, whose left
+  // column has no view to change and so draws no picker before the cards are placed, the dock's second row
+  // leaves the thread list above its foot, and nothing takes it the rest of the way. (From All the left
+  // column goes to Main behind the list first, which draws the picker before the cards are placed.)
+  const placedEarly = await run(brokenScript("  renderThreadSelect();\n  placeCardAnchor(place);\n", "  renderThreadSelect();\n"));
+  assert.deepStrictEqual(placedEarly, { ...real, listFoot: false, listFootAfter: false, cardGrewFoot: false });
+  // The right column's reader kept on its foot in two columns only: a card growing under a reader at the
+  // foot of the thread list leaves them above it.
+  const twoOnly = await run(brokenScript(
+    "if (!sideColumnUp() || currentScreen !== \"main\" || currentView !== \"discord\") return false;",
+    "if (!columnsShown || currentScreen !== \"main\" || currentView !== \"discord\") return false;"));
+  assert.deepStrictEqual(twoOnly, { ...real, cardGrewFoot: false });
+});

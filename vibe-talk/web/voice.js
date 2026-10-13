@@ -30061,6 +30061,9 @@ function renderColumns() {
   // Two columns in a window too narrow for them: the layout they were chosen from — the thread list, or
   // one column — until it is wide enough, the choice kept for then. `#281 view-keys`.
   if (want === "two" && !fit) want = layoutBeforeColumns === "list" ? "list" : null;
+  // `#280 scroll-stability`. Where the reader is in the cards, read before the layout changes the width
+  // they are drawn at: between the thread list and two columns they are kept, and put back there.
+  const cards = currentView === "discord" && screen.getAttribute("data-columns") !== want ? cardAnchor() : null;
   if (screen.getAttribute("data-columns") !== want) {
     if (want) screen.setAttribute("data-columns", want);
     else screen.removeAttribute("data-columns");
@@ -30069,7 +30072,7 @@ function renderColumns() {
   if (currentView === "discord") {
     const now = columnsShown ? "two" : threadListShown ? "list" : "one";
     const next = want !== null && sideHasBox() ? want : "one";
-    if (next !== now) moveLayout(now, next);
+    if (next !== now) moveLayout(now, next, cards);
     else if (fitChanged) renderThreadSelect();
   }
   // `#261 two-column-connectors`. The links between the columns, drawn or taken away with them.
@@ -30080,17 +30083,30 @@ function renderColumns() {
  * From layout `now` to layout `next`: out of the one, then into the other. `#281 view-keys`. Between
  * the thread list and two columns the right column stays as it is, and only the left one comes or goes.
  *
+ * `#280 scroll-stability`. THE CARDS ARE PLACED ONCE THE LAYOUT IS WHOLE. The picker names the layout
+ * that is up, and a <select> is as wide as what it says: "Thread list" is wider than "Main", and at a
+ * desk that wrapped the dock onto a second row after the cards had been opened at their foot, which left
+ * the thread list above it in Chromium, 43px from Main and 86px from two columns. So the cards are placed
+ * again once the picker says the new layout: where the reader was in them (`cards`, read by
+ * `renderColumns` before the layout changed) between the thread list and two columns, which keep them;
+ * else where they were just opened, their foot unless a thread was selected from them up the list
+ * (`placeOpenedCards`).
+ *
  * @param {"one" | "list" | "two"} now
  * @param {"one" | "list" | "two"} next
+ * @param {{newest: boolean, id: string | null, offset: number} | null} [cards]
  */
-function moveLayout(now, next) {
+function moveLayout(now, next, cards = null) {
   // `#277 reply-in-column`. A reply open in a column of the two that go moves to the reply screen once
   // the next layout is drawn under it (`leaveColumns`).
   const handOff = now === "two" ? leaveColumns(next) : null;
   if (now === "list") leaveThreadList(next);
   if (next === "two") enterColumns(now);
   else if (next === "list") enterThreadList(now);
+  const kept = now !== "one" && next !== "one" ? cards : null;
+  const place = sideColumnUp() && columns.side.mode === "list" ? kept || cardAnchor() : null;
   renderThreadSelect();
+  placeCardAnchor(place);
   if (handOff) handOff();
 }
 
@@ -35543,7 +35559,8 @@ if (typeof window.ResizeObserver === "function") {
 // is drawn whole (`#257 summary-truncation`), which in Chromium left the list of threads 43px above its
 // foot the moment the mouse came to rest on its last card — "the thread view also feels like it is not
 // starting out scrolled all the way to the bottom" — and further from it than the slack, the reader had
-// stopped following the threads that moved to the foot. A thread on the right is kept the same way.
+// stopped following the threads that moved to the foot. A thread on the right is kept the same way, and
+// so are the same cards across the window as the thread list (`#281 view-keys`).
 //
 // What the reader was doing is the list's state at its LAST SCROLL: a browser delivers scroll events
 // before it reports sizes in the same frame, so a scroll this page made — a landing, a jump, a place
@@ -35567,9 +35584,10 @@ if (typeof window.ResizeObserver === "function") {
   const area = leftEl("side-scroll");
   /** @type {{foot: boolean, width: number, height: number, context: string} | null} */
   let footing = null;
-  // What the column is showing: a change of it is not the content changing under the reader.
-  const contextOf = () => (columnsShown
-    ? `${currentScreen}|${currentView}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinnedOnly}`)}`
+  // What the column is showing: a change of it is not the content changing under the reader. Beside Main
+  // or on its own as the thread list (`#281 view-keys`), which is a change of what it shows too.
+  const contextOf = () => (sideColumnUp()
+    ? `${columnsShown ? "two" : "list"}|${currentScreen}|${currentView}|${columns.side.mode}|${inColumn(columns.side, () => `${channelContextKey()}|${pinnedOnly}`)}`
     : "one");
   // On the newest line, and scrolled to it. What the column shows is noted only by this observer's
   // passes, which a change of it always brings: not on every scroll event.
@@ -35579,7 +35597,7 @@ if (typeof window.ResizeObserver === "function") {
   // Whether the reader may be kept on the newest line now: the right column on screen, and no other rule
   // holding a place in it.
   const free = () => {
-    if (!columnsShown || currentScreen !== "main" || currentView !== "discord") return false;
+    if (!sideColumnUp() || currentScreen !== "main" || currentView !== "discord") return false;
     if (columns.side.mode === "list") return !cardsOpening;
     return inColumn(columns.side, () => {
       const walk = activeColumn.searchWalk;
