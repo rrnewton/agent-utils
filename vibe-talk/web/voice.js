@@ -2778,12 +2778,7 @@ function applySearch() {
   // and a walk that the change of filter just made nobody's ends here, before anything below says what
   // it found. And in one column on Main, a search nothing matches offers All, which has the replies.
   if (currentView === "discord") renderOlderControl();
-  if (!sideActive) {
-    const all = leftEl("search-in-all");
-    const offered = !pinned && !links && author === "everyone" && terms.length > 0 && matched === 0 && loaded > 0 &&
-      currentView === "discord" && threadingSupported && !columnsShown && channelView === "main";
-    if (all.hidden === offered) all.hidden = !offered;
-  }
+  if (!sideActive) renderSearchInAll();
   if (pinned) {
     const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0, links ? tally : null, author);
     el("search-empty").textContent = sentence;
@@ -2814,6 +2809,47 @@ function applySearch() {
   // while a walk reads older pages, so a status says it once, when the walk is over, and not per page.
   if (!activeColumn.searchWalk) setTextIfChanged(el("search-empty"), empty ? SEARCH_EMPTY_LOADED : searchEmptySentence(loaded));
   el("search-empty").hidden = empty;
+}
+
+/**
+ * `#262 search-load-older`. Whether "Search All — thread replies too" is offered: one column, on Main,
+ * where a search for words alone matches nothing of what is loaded. Main holds a thread's first message
+ * and none of its replies, and All has them. From what the left column's last pass of the search
+ * counted (`searched`) and the layout and view now, so it is asked in the left column.
+ *
+ * @param {SearchCount | null} searched
+ */
+function searchInAllOffered(searched) {
+  return searched !== null && !searched.pinned && searched.matched === 0 && searched.loaded > 0 && searchOpen &&
+    !linksOnly && authorChoosing() === "everyone" && searchTerms(searchQuery).length > 0 &&
+    currentView === "discord" && threadingSupported && !columnsShown && channelView === "main";
+}
+
+/**
+ * Show or take away "Search All — thread replies too" (`searchInAllOffered`). After every pass of the
+ * search in the left column, and whenever two columns come or go: that changes whether it is one column
+ * on Main without changing a row, so no pass of the search follows it when the left column was Main
+ * already, and the button would be left as the other layout had it.
+ */
+function renderSearchInAll() {
+  inColumn(columns.main, () => {
+    const all = leftEl("search-in-all");
+    const offered = searchInAllOffered(columns.main.searched);
+    if (all.hidden === offered) all.hidden = !offered;
+  });
+}
+
+/**
+ * The press of "Search All — thread replies too": All, with the search kept. Only where it is offered
+ * now — never in two columns, whose left column is Main by the layout (`#229 desktop-two-column`); a
+ * button left up by some change nobody foresaw is taken away instead.
+ */
+function searchInAll() {
+  if (!inColumn(columns.main, () => searchInAllOffered(columns.main.searched))) {
+    renderSearchInAll();
+    return undefined;
+  }
+  return inColumn(columns.main, () => changeChannelView("flat"));
 }
 
 /**
@@ -17020,7 +17056,14 @@ async function loadOlderTimeline(signal) {
     }
     if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
     olderFetchInFlight = false;
-    preservingScroll(() => applyTimelinePage(payload, true));
+    preservingScroll(() => {
+      applyTimelinePage(payload, true);
+      // `#262 search-load-older`. The search's pass over the rows that just arrived, inside the same
+      // anchored mutation, where a filter chooses rows: drawn and only then hidden, they would take
+      // their height away outside it, and a reader who is not at the head of the list — one who
+      // scrolled away from a walk for the search — would be moved by it, or dropped at the foot.
+      if (readRunsSuspended()) applySearch();
+    });
     saveChannelScope();
     renderScrollTools();
     requestVisibleSummaries();
@@ -23797,7 +23840,9 @@ function countSearchWalk(walk) {
 
 /** What a walk that has ended says under its control, or "" for nothing: see the head of this section. */
 function searchWalkNote(walk, reason) {
-  const pages = `${walk.pages} page${walk.pages === 1 ? "" : "s"}`;
+  // A walk stopped during the read of Main's own newest page (`walkCursorOwed`) has read that one.
+  const read = Math.max(1, walk.pages);
+  const pages = `${read} page${read === 1 ? "" : "s"}`;
   const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
   const day = oldestLoadedDay();
   const back = day === null ? "" : `, back to ${searchDayWords(day)}`;
@@ -23811,7 +23856,8 @@ function searchWalkNote(walk, reason) {
   if (walk.found === 0) return emptied ? "" : `Nothing more in ${pages} (${messages})${back}.`;
   if (reason === "budget") {
     const seconds = Math.round(SEARCH_OLDER_MS / 1000);
-    return `Found ${walk.found} in ${seconds} s (${pages}, ${messages})${back}.`;
+    // Within, not in: the walk stopped because the next page would have ended past the budget.
+    return `Found ${walk.found} within ${seconds} s (${pages}, ${messages})${back}.`;
   }
   return `Found ${walk.found} in ${pages} (${messages})${back}.`;
 }
@@ -23841,6 +23887,7 @@ function searchOlder() {
     ticket: replyJumpTicket,
     held: new Set([...el("discord-log").children].flatMap(idsOf)),
     pages: 0,
+    cursorRead: false,
     found: 0,
     arrived: 0,
     started: Date.now(),
@@ -23883,7 +23930,13 @@ function searchOlder() {
           steps.resume();
         }
         if (!searchWalkHolds(walk, column) || walk.stopping) break;
-        walk.pages += 1;
+        // Main drawn from All's cover takes its first step from its own newest page (`walkCursorOwed`),
+        // which is no older page, and is not counted as one; once, for the cursor the walk goes on from.
+        // What older messages it brings are counted as found like any others.
+        const owed = olderStep === null && !discordOlderCursor && walkCursorOwed();
+        if (owed && walk.cursorRead) break;
+        walk.cursorRead = walk.cursorRead || owed;
+        if (!owed) walk.pages += 1;
         renderOlderControl();
         const began = Date.now();
         const step = loadOlder(walk.controller ? walk.controller.signal : undefined);
@@ -23893,7 +23946,7 @@ function searchOlder() {
         } finally {
           steps.resume();
         }
-        last = Date.now() - began;
+        if (!owed) last = Date.now() - began;
         if (!searchWalkHolds(walk, column) || walk.stopping) break;
         countSearchWalk(walk);
         if (walk.found >= SEARCH_OLDER_HITS) break;
@@ -24100,6 +24153,9 @@ async function loadOlderPage(signal) {
       renderChannelSeam(
         channelSummary(list.children.length, loadedIsWhole(), channelName(payload.channel))
       );
+      // `#262 search-load-older`. And the search's pass over them, where a filter chooses rows, as in
+      // `loadOlderTimeline`: rows drawn and only then hidden would move a reader not at the head.
+      if (readRunsSuspended()) applySearch();
       // ...and so is this, for exactly the same reason and one nobody photographs: the LAST step
       // of the walk HIDES #load-older, which is a sibling above the log inside the scrolling
       // element. Taking its height away outside the anchor jerks the reader by the height of a
@@ -28168,6 +28224,9 @@ function enterColumns() {
   renderThreadSelect();
   if (open) guardQuietly(() => selectSideThread(open.id, open.summary))();
   else showSideList();
+  // `#262 search-load-older`. Not one column any more: Search All goes, even where the left column was
+  // Main already and nothing above searched it again.
+  renderSearchInAll();
 }
 
 /**
@@ -28196,6 +28255,9 @@ function leaveColumns() {
       columnsRestoring = false;
     }
   }
+  // `#262 search-load-older`. One column again: on Main, where the search still matches nothing, Search
+  // All is offered at once, not at the next keystroke. Back to Main, nothing above searched it again.
+  renderSearchInAll();
 }
 
 /** Show what the right column is showing — the cards or the thread — and say so in its heading. */
@@ -32648,7 +32710,7 @@ el("noise-rule-new").addEventListener("keydown", (event) => {
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(olderControlPressed));
 // `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
-leftEl("search-in-all").addEventListener("click", guardQuietly(() => changeChannelView("flat")));
+leftEl("search-in-all").addEventListener("click", guardQuietly(searchInAll));
 el("load-older-turns").addEventListener("click", guardQuietly(loadOlderTurns));
 el("collapse-all").addEventListener("click", () => setAllFolded(true));
 el("expand-all").addEventListener("click", () => setAllFolded(false));

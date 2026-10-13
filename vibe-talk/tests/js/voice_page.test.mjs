@@ -348,6 +348,9 @@ const FIXTURE_TREE = {
     "inbox-note",
     "clear-backlog",
     "load-older",
+    // `#262 search-load-older`. What the last walk for the search found, directly under the control
+    // that walked: its height is between that control and the matches it opened.
+    "search-older-note",
     "timeline-notice",
     "channel-loading",
     "thread-list",
@@ -406,6 +409,7 @@ const FIXTURE_TREE = {
     "side-inbox-note",
     "side-clear-backlog",
     "side-older",
+    "side-search-older-note",
     "side-notice",
     "side-loading",
     "side-thread-list",
@@ -48294,7 +48298,7 @@ test("`#262 search-load-older`: the walk starts no page its last page's time say
   await settleWalk(page);
   assert.equal(searchReads(page).length, 2, "a page that would end past the budget was started");
   assert.equal(page.el("search-older-note").textContent,
-    `Found 1 in 15 s (2 pages, 8 messages), back to ${searchDay(page, all[28].timestamp)}.`);
+    `Found 1 within 15 s (2 pages, 8 messages), back to ${searchDay(page, all[28].timestamp)}.`);
 });
 
 test("`#262 search-load-older`: Enter in the search field walks back where the step back offers it, and not while composing", async () => {
@@ -48384,11 +48388,13 @@ test("`#262 search-load-older`: the step back holds still while the matches open
 
 /**
  * `#262 search-load-older`. A channel with one long thread: its first message, then `replies` replies
- * one hour apart, reply `i` (from 1, oldest first) saying `content(i)`. Main is the first message alone;
- * All and the thread page back `size` messages at a time. Older reads are kept and held as by
- * `searchHistory`.
+ * one hour apart, reply `i` (from 1, oldest first) saying `content(i)`; and before the thread began,
+ * `top` messages posted to the channel itself, one an hour, post `i` (from 0, oldest first) saying
+ * `posted(i)`. Main is those posts and the first message, All everything, and the thread its own; each
+ * pages back `size` messages at a time. Older reads are kept and held as by `searchHistory`. Returns
+ * the thread, first message first; the posts are `page.posts`.
  */
-function threadHistory(page, { replies = 24, size = 4, content = (i) => `reply ${i}` } = {}) {
+function threadHistory(page, { replies = 24, size = 4, content = (i) => `reply ${i}`, top = 0, posted = (i) => `post ${i}` } = {}) {
   const newest = Date.UTC(2026, 7, 19, 12, 0, 0);
   const id = "spaces/A/threads/long";
   const root = message({ id: "8800000000000000000", content: "a long thread starts",
@@ -48399,8 +48405,16 @@ function threadHistory(page, { replies = 24, size = 4, content = (i) => `reply $
     all.push(message({ id: String(8800000000000000000n + BigInt(i)), content: content(i),
       timestamp: new Date(newest - (replies - i) * 3600000).toISOString(), thread: { ...root.thread, is_root: false } }));
   }
+  const posts = [];
+  for (let i = 0; i < top; i += 1) {
+    posts.push(message({ id: String(8790000000000000000n + BigInt(i)), content: posted(i),
+      timestamp: new Date(newest - (replies + top - i) * 3600000).toISOString() }));
+  }
+  const main = [...posts, root];
+  const everything = [...posts, ...all];
+  page.posts = posts;
   page.threadingSupported = true;
-  page.messages = all;
+  page.messages = everything;
   page.threads = [{ id, root, title: "The long thread", reply_count: replies, reply_count_exact: true,
     updated_at: all[all.length - 1].timestamp }];
   page.pagesServed = [];
@@ -48412,8 +48426,7 @@ function threadHistory(page, { replies = 24, size = 4, content = (i) => `reply $
     const before = url.searchParams.get("before");
     page.pagesServed.push(String(path));
     if (view === "threads") return json(200, timelineAnswer({ view, has_threads: true, threads: page.threads }));
-    if (view === "main") return json(200, timelineAnswer({ view, has_threads: true, messages: [root] }));
-    const rows = view === "thread" ? all : all;
+    const rows = view === "thread" ? all : view === "main" ? main : everything;
     if (before) {
       page.olderOptions.push(options || {});
       const hold = page.olderHold;
@@ -48533,7 +48546,7 @@ test("`#262 search-load-older`: without threads, under Hide read, the walk is no
   assert.match(page.el("search-empty").textContent, / Hide read is on — press h for Show read to search older messages\.$/);
 });
 
-test("`#262 search-load-older`: a change to the search ends the walk; so do a walk in the other column and a jump", async () => {
+test("`#262 search-load-older`: a change to the search ends the walk, and aborts its read on the wire", async () => {
   const { page } = await searchPage({ pages: 10 });
   page.enableAbort();
   await search(page, "engine");
@@ -48669,4 +48682,291 @@ test("`#262 search-load-older`: a finger on the glass holds the walk's next page
   page.expireTimers(sourceConstant("PULL_WAIT_MS"));
   await settleWalk(page);
   assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "the walk did not go on once the finger lifted");
+});
+
+
+test("`#262 search-load-older`: Search All goes when two columns come, and a press left on it does not make the left column All", async () => {
+  const page = await threadPage("main");
+  await search(page, "answer");
+  await page.settle();
+  const all = page.el("search-in-all");
+  assert.equal(all.hidden, false, "Main offered no way to the replies");
+  // The left column was Main already, so nothing searched it again as two columns came.
+  await twoColumns(page);
+  assert.equal(all.hidden, true, "Search All stayed up in two columns");
+  // A press that reaches it anyway, as a tap a moment late would, leaves the left column Main.
+  await all.click();
+  await page.settle();
+  assert.ok(inTwoColumns(page), "the press left two columns");
+  assert.equal(page.el("thread-select").value, "main", "the press made the left column of two All");
+  assert.deepStrictEqual(matchedIds(page), [], "the left column of two drew the replies");
+  assert.equal(all.hidden, true);
+});
+
+test("`#262 search-load-older`: back in one column on Main, a search that still matches nothing offers Search All at once", async () => {
+  const page = await threadPage("main");
+  await twoColumns(page);
+  await search(page, "answer");
+  await page.settle();
+  const all = page.el("search-in-all");
+  assert.equal(all.hidden, true, "Search All was offered in two columns");
+  assert.match(page.el("search-empty").textContent, / Thread replies are not in Main\.$/);
+  // One column again, in Main, the view last chosen in one: nothing reads or searches it again.
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.ok(!inTwoColumns(page));
+  assert.equal(page.el("thread-select").value, "main");
+  assert.equal(all.hidden, false, "Search All waited for another keystroke after two columns went");
+  await all.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "Search All did not open All");
+  assert.deepStrictEqual(matchedIds(page), ["202", "204"]);
+  // ...and the narrow window's way out of two columns does the same.
+  const second = await threadPage("main");
+  await twoColumns(second);
+  await search(second, "answer");
+  await second.settle();
+  await second.setDesk(false);
+  assert.equal(second.el("search-in-all").hidden, false, "a window narrowed to one column on Main did not offer Search All");
+});
+
+/**
+ * `#262 search-load-older`. A channel whose newest page is eight long messages that all say "engine",
+ * so the list of matches is taller than the window, and three short older matches two pages back.
+ */
+async function matchesOnScreen(threads = false) {
+  const older = new Set([37, 30, 25]);
+  const made = await searchPage({ pages: 6, size: 8, threads,
+    content: (i) => (i >= 40 ? longMessage(`engine ${i}`) : older.has(i) ? `engine ${i}` : `message ${i}`) });
+  await search(made.page, "engine");
+  await made.page.settle();
+  return made;
+}
+
+test("`#262 search-load-older`: scrolled a little with matches on screen, the step back holds still and the older matches open under it", async () => {
+  const { page, all } = await matchesOnScreen();
+  const area = page.el("scroll-area");
+  const chip = page.el("load-older");
+  // The step back is a little way down the list, under the channel's line, and in view.
+  const head = chip.getBoundingClientRect().top + area.scrollTop;
+  assert.ok(head > 2, "the fixture has nothing above the step back, so this proves nothing");
+  area.scrollTop = Math.floor(head / 2);
+  await area.dispatch("scroll");
+  await page.settle();
+  const at = area.scrollTop;
+  const top = chip.getBoundingClientRect().top;
+  assert.ok(at > 1 && top > 0, "the step back is not in view at a scroll position off the head");
+  const below = rowWithId(page, all[40].id).getBoundingClientRect().top;
+  assert.ok(below < area.clientHeight, "no match is on screen, so this proves nothing");
+  await chip.click();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 2, "the walk did not stop at the page that brought the third match");
+  assert.deepStrictEqual(matchedIds(page).slice(0, 3), [25, 30, 37].map((i) => all[i].id));
+  assert.equal(chip.getBoundingClientRect().top, top, "the step back moved while the matches opened under it");
+  assert.equal(area.scrollTop, at, "the walk scrolled the reader");
+  // What it found is directly under it, and the matches that were on screen moved down to make room.
+  const note = page.el("search-older-note");
+  assert.equal(note.hidden, false);
+  assert.ok(Math.abs(note.getBoundingClientRect().top - chip.getBoundingClientRect().bottom) <= 1, "the note is not under the step back");
+  assert.ok(rowWithId(page, all[25].id).getBoundingClientRect().top < rowWithId(page, all[40].id).getBoundingClientRect().top);
+  assert.ok(rowWithId(page, all[40].id).getBoundingClientRect().top > below, "the older matches did not open under the step back");
+});
+
+test("`#262 search-load-older`: scrolling while a walk reads lets the step back go, and keeps the message the reader is on instead", async () => {
+  for (const threads of [false, true]) await scrollingFromWalk(threads);
+});
+
+/** The test above, on a chat service without threads or with them: each draws an older page its own way. */
+async function scrollingFromWalk(threads) {
+  const { page, all } = await matchesOnScreen(threads);
+  const area = page.el("scroll-area");
+  const chip = page.el("load-older");
+  area.scrollTop = Math.floor((chip.getBoundingClientRect().top + area.scrollTop) / 2);
+  await area.dispatch("scroll");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  void chip.click();
+  await page.settle();
+  assert.equal(chip.textContent, "Searching… 1 of 5 · Stop");
+  // The reader scrolls down the matches while the page is read: the step back goes off screen.
+  area.scrollTop = 600;
+  await area.dispatch("scroll");
+  await page.settle();
+  const reading = page.el("discord-log").children.find((li) => !li.hasClass("search-hidden") && li.getBoundingClientRect().bottom > 0);
+  assert.ok(reading, "no row is on screen");
+  const y = reading.getBoundingClientRect().top;
+  hold.open();
+  await settleWalk(page);
+  assert.ok(matchedIds(page).includes(all[25].id), "the walk did not go on after the reader scrolled");
+  assert.ok(Math.abs(reading.getBoundingClientRect().top - y) <= 1,
+    `threads ${threads}: the message the reader was on moved from ${y}px to ${reading.getBoundingClientRect().top}px`);
+  assert.ok(chip.getBoundingClientRect().bottom < 0, `threads ${threads}: the step back was brought back on screen`);
+}
+
+test("`#262 search-load-older`: Enter with the step back scrolled off screen brings it to the top of the list first", async () => {
+  const { page, all } = await matchesOnScreen();
+  const area = page.el("scroll-area");
+  const chip = page.el("load-older");
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.ok(chip.getBoundingClientRect().bottom < 0, "the step back is on screen, so this proves nothing");
+  await press(page, page.el("search-field"), "Enter");
+  assert.equal(area.scrollTop, 0, "Enter left the step back off screen");
+  const top = chip.getBoundingClientRect().top;
+  await settleWalk(page);
+  assert.deepStrictEqual(matchedIds(page).slice(0, 3), [25, 30, 37].map((i) => all[i].id));
+  assert.equal(chip.getBoundingClientRect().top, top, "the step back moved once it was brought into view");
+  assert.equal(area.scrollTop, 0);
+});
+
+test("`#262 search-load-older`: the sentence over a list the search emptied is written once a walk, when it ends, and not per page", async () => {
+  const { page, all } = await searchPage({ pages: 10 });
+  await search(page, "engine");
+  await page.settle();
+  const sentence = page.el("search-empty");
+  const before = sentence.textContent;
+  assert.match(before, /^Nothing in the 4 messages loaded so far/);
+  // Every write of the live region, from here on.
+  let text = before;
+  const writes = [];
+  Object.defineProperty(sentence, "textContent", {
+    configurable: true,
+    get: () => text,
+    set: (value) => { text = value; writes.push(value); },
+  });
+  const first = searchHold();
+  page.olderHold = first;
+  void page.el("load-older").click();
+  await page.settle();
+  // The first page lands, and the second is held: the walk is between pages.
+  first.open();
+  const second = searchHold();
+  page.olderHold = second;
+  for (let i = 0; i < 8; i += 1) await page.settle();
+  assert.equal(searchReads(page).length, 2, "the walk is not on its second page");
+  assert.equal(page.el("search-count").textContent, "0 of 8 loaded", "the count did not follow the page");
+  assert.equal(sentence.textContent, before, "the sentence was rewritten while the walk read");
+  assert.deepStrictEqual(writes, []);
+  second.open();
+  await settleWalk(page);
+  assert.deepStrictEqual(writes,
+    [`Nothing in the 24 messages loaded so far, back to ${searchDay(page, all[16].timestamp)}, matches that search.`],
+    "the sentence was not written exactly once, when the walk ended");
+});
+
+test("`#262 search-load-older`: a walk in the other column ends this one, and reads only once this one's read is off the wire", async () => {
+  const page = newPage();
+  // No way to abort a request: the left column's read stays on the wire until it is answered.
+  threadHistory(page, { top: 24 });
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await twoColumns(page);
+  await cardOf(page, page.threads[0].id).click();
+  await page.settle();
+  await search(page, "engine");
+  await page.settle();
+  const left = page.el("load-older");
+  const right = page.el("side-older");
+  assert.match(left.textContent, /^Search before /);
+  assert.match(right.textContent, /^Search replies before /);
+  const view = (path) => new URL(path, "http://fixture.test").searchParams.get("view");
+  const hold = searchHold();
+  page.olderHold = hold;
+  void left.click();
+  await page.settle();
+  assert.equal(left.textContent, "Searching… 1 of 5 · Stop");
+  void right.click();
+  for (let i = 0; i < 8; i += 1) await page.settle();
+  assert.match(left.textContent, /^Search before /, "the left column's walk went on beside the right's");
+  assert.equal(right.textContent, "Searching… 1 of 5 · Stop");
+  assert.deepStrictEqual(searchReads(page).map(view), ["main"], "the right column read while the left column's read was on the wire");
+  hold.open();
+  await settleWalk(page);
+  const reads = searchReads(page).map(view);
+  assert.equal(reads.filter((v) => v === "main").length, 1, "the ended walk read on");
+  assert.equal(reads.filter((v) => v === "thread").length, SEARCH_OLDER_PAGES, "the right column's walk did not read once the left's was off the wire");
+  assert.equal(page.el("search-older-note").hidden, true, "the ended walk said what it found");
+});
+
+test("`#262 search-load-older`: a reply's jump ends the walk, aborting its read, and goes on to the message it answers", async () => {
+  for (const threads of [false, true]) {
+    const page = newPage();
+    const all = searchHistory(page, { pages: 10, threads,
+      content: (i) => (i === 39 ? "engine answer" : i === 30 ? "engine question" : `message ${i}`) });
+    all[39].reply_to = all[30].id;
+    page.enableAbort();
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    await search(page, "engine");
+    await page.settle();
+    const hold = searchHold();
+    page.olderHold = hold;
+    void page.el("load-older").click();
+    await page.settle();
+    assert.equal(page.el("load-older").textContent, "Searching… 1 of 5 · Stop");
+    await tapArrow(page, rowWithId(page, all[39].id));
+    assert.equal(page.olderOptions[0].signal.aborted, true, `threads ${threads}: the jump left the walk's read on the wire`);
+    assert.doesNotMatch(page.el("load-older").textContent, /^Searching/, `threads ${threads}: the walk went on under the jump`);
+    // The step the walk had on the wire was the jump's first, and its abort no failure of the jump's.
+    assert.equal(rowWithId(page, all[30].id).getAttribute("data-landed"), "true", `threads ${threads}: the jump did not arrive`);
+    assert.match(statusText(page), /Here is the message it answers/);
+    assert.equal(page.el("error").hidden, true, `threads ${threads}: the aborted read was reported as a failure`);
+    assert.equal(page.el("search-older-note").hidden, true, `threads ${threads}: the ended walk said what it found`);
+  }
+});
+
+test("`#262 search-load-older`: a filter's walk back to an old pin ends a walk in the other column", async () => {
+  const page = newPage();
+  threadHistory(page, { top: 24 });
+  const [pin] = page.posts;
+  page.pinned.set(pin.id, storedPin(pin));
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await twoColumns(page);
+  await cardOf(page, page.threads[0].id).click();
+  await page.settle();
+  // Every post matches, on the left; no reply does, on the right, whose step back offers the walk.
+  await search(page, "post");
+  await page.settle();
+  assert.match(page.el("side-older").textContent, /^Search replies before /);
+  // The old pin, selected over the left column's Pinned list.
+  await page.el("pinned-filter").click();
+  await page.settle();
+  await page.settle();
+  await tapRow(page, pin.id, "pinned-log");
+  // The right column's thread walks back for the search, its read on the wire.
+  const hold = searchHold();
+  page.olderHold = hold;
+  void page.el("side-older").click();
+  await page.settle();
+  assert.equal(page.el("side-older").textContent, "Searching… 1 of 5 · Stop");
+  // Pinned off: the left column walks back to the pin, and one walk at a time is on the page.
+  await page.el("pinned-filter").click();
+  await page.settle();
+  assert.equal(page.olderOptions[0].signal.aborted, true, "the right column's read went on beside the walk back to the pin");
+  assert.match(page.el("side-older").textContent, /^Search replies before /, "the right column's walk went on");
+  hold.open();
+  await settleWalk(page);
+  assert.equal(page.el("side-search-older-note").hidden, true, "the ended walk said what it found");
+  assert.ok(rowWithId(page, pin.id), "the walk back did not reach the pin");
+});
+
+test("`#262 search-load-older`: Main drawn from All reads its own newest page first, which is no older page and not counted as one", async () => {
+  const page = newPage();
+  pagedThreads(page, 4);
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await pickThread(page, "main");
+  const from = page.timelineCalls.length;
+  await search(page, "engine");
+  await page.settle();
+  await page.el("load-older").click();
+  await settleWalk(page);
+  const reads = page.timelineCalls.slice(from).map((call) => [viewOf(call), beforeOf(call) !== null]);
+  assert.deepStrictEqual(reads, [["main", false], ...Array(SEARCH_OLDER_PAGES).fill(["main", true])],
+    "the walk did not read Main's newest page and then five older ones");
+  assert.match(page.el("search-empty").textContent, /^Nothing in the \d+ messages loaded so far/);
 });
