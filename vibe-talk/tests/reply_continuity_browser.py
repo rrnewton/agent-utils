@@ -37,7 +37,13 @@ leaves them on the phone -- make its Reply "Quote reply", in the accent and with
 and a tap (phone, once as Chromium taps and once as a phone that clears the selection when the finger
 lands) open the reply with the words quoted line by line, the box focused with the caret under the
 quote; a quote cancelled untouched leaves no draft, and Send posts the quote and what was typed under
-it to the message.
+it to the message. At the desk a triple-click on a message of one paragraph, whose range Chromium ends
+at the very start of the next row, is offered and quoted too.
+
+And on a phone at 393 and then 360 wide, on a channel with long names (a person's and a bot's) and
+reply counts: every row's words selected in turn, and Quote reply moves neither the row's height nor
+its words' top in it by more than half a pixel. "Quote reply" where the header line has room, and
+"Quote" at Reply's own width where it has not, its words inside the button; both are seen at 360.
 
 Then once more in the light scheme, to measure the tint there and keep a picture of it. No
 horizontal overflow and no page error at any step.
@@ -794,6 +800,8 @@ def quote_case(walk: Walk) -> None:
         cancelled = state()
         walk.check(cancelled["draft"] is False, f"quote: an untouched quote was kept as a draft: {cancelled}")
         walk.check(cancelled["label"] == "Reply", f"quote: Reply stayed Quote reply after its quote was taken: {cancelled}")
+        triple_click_case(walk, list_box)
+        walk.place(index, list_box["top"] + list_box["height"] * 0.4)
         # Selected again, and Quote reply clicked.
         line = page.evaluate(SELECTION_JS, [row_id, 12, 45, False])
         assert isinstance(line, dict)
@@ -851,7 +859,167 @@ def quote_case(walk: Walk) -> None:
         posted = list(walk.api.replies[sent:])
     walk.check(len(posted) == 1 and posted[0].get("text") == f"{expected}agreed" and posted[0].get("reply_to") == row_id,
                f"quote: what left the browser was {posted}")
-    walk.notes.append(f"Quote reply quoted {len(expected.splitlines()) - 1} line(s) and posted them to their message")
+    quoted = len(expected.splitlines()) - 1
+    walk.notes.append(f"Quote reply quoted {quoted} line{'' if quoted == 1 else 's'} and posted them to their message")
+
+
+# Where the selection's first range ends: the row it ends in, and whether that is in the row's body.
+RANGE_END_JS = """() => {
+  const range = getSelection().rangeCount ? getSelection().getRangeAt(0) : null;
+  if (!range) return null;
+  let node = range.endContainer;
+  const element = node.nodeType === 1 ? node : node.parentElement;
+  const row = element ? element.closest('#discord-log > li[data-id]') : null;
+  return {row: row ? row.dataset.id : null, inBody: !!(element && element.closest('.body'))};
+}"""
+
+
+def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:
+    """A triple-click on a message of one paragraph, at a desk: Quote reply, and the paragraph quoted.
+
+    Chromium selects the paragraph and the break after it, and ends the range at the very start of the
+    next row, so the range's common ancestor is the list, as it is for a selection across two rows.
+    Nothing of the next row is selected, and the page takes the range as the message's.
+    """
+    page = walk.page
+    single = 27
+    row_id = message_id(single)
+    walk.place(single, list_box["top"] + list_box["height"] * 0.4)
+    word: object = page.evaluate(SELECTION_JS, [row_id, 0, 7, False])
+    assert isinstance(word, dict)
+    page.mouse.click(float(word["left"]) + 3, (float(word["top"]) + float(word["bottom"])) / 2, click_count=3)
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{row_id}'] .reply-button\")"
+                  ".textContent === 'Quote reply'", "triple-click: the paragraph selected did not make Reply Quote reply")
+    walk.settled()
+    selected: object = page.evaluate("() => String(getSelection())")
+    walk.check(str(selected).strip() == f"Message {single}: checked.", f"triple-click: the engine selected {selected!r}")
+    ended: object = page.evaluate(RANGE_END_JS)
+    walk.check(isinstance(ended, dict), "triple-click: nothing is selected")
+    assert isinstance(ended, dict)
+    next_row = page.evaluate(f"() => document.querySelector(\"#discord-log > li[data-id='{message_id(single + 1)}'] .reply-button\").textContent")
+    walk.check(next_row == "Reply", f"triple-click: the next message's Reply reads {next_row!r}")
+    expected = quote_text(str(selected))
+    walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
+    walk.wait_for("() => !document.getElementById('screen-reply').hidden", "triple-click: Quote reply did not open the reply")
+    walk.settled()
+    opened: object = page.evaluate(STATE_JS, row_id)
+    assert isinstance(opened, dict)
+    walk.check(opened["value"] == expected == f"> Message {single}: checked.\n\n",
+               f"triple-click: the box holds {opened['value']!r}, not {expected!r}")
+    walk.press("#reply-cancel")
+    walk.wait_for("() => !document.getElementById('screen-main').hidden", "triple-click: Cancel did not go back")
+    walk.settled()
+    where = "the next row" if ended["row"] != row_id else "its own row, outside the words" if not ended["inBody"] else "its words"
+    walk.notes.append(f"a triple-click's paragraph, its range ending in {where}, was offered and quoted")
+
+
+# `#267 quote-reply`, at phone widths: each row's Reply made Quote reply by a selection in its words,
+# and what that moved. The row's height, its words' top in it and Reply's width, before and after.
+LAYOUT_JS = """async () => {
+  const frame = () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+  const until = async (ok) => { for (let tries = 0; tries < 20 && !ok(); tries += 1) await frame(); return ok(); };
+  const out = [];
+  for (const row of document.querySelectorAll('#discord-log > li[data-id]')) {
+    const body = row.querySelector('.body');
+    const reply = row.querySelector('.reply-button');
+    if (!body || !reply || !row.getClientRects().length) continue;
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    let text = walker.nextNode();
+    while (text && !text.data.trim()) text = walker.nextNode();
+    if (!text) continue;
+    const at = () => {
+      const box = row.getBoundingClientRect();
+      return {height: box.height, bodyTop: body.getBoundingClientRect().top - box.top,
+              width: reply.getBoundingClientRect().width};
+    };
+    const before = at();
+    getSelection().setBaseAndExtent(text, 0, text, Math.min(text.data.length, 7));
+    const lit = await until(() => reply.hasAttribute('data-quote'));
+    const after = at();
+    const author = row.querySelector('.msg-author');
+    out.push({id: row.dataset.id, lit, label: reply.textContent, quote: reply.getAttribute('data-quote'),
+              author: author && !author.hidden ? author.textContent : '', clipped: reply.scrollWidth > reply.clientWidth + 0.5,
+              before, after});
+    getSelection().removeAllRanges();
+    await until(() => !reply.hasAttribute('data-quote'));
+  }
+  return out;
+}"""
+
+# Longer names than the walk's own, as bots and people have, for `quote_layout_walk`.
+LONG_PEER = {"author": "integration-coordinator", "author_id": "1000000000000000009", "author_is_bot": False}
+LONG_BOT = {"author": "release-watcher-on-call", "author_id": "1000000000000000010", "author_is_bot": True}
+# The long-named messages answered twice each, so that their Reply counts: "Reply (2)".
+ANSWERED_TWICE = (5, 6, 9, 10, 13)
+
+
+def layout_messages() -> list[Json]:
+    """The walk's channel with long author names, a person's and a bot's, and replies counted on them."""
+    held = [message(index) for index in range(COUNT)]
+    for index, kept in enumerate(held):
+        if index % 4 == 1:
+            kept.update(LONG_PEER)
+        elif index % 4 == 2:
+            kept.update(LONG_BOT)
+    for target in ANSWERED_TWICE:
+        for turn in range(2):
+            answer = message(len(held))
+            answer.update(content=f"Reply {turn + 1} to message {target}.", reply_to=message_id(target))
+            held.append(answer)
+    return held
+
+
+def quote_layout_walk(walk: Walk) -> None:
+    """Quote reply moves nothing on a phone, at 393 and 360 wide, on rows with long names and counts.
+
+    Every row's words are selected in turn, as a long press leaves them, and its height and its
+    words' top in it are measured before and after Reply becomes Quote reply: the same, to half a
+    pixel. Where the header line has room, "Quote reply"; where it does not, "Quote" at Reply's width,
+    its words inside the button. Both are seen at 360.
+    """
+    page = walk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {COUNT}",
+                  "the channel did not open")
+    walk.settled()
+    long_peer = f"{LONG_PEER['author']}"
+    for width, height in ((393, 852), (360, 780)):
+        page.set_viewport_size({"width": width, "height": height})
+        walk.settled()
+        found: object = page.evaluate(LAYOUT_JS)
+        walk.check(isinstance(found, list) and len(found) >= COUNT, f"layout {width}: rows measured: {found!r}")
+        assert isinstance(found, list)
+        rows = [row for row in found if isinstance(row, dict)]
+        for row in rows:
+            before, after = row["before"], row["after"]
+            walk.check(row["lit"] is True and str(row["label"]).startswith("Quote") and row["quote"] in ("true", "short"),
+                       f"layout {width}: a selection in {row['id']} did not make its Reply Quote reply: {row}")
+            walk.check(abs(after["height"] - before["height"]) <= 0.5 and abs(after["bodyTop"] - before["bodyTop"]) <= 0.5,
+                       f"layout {width}: Quote reply moved the words of {row['id']} ({row['author']!r}, {row['label']!r}): "
+                       f"{before} -> {after}")
+            walk.check(row["clipped"] is False, f"layout {width}: {row['label']!r} is cut off in its button: {row}")
+            if row["quote"] == "short":
+                walk.check(abs(after["width"] - before["width"]) <= 0.5,
+                           f"layout {width}: Quote is not as wide as Reply was: {row}")
+        counted_peer = [row for row in rows if row["author"] == long_peer and "(" in str(row["label"])]
+        walk.check(bool(counted_peer), f"layout {width}: no row of {long_peer!r} with a count was measured")
+        short = sum(1 for row in rows if row["quote"] == "short")
+        full = sum(1 for row in rows if row["quote"] == "true")
+        if width == 360:
+            walk.check(short > 0 and full > 0, f"layout 360: not both labels were seen: {full} full, {short} short")
+            target = next(row for row in counted_peer)
+            page.evaluate("""(id) => { const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
+                .find((li) => li.dataset.id === id); row.scrollIntoView({block: 'center'});
+                const walker = document.createTreeWalker(row.querySelector('.body'), NodeFilter.SHOW_TEXT);
+                const text = walker.nextNode(); getSelection().setBaseAndExtent(text, 0, text, 7); }""", target["id"])
+            walk.settled()
+            walk.shot("quote-layout-360")
+            page.evaluate("() => getSelection().removeAllRanges()")
+        walk.notes.append(f"at {width} wide Quote reply moved no row of {len(rows)} ({full} read Quote reply, "
+                          f"{short} Quote at Reply's width; {len(counted_peer)} of {long_peer} with a count)")
 
 
 def light_walk(walk: Walk) -> None:
@@ -918,11 +1086,14 @@ def main() -> int:
         # `#185 reply-new-thread`, on a channel whose messages each head a thread nobody has answered.
         ("1280x800-new-thread", 1280, 800, False, "dark"),
         ("412x915-new-thread", 412, 915, True, "dark"),
+        # `#267 quote-reply`, on long names and reply counts, at 393 and then 360 wide.
+        ("393x852-quote-layout", 393, 852, True, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
-            api = FakeApi(empty_threads=label.endswith("new-thread"))
+            api = (FakeApi(messages=layout_messages()) if label.endswith("quote-layout")
+                   else FakeApi(empty_threads=label.endswith("new-thread")))
             server, thread, url = serve(api, web_root)
             try:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-reply-") as profile:
@@ -944,7 +1115,9 @@ def main() -> int:
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url, wait_until="load")
                     walk = Walk(page, api, phone, label, args.screenshots)
-                    if api.empty_threads:
+                    if label.endswith("quote-layout"):
+                        quote_layout_walk(walk)
+                    elif api.empty_threads:
                         new_thread_walk(walk)
                     elif scheme == "dark":
                         continuity_walk(walk, (100, 80, 130))
