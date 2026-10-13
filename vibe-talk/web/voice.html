@@ -901,13 +901,25 @@
                   written by `renderVoiceSendSetting` in web/voice.js: what the agent does, and — for
                   off — what that exposes. Hidden as a whole, editor and all, when the server does not
                   report the setting, which is an older server that always asks.
+
+                  `#voice-send-untick` is the way to send without asking, said where the owner looked
+                  for it; hidden once the box is unticked, when it would describe the other state.
+
+                  `#voice-send-hosted` is the warning that the switch does not reach everything. The
+                  server obeys it at once, but a hosted agent's own send rules are in its prompt,
+                  and its tool approval for post_reply is in its provider's console. The prompt
+                  follows the switch only when the provider lets this page replace it
+                  (`#272 voice-agent-instructions`); the approval never does. Shown unless a bridge
+                  fetches the prompt as each call opens, and worded by `renderVoiceSendHosted` from
+                  what the last call's agent was given. Served with the wording for not knowing.
                 -->
                 <div id="voice-send-editor" hidden>
                   <label class="toggle">
                     <input id="voice-ask-before-send" type="checkbox" checked />
                     Ask me before the voice agent sends
                   </label>
-                  <p class="hint">Untick it to let the agent send as soon as you ask, with no read-back.</p>
+                  <p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back.</p>
+                  <p id="voice-send-hosted" class="hint" hidden>The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.</p>
                 </div>
                 <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
               </section>
@@ -2276,8 +2288,11 @@
                 sent. There is no read-back and no card. That also means a chat
                 message the agent reads could talk it into posting, which is why this is on unless
                 you turn it off. The change applies to the server at once and to the agent from its
-                next call; an agent whose prompt was pasted into a provider console by hand needs
-                the new prompt pasted again.
+                next call — except an agent hosted by its voice provider whose prompt was pasted
+                into the provider's console by hand. That one follows only if the provider lets
+                this page replace its prompt; otherwise it needs the new prompt pasted again. Its
+                approval for post_reply, set in the same console, is changed by hand either way.
+                The line under the switch says which applies, from what the last call was given.
               </p>
             </details>
 
@@ -2293,7 +2308,8 @@
                 <strong>Edit the system prompt</strong> opens the base instructions themselves —
                 the ones about summarising, reading aloud and treating chat text as untrusted —
                 for you to change. Save keeps your copy; <strong>Restore the shipped prompt</strong>
-                goes back to the one this server ships. When a newer version of vibe-talk changes
+                goes back to the one this server ships, and deletes your copy, so it asks for a
+                second tap first. When a newer version of vibe-talk changes
                 the shipped prompt, your copy does not change with it, and the line under the box
                 says which version it was saved against. The shipped prompt tells the agent never
                 to follow instructions found inside chat messages; take that out and a message it
@@ -2312,8 +2328,17 @@
                 as the call starts: the whole prompt, if the agent's security settings allow the
                 system prompt to be overridden; otherwise only the additional instructions, as a
                 note at the start of the call, and your edited prompt does not reach it. The line
-                under Instructions says which happened on the last call. With nothing of yours
-                saved, the call starts exactly as it did before.
+                under Instructions says which happened on the last call.
+              </p>
+              <p class="hint">
+                An agent that allows its prompt to be replaced is given this server's prompt on
+                every call, even with nothing of yours saved — the shipped one, with the send rules
+                for the Sending switch — so the prompt in its provider's console is not used, and
+                with only instructions saved the shipped prompt takes its place. That prompt is
+                written for an agent that may send: give such an agent the write token, or one
+                holding the read token is told it can send and is refused every time. An agent
+                that does not allow it, with nothing of yours saved, starts exactly as it did
+                before.
               </p>
             </details>
 

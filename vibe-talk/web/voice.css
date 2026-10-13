@@ -714,6 +714,13 @@ a.search-hit-link {
   white-space: pre-wrap;
 }
 
+/* Restore deletes the owner's own copy of the prompt, so it is armed the way #clear-view is: the
+   first tap changes the word and the colour, and only the second acts. */
+#restore-voice-system-prompt.armed {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
 /* The heading and its `?` on one line, the `?` hard right. */
 .group-head {
   display: flex;
