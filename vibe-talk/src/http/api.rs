@@ -1884,7 +1884,8 @@ pub async fn reply(
 // ---------------------------------------------------------------------------------------------
 // `#34 voice-chat-write-confirm`: the post gate's application routes.
 //
-// A model's `post_reply` only PROPOSES; these are how the person it speaks for sees the proposal
+// A model's `post_reply` only PROPOSES while the owner has the agent ask first (`#264
+// voice-send-approval`, the shipped default); these are how the person it speaks for sees the proposal
 // and sends or withdraws it. All four need the WRITE token, and NONE of them is a tool — the commit
 // in particular must stay out of the manifest, because a model that could reach it would be
 // confirming its own post. The handle travels in request bodies, never in a path, so the access

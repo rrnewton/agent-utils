@@ -445,27 +445,37 @@ and this server deliberately implements only the current one. Choosing SSE will 
 | `count_messages` | **auto** — no approval | "How many are in there?" — bounded, and says when it is a floor. |
 | `find_message` | **auto** — no approval | "The one about the mac runner" → that message, in full. |
 | `read_message` | **auto** — no approval | One known message by id. |
-| **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** |
+| **`post_reply`** | **REQUIRE APPROVAL** — or **auto** if you turned off "Ask me before the voice agent sends" | **Speaks in your name, in your channel.** |
 
 That table is the whole policy: **reading is automatic while you are driving, posting asks first.**
+The one exception is yours to make: the voice page's Settings has **Ask me before the voice agent
+sends** under **Voice**, on by default. Turn it off and the agent posts as soon as you ask, with no
+read-back — then set `post_reply` to **auto** here and paste the matching prompt in step 5.
 
 **Be clear about who enforces that.** Fine-Grained Tool Approval runs on **ElevenLabs' side**.
 This server cannot see it, cannot verify you set it, and cannot tell if it is changed later. What
 this server enforces — and what the step 3 script proves — is different: a read token **cannot**
-post, no token can reach a channel outside your allowlist, and even with the write token
-`post_reply` never sends by itself. It proposes, and the post happens only when you tap **Send** on
-the card the voice page shows (or give a spoken yes that a voice bridge attributes to you — see
-"Posting is two-phase" in the README). If you want posting off entirely, give the agent the
-**read token** and let it be physically incapable of proposing at all.
+post, no token can reach a channel outside your allowlist, and — while "Ask me before the voice
+agent sends" is on — even with the write token `post_reply` never sends by itself. It proposes, and
+the post happens only when you tap **Send** on the card the voice page shows, or answer the agent's
+"Send it?" with a plain yes that the voice page itself judges (see "Posting asks first, unless you
+turn that off" in the README). If you want posting off entirely, give the agent the **read token**
+and let it be physically incapable of proposing at all.
 
 5. Give the agent the canonical system prompt: the whole of
    [`prompts/voice-agent-system.txt`](prompts/voice-agent-system.txt), then a blank line, then the
    section that matches the token you gave it —
-   [`prompts/voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt) for the read token,
-   [`prompts/voice-agent-send.txt`](prompts/voice-agent-send.txt) for the write token. Paste that
-   into the agent's system-prompt field. **Match the section to the token**: an agent told it may
-   send while holding a read token promises sends it cannot make. Called with the same token,
-   `GET /api/v1/voice-agent` returns the already-assembled text as `prompt.text`. The files are
+   [`prompts/voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt) for the read token;
+   for the write token, [`prompts/voice-agent-send.txt`](prompts/voice-agent-send.txt) while "Ask
+   me before the voice agent sends" is on (the default), or
+   [`prompts/voice-agent-send-direct.txt`](prompts/voice-agent-send-direct.txt) if you turned it
+   off. Paste that into the agent's system-prompt field. **Match the section to the token and the
+   setting**: an agent told it may send while holding a read token promises sends it cannot make,
+   and one given the wrong send rules asks "Send it?" when nobody will confirm, or says "sent" about
+   a draft still waiting. Called with the same token, `GET /api/v1/voice-agent` returns the
+   already-assembled text as `prompt.text`, and its `variant` names which one it is. **This agent
+   was configured by hand, so it does not follow a change of the setting: paste the prompt again,
+   and the `post_reply` approval from step 4, whenever you change it.** The files are
    provider-neutral so a deployment-managed voice bridge and a hosted agent can use the same
    reviewed instructions instead of maintaining separate, drifting copies.
 
@@ -477,11 +487,13 @@ Open the agent in ElevenLabs and start a conversation. Ask, roughly in this orde
 2. *"What's been happening in lead team?"* — exercises `digest_channel`; this is the real feature.
 3. *"Read me the one about the mac runner."* — exercises `find_message`; this is the feature that
    makes it more than a text-to-speech bot.
-4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. **It must read the exact
-   text back, and nothing is posted until you confirm** — on the voice page, a card appears with
-   that text and a Send button. If a message appears in the channel before you confirm, stop: the
-   server is not the one this guide describes. Switching the agent to the read token removes the
-   capability rather than gating it.
+4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. With "Ask me before the
+   voice agent sends" on, **it must read the exact text back and end with "Send it?", and nothing is
+   posted until you confirm** — on the voice page a card appears with that text and a Send button,
+   and on that page a plain "yes" right after the read-back also sends it. If a message appears in
+   the channel before you confirm, stop: the server is not the one this guide describes. With the
+   setting off, it posts at once and says so only after the server answered `SENT`. Switching the
+   agent to the read token removes the capability rather than gating it.
 
 Barge-in is native, so you can interrupt it mid-sentence without a button. That is not the
 same as pausing: mute is what pauses, and it is this page's own doing — it withholds your audio,
@@ -513,6 +525,7 @@ using a hosted voice agent, and it is worth knowing before you point it at a pri
 | Check 5 returns an **empty** digest | **Message Content Intent** (step 1.3). Second guess: the channel really is empty. |
 | Check 5 mentions a Discord error | The bot is not in that channel, or lacks View Channel / Read Message History. |
 | Check 6 says `channel_not_writable` | That channel is configured `ro`. Change it to `rw`. |
+| Check 6 says direct sends are on | "Ask me before the voice agent sends" is off in Settings, so `post_reply` posted at once. Expected if you turned it off; otherwise tick it again. |
 | Check 6 mentions a Discord error | The bot lacks Send Messages in that channel. |
 | Public URL fails but localhost passed | The tunnel. Check `cloudflared` is running and the ingress hostname matches. |
 | ElevenLabs cannot connect at all | Transport set to SSE instead of Streamable HTTP; or the URL is missing `/mcp`; or Cloudflare Access is in the way. |

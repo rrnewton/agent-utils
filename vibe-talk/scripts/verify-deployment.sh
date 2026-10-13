@@ -302,6 +302,16 @@ else
     grep -qx post_reply <<<"$(tool_names)" || fail "check 6 (write tools/list): the WRITE token was not offered post_reply. Check that this channel is configured 'rw' rather than 'ro'."
     ok "write token IS offered post_reply"
 
+    # `#264 voice-send-approval`: whether post_reply proposes or posts is the owner's setting, so
+    # read it before judging the answer. A server that does not report it always asks.
+    request GET /api/v1/voice-settings "$READ_TOKEN"
+    ask_before_send="true"
+    if [ "$STATUS" = "200" ]; then
+        ask_before_send="$(jget ask_before_send)"
+    elif [ "$STATUS" != "404" ]; then
+        fail "check 6 (voice settings): GET /api/v1/voice-settings returned $STATUS, expected 200. Body was: $BODY"
+    fi
+
     nonce="gtverify-$(date +%s)-$$"
     tool_call "$WRITE_TOKEN" post_reply \
         "{\"channel_id\":\"$CHANNEL\",\"text\":\"vibe-talk deployment check $nonce — this message was posted by the verification script and can be deleted.\"}"
@@ -310,25 +320,39 @@ else
     proposed="$(tool_text)"
     [ "$is_error" = "false" ] || fail "check 6 (propose): the proposal was refused. The server said: $proposed
 If this mentions channel_not_writable, that channel is configured 'ro' — change it to 'rw'."
-    # `#34 voice-chat-write-confirm`: the model-facing tool only PROPOSES. A server that posted
-    # here would be one whose agent can speak in your name without you.
-    case "$proposed" in
-        "NOT SENT."*) ;;
-        *) fail "check 6 (propose): post_reply did not say NOT SENT. This server lets the model post without a separate confirmation. It said: $proposed" ;;
-    esac
-    ok "post_reply proposed and did not send: $(head -n1 <<<"$proposed" | cut -c1-100)"
+    if [ "$ask_before_send" = "false" ]; then
+        # The owner turned confirmation off: post_reply posts at once, and must say so.
+        case "$proposed" in
+            "SENT."*) ;;
+            *) fail "check 6 (direct send): \"Ask me before the voice agent sends\" is off, so post_reply should have posted and said SENT. It said: $proposed" ;;
+        esac
+        ok "post_reply posted at once and said so: $(head -n1 <<<"$proposed" | cut -c1-100)"
+        echo ""
+        echo "  NOTE: DIRECT SENDS ARE ON. \"Ask me before the voice agent sends\" is turned off on this"
+        echo "  server, so the voice agent posts in your name as soon as it decides to, with no"
+        echo "  confirmation. Tick it again in Settings if that is not what you want."
+        echo ""
+    else
+        # `#34 voice-chat-write-confirm`: the model-facing tool only PROPOSES. A server that posted
+        # here would be one whose agent can speak in your name without you.
+        case "$proposed" in
+            "NOT SENT."*) ;;
+            *) fail "check 6 (propose): post_reply did not say NOT SENT. This server lets the model post without a separate confirmation. It said: $proposed" ;;
+        esac
+        ok "post_reply proposed and did not send: $(head -n1 <<<"$proposed" | cut -c1-100)"
 
-    # The confirming half, as the voice page's Send does it: read the server's copy of the pending
-    # proposal and restate it with its handle. This script is the confirming party here — running
-    # it with a write token and without --skip-post is the decision to post.
-    checking "the proposal is confirmed outside the model's tools, and only then posted"
-    request GET /api/v1/post-proposals "$WRITE_TOKEN"
-    [ "$STATUS" = "200" ] || fail "check 6 (pending): GET /api/v1/post-proposals returned $STATUS, expected 200. Body was: $BODY"
-    commit="$(python3 -c "$PY_COMMIT_BODY" "$nonce" <<<"$BODY")" \
-        || fail "check 6 (pending): the pending proposal is not the one this script just made. Body was: $BODY"
-    request POST /api/v1/post-proposals/commit "$WRITE_TOKEN" "$commit"
-    [ "$STATUS" = "200" ] || fail "check 6 (commit): confirming the proposal returned HTTP $STATUS, expected 200. If this is 502, the bot most likely lacks Send Messages in that channel. Body was: $BODY"
-    ok "confirmed proposal $(jget serial) posted as message $(jget posted.id)"
+        # The confirming half, as the voice page's Send does it: read the server's copy of the
+        # pending proposal and restate it with its handle. This script is the confirming party
+        # here — running it with a write token and without --skip-post is the decision to post.
+        checking "the proposal is confirmed outside the model's tools, and only then posted"
+        request GET /api/v1/post-proposals "$WRITE_TOKEN"
+        [ "$STATUS" = "200" ] || fail "check 6 (pending): GET /api/v1/post-proposals returned $STATUS, expected 200. Body was: $BODY"
+        commit="$(python3 -c "$PY_COMMIT_BODY" "$nonce" <<<"$BODY")" \
+            || fail "check 6 (pending): the pending proposal is not the one this script just made. Body was: $BODY"
+        request POST /api/v1/post-proposals/commit "$WRITE_TOKEN" "$commit"
+        [ "$STATUS" = "200" ] || fail "check 6 (commit): confirming the proposal returned HTTP $STATUS, expected 200. If this is 502, the bot most likely lacks Send Messages in that channel. Body was: $BODY"
+        ok "confirmed proposal $(jget serial) posted as message $(jget posted.id)"
+    fi
 
     # Reading it back is what proves it reached Discord rather than being accepted and dropped.
     checking "the posted message is readable back out of Discord"
@@ -364,10 +388,11 @@ echo ""
 echo "PASSED — $checks_run checks against $URL"
 echo ""
 echo "What this did NOT check, and cannot:"
-echo "  * Who confirms a proposal in your deployment. This server refuses to let post_reply send and"
-echo "    holds each proposal for a separate confirmation (the voice page's Send, or a spoken yes the"
-echo "    voice bridge attributes to you); this script confirmed its own. Whether your bridge only"
-echo "    confirms on a real yes is a property of the bridge, and nothing here can see it."
-echo "    What this proved is the half we do enforce: the read token cannot post, post_reply does not"
-echo "    send, and no token can reach a channel outside the allowlist."
+echo "  * Who confirms a proposal in your deployment. While \"Ask me before the voice agent sends\" is"
+echo "    on, this server refuses to let post_reply send and holds each proposal for a separate"
+echo "    confirmation (the voice page's Send, or a plain yes the voice page judges); this script"
+echo "    confirmed its own. Whether a bridge of yours only confirms on a real yes is a property of"
+echo "    that bridge, and nothing here can see it. What this proved is the half we do enforce: the"
+echo "    read token cannot post, post_reply sends only as the owner's setting allows, and no token"
+echo "    can reach a channel outside the allowlist."
 echo "  * TLS, if you pointed this at http://. A tunnel gives you TLS; it does not authorize anyone."

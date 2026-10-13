@@ -8125,11 +8125,13 @@ function readableChannelFailure(error) {
 
 // --- confirming a post the assistant proposed ----------------------------------------------------
 //
-// `#34 voice-chat-write-confirm`. The voice agent's `post_reply` tool never sends. It leaves ONE
-// pending proposal on the server — channel, reply target, exact text — and the owner confirms it
-// outside the model's tools: by tapping Send here, or by a spoken yes that the voice bridge
-// attributes to them. Everything a model can reach is the proposing half, so a model talked into
-// posting by a message it read can at worst put a card on this screen.
+// `#34 voice-chat-write-confirm`. While the owner has "Ask me before the voice agent sends" on (the
+// shipped default; `#264 voice-send-approval`), the voice agent's `post_reply` tool never sends. It
+// leaves ONE pending proposal on the server — channel, reply target, exact text — and the owner
+// confirms it outside the model's tools: by tapping Send here, or by a spoken yes that THIS PAGE
+// judges (see "a spoken yes to the card" below). Everything a model can reach is the proposing
+// half, so a model talked into posting by a message it read can at worst put a card on this screen.
+// With the setting off the tool posts at once and no card appears; nothing here changes for that.
 //
 // The card shows the SERVER's copy, fetched from `/api/v1/post-proposals`, never anything the
 // agent said. Send restates that copy with the handle, and the server refuses unless all of it

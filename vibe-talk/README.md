@@ -1141,7 +1141,7 @@ What it asserts, in this order:
 | 3 | read token calling `post_reply` by name → **HTTP 403**, JSON-RPC **-32001** |
 | 4 | a channel outside the allowlist → refused with `unknown_channel` |
 | 5 | read token `digest_channel` → your **real messages**, non-empty |
-| 6 | write token `post_reply` → **NOT SENT**, a proposal; the script then confirms it over `/api/v1/post-proposals/commit`, as the voice page's Send does |
+| 6 | write token `post_reply` → with "Ask me before the voice agent sends" on (read first from `GET /api/v1/voice-settings`), **NOT SENT**, a proposal, which the script then confirms over `/api/v1/post-proposals/commit`, as the voice page's Send does; with it off, **SENT**, posted at once, and the script says loudly that direct sends are on |
 | 7 | the confirmed message is **read back out of Discord** |
 
 It exits non-zero on the **first** failure and names the check that failed; there is no partial
@@ -2222,8 +2222,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
-| GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting is two-phase" |
-| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — propose a post, as `post_reply` does; supersedes any pending one; answers `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle |
+| GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting asks first, unless you turn that off" |
+| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does: propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder when only part went) — see "Posting asks first, unless you turn that off" |
 | POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
@@ -2246,6 +2246,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
 | PUT | `/api/v1/noise-rules` | **write** | `{rules:["…"]}` — replace the whole list of messages read automatically; answers what was stored. Read through client-config's `noise_rules`; see "Messages read automatically" |
+| GET | `/api/v1/voice-settings` | read | `{ask_before_send, changeable}` — whether the voice agent asks before it sends, and whether this server can keep a change; also client-config's `voice_settings`. See "Posting asks first, unless you turn that off" |
+| PUT | `/api/v1/voice-settings` | **write** | `{ask_before_send: bool}` and nothing else — the owner's choice, kept in the store; answers what was stored; 503 `storage_not_configured` with no store. No MCP tool reaches it |
 | POST | `/api/v1/channels/{id}/not-noise` | **write** | `{messages:[…]}` — these are real messages; stop reading them automatically, leaving the rules alone |
 | GET | `/api/v1/channels/{id}/pins` | read | this app's pinned messages in the channel, oldest message first, each with the snapshot kept of it, and the list's `revision`; see "Pinned messages" |
 | PUT | `/api/v1/channels/{id}/pins/{message_id}` | **write** | `{author, author_id, author_is_bot?, content, timestamp, thread_id?, thread_root?}` — pin it, keeping that much of the row; idempotent. At 100 pins in the channel the oldest is unpinned and named in `unpinned` |
@@ -2948,24 +2950,35 @@ private operations documentation.
 
 Both hosted and deployment-managed conversational providers should use the checked-in
 instructions under [`prompts/`](prompts/): the scope-neutral
-[`voice-agent-system.txt`](prompts/voice-agent-system.txt) followed by exactly one of
-[`voice-agent-send.txt`](prompts/voice-agent-send.txt), for a credential that may post, or
-[`voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt), which tells the agent plainly that
-it can read but cannot send. The prompt follows the credential because an agent told it may send
-while holding a read token promises a send, has it refused, and then invents a reason. Keeping the
+[`voice-agent-system.txt`](prompts/voice-agent-system.txt) followed by exactly one of three
+sections: [`voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt) for a read credential,
+which tells the agent plainly that it can read but cannot send; or, for a credential that may post,
+[`voice-agent-send.txt`](prompts/voice-agent-send.txt) while the owner has "Ask me before the voice
+agent sends" on — propose, read the draft back word for word, end with "Send it?", and leave the
+confirmation and its result to the voice page — or
+[`voice-agent-send-direct.txt`](prompts/voice-agent-send-direct.txt) with it off — post when asked,
+ask no confirmation question, and say it was sent only on a `SENT` result. The prompt follows the
+credential because an agent told it may send while holding a read token promises a send, has it
+refused, and then invents a reason; it follows the setting because an agent given the wrong send
+rules either asks a question nobody wants or announces a send that is still waiting. Keeping the
 prompt beside the protocol makes changes reviewable and prevents one provider from silently
 receiving a different role or chat-sending policy. `GET /api/v1/voice-agent` serves it as data:
-the prompt `id`, `version`, `variant` (`read` or `write`, always matching `write_available`), a
-`fingerprint` of its text, and the assembled text itself, beside the chat provider's
-display name, the operator's time zone, the MCP path, and every MCP tool with its `access`
-(`read`/`write`), whether it `requires_confirmation`, and whether it is `available` to the
+the prompt `id`, `version`, `variant` (`read`, `write-confirm` or `write-direct`; `read` exactly
+when `write_available` is false), a `fingerprint` of its text, and the assembled text itself,
+beside `ask_before_send`, the chat provider's display name, the operator's time zone, the MCP path,
+and every MCP tool with its `access` (`read`/`write`), whether it `requires_confirmation` (for
+`post_reply`, exactly when the owner has the agent ask first), and whether it is `available` to the
 credential that asked. That answer is derived from the same manifest and the same scope filter as
 `tools/list`, so the two cannot disagree; a read credential is told that sending exists but is not
 its to use. A bridge that attaches this server's `/mcp` endpoint to its model should fetch the
 profile with the same credential it gives the MCP client. It may also load the public file at
 deployment time; its endpoint, credentials, and provider-specific tool transport remain outside
-this repository. Changing any of the prompt files means bumping `PROMPT_VERSION` and both pinned
-fingerprints in `src/voice_agent.rs`, which a unit test enforces.
+this repository. Changing any of the prompt files means bumping `PROMPT_VERSION` and all three
+pinned fingerprints in `src/voice_agent.rs`, which a unit test enforces. A bridge that fetches the
+profile once per call picks up a change to the owner's setting at its next call, with no change of
+its own; **a hosted agent whose prompt and per-tool approval were pasted into its console by hand
+must be given the new prompt, and the new approval for `post_reply`, every time the setting
+changes.**
 
 **Startup timing.** "It takes a while to start talking" is not actionable; which phase takes the
 while is. For each `vibe-talk-v1` call the page records milliseconds since Start for
@@ -4865,7 +4878,7 @@ endpoint should have.
 | `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. `hours` counts from that many hours ago. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
 | `read_message` | read | automatic | One known message by id. |
-| `post_reply` | **write** | **requires approval** | *Proposes* a post as the bot. Nothing is sent until the owner confirms it outside the model's tools. |
+| `post_reply` | **write** | **requires approval**, unless the owner turned it off | *Proposes* a post as the bot, and nothing is sent until the owner confirms it outside the model's tools — or, with "Ask me before the voice agent sends" off, posts it at once and says `SENT`. |
 
 They are deliberately thin, with one exception. With a real model in the loop the model should
 compose, not consume pre-chewed operations, so there is no "summarize and reply" tool. The
@@ -4911,20 +4924,51 @@ shape.
 JSON-RPC `-32001` if it calls it anyway. Hiding and enforcing are separate on purpose: hiding a
 tool is never the thing that keeps it from running.
 
-### Posting is two-phase
+### Posting asks first, unless you turn that off
 
-`#34 voice-chat-write-confirm`. A per-tool approval setting is a promise the voice provider makes,
-and a bridge that has no such setting would leave the decision to post entirely to the model — the
-same model that has just read other people's messages, any of which may be written to talk it into
-something. So `post_reply` **never sends**. It leaves one pending proposal on this server and
-answers `NOT SENT`, with the channel and the exact text to read back. The owner confirms it outside
-anything a model can call:
+`#34 voice-chat-write-confirm` and `#264 voice-send-approval`. A per-tool approval setting is a
+promise the voice provider makes, and a bridge that has no such setting would leave the decision to
+post entirely to the model — the same model that has just read other people's messages, any of
+which may be written to talk it into something. So whether `post_reply` sends is decided by this
+server, from one setting the owner owns: **"Ask me before the voice agent sends"**, a checkbox in
+the voice page's Settings, under **Voice**.
+
+**The setting.** On by default. The shipped default is `[conversation] ask_before_send` in the
+configuration file (`true` unless the operator says otherwise); the owner's own choice is one row
+in the store, written only by a write-scope `PUT /api/v1/voice-settings` — which Settings makes,
+and which no MCP tool reaches, because a model that could turn its own confirmation off could then
+post whatever a message it read asked for. Anyone who can read may see it, through
+`GET /api/v1/voice-settings` and client-config's `voice_settings`. With no store configured the
+change is refused with 503 and the configured default stands; a store that cannot be read makes the
+server **ask**, whatever the default says. A purge removes the choice and restores the default.
+The checkbox says, for each state, what that means:
+
+* **On** — "The agent reads the message back and asks 'Send it?'; say yes or tap Send."
+* **Off** — "The agent sends as soon as you ask. A message it reads could also talk it into
+  sending."
+
+The server reads the setting on every `tools/list`, profile and `post_reply`, so its behaviour
+changes at once; the agent's prompt changes at its next call. **Change it between calls**, and
+re-paste the prompt of a hosted agent configured by hand (see "Registering it with an ElevenLabs
+agent").
+
+**Off: `post_reply` posts.** It goes through `ops::reply`, the same function a confirmed proposal
+is posted with — the allowlist, the write policy, the emptiness check, reply targets and the
+splitting of a long message are the ones every other send gets. The model is told `SENT.` first,
+then where it went and the exact text posted (and how many messages, if it was long). A refusal or
+failure starts `NOT SENT.`, and one that failed partway `PARTLY SENT. The rest was NOT sent; do not
+send the whole message again.` — in both modes, so no failure reads as a send. The log gets one
+content-free `post_gate event=sent_direct` line (or `direct_failed`, with the reason): a number,
+the channel, the length. There is no card and no read-back. A read credential is still refused.
+
+**On: `post_reply` proposes.** It leaves one pending proposal on this server and answers `NOT SENT`,
+with the channel and the exact text to read back. The owner confirms it outside anything a model can
+call:
 
 * **on the voice page**, where a card shows the server's own copy — channel, reply target, text —
   with **Send** and **Don't send**; or
-* **by a spoken yes that the voice bridge attributes to the owner**, which the bridge turns into a
-  commit naming `confirmed_by: "speaker_turn"`. Nothing in this repository does that: on the voice
-  page a spoken yes sends nothing, and the model is told to ask for a tap on Send.
+* **by saying yes**, which the voice page — never the model — judges, and turns into a commit
+  naming `confirmed_by: "speaker_turn"` (below). A bridge may do the same under the same rules.
 
 The card is built so that a tap confirms only what the owner read. When a newer proposal replaces
 the text, Send is held for two seconds and the card says the text changed, so a tap already on its
@@ -4932,7 +4976,62 @@ way does not land on the new words. A draft whose card was showing when a call e
 again in the next call on the same page; it lapses on the server. The page remembers that only
 until it is reloaded, so a new call from a reloaded page within the 120 seconds shows it again.
 
-The mechanics, all over the write-scope REST routes in the table above:
+**A spoken yes, judged by the page.** The agent reads the draft back word for word and ends with
+"Send it?". The page takes the owner's next final transcript as a yes only when all of these hold,
+for both wire protocols:
+
+* **The draft is this call's.** The card shows a proposal this call's agent made — not one already
+  pending when the call opened, not one from before a replacement voice session on the same socket
+  (a second `session_started` or `conversation_initiation_metadata`), and never one from another
+  call. It has not lapsed, and holds no sign-in token. Only the newest proposal is ever on the card.
+* **It is a spoken call with echo cancellation on.** A typed call never commits by voice.
+* **The read-back was not interrupted.** No `interruption` (hosted protocol), no
+  `turn_complete{interrupted: true}`, and on `vibe-talk-v1` the read-back's own `turn_complete`
+  arrived before the answer.
+* **The read-back said the card.** Every word of the card's text appears, in order, in what the
+  assistant said since the owner last spoke (mention tokens excepted, since the model says the
+  name), followed by the word "send". A model talked into a bad draft therefore cannot read back
+  something harmless and have the bad text sent on a yes to what it said.
+* **It was heard to the end.** The answer began after the read-back's audio finished playing.
+* **It is not an echo.** A bare "send it" within 1.5 s of the end of "…Send it?" may be the
+  agent's own voice and is refused; a plain "yes" is never taken for an echo.
+* **It is the very next answer, and a yes.** Only the answer right after the read-back can match
+  it. A yes is a phrase from a closed list — *yes, yeah, yep, send it, send, do it, go ahead, sure,
+  please do* — with punctuation and case ignored and at most one word of filler ("yes please",
+  "ok send it"). A yes inside a sentence that adds anything ("yes, and tell him I'm late", "send it
+  to Bob") sends nothing, nor does a question ("Send it?").
+
+A yes that passes waits 1.2 s, so "yes… wait" sends nothing, then commits exactly the card's server
+copy through the same function and busy latch as a tap: a tap and a yes racing commit once, and the
+single-use handle is the backstop. An answer that starts *no, nope, cancel, stop, wait, don't, do
+not* or *never mind*, given to a question about sending, withdraws the draft. Anything else leaves
+the card for a tap.
+
+**Every outcome is said, three ways.** The agent is told through the call's existing text channel
+— the `user_message` the composer and the live relay already send, which `vibe-talk-v1` carries as
+a queued `prompt` once the spoken turn has closed (`#241 voice-composer`) — in one fixed sentence
+starting `Voice page:`: SENT, partly sent, NOT sent with the reason, or not confirmed. Its prompt
+tells it to wait for that and never to say "sent" before it, so the agent never claims a send that
+did not happen, and its context stays truthful for a later "did it go?". The page also says it
+itself, because a model's sentence needs a cooperative model: the status line ("Sent to lead
+team." / "Not sent — the read-back was interrupted."), a transcript seam, and a short tone — a
+rising pair for sent, one low note for not sent; none when Sound is off or in a typed call. A yes
+to a question that was not about sending changes nothing and says so only on the status line.
+
+**What a spoken yes cannot know**, stated plainly:
+
+* **Who spoke.** The page assumes one speaker. A passenger, a phone call on the car speakers or the
+  radio saying "yeah" right after a read-back counts as the owner.
+* **Background speech** is narrowed — the next-answer rule, the closed list, the settle window —
+  not eliminated.
+* **Misrecognition.** Short words are the commonest false transcripts, and the page has no
+  confidence score to consult.
+* **Echo.** It needs echo cancellation on; say a plain "yes" rather than "send it" right after the
+  question.
+* **Coverage.** Links, code and numbers are rarely read out exactly as written, so those drafts fall
+  back to a tap, and the agent and the status line say so.
+
+The mechanics of a proposal, all over the write-scope REST routes in the table above:
 
 * **One proposal at a time.** A new one supersedes the old, so a correction ("no, say tomorrow")
   replaces the draft rather than queueing a second post.
@@ -4953,11 +5052,13 @@ The mechanics, all over the write-scope REST routes in the table above:
   channel id it sends, so the parsers tell a caller without write scope nothing about what they
   accept.
 * **The log is content-free.** One `post_gate` line per step — `proposed`, `committed`, `failed`,
-  `refused`, `cancelled`, `superseded`, `expired` — with a serial, channel id, text length, refusal
-  code and `confirmed_by`. Never a word of the text, never the handle.
+  `refused`, `cancelled`, `superseded`, `expired`, and `sent_direct` / `direct_failed` for a direct
+  send — with a serial, channel id, text length, refusal code and `confirmed_by`. Never a word of
+  the text, never the handle. Changing the setting logs `voice_settings event="changed"` and the
+  boolean alone.
 
-**A bridge that commits on a spoken yes must only do so for a yes the owner could have meant.**
-Two cases break that, and the bridge — not the model — has to rule them out:
+**A bridge that commits on a spoken yes must keep the same rules.** Two cases in particular, which
+the page's rules above already cover:
 
 * **An interrupted read-back.** A barge-in can cut the response after `post_reply` has run but
   before the text was spoken. The proposal is still pending, and the next user turn may be "stop"
@@ -5046,14 +5147,21 @@ reason a digest exists — is in [`QUICKSTART.md`](QUICKSTART.md) under step 5.
 
 **Which token you give it decides the ceiling.** With the read token the agent physically cannot
 post — `post_reply` is not even listed for it. With the write token it can *propose*, and a
-proposal posts only when the owner confirms it — see "Posting is two-phase". The conservative
-first deployment is the read token.
+proposal posts only when the owner confirms it — see "Posting asks first, unless you turn that
+off". The conservative first deployment is the read token.
+
+**The prompt and the approval follow the owner's setting.** With "Ask me before the voice agent
+sends" on, paste the `write-confirm` prompt and keep `post_reply` on **REQUIRE APPROVAL**. With it
+off, paste the `write-direct` prompt (from `GET /api/v1/voice-agent` with the write token) and set
+`post_reply` to **auto**: the owner turned confirmation off, and a vendor prompt in front of every
+send would be the friction he removed. **A hand-configured agent does not follow a change by
+itself — re-paste both whenever the setting changes.**
 
 **Say this plainly: the per-tool approval setting is enforced on ElevenLabs' side, and this server
 cannot verify it.** Nothing here can tell whether you configured approval correctly, or
 whether it was later changed. What this server enforces is the scope split, the allowlist, and the
-confirmation step: a read token cannot post, `post_reply` never sends by itself, and no token can
-reach a channel outside the configuration. Do not mistake the approval prompt for a guarantee we
+confirmation step: a read token cannot post, `post_reply` never sends by itself while the owner has
+the agent ask first, and no token can reach a channel outside the configuration. Do not mistake the approval prompt for a guarantee we
 implement; the confirmation step is the one we do.
 
 Verify the public endpoint before pointing an agent at it — same script, public URL:
@@ -5255,9 +5363,12 @@ makes it, not the voice agent, the real security boundary of the whole design.
   agent cannot post. The server refuses to start if the two tokens are equal or shorter than 24
   characters. Over MCP the read token is not even shown `post_reply` in `tools/list`, and is
   refused with `403` if it calls it by name anyway.
-* **The model cannot post by itself.** Even with the write token, `post_reply` only proposes; the
-  post happens when the owner confirms it through a route no MCP tool reaches. See "Posting is
-  two-phase".
+* **The model cannot post by itself — unless the owner says it may.** With the write token and
+  "Ask me before the voice agent sends" on (the default), `post_reply` only proposes; the post
+  happens when the owner confirms it through a route no MCP tool reaches, by a tap or by a yes the
+  voice page judges. With it off, `post_reply` posts when asked, and a message the agent reads could
+  talk it into posting; that is the owner's choice to make, the setting says so, and no tool can
+  make it for him. See "Posting asks first, unless you turn that off".
 * **Configured channels are an allowlist.** A channel absent from the configuration answers 404
   even to the write token, however many channels the bot happens to be in. Each channel is
   additionally `writable` or not, defaulting to not. **Both front doors share one implementation**

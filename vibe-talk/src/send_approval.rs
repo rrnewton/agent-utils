@@ -146,9 +146,7 @@ pub enum VoicePost {
         channel: ChannelInfo,
         /// A number correlating the log line; drawn from the same counter as proposals.
         serial: u64,
-        /// The first message as the chat service accepted it.
-        posted: Message,
-        /// Every part, in order.
+        /// Every part as the chat service accepted it, in order; the first is the post itself.
         parts: Vec<Message>,
         /// The exact text posted.
         text: String,
@@ -180,7 +178,7 @@ pub async fn voice_post(
         Approval::Direct => {
             let serial = state.post_gate.number();
             match ops::reply(state, channel_id, text, reply_to).await {
-                Ok((channel, posted, parts)) => {
+                Ok((channel, _first, parts)) => {
                     crate::access::post_gate(
                         "sent_direct",
                         Some(serial),
@@ -192,7 +190,6 @@ pub async fn voice_post(
                     Ok(VoicePost::Sent {
                         channel,
                         serial,
-                        posted,
                         parts,
                         text: text.to_owned(),
                         reply_to: reply_to.map(str::to_owned),
