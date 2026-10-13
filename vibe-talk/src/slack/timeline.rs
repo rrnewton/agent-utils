@@ -682,10 +682,17 @@ impl HttpSlackClient {
     /// root names. Anything else reads the thread's newest replies in full, as every Flat read
     /// used to: a count that fell or did not add up (a deletion), more new replies than a Flat page
     /// shows of a thread, a thread never read, or one last read in full [`FLAT_RECONCILE`] ago or
-    /// longer.
+    /// longer. A full read is held only when it agrees with the root: see the comment at the end.
+    /// So a root that names no `latest_reply` is read in full on every Flat read, as it was before
+    /// any of this; the saving depends on the server reporting it.
     ///
     /// An edit to a reply changes nothing on its root, so Flat shows it when that period runs out;
     /// the thread view, which reads the thread itself, shows it at once.
+    ///
+    /// One hole is known, and left to the reconcile: an older reply deleted while two new ones are
+    /// posted, one of them a system event that is not kept, raises the count by one and brings one
+    /// real reply ending at the latest. That adds up, so the deleted reply stays until the thread's
+    /// next full read.
     async fn flat_replies(&self, conversation: &str, root: &Raw) -> Result<Vec<Raw>, ChatError> {
         let key = (conversation.to_owned(), root.ts.clone());
         let latest = root.activity_micros();
@@ -732,10 +739,19 @@ impl HttpSlackClient {
             .replies_newest_before(conversation, &root.ts, None, FLAT_MAX_REPLIES)
             .await?;
         replies.retain(|raw| raw.micros != root.micros);
-        // Every root here has replies. A walk that could not get past a run of system events
-        // returns none and resumes on the next read (`super::history`); holding that nothing
-        // would stop it resuming.
-        if !replies.is_empty() {
+        // Held only when the read agrees with the root this Flat read fetched: it ends at the
+        // latest reply the root names and holds as many replies as the root counts, or a full
+        // Flat share of them. A feed that lagged the root leaves a reply out; a reply posted
+        // after history was read, and perhaps deleted before the next read, ends past it; a root
+        // that names no latest reply makes the count the only sign of change, which one reply
+        // deleted and another added hide. Each is read in full again on the next Flat read, as
+        // before. So is a walk that could not get past a run of system events and returned none:
+        // it resumes on the next read (`super::history`).
+        let agrees = latest != root.micros
+            && replies.last().is_some_and(|raw| raw.micros == latest)
+            && u64::try_from(replies.len())
+                .is_ok_and(|held| held == count.min(FLAT_MAX_REPLIES as u64));
+        if agrees {
             self.remember_flat(
                 key,
                 FlatThread {
@@ -745,8 +761,18 @@ impl HttpSlackClient {
                     full_at: std::time::Instant::now(),
                 },
             );
+        } else {
+            self.forget_flat(&key);
         }
         Ok(replies)
+    }
+
+    /// Stop holding a thread's replies, so the next Flat read reads it in full.
+    fn forget_flat(&self, key: &(String, String)) {
+        self.flat_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
     }
 
     /// The replies held for a thread, unless they were read in full a reconcile period ago.

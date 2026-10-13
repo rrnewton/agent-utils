@@ -1079,9 +1079,14 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   latest reply, so a flat read reuses the replies the server already holds for a thread whose
   root has not changed (no call), and reads only the newer replies of one that has (one call,
   `conversations.replies` with `oldest=`). A thread whose reply count fell or does not add up is
-  read in full, and so is every thread not read in full for fifteen minutes. An edit to a reply
-  changes nothing on its root, so it can take up to those fifteen minutes to show in the flat
-  view. Opening the thread shows it at once.
+  read in full, and so is every thread not read in full for fifteen minutes. A full read is
+  reused only when it agrees with its root — ending at the latest reply the root names, with as
+  many replies as it counts — so a reply the server had not caught up with, or one posted while
+  the read was under way, is read again on the next flat read rather than kept. The saving
+  depends on the server reporting `latest_reply` on each root: a root without it is read in full
+  on every flat read, as before. An edit to a reply changes nothing on its root, so it can take
+  up to those fifteen minutes to show in the flat view, pull-to-refresh included. Opening the
+  thread shows it at once.
 * **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.
@@ -1935,8 +1940,11 @@ conversation's Main and one thread with `oldest=<ts>`. Both read by creation, so
 read; their thread lists, All views, and a forum's or a narrowed channel's Main use the generic
 cursor. A cursor a direct backend did not issue for that view — one a bridge issued before the
 channel moved to the native API, say — is answered `410 cursor_expired`, so the page reads the
-newest page rather than failing every refresh with it. The page keeps its full poll on all such channels, so edits and deletions are as prompt as
-before; forward reads there serve live arrivals and a return to the page.
+newest page rather than failing every refresh with it. The page keeps its full poll on all such
+channels, so edits and deletions arrive with the next poll, as before — except an edit to a reply
+in Slack's All view, which waits for that thread's next full read (see "The flat view rereads
+only threads that moved" in Slack's Limits); forward reads there serve live arrivals and a
+return to the page.
 
 The native backend includes accessible active and archived threads. It bounds discovery at 256
 threads and 100 pages per archived collection, retains pagination inventories for five minutes,
@@ -3035,7 +3043,10 @@ view's coverage and walk-back cursor stay as they were. Where the channel's delt
 bridge with a change record), the poll, a live message, a live edit or deletion, pull-to-refresh,
 and coming back to a page hidden for fifteen seconds or more are all deltas. Where they carry
 additions only, the forty-five-second poll and pull-to-refresh stay full reads, so edits and
-deletions are no slower than before, and deltas serve live arrivals and the return to the page. A
+deletions are no slower than before — except an edit to a reply in Slack's All view, which the
+server rereads only when that thread's root moves or every fifteen minutes (see "The flat view
+rereads only threads that moved" in Slack's Limits) — and deltas serve live arrivals and the
+return to the page. A
 full read still happens on entering a view, changing channel, a stream reset, an expired or
 mismatched cursor (`410 cursor_expired` or `400 cursor_mismatch`, answered at once with a full read
 rather than a failure), a delta still saying `more` after four pages, and every fifteen minutes per

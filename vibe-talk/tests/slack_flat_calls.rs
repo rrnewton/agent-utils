@@ -330,3 +330,155 @@ async fn remembered_replies_are_read_in_full_again_after_the_reconcile_period() 
         assert_eq!(flat(&fake, &every).await.replies.len(), 20);
     }
 }
+
+/// The `conversations.replies` requests that asked for `root`'s thread.
+fn reads_of(read: &Read, root: &str) -> Vec<HashMap<String, String>> {
+    read.replies
+        .iter()
+        .filter(|params| params["ts"] == root)
+        .cloned()
+        .collect()
+}
+
+/// A full read of a thread is held only when it agrees with the root the same Flat read fetched:
+/// a replies feed that lags the history row (a replica or a cache in the bridge) leaves the
+/// newest reply out, and the next read, the root unchanged, must not reuse that. Remote-ops audit
+/// W8 review.
+#[tokio::test]
+async fn a_full_read_that_lagged_its_root_is_read_again() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (lagging, index) = roots[2].clone();
+    let newest = reply_ts(index, REPLIES - 1);
+    // The root says thirty replies, the newest of them latest; the feed has only twenty-nine.
+    let hidden = fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), lagging.clone()))
+            .expect("thread")
+            .pop()
+            .expect("a reply")
+    });
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+    assert!(!first.messages.contains(&newest), "the feed lags");
+
+    // The feed catches up. The root already said thirty, so it reads exactly as before.
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), lagging.clone()))
+            .expect("thread")
+            .push(hidden);
+    });
+    let second = flat(&fake, &client).await;
+    assert_eq!(
+        second.threads(),
+        [lagging.clone(), lagging.clone()],
+        "only the thread whose read did not agree with its root, read in full"
+    );
+    assert!(reads_of(&second, &lagging)
+        .iter()
+        .all(|params| !params.contains_key("oldest")));
+    assert!(
+        second.messages.contains(&newest),
+        "the reply the root reported is shown"
+    );
+
+    // That read agreed with its root: held from now on.
+    let third = flat(&fake, &client).await;
+    assert!(third.replies.is_empty(), "{:?}", third.threads());
+    assert_eq!(third.messages, second.messages);
+}
+
+/// A reply posted after a Flat read fetched history and before it fetched that thread is newer
+/// than the latest reply the root named, so that read is not held. Deleted again before the next
+/// read, the root reads exactly as before, and the reply must not linger. Remote-ops audit W8
+/// review.
+#[tokio::test]
+async fn a_reply_posted_during_a_read_and_deleted_is_not_kept() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (raced, _) = roots[4].clone();
+    let racer = ts(9500, 0);
+    // In the feed, but not yet on the root the read sees.
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), raced.clone()))
+            .expect("thread")
+            .push(
+                json!({"type": "message", "ts": racer, "thread_ts": raced, "user": "UREPLIER1",
+                "text": "the wrong thread", "user_profile": {"display_name": "Replier"}}),
+            );
+    });
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+    assert!(first.messages.contains(&racer));
+
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), raced.clone()))
+            .expect("thread")
+            .retain(|reply| reply["ts"] != json!(racer));
+    });
+    let second = flat(&fake, &client).await;
+    assert_eq!(second.threads(), [raced.clone(), raced.clone()]);
+    assert!(
+        !second.messages.contains(&racer),
+        "a deleted reply is still shown"
+    );
+
+    let third = flat(&fake, &client).await;
+    assert!(third.replies.is_empty(), "{:?}", third.threads());
+    assert_eq!(third.messages, second.messages);
+}
+
+/// A root that carries `reply_count` but no `latest_reply` leaves the count as the only sign of
+/// change, and one reply deleted and another added leave it where it was. Such a thread is read in
+/// full on every Flat read, as before W8: no saving, and nothing stale. Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_root_without_latest_reply_is_read_in_full_every_time() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    fake.with(|state| {
+        for message in state.history.get_mut(CH).expect("history") {
+            message
+                .as_object_mut()
+                .expect("an object")
+                .remove("latest_reply");
+        }
+    });
+    let client = fake.client();
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+
+    let (churned, index) = roots[1].clone();
+    let gone = reply_ts(index, 3);
+    let added = ts(9200, 0);
+    fake.with(|state| {
+        let replies = state
+            .replies
+            .get_mut(&(CH.to_owned(), churned.clone()))
+            .expect("thread");
+        replies.retain(|reply| reply["ts"] != json!(gone));
+        replies.push(
+            json!({"type": "message", "ts": added, "thread_ts": churned, "user": "UREPLIER1",
+            "text": "a new reply", "user_profile": {"display_name": "Replier"}}),
+        );
+    });
+    let second = flat(&fake, &client).await;
+    assert_eq!(
+        (second.history, second.replies.len()),
+        (3, 20),
+        "every thread read in full, as before"
+    );
+    assert!(second.messages.contains(&added), "the new reply is shown");
+    assert!(
+        !second.messages.contains(&gone),
+        "the deleted reply is gone"
+    );
+}
