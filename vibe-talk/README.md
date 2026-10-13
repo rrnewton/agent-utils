@@ -49,8 +49,10 @@ different projection: it lists child conversations within the currently selected
 absent when the configured backend does not provide thread timelines or when the selected channel
 is itself one conversation. It is not an alternate picker for added sources.
 
-The selected channel or space is remembered on this device when you reopen the app. If it is no
-longer configured, the app selects the first available channel.
+The selected channel or space is remembered when you reopen the app. Each window remembers its
+own, so a reload brings a window back to the channel it was showing even when another window has
+since chosen a different one; a new window opens on the channel chosen last in any window. If it
+is no longer configured, the app selects the first available channel.
 
 Tap a root's reply count or a thread-list entry to open its history. **Back**, or a swipe right,
 returns to the view and scroll position you came from. The selected thread has its own history,
@@ -386,6 +388,16 @@ under `vibe-talk.voice.ui-state` and reopens on it:
   token like the snapshot, and goes with it; a channel the server stops listing loses its choice
   when it loses its saved messages. A record from before each channel kept its own view is carried
   forward: the view it held, if you had chosen it, becomes that channel's choice.
+- **Each window its own** (`#265 window-channel-memory`). `localStorage` is shared by every window
+  of the app, so with two windows open a reload used to come back on whatever the window that wrote
+  last had shown. The selected channel and this record are now also kept in each window's own
+  `sessionStorage`, which survives a reload of that window and is read first: two windows left on
+  two channels, or on one channel in two views, each come back where they were. A new window has
+  nothing of its own and opens from the shared copy, on the channel chosen last in any window;
+  reloading a window does not count as choosing. The read mode is a device-wide preference and
+  comes from the shared copy, and a view chosen in another window still applies in a channel this
+  window has not chosen one in. What the right column shows in two columns is not kept across a
+  reload, as before.
 
 `make -C vibe-talk offline-cache-browser` walks that whole sequence in a real Chromium at an
 Android phone's size, against a loopback fake API. Pass `SCREENSHOTS=/tmp/shots` to keep one PNG

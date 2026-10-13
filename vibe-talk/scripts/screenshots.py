@@ -918,8 +918,10 @@ class Driver:
             "  localStorage.removeItem('vibe-talk.voice.resume');\n"
             # `#189 restore-ui-state`. Where the reader left the page is stored, and a reload
             # reopens there; a scene that loads the page must start from the default instead of
-            # the view the previous scene left up.
+            # the view the previous scene left up. `#265 window-channel-memory`: the window keeps
+            # its own copy, which a reload reads first, and every scene loads in this one tab.
             "  localStorage.removeItem('vibe-talk.voice.ui-state');\n"
+            "  sessionStorage.removeItem('vibe-talk.voice.ui-state');\n"
             # `#212 link-filter`. The kinds of link a reader turned off under Links are kept, and
             # `38-link-kinds-off` turns one off: every later Links frame must start with all on.
             "  localStorage.removeItem('vibe-talk.voice.hidden-link-kinds');\n"
@@ -5675,6 +5677,14 @@ def check_scene_storage_isolation_controls() -> list[str]:
             return [
                 f"a screenshot-scene reload keeps {key}, so the refused send one scene leaves "
                 "behind is drawn in every later channel frame."
+            ]
+    # `#265 window-channel-memory`. Every scene loads in one tab, whose own copy of where the reader
+    # was a reload reads before the device's: cleared from the device alone, it still reopens there.
+    for storage in ("localStorage", "sessionStorage"):
+        if f"{storage}.removeItem('vibe-talk.voice.ui-state')" not in script:
+            return [
+                f"a screenshot-scene reload keeps the UI record in {storage}, so a scene opens on "
+                "the view the previous scene left up instead of the default."
             ]
     return []
 
