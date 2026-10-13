@@ -19392,6 +19392,11 @@ async function requestPreparedSpeech(channel, ids) {
  * Never throws. A failure leaves the row unprepared, and the tap falls back to the older and
  * slower route, as it does when the batch fails.
  *
+ * Unlike the batch, it does not ask whether Read is on or which view is showing. The batch runs
+ * on its own, so it must check that someone is reading; this runs only inside a tap that is going
+ * to read anyway, for the same channel and messages the slower route (`fetchSpeech`) would fetch
+ * without those checks. Skipping them reaches nothing that route does not.
+ *
  * @param {Array<string>} ids the tapped row's message ids, oldest first.
  */
 async function prepareSpeechFor(ids) {

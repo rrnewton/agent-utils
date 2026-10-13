@@ -456,13 +456,20 @@ preparing behind it.
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
 kept in memory. It fetches only what is missing:
 
-- outside a thread, one window per channel, shared by preparations that miss at the same time;
-- in a thread, the missing messages, four at a time.
+- outside a thread, one window per channel, shared by preparations that miss at the same time
+  (a preparation joins another's fetch only when that window was at least as wide as its own);
+- in a thread, the missing messages, four at a time per preparation and eight across all of them.
 
-The provider warm-up starts at the top of a preparation and is not awaited. Each preparation logs
-one content-free `read-aloud preparation` line with its phases (`lookup_ms`, `fetch_ms`,
-`normalize_ms`, `preparation_ms`, and whether it started the warm-up). The warm-up logs its own
-`warm_up_ms` when it ends. A read's audio opens with silence, which `playing` already counts as
+An edit or deletion an adapter pushes, a deletion a timeline delta reports, and the storage purge
+all drop the copy in memory at once. A fetch that was already in flight when that happened keeps
+none of what it was told about, so it cannot put the old text back.
+
+The provider warm-up starts at the top of a preparation and is not awaited. Only one runs at a
+time, and it is given up after 60 seconds. Each preparation logs one content-free
+`read-aloud preparation` line with its phases (`lookup_ms`, `fetch_ms`, `normalize_ms`,
+`preparation_ms`, and whether it started the warm-up). The warm-up logs its own `warm_up_ms` when
+it ends: at INFO when it worked, and at WARN with the provider's error `code` when it failed or
+timed out. A read's audio opens with silence, which `playing` already counts as
 audible. So where the page plays through Web Audio, its playback report also carries
 `tap_to_speech_ms`: the time to the first sample loud enough to be speech.
 `GET /api/v1/client-config` reports the selected backend and playback mode. Rust handlers depend on

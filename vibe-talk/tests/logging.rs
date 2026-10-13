@@ -905,3 +905,88 @@ async fn read_aloud_logs_each_phase_and_never_the_message() {
         "message text reached the INFO log:\n{text}"
     );
 }
+
+/// A server voice whose warm-up always fails, with a detail no log may carry.
+struct FailingWarmUp;
+
+/// In the failing warm-up's detail, and so in no log line.
+const WARM_UP_DETAIL: &str = "the provider said something private about the account";
+
+#[async_trait::async_trait]
+impl vibe_talk::speech::SpeechProvider for FailingWarmUp {
+    fn describe(&self) -> vibe_talk::speech::Description {
+        vibe_talk::speech::Description {
+            backend: "failing-warm-up",
+            label: "Failing warm-up".to_owned(),
+            playback: vibe_talk::speech::Playback::Audio,
+            local_only: false,
+        }
+    }
+
+    async fn warm_up(&self) -> Result<(), vibe_talk::speech::SpeechError> {
+        Err(vibe_talk::speech::SpeechError::Backend {
+            code: "conversation_speech_error",
+            detail: WARM_UP_DETAIL.to_owned(),
+        })
+    }
+
+    async fn speak(
+        &self,
+        text: &str,
+        _speed: Option<f64>,
+    ) -> Result<vibe_talk::speech::Speech, vibe_talk::speech::SpeechError> {
+        Ok(vibe_talk::speech::Speech {
+            audio: text.as_bytes().to_vec(),
+            content_type: "audio/test".to_owned(),
+        })
+    }
+}
+
+/// `#191 read-aloud-first-lag`: a warm-up that fails is a WARN, so it shows without reading every
+/// INFO line, and it names the provider's error code, never the provider's words.
+#[tokio::test]
+async fn a_failed_read_aloud_warm_up_is_a_warning_with_its_code_and_nothing_else() {
+    let capture = LogCapture::info_only();
+    let (mut state, discord) = vibe_talk::testing::state();
+    state.speech = std::sync::Arc::new(FailingWarmUp);
+    let harness = Harness {
+        router: router(state),
+        discord,
+    };
+    let id = harness.discord.seed(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "Reader",
+        "a line to hear",
+    );
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            &format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare"),
+            Some(READ_TOKEN),
+            Some(json!({ "ids": [id.0] })),
+        )
+        .await,
+        StatusCode::OK,
+        "a failing warm-up must not fail the preparation"
+    );
+    // The warm-up runs beside the request; let it finish on this thread.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let text = capture.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("read-aloud warm-up finished"))
+        .unwrap_or_else(|| panic!("no warm-up line in:\n{text}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("ok=false"), "{line}");
+    assert!(
+        line.contains("code=\"conversation_speech_error\""),
+        "{line}"
+    );
+    assert!(
+        !text.contains(WARM_UP_DETAIL),
+        "the provider's detail reached the log:\n{text}"
+    );
+}
