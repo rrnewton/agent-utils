@@ -3502,11 +3502,21 @@ const TUNING_BANDS = {
     "seconds it lands on the same slow moment that lost it; past fifteen the reader has already " +
     "decided it failed and is reaching for Retry"],
   OUTGOING_RETRY_FACTOR: [2, 4,
-    "how much longer each later wait is. Below double, three tries are spent inside one bad " +
-    "minute; above four, the last one comes after the reader has stopped looking"],
-  OUTGOING_RETRY_ATTEMPTS: [1, 4,
-    "automatic tries before a person decides. None is the incident this exists for; past a few, a " +
-    "service that is down is asked again and again by a page nobody is watching"],
+    "how much longer each later wait is. Below double, the tries are spent inside one bad " +
+    "minute; above four, the cap is reached by the second wait and the schedule is a flat one"],
+  OUTGOING_RETRY_MAX_MS: [10000, 30000,
+    "the longest wait between automatic tries (#277 send-order). Under ten seconds a service that " +
+    "is down is asked several times a minute by a page nobody is watching; past thirty a failure " +
+    "that took a moment holds the message, and every message written behind it, long after the " +
+    "service is answering again (the owner's 'Retrying in 45 s')"],
+  OUTGOING_RETRY_FLOOR_MS: [250, 3000,
+    "the least wait before an automatic try, after an attempt that took longer to fail than its " +
+    "wait (#277 send-order). Under a quarter of a second the page asks again in the same breath " +
+    "it was refused in; past three it is a wait on top of the one the slow attempt already was"],
+  OUTGOING_RETRY_ATTEMPTS: [1, 8,
+    "automatic tries before a person decides. None is the incident this exists for; past eight, " +
+    "with each wait capped, a service that is down is asked again and again by a page nobody is " +
+    "watching, and a message held behind it waits minutes before anyone is asked"],
   SEND_UNDO_MS: [8000, 30000,
     "how long the Undo chip offers to take back a Dismiss in the outbox (#193 compose-draft-loss). " +
     "Under eight seconds a reader who has just seen what they did is still finding the chip; past " +
@@ -29694,14 +29704,14 @@ test("`#193 compose-draft-loss`: Undo puts back a send's wait to go again on its
   const page = await keyedChannel();
   const lost = await failedSend(page, "going again by itself", 502);
   const key = posted(page)[0].idempotency_key;
-  assert.match(lost.text(), /Retrying in 5 s\./);
+  assert.match(lost.text(), retryingFirst());
   await outgoingDismiss(lost).click();
   assert.equal(page.expireTimers(RETRY_FIRST_MS), 0, "a dismissed send went again on its own");
   await page.el("undo-send-dismiss").click();
   await page.settle();
   const back = outgoingRows(page)[0];
   assert.equal(back.getAttribute("data-send-state"), "retrying", "Undo put it back without its wait");
-  assert.match(back.text(), /Retrying in 5 s\./);
+  assert.match(back.text(), retryingFirst());
   page.replyResponse = sentOk;
   assert.equal(page.expireTimers(RETRY_FIRST_MS), 1, "the wait Undo put back never ran out");
   await settleSend(page);
@@ -33223,7 +33233,13 @@ const SLOW_SEND =
   'Example Chat returned HTTP 502: {"message":"upstream message send failed: command timed out after 4.8s"}';
 const RETRY_FIRST_MS = sourceConstant("OUTGOING_RETRY_FIRST_MS");
 const RETRY_FACTOR = sourceConstant("OUTGOING_RETRY_FACTOR");
+const RETRY_MAX_MS = sourceConstant("OUTGOING_RETRY_MAX_MS");
+const RETRY_FLOOR_MS = sourceConstant("OUTGOING_RETRY_FLOOR_MS");
 const RETRY_ATTEMPTS = sourceConstant("OUTGOING_RETRY_ATTEMPTS");
+/** The wait before automatic try `attempt` + 1, from when the attempt before it started. */
+const retryWait = (attempt) => Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * RETRY_FACTOR ** attempt);
+/** A row's countdown to its first automatic try, after `before` (a regular expression's source). */
+const retryingFirst = (before = "") => new RegExp(`${before}Retrying in ${RETRY_FIRST_MS / 1000} s\\.`);
 const CHANNEL_READ_TIMEOUT_MS = sourceConstant("CHANNEL_READ_TIMEOUT_MS");
 
 /** A signed-in channel view whose server promises that a keyed send is posted at most once. */
@@ -33340,7 +33356,7 @@ test("a send the chat service was too slow to confirm goes again on its own, und
   assert.deepEqual(posted(page), [{ text: "did this go out", idempotency_key: id }],
     "the send carried no key a retry could be recognised by");
   assert.equal(row.getAttribute("data-send-state"), "retrying");
-  assert.match(row.text(), /Sending… Example Chat is slow to answer right now\. Retrying in 5 s\./);
+  assert.match(row.text(), retryingFirst("Sending… Example Chat is slow to answer right now\\. "));
   assert.doesNotMatch(row.text(), /HTTP 502|\{/, "the row shows the server's diagnosis");
   assert.equal(outgoingRetry(row).textContent, "Retry now");
   assert.equal(outgoingSpinner(row), undefined, "a row that is waiting claims to be sending");
@@ -33355,12 +33371,16 @@ test("a send the chat service was too slow to confirm goes again on its own, und
   assert.equal(shownIds(page).filter((shown) => shown === "9194000000000000001").length, 1);
 });
 
-test("automatic retries wait 5, 15 and 45 seconds, then stop and leave Retry to the reader", async () => {
+test("automatic retries wait 3, 6 and 12 seconds, then 20 at most, then stop and leave Retry to the reader", async () => {
+  // `#277 send-order`: 5, 15 and 45 seconds had the owner reading "Retrying in 45 s" after a
+  // failure that took a moment, with the messages he wrote after it waiting just as long.
+  assert.deepEqual([0, 1, 2, 3, 4, 5].map(retryWait), [3000, 6000, 12000, 20000, 20000, 20000],
+    "the schedule is not the one this test is named for");
   const page = await keyedChannel();
   page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
   await sendChannel(page, "keep trying");
   for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt += 1) {
-    const wait = RETRY_FIRST_MS * RETRY_FACTOR ** attempt;
+    const wait = retryWait(attempt);
     assert.match(outgoingRows(page)[0].text(), new RegExp(`Retrying in ${wait / 1000} s\\.`));
     assert.ok(page.expireTimers(wait) >= 1, `no retry was armed for ${wait} ms`);
     await settleSend(page);
@@ -33371,7 +33391,7 @@ test("automatic retries wait 5, 15 and 45 seconds, then stop and leave Retry to 
   assert.doesNotMatch(row.text(), /Retrying in/);
   assert.match(row.text(), /Delivery unconfirmed\. Retrying cannot post it twice\./);
   assert.equal(outgoingRetry(row).textContent, "Retry");
-  page.expireTimers(RETRY_FIRST_MS * RETRY_FACTOR ** RETRY_ATTEMPTS);
+  page.expireTimers(retryWait(RETRY_ATTEMPTS));
   await settleSend(page);
   assert.equal(page.repliesPosted.length, RETRY_ATTEMPTS + 1, "a retry went out after the last one");
   assert.ok(posted(page).every((body) => body.idempotency_key === posted(page)[0].idempotency_key),
@@ -33381,7 +33401,7 @@ test("automatic retries wait 5, 15 and 45 seconds, then stop and leave Retry to 
   await outgoingRetry(row).click();
   await settleSend(page);
   assert.equal(page.repliesPosted.length, RETRY_ATTEMPTS + 2);
-  assert.match(outgoingRows(page)[0].text(), /Retrying in 5 s\./);
+  assert.match(outgoingRows(page)[0].text(), retryingFirst());
 });
 
 test("a refusal is never sent again on its own, keyed or not", async () => {
@@ -33396,13 +33416,13 @@ test("a refusal is never sent again on its own, keyed or not", async () => {
   assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
   assert.match(row.text(), /not allowed in this space/);
   assert.doesNotMatch(row.text(), /Retrying in|\{/);
-  // ...and the server itself refusing, with a 4xx.
+  // ...and the server itself refusing, with a 4xx. Dismissed first, as the next message to the same
+  // place would otherwise wait behind it (`#277 send-order`).
+  await outgoingDismiss(row).click();
   page.replyResponse = errorResponse(400, "refused", "message content is empty");
   await sendChannel(page, "also refused");
-  assert.equal(outgoingRows(page)[1].getAttribute("data-send-state"), "failed");
-  for (const wait of [RETRY_FIRST_MS, RETRY_FIRST_MS * RETRY_FACTOR, RETRY_FIRST_MS * RETRY_FACTOR ** 2]) {
-    page.expireTimers(wait);
-  }
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "failed");
+  for (const wait of [0, 1, 2, 3, 4, 5].map(retryWait)) page.expireTimers(wait);
   await settleSend(page);
   assert.equal(page.repliesPosted.length, 2, "a refusal was asked again");
 });
@@ -33453,7 +33473,7 @@ test("where no provider promises one post per key, a lost send waits for the rea
   await sendChannel(multi, "to the space");
   assert.equal("idempotency_key" in posted(multi)[0], false, "the other provider's guarantee was borrowed");
   assert.ok(posted(multi)[1].idempotency_key, "the promising provider's channel sent no key");
-  assert.match(outgoingRows(multi)[0].text(), /Retrying in 5 s\./);
+  assert.match(outgoingRows(multi)[0].text(), retryingFirst());
 });
 
 test("a message written while the device is offline waits for the connection, then goes", async () => {
@@ -33478,7 +33498,7 @@ test("a retry that comes due while offline waits for the connection instead", as
   const page = await keyedChannel();
   page.replyResponse = async () => { throw new TypeError("Failed to fetch"); };
   await sendChannel(page, "sent as the signal dropped");
-  assert.match(outgoingRows(page)[0].text(), /Retrying in 5 s\./);
+  assert.match(outgoingRows(page)[0].text(), retryingFirst());
   await page.setOnline(false);
   page.expireTimers(RETRY_FIRST_MS);
   await settleSend(page);
@@ -33518,7 +33538,7 @@ test("a reload never resumes an automatic retry, and a tapped Retry still goes u
   });
   await signIn(again);
   await reopenedChannel(again);
-  for (const wait of [RETRY_FIRST_MS, RETRY_FIRST_MS * RETRY_FACTOR]) again.expireTimers(wait);
+  for (const wait of [retryWait(0), retryWait(1)]) again.expireTimers(wait);
   await settleSend(again);
   assert.equal(again.repliesPosted.length, 0, "reopening the app sent a message on its own");
   const row = outgoingRows(again)[0];
@@ -33537,7 +33557,7 @@ test("after part of a message posted, the rest goes again on its own only if it 
     resumable: true,
   });
   await sendChannel(page, "the first part. the second part");
-  assert.match(outgoingRows(page)[0].text(), /1 part confirmed\. Sending… .*Retrying in 5 s\./);
+  assert.match(outgoingRows(page)[0].text(), retryingFirst("1 part confirmed\\. Sending… .*"));
   page.replyResponse = sentOk;
   page.expireTimers(RETRY_FIRST_MS);
   await settleSend(page);
@@ -33577,7 +33597,7 @@ test("the rest of a post cut in parts goes into the thread the server names, wit
     resumable: true, thread_id: "t_first",
   });
   await sendChannel(page, "the first part. the second part");
-  assert.match(outgoingRows(page)[0].text(), /1 part confirmed\. Sending… .*Retrying in 5 s\./);
+  assert.match(outgoingRows(page)[0].text(), retryingFirst("1 part confirmed\\. Sending… .*"));
   assert.equal(savedOutgoing(page)[0].continueIn, "t_first", "a reload would send the rest elsewhere");
   page.replyResponse = sentOk;
   page.expireTimers(RETRY_FIRST_MS);
@@ -33600,7 +33620,7 @@ test("the rest of a post cut in parts goes into the thread the server names, wit
   await replied.el("reply-send").click();
   await replied.settle();
   assert.equal(posted(replied)[0].reply_to, "1945");
-  assert.match(outgoingRows(replied)[0].text(), /Retrying in 5 s\./, "a continued reply was left to the reader");
+  assert.match(outgoingRows(replied)[0].text(), retryingFirst(), "a continued reply was left to the reader");
   replied.replyResponse = sentOk;
   replied.expireTimers(RETRY_FIRST_MS);
   await settleSend(replied);
@@ -33704,7 +33724,7 @@ test("a gateway's own error page in front of the server is retried where the key
   await sendChannel(page, "through a proxy");
   const row = outgoingRows(page)[0];
   assert.equal(row.getAttribute("data-send-state"), "retrying", "a gateway 502 was left to the reader");
-  assert.match(row.text(), /Sending… vibe-talk did not answer \(HTTP 502\)\. Retrying in 5 s\./);
+  assert.match(row.text(), retryingFirst("Sending… vibe-talk did not answer \\(HTTP 502\\)\\. "));
   page.replyResponse = sentOk;
   page.expireTimers(RETRY_FIRST_MS);
   await settleSend(page);
@@ -33719,7 +33739,7 @@ test("a waiting row's cause reads as a sentence before the countdown", async () 
     'Example Chat returned HTTP 502: {"message":"upstream command exited 1"}');
   await sendChannel(page, "one more try");
   assert.match(outgoingRows(page)[0].text(),
-    /Sending… Example Chat could not answer: upstream command exited 1\. Retrying in 5 s\./);
+    retryingFirst("Sending… Example Chat could not answer: upstream command exited 1\\. "));
 });
 
 test("signing out cancels every automatic retry", async () => {
@@ -33732,6 +33752,280 @@ test("signing out cancels every automatic retry", async () => {
   page.expireTimers(RETRY_FIRST_MS);
   await settleSend(page);
   assert.equal(page.repliesPosted.length, 1, "a send went out after signing out");
+});
+
+// --- one destination, in the order written -------------------------------------------------------
+//
+// `#277 send-order`. The owner: "I write A then B but B lands first." A's POST failed, A went to
+// wait for its automatic retry, and B — queued behind A only while A's POST was on the wire — went
+// at once; A's retry landed after it. These hold B behind A for as long as A is not sent, through
+// its retries, a reload, and a refusal, and let it go when A lands, or is dismissed or edited back
+// into its box. Every text here is invented.
+
+/** A bridge's own word that a send failed, answered at once: the owner's failure. */
+const BRIDGE_FAILED = 'Example Chat returned HTTP 502: {"message":"Example Chat message send failed"}';
+
+/** Answer every POST to the reply route as its own new message in the channel it was posted to. */
+function postedAsSent(page) {
+  let sent = 0;
+  page.replyResponse = async (path, options) => {
+    const body = JSON.parse(options.body);
+    sent += 1;
+    const channel = decodeURIComponent(/\/channels\/([^/]+)\/reply$/.exec(String(path))[1]);
+    return json(200, {
+      posted: message({ id: `92770000000000000${String(sent).padStart(2, "0")}`, channel_id: channel,
+        content: body.text, ...(body.thread_id ? { thread: { id: body.thread_id, root_message_id: null,
+          is_root: false, reply_count: null, reply_count_exact: false } } : {}) }),
+    });
+  };
+}
+
+/** Write `text` into the box on screen and press Send, without waiting for it: it may have to wait. */
+async function sendBehind(page, text) {
+  await page.el("channel-compose-text").setValue(text);
+  page.el("channel-send").click();
+  await page.settle();
+}
+
+const sentTexts = (page) => posted(page).map((body) => body.text);
+
+test("`#277 send-order`: a message written while the one before it waits to retry waits behind it, and both land in the order written", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "A, written first");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "retrying");
+  assert.match(outgoingRows(page)[0].text(), retryingFirst("Sending… Example Chat could not answer: Example Chat message send failed\\. "));
+
+  postedAsSent(page);
+  await sendBehind(page, "B, written second");
+  assert.deepEqual(sentTexts(page), ["A, written first"],
+    "B went while A waited to go again, so B would land first");
+  const behind = outgoingRows(page)[1];
+  assert.equal(behind.getAttribute("data-send-state"), "queued");
+  assert.match(behind.text(), new RegExp(
+    `Waiting to send… “A, written first” goes first, and goes again in ${RETRY_FIRST_MS / 1000} s\\.`));
+  assert.equal(outgoingSpinner(behind), undefined, "a message waiting its turn claims to be sending");
+  assert.equal(savedOutgoing(page)[1].phase, "queued", "the outbox saved B as something other than waiting");
+
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 1, "A's retry was not armed");
+  await settleSend(page);
+  await settleSend(page);
+  assert.deepEqual(sentTexts(page), ["A, written first", "A, written first", "B, written second"]);
+  assert.equal(posted(page)[1].idempotency_key, posted(page)[0].idempotency_key, "A's retry went under another key");
+  assert.notEqual(posted(page)[2].idempotency_key, posted(page)[0].idempotency_key, "B went under A's key");
+  assert.equal(outgoingRows(page).length, 0, "a receipt was left behind");
+  const shown = shownIds(page);
+  assert.ok(shown.indexOf("9277000000000000001") < shown.indexOf("9277000000000000002"),
+    `the channel shows B before A: ${shown.join(", ")}`);
+});
+
+test("`#277 send-order`: three behind one that keeps failing wait in the order written, and drain in it", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "one");
+  for (const text of ["two", "three", "four"]) await sendBehind(page, text);
+  assert.equal(page.repliesPosted.length, 1);
+  assert.deepEqual(outgoingRows(page).map((row) => row.getAttribute("data-send-state")),
+    ["retrying", "queued", "queued", "queued"]);
+  // Each waits behind the first message not yet sent, which is the one that is failing.
+  for (const row of outgoingRows(page).slice(1)) assert.match(row.text(), /“one” goes first/);
+
+  // The first retry fails too: the queue keeps waiting, and is told the new wait.
+  assert.equal(page.expireTimers(retryWait(0)), 1);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2, "a message behind the failing one went");
+  assert.match(outgoingRows(page)[3].text(), new RegExp(`goes again in ${retryWait(1) / 1000} s\\.`));
+
+  postedAsSent(page);
+  // `>=`: the status line's own timer can share the delay.
+  assert.ok(page.expireTimers(retryWait(1)) >= 1, "the second retry was not armed");
+  for (let step = 0; step < 4; step += 1) await settleSend(page);
+  assert.deepEqual(sentTexts(page), ["one", "one", "one", "two", "three", "four"]);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#277 send-order`: a reload keeps a message waiting behind the one before it, and it goes once that one is retried", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "A, before the reload");
+  await sendBehind(page, "B, behind it");
+  assert.equal(page.repliesPosted.length, 1);
+  const key = posted(page)[0].idempotency_key;
+
+  const again = reloadWith(new Map(page.storage), [], (p) => {
+    p.idempotentPostsSupported = true;
+  });
+  await signIn(again);
+  await reopenedChannel(again);
+  for (const wait of [0, 1, 2, 3].map(retryWait)) again.expireTimers(wait);
+  await settleSend(again);
+  assert.equal(again.repliesPosted.length, 0, "reopening the app sent a message on its own");
+  const [first, second] = outgoingRows(again);
+  assert.equal(first.getAttribute("data-send-state"), "unconfirmed");
+  assert.equal(second.getAttribute("data-send-state"), "queued", "the reload forgot that B waits behind A");
+  assert.match(second.text(),
+    /Waiting to send… “A, before the reload” goes first, and its delivery is unconfirmed\. Retry or Dismiss it to let this one go\./);
+  assert.deepEqual(outgoingActions(second), ["Edit", "Dismiss"],
+    "a message waiting its turn offers to send out of turn, or cannot be taken back");
+
+  postedAsSent(again);
+  await outgoingRetry(first).click();
+  await settleSend(again);
+  await settleSend(again);
+  assert.deepEqual(sentTexts(again), ["A, before the reload", "B, behind it"]);
+  assert.equal(posted(again)[0].idempotency_key, key, "A's retry after the reload went under another key");
+  assert.notEqual(posted(again)[1].idempotency_key, key);
+  assert.equal(outgoingRows(again).length, 0);
+});
+
+test("`#277 send-order`: dismissing the message in front lets the next one go, and so does editing it back into the box", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await sendChannel(page, "A, refused");
+  postedAsSent(page);
+  await sendBehind(page, "B, behind it");
+  assert.deepEqual(sentTexts(page), ["A, refused"], "B went past a message that was not sent");
+  const [refused, waiting] = outgoingRows(page);
+  assert.equal(waiting.getAttribute("data-send-state"), "queued");
+  assert.match(waiting.text(),
+    /Waiting to send… “A, refused” goes first, and was not sent\. Retry, Edit or Dismiss it to let this one go\./);
+  await outgoingDismiss(refused).click();
+  await settleSend(page);
+  assert.deepEqual(sentTexts(page), ["A, refused", "B, behind it"], "a Dismiss did not let B go");
+  assert.equal(outgoingRows(page).length, 0);
+
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await sendChannel(page, "C, refused");
+  postedAsSent(page);
+  await sendBehind(page, "D, behind it");
+  assert.equal(page.repliesPosted.length, 3, "D went past a message that was not sent");
+  await outgoingEdit(outgoingRows(page)[0]).click();
+  await settleSend(page);
+  assert.deepEqual(sentTexts(page).slice(2), ["C, refused", "D, behind it"], "an Edit did not let D go");
+  assert.equal(page.el("channel-compose-text").value, "C, refused", "the edited message is not in the box");
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#277 send-order`: a message waiting its turn can be taken back with Edit or Dismiss, but never sent out of turn", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "A, failing");
+  for (const text of ["B, to edit", "C, to dismiss", "D, kept"]) await sendBehind(page, text);
+  const rowWith = (text) => outgoingRows(page).find((row) => row.text().includes(text));
+  assert.deepEqual(outgoingActions(rowWith("B, to edit")), ["Edit", "Dismiss"], "no way to take back a waiting message");
+  await outgoingEdit(rowWith("B, to edit")).click();
+  await page.settle();
+  assert.equal(page.el("channel-compose-text").value, "B, to edit", "Edit did not put the waiting message in the box");
+  await outgoingDismiss(rowWith("C, to dismiss")).click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1, "taking a waiting message back sent something");
+  assert.deepEqual(outgoingRows(page).map((row) => row.getAttribute("data-send-state")), ["retrying", "queued"]);
+  assert.match(rowWith("D, kept").text(), /“A, failing” goes first/, "D stopped waiting behind A");
+
+  postedAsSent(page);
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 1);
+  await settleSend(page);
+  await settleSend(page);
+  assert.deepEqual(sentTexts(page), ["A, failing", "A, failing", "D, kept"]);
+
+  // Dismissed while it waited, it is kept as a message that was not sent, and goes only on Retry.
+  page.expireTimers(SEND_UNDO_MS);
+  await putBackOf(dismissedItems(page)[0]).click();
+  await page.settle();
+  const back = rowWith("C, to dismiss");
+  assert.equal(back.getAttribute("data-send-state"), "failed");
+  assert.match(back.text(), /Not sent\. Dismissed while it waited its turn, so it was not sent\./);
+  assert.deepEqual(outgoingActions(back), ["Retry", "Edit", "Dismiss"]);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 3, "putting it back sent it");
+});
+
+test("`#277 send-order`: another thread, or another channel, does not wait for a message that is failing here", async () => {
+  const page = newPage();
+  const data = threadData();
+  const other = { id: "2220000000000000277", label: "another channel", writable: true };
+  page.channels.push(other);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.idempotentPostsSupported = true;
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "to Main, failing");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "retrying");
+
+  postedAsSent(page);
+  await threadBadge(page.el("discord-log").children[1]).click();
+  await page.settle();
+  await sendChannel(page, "into the thread");
+  assert.deepEqual(postedWhere(page), [["to Main, failing", null], ["into the thread", data.threads[0].id]],
+    "a thread waited for a message failing on Main");
+  await page.el("thread-back").click();
+  await page.settle();
+  await sendBehind(page, "to Main, behind it");
+  assert.equal(page.repliesPosted.length, 2, "a second message to Main went past the failing one");
+
+  page.el("discord-channel").value = other.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  await sendChannel(page, "to another channel");
+  assert.equal(page.repliesPosted.length, 3, "another channel waited for a message failing in this one");
+  assert.ok(page.repliesPosted[2].path.includes(other.id));
+
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 1);
+  await settleSend(page);
+  await settleSend(page);
+  assert.deepEqual(sentTexts(page).slice(3), ["to Main, failing", "to Main, behind it"]);
+});
+
+test("`#277 send-order`: a send put back from Dismiss waits for the one already on its way, never beside it", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "A, dismissed");
+  await outgoingDismiss(outgoingRows(page)[0]).click();
+  const finish = delayedReply(page);
+  await sendBehind(page, "B, on its way");
+  assert.equal(page.repliesPosted.length, 2);
+  await page.el("undo-send-dismiss").click();
+  await page.settle();
+  // Back where it was written, before B, with its wait to go again: which runs out while B's POST
+  // is still on the wire.
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 1, "Undo did not put back A's wait");
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 2, "two POSTs to one destination were on the wire at once");
+  const held = outgoingRows(page).find((row) => /A, dismissed/.test(row.text()));
+  assert.equal(held.getAttribute("data-send-state"), "queued");
+  assert.match(held.text(), /Waiting to send… “B, on its way” goes first, and is still sending\./);
+
+  finish(json(200, { posted: message({ id: "9277000000000000099", content: "B, on its way" }) }));
+  postedAsSent(page);
+  await settleSend(page);
+  await settleSend(page);
+  assert.deepEqual(sentTexts(page), ["A, dismissed", "B, on its way", "A, dismissed"]);
+  assert.equal(posted(page)[2].idempotency_key, posted(page)[0].idempotency_key);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#277 send-order`: an attempt that took longer to fail than its wait goes again after the floor, not a wait more", async () => {
+  // A slow bridge: the attempt itself was the wait. Counted from when it started, the next try is
+  // due already, and goes after the floor.
+  const page = await keyedChannel();
+  page.replyResponse = async () => {
+    page.setClock(page.clock() + 25000);
+    return json(502, { error: "chat_error", detail: SLOW_SEND });
+  };
+  await sendChannel(page, "slow to fail");
+  assert.match(outgoingRows(page)[0].text(), new RegExp(`Retrying in ${RETRY_FLOOR_MS / 1000} s\\.`));
+  // The next fails at once, and waits its own wait from when it started.
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  assert.equal(page.expireTimers(RETRY_FLOOR_MS), 1, "the retry waited more than the floor");
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2);
+  assert.match(outgoingRows(page)[0].text(), new RegExp(`Retrying in ${retryWait(1) / 1000} s\\.`));
 });
 
 // --- messages read automatically -----------------------------------------------------------------

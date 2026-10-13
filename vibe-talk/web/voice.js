@@ -793,17 +793,28 @@ const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
 const OUTGOING_KEY = "vibe-talk.outgoing-messages";
 const OUTGOING_TIMEOUT_MS = 60000;
 // `#195 send-resilience`. A send whose answer was lost goes out again on its own after the first
-// wait, then after each wait this many times the last — 5 s, 15 s, 45 s — and then a person decides.
-// Only where it cannot post twice; see `retriesItself`.
-const OUTGOING_RETRY_FIRST_MS = 5000;
-const OUTGOING_RETRY_FACTOR = 3;
-const OUTGOING_RETRY_ATTEMPTS = 3;
+// wait, then after each wait this many times the last, never more than the longest — 3 s, 6 s,
+// 12 s, 20 s, 20 s, 20 s — and then a person decides. Each wait counts from when the attempt that
+// failed STARTED, so an attempt a slow service took a minute to fail goes again at once rather than
+// a further wait later (never sooner than the floor). `#277 send-order`: it was 5 s, 15 s and 45 s,
+// counted from the failure, and a message behind one waits for it. Only where it cannot post
+// twice; see `retriesItself`.
+const OUTGOING_RETRY_FIRST_MS = 3000;
+const OUTGOING_RETRY_FACTOR = 2;
+const OUTGOING_RETRY_MAX_MS = 20000;
+const OUTGOING_RETRY_FLOOR_MS = 1000;
+const OUTGOING_RETRY_ATTEMPTS = 6;
 const outgoingMessages = new Map();
 const outgoingObservations = new Map();
-const outgoingDestinations = new Map();
-// Per channel, the replies still finding out which thread they go in. See `scheduleOutgoingMessage`.
-const outgoingPlacing = new Map();
+// By entry id, the attempt in progress — a reply being placed, or a POST — and nothing else: a send
+// waiting its turn has no job. See "one destination, in the order written".
 const outgoingJobs = new Map();
+// By entry id, whoever is waiting for its next attempt to end, and the credential it was queued
+// under. Never saved. See `scheduleOutgoingMessage`.
+const outgoingWaiters = new Map();
+const outgoingQueuedUnder = new Map();
+let outgoingPumping = false;
+let outgoingPumpAgain = false;
 /**
  * Entries waiting to go out again on their own, by id: when (`at`), or when the connection returns
  * (`offline`); whether nothing has been attempted yet (`unsent`); the credential it was armed
@@ -17850,9 +17861,25 @@ function loadOutgoingMessages() {
   try {
     const saved = JSON.parse(localStorage.getItem(OUTGOING_KEY) || "[]");
     if (!Array.isArray(saved)) return;
+    const queued = [];
     for (const held of saved) {
       const entry = outgoingFromSaved(held);
-      if (entry) outgoingMessages.set(entry.id, entry);
+      if (!entry) continue;
+      outgoingMessages.set(entry.id, entry);
+      if (held.state === "sending" && held.phase === "queued" && entry.placement !== "unknown") queued.push(entry);
+    }
+    // `#277 send-order`. A message that was waiting behind an earlier one to the same place still
+    // is: it never left the device, and it goes once that one has — after a Retry on this page, or
+    // a Dismiss or Edit. One with nothing ahead of it any more is NOT sent on its own: nobody asked
+    // this page to send it, so it is left to Retry, as before. In order, so a message restored to
+    // the queue holds the ones written after it.
+    for (const entry of queued) {
+      Object.assign(entry, { state: "sending", phase: "queued", detail: "" });
+      if (outgoingBlocker(entry)) {
+        outgoingQueuedUnder.set(entry.id, currentCredential());
+      } else {
+        Object.assign(entry, { state: "failed", phase: "", detail: "This page closed before this message was sent." });
+      }
     }
     // In particular, never replay a POST merely because Android reopened this page.
     if (outgoingMessages.size) persistOutgoingMessages();
@@ -17871,9 +17898,11 @@ function outgoingInView(entry) {
 
 function outgoingStatus(entry) {
   if (entry.state === "sending") {
-    return entry.phase === "queued" ? "Waiting to send…"
-      : entry.phase === "placing" ? "Finding out which thread the message you answered is in…"
-        : "Sending…";
+    if (entry.phase === "queued") {
+      const ahead = outgoingBlocker(entry);
+      return ahead ? `Waiting to send… ${waitingBehind(ahead)}` : "Waiting to send…";
+    }
+    return entry.phase === "placing" ? "Finding out which thread the message you answered is in…" : "Sending…";
   }
   if (entry.state === "sent") return "Sent.";
   const prefix = entry.postedCount > 0
@@ -17946,7 +17975,9 @@ function renderOutgoingMessages() {
     row.className = "outgoing-message";
     row.setAttribute("data-outgoing-id", entry.id);
     const waiting = outgoingRetries.has(entry.id);
-    row.setAttribute("data-send-state", waiting ? "retrying" : entry.state);
+    // `#277 send-order`. Waiting its turn is neither sending nor failing.
+    const queued = entry.state === "sending" && entry.phase === "queued";
+    row.setAttribute("data-send-state", waiting ? "retrying" : queued ? "queued" : entry.state);
     row.setAttribute("data-who", "me");
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -17979,7 +18010,7 @@ function renderOutgoingMessages() {
     const status = document.createElement("div");
     status.className = "outgoing-status";
     status.setAttribute("role", "status");
-    if (entry.state === "sending") {
+    if (entry.state === "sending" && !queued) {
       const spinner = document.createElement("span");
       spinner.className = "outgoing-spinner";
       spinner.setAttribute("aria-hidden", "true");
@@ -17990,7 +18021,9 @@ function renderOutgoingMessages() {
       " This browser could not save this message. Keep this page open; reloading may lose its text or delivery status.");
     status.append(label);
     row.append(meta, body, status);
-    if (entry.state === "failed" || entry.state === "unconfirmed") {
+    // `#277 send-order`. A message waiting its turn behind another has not left the device: it can be
+    // taken back, Edit and Dismiss, but there is no Retry to send it out of turn.
+    if (entry.state === "failed" || entry.state === "unconfirmed" || queued) {
       const actions = document.createElement("div");
       actions.className = "outgoing-actions";
       const retry = document.createElement("button");
@@ -18018,7 +18051,7 @@ function renderOutgoingMessages() {
         "Take this out of the outbox. This does not delete a message from the chat service. Undo " +
           `brings it back, and Settings keeps it under Recently dismissed for ${DISMISSED_SENDS_DAYS} days.`);
       dismiss.addEventListener("click", inThisColumn(() => dismissOutgoingMessage(entry.id)));
-      actions.append(...(editableSend(entry) ? [retry, edit, dismiss] : [retry, dismiss]));
+      actions.append(...(queued ? [] : [retry]), ...(editableSend(entry) ? [edit, dismiss] : [dismiss]));
       row.append(actions);
     }
     // `#129 message-search`. What the reader WROTE, under the word the row prints for them: a
@@ -18130,133 +18163,233 @@ function retryOutgoingMessage(id, automatic = false) {
   return scheduleOutgoingMessage(entry);
 }
 
+// --- one destination, in the order written ---------------------------------------------------------
+//
+// `#277 send-order`. The owner: "when it retries it ends up sending messages OUT OF ORDER. I.e. I
+// write A then B but B lands first." Messages to one destination were serialised only while a POST
+// was on the wire: when A's POST failed and A went to wait for its automatic retry, the lane was
+// free, B went, and A's retry landed after it. Order is now kept by the outbox itself, in the order
+// its entries were written (the order of `outgoingMessages`, which is the order it is saved in, so
+// a reload keeps it):
+//
+//   * A message goes only when every earlier message to the same destination — the channel, and the
+//     thread in it or none — has been SENT. One still sending, waiting to retry, waiting for the
+//     connection, or failed and waiting for the reader holds every later one to that destination,
+//     whose row says what it is waiting behind and why. When that one is sent the queue drains in
+//     order; when it is dismissed, or edited back into its box, the next one goes.
+//   * Never two POSTs on the wire to one destination at once, whatever their order — a send put back
+//     from Dismiss waits for the one already going out.
+//   * Other destinations are not held: a thread does not wait for the main channel or another thread.
+//   * A reply whose thread is still to be found out (`placeReplyTarget`) may be bound for any
+//     destination in its channel, so whatever was written after it in that channel waits for the
+//     placement, and then for its delivery only if both go to the same place. One that could not be
+//     placed posted nothing and holds nothing up. `#185 reply-new-thread`.
+//
+// Each entry keeps its own id and so its own idempotency key across every attempt (`#195
+// send-resilience`): waiting behind another message changes when it goes, never what it is.
+
 /** The outbox lane of one destination: a channel, and the thread in it or none. */
 function outgoingDestination(channel, threadId) {
   return JSON.stringify([channel, threadId || null]);
 }
 
 /**
- * Serialize a burst to one destination without making the composer wait for that destination.
- *
- * A message's destination is fixed when it is queued, except for a reply whose thread is still to
- * be found out (`placeReplyTarget`). Until it is placed it may be bound for any destination in its
- * channel, so whatever is queued in that channel after it waits for the placement, and then for its
- * delivery only if both go to the same place; the reply in turn waits behind whatever was already
- * on its way to where it is placed. Queued in the main channel's lane instead, as it first was, a
- * placed reply was overtaken by an answer sent into the same thread while the read was out, and
- * held up every main-channel message behind a delivery somewhere else. `#185 reply-new-thread`.
+ * The message `entry` has to wait for before it can go, or null when it can go now: by the rules
+ * above, the first earlier message in its lane not yet sent, an earlier reply in its channel still
+ * finding out where it goes, or a POST to its destination already on the wire. For a reply still to
+ * be placed, only an earlier one still being placed: one read places both.
  */
-function scheduleOutgoingMessage(entry) {
-  let credential = "";
-  try { credential = token(); } catch (_error) { /* Dispatch reports the missing credential. */ }
-  const job = { credential, stopped: false, cancel: null };
-  outgoingJobs.set(entry.id, job);
-  persistOutgoingMessages();
-  renderOutgoingEverywhere();
-  // What this message must not overtake, as things stand now: the last message queued for each
-  // destination, and every reply in its channel that is still being placed.
-  const lanes = new Map(outgoingDestinations);
-  const placing = [...(outgoingPlacing.get(entry.channel) || [])];
-  const ahead = (destination) => Promise.all([
-    lanes.get(destination),
-    ...placing.map((earlier) => earlier.placed.then((where) => (where === destination ? earlier.done : null))),
-  ].map((step) => Promise.resolve(step).catch(() => {})));
-  const release = () => {
-    if (outgoingJobs.get(entry.id) === job) outgoingJobs.delete(entry.id);
-  };
-  if (entry.placement !== "unknown") {
-    const destination = outgoingDestination(entry.channel, entry.threadId);
-    const completion = ahead(destination).then(() => dispatchOutgoingMessage(entry, job));
-    outgoingDestinations.set(destination, completion);
-    return completion.finally(() => {
-      release();
-      if (outgoingDestinations.get(destination) === completion) outgoingDestinations.delete(destination);
-    });
-  }
-  let settle = (_destination) => {};
-  const record = { placed: new Promise((resolve) => { settle = resolve; }), done: null };
-  record.done = dispatchOutgoingMessage(entry, job, {
-    // One read of All places every message the stream left unplaced, so an earlier reply's read
-    // goes first and this one is then usually placed from the store, without a read of its own.
-    earlier: Promise.all(placing.map((earlier) => earlier.placed)),
-    placed: (destination) => settle(destination),
-    ahead,
-  });
-  outgoingPlacing.set(entry.channel, [...(outgoingPlacing.get(entry.channel) || []), record]);
-  return record.done.finally(() => {
+function outgoingBlocker(entry) {
+  const lane = entry.placement === "unknown" ? null : outgoingDestination(entry.channel, entry.threadId);
+  let earlier = true;
+  for (const other of outgoingMessages.values()) {
+    if (other === entry) {
+      earlier = false;
+      continue;
+    }
+    if (other.channel !== entry.channel || other.state === "sent") continue;
+    const unplaced = other.placement === "unknown";
     // Never placed (refused, unreadable, signed out) means never posted: nothing waits for it.
-    settle(null);
-    release();
-    const left = (outgoingPlacing.get(entry.channel) || []).filter((held) => held !== record);
-    if (left.length) outgoingPlacing.set(entry.channel, left);
-    else outgoingPlacing.delete(entry.channel);
-  });
+    if (unplaced) {
+      if (earlier && other.state === "sending") return other;
+      continue;
+    }
+    if (lane === null || outgoingDestination(other.channel, other.threadId) !== lane) continue;
+    if (earlier || (other.state === "sending" && other.phase === "posting")) return other;
+  }
+  return null;
+}
+
+/** Why a queued message is waiting, after "Waiting to send…": what it waits behind, and for what. */
+function waitingBehind(ahead) {
+  const which = `“${sendSnippet(unsentText(ahead))}” goes first`;
+  if (ahead.state === "sending") {
+    return ahead.placement === "unknown" ? `${which}, once it is known which thread it goes in.`
+      : ahead.phase === "queued" ? `${which}, and is waiting its turn too.` : `${which}, and is still sending.`;
+  }
+  const waiting = outgoingRetries.get(ahead.id);
+  if (waiting && waiting.offline) return `${which}, when this device is online.`;
+  if (waiting) {
+    const seconds = Math.max(1, Math.round((waiting.at - Date.now()) / 1000));
+    return `${which}, and goes again in ${seconds} s.`;
+  }
+  return ahead.state === "unconfirmed"
+    ? `${which}, and its delivery is unconfirmed. Retry or Dismiss it to let this one go.`
+    : `${which}, and was not sent. ${editableSend(ahead) ? "Retry, Edit" : "Retry"} or Dismiss it to let this one go.`;
 }
 
 /**
- * Post one outbox entry. `placing` is given only for a reply still to be placed, by
- * `scheduleOutgoingMessage`: what to let go first, where to say it was placed, and what to wait
- * behind once it has been.
+ * Put `entry`, just queued or retried, in the outbox's order to go, without making the composer wait
+ * for its destination. Answers a promise settled when this attempt is over — sent, failed, or no
+ * longer in the outbox — which may be long after it was queued: it waits behind what was written
+ * before it.
  */
-async function dispatchOutgoingMessage(entry, job, placing = null) {
+function scheduleOutgoingMessage(entry) {
+  outgoingQueuedUnder.set(entry.id, currentCredential());
+  const settled = new Promise((resolve) => {
+    outgoingWaiters.set(entry.id, [...(outgoingWaiters.get(entry.id) || []), resolve]);
+  });
+  persistOutgoingMessages();
+  renderOutgoingEverywhere();
+  pumpOutgoing();
+  return settled;
+}
+
+/** Let whoever waits for `id`'s attempt go: it is over, or it is out of the outbox. */
+function settleOutgoing(id) {
+  const waiters = outgoingWaiters.get(id) || [];
+  outgoingWaiters.delete(id);
+  outgoingQueuedUnder.delete(id);
+  for (const resolve of waiters) resolve();
+}
+
+/** Start every queued message that has nothing to wait for any more, in the order written. */
+function pumpOutgoing() {
+  // Starting one can finish it at once — signed out, offline — and that asks for a pump of its own.
+  if (outgoingPumping) {
+    outgoingPumpAgain = true;
+    return;
+  }
+  outgoingPumping = true;
+  try {
+    do {
+      outgoingPumpAgain = false;
+      for (const entry of [...outgoingMessages.values()]) {
+        if (outgoingMessages.get(entry.id) !== entry || entry.state !== "sending" ||
+            entry.phase !== "queued" || outgoingJobs.has(entry.id) || outgoingBlocker(entry)) continue;
+        startOutgoing(entry);
+      }
+    } while (outgoingPumpAgain);
+  } finally {
+    outgoingPumping = false;
+  }
+}
+
+/** One attempt for a message whose turn it is: placing a reply, or the POST. */
+function startOutgoing(entry) {
+  // Under the credential it was queued under: a send made by one person is not made by another.
+  const credential = outgoingQueuedUnder.has(entry.id) ? outgoingQueuedUnder.get(entry.id) : currentCredential();
+  const job = { credential, stopped: false, cancel: null };
+  outgoingJobs.set(entry.id, job);
+  const placing = entry.placement === "unknown";
+  const over = () => {
+    if (outgoingJobs.get(entry.id) === job) outgoingJobs.delete(entry.id);
+    // An attempt that ended with no outcome is not started again, and again: only a reply it placed
+    // is still to be sent, behind whatever is ahead of it where it goes.
+    if (entry.state === "sending" && !(placing && entry.placement !== "unknown")) {
+      Object.assign(entry, { state: "failed", phase: "", detail: entry.detail || "This message was not sent." });
+      persistOutgoingMessages();
+    }
+    if (entry.state !== "sending" || outgoingMessages.get(entry.id) !== entry) settleOutgoing(entry.id);
+    pumpOutgoing();
+  };
+  (placing ? placeOutgoingMessage(entry, job) : dispatchOutgoingMessage(entry, job)).then(over, over);
+}
+
+/** The credential this page holds now, or none where its storage cannot be read. */
+function currentCredential() {
+  try {
+    return token();
+  } catch (_error) {
+    return "";
+  }
+}
+
+/**
+ * Whether `entry` cannot go now, saying why on the entry: the sign-in it was queued under is gone,
+ * its channel is read-only, or the device is offline — `#195 send-resilience`: held for the
+ * connection instead of failed. Nothing has left the device, so sending it when the connection
+ * returns cannot post it twice, through any provider, keyed or not.
+ */
+function outgoingCannotGo(entry, job) {
+  if (!job.credential || currentCredential() !== job.credential) {
+    entry.state = "failed";
+    entry.detail = "Sign-in changed before this message was sent. Sign in and retry when ready.";
+    return true;
+  }
+  if (knownChannel(entry.channel)?.writable === false) {
+    entry.state = "failed";
+    entry.detail = "This channel is read-only.";
+    return true;
+  }
+  if (navigator.onLine === false) {
+    entry.state = "failed";
+    entry.detail = "This device is offline.";
+    holdOutgoingMessage(entry, { at: Date.now(), offline: true, unsent: true });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Find out where a reply to a message the stream left unplaced goes (`placeReplyTarget`), and leave
+ * it queued for that destination; `pumpOutgoing` posts it when its turn there comes.
+ */
+async function placeOutgoingMessage(entry, job) {
+  if (job.stopped) return;
+  try {
+    if (outgoingCannotGo(entry, job)) return;
+    entry.phase = "placing";
+    persistOutgoingMessages();
+    renderOutgoingEverywhere();
+    let thread = null;
+    try {
+      thread = await placeReplyTarget(entry);
+    } catch (error) {
+      if (job.stopped) return;
+      // Nothing has been posted, so this is a plain failure the reader can retry, never the
+      // "unconfirmed" of a POST whose answer was lost.
+      entry.state = "failed";
+      entry.detail = redact(
+        "The message you answered came in live, and whether it is in a thread could not be " +
+          `found out, so this was not posted anywhere: ${error.message}. Retry once the channel ` +
+          "can be read."
+      );
+      return;
+    }
+    if (job.stopped) return;
+    entry.threadId = thread;
+    entry.placement = null;
+  } finally {
+    if (entry.state === "sending" && !job.stopped) entry.phase = "queued";
+    else entry.phase = "";
+    persistOutgoingMessages();
+    eachColumn(renderChannelRows);
+  }
+}
+
+/** Post one outbox entry whose turn it is. */
+async function dispatchOutgoingMessage(entry, job) {
   if (job.stopped) return;
   let timer = null;
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   // Whether this attempt failed in a way that could succeed later — a timeout, a lost connection,
   // the provider's 5xx — rather than with an answer. Only such a failure goes again on its own.
   let transient = false;
+  // When this attempt started: the next one's wait counts from here (`planOutgoingRetry`).
+  const startedAt = Date.now();
   try {
-    if (!job.credential || token() !== job.credential) {
-      entry.state = "failed";
-      entry.detail = "Sign-in changed before this message was sent. Sign in and retry when ready.";
-      return;
-    }
-    if (knownChannel(entry.channel)?.writable === false) {
-      entry.state = "failed";
-      entry.detail = "This channel is read-only.";
-      return;
-    }
-    // `#195 send-resilience`. A device that knows it is offline holds the message instead of
-    // failing it. Nothing has left the device, so sending it when the connection returns cannot
-    // post it twice — through any provider, keyed or not.
-    if (navigator.onLine === false) {
-      entry.state = "failed";
-      entry.detail = "This device is offline.";
-      holdOutgoingMessage(entry, { at: Date.now(), offline: true, unsent: true });
-      return;
-    }
-    if (placing) {
-      await placing.earlier;
-      if (job.stopped) return;
-      entry.phase = "placing";
-      persistOutgoingMessages();
-      renderOutgoingEverywhere();
-      let thread = null;
-      try {
-        thread = await placeReplyTarget(entry);
-      } catch (error) {
-        if (job.stopped) return;
-        // Nothing has been posted, so this is a plain failure the reader can retry, never the
-        // "unconfirmed" of a POST whose answer was lost.
-        entry.state = "failed";
-        entry.detail = redact(
-          "The message you answered came in live, and whether it is in a thread could not be " +
-            `found out, so this was not posted anywhere: ${error.message}. Retry once the channel ` +
-            "can be read."
-        );
-        return;
-      }
-      if (job.stopped) return;
-      entry.threadId = thread;
-      entry.placement = null;
-      const destination = outgoingDestination(entry.channel, thread);
-      placing.placed(destination);
-      entry.phase = "queued";
-      persistOutgoingMessages();
-      renderOutgoingEverywhere();
-      await placing.ahead(destination);
-      if (job.stopped) return;
-    }
+    if (outgoingCannotGo(entry, job)) return;
     entry.phase = "posting";
     persistOutgoingMessages();
     renderOutgoingEverywhere();
@@ -18379,7 +18512,7 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     if (timer !== null) clearTimeout(timer);
     job.cancel = null;
     entry.phase = "";
-    if (transient && !job.stopped) planOutgoingRetry(entry);
+    if (transient && !job.stopped) planOutgoingRetry(entry, startedAt);
     persistOutgoingMessages();
     eachColumn(renderChannelRows);
     // `#277 reply-in-column`. After the rows, the outbox's among them: what is said points at one. Not
@@ -18398,10 +18531,18 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
 // with every attempt as its idempotency key, the server binds it to each part's text, and the
 // provider posts it at most once. After a partial post that holds for the unsent remainder only
 // where the server says the remainder is `resumable` — the part that failed goes again as the same
-// words under the same key. There, and only there, a transient failure goes again after
-// 5 s, 15 s and 45 s, sooner when the connection returns or the page comes back into view, and
-// then stops and offers Retry. Everywhere else the only automatic send is one that never left the
-// device — held while it knew it was offline.
+// words under the same key. There, and only there, a transient failure goes again after 3 s, 6 s,
+// 12 s and then every 20 s, six times in all, sooner when the connection returns or the page comes
+// back into view, and then stops and offers Retry. Everywhere else the only automatic send is one
+// that never left the device — held while it knew it was offline.
+//
+// `#277 send-order`. The waits were 5 s, 15 s and 45 s, counted from when the attempt FAILED. On a
+// slow bridge that was the wrong clock twice over: an attempt it takes half a minute to fail had
+// already waited that long, and a third wait of 45 s came after a failure that took a moment, when
+// a short wait would have found the bridge answering again — and every message written behind it
+// waits as long. So each wait now counts from when the failed attempt started (an attempt that took
+// longer than the wait goes again after the floor), and none is longer than OUTGOING_RETRY_MAX_MS.
+// The row says what it is waiting for and when; a message behind it says what it waits behind.
 //
 // Never after a reload: a reopened page has no record of what its last attempt did, and a send the
 // reader did not watch go out should not go out again on a page they did not ask to send from.
@@ -18436,12 +18577,23 @@ function retriesItself(entry) {
     !(entry.postedCount > 0 && entry.replyTo && !entry.continueIn);
 }
 
-/** After a transient failure: arm the next automatic attempt, or leave the row to the reader. */
-function planOutgoingRetry(entry) {
+/**
+ * The wait before automatic attempt `used` + 1, from when the attempt before it started: 3 s, 6 s,
+ * 12 s, then OUTGOING_RETRY_MAX_MS. `#277 send-order`.
+ */
+function outgoingRetryWait(used) {
+  return Math.min(OUTGOING_RETRY_MAX_MS, OUTGOING_RETRY_FIRST_MS * OUTGOING_RETRY_FACTOR ** used);
+}
+
+/**
+ * After a transient failure of the attempt that started at `startedAt`: arm the next automatic
+ * attempt, or leave the row to the reader.
+ */
+function planOutgoingRetry(entry, startedAt) {
   const used = entry.retriesUsed || 0;
   if (!retriesItself(entry) || used >= OUTGOING_RETRY_ATTEMPTS) return;
-  const delay = OUTGOING_RETRY_FIRST_MS * OUTGOING_RETRY_FACTOR ** used;
-  holdOutgoingMessage(entry, { at: Date.now() + delay, offline: navigator.onLine === false, unsent: false });
+  const at = Math.max(startedAt + outgoingRetryWait(used), Date.now() + OUTGOING_RETRY_FLOOR_MS);
+  holdOutgoingMessage(entry, { at, offline: navigator.onLine === false, unsent: false });
 }
 
 /** Hold `entry` for an automatic send: at `at`, or when the connection returns. */
@@ -18516,18 +18668,21 @@ function readableCause(detail, service) {
 function stopOutgoingSends() {
   // Nothing goes out on its own for a credential that is going away.
   for (const id of [...outgoingRetries.keys()]) cancelOutgoingRetry(id);
-  for (const [id, job] of outgoingJobs) {
-    const entry = outgoingMessages.get(id);
-    if (!entry || entry.state !== "sending") continue;
-    job.stopped = true;
+  // Every message on its way, and every one waiting its turn behind another (`#277 send-order`),
+  // which has no job of its own to stop.
+  for (const entry of outgoingMessages.values()) {
+    if (entry.state !== "sending") continue;
+    const job = outgoingJobs.get(entry.id);
+    if (job) job.stopped = true;
     const attempted = entry.phase === "posting";
     entry.state = attempted ? "unconfirmed" : "failed";
     if (attempted) entry.mayHavePosted = true;
     outgoingObservations.delete(entry.id);
     entry.detail = attempted ? "Sign-in changed before delivery was confirmed."
       : "Sign-in changed before this message was sent.";
-    if (job.cancel) job.cancel();
+    if (job && job.cancel) job.cancel();
     entry.phase = "";
+    settleOutgoing(entry.id);
   }
   persistOutgoingMessages();
   renderOutgoingEverywhere();
@@ -18560,15 +18715,24 @@ function unsentText(entry) {
 }
 
 /**
- * Whether Edit may take `entry` back: refused, or never sent, so that none of its unsent text can be
- * in the channel already. Not a send whose delivery is unconfirmed, or ever was (`mayHavePosted`, kept
+ * Whether Edit may take `entry` back: refused, or never sent — failed, or still waiting its turn
+ * behind another message (`#277 send-order`) — so that none of its unsent text can be in the channel
+ * already. Not a send whose delivery is unconfirmed, or ever was (`mayHavePosted`, kept
  * through a later refusal): its outbox id is the idempotency key that lets Retry go again without
  * posting it twice, and Edit would drop it, so the same words sent again from the box would be a
  * second message wherever the first had landed after all — the `#195 send-resilience` incident.
  * Retry and Dismiss are its ways out.
  */
 function editableSend(entry) {
-  return entry.state === "failed" && entry.mayHavePosted !== true;
+  return (entry.state === "failed" || waitingItsTurn(entry)) && entry.mayHavePosted !== true;
+}
+
+/**
+ * Whether `entry` is waiting behind another message to its destination, with no attempt of its own
+ * in progress: nothing of it is on its way, so it can be taken back. `#277 send-order`.
+ */
+function waitingItsTurn(entry) {
+  return entry.state === "sending" && entry.phase === "queued" && !outgoingJobs.has(entry.id);
 }
 
 /** Said where Edit could not save the text as a draft, and so left the send where it was. */
@@ -18591,12 +18755,17 @@ function sendSnippet(text) {
   return `${cut.trimEnd()}…`;
 }
 
-/** Take an entry out of the outbox, durably, in every column. */
+/**
+ * Take an entry out of the outbox, durably, in every column — and let the next message to its
+ * destination go, which was waiting behind it (`#277 send-order`).
+ */
 function dropOutgoing(id) {
   cancelOutgoingRetry(id);
   outgoingMessages.delete(id);
   outgoingObservations.delete(id);
+  settleOutgoing(id);
   persistOutgoingMessages();
+  pumpOutgoing();
   renderOutgoingEverywhere();
 }
 
@@ -18695,8 +18864,13 @@ function editOutgoingReply(entry, text) {
 /** Dismiss: out of the outbox, into the recently dismissed, with Undo offered for a while. */
 function dismissOutgoingMessage(id) {
   const entry = outgoingMessages.get(id);
-  if (!entry) return;
-  dismissedSends = [{ entry: { ...entry, phase: "" }, at: Date.now() },
+  if (!entry || (entry.state === "sending" && !waitingItsTurn(entry))) return;
+  // `#277 send-order`. One taken back while it waited its turn was never sent: kept as that, never as
+  // a send that was on its way when the page closed.
+  const copy = entry.state === "sending"
+    ? { ...entry, state: "failed", phase: "", detail: "Dismissed while it waited its turn, so it was not sent." }
+    : { ...entry, phase: "" };
+  dismissedSends = [{ entry: copy, at: Date.now() },
     ...dismissedSends.filter((held) => held.entry.id !== id)];
   const kept = persistDismissedSends();
   // A send waiting to go again on its own, for Undo to set waiting again. Never saved, as the wait
