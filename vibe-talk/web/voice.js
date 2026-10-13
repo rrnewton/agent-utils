@@ -8777,6 +8777,7 @@ const SPOKEN_YES_REASONS = {
   token: "the draft contains the sign-in token",
   busy: "another send or cancel was already under way",
   heard_more: "more than a yes was heard",
+  said_more: "the assistant said more than One moment, and the yes may have answered that instead",
   changed: "the draft changed before it was sent",
   withdrawn: "the draft was withdrawn on the screen",
   typed: "a typed message arrived before it was sent",
@@ -8802,10 +8803,12 @@ const SPOKEN_COMMIT_REFUSALS = {
 /**
  * What an answer is judged against: the assistant's turns before it, what it said since the user
  * last spoke, whether a page text turn came between, whether the read-back was cut off or completed,
- * when the answer began, and when the read-back's audio finished playing.
+ * when the answer began, and when the read-back's audio finished playing — and, for a yes that then
+ * settles, the answer's turn number and the keys of the assistant turns left out as its reply.
  *
  * @typedef {{turns: SpokenYesTurn[], sinceUser: {text: string}[], interposed: boolean, cut: boolean,
- *   done: boolean, answerAt: number, playEnd: number}} SpokenYesHeard
+ *   done: boolean, answerAt: number, playEnd: number, turn: number | null,
+ *   replies: Set<string>}} SpokenYesHeard
  */
 
 const spokenYes = {
@@ -8851,7 +8854,9 @@ const spokenYes = {
   ineligible: null,
   /** @type {"earlier_draft" | "replaced_session"} */
   ineligibleWhy: "earlier_draft",
-  /** @type {{handle: string, words: string, timer: any, proposal: VibeTalk.PendingPost} | null} */
+  // The yes waiting out SPOKEN_YES_SETTLE_MS: the card it would send, its words, the answer's turn
+  // number, and the assistant turns it was judged without because they were its reply (`isReplyTo`).
+  /** @type {{handle: string, words: string, timer: any, proposal: VibeTalk.PendingPost, turn: number | null, replies: Set<string>} | null} */
   settling: null,
   // The last draft the card showed during this call, kept after the card goes, so a yes to its
   // read-back that arrives once it has lapsed or been settled is still answered.
@@ -8988,7 +8993,9 @@ function unsayableDraft(text) {
  * "The part said once this draft was on the card" is counted in words, not only in turns: the
  * neutral protocol keeps one row per numbered turn, so a sentence the agent said before it proposed
  * ("Sure, let me draft that.") and the read-back after it can be one turn, and that turn began
- * before the card did. `#268 voice-call-drops`.
+ * before the card did. Only a turn that began with NO draft on the card is counted that way: in one
+ * that began with another draft up, or saw one replaced, a newer draft read back after an older one
+ * is refused, as it was before. `#268 voice-call-drops`.
  *
  * @param {VibeTalk.PendingPost} shown
  * @param {{text: string, card: string | null, cardFrom?: {handle: string, words: number} | null}[]} turns
@@ -9117,8 +9124,11 @@ function noteProposalsAtCallOpen(proposal) {
  * PR" by "merge the PR" — is not confirmed by the first one's read-back, since neither is word for
  * word the second's.
  *
- * A turn already under way when a new draft appears remembers how many of its words came before
- * it, so the words it goes on to say count as said once the draft was up (`readBackRefusal`).
+ * A turn already under way when the FIRST draft of it appears — one that began with no draft on the
+ * card — remembers how many of its words came before it, so the words it goes on to say count as
+ * said once the draft was up (`readBackRefusal`). A draft that REPLACES another in the middle of a
+ * turn gets no such allowance: that turn read the old draft or began to, and the new one is held,
+ * as it always was, to the turns that began once it was up. `#268 voice-call-drops`.
  */
 function noteCardForSpokenYes(proposal, previous) {
   const handle = proposal ? proposal.handle : null;
@@ -9128,29 +9138,64 @@ function noteCardForSpokenYes(proposal, previous) {
   if (proposal) spokenYes.lastShown = proposal;
   if (handle === null) return;
   for (const turn of spokenYes.said.values()) {
-    if (turn.card !== handle) turn.cardFrom = { handle, words: answerWords(turn.text).length };
+    if (turn.card === null && turn.cardFrom === null) {
+      turn.cardFrom = { handle, words: answerWords(turn.text).length };
+    }
   }
+}
+
+/**
+ * The words the agent is told to say on a yes, and nothing else: every prompt that asks before it
+ * sends says `say only "One moment."`. `#268 voice-call-drops`.
+ */
+const SPOKEN_YES_ACKNOWLEDGEMENT = ["one", "moment"];
+
+/**
+ * Are `text`'s words the acknowledgement of a yes, matched as the prompt instructs it — "One
+ * moment." and nothing else, case and punctuation aside? While its turn is still open, "One" alone
+ * also counts: the assistant's words are streamed as they come, and that is where "One moment."
+ * starts. "One moment, or should I cancel it?" is not it, nor is "Or should I cancel it instead?",
+ * nor a turn that completed on "One".
+ *
+ * @param {string} text
+ * @param {boolean} open whether the turn may still say more
+ */
+function isSpokenYesAcknowledgement(text, open) {
+  const words = answerWords(text);
+  const ack = SPOKEN_YES_ACKNOWLEDGEMENT;
+  if (words.length === 0 || words.length > ack.length) return false;
+  if (words.length < ack.length && !open) return false;
+  return words.every((word, at) => word === ack[at]);
 }
 
 /**
  * Is `turn` the assistant's reply to `answer`, rather than something said before it? `#268
  * voice-call-drops`.
  *
- * The neutral protocol numbers a turn for the user's words and the assistant's answer to them alike,
- * so an assistant turn numbered at or after the answer's is its reply. A bridge relays the user's
- * transcript and the assistant's answer as two streams, and the answer's FINAL transcript can arrive
- * after the reply has begun — "One moment." on the page before the "Yes." it answers — so the
- * number, not the order of arrival, says which came first.
+ * A bridge relays the user's transcript and the assistant's answer as two streams, and the answer's
+ * FINAL transcript can arrive after the reply has begun — "One moment." on the page before the
+ * "Yes." it answers — so the order of arrival cannot say which came first. An assistant turn
+ * numbered at or after the answer's, whose words are the acknowledgement the agent is told to give a
+ * yes (`isSpokenYesAcknowledgement`), is taken for the reply and left out of the read-back.
  *
- * Without numbers nothing does: the order of arrival is exactly what cannot be trusted, and a
- * hypothesis of background noise before the read-back would make the read-back look like a reply.
- * So an unnumbered turn is never taken for a reply, and is judged as it always was.
+ * That leans on an ASSUMPTION the protocol does not state: that it numbers the user's words and the
+ * assistant's answer to them alike. Safety does not rest on it, because only the acknowledgement is
+ * excused. Any other words in such a turn — "Or should I cancel it instead?" — stay part of what the
+ * answer is judged against, so the yes is refused, whichever side of it they were said on; and an
+ * interrupted turn of that kind counts as the read-back cut off (`heardBefore`). If the assumption
+ * were wrong, the most it lets through is a yes whose exact, completed read-back was followed by
+ * "One moment." before the owner answered.
+ *
+ * Without numbers nothing tells a reply from more of the read-back, so an unnumbered turn is never
+ * taken for a reply, and is judged as it always was.
  *
  * @param {{turn: number | null}} answer
- * @param {{turn: number | null}} turn
+ * @param {{turn: number | null, text: string}} turn
  */
 function isReplyTo(answer, turn) {
-  return answer.turn !== null && turn.turn !== null && turn.turn >= answer.turn;
+  if (answer.turn === null || turn.turn === null || turn.turn < answer.turn) return false;
+  const open = session.lastCompletedTurn === null || turn.turn > session.lastCompletedTurn;
+  return isSpokenYesAcknowledgement(turn.text, open);
 }
 
 /**
@@ -9171,6 +9216,13 @@ function hearAssistantForSpokenYes(key, text, turn = null) {
   spokenYes.said.set(key, entry);
   const since = spokenYes.sinceUser.get(key);
   spokenYes.sinceUser.set(key, { text: String(text), turn, at: since ? since.at : at });
+  // A turn the yes now settling was judged without, as its reply, has said more than the
+  // acknowledgement: whatever it went on to say may have come before the yes, so the yes stops.
+  // `#268 voice-call-drops`.
+  const settling = spokenYes.settling;
+  if (settling && settling.replies.has(key) && !isReplyTo({ turn: settling.turn }, entry)) {
+    abortSpokenYes("said_more");
+  }
   // The reply to an answer the page has begun to hear says nothing about what that answer answers:
   // it neither reopens the read-back nor moves the moment the answer began.
   const answer = spokenYes.answer;
@@ -9262,6 +9314,9 @@ function noteUserTextForSpokenYes() {
  * (`heardBefore`). What the assistant says in reply, which can reach this page before the answer's
  * own final transcript does, is no part of that; it is kept, as the first thing said since.
  *
+ * A late frame of an OLDER turn than the answer the page has begun to hear is not that answer
+ * (`refuseLateAnswer`). `#268 voice-call-drops`.
+ *
  * @param {string} key
  * @param {string} text
  * @param {boolean} final
@@ -9269,8 +9324,12 @@ function noteUserTextForSpokenYes() {
  */
 function hearUserForSpokenYes(key, text, final, turn = null) {
   const now = Date.now();
+  const current = spokenYes.answer;
+  if (current && current.key !== key && turn !== null && current.turn !== null && turn < current.turn) {
+    if (final && key !== spokenYes.answered) refuseLateAnswer(key, text);
+    return;
+  }
   if (key !== spokenYes.answered) {
-    const current = spokenYes.answer;
     if (!current || current.key !== key) {
       spokenYes.answer = { key, turn, text: String(text), startedAt: now };
     } else {
@@ -9285,11 +9344,11 @@ function hearUserForSpokenYes(key, text, final, turn = null) {
   const answer = spokenYes.answer || { key, turn, text: String(text), startedAt: now };
   spokenYes.answer = null;
   // What this answer is judged against, taken before it is forgotten: the read-back belongs to the
-  // answer right after it and to no later one.
+  // answer right after it and to no later one. Its reply, if any has arrived, is kept as the first
+  // thing said since.
   const heard = heardBefore(answer);
-  const reply = (entry) => isReplyTo(answer, entry);
-  spokenYes.said = new Map([...spokenYes.said].filter(([, entry]) => reply(entry)));
-  spokenYes.sinceUser = new Map([...spokenYes.sinceUser].filter(([, entry]) => reply(entry)));
+  spokenYes.said = new Map([...spokenYes.said].filter(([entryKey]) => heard.replies.has(entryKey)));
+  spokenYes.sinceUser = new Map([...spokenYes.sinceUser].filter(([, entry]) => isReplyTo(answer, entry)));
   spokenYes.completed = new Map(
     [...spokenYes.completed].filter(([number]) => answer.turn !== null && number >= answer.turn)
   );
@@ -9299,6 +9358,25 @@ function hearUserForSpokenYes(key, text, final, turn = null) {
   // The same yes again while one is already settling or committing is not a second answer.
   if (spokenYes.settling || postWatch.busy) return;
   judgeSpokenAnswer(text, heard);
+}
+
+/**
+ * The final transcript of an older user turn arrived after a newer one had begun: the owner's
+ * "Yes" finished, then "wait, no" started, and only then did the bridge mark "Yes." final. The
+ * newer answer is the one the owner is giving now and stays the one the page is hearing; this one
+ * is judged as more than a yes was heard — a no still withdraws the draft, nothing sends — and a yes
+ * already settling stops. `#268 voice-call-drops`.
+ *
+ * @param {string} key
+ * @param {string} text
+ */
+function refuseLateAnswer(key, text) {
+  spokenYes.answered = key;
+  abortSpokenYes("heard_more");
+  if (postWatch.busy) return;
+  const answer = spokenYes.answer;
+  if (!answer) return;
+  judgeSpokenAnswer(text, heardBefore(answer), "heard_more");
 }
 
 /**
@@ -9312,24 +9390,36 @@ function hearUserForSpokenYes(key, text, final, turn = null) {
  * came sooner: a reply cannot start before the words it answers, so the earlier of the two is still
  * no earlier than the answer began, and judging from it is never more lenient.
  *
+ * Only the acknowledgement is left out as the reply (`isReplyTo`). A numbered turn at or after the
+ * answer's that completed interrupted counts as the read-back cut off unless all it said was the
+ * acknowledgement: it may have been said before the answer, and the owner may not have heard it out.
+ *
  * @param {{key: string, turn: number | null, startedAt: number}} answer
  * @returns {SpokenYesHeard}
  */
 function heardBefore(answer) {
-  const said = [...spokenYes.said.values()];
-  const turns = said.filter((entry) => !isReplyTo(answer, entry));
+  const entries = [...spokenYes.said];
+  const replies = new Set(entries.filter(([, entry]) => isReplyTo(answer, entry)).map(([key]) => key));
+  const turns = entries.filter(([key]) => !replies.has(key)).map(([, entry]) => entry);
   const sinceUser = [...spokenYes.sinceUser.values()].filter((entry) => !isReplyTo(answer, entry));
   let answerAt = answer.startedAt || Date.now();
-  for (const entry of said) {
-    if (isReplyTo(answer, entry)) answerAt = Math.min(answerAt, entry.at);
+  for (const [key, entry] of entries) {
+    if (replies.has(key)) answerAt = Math.min(answerAt, entry.at);
   }
+  // The numbered turns whose words were only the acknowledgement: the one kind of turn at or after
+  // the answer's whose interruption says nothing about the read-back.
+  const acknowledged = new Set(
+    entries.filter(([key]) => replies.has(key)).map(([, entry]) => entry.turn)
+  );
   const before = (number) => answer.turn === null || number < answer.turn;
-  const cutBefore = [...spokenYes.completed].some(([number, end]) => end.interrupted && before(number));
+  const cutBefore = [...spokenYes.completed].some(([number, end]) =>
+    end.interrupted && (before(number) || !acknowledged.has(number))
+  );
   let done = spokenYes.done;
   let playEnd = session.playEndMs || 0;
   const numbered = turns.length > 0 && turns.every((entry) => entry.turn !== null);
   if (session.protocol === "vibe-talk-v1" && numbered) {
-    const end = spokenYes.completed.get(Math.max(...turns.map((entry) => entry.turn)));
+    const end = spokenYes.completed.get(Math.max(...turns.map((entry) => Number(entry.turn))));
     done = Boolean(end && !end.interrupted);
     if (end) playEnd = end.playEnd;
   }
@@ -9341,6 +9431,8 @@ function heardBefore(answer) {
     done,
     answerAt,
     playEnd,
+    turn: answer.turn,
+    replies,
   };
 }
 
@@ -9350,8 +9442,10 @@ function heardBefore(answer) {
  *
  * @param {string} text
  * @param {SpokenYesHeard} heard
+ * @param {keyof typeof SPOKEN_YES_REASONS | null} [refused] why a yes is refused whatever the
+ *   read-back was: an answer that is no longer the one the owner is giving (`refuseLateAnswer`)
  */
-function judgeSpokenAnswer(text, heard) {
+function judgeSpokenAnswer(text, heard, refused = null) {
   if (!session.connected || !spokenYes.askFirst) return;
   const shown = postWatch.shown;
   const kind = classifySpokenAnswer(text);
@@ -9391,7 +9485,7 @@ function judgeSpokenAnswer(text, heard) {
     reportSpokenOutcome({ kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS.hint });
     return;
   }
-  const refusal = spokenYesRefusal(shown, text, heard);
+  const refusal = refused || spokenYesRefusal(shown, text, heard);
   if (refusal) {
     reportSpokenOutcome({ kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS[refusal] });
     return;
@@ -9402,6 +9496,8 @@ function judgeSpokenAnswer(text, heard) {
     words: answerWords(text).join(" "),
     timer: /** @type {any} */ (null),
     proposal: shown,
+    turn: heard.turn,
+    replies: heard.replies,
   };
   settling.timer = setTimeout(() => {
     if (spokenYes.settling !== settling || spokenYes.epoch !== epoch) return;

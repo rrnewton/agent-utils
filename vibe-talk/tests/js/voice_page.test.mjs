@@ -3299,6 +3299,20 @@ const sourceConstant = (name) =>
   );
 
 /**
+ * The same, for a constant a recent change introduced: its value, or undefined when the page does
+ * not state it, rather than a failure while this module loads.
+ *
+ * `#268 voice-call-drops`. Read at the top level, `sourceConstant` of a constant the previous page
+ * did not have made the whole module throw before any test ran, so "this test fails on the
+ * previous page" could not be observed — only that the suite would not load. A test that reads
+ * its constant with this says what it does when the constant is missing, and fails on its own.
+ */
+const optionalSourceConstant = (name) => {
+  const found = new RegExp(`^const ${name} = (\\d+);$`, "m").exec(SCRIPT_CODE);
+  return found ? Number(found[1]) : undefined;
+};
+
+/**
  * The same, for a constant whose value is one quoted string.
  *
  * Same argument as above: a test that restated the marker text would keep passing against a page
@@ -49016,7 +49030,7 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
 // and that a yes is judged against what was said BEFORE it in whatever order the bridge's two
 // streams — the owner's words and the assistant's — reach the page.
 
-const SPOKEN_TURN_HOLD_MS = sourceConstant("SPOKEN_TURN_HOLD_MS");
+const SPOKEN_TURN_HOLD_MS = optionalSourceConstant("SPOKEN_TURN_HOLD_MS");
 const CAPTURE_RESUME_MS = sourceConstant("VOICE_CAPTURE_RESUME_MS");
 
 /** The JSON control frames the page sent on `socket`, by type, in order. */
@@ -49079,7 +49093,7 @@ test("`#268 voice-call-drops`: a yes whose final transcript arrives after the re
   // THE CONTROL: the reply held up as part of the read-back, as before this fix. The same frames
   // then send nothing, and the agent is told the read-back was interrupted.
   const control = newPage(new Map(), brokenScript(
-    "  return answer.turn !== null && turn.turn !== null && turn.turn >= answer.turn;",
+    "  if (answer.turn === null || turn.turn === null || turn.turn < answer.turn) return false;",
     "  return false;"
   ));
   const socket = await neutralReadBack(control);
@@ -49091,13 +49105,25 @@ test("`#268 voice-call-drops`: a yes whose final transcript arrives after the re
   assert.match(control.el("status").textContent, /^Not sent/);
 });
 
-test("`#268 voice-call-drops`: on the bridge's order every safety rule of a spoken yes still holds", async () => {
-  /** Answer the read-back the way the bridge orders it: the reply first, then the final "Yes.". */
-  const answer = (page, socket) => {
+test("`#268 voice-call-drops`: on the bridge's order each safety rule of a spoken yes still refuses, for its own reason", async () => {
+  // A guard that taking the bridge's order loosened none of the rules. On the page before `#268`
+  // every case below sent nothing too, but so did the same frames with every rule met: the reply
+  // alone refused every yes, so those refusals said nothing about the rules. So the first call here
+  // meets every rule and must post, and each case after it is that call with exactly one thing
+  // changed, refused with that thing's reason. On the previous page it is the first call that fails.
+  /** Answer the read-back the way the bridge orders it: the reply first, then the final answer. */
+  const answer = (page, socket, said = "Yes.") => {
     socket.onmessage({ data: page.pcmFrame(12000, SPEECH) });
     speech(socket, "assistant", 2, "One moment.", true);
-    speech(socket, "user", 2, "Yes.", true);
+    speech(socket, "user", 2, said, true);
   };
+  const met = newPage();
+  const pending = spokenDraft();
+  answer(met, await neutralReadBack(met, { pending }));
+  await settleSpokenYes(met);
+  assert.deepEqual(met.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]],
+    "the call that meets every rule did not post, so no refusal below says anything about its rule");
+
   // The read-back's own turn was cut off: the reply arriving first does not mend it.
   const cut = newPage();
   answer(cut, await neutralReadBack(cut, { interrupted: true }));
@@ -49124,9 +49150,7 @@ test("`#268 voice-call-drops`: on the bridge's order every safety rule of a spok
 
   // A plain-words rule and "only the very next answer" are untouched: a hint is answered, not sent.
   const hint = newPage();
-  const hinted = await neutralReadBack(hint);
-  speech(hinted, "assistant", 2, "One moment.", true);
-  speech(hinted, "user", 2, "yes and tell him I'm late", true);
+  answer(hint, await neutralReadBack(hint), "yes and tell him I'm late");
   await settleSpokenYes(hint);
   assert.deepEqual(hint.proposalCommits, []);
   assert.match(hint.el("status").textContent, /^Not sent — only a plain answer/);
@@ -49181,6 +49205,145 @@ test("`#268 voice-call-drops`: a read-back in the same numbered turn as words be
   speech(changedSocket, "user", 2, "yes", true);
   await settleSpokenYes(changed);
   assert.deepEqual(changed.proposalCommits, [], "an inserted 'not' was confirmed");
+});
+
+test("`#268 voice-call-drops`: a turn numbered with the answer is left out as its reply only when all it says is 'One moment.'", async () => {
+  // The protocol does not promise that it numbers the owner's words and the answer to them alike,
+  // so a turn numbered with the answer may have been said before it. Only the acknowledgement the
+  // agent is told to give a yes is left out of what the yes is judged against; anything else in
+  // such a turn stays in, so the yes is refused. Every assistant turn numbered at or after the
+  // answer's used to be dropped by its number alone, and each of these posted.
+  const variants = [
+    ["its turn still open", null, /^Not sent — the read-back was interrupted\./],
+    ["its turn completed interrupted first", true, /^Not sent — the read-back was interrupted\./],
+    ["its turn completed first", false, /^Not sent — the read-back did not end with the question Send it\./],
+  ];
+  for (const [label, interrupted, refusal] of variants) {
+    const page = newPage();
+    const socket = await neutralReadBack(page);
+    speech(socket, "assistant", 2, "Or should I cancel it instead?", true);
+    if (interrupted !== null) {
+      socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 2, interrupted }) });
+    }
+    speech(socket, "user", 2, "Yes.", true);
+    await settleSpokenYes(page);
+    assert.deepEqual(page.proposalCommits, [], `${label}: a yes after "Or should I cancel it instead?" posted`);
+    assert.match(page.el("status").textContent, refusal, label);
+  }
+
+  // Matched as the prompt says it, "One moment." and nothing else: more words are not it.
+  const longer = newPage();
+  const longerSocket = await neutralReadBack(longer);
+  speech(longerSocket, "assistant", 2, "One moment, or should I cancel it?", true);
+  speech(longerSocket, "user", 2, "Yes.", true);
+  await settleSpokenYes(longer);
+  assert.deepEqual(longer.proposalCommits, [], "a turn that said more than 'One moment.' was left out");
+
+  // Streamed as it comes, "One" is where the acknowledgement starts while its turn is open...
+  const streamed = newPage();
+  const pending = spokenDraft();
+  const streamedSocket = await neutralReadBack(streamed, { pending });
+  speech(streamedSocket, "assistant", 2, "One", false);
+  speech(streamedSocket, "user", 2, "Yes.", true);
+  speech(streamedSocket, "assistant", 2, "One moment.", true);
+  await settleSpokenYes(streamed);
+  assert.deepEqual(streamed.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
+
+  // ...and a turn left out as the reply that then says more stops the yes still settling: what it
+  // went on to say may have come before the yes.
+  const grew = newPage();
+  const grewSocket = await neutralReadBack(grew);
+  speech(grewSocket, "assistant", 2, "One", false);
+  speech(grewSocket, "user", 2, "Yes.", true);
+  assert.match(grew.el("status").textContent, /Heard yes/);
+  speech(grewSocket, "assistant", 2, "One more thing, should I cancel it instead?", false);
+  await settleSpokenYes(grew);
+  assert.deepEqual(grew.proposalCommits, [], "a reply that turned out to say more did not stop the yes");
+  assert.match(grew.el("status").textContent, /^Not sent — the assistant said more than One moment/);
+
+  // A turn that completed on "One" said "One", which is not the acknowledgement.
+  const cutShort = newPage();
+  const cutShortSocket = await neutralReadBack(cutShort);
+  speech(cutShortSocket, "assistant", 2, "One", false);
+  turnDone(cutShortSocket, 2);
+  speech(cutShortSocket, "user", 2, "Yes.", true);
+  await settleSpokenYes(cutShort);
+  assert.deepEqual(cutShort.proposalCommits, [], "a turn that completed on 'One' was left out");
+});
+
+test("`#268 voice-call-drops`: the acknowledgement a spoken yes excuses is the one every prompt tells the agent to say", () => {
+  // The page leaves "One moment." out of a read-back because the agent is told to say exactly that
+  // on a yes. If the prompts said anything else, a cooperative agent's reply would refuse every yes
+  // that the bridge answered before its final transcript.
+  const stated = /^const SPOKEN_YES_ACKNOWLEDGEMENT = \[([^\]]*)\];$/m.exec(SCRIPT_CODE);
+  assert.ok(stated, "web/voice.js states no SPOKEN_YES_ACKNOWLEDGEMENT");
+  const excused = [...stated[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]).join(" ");
+  const ROOT = join(WEB, "..");
+  for (const file of ["prompts/voice-agent-send.txt", "src/ops.rs", "src/mcp/mod.rs"]) {
+    const text = readFileSync(join(ROOT, file), "utf8").replace(/\\"/g, '"').replace(/\\\n\s*/g, "");
+    const told = /say only "([^"]+)"/.exec(text.replace(/\s+/g, " "));
+    assert.ok(told, `${file} no longer tells the agent what to say on a yes`);
+    assert.equal(told[1].toLowerCase().replace(/[^a-z' ]/g, ""), excused, file);
+  }
+});
+
+test("`#268 voice-call-drops`: a late final transcript of an older turn is not taken over a newer answer already begun", async () => {
+  // The owner said "Yes", then "wait, no", and the bridge marked "Yes." final only after the newer
+  // turn had begun. The page took that late final for the answer it was hearing, judged it a yes,
+  // and forgot the newer one: the yes posted, and "wait, no" was never judged.
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await neutralReadBack(page, { pending });
+  speech(socket, "user", 2, "Yes", false);
+  speech(socket, "assistant", 2, "One moment.", true);
+  speech(socket, "user", 3, "wait no", false);
+  speech(socket, "user", 2, "Yes.", true);
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a late yes was taken over the newer answer");
+  assert.match(page.el("status").textContent, /^Not sent — more than a yes was heard\./);
+  turnDone(socket, 3);
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a late yes posted once the newer turn completed");
+  // The newer answer is still the one the page heard, and it is a no.
+  assert.deepEqual(page.proposalCancels, [{ handle: pending.handle }], "'wait no' was never judged");
+});
+
+test("`#268 voice-call-drops`: a draft that replaced another in the middle of a turn is not confirmed by a read-back in that turn", async () => {
+  // Counting "said once this draft was on the card" in words within a turn is for a turn that began
+  // with no draft up: "Sure, let me draft that." and then the read-back. It also let a turn that read
+  // one draft back, saw it replaced, and read the replacement, confirm the replacement — which the
+  // page refused before, and refuses again: the yes answers a turn that read two drafts.
+  const first = spokenDraft({ text: "merge the PR" });
+  const second = spokenDraft({ serial: 8, handle: "rEpLaCeD-0123456789abc", text: "merge the PR after the build" });
+  for (const cardFirst of [false, true]) {
+    const label = cardFirst ? "the turn began with the first draft up" : "the turn began with no draft up";
+    const page = newPage();
+    const socket = await startNeutralCall(page);
+    await page.settle();
+    speech(socket, "user", 1, "tell lead team to merge the PR", true);
+    if (cardFirst) {
+      page.propose(first);
+      await page.settle();
+    }
+    speech(socket, "assistant", 1, "Sure.", false);
+    if (!cardFirst) {
+      page.propose(first);
+      await page.settle();
+    }
+    const firstReadBack = `Sure. To lead team: ${first.text}. Send it?`;
+    speech(socket, "assistant", 1, firstReadBack, false);
+    page.propose(second);
+    await page.settle();
+    assert.equal(page.el("post-confirm-text").textContent, second.text, label);
+    socket.onmessage({ data: page.pcmFrame(24000, SPEECH) });
+    speech(socket, "assistant", 1, `${firstReadBack} To lead team: ${second.text}. Send it?`, true);
+    turnDone(socket, 1);
+    page.setClock(page.clock() + 3000);
+    speech(socket, "user", 2, "yes", true);
+    await settleSpokenYes(page);
+    assert.deepEqual(page.proposalCommits, [], `${label}: the replacement was confirmed in the turn that replaced it`);
+    assert.match(page.el("status").textContent, /not the card's text word for word/, label);
+  }
 });
 
 test("`#268 voice-call-drops`: a page message waits for an open spoken turn instead of closing the segment inside it", async () => {
