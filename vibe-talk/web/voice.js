@@ -6078,6 +6078,10 @@ function noteConversationEnded(cause = "ended") {
   // Drawn at the moment of the DROP, not when Resume is tapped: the boundary is where the
   // conversation actually broke, and marking it later would put the reader's own next turn on the
   // wrong side of it.
+  //
+  // The card first: a draft retired by Hang up leaves its "Not sent" line inside the conversation
+  // that ended, above the boundary, where a reload draws it. `#269 approval-card-inline`.
+  settleCardAtCallEnd(cause);
   const boundary = transcriptSeam("new conversation", seamDetailFor(cause));
   // `#270 voice-transcript-markers`. Which conversation this line ends, so a send that settles late
   // is drawn inside it, above the line, where a reload draws it.
@@ -9775,10 +9779,17 @@ const postWatch = {
   // The serial of the last proposal the server reported, shown or not: the long poll's `seen`.
   /** @type {number | null} */
   received: null,
-  // The handle pending when the last call ended. The next call does not offer it: a draft from a
-  // conversation that is over is not something to confirm in a new one.
+  // The handle on the card when the owner hung up. The next call does not offer it: a draft from a
+  // conversation he ended is not something to confirm in a new one. A call that DROPPED keeps its
+  // card instead (`dropped`). `#269 approval-card-inline`.
   /** @type {string | null} */
   ignored: null,
+  // The card outlived a call that ended without a Hang up — the service closed it, the connection
+  // failed, the page was put away — and is kept, tap only, until it lapses or the next call opens.
+  dropped: false,
+  // The drafts whose "Not sent" line is drawn, under `postKey`, so none is marked twice.
+  /** @type {Set<string>} */
+  notSent: new Set(),
   // When the shown proposal lapses, fixed once when it first appears so a re-render cannot extend it.
   deadline: 0,
   tick: null,
@@ -9848,6 +9859,8 @@ function startPostWatch() {
   spokenYes.askFirst = !(voiceSendSetting && voiceSendSetting.ask_before_send === false);
   postWatch.running = true;
   postWatch.generation += 1;
+  // A card kept from a call that dropped is this call's to show now, still tap only.
+  postWatch.dropped = false;
   // `#270 voice-transcript-markers`. This call's window on the send memory opens at its first read.
   postWatch.window = { conversationId: null, from: null, to: null };
   postWatch.windows.push(postWatch.window);
@@ -9861,11 +9874,10 @@ function stopPostWatch() {
   postWatch.generation += 1;
   if (postWatch.controller) postWatch.controller.abort();
   postWatch.controller = null;
-  // The proposal itself is left to lapse on the server. Hanging up is not a decision about it, and
-  // a card with no call behind it would be a Send button for a conversation that is over — so is
-  // offering the same draft again when the next call opens.
-  if (postWatch.shown) postWatch.ignored = postWatch.shown.handle;
-  showPostProposal(null);
+  // The card is NOT taken down here. What becomes of it depends on how the call ended, which only
+  // `noteConversationEnded` knows: a Hang up retires it, and a call the owner did not end keeps it,
+  // tap only — `resetSpokenYes` above has made it ineligible for a yes — until it lapses. `#269
+  // approval-card-inline`.
   // `#270 voice-transcript-markers`. The call's window closes at one last read of the send memory,
   // which also brings a send that settled between the last waiting read and now.
   const window = postWatch.window;
@@ -10082,7 +10094,10 @@ async function watchPostProposals(generation) {
       // wakes this watch the moment it spends the handle, before that answer; taken down here, the
       // card would vanish before the frozen card that replaces it is drawn, and take the focus with
       // it. `#270 voice-transcript-markers`.
-      if (!(next === null && postWatch.busy && postWatch.shown)) showPostProposal(next);
+      if (!(next === null && postWatch.busy && postWatch.shown)) {
+        noteCardTakenDown(answer, next);
+        showPostProposal(next);
+      }
       waitSeconds = POST_WATCH_WAIT_SECONDS;
     } catch (error) {
       if (postWatch.generation !== generation) return;
@@ -10322,6 +10337,7 @@ function draftBelowView() {
 const POST_CARD_STATUS = {
   waiting: (seconds) => `Waiting for you · lapses in ${seconds} s`,
   changed: (seconds) => `Changed: read again · lapses in ${seconds} s`,
+  dropped: (seconds) => `Call dropped · Send still posts · ${seconds} s`,
   settling: "Heard yes — tap Don't send to stop",
   lapsed: "Lapsed — nothing was posted.",
   token: "Has your sign-in token · tap Don't send",
@@ -10344,6 +10360,9 @@ function renderPostExpiry() {
   if (seconds === 0) {
     el("post-confirm-send").disabled = true;
     status.textContent = POST_CARD_STATUS.lapsed;
+    // A card kept through a call that dropped has no watch to take it down: it goes at its lapse,
+    // once whatever is drawing it now has finished. `#269 approval-card-inline`.
+    if (!postWatch.running && !postWatch.busy) void Promise.resolve().then(() => lapseKeptCard(proposal));
     return;
   }
   // A spoken yes is settling: what the next second does is send, and the one control that stops
@@ -10351,6 +10370,8 @@ function renderPostExpiry() {
   const settling = spokenYes.settling;
   if (settling && settling.handle === proposal.handle) {
     status.textContent = POST_CARD_STATUS.settling;
+  } else if (postWatch.dropped && !postWatch.running) {
+    status.textContent = POST_CARD_STATUS.dropped(seconds);
   } else {
     status.textContent = postWatch.changed ? POST_CARD_STATUS.changed(seconds) : POST_CARD_STATUS.waiting(seconds);
   }
@@ -10478,21 +10499,29 @@ async function cancelPostProposal(options) {
   postWatch.busy = true;
   try {
     await api("/api/v1/post-proposals/cancel", { method: "POST", body: { handle: proposal.handle } });
+    // `#270 voice-transcript-markers`. Withdrawn, on the server's word: the draft's "Not sent" line,
+    // kept, where the card was — and where the focus goes if it was on the card. A spoken no draws
+    // its own (`reportSpokenOutcome`), after the "no" it answers.
+    if (!spoken) postWatch.parkOn = noteNotSent("withdrawn", proposal);
     settlePostCard(proposal);
     setStatus("Not sent.");
     if (!spoken) tellAgentAboutTap({ kind: "withdrawn", proposal });
   } catch (error) {
     // Already settled is still "not sent from this card" — the watch shows whatever came next.
+    // What that was is not this tap's to say, so it leaves no mark: a send arrives from the send
+    // memory, a lapse from the proposal's fate. `#270 voice-transcript-markers`.
     if (!error.network) settlePostCard(proposal);
     if (error.network) showError(error.message);
     // The yes this tap stopped still gets its one answer: it was not sent.
     if (stoppedYes) {
       reportSpokenOutcome({ kind: "not_armed", proposal, reason: SPOKEN_YES_REASONS.withdrawn });
     }
+    return false;
   } finally {
     postWatch.busy = false;
     if (postWatch.shown) showPostProposal(postWatch.shown);
   }
+  return true;
 }
 
 /** Take a settled proposal off the card, unless the watch has already put a newer one there. */
@@ -10712,15 +10741,28 @@ function markNotKept(li) {
 }
 
 /**
- * Put a frozen card in the transcript: at the end for the conversation on screen, or, for one that
- * has ended, in it — just above the boundary that ended it — where a reload draws it too. A late
- * commit answer, or a send that settled after the next call began, lands where it belongs.
+ * Put a frozen card in the transcript, in the conversation it belongs to (`placeInConversation`).
+ * A late commit answer, a send that settled after the next call began, or a tap on a card kept
+ * through a call that dropped lands where a reload draws it.
  *
  * @param {{text: string, at_ms?: number, detail?: any}} turn
  * @param {string | null} conversationId
  */
 function placeSentCard(turn, conversationId) {
-  const li = sentCardNode(turn);
+  return placeInConversation(sentCardNode(turn), conversationId, 1);
+}
+
+/**
+ * Put a row the page drew — a frozen card, a draft's "Not sent" line — at the end of the transcript
+ * for the conversation on screen, or, for one that has ended, in it: just above the boundary that
+ * ended it, where a reload draws it too. `turns` is 1 for a message and 0 for a line about one.
+ * `#270 voice-transcript-markers`.
+ *
+ * @param {HTMLElement} li
+ * @param {string | null} conversationId
+ * @param {number} [turns]
+ */
+function placeInConversation(li, conversationId, turns = 0) {
   const list = leftEl("transcript");
   const pinned = atBottom(leftEl("scroll-area"));
   const boundary = conversationId
@@ -10730,7 +10772,7 @@ function placeSentCard(turn, conversationId) {
   else list.append(li);
   renderEmptyState();
   applySearch();
-  followIfPinned(pinned, 1);
+  followIfPinned(pinned, turns);
   return li;
 }
 
@@ -10848,6 +10890,151 @@ function recordRecord(conversationId, body) {
   });
   recordQueue = done.then(() => undefined);
   return done;
+}
+
+// --- drafts that were not sent -----------------------------------------------------------------------
+//
+// `#270 voice-transcript-markers`. A draft that went nowhere leaves a line where it was waiting, so a
+// read-back followed by nothing does not read, months later, as a question nobody answered. One
+// label, and one fixed sentence per reason, the same live and restored. On a server that takes
+// records the line is kept, as a `not_sent` marker in the draft's conversation.
+//
+// Drawn only on the server's word: Don't send once the server withdrew the draft, a spoken no once it
+// did, a lapse once the server says the draft EXPIRED, and a Hang up with the draft still waiting.
+// Nothing for a draft a newer one replaced (the newer one is on the card), one that was committed (the
+// send memory draws what went), or one somebody else withdrew.
+
+/** What a "Not sent" line says, per reason. A spoken no's is `SPOKEN_YES_SEAMS.declined`. */
+const NOT_SENT_SEAMS = {
+  withdrawn:
+    "You tapped Don't send, so the draft was withdrawn and nothing was posted. Ask the assistant " +
+    "for new words if you want them.",
+  lapsed:
+    "The draft lapsed before anyone sent it, so nothing was posted. Ask the assistant to draft it " +
+    "again if you still want it sent.",
+  ended:
+    "You hung up with a draft still waiting, so nothing was posted. A new call does not offer that " +
+    "draft again.",
+};
+
+/**
+ * How long after a kept card's lapse the server is asked what became of it, so its "Not sent" line
+ * says lapsed only on the server's word. `#269 approval-card-inline`.
+ */
+const POST_FATE_RECHECK_MS = 1000;
+
+/**
+ * A draft's "Not sent" line, for `why`: into `into` (a restored run, or a throwaway for one placed by
+ * the caller). Focusable, as a place for the focus to go when the card goes with it inside.
+ *
+ * @param {string} why
+ * @param {HTMLElement[]} into
+ */
+function notSentSeam(why, into) {
+  const detail = why === "declined" ? SPOKEN_YES_SEAMS.declined : NOT_SENT_SEAMS[why] || NOT_SENT_SEAMS.lapsed;
+  const li = transcriptSeam("Not sent", detail, into);
+  li.setAttribute("data-not-sent", String(why));
+  li.setAttribute("tabindex", "-1");
+  return li;
+}
+
+/**
+ * `proposal` was not sent, for `why`: draw its line in the conversation it was shown in (or
+ * `conversationId`), keep it as a marker, and return the line — or null when this draft already has
+ * one.
+ *
+ * @param {"withdrawn" | "declined" | "lapsed" | "ended"} why
+ * @param {VibeTalk.PendingPost} proposal
+ * @param {string | null} [conversationId]
+ */
+function noteNotSent(why, proposal, conversationId) {
+  const key = postKey(proposal.instance, proposal.serial);
+  if (postWatch.notSent.has(key)) return null;
+  postWatch.notSent.add(key);
+  if (postWatch.notSent.size > 64) postWatch.notSent.delete(postWatch.notSent.values().next().value);
+  let where = conversationId;
+  if (where === undefined) {
+    const shown = shownConversation(key);
+    where = shown !== undefined && shown !== null ? shown : session.conversationId;
+  }
+  const li = placeInConversation(notSentSeam(why, []), where || null);
+  if (why === "lapsed") setStatus(`The draft to ${proposal.channel_name} lapsed; nothing was posted.`);
+  if (transcriptRecordsSupported && where) {
+    const marker = { kind: "not_sent", why, serial: proposal.serial };
+    recordInScreenOrder(() => void recordRecord(where, { speaker: "marker", text: "", marker }));
+  }
+  return li;
+}
+
+/**
+ * What the server says became of `proposal`, from one read's `settled`, or null when it does not
+ * say — an older server, or another run of this one.
+ *
+ * @param {VibeTalk.PendingPostResponse} answer
+ * @param {VibeTalk.PendingPost} proposal
+ */
+function proposalFate(answer, proposal) {
+  if ((answer.instance || "") !== (proposal.instance || "")) return null;
+  const settled = (answer.settled || []).find((one) => one.serial === proposal.serial);
+  return settled ? settled.fate : null;
+}
+
+/** A read is taking the card down, or replacing it: a draft the server let lapse says so. */
+function noteCardTakenDown(answer, next) {
+  const shown = postWatch.shown;
+  if (!shown || (next && next.handle === shown.handle) || postWatch.busy) return;
+  if (proposalFate(answer, shown) === "expired") noteNotSent("lapsed", shown);
+}
+
+/**
+ * A card kept through a call that dropped reached its lapse with no watch to take it down: it goes
+ * now, and a moment later the server is asked what became of it.
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ */
+function lapseKeptCard(proposal) {
+  if (postWatch.shown !== proposal || postWatch.running || postWatch.busy) return;
+  showPostProposal(null);
+  setTimeout(() => void readLapsedFate(proposal), POST_FATE_RECHECK_MS);
+}
+
+/** @param {VibeTalk.PendingPost} proposal */
+async function readLapsedFate(proposal) {
+  let answer;
+  try {
+    answer = await apiDecoded("PendingPostResponse", postWatchPath(0));
+  } catch (_error) {
+    return; // Nothing more to say: the card has gone, and a lapse is not drawn on a guess.
+  }
+  noteSendMemory(answer);
+  if (proposalFate(answer, proposal) === "expired") noteNotSent("lapsed", proposal);
+}
+
+/**
+ * The call has ended, for `cause`, with `proposal` on the card. `#269 approval-card-inline`.
+ *
+ * A Hang up is a decision about the call, and retires the draft with it: the card goes, the next
+ * call does not offer it, and its "Not sent" line says so — unless a send or a withdrawal is on its
+ * way, whose answer settles the card. Every other ending — the service closed the call, the
+ * connection failed, the page was put away — is one the owner did not choose, and keeps the card,
+ * tap only, until it lapses: on 2026-10-13 a drop came nineteen seconds after a tap on Send, and
+ * discarding the draft at a drop loses messages he meant to send.
+ *
+ * @param {string} cause
+ */
+function settleCardAtCallEnd(cause) {
+  const proposal = postWatch.shown;
+  if (!proposal) return;
+  if (cause !== "ended") {
+    postWatch.dropped = true;
+    renderPostExpiry();
+    return;
+  }
+  if (postWatch.busy) return;
+  postWatch.ignored = proposal.handle;
+  postWatch.parkOn = noteNotSent("ended", proposal, session.conversationId);
+  showPostProposal(null);
+  postWatch.parkOn = null;
 }
 
 // --- a spoken yes to the card ----------------------------------------------------------------------
@@ -11872,8 +12059,8 @@ async function commitBySpokenYes(proposal, epoch) {
 async function cancelBySpokenNo() {
   if (postWatch.busy) return;
   const proposal = postWatch.shown;
-  await cancelPostProposal({ spoken: true });
-  reportSpokenOutcome({ kind: "declined", proposal });
+  const withdrawn = await cancelPostProposal({ spoken: true });
+  reportSpokenOutcome({ kind: "declined", proposal, withdrawn: withdrawn === true });
 }
 
 /**
@@ -11985,7 +12172,8 @@ function tellAgentAboutTap(outcome) {
 /**
  * Say what came of a yes: to the agent, on the status line, in the transcript, and as a tone.
  *
- * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string}} outcome
+ * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string, withdrawn?: boolean}} outcome
+ *   `withdrawn`, for a spoken no: whether the server withdrew the draft
  */
 function reportSpokenOutcome(outcome) {
   const channel = (outcome.proposal && outcome.proposal.channel_name) || "the channel";
@@ -12009,8 +12197,12 @@ function reportSpokenOutcome(outcome) {
   tellAgent(outcomeNotice({ ...outcome, kind }, "voice"));
   setStatus(status);
   // `#270 voice-transcript-markers`. A send — whole, partial or unconfirmed — is the frozen card,
-  // which says "approved by voice" and is kept; a seam beside it would say it twice.
-  if (kind !== "sent" && kind !== "partial" && kind !== "unconfirmed") {
+  // which says "approved by voice" and is kept; a seam beside it would say it twice. A no that
+  // withdrew the draft is that draft's "Not sent" line, kept as well; one the server did not take
+  // withdrew nothing, and says nothing here.
+  if (kind === "declined") {
+    if (outcome.withdrawn && outcome.proposal) noteNotSent("declined", outcome.proposal);
+  } else if (kind !== "sent" && kind !== "partial" && kind !== "unconfirmed") {
     transcriptSeam(SPOKEN_YES_SEAM_LABELS[kind], SPOKEN_YES_SEAMS[kind]);
   }
   playSpokenYesTone(kind === "sent");
@@ -12235,10 +12427,14 @@ function restoredRun(turns, trailingSeam) {
       rule(previous);
     }
     // `#270 voice-transcript-markers`. A message the voice agent posted is its frozen card, drawn
-    // by the builder the live one is. A marker is not a turn: nothing is drawn for one here.
+    // by the builder the live one is, and a draft that was not sent is the line the live page drew
+    // for it, in the same words. A marker is not a turn: nothing else is drawn for one here.
     if (turn.speaker === "sent") {
       rows.push(sentCardNode(turn));
-    } else if (turn.speaker !== "marker") {
+    } else if (turn.speaker === "marker") {
+      const detail = turn.detail;
+      if (detail && detail.kind === "not_sent") notSentSeam(String(detail.why), rows);
+    } else {
       rows.push(turnNode(restoredSpeaker(turn.speaker), turn.text, turn.at_ms));
     }
     previous = turn.conversation_id;
