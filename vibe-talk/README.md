@@ -5535,7 +5535,10 @@ and a plain yes sent nothing. The rules above are now asked of what was said BEF
   no part of the read-back. Anything else such a turn says ("Or should I cancel it instead?", "One
   moment, or should I cancel it?") stays part of the read-back, so the yes is refused; and if such
   a turn completes interrupted, the read-back counts as interrupted. A turn taken for the reply
-  that goes on to say more, or that completes on "One" alone, stops a yes that is still settling.
+  that goes on to say more, or that completes on "One" alone, stops a yes that is still settling;
+  so does a turn numbered the same as the answer or later that first appears while the yes is
+  settling ("Actually, should I cancel it instead?") unless it is the acknowledgement, which is
+  then held to the same rule.
 * That rests on an **assumption the protocol does not state**: that `vibe-talk-v1` numbers the
   owner's words and the assistant's answer to them alike. The safety of the rule does not depend on
   it. Only the acknowledgement is ever left out, whichever side of the answer it was really said

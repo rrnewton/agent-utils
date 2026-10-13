@@ -50009,6 +50009,49 @@ test("`#268 voice-call-drops`: a reply excused on a streamed 'One' that then com
   assert.deepEqual(whole.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
 });
 
+test("`#268 voice-call-drops`: a new turn numbered at or after the answer that begins inside the settle window stops the yes unless it is 'One moment.'", async () => {
+  // The review's probe: "One moment." in turn 2, the owner's "Yes." final in turn 2, then the
+  // assistant's turn 3 "Actually, should I cancel it instead?" inside the settle window. Only a
+  // reply the yes was judged without could stop it by saying more; a turn that first appeared
+  // after the judgement could say anything, and the yes posted.
+  const page = newPage();
+  const socket = await neutralReadBack(page);
+  speech(socket, "assistant", 2, "One moment.", true);
+  speech(socket, "user", 2, "Yes.", true);
+  assert.match(page.el("status").textContent, /Heard yes/);
+  speech(socket, "assistant", 3, "Actually, should I cancel it instead?", true);
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a new turn after the yes that was not 'One moment.' did not stop it");
+  assert.match(page.el("status").textContent, /^Not sent — the assistant said more than One moment/);
+
+  // A first frame in the answer's own turn, after the judgement, is held to the same rule.
+  const same = newPage();
+  const sameSocket = await neutralReadBack(same);
+  speech(sameSocket, "user", 2, "Yes.", true);
+  assert.match(same.el("status").textContent, /Heard yes/);
+  speech(sameSocket, "assistant", 2, "Or should I cancel it instead?", false);
+  await settleSpokenYes(same);
+  assert.deepEqual(same.proposalCommits, [], "a reply begun after the judgement said more and the yes posted");
+
+  // The acknowledgement in a new turn is the reply, and the yes posts...
+  const ack = newPage();
+  const pending = spokenDraft();
+  const ackSocket = await neutralReadBack(ack, { pending });
+  speech(ackSocket, "user", 2, "Yes.", true);
+  speech(ackSocket, "assistant", 3, "One moment.", true);
+  await settleSpokenYes(ack);
+  assert.deepEqual(ack.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
+
+  // ...held to that from then on: one begun as "One" that completes there stops the yes.
+  const short = newPage();
+  const shortSocket = await neutralReadBack(short);
+  speech(shortSocket, "user", 2, "Yes.", true);
+  speech(shortSocket, "assistant", 3, "One", false);
+  turnDone(shortSocket, 3);
+  await settleSpokenYes(short);
+  assert.deepEqual(short.proposalCommits, [], "a reply begun after the judgement completed on 'One' and the yes posted");
+});
+
 test("`#268 voice-call-drops`: the acknowledgement a spoken yes excuses is the one every prompt tells the agent to say", () => {
   // The page leaves "One moment." out of a read-back because the agent is told to say exactly that
   // on a yes. If the prompts said anything else, a cooperative agent's reply would refuse every yes

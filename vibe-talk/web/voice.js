@@ -9272,10 +9272,18 @@ function hearAssistantForSpokenYes(key, text, turn = null) {
   spokenYes.sinceUser.set(key, { text: String(text), turn, at: since ? since.at : at });
   // A turn the yes now settling was judged without, as its reply, has said more than the
   // acknowledgement: whatever it went on to say may have come before the yes, so the yes stops.
-  // `#268 voice-call-drops`.
+  // So does a NEW turn numbered at or after the answer that is not the acknowledgement: by the
+  // same assumption it may have been said before the yes, and the yes was judged without it. One
+  // that is the acknowledgement is taken for the reply, and held to that from here as the others
+  // are. `#268 voice-call-drops`.
   const settling = spokenYes.settling;
-  if (settling && settling.replies.has(key) && !isReplyTo({ turn: settling.turn }, entry)) {
-    abortSpokenYes("said_more");
+  if (settling) {
+    const answering = settling.turn !== null && turn !== null && turn >= settling.turn;
+    if (isReplyTo({ turn: settling.turn }, entry)) {
+      settling.replies.add(key);
+    } else if (settling.replies.has(key) || answering) {
+      abortSpokenYes("said_more");
+    }
   }
   // The reply to an answer the page has begun to hear says nothing about what that answer answers:
   // it neither reopens the read-back nor moves the moment the answer began.
