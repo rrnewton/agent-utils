@@ -924,6 +924,13 @@ declare namespace VibeTalk {
      */
     handle: string;
     /**
+     * Which run of this server numbered `serial`: a token minted when the process started, the same
+     * on every answer until it stops. `#270 voice-transcript-markers`. A page that stays open
+     * across a restart sees the serials it has drawn come round again, and tells them apart by this.
+     * Absent from an older server.
+     */
+    instance?: string;
+    /**
      * The start of `text` that this server put there: the owner's tag for what the voice agent
      * posts (`#303 voice-post-prefix`). `text` begins with exactly this. Absent when nothing was
      * added — tagging is off — and from an older server. It is his own words, not the agent's, so
@@ -946,6 +953,9 @@ declare namespace VibeTalk {
     reply_to_excerpt?: string | null;
     /**
      * Correlates this proposal's steps in the access log. Increases with every proposal.
+     *
+     * Within one server process only: a restarted server numbers its proposals from one again.
+     * `instance` says which process numbered this one.
      */
     serial: number;
     /**
@@ -966,13 +976,22 @@ declare namespace VibeTalk {
    * posted in the last [`crate::post_gate::SEND_MEMORY_TTL`], however it was approved, published
    * once it settled. A page reads it with `sent_after`, the newest `send_seq` it has seen; without
    * that it gets no sends and waits as it always did.
+   *
+   * The fields this adds are optional in the contract, though this server always sends them, so a
+   * page left open across a rollback to an older server still reads the proposal it is shown: a
+   * field the contract required would make the page refuse every answer from that server.
    */
   interface PendingPostResponse {
     /**
-     * The server's clock, in milliseconds since the Unix epoch, for placing a send's
-     * `begun_at_ms` in a call.
+     * Which run of this server answered: see [`PendingPost::instance`]. Its `send_seq` numbers
+     * only go forward within one run; a different run numbers its own, from its clock.
      */
-    now_ms: number;
+    instance?: string;
+    /**
+     * The server's clock, in milliseconds since the Unix epoch, for placing a send's
+     * `begun_at_ms` in a call. Always sent by this server; absent only from an older one.
+     */
+    now_ms?: number | null;
     /**
      * The pending proposal. At most one exists: a new proposal supersedes the old.
      */
@@ -983,9 +1002,10 @@ declare namespace VibeTalk {
      */
     sends?: VoiceSend[];
     /**
-     * The newest `send_seq` this server has handed out: the page's next `sent_after`.
+     * The newest `send_seq` this server has handed out: the page's next `sent_after`. Always sent
+     * by this server; absent only from an older one.
      */
-    sends_through: number;
+    sends_through?: number | null;
     /**
      * What became of the proposals this server still remembers, oldest first. Absent when none.
      */
@@ -1989,6 +2009,11 @@ declare namespace VibeTalk {
      * Where it went, how it was approved, and what is known to have been posted.
      */
     detail: SentRecord;
+    /**
+     * Which run of this server numbered `detail.serial`: see [`PendingPost::instance`]. Not
+     * stored with a transcript row, which names its send by `send_seq` alone.
+     */
+    instance?: string;
     /**
      * The text that went, capped as a transcript row is.
      */
