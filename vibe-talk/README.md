@@ -6910,6 +6910,19 @@ send memory when that answer was lost, when the send settled after hang-up, or w
 send; a server that takes records files it in the stored transcript from its own copy, so a reload
 draws the same card. A yes that sent nothing is a seam, as before.
 
+**A yes that sends shows no turn of its own** (`#269 approval-card-inline`): the frozen card says
+"approved by voice", and that is the answer. While the owner's turn could still become a yes to the
+card — this call's draft is up and nothing is sending it, sending is the subject, and the words so
+far are a yes or the start of one ("ye", "ok se") — its row is drawn out of sight. It stays that way
+only if that yes sends. Anything else brings it back in its own place: words that cannot be a yes,
+a judgement that does not take it, "wait" or a tap in the settle window, a refused or lost commit,
+the end of the call, or a bound (ten seconds without a judgement, twenty while it sends). So a turn
+that starts like a yes and becomes something else appears a moment late, and a yes never appears and
+then vanishes. The record always keeps the yes as an ordinary `you` turn; on a server that keeps
+records it is tagged as the answer to the proposal when the page had acted on it by the time it was
+filed, and a reload hides it only when a `sent` row approved by voice for that proposal follows it.
+A tag on a yes that then sent nothing hides nothing.
+
 **What a spoken yes cannot know**, stated plainly:
 
 * **Who spoke.** The page assumes one speaker. A passenger, a phone call on the car speakers or the
