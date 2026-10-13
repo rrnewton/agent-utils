@@ -34,6 +34,8 @@
 //! treated as a second at-rest copy of third-party text: bounded by the same retention, erased by
 //! the same purge, and never written on behalf of a read-scope token. Read state in particular is OURS:
 //! Discord shares none with a bot, so nothing here is synchronised with it in either direction.
+//! [`cache`] is a disposable on-disk copy of channel messages in a file of its own
+//! (`#208 persistent-cache`); in this build nothing opens it, so it keeps nothing.
 //!
 //! # Untrusted input
 //!

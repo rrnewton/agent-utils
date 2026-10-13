@@ -299,6 +299,11 @@ impl Writer<'_> {
 
     fn run(&mut self, rx: &Receiver<Envelope>) -> Option<mpsc::Sender<()>> {
         loop {
+            // Checked on every turn, not only when the queue goes quiet: a writer that is never
+            // idle for an hour must still expire what has aged out.
+            if self.last_hourly.elapsed() >= HOURLY {
+                self.hourly();
+            }
             if !self.shared.search_text_current.load(Ordering::SeqCst) {
                 self.rebuild_chunk();
             }
@@ -311,9 +316,7 @@ impl Writer<'_> {
             let first = match rx.recv_timeout(wait) {
                 Ok(envelope) => envelope,
                 Err(RecvTimeoutError::Timeout) => {
-                    if self.last_hourly.elapsed() >= HOURLY {
-                        self.hourly();
-                    } else if self.checkpoint_due {
+                    if self.checkpoint_due {
                         self.checkpoint();
                     }
                     continue;
