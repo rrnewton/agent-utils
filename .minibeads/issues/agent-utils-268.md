@@ -1,10 +1,11 @@
 ---
 title: 'voice-call-drops: voice calls end on their own, and a spoken yes is not acted on'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-10-13T11:49:51.275172468+00:00
-updated_at: 2026-10-13T11:49:51.275172468+00:00
+updated_at: 2026-10-13T17:10:11.353484411+00:00
+closed_at: 2026-10-13T17:10:11.353484251+00:00
 ---
 
 # Description
