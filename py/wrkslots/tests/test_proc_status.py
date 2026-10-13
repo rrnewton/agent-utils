@@ -1214,7 +1214,8 @@ def test_the_audit_publishes_each_slot_once_even_from_several_routes() -> None:
 
 def exiting_init_proc(
     proc_root: Path, pid: int = 2991802, *, wchan: str = "zap_pid_ns_processes",
-    nspid: str = "2991802\t1", cwd: str | None = None,
+    nspid: str = "2991802\t1", cwd: str | None = None, root: str | None = None,
+    threads: int = 1,
 ) -> Path:
     """The measured shape of a PID-namespace init being torn down.
 
@@ -1227,11 +1228,13 @@ def exiting_init_proc(
     uid = os.getuid()
     (pid_dir / "status").write_text(
         f"Name:\tpidns_recheck\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
-        f"NSpid:\t{nspid}\n", encoding="ascii")
+        f"NSpid:\t{nspid}\nThreads:\t{threads}\n", encoding="ascii")
     (pid_dir / "cgroup").write_text("0::/fixture\n", encoding="ascii")
     (pid_dir / "wchan").write_text(wchan, encoding="ascii")
     if cwd is not None:
         (pid_dir / "cwd").symlink_to(cwd)
+    if root is not None:
+        (pid_dir / "root").symlink_to(root)
     return pid_dir
 
 
@@ -1253,8 +1256,12 @@ def test_an_exiting_namespace_init_holds_no_checkout(tmp_path: Path, capsys) -> 
 @pytest.mark.parametrize("near_miss", [
     {"wchan": "do_wait"},                   # same name, not tearing down: still refused
     {"nspid": "2991802\t7"},               # not the init of its namespace
+    {"nspid": "1\t7"},                     # PID 1 only at an OUTER level: not the init
     {"cwd": "/home/somewhere/checkout"},   # still holds a working directory
-], ids=["other-wait-channel", "not-a-namespace-init", "cwd-still-held"])
+    {"root": "/"},                          # still holds a root
+    {"threads": 2},                         # another thread may still hold files
+], ids=["other-wait-channel", "not-a-namespace-init", "init-only-at-an-outer-level",
+        "cwd-still-held", "root-still-held", "two-threads"])
 def test_a_near_miss_of_an_exiting_namespace_init_is_still_refused(
         tmp_path: Path, near_miss: dict[str, str]) -> None:
     proc_root = tmp_path / "proc"
@@ -1265,3 +1272,20 @@ def test_a_near_miss_of_an_exiting_namespace_init_is_still_refused(
                                               stderr_limit=1 << 20)
     with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991802"):
         cli._same_uid_process_observations(budget, proc_root)
+
+
+
+def test_a_link_that_is_unreadable_rather_than_released_is_still_refused(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only ENOENT means released; a permission error on cwd says nothing.
+    proc_root = tmp_path / "proc"
+    pid_dir = exiting_init_proc(proc_root)
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        if Path(path) == pid_dir / "cwd":
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "readlink", readlink)
+    assert not cli._process_is_exiting_namespace_init(pid_dir)

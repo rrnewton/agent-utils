@@ -46446,13 +46446,14 @@ def _process_is_exiting_namespace_init(pid_dir: Path) -> bool:
 
     The kernel's exit path (do_exit) releases a task's files, its
     filesystem context and its namespaces (exit_files, exit_fs,
-    exit_task_namespaces) before exit_notify looks for a child reaper; an
+    exit_task_namespaces, exit_nsproxy_namespaces in 7.x) before exit_notify
+    looks for a child reaper; an
     exiting namespace init then waits in zap_pid_ns_processes until every
     other process of its namespace is gone. Such a task can hold no
     checkout: it has no open files, no working directory or root, and no
     mount namespace, which is why its mount namespace reads as absent.
     Required, each from /proc: the wait channel is zap_pid_ns_processes;
-    the innermost NSpid is 1; and cwd, root and ns/mnt each read as ENOENT
+    the innermost NSpid is 1; Threads is 1; and cwd, root and ns/mnt each read as ENOENT
     (released), not as a permission error. Anything else is not exempt.
     """
     try:
@@ -46464,6 +46465,11 @@ def _process_is_exiting_namespace_init(pid_dir: Path) -> bool:
         return False
     nspid = [line.split()[1:] for line in status.split("\n") if line.startswith("NSpid:")]
     if not nspid or not nspid[0] or nspid[0][-1] != "1":
+        return False
+    # One thread: a multi-threaded init whose leader exits keeps running
+    # threads that may still hold files; only a lone exiting task is proven.
+    threads = [line.split()[1:] for line in status.split("\n") if line.startswith("Threads:")]
+    if not threads or threads[0] != ["1"]:
         return False
     for released in ("cwd", "root", "ns/mnt"):
         try:
