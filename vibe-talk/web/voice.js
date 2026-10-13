@@ -27593,17 +27593,18 @@ async function saveVoicePrompt(field, text) {
         ? "Saved. The voice agent gets these instructions from its next call."
         : "Saved. The voice agent has no additional instructions from its next call."
     );
-  } else if (!stored.system_prompt_edited) {
-    setStatus("Saved. The voice agent gets the shipped prompt from its next call.");
   } else {
-    // His copy reaches a hosted agent only if the agent lets this page replace its prompt.
+    // His copy — or after Restore, the shipped prompt — reaches a hosted agent only if the agent
+    // lets this page replace its prompt; one that does not keeps the prompt in its console.
+    const which = stored.system_prompt_edited ? "your prompt" : "the shipped prompt";
     const follows = agentPromptFollowsSwitch();
     setStatus(
       follows === "kept"
-        ? "Saved, but the last call's agent does not let this page replace its prompt, so your prompt will not reach it; your instructions still do."
+        ? `Saved, but the last call's agent does not let this page replace its prompt, so ${which} will not reach it; ` +
+            (stored.system_prompt_edited ? "your instructions still do." : "it keeps the one in its provider's console.")
         : follows === "unknown"
-          ? "Saved. The voice agent gets your prompt from its next call if its provider lets this page replace its prompt."
-          : "Saved. The voice agent gets your prompt from its next call."
+          ? `Saved. The voice agent gets ${which} from its next call if its provider lets this page replace its prompt.`
+          : `Saved. The voice agent gets ${which} from its next call.`
     );
   }
 }

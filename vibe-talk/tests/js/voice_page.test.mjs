@@ -49610,6 +49610,43 @@ test("`#272 voice-agent-instructions`: a call given the shipped prompt in place 
     /The last call was given the shipped prompt, in place of the prompt in its provider's console\.$/);
 });
 
+test("`#272 voice-agent-instructions`: after Restore, the status says whether the shipped prompt reaches the agent, as a saved copy's does", async () => {
+  // Restore is a save of the system prompt like any other. A hosted agent that keeps its console
+  // prompt does not get the shipped one from its next call any more than it got the owner's copy,
+  // and the status used to say it did.
+  const restoreAfter = async (agentPrompt) => {
+    const page = newPage();
+    page.voicePrompt = voicePromptView({ system_prompt: "mine", system_prompt_edited: true, edited_from_version: 9 });
+    if (agentPrompt !== null) {
+      await talkWithPrompt(page, agentPrompt);
+      await page.el("hang-up").click();
+      await page.settle();
+    } else {
+      await signIn(page);
+    }
+    await page.el("open-settings").click();
+    await page.el("restore-voice-system-prompt").click();
+    await page.el("restore-voice-system-prompt").click();
+    await page.settle();
+    assert.deepStrictEqual(page.voicePromptCalls, [{ system_prompt: "" }]);
+    return page.el("status").textContent;
+  };
+
+  const kept = await restoreAfter({
+    transport: "not_sent", system_prompt_applied: false, instructions_applied: false, override_allowed: false,
+  });
+  assert.equal(kept,
+    "Saved, but the last call's agent does not let this page replace its prompt, so the shipped prompt will not reach it; it keeps the one in its provider's console.",
+    "Restore claimed the shipped prompt reaches an agent that keeps its console prompt");
+
+  assert.equal(await restoreAfter(null),
+    "Saved. The voice agent gets the shipped prompt from its next call if its provider lets this page replace its prompt.",
+    "with no call yet, Restore spoke as if the prompt always follows");
+
+  assert.equal(await restoreAfter({ ...OVERRIDE, system_prompt_applied: true, instructions_applied: false }),
+    "Saved. The voice agent gets the shipped prompt from its next call.");
+});
+
 test("`#272 voice-agent-instructions`: Restore asks twice before it deletes the owner's copy, and a lapse disarms it", async () => {
   const page = await instructionsPage({ system_prompt: "mine, and long", system_prompt_edited: true, edited_from_version: 9 });
   const restore = page.el("restore-voice-system-prompt");
