@@ -665,12 +665,15 @@ steps:
   # client: a mock Google Chat bridge on loopback fails A at once; B waits behind A, saying so, and
   # the bridge never sees it; A goes again under the same nonce and lands, then B; across a real
   # reload a message still waits behind the one before it, and Retry on that one lands both, in
-  # order. It starts the release binary, so it hangs off the build; the server and the bridge are its
-  # own, on free loopback ports, and stopped with it. Measured on 2026-10-13: about 9.3s wall, most
-  # of it the page's own 3 s wait before A goes again and a 4 s watch that a reload sends nothing.
+  # order; Dismiss on a failing message lets the next go; a slow bridge is given one post at a time,
+  # in order; and a post whose caller hangs up mid-post still lands before the next one reaches the
+  # bridge. It starts the release binary, so it hangs off the build; the server and the bridge are
+  # its own, on free loopback ports, and stopped with it. Measured on 2026-10-13: about 14.3s wall,
+  # most of it the page's own 3 s wait before A goes again, a 4 s watch that a reload sends nothing,
+  # and the slow bridge's own 0.8 s per post and 2.5 s on the post whose caller hung up.
   - group: check
     job: send-order-browser
-    desc: messages to one destination land in the order written, through a bridge that fails the first and across a reload, in current Chromium against the real server
+    desc: messages to one destination land in the order written, through a bridge that fails the first, across a reload, past a Dismiss, on a slow bridge and after a caller hangs up, in current Chromium against the real server
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/send_order_browser.py
     jobs_flag: ""
@@ -679,7 +682,7 @@ steps:
     cpu_timeout: 60
     hint:
       resources: {browser: 1}
-      est_duration_s: 10
+      est_duration_s: 15
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
