@@ -48381,3 +48381,194 @@ test("`#262 search-load-older`: the step back holds still while the matches open
   assert.ok(rowWithId(page, all[22].id).descendants().some((node) => node.tagName === "mark" || node.tagName === "MARK"),
     "the match found further back is not marked");
 });
+
+/**
+ * `#262 search-load-older`. A channel with one long thread: its first message, then `replies` replies
+ * one hour apart, reply `i` (from 1, oldest first) saying `content(i)`. Main is the first message alone;
+ * All and the thread page back `size` messages at a time. Older reads are kept and held as by
+ * `searchHistory`.
+ */
+function threadHistory(page, { replies = 24, size = 4, content = (i) => `reply ${i}` } = {}) {
+  const newest = Date.UTC(2026, 7, 19, 12, 0, 0);
+  const id = "spaces/A/threads/long";
+  const root = message({ id: "8800000000000000000", content: "a long thread starts",
+    timestamp: new Date(newest - replies * 3600000).toISOString(),
+    thread: { id, root_message_id: "8800000000000000000", is_root: true, reply_count: replies, reply_count_exact: true } });
+  const all = [root];
+  for (let i = 1; i <= replies; i += 1) {
+    all.push(message({ id: String(8800000000000000000n + BigInt(i)), content: content(i),
+      timestamp: new Date(newest - (replies - i) * 3600000).toISOString(), thread: { ...root.thread, is_root: false } }));
+  }
+  page.threadingSupported = true;
+  page.messages = all;
+  page.threads = [{ id, root, title: "The long thread", reply_count: replies, reply_count_exact: true,
+    updated_at: all[all.length - 1].timestamp }];
+  page.pagesServed = [];
+  page.olderOptions = [];
+  page.olderHold = null;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const view = url.searchParams.get("view");
+    const before = url.searchParams.get("before");
+    page.pagesServed.push(String(path));
+    if (view === "threads") return json(200, timelineAnswer({ view, has_threads: true, threads: page.threads }));
+    if (view === "main") return json(200, timelineAnswer({ view, has_threads: true, messages: [root] }));
+    const rows = view === "thread" ? all : all;
+    if (before) {
+      page.olderOptions.push(options || {});
+      const hold = page.olderHold;
+      page.olderHold = null;
+      const signal = options && options.signal;
+      if (hold) {
+        await new Promise((resolve, reject) => {
+          hold.promise.then(resolve);
+          if (signal) signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+        });
+      }
+    }
+    const end = before ? rows.findIndex((m) => m.id === before) : rows.length;
+    const start = Math.max(0, end - size);
+    const messages = rows.slice(start, end);
+    return json(200, timelineAnswer({ view, has_threads: true, messages, has_more: start > 0,
+      next_before: start > 0 ? rows[start].id : null,
+      thread: view === "thread" ? page.threads[0] : null,
+      dismissed: messages.map((m) => String(m.id)).filter((held) => page.dealtWith.has(held)) }));
+  };
+  return all;
+}
+
+/** Two columns over `threadHistory`'s channel, the long thread selected on the right. */
+async function sideThreadPage(options = {}) {
+  const page = newPage();
+  const all = threadHistory(page, options);
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await twoColumns(page);
+  await cardOf(page, page.threads[0].id).click();
+  await page.settle();
+  assert.equal(page.el("side-pane").hidden, false, "the thread did not open on the right");
+  return { page, all };
+}
+
+test("`#262 search-load-older`: in two columns the right column's thread walks its own older replies, from its own control", async () => {
+  const { page, all } = await sideThreadPage({ content: (i) => (i === 3 ? "the engine reply" : `reply ${i}`) });
+  await search(page, "engine");
+  await page.settle();
+  // Main holds the first message alone, and says so.
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.match(page.el("search-empty").textContent, / Thread replies are not in Main\.$/);
+  assert.equal(page.el("search-in-all").hidden, true, "Search All was offered in two columns");
+  const chip = page.el("side-older");
+  assert.equal(chip.hidden, false);
+  assert.equal(chip.textContent, `Search replies before ${searchDay(page, all[21].timestamp)}`);
+  await chip.click();
+  await settleWalk(page);
+  assert.deepStrictEqual(matchedIds(page, "side-log"), [all[3].id], "the thread's walk did not find its older reply");
+  assert.match(page.el("side-search-older-note").textContent, /^Found 1 in \d pages \(\d+ messages\)/);
+  assert.equal(page.el("search-older-note").hidden, true, "the left column said what the right one found");
+  // Enter walks the column that holds the keys: the left, which has nothing older to search.
+  const reads = page.olderOptions.length;
+  await press(page, page.el("search-field"), "Enter");
+  await settleWalk(page);
+  assert.equal(page.olderOptions.length, reads, "Enter walked a column the keys are not in");
+});
+
+test("`#262 search-load-older`: closing the right column's thread, or leaving two columns, ends its walk where it is", async () => {
+  for (const end of ["close", "narrow"]) {
+    const { page } = await sideThreadPage();
+    await search(page, "engine");
+    await page.settle();
+    page.olderHold = searchHold();
+    const hold = page.olderHold;
+    void page.el("side-older").click();
+    await page.settle();
+    assert.equal(page.el("side-older").textContent, "Searching… 1 of 5 · Stop");
+    if (end === "close") await page.el("side-close").click();
+    else await page.setDesk(false);
+    await page.settle();
+    assert.equal(page.olderOptions[0].signal.aborted, true, `${end}: the read on the wire went on`);
+    hold.open();
+    await settleWalk(page);
+    assert.equal(page.olderOptions.length, 1, `${end}: the walk read on into a list nobody sees`);
+    assert.equal(page.el("side-search-older-note").hidden, true, `${end}: the ended walk wrote its note`);
+    assert.equal(page.el("error").hidden, true, `${end}: the ended walk was reported as a failure`);
+  }
+});
+
+test("`#262 search-load-older`: Hide read steps aside under the search, so a walk finds the read messages it reads", async () => {
+  const page = newPage();
+  const all = searchHistory(page, { threads: true, pages: 8, content: (i) => (i === 17 ? "engine log" : `message ${i}`) });
+  // Everything is read but the newest page.
+  page.dealtWith = new Set(all.slice(0, 28).map((m) => m.id));
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await chooseReadMode(page, "Hide read");
+  await search(page, "engine");
+  await page.settle();
+  assert.match(page.el("load-older").textContent, /^Search before /, "the walk was not offered under Hide read");
+  await page.el("load-older").click();
+  await settleWalk(page);
+  assert.deepStrictEqual(matchedIds(page), [all[17].id], "the walk under Hide read did not find a read match");
+  assert.equal(rowWithId(page, all[17].id).getAttribute("data-archived"), "true");
+  assert.equal(page.el("search-older-note").textContent, `Found 1 in 5 pages (20 messages), back to ${searchDay(page, all[8].timestamp)}.`);
+  // Closed, the search gives the list back to Hide read.
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), all.slice(28).map((m) => m.id), "Hide read did not come back");
+});
+
+test("`#262 search-load-older`: without threads, under Hide read, the walk is not offered and the sentence says how out", async () => {
+  const page = newPage();
+  searchHistory(page, { pages: 4 });
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await turnTodoOn(page);
+  await search(page, "engine");
+  await page.settle();
+  assert.doesNotMatch(page.el("load-older").textContent, /^Search/, "a walk was offered over Hide read's own list");
+  await press(page, page.el("search-field"), "Enter");
+  assert.equal(searchReads(page).length, 0, "Enter walked back over Hide read's own list");
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.match(page.el("search-empty").textContent, / Hide read is on — press h for Show read to search older messages\.$/);
+});
+
+test("`#262 search-load-older`: a change to the search ends the walk; so do a walk in the other column and a jump", async () => {
+  const { page } = await searchPage({ pages: 10 });
+  page.enableAbort();
+  await search(page, "engine");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  void page.el("load-older").click();
+  await page.settle();
+  await page.el("search-field").setValue("engine room");
+  await page.settle();
+  assert.equal(page.olderOptions[0].signal.aborted, true, "typing left the walk's read on the wire");
+  hold.open();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 1, "the walk read on under a search that had changed");
+  assert.match(page.el("load-older").textContent, /^Search before /);
+  assert.equal(page.el("search-older-note").hidden, true);
+});
+
+test("`#262 search-load-older`: a tap while the scroll's step back is on the wire starts the walk, with that step as its first page", async () => {
+  const { page } = await searchPage({ pages: 10 });
+  await search(page, "engine");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  // The reader scrolls to the head of the list: a plain step goes out.
+  page.el("scroll-area").scrollTop = 0;
+  await page.el("scroll-area").dispatch("scroll");
+  await page.settle();
+  const reads = searchReads(page).length;
+  assert.ok(reads >= 1, "scrolling to the head took no step back");
+  assert.equal(page.el("load-older").disabled, false, "the step back was greyed out under the scroll's step");
+  void page.el("load-older").click();
+  await page.settle();
+  assert.equal(page.el("load-older").textContent, "Searching… 1 of 5 · Stop");
+  hold.open();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, reads - 1 + SEARCH_OLDER_PAGES, "the scroll's step was not the walk's first page");
+});
