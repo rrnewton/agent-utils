@@ -27731,10 +27731,17 @@ test("live replies refresh only the active thread instead of leaking across cont
   const before = page.timelineCalls.length;
   await deliver(page, page.stream(), sseMessage(arriving));
   await page.settle();
-  assert.ok(page.timelineCalls.length > before);
-  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), page.threads[0].id);
+  // `#278 page-live-reads`. Its thread record says it is in the other thread, so the thread on screen
+  // is not read for it: nothing there changed. What it did change — its root's count on All and Main,
+  // its thread, the list of threads — the event did not say in full, and is read when next shown.
+  assert.deepStrictEqual(page.timelineCalls.slice(before), [], "the thread on screen was read for a reply in another");
   assert.doesNotMatch(page.el("discord-log").text(), /other discussion only/);
   assert.equal(page.el("thread-heading").hidden, false);
+  await page.el("thread-back").click();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, before), ["flat"], "going back to All did not read it behind its rows");
+  assert.ok(shownIds(page).includes("205"), "All does not show the reply");
 });
 
 test("a slow mode response cannot replace the view chosen after it", async () => {
@@ -30858,17 +30865,24 @@ test("switching Main, Threads, All and a read thread in one page is local, and e
   await page.settle();
 
   // A reply arrives on the stream while Main — where replies do not show — is on screen. The page
-  // re-reads the view on screen for the server's counts, as it always has; nothing else.
+  // re-reads the view on screen for the server's counts, as it always has; nothing else now.
   const first = data.threads[0];
   const reads = channelReads(page).length;
-  page.stream().push(sseMessage(message({ id: "205", content: "a live reply", thread: { ...data.messages[2].thread } })));
+  const reply = message({ id: "205", content: "a live reply", thread: { ...data.messages[2].thread } });
+  // The server has it too, and counts it, as the one that published it does.
+  page.messages.push(reply);
+  page.threads = page.threads.map((t) => (t.id === first.id ? { ...t, reply_count: t.reply_count + 1, updated_at: reply.timestamp } : t));
+  page.stream().push(sseMessage(reply));
   await page.settle();
   await page.settle();
-  assert.deepStrictEqual(channelReads(page).slice(reads).map((r) => new URL(r.slice(4), "http://x").searchParams.get("view")),
-    ["main"], "a live arrival re-read more than the view on screen");
+  const viewsOf = (from) => channelReads(page).slice(from).map((r) => new URL(r.slice(4), "http://x").searchParams.get("view"));
+  assert.deepStrictEqual(viewsOf(reads), ["main"], "a live arrival re-read more than the view on screen");
   const before = channelReads(page).length;
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a reply was drawn in Main");
 
+  // Each view is drawn at once from the store, live reply and all. `#278 page-live-reads`: and read
+  // behind its rows, once, since the event did not say all it changed (its count) and the poll behind
+  // a pushed stream would not come round to it for fifteen minutes.
   await page.el("channel-view-flat").click();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204", "205"], "All missed the live reply");
   await page.el("channel-view-threads").click();
@@ -30879,7 +30893,17 @@ test("switching Main, Threads, All and a read thread in one page is local, and e
   await page.el("thread-back").click();
   await page.el("channel-view-main").click();
   await page.settle();
-  assert.equal(channelReads(page).length, before, "switching among read views went to the network");
+  assert.deepStrictEqual(viewsOf(before), ["flat", "threads", "thread"],
+    "the views a live reply changed were not each read once behind their rows");
+  // Every one of them read since: switching among them again is the local change it always was.
+  const after = channelReads(page).length;
+  await page.el("channel-view-flat").click();
+  await page.el("channel-view-threads").click();
+  await page.el("thread-list").children.at(-1).children[0].click();
+  await page.el("thread-back").click();
+  await page.el("channel-view-main").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, after, "switching among read views went to the network");
 });
 
 test("a view no page has covered is read, once", async () => {
@@ -51445,46 +51469,9 @@ test("`#278 page-live-reads`: a placed live message that lands while a full read
   assert.equal(reads, 0, "a placed live message was read for");
   // THE CONTROL: no live message put back over that read.
   const control = await run(brokenScript(
-    "    if ((before || !arrival.live) && !channelCanon.messages.some((held) => String(held.id) === id)) {",
-    "    if (false) {"));
+    "    if (!channelCanon.messages.some((held) => String(held.id) === id)) foldLiveMessage(arrival.message, arrival.live, false);",
+    ""));
   assert.ok(control.drawn && !control.kept, "the control kept the live message anyway, so this test cannot see it lost");
-});
-
-test("`#278 page-live-reads`: an edit and a placed message are kept over a read sent after them that the service answered from before them", async () => {
-  // A service may answer a read from a copy it cut a few seconds before; behind a pushed stream the
-  // next read may be fifteen minutes away.
-  const run = async (script) => {
-    const { page, server } = await pushedPage({ complete: false }, script);
-    server.edit("200", { content: "edited live" });
-    await deliver(page, page.stream(), sseUpdate("edit-200", page.messages.find((m) => m.id === "200")));
-    await page.settle();
-    const arriving = server.post(message({ id: "497", content: "placed live" }));
-    await deliver(page, page.stream(), sseMessage(arriving, { thread_facts: placedFacts(arriving) }));
-    await page.settle();
-    const drawn = Boolean(rowShowing(page, "edited live")) && shownIds(page).includes("497");
-    // The service's copy from before both: the old words, and no 497.
-    const stale = page.messages.find((m) => m.id === "200");
-    stale.content = "main channel announcement";
-    page.messages = page.messages.filter((m) => m.id !== "497");
-    page.setClock(page.clock() + 2000);
-    const reads = server.reads.length;
-    // A stream reset, which reads the newest page in full: the server restarted, say.
-    await deliver(page, page.stream(), `event: reset\ndata: ${JSON.stringify({ missed: 1 })}\n\n`);
-    await page.settle();
-    await page.settle();
-    return {
-      drawn, reads: server.reads.slice(reads),
-      kept: Boolean(rowShowing(page, "edited live")) && shownIds(page).includes("497"),
-    };
-  };
-  const { drawn, reads, kept } = await run(SCRIPT);
-  assert.ok(drawn, "the edit and the message were not drawn at once");
-  assert.deepStrictEqual(reads, [{ view: "main", after: null, before: null }], "the reset did not read the newest page in full");
-  assert.ok(kept, "a read answered from before the edit and the message put the old words back or took the message off");
-  // THE CONTROL: patches and arrivals applied only over reads sent before them.
-  const control = await run(brokenScript("  const cutBefore = (epoch) => typeof sent === \"number\" && epoch > sent;",
-    "  const cutBefore = (epoch) => typeof sent === \"number\" && epoch > sent;\n  if (typeof sent === \"number\" && [...livePatches.values(), ...liveArrivals.values()].every((one) => one.epoch <= sent)) return;"));
-  assert.ok(control.drawn && !control.kept, "the control kept both anyway, so this test cannot see either lost");
 });
 
 test("`#278 page-live-reads`: a read of the view that lands ends a give-up's hold, so the poll reads it inside the server's bound", async () => {
@@ -51665,4 +51652,249 @@ test("`#278 page-live-reads`: a pushed stream that says nothing for forty second
   // THE CONTROL: the server polling its provider, whose poll is forty-five seconds anyway, is not watched.
   const { page: polled } = await forwardPage();
   assert.equal(polled.expireTimers(LIVE_QUIET_MS), 0, "a stream with no push behind it was watched");
+});
+
+// --- `#278 page-live-reads`, second review: a read sent after a live event is believed, and what an
+// event leaves unsaid is read in every view it may have changed
+//
+// The first review's fix put live events back over reads sent AFTER them for fifty seconds, which
+// overrode answers the server had right; and the fifteen-minute poll left views the stream could not
+// keep current — the thread on the right, a view gone back to, a root's count after a removal the
+// store could not apply, a thread's card after its root changed — stale where the page before #278
+// read them within forty-five seconds. Each test below fails on b3d8081c's page.
+
+/** Walk `ms` with the server's keep-alive every fifteen seconds, as a healthy stream sends it. */
+async function healthyWalk(page, ms) {
+  for (let t = 0; t < ms; t += 15000) {
+    await passTime(page, Math.min(15000, ms - t));
+    await deliver(page, page.stream(), ": keep-alive\n\n");
+    await page.settle();
+  }
+}
+
+/** A stream reset, which reads the newest page in full: the server restarted, say. */
+const sseReset = (missed = 1) => `event: reset\ndata: ${JSON.stringify({ missed })}\n\n`;
+
+test("`#278 page-live-reads`: a placed message removed while the stream could not say so is believed gone when the reset's read lacks it", async () => {
+  const { page, server } = await pushedPage();
+  const arriving = server.post(message({ id: "498", content: "placed then removed" }));
+  await deliver(page, page.stream(), sseMessage(arriving, { thread_facts: placedFacts(arriving) }));
+  await page.settle();
+  assert.ok(shownIds(page).includes("498"), "the placed message was not drawn, so this proves nothing");
+  // Removed upstream while the server could not tell the stream: it says it missed one.
+  server.remove("498");
+  page.setClock(page.clock() + 10000);
+  await deliver(page, page.stream(), sseReset());
+  await page.settle();
+  await page.settle();
+  assert.ok(!shownIds(page).includes("498"),
+    "the reset's read showed the message was gone, and the page put it back until the fifteen-minute reconcile");
+});
+
+test("`#278 page-live-reads`: a pull sent after a placed message that the service has since removed is believed", async () => {
+  const { page, server } = await pushedPage();
+  const arriving = server.post(message({ id: "499", content: "placed then removed while away" }));
+  await deliver(page, page.stream(), sseMessage(arriving, { thread_facts: placedFacts(arriving) }));
+  await page.settle();
+  assert.ok(shownIds(page).includes("499"), "the placed message was not drawn, so this proves nothing");
+  server.remove("499");
+  page.setClock(page.clock() + 15000);
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  await page.settle();
+  assert.ok(!shownIds(page).includes("499"), "the reader's own pull lacked the message and the page put it back");
+});
+
+test("`#278 page-live-reads`: a second edit the stream missed in a gap is not undone by the first after the reset's read", async () => {
+  const { page, server } = await pushedPage();
+  server.edit("200", { content: "first edit" });
+  await deliver(page, page.stream(), sseUpdate("edit-1", { ...page.messages.find((m) => m.id === "200") }));
+  await page.settle();
+  assert.ok(rowShowing(page, "first edit"), "the first edit was not drawn, so this proves nothing");
+  // The second edit's event the server lost: the stream says it missed one.
+  server.edit("200", { content: "second edit" });
+  page.setClock(page.clock() + 10000);
+  await deliver(page, page.stream(), sseReset());
+  await page.settle();
+  await page.settle();
+  await healthyWalk(page, 60000);
+  assert.ok(rowShowing(page, "second edit"), "the reset's read brought the second edit, and the page put the first edit's words back");
+});
+
+test("`#278 page-live-reads`: an edit's copy does not undo the count a read sent after it gave", async () => {
+  const { page, server } = await pushedPage();
+  const root = page.messages.find((m) => m.id === "201");
+  // The new `placed` contract asks adapters to send the thread record, so an edit's copy carries it.
+  server.edit("201", { content: "root edited" });
+  await deliver(page, page.stream(), sseUpdate("edit-201", JSON.parse(JSON.stringify(root))));
+  await page.settle();
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)", "the edit's copy does not count one reply, so this proves nothing");
+  root.thread.reply_count = 3;
+  server.edit("201", {});
+  page.setClock(page.clock() + 2000);
+  await deliver(page, page.stream(), sseReset(2));
+  await page.settle();
+  await page.settle();
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(3)",
+    "a read sent after the edit had its count overridden by the edit's older thread record");
+});
+
+test("`#278 page-live-reads`: an edit of a thread's root changes its card's words at once, in two columns", async () => {
+  const { page, server, data } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  const [first] = data.threads;
+  const text = () => cardPart(page, first.id, "side-card-text");
+  assert.match(String(text()), /first thread root/, `the card does not show the root's words, so this proves nothing: ${text()}`);
+  server.edit("201", { content: "root edited live" });
+  await deliver(page, page.stream(), sseUpdate("edit-201", bareOf(page.messages.find((m) => m.id === "201"))));
+  await page.settle();
+  assert.ok(rowShowing(page, "root edited live"), "Main did not draw the root's edit");
+  assert.match(String(text()), /root edited live/, `the card still shows the root's old words: ${text()}`);
+  // A provider may name the thread from its root's first line, as Slack does: the list is read for it.
+  page.threads = page.threads.map((t) => (t.id === first.id
+    ? { ...t, title: "root edited live", root: page.messages.find((m) => m.id === "201") } : t));
+  const listReads = page.timelineCalls.filter((path) => path.includes("view=threads")).length;
+  await healthyWalk(page, 120000);
+  assert.ok(page.timelineCalls.filter((path) => path.includes("view=threads")).length > listReads,
+    "a title the provider may take from the root's first line was never read again");
+  assert.match(String(text()), /root edited live/, `a read of the list put the root's old words back: ${text()}`);
+});
+
+test("`#278 page-live-reads`: a removal of a thread's root takes its words off the card, in two columns", async () => {
+  const { page, server, data } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  const [first] = data.threads;
+  const text = () => cardPart(page, first.id, "side-card-text");
+  assert.match(String(text()), /first thread root/, `the card does not show the root's words, so this proves nothing: ${text()}`);
+  server.remove("201");
+  page.threads = page.threads.map((t) => (t.id === first.id ? { ...t, root: null } : t));
+  await deliver(page, page.stream(), sseDelete("remove-201", CHANNEL.id, "201"));
+  await page.settle();
+  assert.ok(!shownIds(page).includes("201"), "Main still shows the removed root");
+  assert.doesNotMatch(String(text()), /first thread root/, `the card still shows the removed root's words: ${text()}`);
+  const listReads = page.timelineCalls.filter((path) => path.includes("view=threads")).length;
+  await healthyWalk(page, 120000);
+  assert.ok(page.timelineCalls.filter((path) => path.includes("view=threads")).length > listReads,
+    "whether the thread outlives its root is the provider's to say, and the list was never read for it");
+  assert.doesNotMatch(String(text()), /first thread root/, `the card shows the removed root's words again: ${text()}`);
+});
+
+test("`#278 page-live-reads`: replies the bridge's stream does not place, into the thread open on the right, are each shown within ten seconds", async () => {
+  const { page, server, data } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the first thread is not open on the right");
+  const root = data.messages[1];
+  const missing = [];
+  for (let n = 0; n < 3; n += 1) {
+    const reply = server.post(message({ id: `${520 + n}`, content: `bridge reply ${n}`, thread: { ...root.thread, is_root: false } }));
+    root.thread.reply_count += 1;
+    server.edit("201", {});
+    // The bridge's shape today: no thread record, and no facts.
+    await deliver(page, page.stream(), sseMessage(bareOf(reply)));
+    await page.settle();
+    await healthyWalk(page, LIVE_FACT_READ_MS);
+    if (!sideIds(page).includes(reply.id)) missing.push(reply.id);
+  }
+  assert.deepStrictEqual(missing, [], `replies in the thread on the right were not shown: ${missing} (right column ${sideIds(page)})`);
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(4)", "Main's root did not count them");
+});
+
+test("`#278 page-live-reads`: a reply the stream does not place, into a thread not on screen, is counted on Main when the reader goes back to it", async () => {
+  const { page, server } = await pushedPage();
+  await pickThread(page, `thread:${page.threads[1].id}`);
+  await page.settle();
+  const root = page.messages.find((m) => m.id === "201");
+  const reply = server.post(message({ id: "550", content: "bridge reply in the first", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  await deliver(page, page.stream(), sseMessage(bareOf(reply)));
+  await page.settle();
+  // Long enough for every read the arrival owed the view on screen to have gone and landed.
+  await healthyWalk(page, 60000);
+  const calls = page.timelineCalls.length;
+  await pickThread(page, "main");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, calls), ["main"], "going back to Main did not read it behind its rows");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)",
+    `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} on coming back`);
+  // THE CONTROL: no live event in between, and going back is the local change it always was.
+  const { page: quiet } = await pushedPage();
+  await pickThread(quiet, `thread:${quiet.threads[1].id}`);
+  await quiet.settle();
+  await healthyWalk(quiet, 60000);
+  const before = quiet.timelineCalls.length;
+  await pickThread(quiet, "main");
+  await quiet.settle();
+  await quiet.settle();
+  assert.deepStrictEqual(readViewsSince(quiet, before), [], "going back to Main read it with nothing owed");
+});
+
+test("`#278 page-live-reads`: in Main, removing a reply the page does not hold lowers its root's count with the read every removal had", async () => {
+  const { page, server } = await pushedPage();
+  const root = page.messages.find((m) => m.id === "201");
+  // Two more replies, read, so the root says Thread(3); Main holds none of them.
+  root.thread.reply_count = 3;
+  server.edit("201", {});
+  page.setClock(page.clock() + 1000);
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  await page.settle();
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(3)", "the root does not say 3, so this proves nothing");
+  assert.ok(!page.pure(`channelCanon.messages.some((m) => String(m.id) === "202")`), "Main holds the reply, so this proves nothing");
+  server.remove("202");
+  root.thread.reply_count = 2;
+  server.edit("201", {});
+  const calls = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseDelete("remove-202", CHANNEL.id, "202"));
+  await page.settle();
+  await page.settle();
+  assert.ok(page.timelineCalls.length - calls >= 1, "a removal the store could not apply was not read for");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)",
+    `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} after a reply was removed`);
+});
+
+test("`#278 page-live-reads`: refitting the poll to a stream that stayed attached never puts off a reconcile already due", async () => {
+  const { page } = await pushedPage();
+  const due = page.pure("discordPollDueAt");
+  await healthyWalk(page, 600000);
+  // A failed read of the list of threads, in one column: the picker touched.
+  const healthy = page.timeline;
+  page.timeline = (path, options) => (path.includes("view=threads") ? errorResponse(502, "chat_error", "boom")(path) : healthy(path, options));
+  await page.el("thread-select").dispatch("focus");
+  await page.settle();
+  await page.settle();
+  assert.ok(page.pure("discordPollDueAt") <= due,
+    `the reconcile due in ${(due - page.clock()) / 1000} s was put off to ${(page.pure("discordPollDueAt") - page.clock()) / 1000} s`);
+});
+
+test("`#278 page-live-reads`: a reply the stream does not place moves its thread's card to the foot within a minute, in two columns", async () => {
+  const { page, server, data } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  const [first, second] = data.threads;
+  assert.deepStrictEqual(cardIds(page), [first.id, second.id], "the cards are not oldest activity first");
+  const root = data.messages[1];
+  const reply = server.post(message({ id: "540", content: "bridge reply in the first", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  page.threads = page.threads.map((t) => (t.id === first.id ? { ...t, reply_count: t.reply_count + 1, updated_at: reply.timestamp } : t));
+  server.threadChanged.set(first.id, ++server.revision);
+  // No record, so nothing here can say which card it moves: the list of threads is read for it, once
+  // its minute between reads allows.
+  await deliver(page, page.stream(), sseMessage(bareOf(reply)));
+  await page.settle();
+  await healthyWalk(page, 60000);
+  assert.deepStrictEqual(cardIds(page), [second.id, first.id], "the card of the thread the reply moved did not go to the foot");
 });

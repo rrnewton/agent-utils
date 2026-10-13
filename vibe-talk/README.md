@@ -3041,23 +3041,40 @@ updated". During a call the stream stays open and the agent hears what arrives, 
 attached** (`#278 page-live-reads`, remote-ops audit W6 and W7). Behind a bridge one read of a
 channel can cost the adapter a scan of the whole space, and the page used to send one for every
 live message and two for every edit or removal. Now, on a channel with threads, an edit or removal
-is applied from its event and drawn from the store, in both columns, with no read; an edit that
-lands while a read sent before it is out is applied again over that read's answer, and so is one a
-read sent after it answers from a copy the service cut before it. A live message whose event carries
-`thread_facts` — its producer placed it — is placed by them, and its thread's root and card take
-the count and latest activity they give, with no read, unless a read has since seen later activity
-in that thread, whose count stands. A read sent before such a message arrived, which does not carry
-it, does not take it off the screen: it is put back over that read's answer, for the server's
-fifty-second bound. One without facts, or whose facts leave a reply's count unsaid, or name a
-thread the store's list of threads lacks, is read for at most once every ten seconds, whatever
-arrives meanwhile; on the voice pane it is not read at all, entering the channel reads it.
+is applied from its event and drawn from the store, in both columns, with no read; an edit of a
+thread's first message goes into its thread's summary too, which its card, its name and the heading
+are drawn from. A live message whose event carries `thread_facts` — its producer placed it — is
+placed by them, and its thread's root and card take the count and latest activity they give, with
+no read, unless a read has since seen later activity in that thread, whose count stands.
+
+A read sent *before* a live event, which may answer from before it, does not undo it: the edit, the
+removal or the placed message is put back over that read's answer, for the server's fifty-second
+bound. A read sent *after* it is the service's answer since, and is believed as it stands — the
+stream reset's read, the reader's pull, entering a view, the poll: a message it lacks is gone, an
+edit it carries is the latest, a count it gives is the count.
+
+Some events leave something only a read can say, and then every view they may have changed is
+read: a column showing one now, at most once every ten seconds whatever arrives meanwhile; any other
+view when it is next shown, behind the rows drawn from the store. They are a live message without
+facts, or whose facts leave a reply's count unsaid, or name a thread the store's list of threads
+lacks — without a thread record, as the bridge's stream sends every message today, it may be in any
+thread, the one open on the right included, so Main, the right column and every other view are owed
+a read; a removal of a message the store does not hold, usually a reply behind Main, whose root's
+count only a read corrects, and which gets the read every removal had before; and an edit or
+removal of a thread's first message, after which only a read of the list of threads, or of the
+thread, says what the provider titles it (Slack titles a thread by its root's first line) or
+whether it outlives its root. On the voice pane a live message is not read for at all; entering the
+channel reads it.
 
 While an adapter's pushed stream is attached the poll waits fifteen minutes instead of forty-five
 seconds, since the stream carries every creation, edit and removal. It goes back to forty-five
 seconds when the stream drops; when the last read of either column failed, whether or not any rows
-were on screen; and when the stream says nothing for forty seconds, not even the keep-alive the
-server sends every fifteen, which lets the stream go as a drop does. The stream coming back polls
-at once. Attached is not proof that the adapter behind the server is alive: its own feed can stop
+were on screen; while a column shows a view a live event left something unsaid of and no read has
+answered yet (the list of threads, for one, is read at most once a minute); and when the stream
+says nothing for forty seconds, not even the keep-alive the server sends every fifteen, which lets
+the stream go as a drop does. The stream coming back polls at once. Going back to fifteen minutes
+counts from when that wait began, so a column falling behind and catching up never puts the
+reconcile off. Attached is not proof that the adapter behind the server is alive: its own feed can stop
 while the server's keep-alives go on, and nothing here checks it. **The tradeoff:** the stream does
 not carry reactions, what is read or Done, the reading bookmark, or the pins revision, which only a
 read brings; behind a pushed stream a change of those made on another device takes up to fifteen

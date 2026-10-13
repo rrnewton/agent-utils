@@ -13246,6 +13246,10 @@ function emptyCanon(channel = "") {
   return {
     channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false,
     scope: null, unplaced: new Set(),
+    // `#278 page-live-reads`. The live event after which every view is owed a read (`markLiveOwed`),
+    // by `liveEventEpoch`, or 0; and by view key, the one after which that view is. In memory only,
+    // as that count is.
+    owedAll: 0, owedViews: new Map(),
     // `#203 incremental-refresh`. Whether this channel's forward reads carry edits and deletions:
     // null until one has landed. The backend's property rather than a view's, so it outlives a
     // view's cover being reset by an explicit refresh.
@@ -13355,6 +13359,9 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
     // rows would usually have expired by the time a cold start could use it.
     newest: prior ? prior.newest || null : null,
     fullAt: prior ? prior.fullAt || 0 : 0,
+    // `#278 page-live-reads`. The live events this view's reads have answered (`liveOwes`). An older
+    // page answers nothing new, so it only carries it.
+    seen: prior ? prior.seen || 0 : 0,
   });
 }
 
@@ -13386,6 +13393,7 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
     cover.fullAt = Date.now();
     const asOf = staleAsOf(payload);
     if (asOf !== null) cover.at = asOf;
+    noteViewAnswered(cover, payload);
   }
   // A page is the server's own answer for every message on it, thread record or none.
   for (const message of payload.messages || []) channelCanon.unplaced.delete(String(message.id));
@@ -13541,13 +13549,15 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     unchangedDeltas.add(payload);
   }
   const asOf = staleAsOf(payload);
-  channelCanon.views.set(key, {
+  const next = {
     ...cover,
     notice: payload.notice || "",
     at: asOf === null ? Date.now() : asOf,
     live: true,
     newest: payload.next_after || null,
-  });
+  };
+  channelCanon.views.set(key, next);
+  noteViewAnswered(next, payload);
   channelCanon.complete = delta.complete === true;
   // `#278 page-live-reads`. Never the words from before an edit the stream has already delivered.
   reapplyLivePatches(payload);
@@ -15114,8 +15124,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
     // ...but a view drawn from held rows whose read never landed still owes that read — queued
     // behind a read of another view still on the wire; one of this view lands here by itself.
     // ...and so does a thread whose root reports replies the held rows lack (`#222 unread-replies`).
-    if (outrun || (sameStore && view !== "threads" && !channelCanon.views.has(viewKey()) &&
-        timelineReadContext !== channelContextKey())) {
+    // ...and a view the live stream left something unsaid of since its last read, which the poll
+    // behind a pushed stream would not come round to for fifteen minutes (`liveOwes`, `#278`).
+    if (outrun || ((sameStore && view !== "threads" && !channelCanon.views.has(viewKey())) || liveOwes()) &&
+        timelineReadContext !== channelContextKey()) {
       await readBehindSwitch();
     }
     return;
@@ -15136,7 +15148,9 @@ async function changeChannelView(view, threadId = null, summary = null) {
     // reading the oldest of them: arriving there asks for what is above, as scrolling there does.
     if (walkCursorOwed()) maybeLoadOlder();
     // A thread whose saved cover lacks replies its root reports is read behind it. `#222 unread-replies`.
-    if (outrun) await readBehindSwitch();
+    // So is a view the live stream left something unsaid of since it was read (`liveOwes`, `#278`),
+    // unless the step back just asked for is reading it already.
+    if (outrun || (liveOwes() && timelineReadContext !== channelContextKey())) await readBehindSwitch();
     return;
   }
   // Covered by nothing, but the store holds some of it: up at once, and read behind it.
@@ -15202,6 +15216,8 @@ function inheritAllCover(view, threadId = null, summary = null) {
     own.live = true;
     own.at = all.at;
     own.fromAll = true;
+    // `#278 page-live-reads`. ...and as answered for what the stream left unsaid (`liveOwes`).
+    own.seen = Math.max(own.seen || 0, all.seen || 0);
   } else if (view === "thread" && !own && allReachesThread(threadId, summary) && !storeLacksReplies(threadId, summary)) {
     channelCanon.views.set(key, { ...all, cursor: null, newest: null, fullAt: 0 });
   } else {
@@ -15867,14 +15883,18 @@ async function refreshThreadDirectory() {
     Date.now() - (cover.fullAt || 0) < TIMELINE_RECONCILE_MS ? cover.newest : null;
   try {
     let payload;
+    // `#278 page-live-reads`. Which live events came after it was sent: those it cannot answer.
+    let live = liveEventEpoch;
     try {
       payload = await apiDecoded("TimelineResponse", sent ? `${base}&after=${encodeURIComponent(sent)}` : base);
     } catch (error) {
       if (!sent || !isCursorRefusal(error)) throw error;
       if (cover.newest === sent) cover.newest = null;
       sent = null;
+      live = liveEventEpoch;
       payload = await apiDecoded("TimelineResponse", base);
     }
+    liveSentEpochs.set(payload, live);
     if (String(el("discord-channel").value) !== channel) return;
     if (sent && payload.delta) {
       if (!foldTimelineDelta(payload, sent, "threads", null)) return;
@@ -15886,6 +15906,8 @@ async function refreshThreadDirectory() {
     renderThreadHeading();
     // Its summaries carry counts Main's roots are kept and counted by (`#222 unread-replies`).
     syncUnreadReplies();
+    // `#278 page-live-reads`. A list owed a read that has it now lets the poll wait again.
+    fitPollToStream();
   } catch (error) {
     // The selector keeps offering what the store already knew; the next touch may ask again — in
     // two columns the next poll, the right column's line saying meanwhile that the cards are as
@@ -15995,8 +16017,11 @@ async function loadThreadDirectory(older) {
   let path = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
   if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
   let payload;
+  // `#278 page-live-reads`. Which live events came after it was sent: those it cannot answer.
+  const live = liveEventEpoch;
   try {
     payload = await apiDecoded("TimelineResponse", path);
+    liveSentEpochs.set(payload, live);
   } catch (error) {
     if (generation !== threadDirectory.generation) return;
     Object.assign(threadDirectory, {
@@ -30719,40 +30744,54 @@ const columnsBehind = new Set();
 
 /**
  * Whether a column on screen is not current: its last read failed (`columnsBehind`), or, for the
- * right column showing the list of threads, its last read of that list did.
+ * right column showing the list of threads, its last read of that list did; or the live stream left
+ * something unsaid of the view it shows that no read has answered yet (`liveOwes`) — the read it is
+ * owed may have been put off, refused by the thread list's own pace, or failed.
  */
 function readsBehind() {
-  if (columnsBehind.has(columns.main)) return true;
+  if (columnsBehind.has(columns.main) || inColumn(columns.main, () => liveOwes())) return true;
   if (!columnsShown) return false;
-  if (columns.side.mode === "thread") return columnsBehind.has(columns.side);
-  return threadListFailures.has(String(el("discord-channel").value));
+  if (columns.side.mode === "thread") return columnsBehind.has(columns.side) || inColumn(columns.side, () => liveOwes());
+  return threadListFailures.has(String(el("discord-channel").value)) || liveOwes(viewKey("threads"));
 }
 
 /**
  * The read the column being worked on made of its view landed current (`true`), or did not: a
- * column that is not current is polled for at forty-five seconds, even behind a pushed stream.
+ * column that is not current is polled for at forty-five seconds, even behind a pushed stream; one
+ * that is current again lets the poll go back to waiting as long as it waited before (`fitPollToStream`).
  *
  * @param {boolean} current
  */
 function noteColumnRead(current) {
-  if (current) {
-    columnsBehind.delete(activeColumn);
-    return;
-  }
-  columnsBehind.add(activeColumn);
+  if (current) columnsBehind.delete(activeColumn);
+  else columnsBehind.add(activeColumn);
   fitPollToStream();
 }
 
+/** When the wait of the poll armed now began, by the clock: what `fitPollToStream` measures from. */
+let discordPollArmedAt = 0;
+
 /**
- * The stream attached or went away: an armed poll waits as long as `pollInterval` now says, never
- * longer than it said before going away. Nothing while no poll is armed — a hidden page, another
- * view — which arms its own when it comes back.
+ * The stream attached or went away, or a column fell behind or caught up: an armed poll waits as
+ * long as `pollInterval` now says. Nothing while no poll is armed — a hidden page, another view —
+ * which arms its own when it comes back.
+ *
+ * MEASURED FROM WHEN THE WAIT BEGAN, NOT FROM NOW. Stretched to the reconcile, the poll is due that
+ * long after it was armed: a fit made ten minutes into a wait of fifteen leaves it five minutes off,
+ * where it used to start the fifteen again, so that a column falling behind and catching up, over
+ * and over, could put the reconcile off for good. Shortened, it is due no later than the forty-five
+ * seconds from now, as before.
  */
 function fitPollToStream() {
   if (discordPollTimer === null) return;
+  const now = Date.now();
   const interval = pollInterval();
-  if (interval > DISCORD_POLL_MS) scheduleDiscordPoll(interval);
-  else if (discordPollDueAt - Date.now() > interval) scheduleDiscordPoll(interval);
+  if (interval > DISCORD_POLL_MS) {
+    const due = Math.min(discordPollArmedAt + TIMELINE_RECONCILE_MS, now + interval);
+    if (due !== discordPollDueAt) scheduleDiscordPoll(Math.max(0, due - now), discordPollArmedAt);
+  } else if (discordPollDueAt - now > interval) {
+    scheduleDiscordPoll(interval, discordPollArmedAt);
+  }
 }
 
 /**
@@ -30929,9 +30968,11 @@ function stopDiscordPolling() {
  * is never sharing its network with a background refresh nobody is looking at — and, `#226
  * page-energy-profile`, while the page is hidden: a poll armed or come due then waits for the
  * page to be shown (`resumePolling`). `delay` is the rest of a wait a glance away interrupted.
+ * `armedAt` is when the wait began, for the rest of one: `fitPollToStream` measures from it.
  */
-function scheduleDiscordPoll(delay = pollInterval()) {
+function scheduleDiscordPoll(delay = pollInterval(), armedAt = Date.now()) {
   stopDiscordPolling();
+  discordPollArmedAt = armedAt;
   discordPollDueAt = Date.now() + delay;
   if (document.hidden) {
     discordPollPaused = true;
@@ -31054,7 +31095,8 @@ function resumePolling(how) {
   discordPollPaused = false;
   if (currentView !== "discord") return;
   if (how === "now") pollDiscord();
-  else scheduleDiscordPoll(how === "fresh" ? pollInterval() : Math.max(0, discordPollDueAt - Date.now()));
+  else if (how === "fresh") scheduleDiscordPoll(pollInterval());
+  else scheduleDiscordPoll(Math.max(0, discordPollDueAt - Date.now()), discordPollArmedAt);
 }
 
 /**
@@ -31928,6 +31970,111 @@ function refreshAfterLiveMutation() {
 // store, as a read would have. A read is still sent for what an event leaves unsaid — a message the
 // stream did not place, a count it did not give, the card of a thread the store has never listed —
 // and then at most once in `LIVE_FACT_READ_MS`, whatever arrived meanwhile.
+//
+// NOT ONLY THE VIEWS ON SCREEN. What an event leaves unsaid can change a view nobody is looking at:
+// a reply the bridge did not place may be in any thread, and its root's count is on Main. Before
+// this, the poll read whichever view the reader went to within forty-five seconds; behind a pushed
+// stream it waits fifteen minutes, and going back to a view this page holds draws it from the store
+// with no read (`#220 view-switch-instant`). So every view such an event may have changed is owed a
+// read (`markLiveOwed`): a column showing one is read for it (`readOwedColumns`), and polled at forty-
+// five seconds until that read lands (`readsBehind`); any other is read behind its rows when it is
+// next shown (`changeChannelView`). A read answers for it only if it was sent after the event.
+
+/**
+ * Whether the live stream left something unsaid of view `key` — the current view by default — that
+ * no read of the view sent since has answered (`markLiveOwed`, `noteViewAnswered`). `#278
+ * page-live-reads`. Never for a view no page has covered: that one is read when it is shown anyway.
+ */
+function liveOwes(key = viewKey()) {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return false;
+  const cover = channelCanon.views.get(key);
+  return Boolean(cover) && Math.max(channelCanon.owedViews.get(key) || 0, channelCanon.owedAll) > (cover.seen || 0);
+}
+
+/**
+ * The live event just taken in (`liveEventEpoch`) left something unsaid that only a read can say, in
+ * the views of the selected channel `keys` names, or in all of them: each is owed a read sent after
+ * it, and those on screen are read for it now — unless `read` is false, for a caller that sends
+ * those reads itself. Kept by view rather than on its cover, so that a view whose first page is on
+ * the wire now, sent before the event, or whose cover a refresh starts afresh, is owed too.
+ *
+ * @param {string[] | null} [keys]
+ * @param {boolean} [read]
+ */
+function markLiveOwed(keys = null, read = true) {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  if (keys === null) channelCanon.owedAll = liveEventEpoch;
+  else for (const key of keys) channelCanon.owedViews.set(key, liveEventEpoch);
+  if (read) readOwedColumns(keys);
+  fitPollToStream();
+}
+
+/**
+ * A read of a view landed and was folded into its cover: what the stream left unsaid before that
+ * read was sent is answered. A read with no send count recorded (`liveSentEpochs`) answers nothing.
+ *
+ * @param {any} cover
+ * @param {object} payload
+ */
+function noteViewAnswered(cover, payload) {
+  const sent = liveSentEpochs.get(payload);
+  if (typeof sent === "number" && sent > (cover.seen || 0)) cover.seen = sent;
+}
+
+/**
+ * A live message left something only a read can say (`liveFactsMissing`): owe a read to every view
+ * it may have changed. `message` is the store's copy.
+ *
+ * WITH NO THREAD RECORD — the bridge's stream today — IT MAY BE ANYWHERE: in the thread open on the
+ * right, which a read of Main never brings, since Main's page carries no replies; or in a thread
+ * neither column shows, whose root's count is on Main. So every view is owed. With one, a reply of
+ * thread T changes Main and All (T's root), the list of threads (T's card) and T. `#229
+ * desktop-two-column`: a reply in the thread open on the right is read as that thread, which brings
+ * its root's count with it, so Main is not read for it too.
+ *
+ * @param {VibeTalk.Message} message
+ */
+function markOwedByArrival(message) {
+  const thread = threadOf(message);
+  if (thread === null) {
+    markLiveOwed();
+    return;
+  }
+  markLiveOwed([...(inSideThread(message) ? [] : ["main"]), "flat", "threads", viewKey("thread", thread)]);
+}
+
+/**
+ * Read each column on screen whose view is owed a read (`liveOwes`) — the right column's list of
+ * threads as that list — at most once in `LIVE_FACT_READ_MS` (`oweLiveFactRead`). Nothing while the
+ * page is hidden: coming back reads what is on screen, and every other view is read when shown.
+ *
+ * AND A VIEW NO PAGE HAS COVERED YET among `keys` (all of them, when null): its first read may be on
+ * the wire now, sent before the event, and it is read again behind that one, as every view on screen
+ * was before `#278 page-live-reads`.
+ *
+ * @param {string[] | null} [keys]
+ */
+function readOwedColumns(keys = null) {
+  if (currentView !== "discord") return;
+  if (inColumn(columns.main, () => columnOwed(viewKey(), keys))) oweLiveFactRead(columns.main);
+  if (!columnsShown) return;
+  if (sideShowing() ? inColumn(columns.side, () => columnOwed(viewKey(), keys)) : liveOwes(viewKey("threads"))) {
+    oweLiveFactRead(columns.side);
+  }
+}
+
+/**
+ * Whether the column being worked on, showing view `key`, is owed a read for a live event: its view
+ * is (`liveOwes`), or no page has covered it and it is among `keys` (all, when null).
+ *
+ * @param {string} key
+ * @param {string[] | null} [keys]
+ */
+function columnOwed(key, keys = null) {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return false;
+  if (channelCanon.views.has(key)) return liveOwes(key);
+  return keys === null || keys.includes(key);
+}
 
 /** The least time between two reads for what live messages left unsaid: ten seconds. */
 const LIVE_FACT_READ_MS = 10000;
@@ -32103,29 +32250,65 @@ function sendLiveFactRead() {
   }
   liveFactReadAt = Date.now();
   for (const column of owed) {
-    // A thread on the right closed since it was owed is read when it is next shown.
-    if (column === columns.side && !sideShowing()) continue;
+    // The right column's list of threads is read as that list (`readOwedThreadList`).
+    if (column === columns.side && !sideShowing()) {
+      readOwedThreadList();
+      continue;
+    }
+    // A view another read has answered since this one was owed — the poll, or a view left and come
+    // back to — is not read again; one shown since that is still owed is read now, and so is one no
+    // page has covered yet (`columnOwed`).
+    if (inColumn(column, () => channelCanon.views.has(viewKey()) && !liveOwes())) continue;
     refreshQuietly(() => inColumn(column, () => loadDiscord({ keepPosition: true, reason: "live" })))();
   }
+}
+
+/** The timer `readOwedThreadList` armed, or null. */
+let liveListReadTimer = null;
+
+/**
+ * Read the list of threads the right column shows, when a live event left it owed a read
+ * (`liveOwes`): now, or once its own pace allows (`THREAD_DIRECTORY_REFRESH_MS`, a minute between two
+ * reads of it). Meanwhile the poll comes at forty-five seconds for it (`readsBehind`), as it came
+ * for every view before `#278 page-live-reads`.
+ */
+function readOwedThreadList() {
+  if (!columnsShown || sideShowing() || document.hidden || !liveOwes(viewKey("threads"))) return;
+  const wait = (threadDirectoryReadAt.get(String(el("discord-channel").value)) || 0) + THREAD_DIRECTORY_REFRESH_MS - Date.now();
+  if (wait <= 0) {
+    guardQuietly(refreshThreadDirectory)();
+    return;
+  }
+  if (liveListReadTimer !== null) return;
+  liveListReadTimer = setTimeout(() => {
+    liveListReadTimer = null;
+    readOwedThreadList();
+  }, wait);
 }
 
 /** The stream stopped: what it owed belongs to a channel the next stream's entry reads anyway. */
 function forgetLiveFactRead() {
   if (liveFactReadTimer !== null) clearTimeout(liveFactReadTimer);
   liveFactReadTimer = null;
+  if (liveListReadTimer !== null) clearTimeout(liveListReadTimer);
+  liveListReadTimer = null;
   liveFactReadColumns.clear();
 }
 
 /**
- * The edits and removals the stream delivered while a read was on the wire, by message id: the
- * edited message, or null for a removal, with the count of live events when it came and the clock.
- * A read sent before one may carry the copy from before it, and folding that would put the old
- * words back, or the removed row; so each is applied again over every read folded until no such
- * read can still land: `SERVER_READ_BOUND_MS` after it (`reapplyLivePatches`). Over a read sent
- * after it too: a service may answer from a copy it cut a few seconds earlier, and any later change
- * comes as a patch of its own.
+ * The edits and removals the stream delivered, by message id: the edited message, or null for a
+ * removal, with its channel, the count of live events when it came, and the clock. A read sent
+ * before one may carry the copy from before it, and folding that would put the old words back, or
+ * the removed row; so each is applied again over every read sent before it that lands until no such
+ * read can still land: `SERVER_READ_BOUND_MS` after it (`reapplyLivePatches`).
  *
- * @type {Map<string, {message: VibeTalk.Message | null, epoch: number, at: number}>}
+ * NEVER OVER A READ SENT AFTER IT. That read is the service's answer since the event, and what it
+ * says stands, as it did before `#278 page-live-reads`: the words of a second edit whose event a gap
+ * lost, a removal the stream could not say, a count. The stream reset's read and the reader's own
+ * pull are such reads, and putting the event back over them kept a removed message on screen until
+ * the fifteen-minute reconcile.
+ *
+ * @type {Map<string, {message: VibeTalk.Message | null, channel: string, epoch: number, at: number}>}
  */
 const livePatches = new Map();
 /**
@@ -32134,10 +32317,9 @@ const livePatches = new Map();
  * the channel. A newest page read before one arrived does not carry it, and folding that page took
  * it out of the store as deleted upstream (`mergeIntoCanon`) with no read left to bring it back —
  * the read that used to follow every live message. So it is put back over such a page, counted on
- * its thread again and given its facts again, which that page's counts predate. A placed one is put
- * back over any page that lacks it, as an edit is; an unplaced one only over a page sent before it,
- * since a page sent after that lacks it is how the page learns it is not in that view. A removal
- * from the stream forgets it. `#278 page-live-reads`.
+ * its thread again and given its facts again, which that page's counts predate. Only over a page
+ * sent before it, as an edit is: a page sent after it that lacks it is how the page learns it is not
+ * in that view, or is gone. A removal from the stream forgets it. `#278 page-live-reads`.
  *
  * @type {Map<string, {message: VibeTalk.Message, live: boolean, facts: VibeTalk.LiveThreadFacts | null, channel: string, epoch: number, at: number}>}
  */
@@ -32180,14 +32362,24 @@ function noteLiveArrival(message, live, facts) {
 
 /**
  * An edit (`message_update`) or removal (`message_delete`) from the stream, as it happened: into the
- * store, and drawn from there. Answers false for an event this cannot read, which then gets the
- * authoritative re-read a malformed event always got.
+ * store, and drawn from there. Answers false for an event this cannot read, or one that needs the
+ * read every edit and removal had before `#278 page-live-reads` (`refreshAfterLiveMutation`).
  *
  * NOT A GUESS AT WHAT CHANGED. An edit carries the whole message as it now stands and a removal its
  * id, so the store's copy is replaced or dropped outright. A copy with no thread record keeps the
- * held one, as every live copy does (`foldLiveMessage`). A message the store does not hold is left
- * to the read that next covers it, which brings it as it then is. A removed reply is one fewer on
- * its thread's counts.
+ * held one, as every live copy does (`foldLiveMessage`). A removed reply is one fewer on its
+ * thread's counts.
+ *
+ * A THREAD'S FIRST MESSAGE IS ALSO ITS SUMMARY'S `root`, which its card, its name and the heading
+ * over it are drawn from: an edit goes into that copy too, and a removal takes it out. What the
+ * provider makes of it besides — a title taken from the root's first line, as Slack's is; whether
+ * the thread outlives its root — only a read of the list of threads, or of the thread, says, so
+ * those two views are owed one (`markLiveOwed`).
+ *
+ * A MESSAGE THE STORE DOES NOT HOLD. An edit of one changes nothing on screen beyond a summary's
+ * root, and the read that next covers it brings it as it then is. A removal of one may: on Main,
+ * which holds no replies, it is usually a reply, and its root's count is on screen; the event does
+ * not say which thread it was in. So it gets the read it always got, and every other view is owed.
  *
  * @param {string} event
  * @param {any} payload
@@ -32207,20 +32399,54 @@ function applyLiveMutation(event, payload) {
   if (channelCanon.channel !== channel) loadCanon(channel);
   liveEventEpoch += 1;
   pruneLivePatches();
-  livePatches.set(id, { message: edited, epoch: liveEventEpoch, at: Date.now() });
+  livePatches.set(id, { message: edited, channel, epoch: liveEventEpoch, at: Date.now() });
   if (edited === null) liveArrivals.delete(id);
   const held = channelCanon.messages.find((message) => String(message.id) === id);
-  if (!held) return true;
+  // The threads it is the first message of: by the store's copy, and by any summary's root.
+  const rooted = new Set(patchSummaryRoots(id, edited));
+  if (held && held.thread && held.thread.is_root === true) rooted.add(String(held.thread.id));
+  if (!held && edited === null) {
+    markLiveOwed(null, false);
+    return false;
+  }
+  if (rooted.size > 0) markLiveOwed(["threads", ...[...rooted].map((thread) => viewKey("thread", thread))]);
   const positions = document.hidden ? null : liveDrawPositions();
-  if (edited) foldLiveMessage(edited, true, false);
-  else removeHeldMessage(held);
+  if (held && edited) foldLiveMessage(edited, true, false);
+  else if (held) removeHeldMessage(held);
   if (positions === null) {
-    liveArrivedHidden = true;
-    liveChangedHidden = true;
+    if (held || rooted.size > 0) {
+      liveArrivedHidden = true;
+      liveChangedHidden = true;
+    }
     return true;
   }
-  drawLiveChange(positions);
+  if (held || rooted.size > 0) drawLiveChange(positions);
   return true;
+}
+
+/**
+ * Put an edit of message `id`, or its removal (`edited` null), into every thread summary whose
+ * first message (`root`) it is. Answers the ids of those threads. The summary's thread record and
+ * reactions on its copy stand where the edit's copy lacks them, as the store's do (`foldLiveMessage`).
+ *
+ * @param {string} id
+ * @param {VibeTalk.Message | null} edited
+ * @returns {string[]}
+ */
+function patchSummaryRoots(id, edited) {
+  const threads = [];
+  for (const summary of [...channelCanon.threads]) {
+    if (!summary.root || String(summary.root.id) !== id) continue;
+    threads.push(String(summary.id));
+    const record = summary.root.thread || edited.thread;
+    const root = edited === null ? null : {
+      ...summary.root, ...edited,
+      ...(record ? { thread: record } : {}),
+      ...(Array.isArray(edited.reactions) || !Array.isArray(summary.root.reactions) ? {} : { reactions: summary.root.reactions }),
+    };
+    if (JSON.stringify(root) !== JSON.stringify(summary.root)) upsertThreadSummary({ ...summary, root });
+  }
+  return threads;
 }
 
 /** Whether an edit or removal changed the store while the page was hidden: coming back draws it. */
@@ -32244,10 +32470,16 @@ function removeHeldMessage(held) {
 }
 
 /**
- * Put back what the stream delivered, over what `payload`'s read just put in the store: every live
- * message that read took out (`liveArrivals`), and every live edit and removal (`livePatches`).
- * Called when any page of a view is folded. Those past `SERVER_READ_BOUND_MS` are dropped: every
- * read sent before them has landed or been given up.
+ * Put back what the stream delivered after `payload`'s read was sent, over what that read just put
+ * in the store, its answer having been cut before it: every live message the read took out
+ * (`liveArrivals`), and every live edit and removal (`livePatches`), in the rows and in the thread
+ * summaries' roots. Called when any page of a view is folded. Nothing over a read sent after them,
+ * nor over one whose sending was not counted; and those past `SERVER_READ_BOUND_MS` are dropped:
+ * every read sent before them has landed or been given up.
+ *
+ * WHAT THE READ OWNS STANDS. An edit puts back its words; the thread record and the reactions are
+ * the read's where it has them. A count the read gave is not lowered by an event it predates
+ * (`applyThreadFacts`).
  *
  * @param {object} payload
  */
@@ -32255,28 +32487,26 @@ function reapplyLivePatches(payload) {
   pruneLivePatches();
   if (livePatches.size === 0 && liveArrivals.size === 0) return;
   const sent = liveSentEpochs.get(payload);
-  /** Whether the read was sent before live event `epoch`, so that its answer was cut before it. */
-  const cutBefore = (epoch) => typeof sent === "number" && epoch > sent;
+  if (typeof sent !== "number") return;
   for (const [id, arrival] of liveArrivals) {
-    if (arrival.channel !== channelCanon.channel) continue;
-    const before = cutBefore(arrival.epoch);
-    if ((before || !arrival.live) && !channelCanon.messages.some((held) => String(held.id) === id)) {
-      // One more on its thread's counts only over a read whose counts were cut before it.
-      foldLiveMessage(arrival.message, arrival.live, !before);
-    }
-    if (before && arrival.facts) applyThreadFacts(arrival.facts);
+    if (arrival.channel !== channelCanon.channel || arrival.epoch <= sent) continue;
+    // One more on its thread's counts, which the read's were cut before.
+    if (!channelCanon.messages.some((held) => String(held.id) === id)) foldLiveMessage(arrival.message, arrival.live, false);
+    if (arrival.facts) applyThreadFacts(arrival.facts);
   }
   for (const [id, patch] of livePatches) {
+    if (patch.channel !== channelCanon.channel || patch.epoch <= sent) continue;
+    patchSummaryRoots(id, patch.message);
     const held = channelCanon.messages.find((message) => String(message.id) === id);
     if (!held) continue;
     if (patch.message === null) {
       removeHeldMessage(held);
       continue;
     }
-    // The read's thread record and reactions, which an edit's copy may lack; the edit's words.
+    const record = held.thread || patch.message.thread;
     const kept = {
       ...held, ...patch.message,
-      thread: patch.message.thread || held.thread,
+      ...(record ? { thread: record } : {}),
       ...(Array.isArray(patch.message.reactions) || !Array.isArray(held.reactions) ? {} : { reactions: held.reactions }),
     };
     if (sameMessage(held, kept)) continue;
@@ -32341,7 +32571,10 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = nul
         if (!replayed) noteLiveArrival(kept, !facts, facts);
         if (facts && !replayed && applyThreadFacts(facts)) liveChangedHidden = true;
         liveArrivedHidden = true;
-        if (owed) liveReadOwedHidden = true;
+        if (owed) {
+          liveReadOwedHidden = true;
+          markOwedByArrival(kept);
+        }
         followReplyStore();
       }
       renderOutgoingEverywhere();
@@ -32375,13 +32608,11 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = nul
     renderOutgoingEverywhere();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. When the event did not carry
-    // them, read the active context instead of dropping a reply from another thread into the visible
-    // conversation — at most once in `LIVE_FACT_READ_MS` (`oweLiveFactRead`).
-    // `#229 desktop-two-column`: a reply in the thread on the right is read as that thread, which
-    // brings its root's count with it; anything else as Main. One read, never one per column.
+    // them, read what it may have changed instead of dropping a reply from another thread into the
+    // visible conversation — at most once in `LIVE_FACT_READ_MS` (`oweLiveFactRead`), and every view
+    // not on screen when it is next shown (`markOwedByArrival`).
     if (owed) {
-      const column = inSideThread(heldMessage(String(message.id)) || placed) ? columns.side : columns.main;
-      oweLiveFactRead(column);
+      markOwedByArrival(heldMessage(String(message.id)) || placed);
     } else if (replayed && !held) {
       awaitReplayRead(String(message.id), String(message.channel_id),
         fromTail ? liveAttachReads : timelineReadsStarted);
