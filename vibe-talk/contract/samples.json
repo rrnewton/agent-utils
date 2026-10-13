@@ -645,12 +645,14 @@
   ],
   "PendingPostResponse": [
     {
+      "instance": "cnVuLW9uZQ",
       "now_ms": 1700000000000,
       "proposal": {
         "channel_id": "111",
         "channel_name": "lead team",
         "expires_in_ms": 120000,
         "handle": "AAAAAAAAAAAAAAAAAAAAAA",
+        "instance": "cnVuLW9uZQ",
         "prefix": "(Voice-agent relayed, from user) ",
         "reply_to": "300",
         "reply_to_author": "Alex",
@@ -662,12 +664,14 @@
       "sends_through": 0
     },
     {
+      "instance": "cnVuLW9uZQ",
       "now_ms": 1700000000000,
       "proposal": {
         "channel_id": "111",
         "channel_name": "lead team",
         "expires_in_ms": 1,
         "handle": "BBBBBBBBBBBBBBBBBBBBBB",
+        "instance": "cnVuLW9uZQ",
         "reply_to": null,
         "serial": 4,
         "text": "on my way"
@@ -681,6 +685,7 @@
       ]
     },
     {
+      "instance": "cnVuLXR3bw",
       "now_ms": 1700000000000,
       "proposal": null,
       "sends": [
@@ -702,6 +707,7 @@
             "text_truncated": false,
             "unsent_chars": 0
           },
+          "instance": "cnVuLXR3bw",
           "text": "on my way"
         },
         {
@@ -728,6 +734,7 @@
             "uncertain_part": 2,
             "unsent_chars": 1900
           },
+          "instance": "cnVuLXR3bw",
           "text": "the first part"
         },
         {
@@ -747,6 +754,7 @@
             "text_truncated": false,
             "unsent_chars": 0
           },
+          "instance": "cnVuLXR3bw",
           "text": "rebase onto main"
         }
       ],
@@ -773,6 +781,17 @@
           "serial": 5
         }
       ]
+    },
+    {
+      "proposal": {
+        "channel_id": "111",
+        "channel_name": "lead team",
+        "expires_in_ms": 5000,
+        "handle": "CCCCCCCCCCCCCCCCCCCCCC",
+        "reply_to": null,
+        "serial": 2,
+        "text": "on my way"
+      }
     }
   ],
   "PinChangeResponse": [

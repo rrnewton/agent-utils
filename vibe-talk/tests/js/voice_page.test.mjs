@@ -1849,6 +1849,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     sendMemory: [],
     /** The newest `send_seq` handed out. */
     sendsThrough: 0,
+    /**
+     * Which run of the fake server this is, as every proposal, send and long-poll answer names it.
+     * A test restarts the server by emptying its memory and giving it another; `null` names none,
+     * as an older server does.
+     */
+    serverInstance: "cnVuLW9uZQ",
     /** The server's clock as the long poll reports it; `null` is the fixture's own clock. */
     serverNowMs: null,
     /** Set to a status to make every claim of a send fail with it. */
@@ -1896,8 +1902,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       const after = url.searchParams.get("sent_after");
       // `sends_through` and `now_ms` ride on every answer, as the server's do; the sends past
       // `sent_after` only when it is asked for (`#270 voice-transcript-markers`).
+      const instance = page.serverInstance || undefined;
       const answer = () => json(200, {
-        proposal: page.proposal,
+        proposal: page.proposal && instance ? { ...page.proposal, instance } : page.proposal,
+        instance,
         sends: after === null
           ? undefined
           : page.sendMemory.filter((send) => page.resendAll || send.detail.send_seq > Number(after)),
@@ -3409,6 +3417,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         sent_at_ms: now,
         ...overrides,
       },
+      instance: page.serverInstance || undefined,
     };
     page.sendMemory.push(send);
     for (const wake of page.proposalWaiters.splice(0)) wake();
@@ -34281,6 +34290,39 @@ test("`#270 voice-transcript-markers`: a send from the send memory is drawn once
   assert.equal(sentCards(page).length, 1, "another page's send was drawn here");
 });
 
+/**
+ * The fake server restarts: its memory is empty, its proposals number from one again, its sends
+ * number from its clock, above anything the last run handed out, and it is another run.
+ */
+function restartServer(page, instance = "cnVuLXR3bw") {
+  page.sendMemory = [];
+  page.sendsThrough = 1_700_000_000_000;
+  page.serverInstance = instance;
+}
+
+/**
+ * Hang up, then call again into the vendor conversation `conversationId`, on the same page;
+ * `between` runs after the hang-up has settled and before the next call starts.
+ */
+async function callAgain(page, conversationId, between = () => {}) {
+  await page.el("hang-up").click();
+  await watchTurns(page);
+  between();
+  await page.el("talk").click();
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({
+    type: "conversation_initiation_metadata",
+    conversation_initiation_metadata_event: { conversation_id: conversationId, agent_output_audio_format: "pcm_16000" },
+  }) });
+  await watchTurns(page);
+  return socket;
+}
+
+/** Each row of the transcript, as a card, a seam ending a conversation, or its class. */
+const rowShapes = (page) => page.el("transcript").children.map((li) => (li.hasClass("sent-card") ? "CARD" : li.className) +
+  (li.getAttribute("data-ends") ? `[ends ${li.getAttribute("data-ends")}]` : ""));
+
 test("`#270 voice-transcript-markers`: after the server restarts, a send that reuses a drawn serial is still drawn", async () => {
   const page = newPage();
   await recordingCall(page);
@@ -34288,14 +34330,137 @@ test("`#270 voice-transcript-markers`: after the server restarts, a send that re
   page.publishSend(proposal({ serial: 3, handle: "bEfOrE", text: "before the restart" }), "direct");
   await watchTurns(page);
   assert.equal(sentCards(page).length, 1);
-  // The server restarts: its memory is empty, its proposals number from one again, and its sends
-  // number from its clock, above anything the last process handed out.
-  page.sendMemory = [];
-  page.sendsThrough = 1_700_000_000_000;
+  restartServer(page);
   page.publishSend(proposal({ serial: 3, handle: "aFtEr", text: "after the restart" }), "direct");
   await watchTurns(page, 6);
   assert.equal(sentCards(page).length, 2, "a new send was taken for one already drawn because its serial came round again");
   assert.match(wordsOf(sentCards(page)[1]), /after the restart/);
+});
+
+test("`#270 voice-transcript-markers`: a tapped send after a restart is drawn and filed in the call it was tapped in, not the one its serial was first used in", async () => {
+  // Proposal serials start again at one in every run of the server, and the page stays open across
+  // a restart. Keyed by serial alone, the next run's serial 3 was taken for the card already drawn:
+  // the commit's own answer drew nothing, and the send memory then placed it above the end of the
+  // FIRST call and filed it there.
+  for (const firstFate of ["sent", "withdrawn"]) {
+    const page = newPage();
+    await recordingCall(page, "conv_one");
+    await watchTurns(page);
+    page.propose(proposal({ serial: 3, handle: "bEfOrE-0123456789abcd", reply_to: null, text: "before the restart" }));
+    await page.settle();
+    page.expireTimers(2000);
+    await page.el(firstFate === "sent" ? "post-confirm-send" : "post-confirm-cancel").click();
+    await watchTurns(page);
+    assert.equal(sentCards(page).length, firstFate === "sent" ? 1 : 0);
+
+    restartServer(page);
+    await callAgain(page, "conv_two");
+    page.propose(proposal({ serial: 3, handle: "aFtEr-0123456789abcde", reply_to: null, text: "after the restart" }));
+    await watchTurns(page);
+    page.expireTimers(2000);
+    await page.el("post-confirm-send").click();
+    await watchTurns(page, 8);
+
+    const cards = sentCards(page);
+    assert.equal(cards.length, firstFate === "sent" ? 2 : 1, `${firstFate}: ${rowShapes(page).join(" | ")}`);
+    assert.match(wordsOf(cards.at(-1)), /after the restart/);
+    assert.equal(page.el("transcript").children.at(-1), cards.at(-1),
+      `${firstFate}: the new send is not the newest row of the call it was tapped in: ${rowShapes(page).join(" | ")}`);
+    assert.equal(page.claims.at(-1).id, "conv_two", `${firstFate}: the new send was filed in the earlier conversation`);
+    assert.equal(page.claims.filter((claim) => claim.id === "conv_two").length, 1);
+  }
+});
+
+test("`#270 voice-transcript-markers`: two reads whose answers cross never take the cursor back, so nothing is drawn twice", async () => {
+  const page = newPage();
+  page.sendsThrough = 10;
+  await recordingCall(page);
+  await watchTurns(page);
+  page.publishSend(proposal({ serial: 21, handle: "dIrEcT", text: "rebase onto main" }), "direct");
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1);
+  // An answer from earlier arrives late, from the same run: its count is behind every cursor this
+  // page has sent.
+  const late = 6;
+  const serving = page.postProposals;
+  let crossed = false;
+  page.postProposals = async (path, options) => {
+    const answer = await serving(path, options);
+    if (crossed || !path.includes("wait=")) return answer;
+    crossed = true;
+    const body = JSON.parse(await answer.text());
+    return json(200, { ...body, sends: [], sends_through: late });
+  };
+  page.propose(proposal({ serial: 40, handle: "wAkE" }));
+  await watchTurns(page);
+  page.propose(null);
+  await watchTurns(page, 8);
+  assert.ok(crossed, "the fixture never crossed an answer");
+  const reads = proposalWatches(page);
+  assert.ok(!reads.some((read) => read.includes(`sent_after=${late}`)), `the cursor went back: ${reads.join(", ")}`);
+  assert.equal(sentCards(page).length, 1, "a send was drawn twice after the cursor went back");
+  assert.equal(page.claims.length, 1);
+});
+
+test("`#270 voice-transcript-markers`: a send the long poll brings before the commit's own answer is drawn once", async () => {
+  // The server wakes the long poll the moment a send settles, before the commit's answer leaves.
+  const page = newPage();
+  await recordingCall(page);
+  page.propose(proposal({ reply_to: null }));
+  await page.settle();
+  page.expireTimers(2000);
+  const answering = page.commitProposal;
+  let release = null;
+  page.commitProposal = async (body) => {
+    const answer = await answering(body);
+    await new Promise((resolve) => { release = resolve; });
+    return answer;
+  };
+  const tapped = page.el("post-confirm-send").click();
+  await watchTurns(page, 6);
+  assert.ok(release, "the commit never reached the fixture");
+  assert.equal(sentCards(page).length, 1, "the send memory did not draw the send while its answer was on its way");
+  release();
+  await tapped;
+  await watchTurns(page, 6);
+  assert.equal(sentCards(page).length, 1, "the commit's answer drew the same send again");
+  assert.equal(page.claims.length, 1);
+});
+
+test("`#270 voice-transcript-markers`: a send that began after a call ended, and before the next began, is not that call's", async () => {
+  const page = newPage();
+  page.serverNowMs = 1_700_000_000_000;
+  await recordingCall(page, "conv_one");
+  await watchTurns(page);
+  // The first call ends at 10 s on the server's clock, and the next begins at 60 s.
+  page.serverNowMs = 1_700_000_010_000;
+  await callAgain(page, "conv_two", () => { page.serverNowMs = 1_700_000_060_000; });
+  // Another tab's direct send, begun in the gap between the two calls.
+  page.publishSend(proposal({ serial: 23, handle: "gAp", text: "from another tab" }), "direct",
+    { begun_at_ms: 1_700_000_030_000 });
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 0, `a send from between the calls was drawn: ${rowShapes(page).join(" | ")}`);
+  assert.deepEqual(page.claims, []);
+});
+
+test("`#270 voice-transcript-markers`: a draft shown before the voice service named the conversation is filed in it", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  const socket = await startTalking(page);
+  await page.settle();
+  page.propose(proposal({ reply_to: null }));
+  await page.settle();
+  socket.onmessage({ data: JSON.stringify({
+    type: "conversation_initiation_metadata",
+    conversation_initiation_metadata_event: { conversation_id: "conv_named_late", agent_output_audio_format: "pcm_16000" },
+  }) });
+  await page.settle();
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1);
+  assert.deepEqual(page.claims.map((claim) => claim.id), ["conv_named_late"]);
+  assert.ok(!wordsOf(sentCards(page)[0]).includes("Not kept"), "the card says it was not kept");
 });
 
 test("`#270 voice-transcript-markers`: a commit whose answer was lost is drawn when the send memory says it went", async () => {
