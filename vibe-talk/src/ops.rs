@@ -1676,6 +1676,11 @@ pub async fn reply_scoped(
     }
 
     let keys = idempotency_key.map(|key| part_keys(key, &parts));
+    // `#277 send-order`. This destination's turn, after every post to it that arrived first, held
+    // from the first part to the last: a retry cannot overtake the attempt it repeats while that is
+    // still on its way to a slow provider, and nothing lands between the parts of a long post. See
+    // `crate::post_lanes`.
+    let _turn = state.post_lanes.turn(info.id.as_str(), thread_id).await;
     let mut posted: Vec<Message> = Vec::new();
     // Where the parts after the first go, for a post to the conversation itself: the thread under
     // the first part, where the provider continues a long message there. Learned from the first
