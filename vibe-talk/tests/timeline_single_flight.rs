@@ -745,3 +745,50 @@ async fn a_window_read_that_a_running_fetch_cannot_answer_does_not_wait_for_it()
         h.chat.calls()
     );
 }
+
+fn contents(body: &Value) -> Vec<String> {
+    body["messages"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timeline_answer_replayed_from_the_memo_does_not_put_back_an_older_copy() {
+    // Review of #278: a newest timeline answer replayed from the few seconds' memory was
+    // remembered again with its original start, over the newer copy a later window read had put in
+    // read-ahead memory. Speech preparation and summaries then served the text from before an edit
+    // nobody pushed.
+    let h = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let held_reply = || {
+        let held = h
+            .state
+            .read_ahead
+            .recall(&channel, None, &["11".to_owned()]);
+        held["11"].content.clone()
+    };
+    let poll = timeline("view=main&reason=poll");
+    assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
+    // Edited upstream, and not pushed.
+    h.upstream.messages.lock().unwrap()[1].content = "reply, edited".to_owned();
+    let window = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
+    let (status, body) = get(&h.app, &window, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(contents(&body).contains(&"reply, edited".to_owned()));
+    assert_eq!(held_reply(), "reply, edited", "fixture");
+    // Inside the memo: answered from the kept read, which began before the edit.
+    assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
+    assert_eq!(
+        h.chat.count("fetch_timeline"),
+        1,
+        "fixture: the poll was not answered from the memo"
+    );
+    assert_eq!(
+        held_reply(),
+        "reply, edited",
+        "a memo replay put an older copy back over a newer one in read-ahead memory"
+    );
+}

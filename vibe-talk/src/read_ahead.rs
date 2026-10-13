@@ -277,7 +277,8 @@ impl ReadAhead {
     ///
     /// `fetch_began` must be taken BEFORE the fetch is sent. A message forgotten after that
     /// instant, or everything if the memory was cleared after it, is not kept: the fetch may have
-    /// read it before the change that forgot it. And the message expires [`RECENT_TTL`] after it,
+    /// read it before the change that forgot it. Nor is a message already held from a fetch that
+    /// began after it: that copy is the newer. And the message expires [`RECENT_TTL`] after it,
     /// not after this call, because that is the oldest the text can be.
     pub fn remember(
         &self,
@@ -315,6 +316,17 @@ impl ReadAhead {
                 .forgotten
                 .get(&key)
                 .is_some_and(|forgotten| *forgotten >= fetch_began)
+            {
+                continue;
+            }
+            // A copy read by a fetch that began LATER is newer text than this one: a fetch that
+            // lands after a later one, or a timeline answer replayed from the few seconds' memory
+            // with its original start (`crate::timeline_flight`), must not put older text back over
+            // it. `#278 timeline-single-flight`.
+            if held
+                .recent
+                .get(&key)
+                .is_some_and(|kept| kept.fetched > fetch_began)
             {
                 continue;
             }
@@ -874,6 +886,47 @@ mod tests {
                 .recall_at(&channel, None, &ids(&["10"]), landed)
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_began_earlier_cannot_put_an_older_copy_back_over_a_newer_one() {
+        // Review of #278: a timeline answer replayed from the few seconds' memory is remembered
+        // again with its original start, after a later window fetch has stored an edit nobody
+        // pushed. The replay put the pre-edit text back, for speech and summaries to serve.
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let early = Instant::now();
+        let late = early + Duration::from_secs(1);
+        let edited = Message {
+            content: "text of 10, edited".to_owned(),
+            ..message("10", None)
+        };
+        read_ahead.remember_at(&channel, None, &[message("10", None)], early, early);
+        read_ahead.remember_at(&channel, None, &[edited], late, late);
+        // The earlier answer again, landing (or replayed) after the later one.
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[message("10", None), message("11", None)],
+            early,
+            late + Duration::from_millis(1),
+        );
+        let found = read_ahead.recall_at(&channel, None, &ids(&["10", "11"]), late);
+        assert_eq!(
+            found["10"].content, "text of 10, edited",
+            "an older copy was put back over a newer one"
+        );
+        assert_eq!(
+            found["11"].content, "text of 11",
+            "a message held by no later fetch was not kept"
+        );
+        // A copy from a fetch that began later still replaces it.
+        let later = late + Duration::from_secs(1);
+        read_ahead.remember_at(&channel, None, &[message("10", None)], later, later);
+        assert_eq!(
+            read_ahead.recall_at(&channel, None, &ids(&["10"]), later)["10"].content,
+            "text of 10"
         );
     }
 
