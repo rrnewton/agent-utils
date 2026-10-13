@@ -3,10 +3,11 @@
 //!
 //! The first test is an INVENTORY, checked against `src/chat.rs` in the style of
 //! `tests/scope_first.rs`. [`ProfiledClient`] wraps every provider's client, and
-//! [`vibe_talk::providers::ChatRouter`] fronts them all. A `ChatClient` method either of them
-//! leaves to the trait's default body runs that default on the wrapper, which calls the wrapper's
-//! other methods and silently skips whatever the provider overrides. So a method added to the
-//! trait fails here until both forward it.
+//! [`vibe_talk::providers::ChatRouter`] fronts them all; `vibe_talk::testing::CountingChat`
+//! counts the calls a test makes through it. A `ChatClient` method any of them leaves to the
+//! trait's default body runs that default on the wrapper, which calls the wrapper's other methods
+//! and silently skips whatever the provider overrides. So a method added to the trait fails here
+//! until all three forward it.
 
 mod slack_fake;
 
@@ -35,6 +36,7 @@ use vibe_talk::upstream_profile::{Outcome, ProfiledClient, UpstreamProfile};
 const CHAT_SOURCE: &str = include_str!("../src/chat.rs");
 const ROUTER_SOURCE: &str = include_str!("../src/providers.rs");
 const PROFILE_SOURCE: &str = include_str!("../src/upstream_profile.rs");
+const TESTING_SOURCE: &str = include_str!("../src/testing.rs");
 
 /// The code directly inside the block `header` opens: comments, string and character literals,
 /// and every nested block left out.
@@ -221,6 +223,13 @@ fn the_profiled_client_and_the_router_forward_every_chat_client_method() {
             "src/providers.rs",
             ROUTER_SOURCE,
             "impl ChatClient for ChatRouter {",
+        ),
+        // The counting fixture of the remote-ops audit: a default left on it would count a call
+        // the wrapped provider never received, or miss one it did.
+        (
+            "src/testing.rs",
+            TESTING_SOURCE,
+            "impl crate::chat::ChatClient for CountingChat {",
         ),
     ] {
         let (defined, _) = fn_names(&top_level_of(source, header));
