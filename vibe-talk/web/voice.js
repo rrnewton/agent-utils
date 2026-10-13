@@ -5555,7 +5555,10 @@ function noteConversationEnded(cause = "ended") {
   // Drawn at the moment of the DROP, not when Resume is tapped: the boundary is where the
   // conversation actually broke, and marking it later would put the reader's own next turn on the
   // wrong side of it.
-  transcriptSeam("new conversation", seamDetailFor(cause));
+  const boundary = transcriptSeam("new conversation", seamDetailFor(cause));
+  // `#270 voice-transcript-markers`. Which conversation this line ends, so a send that settles late
+  // is drawn inside it, above the line, where a reload draws it.
+  if (session.conversationId) boundary.setAttribute("data-ends", session.conversationId);
 }
 
 // --- clearing the transcript ---------------------------------------------------------------
@@ -9158,7 +9161,38 @@ const postWatch = {
   busy: false,
   // Whether the owner opened a long draft with More. A new draft starts folded again.
   unfolded: false,
+  // `#270 voice-transcript-markers`. The send memory's cursor, for the page's whole life: the
+  // newest `send_seq` this page has read, null until its first read ever says where the server is.
+  /** @type {number | null} */
+  sentThrough: null,
+  // Each proposal this page showed, by serial, with the conversation it was shown in: a send of
+  // one of them is this page's wherever the server says it began.
+  /** @type {Map<number, string | null>} */
+  shownSerials: new Map(),
+  // The frozen card drawn for each serial, so no send is drawn twice, and the `send_seq` it was
+  // drawn under when known: a server that restarted numbers its proposals from one again, and a
+  // send of a serial already drawn, under another `send_seq`, is another send.
+  /** @type {Map<number, HTMLElement>} */
+  sentDrawn: new Map(),
+  /** @type {Map<number, number | null>} */
+  sentSeqs: new Map(),
+  // This page's calls in the server's clock, each `{conversationId, from, to}`: a send that began
+  // inside one is this page's. `window` is the open one, whose end is still "now".
+  /** @type {Array<{conversationId: string | null, from: number | null, to: number | null}>} */
+  windows: [],
+  /** @type {{conversationId: string | null, from: number | null, to: number | null} | null} */
+  window: null,
+  // The server's clock at the last read, and this page's when it arrived, to close a window whose
+  // last read failed.
+  lastNowMs: 0,
+  lastNowAt: 0,
+  // The frozen card the focus goes to when the card it froze from goes with the focus inside it.
+  /** @type {HTMLElement | null} */
+  parkOn: null,
 };
+
+/** Whether this server takes the voice page's transcript records. `#270 voice-transcript-markers`. */
+let transcriptRecordsSupported = false;
 
 // What a refused confirmation means, per code. Every one of them says that THIS tap posted nothing,
 // because that is the question the owner has at that moment.
@@ -9180,6 +9214,9 @@ function startPostWatch() {
   spokenYes.askFirst = !(voiceSendSetting && voiceSendSetting.ask_before_send === false);
   postWatch.running = true;
   postWatch.generation += 1;
+  // `#270 voice-transcript-markers`. This call's window on the send memory opens at its first read.
+  postWatch.window = { conversationId: null, from: null, to: null };
+  postWatch.windows.push(postWatch.window);
   void watchPostProposals(postWatch.generation);
 }
 
@@ -9195,6 +9232,128 @@ function stopPostWatch() {
   // offering the same draft again when the next call opens.
   if (postWatch.shown) postWatch.ignored = postWatch.shown.handle;
   showPostProposal(null);
+  // `#270 voice-transcript-markers`. The call's window closes at one last read of the send memory,
+  // which also brings a send that settled between the last waiting read and now.
+  const window = postWatch.window;
+  postWatch.window = null;
+  if (window) {
+    window.conversationId = session.conversationId;
+    void finalSendsRead(window);
+  }
+}
+
+/** The path of one read of the proposal and the send memory. */
+function postWatchPath(waitSeconds) {
+  const query = [];
+  if (waitSeconds > 0) {
+    query.push(`wait=${waitSeconds}`);
+    if (postWatch.received !== null) query.push(`seen=${postWatch.received}`);
+  }
+  // On every read once the cursor is known, a retry after an error included.
+  if (transcriptRecordsSupported && postWatch.sentThrough !== null) {
+    query.push(`sent_after=${postWatch.sentThrough}`);
+  }
+  return query.length ? `/api/v1/post-proposals?${query.join("&")}` : "/api/v1/post-proposals";
+}
+
+/**
+ * What one read said about the send memory. `#270 voice-transcript-markers`.
+ *
+ * The page's first read ever only learns where the server's numbering is. Every later one carries
+ * the sends past the page's cursor, and each that is this page's — it began inside one of this
+ * page's calls, or it is a proposal this page showed — is drawn as a frozen card, once, and filed
+ * in the transcript from the server's own copy.
+ *
+ * @param {VibeTalk.PendingPostResponse} answer
+ */
+function noteSendMemory(answer) {
+  if (!transcriptRecordsSupported) return;
+  if (typeof answer.now_ms === "number") {
+    postWatch.lastNowMs = answer.now_ms;
+    postWatch.lastNowAt = Date.now();
+    if (postWatch.window && postWatch.window.from === null) postWatch.window.from = answer.now_ms;
+  }
+  if (postWatch.sentThrough === null) {
+    postWatch.sentThrough = answer.sends_through;
+    return;
+  }
+  // A server numbering below this page's cursor has restarted: its serials start again, so one
+  // already drawn here says nothing about a send of the same number now. The cards stay on screen.
+  if (answer.sends_through < postWatch.sentThrough) {
+    postWatch.sentDrawn.clear();
+    postWatch.sentSeqs.clear();
+    postWatch.shownSerials.clear();
+  }
+  for (const send of answer.sends || []) drawSentFromMemory(send);
+  postWatch.sentThrough = answer.sends_through;
+}
+
+/**
+ * The conversation a send that began at `beganAt` (server clock) belongs to on this page, or
+ * undefined when it began in none of this page's calls.
+ */
+function windowConversation(beganAt) {
+  for (let at = postWatch.windows.length - 1; at >= 0; at -= 1) {
+    const window = postWatch.windows[at];
+    if (window.from === null || beganAt < window.from) continue;
+    if (window.to !== null && beganAt > window.to) continue;
+    return window.to === null && window === postWatch.window ? session.conversationId : window.conversationId;
+  }
+  return undefined;
+}
+
+/** @param {VibeTalk.VoiceSend} send */
+function drawSentFromMemory(send) {
+  const detail = send.detail;
+  const drawnUnder = postWatch.sentSeqs.get(detail.serial);
+  if (postWatch.sentDrawn.has(detail.serial) && (drawnUnder === null || drawnUnder === detail.send_seq)) {
+    // Drawn from the commit's answer, which had no number to file it under: this one does.
+    if (drawnUnder === null) postWatch.sentSeqs.set(detail.serial, detail.send_seq);
+    recordSent(detail.send_seq, postWatch.shownSerials.get(detail.serial) || session.conversationId, detail.serial);
+    return;
+  }
+  const conversationId = postWatch.shownSerials.has(detail.serial)
+    ? postWatch.shownSerials.get(detail.serial)
+    : windowConversation(detail.begun_at_ms);
+  if (conversationId === undefined) return;
+  const turn = { speaker: "sent", text: send.text, at_ms: detail.sent_at_ms, detail: { kind: "sent", ...detail } };
+  const li = placeSentCard(turn, conversationId || null);
+  postWatch.sentDrawn.set(detail.serial, li);
+  postWatch.sentSeqs.set(detail.serial, detail.send_seq);
+  // A card still up for this send — its commit's answer is on its way, or was lost: the memory says
+  // it went, so the card freezes into this one, the focus with it.
+  if (postWatch.shown && postWatch.shown.serial === detail.serial) {
+    postWatch.parkOn = li;
+    showPostProposal(null);
+  }
+  recordSent(detail.send_seq, conversationId || null, detail.serial);
+}
+
+/** The window's last read: what settled before it closed, and when it did. */
+async function finalSendsRead(window) {
+  if (!transcriptRecordsSupported || postWatch.sentThrough === null) {
+    window.to = postWatch.lastNowMs + (Date.now() - postWatch.lastNowAt);
+    return;
+  }
+  try {
+    const answer = await apiDecoded("PendingPostResponse", postWatchPath(0));
+    window.to = answer.now_ms;
+    noteSendMemory(answer);
+  } catch (_error) {
+    // The server's clock now, as near as this page can say: a window left open would claim
+    // another tab's sends for a call that is over.
+    window.to = postWatch.lastNowMs + (Date.now() - postWatch.lastNowAt);
+  }
+}
+
+/** One read of the send memory outside a call, for a commit whose answer was lost. */
+async function readSendsOnce() {
+  if (!transcriptRecordsSupported || postWatch.sentThrough === null || postWatch.running) return;
+  try {
+    noteSendMemory(await apiDecoded("PendingPostResponse", postWatchPath(0)));
+  } catch (_error) {
+    // Nothing more to do: the card the commit left is still there for the owner to read.
+  }
 }
 
 async function watchPostProposals(generation) {
@@ -9204,15 +9363,13 @@ async function watchPostProposals(generation) {
   while (postWatch.generation === generation) {
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     postWatch.controller = controller;
-    const seen = postWatch.received === null ? "" : `&seen=${postWatch.received}`;
-    const path = waitSeconds === 0
-      ? "/api/v1/post-proposals"
-      : `/api/v1/post-proposals?wait=${waitSeconds}${seen}`;
+    const path = postWatchPath(waitSeconds);
     try {
       const answer = await apiDecoded(
         "PendingPostResponse", path, controller ? { signal: controller.signal } : undefined
       );
       if (postWatch.generation !== generation) return;
+      noteSendMemory(answer);
       const proposal = answer.proposal;
       postWatch.received = proposal ? proposal.serial : null;
       if (first) {
@@ -9220,7 +9377,12 @@ async function watchPostProposals(generation) {
         first = false;
         noteProposalsAtCallOpen(proposal);
       }
-      showPostProposal(proposal && proposal.handle === postWatch.ignored ? null : proposal);
+      const next = proposal && proposal.handle === postWatch.ignored ? null : proposal;
+      // A commit or a withdrawal on its way settles the card itself, from its answer. The server
+      // wakes this watch the moment it spends the handle, before that answer; taken down here, the
+      // card would vanish before the frozen card that replaces it is drawn, and take the focus with
+      // it. `#270 voice-transcript-markers`.
+      if (!(next === null && postWatch.busy && postWatch.shown)) showPostProposal(next);
       waitSeconds = POST_WATCH_WAIT_SECONDS;
     } catch (error) {
       if (postWatch.generation !== generation) return;
@@ -9262,6 +9424,14 @@ function showPostProposal(proposal) {
   }
   const fresh = !previous || previous.handle !== proposal.handle;
   if (fresh) {
+    // `#270 voice-transcript-markers`. A send of this proposal is this page's, and belongs to the
+    // conversation it was shown in, wherever the send memory says it began. Bounded, oldest out.
+    if (!postWatch.shownSerials.has(proposal.serial)) {
+      postWatch.shownSerials.set(proposal.serial, session.conversationId);
+      if (postWatch.shownSerials.size > 64) {
+        postWatch.shownSerials.delete(postWatch.shownSerials.keys().next().value);
+      }
+    }
     postWatch.deadline = Date.now() + proposal.expires_in_ms;
     // Words the owner may be about to confirm appeared under a tap aimed at whatever was there
     // before — a row, the old text, or, now that the card is the next message in the list, the
@@ -9374,6 +9544,13 @@ function placePostCard() {
  * One using the keys or a mouse gets the box of the list on screen, where typing goes on.
  */
 function parkFocusOffCard() {
+  // The card froze into a row of the transcript: the focus goes with it. `#270`.
+  const frozen = postWatch.parkOn;
+  postWatch.parkOn = null;
+  if (frozen && frozen.parentNode && currentScreen === "main" && currentView === "voice") {
+    frozen.focus({ preventScroll: true });
+    return;
+  }
   if (currentScreen !== "main") {
     focusList(null);
     return;
@@ -9469,28 +9646,46 @@ async function commitShownProposal(proposal, confirmedBy) {
         confirmed_by: confirmedBy,
       },
     });
-    settlePostCard(proposal);
     if (answer && answer.error === "partially_posted") {
-      // A failed first part is reported the same way, as a partial send of nothing.
+      // A failed first part is reported the same way, as a partial send of nothing — unless its
+      // answer was lost, when it may be in the channel: that is not confirmed, never "refused".
+      // `#270 voice-transcript-markers`.
       const detail = redact(answer.detail || "the rest was not sent");
       const nothing = Number(answer.posted) === 0;
-      showError(nothing
-        ? `Nothing was posted to ${proposal.channel_name}: ${detail}`
-        : `Only part of the message reached ${proposal.channel_name}: ${detail}`);
-      outcome = nothing
-        ? { kind: "refused", proposal, reason: "the chat service did not accept it" }
-        : { kind: "partial", proposal };
+      const unconfirmed = nothing && answer.uncertain === true;
+      if (!nothing || unconfirmed) freezeSentCard(proposal, confirmedBy, unconfirmed ? "unconfirmed" : "partial", answer);
+      settlePostCard(proposal);
+      showError(unconfirmed
+        ? `The post to ${proposal.channel_name} could not be confirmed: ${detail}. Check the channel before sending it again.`
+        : nothing
+          ? `Nothing was posted to ${proposal.channel_name}: ${detail}`
+          : `Only part of the message reached ${proposal.channel_name}: ${detail}`);
+      outcome = unconfirmed
+        ? { kind: "unconfirmed", proposal }
+        : nothing
+          ? { kind: "refused", proposal, reason: "the chat service did not accept it" }
+          : { kind: "partial", proposal };
     } else if (VibeTalkContract.is("CommittedPostResponse", answer)) {
+      // The frozen card first, so a focus the card had goes to it rather than to the list.
+      freezeSentCard(proposal, confirmedBy, "sent", answer);
+      settlePostCard(proposal);
       setStatus(`Posted to ${proposal.channel_name}.`);
       outcome = { kind: "sent", proposal };
     } else {
+      settlePostCard(proposal);
       showError("vibe-talk accepted the post but did not say what it posted. Check the channel.");
       outcome = { kind: "unknown", proposal };
+      // The send memory knows what it posted: asked once, a moment from now, when no call's watch
+      // is reading it already. `#270 voice-transcript-markers`.
+      setTimeout(() => void readSendsOnce(), SEND_MEMORY_RECHECK_MS);
     }
   } catch (error) {
     // A request that never arrived spent nothing, so the card stays for another try. Anything the
     // server answered spent the proposal, whatever the answer was.
     if (!error.network) settlePostCard(proposal);
+    // A commit whose answer was lost may have posted all the same, and the send memory would say
+    // so: asked once, a moment from now, when no call's watch is reading it already.
+    if (error.network) setTimeout(() => void readSendsOnce(), SEND_MEMORY_RECHECK_MS);
     if (confirmedBy === "ui") {
       showError(POST_REFUSALS[error.code] || error.message);
     } else {
@@ -9547,6 +9742,337 @@ async function cancelPostProposal(options) {
 /** Take a settled proposal off the card, unless the watch has already put a newer one there. */
 function settlePostCard(proposal) {
   if (postWatch.shown && postWatch.shown.serial === proposal.serial) showPostProposal(null);
+  postWatch.parkOn = null;
+}
+
+// --- frozen send cards ------------------------------------------------------------------------------
+//
+// `#270 voice-transcript-markers`. Every message the voice agent posted — tapped, said yes to, or
+// sent without asking — stays in the transcript as a frozen card: the live card's own tile at the
+// same inset, now saying what went where and how it was approved. Drawn at once from the commit's
+// answer when this page made the commit, and from the server's send memory otherwise — a lost
+// answer, a send that settled after hang-up, a direct send — once per serial. Filed in the stored
+// transcript from the server's own copy (`{speaker: "sent", send}`), so a reload draws the same card.
+
+/** How long after a commit whose answer was lost the send memory is asked about it. */
+const SEND_MEMORY_RECHECK_MS = 3000;
+
+/** The sends, by `send_seq`, this page has asked the server to file. */
+const sentClaimed = new Set();
+
+/**
+ * A frozen card for a send this page committed, from the commit's answer, before the server's own
+ * copy is filed: that copy corrects it when the claim answers.
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ * @param {"ui" | "speaker_turn"} confirmedBy
+ * @param {"sent" | "partial" | "unconfirmed"} outcome
+ * @param {any} answer the commit's answer, a 200 or a 207
+ */
+function freezeSentCard(proposal, confirmedBy, outcome, answer) {
+  if (postWatch.sentDrawn.has(proposal.serial)) return;
+  const conversationId = postWatch.shownSerials.has(proposal.serial)
+    ? postWatch.shownSerials.get(proposal.serial)
+    : session.conversationId;
+  const first = outcome === "sent" && answer.posted && typeof answer.posted === "object" ? answer.posted : null;
+  const parts = Array.isArray(answer.parts) ? answer.parts.length : 0;
+  const posted = outcome === "sent" ? parts : Number(answer.posted) || 0;
+  const thread = first && first.thread && !first.thread.is_root ? String(first.thread.id) : undefined;
+  const now = Date.now();
+  const sendSeq = typeof answer.send_seq === "number" ? answer.send_seq : null;
+  const turn = {
+    speaker: "sent",
+    text: proposal.text,
+    at_ms: now,
+    detail: {
+      kind: "sent",
+      serial: proposal.serial,
+      send_seq: sendSeq === null ? 0 : sendSeq,
+      channel_id: String(proposal.channel_id),
+      channel_name: proposal.channel_name,
+      reply_to: proposal.reply_to || undefined,
+      reply_to_author: proposal.reply_to_author || undefined,
+      reply_to_excerpt: proposal.reply_to_excerpt || undefined,
+      thread_id: thread,
+      thread_name: proposal.thread_name || undefined,
+      message_id: first ? String(first.id) : undefined,
+      parts_posted: posted,
+      parts_total: outcome === "sent" ? parts : 0,
+      uncertain_part: answer.uncertain === true ? posted + 1 : undefined,
+      unsent_chars: outcome === "sent" ? 0 : String(answer.unsent || "").length,
+      outcome,
+      how: confirmedBy === "ui" ? "tap" : "voice",
+      origin: "commit",
+      text_truncated: false,
+      text_chars: String(proposal.text).length,
+      begun_at_ms: now,
+      sent_at_ms: now,
+    },
+  };
+  const li = placeSentCard(turn, conversationId || null);
+  postWatch.sentDrawn.set(proposal.serial, li);
+  postWatch.sentSeqs.set(proposal.serial, sendSeq);
+  postWatch.parkOn = li;
+  if (sendSeq !== null) recordSent(sendSeq, conversationId || null, proposal.serial);
+  else if (transcriptRecordsSupported) markNotKept(li);
+}
+
+/**
+ * The frozen card for one `sent` row — the stored one, the send memory's, or the page's own until
+ * the server's corrects it. ONE builder, so a card drawn live and one restored look the same.
+ *
+ * @param {{text: string, at_ms?: number, detail?: any}} turn
+ */
+function sentCardNode(turn) {
+  const detail = turn.detail && typeof turn.detail === "object" ? turn.detail : {};
+  const text = String(turn.text === null || turn.text === undefined ? "" : turn.text);
+  const channel = String(detail.channel_name || "the channel");
+  const li = document.createElement("li");
+  li.className = "mine sent-card";
+  // Where the focus goes when the live card it froze from goes with the focus in it.
+  li.setAttribute("tabindex", "-1");
+  if (detail.serial !== undefined) li.setAttribute("data-serial", String(detail.serial));
+  li.setAttribute("data-outcome", String(detail.outcome || "sent"));
+  const meta = document.createElement("div");
+  meta.className = "meta sent-meta";
+  const mark = document.createElement("span");
+  mark.className = "sent-mark";
+  mark.setAttribute("aria-hidden", "true");
+  mark.textContent = "✓";
+  const status = document.createElement("span");
+  status.className = "who sent-status";
+  status.textContent = detail.outcome === "partial"
+    ? `Partly sent to ${channel}`
+    : detail.outcome === "unconfirmed"
+      ? `Not confirmed: ${channel}`
+      : `Sent to ${channel}`;
+  const sentAt = typeof detail.sent_at_ms === "number" ? detail.sent_at_ms : turn.at_ms;
+  const when = sentAt === undefined ? new Date() : new Date(sentAt);
+  const at = timeNode("at", Number.isNaN(when.getTime()) ? null : when, stamp(when.getTime()));
+  const how = document.createElement("span");
+  how.className = "sent-how";
+  how.textContent = detail.how === "voice"
+    ? "approved by voice"
+    : detail.how === "direct"
+      ? "sent without asking"
+      : "approved by tap";
+  meta.append(mark, status, at, how);
+  const body = document.createElement("div");
+  body.className = "body";
+  // What went, as text, a sign-in token never put on screen.
+  body.textContent = redact(text);
+  li.append(meta, body);
+  const where = sentWhere(detail);
+  if (where) {
+    const line = document.createElement("p");
+    line.className = "sent-where";
+    line.textContent = where;
+    li.append(line);
+  }
+  for (const said of sentNotes(detail)) {
+    const note = document.createElement("p");
+    note.className = "sent-note";
+    note.textContent = said;
+    li.append(note);
+  }
+  if (detail.message_id) {
+    const open = document.createElement("button");
+    open.className = "chip sent-open";
+    open.setAttribute("type", "button");
+    open.textContent = "Open in channel";
+    open.addEventListener("click", () => void openSentMessage(detail));
+    li.append(open);
+  }
+  foldable(li, meta, body, text);
+  searchable(li, "sent", channel, text);
+  li.linkText = text;
+  return li;
+}
+
+/** What a frozen card says it answered, and where, in words: never an id. */
+function sentWhere(detail) {
+  const parts = [];
+  if (detail.reply_to) {
+    if (detail.reply_to_author && detail.reply_to_excerpt) {
+      parts.push(`replying to ${detail.reply_to_author}: “${detail.reply_to_excerpt}”`);
+    } else if (detail.reply_to_author) {
+      parts.push(`replying to ${detail.reply_to_author}`);
+    } else {
+      parts.push("replying to an earlier message");
+    }
+  }
+  if (detail.thread_name) parts.push(`in thread “${detail.thread_name}”`);
+  else if (detail.thread_id) parts.push("in a thread");
+  return parts.join(" · ");
+}
+
+/** The lines a frozen card adds when less than all of it is known to have gone, or it is cut. */
+function sentNotes(detail) {
+  const notes = [];
+  const posted = Number(detail.parts_posted) || 0;
+  const total = Number(detail.parts_total) || 0;
+  const unsent = Number(detail.unsent_chars) || 0;
+  const went = posted === 1 ? "Part 1" : `Parts 1–${posted}`;
+  if (detail.outcome === "unconfirmed") {
+    notes.push("The chat service may have it — check the channel.");
+  } else if (detail.outcome === "partial" && detail.uncertain_part) {
+    notes.push(`${went} went; part ${posted + 1} may have arrived — check the channel; the rest was not sent.`);
+  } else if (detail.outcome === "partial") {
+    notes.push(total > 0
+      ? `${went} of ${total} went; the rest (${unsent} characters) was not sent.`
+      : `${went} went; the rest (${unsent} characters) was not sent.`);
+  }
+  if (detail.text_truncated) {
+    const shown = Number(detail.text_chars) || 0;
+    notes.push(`Shortened here — ${Math.min(shown, 8000)} of ${shown} characters; the full message is in the channel.`);
+  }
+  return notes;
+}
+
+/** The card's own line saying the server did not file it. */
+function markNotKept(li) {
+  if ([...li.children].some((kid) => kid.className === "sent-note sent-not-kept")) return;
+  const note = document.createElement("p");
+  note.className = "sent-note sent-not-kept";
+  note.textContent = "Not kept in the stored transcript.";
+  preservingScroll(() => li.append(note));
+}
+
+/**
+ * Put a frozen card in the transcript: at the end for the conversation on screen, or, for one that
+ * has ended, in it — just above the boundary that ended it — where a reload draws it too. A late
+ * commit answer, or a send that settled after the next call began, lands where it belongs.
+ *
+ * @param {{text: string, at_ms?: number, detail?: any}} turn
+ * @param {string | null} conversationId
+ */
+function placeSentCard(turn, conversationId) {
+  const li = sentCardNode(turn);
+  const list = leftEl("transcript");
+  const pinned = atBottom(leftEl("scroll-area"));
+  const boundary = conversationId
+    ? [...list.children].reverse().find((row) => row.getAttribute("data-ends") === conversationId)
+    : undefined;
+  if (boundary) preservingScroll(() => list.insertBefore(li, boundary));
+  else list.append(li);
+  renderEmptyState();
+  applySearch();
+  followIfPinned(pinned, 1);
+  return li;
+}
+
+/** The server filed the card's send: draw its own copy where the page's was. */
+function correctSentCard(serial, turn) {
+  const li = postWatch.sentDrawn.get(serial);
+  if (!li || !li.parentNode) return;
+  const fresh = sentCardNode(turn);
+  const focused = document.activeElement === li;
+  preservingScroll(() => li.replaceWith(fresh));
+  postWatch.sentDrawn.set(serial, fresh);
+  if (focused) fresh.focus({ preventScroll: true });
+  applySearch();
+}
+
+/**
+ * Open the message a frozen card sent, in the channel view: the channel, the thread it went to,
+ * and the row itself when it is loaded. When it is not, the status line says where to look.
+ */
+async function openSentMessage(detail) {
+  if (String(el("discord-channel").value) !== String(detail.channel_id)) {
+    setStatus(`That message is in ${detail.channel_name}; choose it in the channel picker to see it.`);
+    return;
+  }
+  if (currentView !== "discord") {
+    uiStateSettled = true;
+    showView("discord");
+    await readEnteredChannel(false);
+  }
+  if (detail.thread_id) await openThread(String(detail.thread_id));
+  const row = [...leftEl("discord-log").children].find((each) => idsOf(each).includes(String(detail.message_id)));
+  if (row) revealRow(row);
+  else setStatus(`That message is not among the ones loaded here — scroll back in ${detail.channel_name} to find it.`);
+}
+
+/**
+ * File the send `sendSeq` in `conversationId`'s stored transcript, from the server's copy, in the
+ * order the screen shows it: after every turn drawn above the card. Once per serial.
+ */
+function recordSent(sendSeq, conversationId, serial) {
+  if (!transcriptRecordsSupported || sentClaimed.has(sendSeq)) return;
+  sentClaimed.add(sendSeq);
+  recordInScreenOrder(() => {
+    void recordRecord(conversationId, { speaker: "sent", text: "", send: sendSeq }).then((result) => {
+      const li = postWatch.sentDrawn.get(serial);
+      if (!li) return;
+      if (result && result.turn) correctSentCard(serial, result.turn);
+      else if (!result || result.refused !== "send_recorded") markNotKept(li);
+    });
+  });
+}
+
+/** Steps waiting for the live turns drawn above them to be stored first. */
+let recordsAfterLive = [];
+
+/** Whether a live turn of the vibe-talk-v1 protocol is on screen and not yet stored. */
+function liveTurnsUnstored() {
+  for (const entry of session.liveTurns.values()) {
+    if (!entry.stored && !entry.echo) return true;
+  }
+  return false;
+}
+
+/**
+ * Run a record step now, or once every live turn drawn above it is stored, so the record holds
+ * [read-back][yes][One moment.][card] in the order the screen does.
+ */
+function recordInScreenOrder(step) {
+  if (liveTurnsUnstored()) recordsAfterLive.push(step);
+  else step();
+}
+
+/** The live turns are stored: the record steps that waited for them go now, in order. */
+function flushRecordsAfterLive() {
+  if (recordsAfterLive.length === 0 || liveTurnsUnstored()) return;
+  const steps = recordsAfterLive;
+  recordsAfterLive = [];
+  for (const step of steps) step();
+}
+
+/**
+ * Post one transcript record — a send, a marker — in the queue the turns go through. Resolves to
+ * `{turn}` as stored, `{refused: code}` for a refusal that is final, or null when nothing was kept.
+ *
+ * A refusal is NEVER the end of recording, as a turn's failure is: 404 and 409 say the record is
+ * not the server's to file or is filed already, and a 400 or 413 is said in Settings. Only a
+ * request that never arrived, or a 5xx, says the store is gone.
+ *
+ * @param {string | null} conversationId
+ * @param {Record<string, unknown>} body
+ */
+function recordRecord(conversationId, body) {
+  if (!transcriptRecordsSupported || !conversationId) return Promise.resolve(null);
+  const done = recordQueue.then(async () => {
+    if (recordingBroken) return null;
+    try {
+      const answer = await api(`/api/v1/conversations/${conversationId}/turns`, { method: "POST", body });
+      return answer && answer.turn ? { turn: answer.turn } : null;
+    } catch (error) {
+      const status = Number(error.status) || 0;
+      if (status === 404 || status === 409) return { refused: String(error.code || status) };
+      if (status >= 400 && status < 500) {
+        setStorageState(`A record of this call was not kept: ${error.message}.`);
+        return { refused: String(error.code || status) };
+      }
+      recordingBroken = true;
+      setStorageState(
+        `Not recording: ${error.message}. What is already stored is untouched; the lines on ` +
+          `screen are only on screen.`
+      );
+      return null;
+    }
+  });
+  recordQueue = done.then(() => undefined);
+  return done;
 }
 
 // --- a spoken yes to the card ----------------------------------------------------------------------
@@ -10589,6 +11115,9 @@ const SPOKEN_YES_SEAMS = {
   unknown:
     "The page could not confirm whether your yes posted the message, so the assistant was told to " +
     "say so. Check the channel before sending again.",
+  unconfirmed:
+    "The chat service's answer was lost, so nobody can say whether your yes posted it. The card " +
+    "above says so, and the assistant was told.",
   refused:
     "Your yes reached the server, which refused the send, so nothing was posted. The status line " +
     "says why, and the assistant was told.",
@@ -10608,6 +11137,7 @@ const SPOKEN_YES_SEAM_LABELS = {
   sent: "Sent by voice",
   partial: "Partly sent",
   unknown: "Not confirmed",
+  unconfirmed: "Not confirmed",
   refused: "Not sent",
   gone: "Not sent",
   not_armed: "Not sent",
@@ -10635,6 +11165,7 @@ function outcomeNotice(outcome, how) {
       return `Voice page: only part of the message reached ${channel}; the rest was NOT sent. ` +
         "Tell the user that in one short sentence, and that the screen has the rest. Then stop.";
     case "unknown":
+    case "unconfirmed":
       return "Voice page: I could not confirm whether the message was sent. Tell the user to " +
         "check the channel before sending it again. Then stop.";
     case "refused":
@@ -10689,7 +11220,7 @@ function reportSpokenOutcome(outcome) {
     status = `Sent to ${channel}.`;
   } else if (kind === "partial") {
     status = `Only part reached ${channel} — the rest was not sent.`;
-  } else if (kind === "unknown") {
+  } else if (kind === "unknown" || kind === "unconfirmed") {
     status = "Could not confirm the send — check the channel.";
   } else if (kind === "refused") {
     status = `Not sent — ${outcome.reason || "the server refused it"}.`;
@@ -10702,7 +11233,11 @@ function reportSpokenOutcome(outcome) {
   }
   tellAgent(outcomeNotice({ ...outcome, kind }, "voice"));
   setStatus(status);
-  transcriptSeam(SPOKEN_YES_SEAM_LABELS[kind], SPOKEN_YES_SEAMS[kind]);
+  // `#270 voice-transcript-markers`. A send — whole, partial or unconfirmed — is the frozen card,
+  // which says "approved by voice" and is kept; a seam beside it would say it twice.
+  if (kind !== "sent" && kind !== "partial" && kind !== "unconfirmed") {
+    transcriptSeam(SPOKEN_YES_SEAM_LABELS[kind], SPOKEN_YES_SEAMS[kind]);
+  }
   playSpokenYesTone(kind === "sent");
 }
 
@@ -10914,21 +11449,33 @@ function restoredRun(turns, trailingSeam) {
   const rows = [];
   // Drawn from one place on purpose. A boundary between two stored calls and a boundary between
   // the record and the live one are the same boundary, and a second call site here is how the
-  // two wordings would come to differ.
-  const rule = () => transcriptSeam(STORED_SEAM_LABEL, STORED_SEAM_DETAIL, rows);
+  // two wordings would come to differ. Each says which conversation it ends, as a live one does
+  // (`#270 voice-transcript-markers`), so a late send is drawn above the right line.
+  const rule = (ends) => {
+    transcriptSeam(STORED_SEAM_LABEL, STORED_SEAM_DETAIL, rows).setAttribute("data-ends", ends);
+  };
   let previous = null;
   for (const turn of turns) {
     if (previous !== null && turn.conversation_id !== previous) {
-      rule();
+      rule(previous);
     }
-    rows.push(turnNode(restoredSpeaker(turn.speaker), turn.text, turn.at_ms));
+    // `#270 voice-transcript-markers`. A message the voice agent posted is its frozen card, drawn
+    // by the builder the live one is. A marker is not a turn: nothing is drawn for one here.
+    if (turn.speaker === "sent") {
+      rows.push(sentCardNode(turn));
+    } else if (turn.speaker !== "marker") {
+      rows.push(turnNode(restoredSpeaker(turn.speaker), turn.text, turn.at_ms));
+    }
     previous = turn.conversation_id;
   }
   if (previous !== null && trailingSeam) {
-    rule();
+    rule(previous);
   }
   return rows;
 }
+
+/** The query that asks a transcript read for record rows, when this server keeps them. `#270`. */
+const recordsQuery = () => (transcriptRecordsSupported ? "&records=1" : "");
 
 /** Newest first on the wire — a page is taken from the end the reader is at. Read the other way. */
 const oldestFirst = (payload) => [...((payload && payload.turns) || [])].reverse();
@@ -10998,7 +11545,7 @@ async function loadStoredConversation() {
   }
   let payload = null;
   try {
-    payload = await api(`/api/v1/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}`);
+    payload = await api(`/api/v1/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}${recordsQuery()}`);
   } catch (error) {
     setStorageState(`Could not read the stored transcript: ${error.message}`);
     return;
@@ -11042,7 +11589,7 @@ async function loadOlderTurns() {
   try {
     const payload = await api(
       `/api/v1/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}` +
-        `&before=${encodeURIComponent(transcriptOlderCursor)}`
+        `&before=${encodeURIComponent(transcriptOlderCursor)}${recordsQuery()}`
     );
     const turns = oldestFirst(payload);
     // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
@@ -12762,6 +13309,8 @@ function storeSpoken(entry) {
   if (!entry.echo) {
     recordTurn(entry.who, spokenText(entry));
   }
+  // `#270 voice-transcript-markers`. A record drawn below this turn waited for it to be stored.
+  flushRecordsAfterLive();
 }
 
 /** The turn is over: everything said in it is as good as it is going to get. */
@@ -35816,6 +36365,9 @@ function applyClientConfig(config) {
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.
   resumeAllowed = config.replay_enabled === true;
+  // `#270 voice-transcript-markers`. Records, `records=1` and the send memory's cursor go only to a
+  // server that says it takes them.
+  transcriptRecordsSupported = config.transcript_records_supported === true;
   renderResumeState();
   renderSpeechPrepState(config.speech_prep_enabled);
   applyNoiseRules(config.noise_rules);
@@ -36449,7 +37001,7 @@ function pressViewSwitch() {
 
 /** Read the channel just entered, and keep reading it while it stays on screen. */
 function readEnteredChannel(keepPosition) {
-  guardQuietly(async () => {
+  return guardQuietly(async () => {
     try {
       // A return finds the channel's store as it was left, so it asks only for what changed.
       const since = timelineReadsStarted;

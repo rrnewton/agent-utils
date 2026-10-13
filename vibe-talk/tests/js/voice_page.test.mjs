@@ -1694,6 +1694,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // `#252 thread-button-state`.
         replies_in_thread: page.repliesInThread,
         replay_enabled: page.replayEnabled,
+        // `#270 voice-transcript-markers`. Absent unless a test says the server takes records.
+        transcript_records_supported: page.transcriptRecordsSupported,
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
         owner_author_id: page.ownerAuthorId,
@@ -1828,6 +1830,25 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** Watches parked on "nothing changed", released by the next change. */
     proposalWaiters: [],
     /**
+     * `#270 voice-transcript-markers`. Whether the server says it takes transcript records;
+     * `undefined` sends nothing, as an older server does.
+     */
+    transcriptRecordsSupported: undefined,
+    /**
+     * The fake server's send memory: each settled send as `GET /api/v1/post-proposals` publishes it
+     * (`{text, detail}`), oldest first. A commit adds one, as the server's gate does; `page.publishSend`
+     * adds any other, a direct send say, and wakes a parked watch.
+     */
+    sendMemory: [],
+    /** The newest `send_seq` handed out. */
+    sendsThrough: 0,
+    /** The server's clock as the long poll reports it; `null` is the fixture's own clock. */
+    serverNowMs: null,
+    /** Set to a status to make every claim of a send fail with it. */
+    claimStatus: null,
+    /** Set to answer every read with the whole send memory, whatever its cursor, as a retry might. */
+    resendAll: false,
+    /**
      * What a commit answers. The default behaves like the server's gate: the handle must be the
      * pending one and the restated channel, text and reply target must match it, and a commit
      * spends the proposal whatever the answer.
@@ -1843,7 +1864,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         return json(409, { error: "proposal_mismatch", detail: "restated binding differs" });
       }
       const posted = message({ channel_id: pending.channel_id, content: pending.text, reply_to: pending.reply_to });
-      return json(200, { serial: pending.serial, posted, parts: [posted] });
+      // Filed in the send memory as the server's gate files it. `#270 voice-transcript-markers`.
+      const send = page.fileSend(pending, body.confirmed_by === "ui" ? "tap" : "voice", { message_id: String(posted.id) });
+      return json(200, { serial: pending.serial, send_seq: send.detail.send_seq, posted, parts: [posted] });
     },
     postProposals: async (path, options) => {
       if (path === "/api/v1/post-proposals/commit") {
@@ -1863,11 +1886,20 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       const url = new URL(path, "http://fixture.test");
       const wait = Number(url.searchParams.get("wait") || 0);
       const seen = url.searchParams.get("seen");
-      // `sends_through` and `now_ms` ride on every answer, as the server's do (`#270
-      // voice-transcript-markers`).
-      const answer = () => json(200, { proposal: page.proposal, sends_through: 0, now_ms: Date.now() });
+      const after = url.searchParams.get("sent_after");
+      // `sends_through` and `now_ms` ride on every answer, as the server's do; the sends past
+      // `sent_after` only when it is asked for (`#270 voice-transcript-markers`).
+      const answer = () => json(200, {
+        proposal: page.proposal,
+        sends: after === null
+          ? undefined
+          : page.sendMemory.filter((send) => page.resendAll || send.detail.send_seq > Number(after)),
+        sends_through: page.sendsThrough,
+        now_ms: page.serverNowMs === null ? page.clock() : page.serverNowMs,
+      });
       const current = page.proposal ? String(page.proposal.serial) : null;
       if (wait === 0 || current !== seen) return answer();
+      if (after !== null && Number(after) !== page.sendsThrough) return answer();
       return new Promise((resolve) => page.proposalWaiters.push(() => resolve(answer())));
     },
     timeline: async (path) => {
@@ -3226,15 +3258,20 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         }
         const query = new URLSearchParams(wantsTranscript[1] || "");
         const limit = Math.min(200, Math.max(1, Number(query.get("limit") || 40)));
+        // `#270 voice-transcript-markers`. Record rows and details only on `records=1`, left out
+        // in the read itself as the server leaves them out.
+        const records = query.get("records") === "1";
         const all = [];
         for (const [id, held] of page.storedTurns) {
           held.forEach((turn, index) => {
+            if (!records && (turn.speaker === "sent" || turn.speaker === "marker")) return;
             all.push({
               conversation_id: id,
               seq: index + 1,
               speaker: turn.speaker,
               text: turn.text,
               at_ms: turn.at_ms,
+              ...(records && turn.detail ? { detail: turn.detail } : {}),
             });
           });
         }
@@ -3287,6 +3324,21 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           if (page.holdTurnPosts) {
             await new Promise((resolve) => page.pendingTurnPosts.push(resolve));
           }
+          // `#270 voice-transcript-markers`. A claim files the send memory's own copy, once.
+          if (body.speaker === "sent") {
+            page.claims.push({ id, ...body });
+            if (page.claimStatus) {
+              return json(page.claimStatus, { error: page.claimStatus === 409 ? "send_recorded" : "bad_record", detail: "refused" });
+            }
+            const send = page.sendMemory.find((one) => one.detail.send_seq === body.send);
+            if (!send) return json(404, { error: "send_unknown", detail: "this server no longer remembers that send" });
+            if (send.claimed) return json(409, { error: "send_recorded", detail: "that send is already in a transcript" });
+            send.claimed = id;
+            const held = page.storedTurns.get(id) || [];
+            held.push({ speaker: "sent", text: send.text, at_ms: 1_700_000_000_000, detail: { kind: "sent", ...send.detail } });
+            page.storedTurns.set(id, held);
+            return json(200, { id, turn: held[held.length - 1] });
+          }
           // Appended when the request is ANSWERED, not when it is issued — the server assigns
           // `seq` on arrival, so the order that ends up stored is the order things landed in.
           const held = page.storedTurns.get(id) || [];
@@ -3322,6 +3374,40 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
   };
+  /** Every claim of a send the page made, as `{id, speaker, text, send}`. `#270`. */
+  page.claims = [];
+  /**
+   * File a settled send in the fake send memory, as the server's gate does when one settles, and
+   * wake every parked watch. `overrides` replace any field of the detail.
+   */
+  page.fileSend = (pending, how, overrides = {}) => {
+    page.sendsThrough += 1;
+    const now = page.serverNowMs === null ? page.clock() : page.serverNowMs;
+    const send = {
+      text: pending.text,
+      detail: {
+        serial: pending.serial,
+        send_seq: page.sendsThrough,
+        channel_id: String(pending.channel_id),
+        channel_name: pending.channel_name,
+        parts_posted: 1,
+        parts_total: 1,
+        unsent_chars: 0,
+        outcome: "sent",
+        how,
+        origin: how === "direct" ? "mcp" : "commit",
+        text_truncated: false,
+        text_chars: String(pending.text).length,
+        begun_at_ms: now,
+        sent_at_ms: now,
+        ...overrides,
+      },
+    };
+    page.sendMemory.push(send);
+    for (const wake of page.proposalWaiters.splice(0)) wake();
+    return send;
+  };
+  page.publishSend = (pending, how = "direct", overrides = {}) => page.fileSend(pending, how, overrides);
   /** Hold `proposal` for confirmation, superseding any other, and wake every parked watch. */
   page.propose = (proposal) => {
     page.proposal = proposal;
@@ -4080,6 +4166,11 @@ const TUNING_BANDS = {
     "how long the voice socket may take to open. Healthy starts opened in 0.4 to 3.1 s, so much " +
     "under five fails a slow start that would have worked; past fifteen the reader has given up " +
     "on a call that says Connecting and pressed something else"],
+  // `#270 voice-transcript-markers`.
+  SEND_MEMORY_RECHECK_MS: [1000, 10000,
+    "how long after a commit whose answer was lost the page asks the send memory what it posted. " +
+    "Under a second, a send still on its way to the chat service is not there yet and the card it " +
+    "left stays up; past ten, the owner looks at a draft that went for that long without knowing"],
   POST_CHANGE_HOLD_MS: [1000, 3000,
     "how long Send is held after a card appears or a newer proposal replaces it. Under a second, " +
     "a tap already under way when the text appeared still lands on words the owner never read; " +
@@ -6598,11 +6689,14 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
     ],
     // `#264 voice-send-approval`: the outcome of a spoken yes. Every wording it can draw is held
     // to the same band by its own test, from the table it is drawn from.
+    // A yes that sent is a frozen card now (`#270 voice-transcript-markers`), so the seam a yes can
+    // still draw is the one for a commit whose answer never came back.
     [
-      "Sent by voice",
+      "Not confirmed",
       async () => {
         const page = newPage();
         const socket = await readBackDuringACall(page);
+        page.commitProposal = async () => { throw new TypeError("Failed to fetch"); };
         hostedHears(socket, "yes");
         await settleSpokenYes(page);
         return page;
@@ -7643,10 +7737,12 @@ test("ONE COLLAPSING IDIOM: the transcript and the channel fold a long message i
     "the two lists word their fold controls differently"
   );
 
-  // And it is literally one function, called twice — not two implementations that agree today.
+  // And it is literally one function — not implementations that agree today — called once by each
+  // row builder: a turn, a channel message, and (`#270 voice-transcript-markers`) a frozen send card,
+  // which is a row of the transcript like any turn.
   assert.match(SCRIPT_CODE, /function foldable\(/, "the folding idiom is not a shared function");
   const calls = (SCRIPT_CODE.match(/foldable\(/g) || []).length - 1;
-  assert.equal(calls, 2, `foldable() is called from ${calls} places; both message lists need it`);
+  assert.equal(calls, 3, `foldable() is called from ${calls} places; each row builder needs it once`);
 });
 
 test("a short message gets no fold control at all, in either list", async () => {
@@ -33217,6 +33313,270 @@ test("`#269 approval-card-inline`: a new draft is said once on the status line, 
   assert.equal(page.el("status").textContent, "The assistant changed the draft to lead team — read it again.");
 });
 
+// --- `#270 voice-transcript-markers`: frozen send cards -------------------------------------------
+
+/** Every word under `node`, its own and its children's. */
+const wordsOf = (node) => [node.textContent, ...node.children.map(wordsOf)].join(" ");
+
+/** The frozen cards in the transcript, in order. */
+const sentCards = (page) => page.el("transcript").children.filter((li) => li.hasClass("sent-card"));
+
+/** A write-scope call, on a server that takes records, in a conversation the vendor named. */
+async function recordingCall(page, conversationId = "conv_cards") {
+  page.transcriptRecordsSupported = true;
+  const socket = await startTalkingNamed(page, conversationId);
+  await page.settle();
+  return socket;
+}
+
+/** Let the watch's loop take its next turn, and whatever it read be drawn. */
+async function watchTurns(page, turns = 4) {
+  for (let i = 0; i < turns; i += 1) await page.settle();
+}
+
+test("`#270 voice-transcript-markers`: a tapped Send freezes into a card in the transcript, filed from the server's own copy", async () => {
+  const page = newPage();
+  await recordingCall(page);
+  page.propose(proposal({ reply_to: null }));
+  await page.settle();
+  page.expireTimers(2000);
+  const send = page.el("post-confirm-send");
+  send.focus();
+  await send.click();
+  await watchTurns(page);
+  const cards = sentCards(page);
+  assert.equal(cards.length, 1, "the send left no frozen card, or two");
+  const card = cards[0];
+  assert.equal(page.el("transcript").children.at(-1), card, "the frozen card is not the newest row");
+  assert.ok(card.hasClass("mine"), "the frozen card does not stand where a turn of the owner's does");
+  assert.match(wordsOf(card), /Sent to lead team/);
+  assert.match(wordsOf(card), /approved by tap/);
+  assert.match(wordsOf(card), /second line/, "the frozen card lost the words that went");
+  assert.ok(!page.el("transcript").children.some((li) => li.className === "seam"), "a seam said it again");
+  // Filed once, as the server's copy: the claim names the send and carries no words.
+  assert.deepEqual(page.claims.map(({ speaker, text, send: seq }) => ({ speaker, text, send: seq })),
+    [{ speaker: "sent", text: "", send: 1 }]);
+  assert.equal(page.claims[0].id, "conv_cards");
+  assert.equal(page.storedTurns.get("conv_cards").at(-1).speaker, "sent");
+  // The focus went with the card into the transcript, not into the message box.
+  assert.ok(page.document.activeElement && page.document.activeElement.hasClass("sent-card"),
+    `the focus went to ${page.document.activeElement && page.document.activeElement.id}`);
+  assert.ok(!wordsOf(card).includes("Not kept"), "a filed card says it was not kept");
+});
+
+test("`#270 voice-transcript-markers`: a send from the send memory is drawn once when it is this page's, and never when it is not", async () => {
+  const page = newPage();
+  page.setClock(1_700_000_100_000);
+  await recordingCall(page);
+  await watchTurns(page);
+  const watched = proposalWatches(page).filter((r) => r.includes("sent_after="));
+  assert.ok(watched.length > 0, "the watch never read the send memory");
+
+  // A direct send that began inside this call: "sent without asking", filed once.
+  page.publishSend(proposal({ serial: 21, handle: "dIrEcT", text: "rebase onto main" }), "direct");
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1);
+  assert.match(wordsOf(sentCards(page)[0]), /sent without asking/);
+  assert.deepEqual(page.claims.map((c) => c.send), [1]);
+
+  // The same send again draws nothing more, and files nothing more.
+  page.resendAll = true;
+  page.propose(proposal({ serial: 40, handle: "wAkE" }));
+  await watchTurns(page);
+  page.resendAll = false;
+  page.propose(null);
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1, "one send was drawn twice");
+  assert.equal(page.claims.length, 1);
+
+  // A send that began before this call, from another page, and was never shown here: not ours.
+  page.publishSend(proposal({ serial: 22, handle: "eLsEwHeRe", text: "from another tab" }), "direct",
+    { begun_at_ms: 1_600_000_000_000 });
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1, "another page's send was drawn here");
+});
+
+test("`#270 voice-transcript-markers`: after the server restarts, a send that reuses a drawn serial is still drawn", async () => {
+  const page = newPage();
+  await recordingCall(page);
+  await watchTurns(page);
+  page.publishSend(proposal({ serial: 3, handle: "bEfOrE", text: "before the restart" }), "direct");
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1);
+  // The server restarts: its memory is empty, its proposals number from one again, and its sends
+  // number from its clock, above anything the last process handed out.
+  page.sendMemory = [];
+  page.sendsThrough = 1_700_000_000_000;
+  page.publishSend(proposal({ serial: 3, handle: "aFtEr", text: "after the restart" }), "direct");
+  await watchTurns(page, 6);
+  assert.equal(sentCards(page).length, 2, "a new send was taken for one already drawn because its serial came round again");
+  assert.match(wordsOf(sentCards(page)[1]), /after the restart/);
+});
+
+test("`#270 voice-transcript-markers`: a commit whose answer was lost is drawn when the send memory says it went", async () => {
+  const page = newPage();
+  await recordingCall(page);
+  page.propose(proposal());
+  await page.settle();
+  page.expireTimers(2000);
+  const pending = page.proposal;
+  page.commitProposal = async () => {
+    // The server took it and posted it; its answer never arrived.
+    page.settleProposal();
+    page.fileSend(pending, "tap");
+    throw new TypeError("Failed to fetch");
+  };
+  await page.el("post-confirm-send").click();
+  await watchTurns(page, 6);
+  assert.equal(sentCards(page).length, 1, "the send memory's word on the lost commit drew no card");
+  assert.match(wordsOf(sentCards(page)[0]), /approved by tap/);
+  assert.equal(page.el("post-confirm").hidden, true, "the card stayed up for a send that went");
+  assert.equal(page.claims.length, 1);
+});
+
+test("`#270 voice-transcript-markers`: the send memory's cursor goes on every read, a retry after an error included", async () => {
+  const page = newPage();
+  await recordingCall(page);
+  await watchTurns(page);
+  const failing = page.postProposals;
+  let failed = false;
+  page.postProposals = async (path, options) => {
+    if (!failed && path.includes("wait=")) {
+      failed = true;
+      return json(500, { error: "storage_error", detail: "down" });
+    }
+    return failing(path, options);
+  };
+  page.propose(proposal());
+  await watchTurns(page);
+  page.expireTimers(3000);
+  await watchTurns(page);
+  const reads = proposalWatches(page);
+  assert.ok(failed, "the fixture never failed a read");
+  const retry = reads[reads.indexOf(reads.find((r) => r.includes("wait="))) + 1] || reads.at(-1);
+  assert.ok(reads.slice(1).every((r) => r.includes("sent_after=")), `a read went without the cursor: ${reads.join(", ")}`);
+  assert.ok(retry.includes("sent_after="));
+});
+
+test("`#270 voice-transcript-markers`: a send that settles between the last waiting read and Hang up is drawn above the line that ends the call", async () => {
+  const page = newPage();
+  await recordingCall(page, "conv_last");
+  await watchTurns(page);
+  // Settled, but the watch is parked and is not woken: Hang up's last read is what brings it.
+  const settle = page.proposalWaiters.splice(0);
+  page.sendsThrough += 1;
+  page.sendMemory.push({
+    text: "landed at the last moment",
+    detail: {
+      serial: 31, send_seq: page.sendsThrough, channel_id: CHANNEL.id, channel_name: "lead team", parts_posted: 1,
+      parts_total: 1, unsent_chars: 0, outcome: "sent", how: "direct", origin: "mcp", text_truncated: false,
+      text_chars: 25, begun_at_ms: page.clock(), sent_at_ms: page.clock(),
+    },
+  });
+  await page.el("hang-up").click();
+  await watchTurns(page);
+  for (const wake of settle) wake();
+  await watchTurns(page);
+  const rows = page.el("transcript").children;
+  const card = sentCards(page)[0];
+  assert.ok(card, "the last moment's send was never drawn");
+  const boundary = rows.find((li) => li.getAttribute("data-ends") === "conv_last");
+  assert.ok(boundary, "the line that ends the call does not say which call it ends");
+  assert.ok(rows.indexOf(card) < rows.indexOf(boundary), "the send was drawn below the end of its call");
+  assert.equal(page.claims.at(-1).id, "conv_last");
+});
+
+test("`#270 voice-transcript-markers`: a claim the server refuses keeps the card and never stops the recording", async () => {
+  for (const [status, noted] of [[404, true], [409, false], [400, true], [413, true]]) {
+    const page = newPage();
+    await recordingCall(page);
+    page.claimStatus = status;
+    page.propose(proposal({ reply_to: null }));
+    await page.settle();
+    page.expireTimers(2000);
+    await page.el("post-confirm-send").click();
+    await watchTurns(page);
+    assert.equal(sentCards(page).length, 1, `${status} took the card away`);
+    assert.equal(/Not kept in the stored transcript/.test(wordsOf(sentCards(page)[0])), noted, String(status));
+    // The next turn is still recorded.
+    const before = page.storeCalls.length;
+    youSay(page, "and the next thing");
+    page.sockets[0].onmessage({ data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "ok" } }) });
+    await watchTurns(page);
+    assert.ok(page.storeCalls.length > before, `${status} stopped the recording`);
+  }
+});
+
+test("`#270 voice-transcript-markers`: a server that does not take records is sent no claim, no records=1 and no cursor", async () => {
+  const page = newPage();
+  await startTalkingNamed(page, "conv_old");
+  await page.settle();
+  page.propose(proposal({ reply_to: null }));
+  await page.settle();
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await watchTurns(page);
+  assert.equal(sentCards(page).length, 1, "the live card should still freeze on screen");
+  assert.ok(!wordsOf(sentCards(page)[0]).includes("Not kept"), "an old server's card nags about keeping");
+  assert.deepEqual(page.claims, []);
+  assert.ok(!proposalWatches(page).some((r) => r.includes("sent_after")), "the cursor went to an old server");
+  assert.ok(!page.transcriptCalls.some((r) => r.includes("records=1")), "records=1 went to an old server");
+});
+
+test("`#270 voice-transcript-markers`: a restored record asks for records and draws its sends as the same frozen cards", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "agent", text: "To lead team: ship it. Send it?", at_ms: 1_700_000_000_000 },
+    { speaker: "you", text: "yes", at_ms: 1_700_000_000_001 },
+    { speaker: "marker", text: "", at_ms: 1_700_000_000_002, detail: { kind: "not_sent", why: "lapsed", serial: 3 } },
+    {
+      speaker: "sent", text: "ship it", at_ms: 1_700_000_000_003,
+      detail: {
+        kind: "sent", serial: 4, send_seq: 2, channel_id: CHANNEL.id, channel_name: "lead team", reply_to: "11",
+        reply_to_author: "Alex", reply_to_excerpt: "is it green", parts_posted: 1, parts_total: 2, unsent_chars: 40,
+        outcome: "partial", how: "voice", origin: "commit", text_truncated: false, text_chars: 7,
+        begun_at_ms: 1_700_000_000_000, sent_at_ms: 1_700_000_000_003,
+      },
+    },
+  ]);
+  await signIn(page);
+  await page.settle();
+  assert.ok(page.transcriptCalls.some((r) => r.includes("records=1")), "the record was read without its records");
+  const cards = sentCards(page);
+  assert.equal(cards.length, 1, "the stored send was not drawn as a frozen card");
+  const said = wordsOf(cards[0]);
+  assert.match(said, /Partly sent to lead team/);
+  assert.match(said, /approved by voice/);
+  assert.match(said, /replying to Alex: “is it green”/);
+  assert.match(said, /Part 1 of 2 went; the rest \(40 characters\) was not sent\./);
+  assert.ok(!said.includes("11"), "the reply's id reached the screen");
+  // The marker is not a turn: nothing is drawn for it, and the boundary says which call it ends.
+  assert.ok(!page.el("transcript").children.some((li) => wordsOf(li).includes("lapsed")));
+  const boundary = page.el("transcript").children.find((li) => li.className === "seam");
+  assert.equal(boundary.getAttribute("data-ends"), "conv_earlier");
+});
+
+test("`#270 voice-transcript-markers`: Open in channel takes the owner to the message the card sent", async () => {
+  const page = newPage();
+  await recordingCall(page);
+  page.propose(proposal({ reply_to: null }));
+  await page.settle();
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await watchTurns(page);
+  const card = sentCards(page)[0];
+  const open = card.children.find((kid) => kid.hasClass("sent-open"));
+  assert.ok(open, "a card for a message with an id has no way to open it");
+  const id = String(page.storedTurns.get("conv_cards").at(-1).detail.message_id);
+  page.messages = [message({ id, channel_id: CHANNEL.id, content: "on it" })];
+  await open.click();
+  await watchTurns(page, 8);
+  assert.equal(page.tab(), "discord", "Open in channel did not open the channel");
+  const row = page.el("discord-log").children.find((li) => String(li.getAttribute("data-ids") || "").includes(id));
+  assert.ok(row && row.getAttribute("data-landed") === "true", "the message was not brought into view");
+});
+
 test("a read-scope call never asks about proposals", async () => {
   const page = newPage();
   page.tokenScope = "read";
@@ -33451,8 +33811,14 @@ test("`#264 voice-send-approval`: a plain yes after an uninterrupted read-back s
     !session_lines(page).some((li) => li.text().includes("Voice page")),
     "the page's notice was shown as the owner's words"
   );
-  const seam = page.el("transcript").children.find((li) => li.className === "seam");
-  assert.equal(seamLabel(seam), "Sent by voice");
+  // `#270 voice-transcript-markers`. The send is a frozen card that says how it was approved, and no
+  // seam says it a second time.
+  assert.ok(!page.el("transcript").children.some((li) => li.className === "seam"), "a seam said it again");
+  const card = page.el("transcript").children.find((li) => li.hasClass("sent-card"));
+  assert.ok(card, "the send left no frozen card");
+  const words = (node) => [node.textContent, ...node.children.map(words)].join(" ");
+  assert.match(words(card), /Sent to lead team/);
+  assert.match(words(card), /approved by voice/);
   assert.deepEqual(tonesSince(page, sources), ["sent"], "no rising pair said it was sent");
 
   // Saying it again is not a second send: there is nothing on the card to send.
@@ -34452,8 +34818,25 @@ const COMMIT_FAILURES = [
     notice: /^Voice page: only part of the message reached lead team; the rest was NOT sent\./,
     tapNotice: /^Voice page: only part of the message reached lead team; the rest was NOT sent\./,
     status: "Only part reached lead team — the rest was not sent.",
-    seam: "Partly sent",
+    // `#270 voice-transcript-markers`: what went is a frozen card, never a seam.
+    seam: null,
+    card: /Partly sent to lead team/,
     screen: /^Only part of the message reached lead team: /,
+  },
+  {
+    name: "a 207 whose answer for the first part was lost",
+    answer: (page) => {
+      page.settleProposal();
+      return json(207, {
+        error: "partially_posted", detail: "timed out", posted: 0, unsent: "on it, rebasing now", uncertain: true,
+      });
+    },
+    notice: /^Voice page: I could not confirm whether the message was sent\. Tell the user to check the channel/,
+    tapNotice: /^Voice page: I could not confirm whether the message was sent\./,
+    status: "Could not confirm the send — check the channel.",
+    seam: null,
+    card: /Not confirmed: lead team/,
+    screen: /could not be confirmed: timed out\. Check the channel/,
   },
   {
     name: "a request that never came back",
@@ -34481,7 +34864,14 @@ test("`#264 voice-send-approval`: a spoken commit that is refused, partly posted
     assert.doesNotMatch(notices[0], /was SENT/, failure.name);
     assert.equal(page.el("status").textContent, failure.status, failure.name);
     const seams = page.el("transcript").children.filter((li) => li.className === "seam");
-    assert.equal(seamLabel(seams.at(-1)), failure.seam, failure.name);
+    if (failure.seam === null) {
+      assert.equal(seams.length, 0, `${failure.name}: a seam beside the frozen card`);
+      const card = page.el("transcript").children.find((li) => li.hasClass("sent-card"));
+      const words = (node) => [node.textContent, ...node.children.map(words)].join(" ");
+      assert.ok(card && failure.card.test(words(card)), `${failure.name}: no frozen card said so`);
+    } else {
+      assert.equal(seamLabel(seams.at(-1)), failure.seam, failure.name);
+    }
     assert.ok(!seams.some((li) => seamLabel(li) === "Sent by voice"), `${failure.name}: a seam said sent`);
     assert.deepEqual(tonesSince(page, sources), ["not sent"], failure.name);
   }

@@ -172,8 +172,9 @@ send-order-browser:
 # out as the next message -- in the list on the call's view and the channel, docked on Settings --
 # with Send's centre at least 0.62 of the way down the screen, uncovered, wholly on screen with where
 # the draft goes, the box's own Send out of the way, the card at the owner's own inset, and both
-# buttons held when it appears. Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to
-# keep a PNG of each placement.
+# buttons held when it appears; then the frozen card it becomes, filed after its commit and restored
+# by a reload (`#270 voice-transcript-markers`). Pass WEB_ROOT=dir for another copy of the page,
+# SCREENSHOTS=dir to keep a PNG of each placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

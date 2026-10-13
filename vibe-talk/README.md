@@ -6856,10 +6856,18 @@ something else does not derail the conversation. The prompt tells the agent neve
 before that notice, so it never claims a send that did not happen, and its context stays truthful
 for a later "did it go?". The page also says it itself, because a model's sentence needs a
 cooperative model: the status line ("Sent to lead team." / "Not sent — the read-back was
-interrupted."), a transcript seam, and a short tone queued after the speech already playing — a
+interrupted."), the transcript, and a short tone queued after the speech already playing — a
 rising pair for sent, one low note for not sent; none when Sound is off or in a typed call. A tap on
 **Send** or **Don't send** during a call is told to the agent too (the screen already says it), so
 an agent waiting on "Send it?" hears the result.
+
+In the transcript, a message that went — tapped, said yes to, or sent without asking — is a
+**frozen card** (`#270 voice-transcript-markers`): the card it was sent from, at the same place,
+saying "Sent to lead team", "Partly sent to …" or "Not confirmed: …", when, how it was approved,
+what it answered, and Open in channel. It is drawn from the commit's answer, or from the server's
+send memory when that answer was lost, when the send settled after hang-up, or when it was a direct
+send; a server that takes records files it in the stored transcript from its own copy, so a reload
+draws the same card. A yes that sent nothing is a seam, as before.
 
 **What a spoken yes cannot know**, stated plainly:
 

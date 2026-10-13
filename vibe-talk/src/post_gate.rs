@@ -233,7 +233,10 @@ struct Inner {
     /// The send memory, oldest first. `#270 voice-transcript-markers`.
     sends: VecDeque<RecentSend>,
     /// The last `send_seq` handed out. Never reset, not even by a purge, so a page's cursor never
-    /// points at a number that will be handed out again in the same process.
+    /// points at a number that will be handed out again in the same process. It starts at the
+    /// server's clock in milliseconds ([`PostGate::with_ttl`]), so it does not start again after a
+    /// restart either: a page that read the last process's numbers still reads every send of this
+    /// one, because each is numbered above them.
     send_seq: u64,
 }
 
@@ -614,9 +617,19 @@ impl PostGate {
     /// A gate with a different lifetime. For tests, which should not wait two minutes.
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
+        Self::with_ttl_and_numbering(ttl, u64::try_from(crate::store::now_ms()).unwrap_or(0))
+    }
+
+    /// A gate whose send memory numbers from `send_seq_base`: the first send settled is one above
+    /// it. For tests, which want small numbers; [`PostGate::with_ttl`] starts from the clock.
+    #[must_use]
+    pub fn with_ttl_and_numbering(ttl: Duration, send_seq_base: u64) -> Self {
         let (changed, _) = watch::channel(0);
         Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                send_seq: send_seq_base,
+                ..Inner::default()
+            }),
             ttl,
             changed,
         }
@@ -1110,6 +1123,11 @@ fn fresh_handle() -> String {
 mod tests {
     use super::*;
 
+    /// A gate whose sends number from one, so a test can name them.
+    fn numbered_from_zero() -> PostGate {
+        PostGate::with_ttl_and_numbering(PROPOSAL_TTL, 0)
+    }
+
     fn binding(text: &str) -> Binding {
         Binding {
             channel_id: "111".to_owned(),
@@ -1150,7 +1168,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_matching_commit_spends_the_proposal_exactly_once() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (proposal, displaced) = gate.propose(binding("ship it"));
         assert!(displaced.is_none());
         assert_eq!(
@@ -1177,7 +1195,7 @@ mod tests {
                 ..binding("ship it")
             },
         ] {
-            let gate = PostGate::new();
+            let gate = numbered_from_zero();
             let (proposal, _) = gate.propose(binding("ship it"));
             assert_eq!(
                 take(&gate, &proposal.handle, &restated).map_err(|e| e.0),
@@ -1194,7 +1212,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_expired_proposal_is_refused_as_expired() {
-        let gate = PostGate::with_ttl(Duration::from_secs(5));
+        let gate = PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0);
         let (proposal, _) = gate.propose(binding("late"));
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(gate.pending().is_none());
@@ -1207,7 +1225,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_commit_that_is_first_to_notice_the_expiry_refuses_it_and_wakes_watchers() {
         // Nothing reads `pending` first here, so the lapse is found inside `take` itself.
-        let gate = PostGate::with_ttl(Duration::from_secs(5));
+        let gate = PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0);
         let (proposal, _) = gate.propose(binding("late"));
         let changes = gate.changed.subscribe();
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -1221,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_proposal_supersedes_the_pending_one() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (first, _) = gate.propose(binding("draft one"));
         let (second, displaced) = gate.propose(binding("draft two"));
         assert_eq!(
@@ -1244,7 +1262,7 @@ mod tests {
     async fn the_same_direct_send_is_not_begun_twice_on_its_way_or_within_a_minute() {
         // `#264 voice-send-approval`: a retried tool call, or an owner's "try again" after a lost
         // answer, must not post the same words twice.
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (draft, _) = gate.propose(binding("draft"));
         let changes = gate.changed.subscribe();
         let first = direct(&gate, binding("rebase")).expect("nothing like it yet");
@@ -1310,7 +1328,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_direct_send_that_certainly_posted_nothing_is_forgotten_and_an_unknown_one_is_not() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         direct(&gate, binding("refused"))
             .expect("first")
             .finish(None);
@@ -1343,7 +1361,7 @@ mod tests {
     async fn a_direct_send_abandoned_on_its_way_is_remembered_as_unconfirmed() {
         // A client that hangs up mid-call drops the request, and the post may already be on the
         // wire: that is a send nobody can confirm, not one that never happened.
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let ticket = direct(&gate, binding("rebase")).expect("first");
         drop(ticket);
         let repeat = direct(&gate, binding("rebase")).expect_err("an abandoned send was forgotten");
@@ -1361,7 +1379,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_commit_enters_the_send_memory_as_it_is_taken_and_publishes_when_it_settles() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (proposal, _) = gate.propose(binding("ship it"));
         let (taken, ticket) = gate
             .take(
@@ -1399,7 +1417,7 @@ mod tests {
     #[tokio::test]
     async fn send_seq_follows_the_order_sends_settle_in_not_their_serials() {
         // Two direct sends, settling out of serial order: a cursor of serials would skip the first.
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let early = direct(&gate, binding("early")).expect("first");
         let late = direct(&gate, binding("late")).expect("second");
         assert!(early.serial() < late.serial());
@@ -1424,7 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_send_that_certainly_posted_nothing_is_never_published() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (proposal, _) = gate.propose(binding("refused upstream"));
         let (_, ticket) = gate
             .take(
@@ -1440,7 +1458,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_long_text_is_filed_capped_and_says_how_long_it_was() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let long = "word ".repeat(MAX_TURN_CHARS);
         let ticket = direct(&gate, binding("long")).expect("first");
         ticket.finish(Some(SendReport {
@@ -1458,7 +1476,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_send_memory_holds_thirty_two_for_fifteen_minutes_and_forgetting_empties_it() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         for i in 0..40 {
             direct(&gate, binding(&format!("m{i}")))
                 .expect("distinct words")
@@ -1490,7 +1508,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_settled_send_is_claimed_once_and_forgetting_its_conversation_forgets_it() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         direct(&gate, binding("ship it"))
             .expect("first")
             .finish(Some(report(SendOutcome::Sent, false)));
@@ -1514,9 +1532,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_gate_numbers_its_sends_above_the_clock_so_a_restart_never_numbers_lower() {
+        let before = u64::try_from(crate::store::now_ms()).expect("after 1970");
+        let first = PostGate::new();
+        assert!(first.sends_through() >= before);
+        direct(&first, binding("one"))
+            .expect("first")
+            .finish(Some(report(SendOutcome::Sent, false)));
+        let read_through = first.sends_through();
+        // The next process: every send it numbers is past a cursor the last one handed out.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let next = PostGate::new();
+        direct(&next, binding("two"))
+            .expect("first")
+            .finish(Some(report(SendOutcome::Sent, false)));
+        let (sends, _) = next.sends_after(read_through);
+        assert_eq!(
+            sends.len(),
+            1,
+            "the restarted server's send fell under the old cursor"
+        );
+        assert_eq!(sends[0].text, "words");
+    }
+
+    #[tokio::test]
     async fn a_cursor_ahead_of_this_process_is_read_as_zero() {
         // The page read from a server that has since restarted.
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         direct(&gate, binding("after the restart"))
             .expect("first")
             .finish(Some(report(SendOutcome::Sent, false)));
@@ -1526,14 +1568,14 @@ mod tests {
 
     #[tokio::test]
     async fn fates_tell_committed_cancelled_expired_superseded_and_refused_apart() {
-        let gate = PostGate::with_ttl(Duration::from_millis(1));
+        let gate = PostGate::with_ttl_and_numbering(Duration::from_millis(1), 0);
         let (lapsing, _) = gate.propose(binding("lapses"));
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(gate.pending().is_none());
         let gate_fates = gate.fates();
         assert_eq!(gate_fates, [(lapsing.serial, ProposalFate::Expired)]);
 
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (replaced, _) = gate.propose(binding("one"));
         let (cancelled, _) = gate.propose(binding("two"));
         gate.cancel(&cancelled.handle).expect("cancel");
@@ -1563,7 +1605,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_long_poll_wakes_for_a_settled_send_only_when_it_reads_the_send_memory() {
-        let gate = std::sync::Arc::new(PostGate::new());
+        let gate = std::sync::Arc::new(numbered_from_zero());
         // Not reading the send memory: a settle does not end the wait.
         let blind = {
             let gate = gate.clone();
@@ -1604,7 +1646,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_proposal_cannot_be_committed() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (proposal, _) = gate.propose(binding("never mind"));
         assert_eq!(gate.cancel(&proposal.handle), Ok(proposal.clone()));
         assert_eq!(gate.cancel(&proposal.handle), Err(Refusal::Used));
@@ -1616,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_handle_that_was_never_issued_is_unknown_and_disturbs_nothing() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let (proposal, _) = gate.propose(binding("real"));
         assert_eq!(
             take(&gate, "made-up", &binding("real")).map_err(|e| e.0),
@@ -1628,7 +1670,7 @@ mod tests {
 
     #[tokio::test]
     async fn handles_are_distinct_and_unguessably_long() {
-        let gate = PostGate::new();
+        let gate = numbered_from_zero();
         let mut seen = std::collections::HashSet::new();
         for i in 0..100 {
             let (proposal, _) = gate.propose(binding(&format!("m{i}")));
@@ -1640,7 +1682,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_commits_of_one_handle_post_at_most_once() {
-        let gate = std::sync::Arc::new(PostGate::new());
+        let gate = std::sync::Arc::new(numbered_from_zero());
         let (proposal, _) = gate.propose(binding("once"));
         let mut tasks = Vec::new();
         for _ in 0..16 {
@@ -1661,7 +1703,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_long_poll_wakes_for_a_new_proposal_and_for_an_expiry() {
-        let gate = std::sync::Arc::new(PostGate::with_ttl(Duration::from_secs(5)));
+        let gate = std::sync::Arc::new(PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0));
         let waiter = {
             let gate = gate.clone();
             tokio::spawn(async move {
