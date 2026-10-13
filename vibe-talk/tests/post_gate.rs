@@ -1041,6 +1041,42 @@ async fn forgetting_the_stored_conversations_or_purging_empties_the_send_memory(
     }
 }
 
+#[tokio::test]
+async fn every_answer_names_the_run_of_the_server_that_numbered_its_proposal_and_sends() {
+    // A page stays open across a restart, and the next run numbers its proposals from one again:
+    // the run's name is what keeps the next run's serial 3 from being taken for the last run's.
+    let first = harness();
+    let proposal = propose(&first, "on my way").await;
+    let run = proposal["instance"]
+        .as_str()
+        .expect("the proposal names its run")
+        .to_owned();
+    assert!(!run.is_empty());
+    let (status, _) = commit(&first, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::OK);
+    let answer = sends_after(&first, 0).await;
+    assert_eq!(answer["instance"], run.as_str(), "{answer}");
+    assert_eq!(answer["sends"][0]["instance"], run.as_str(), "{answer}");
+    assert!(answer["sends_through"].is_u64(), "{answer}");
+    assert!(answer["now_ms"].is_i64(), "{answer}");
+    // No transcript row keeps it: a stored send is named by its `send_seq` alone.
+    assert!(
+        answer["sends"][0]["detail"].get("instance").is_none(),
+        "{answer}"
+    );
+
+    let restarted = harness();
+    let again = propose(&restarted, "on my way").await;
+    assert_eq!(
+        again["serial"], proposal["serial"],
+        "the serials came round again"
+    );
+    assert_ne!(
+        again["instance"], proposal["instance"],
+        "the next run has the same name"
+    );
+}
+
 // --- #270 voice-transcript-markers: claims and markers through the append route ------------------
 
 fn store_harness() -> Harness {
