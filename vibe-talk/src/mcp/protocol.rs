@@ -1285,7 +1285,7 @@ async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
             &channel,
             &text,
             reply_to.as_deref(),
-            parts.len(),
+            &parts,
         )),
         // Not an error: nothing failed, and a client that retries errors must not be invited to.
         crate::send_approval::VoicePost::Repeat {

@@ -2031,12 +2031,7 @@ pub async fn propose_post(
         }) => Ok(Json(ProposedResponse {
             sent: true,
             serial,
-            result: crate::send_approval::sent_notice(
-                &channel,
-                &text,
-                reply_to.as_deref(),
-                parts.len(),
-            ),
+            result: crate::send_approval::sent_notice(&channel, &text, reply_to.as_deref(), &parts),
         })
         .into_response()),
         // The same words to the same place moments after an earlier direct send: nothing posted.

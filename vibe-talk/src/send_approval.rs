@@ -42,9 +42,11 @@
 //!
 //! # Why this is its own module
 //!
-//! The direct send calls [`crate::ops::reply`] and nothing below it. Splitting a long post is being
-//! reworked inside `ops::reply_scoped`, and keeping this out of that function means there is still
-//! exactly one place that decides how a long message goes out.
+//! The direct send calls [`crate::ops::reply`] and nothing below it. How a long post is cut, and
+//! where its parts go — the first in the conversation and the rest in the thread under it where
+//! the provider continues a long message there (`#263 post-split-per-provider`) — is decided inside
+//! `ops::reply_scoped`, and keeping this out of that function means there is still exactly one
+//! place that decides how a long message goes out.
 
 use crate::model::{ChannelInfo, Message};
 use crate::ops::{self, OpError};
@@ -280,21 +282,31 @@ pub async fn voice_post(
 
 /// What a model is told after a direct send: `SENT.` first, then what went where, in words it can
 /// repeat, and that calling again would post again.
+///
+/// `parts` are the messages posted, in order. Where the provider continued a long post in its
+/// first part's thread (`#263 post-split-per-provider`) the notice says so: a speaker told only
+/// that it went as several messages looks in the channel and finds one.
 #[must_use]
 pub fn sent_notice(
     channel: &ChannelInfo,
     text: &str,
     reply_to: Option<&str>,
-    parts: usize,
+    parts: &[Message],
 ) -> String {
     let target = match reply_to {
         Some(message) => format!(" as a reply to message {message}"),
         None => String::new(),
     };
-    let split = if parts > 1 {
-        format!("\nIt was long, so it went as {parts} messages.")
-    } else {
-        String::new()
+    let count = parts.len();
+    // A direct send goes to the conversation itself, so a later part that is in a thread is in the
+    // one its first part started: the rule the page's own receipt for a long post keeps.
+    let split = match parts {
+        [] | [_] => String::new(),
+        [_, rest @ ..] if rest.iter().any(|part| part.thread.is_some()) => format!(
+            "\nIt was long, so it went as {count} messages: the first in the channel, and the rest \
+             in the thread under it."
+        ),
+        _ => format!("\nIt was long, so it went as {count} messages."),
     };
     format!(
         "SENT. Posted to {channel} (id {id}){target} as the owner's bot.\n\
@@ -466,7 +478,7 @@ mod tests {
         };
         assert_eq!(discord.posted().len(), 1);
         assert!(state.post_gate.pending().is_none());
-        let said = sent_notice(&channel, &text, reply_to.as_deref(), parts.len());
+        let said = sent_notice(&channel, &text, reply_to.as_deref(), &parts);
         assert!(
             said.starts_with("SENT. Posted to lead team (id 2222222222) as a reply to message 42"),
             "{said}"

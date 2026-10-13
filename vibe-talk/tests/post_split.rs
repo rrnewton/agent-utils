@@ -543,3 +543,117 @@ async fn a_long_discord_post_is_still_consecutive_messages_in_the_channel() {
         "a Discord part was placed in a thread"
     );
 }
+
+// --- a direct voice send ---------------------------------------------------------------------------
+
+/// `post_reply` through MCP, as a voice agent calls it, and the sentence its model is handed.
+async fn voice_post_reply(state: &AppState, text: &str) -> String {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "post_reply",
+                    "arguments": { "channel_id": WRITE_CHANNEL, "text": text },
+                },
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("a JSON-RPC answer");
+    body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `#264 voice-send-approval` with "Ask me before the voice agent sends" off. The direct send is
+/// the same send as every other, so a long one to Google Chat is one message in the conversation
+/// with the rest in its thread, and the model is told where the rest is: a speaker told only that
+/// it went as several messages looks in the channel and finds one. One that fails part-way answers
+/// the REST route with the reply route's 207, naming that thread, and tells the model it was partly
+/// sent.
+#[tokio::test]
+async fn a_direct_voice_send_continues_in_the_first_parts_thread_and_says_where() {
+    let (state, posts, task) = google_chat(600, &[]).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let said = voice_post_reply(&state, &prose(2_400)).await;
+    {
+        let posts = posts.lock().expect("posts");
+        assert!(posts.len() > 2, "the fixture did not split");
+        assert_eq!(
+            posts[0].0, MAIN,
+            "the first part did not go to the conversation"
+        );
+        assert!(
+            posts[1..]
+                .iter()
+                .all(|(path, _)| path == &in_thread("t_91940001")),
+            "a later part was not posted in the first part's thread"
+        );
+        assert!(said.starts_with("SENT. "), "{said}");
+        assert!(
+            said.contains(&format!(
+                "It was long, so it went as {} messages: the first in the channel, and the rest \
+                 in the thread under it.",
+                posts.len()
+            )),
+            "{said}"
+        );
+    }
+    task.abort();
+
+    let (state, posts, task) = google_chat(600, &[2]).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let (status, partial) = call(
+        &state,
+        "/api/v1/post-proposals",
+        json!({ "channel_id": WRITE_CHANNEL, "text": prose(2_400) }),
+    )
+    .await;
+    let shown = brief(&partial);
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{shown}");
+    assert_eq!(partial["posted"], 1, "{shown}");
+    assert_eq!(
+        partial["thread_id"], "t_91940001",
+        "the 207 did not say where the rest goes: {shown}"
+    );
+    assert_eq!(posts.lock().expect("posts").len(), 2);
+    task.abort();
+
+    // The tool, the same failure: the part whose answer was lost may be in the thread, so the
+    // model is told it was partly sent and not that the rest was not.
+    let (state, _posts, task) = google_chat(600, &[2]).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let said = voice_post_reply(&state, &prose(2_400)).await;
+    assert!(said.starts_with("PARTLY SENT. "), "{said}");
+    assert!(!said.contains("The rest was NOT sent"), "{said}");
+    task.abort();
+}
