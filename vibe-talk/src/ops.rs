@@ -490,7 +490,20 @@ pub async fn message_by_id_scoped(
     Ok((channel, message))
 }
 
+/// What [`timeline`] answers: the channel, the page, and the instant the provider read for it
+/// began.
+pub type TimelineRead = (
+    ChannelInfo,
+    crate::threads::TimelinePage,
+    std::time::Instant,
+);
+
 /// Browse a channel or its threads through the provider's own pagination contract.
+///
+/// Answers with the instant the provider read BEGAN, too: what the page says was true then or a
+/// little later, unless it carries `as_of`. Thread naming compares it with when the rows it
+/// already holds were read (`#278 naming-throttle`; see
+/// [`crate::summarize::threads::ThreadNames::annotate`]).
 ///
 /// `request.after` is the PAGE-VISIBLE forward cursor, vibe-talk's envelope around either the
 /// backend's own cursor or a generic position; see [`crate::timeline_forward`]. It is unwrapped
@@ -507,7 +520,7 @@ pub async fn timeline(
     state: &AppState,
     channel_id: &str,
     request: &crate::threads::TimelineRequest,
-) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
+) -> Result<TimelineRead, OpError> {
     use crate::timeline_forward::{self as forward, Forward};
     let channel = allowed(state, channel_id).await?;
     request.one_direction()?;
@@ -574,7 +587,7 @@ pub async fn timeline(
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
     }
-    Ok((channel, page))
+    Ok((channel, page, fetch_began))
 }
 
 /// One speakable line per recent message, and what was left out of it.

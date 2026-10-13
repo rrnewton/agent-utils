@@ -1515,7 +1515,7 @@ pub async fn timeline(
         after: query.after,
         limit,
     };
-    let (channel, mut page) = ops::timeline(&state, &channel_id, &request).await?;
+    let (channel, mut page, read_began) = ops::timeline(&state, &channel_id, &request).await?;
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
     crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
@@ -1529,6 +1529,7 @@ pub async fn timeline(
             &channel.id,
             &request,
             &mut page,
+            read_began,
             caller >= crate::auth::Scope::Write,
         )
         .await;

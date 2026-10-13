@@ -395,8 +395,9 @@ fn channel() -> ChannelId {
     ChannelId("2222222222".to_owned())
 }
 
-/// The thread list as the provider answers it, before any name is attached.
-async fn thread_page(threads: &Threads) -> (TimelineRequest, TimelinePage) {
+/// The thread list as the provider answers it, before any name is attached, and when the read
+/// for it began (what `ThreadNames::annotate` is told).
+async fn thread_page(threads: &Threads) -> (TimelineRequest, TimelinePage, std::time::Instant) {
     let request = TimelineRequest {
         view: TimelineView::Threads,
         thread_id: None,
@@ -404,11 +405,12 @@ async fn thread_page(threads: &Threads) -> (TimelineRequest, TimelinePage) {
         after: None,
         limit: 50,
     };
+    let read_began = std::time::Instant::now();
     let page = threads
         .fetch_timeline(&channel(), &request)
         .await
         .expect("a page");
-    (request, page)
+    (request, page, read_began)
 }
 
 /// Each thread's id and display name, from an annotated page.
@@ -694,18 +696,18 @@ async fn a_store_that_cannot_be_read_never_gives_a_thread_a_second_name() {
     call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
     until_named(&h.names, 2).await;
     let deps = ThreadDeps::from_state(&h.state);
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     h.names
-        .annotate(&deps, &channel(), &request, &mut page, true)
+        .annotate(&deps, &channel(), &request, &mut page, read, true)
         .await;
     let names_before = page_names(&page);
 
     // A restart, so nothing is in memory, and the store's next read fails.
     let names = Arc::new(ThreadNames::new());
     h.store.fail_next("the disk is busy");
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     names
-        .annotate(&deps, &channel(), &request, &mut page, true)
+        .annotate(&deps, &channel(), &request, &mut page, read, true)
         .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
@@ -725,9 +727,9 @@ async fn a_store_that_cannot_be_read_never_gives_a_thread_a_second_name() {
     );
 
     // Once the store answers, the name it held is the name shown.
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     names
-        .annotate(&deps, &channel(), &request, &mut page, true)
+        .annotate(&deps, &channel(), &request, &mut page, read, true)
         .await;
     assert_eq!(page_names(&page), names_before);
 }
@@ -740,28 +742,28 @@ async fn a_naming_queued_on_stale_knowledge_keeps_the_name_already_filed() {
     let h = harness();
     let deps = ThreadDeps::from_state(&h.state);
     let stale = Arc::new(ThreadNames::new());
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     stale
-        .annotate(&deps, &channel(), &request, &mut page, false)
+        .annotate(&deps, &channel(), &request, &mut page, read, false)
         .await;
     assert!(page_names(&page).iter().all(|(_, name)| name.is_none()));
 
     call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
     until_named(&h.names, 2).await;
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     h.names
-        .annotate(&deps, &channel(), &request, &mut page, false)
+        .annotate(&deps, &channel(), &request, &mut page, read, false)
         .await;
     let filed = page_names(&page);
 
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     stale
-        .annotate(&deps, &channel(), &request, &mut page, true)
+        .annotate(&deps, &channel(), &request, &mut page, read, true)
         .await;
     until_named(&stale, 2).await;
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     stale
-        .annotate(&deps, &channel(), &request, &mut page, false)
+        .annotate(&deps, &channel(), &request, &mut page, read, false)
         .await;
     assert_eq!(page_names(&page), filed, "a filed name was replaced");
 }
@@ -806,9 +808,9 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
             .await
             .unwrap();
     }
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     h.names
-        .annotate(&deps, &channel(), &request, &mut page, true)
+        .annotate(&deps, &channel(), &request, &mut page, read, true)
         .await;
     let touched = || async {
         let text = h
@@ -897,9 +899,9 @@ async fn an_active_thread_keeps_its_sentence_row_alive_with_its_name() {
     };
     assert_eq!(sentence_made().await, old * 1_000);
 
-    let (request, mut page) = thread_page(&h.threads).await;
+    let (request, mut page, read) = thread_page(&h.threads).await;
     h.names
-        .annotate(&deps, &channel(), &request, &mut page, true)
+        .annotate(&deps, &channel(), &request, &mut page, read, true)
         .await;
     for _ in 0..100 {
         if sentence_made().await > old * 1_000 {

@@ -1509,7 +1509,9 @@ Names are produced **in the background, never on the read path**: a thread-list 
 write-scope token queues the threads that are due, and they are named one at a time — find the
 thread's root and newest messages, one call, file the result. A read token is shown names that
 exist but never causes a call. A name produced after a page was read reaches it on its next
-refresh, a forward delta included. A thread whose naming failed is left alone for ten minutes. The
+refresh, a forward delta included: for up to fifteen minutes, deltas of the thread list carry the
+thread with its new name, as the newest page this server served showed it, unless a delta has said
+it left the list. A thread whose naming failed is left alone for ten minutes. The
 model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
 characters); any other answer fails that naming by name rather than being cut into shape.
 
@@ -1517,19 +1519,29 @@ characters); any other answer fails that naming by name rather than being cut in
 expensive (a bridge that rebuilds a whole space for each read), background naming used to be most
 of the thread reads a deployment made. So:
 
-* A thread whose messages this server has **just read** is named from them, with no read: the
-  thread list's own root, which is all of a thread with no replies, and what a thread page you
-  opened or a Flat page (which on a bridge carries every reply) brought in the last 30 seconds. A
+* A thread whose messages this server has **just read** is named from them, with no read: what
+  the thread list (its own root, which is all of a thread with no replies), a thread page you
+  opened, or a Flat page (which on a bridge carries every reply) brought in the last 30 seconds. A
   queued thread you open is named from that read straight away.
 * Those messages stand in for a read only when they are what the read would bring, because a name
-  is kept for good. The thread's reply count must be exact and at most 50, exactly that many
-  replies must be held, and the newest of them must be no older than the thread's last activity.
-  They are looked up when the thread's turn comes, so an edit or delete pushed while it waits
-  sends it to the provider instead. A thread of more than 50 replies is always read: the replies
-  held might be an older page you scrolled to rather than its newest.
-* One staleness remains: a reply edited upstream with nothing pushed, within those 30 seconds,
-  changes neither the count nor the last activity, so the thread is named from the text as the
-  page read it. A provider that pushes edits (a bridge with a tail) closes it.
+  is kept for good. Nothing is copied when a thread is queued: when its turn comes, its messages,
+  root included, are looked up in what was read in the last 30 seconds, and checked against the
+  newest reply count any page has shown for it since (every page refreshes a queued thread's
+  count and last activity). That count must be exact, at most 50, read in the last 30 seconds from
+  a page the provider had brought up to date, and read no earlier than any of the replies held;
+  exactly that many replies must be held, and the newest of them must be no older than the
+  thread's last activity. So an edit or delete pushed while the thread waits, a reply added, a
+  delta saying it left the list, or messages that have expired all send it to the provider
+  instead. A thread of more than 50 replies is always read: the replies held might be an older
+  page you scrolled to rather than its newest.
+* What this cannot see is a change nobody pushed, within those 30 seconds. An edit, to the root
+  or a reply, changes neither the count nor the last activity, so the thread is named from the
+  text as the page read it; and a deleted reply can still be among the messages a thread is named
+  from, or a deleted thread still be named. A provider that pushes edits and deletes (a bridge
+  with a tail) closes it.
+* Being strict costs reads: a Flat page read *after* the thread list is not used until a page
+  shows the thread's count again, and a thread list the provider could not bring up to date
+  (`as_of`) names nothing without a read.
 * Any other thread costs one read, and naming reads **at most one thread per channel every 30
   seconds**. Twenty unnamed threads in one channel are named over ten minutes, not in one burst;
   at most 64 of one channel's threads wait at a time, so other channels are not held behind

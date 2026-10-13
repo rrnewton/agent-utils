@@ -13,12 +13,18 @@
 //!   minutes.
 //!
 //! And the limits on the first rule, each counted as the read it does NOT save: held rows stand in
-//! for a read only when they are what the read would bring (looked up at the thread's turn, an
-//! exact count of at most 50 matched exactly, the newest reply no older than the thread's last
-//! activity). Plus two queue rules: a channel taken off the list is not read or filed for, and one
-//! channel's backlog does not keep another's threads out of the queue.
+//! for a read only when they are what the read would bring. They are looked up at the thread's
+//! turn, the root included, never copied when it is queued, and checked against the newest summary
+//! any page has carried of the thread since: an exact count of at most 50, from a current page,
+//! read no earlier than any reply held, matched exactly, the newest reply no older than the
+//! thread's last activity. What changes while a thread waits (an edit or delete pushed, a reply
+//! added, a delta that removes it) is seen at its turn, and a renamed thread rides a delta as the
+//! newest page showed it. Plus two queue rules: a channel taken off the list is not read or filed
+//! for, and one channel's backlog does not keep another's threads out of the queue.
 //!
-//! Every test runs on tokio's paused clock, so minutes of budget cost no wall time.
+//! Every test runs on tokio's paused clock, so minutes of budget cost no wall time. Read-ahead
+//! keeps its rows by the wall clock, which these tests barely move, so a row never expires in
+//! one; the storage purge (`ReadAhead::clear`) stands in for expiry where a test needs rows gone.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -32,11 +38,13 @@ use tower::ServiceExt as _;
 use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::summarize::fake::FakeSummarizer;
-use vibe_talk::summarize::threads::{sentence_key, ThreadNames, ThreadNaming, ThreadRequest};
+use vibe_talk::summarize::threads::{
+    sentence_key, FiledSentence, ThreadDeps, ThreadNames, ThreadNaming, ThreadRequest,
+};
 use vibe_talk::summarize::{Summarizer, Summary, SummaryError, SummaryRequest};
 use vibe_talk::testing::{self, CountingChat, READ_CHANNEL, WRITE_CHANNEL, WRITE_TOKEN};
 use vibe_talk::threads::{
-    MessageThread, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
+    MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView,
 };
 
 // --- a provider with threads --------------------------------------------------------------------
@@ -60,6 +68,9 @@ struct ForumThread {
 struct Forum {
     channels: Mutex<BTreeMap<ChannelId, Vec<ForumThread>>>,
     thread_reads: Mutex<Vec<(tokio::time::Instant, String)>>,
+    /// When set, the thread list answers as a provider serving what it could not bring up to date
+    /// does: complete only up to this instant (`as_of`).
+    list_as_of: Mutex<Option<String>>,
 }
 
 fn message(channel: &ChannelId, id: u64, content: &str, thread: &str, is_root: bool) -> Message {
@@ -219,6 +230,7 @@ impl ChatClient for Forum {
             TimelineView::Threads => TimelinePage {
                 threads: threads.iter().map(Self::summary).collect(),
                 has_threads: true,
+                as_of: self.list_as_of.lock().unwrap().clone(),
                 ..TimelinePage::default()
             },
             TimelineView::Thread => {
@@ -778,6 +790,438 @@ async fn a_reply_replaced_after_the_flat_page_is_read_though_the_count_did_not_m
     let prompt = &h.summarizer.thread_prompts()[0];
     assert!(prompt.contains("a newer reply 3"), "{prompt}");
     assert!(!prompt.contains("reply 2 in thread 0"), "{prompt}");
+}
+
+// --- what changes while a thread waits for its turn ------------------------------------------------
+//
+// A thread can wait minutes: behind another naming's model call, or for its channel's next read.
+// Whatever it is named from is decided when its turn comes, against the newest the server has seen
+// of it, never against a copy taken when it was queued. Each test below fails if any part of that
+// copy (its root, its reply count, its last activity) is what the naming or a later delta uses.
+
+/// The one prompt that mentions any of `needles`, if there is one.
+fn prompt_naming(h: &Harness, needles: &[&str]) -> Option<String> {
+    let prompts = h.summarizer.thread_prompts();
+    let found: Vec<&String> = prompts
+        .iter()
+        .filter(|p| needles.iter().any(|needle| p.contains(needle)))
+        .collect();
+    assert!(found.len() <= 1, "prompts naming {needles:?}: {prompts:#?}");
+    found.first().map(|p| (*p).clone())
+}
+
+/// Thread `n` of the write channel, as the page names it.
+fn write_thread(n: usize) -> String {
+    format!("spaces/{WRITE_CHANNEL}/threads/t{n}")
+}
+
+/// A forward delta of the write channel's thread list since `cursor`.
+async fn thread_delta(h: &Harness, cursor: &str) -> Value {
+    get(
+        h,
+        &format!(
+            "/api/v1/channels/{WRITE_CHANNEL}/timeline?view=threads&after={}",
+            urlencode(cursor)
+        ),
+    )
+    .await
+}
+
+/// The thread `id` as `page` carries it, if it does.
+fn carried(page: &Value, id: &str) -> Option<Value> {
+    page["threads"]
+        .as_array()
+        .expect("a thread list")
+        .iter()
+        .find(|thread| thread["id"] == id)
+        .cloned()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_edited_and_pushed_while_its_thread_waits_is_named_from_the_new_text() {
+    // A thread with no replies is all there in the list's root. The root is edited upstream, and
+    // the edit pushed, while the thread waits behind another naming's model call: it is named from
+    // the edited text, not from the list's copy of the root taken when it was queued.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let mut root = None;
+    h.forum.change(&write_channel(), |threads| {
+        threads[1].root.content = "EDITED ROOT of thread 1".to_owned();
+        root = Some(threads[1].root.id.clone());
+    });
+    // What the ingest route does with a pushed update.
+    h.state
+        .read_ahead
+        .forget(&write_channel(), &root.expect("a root"));
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_naming(&h, &["thread 1 starts here", "EDITED ROOT"]).expect("named");
+    assert!(
+        prompt.contains("EDITED ROOT of thread 1"),
+        "named from the root as it was before an edit pushed while it waited: {prompt}"
+    );
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "the edited thread is read; the other is named from the list alone"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_edited_while_its_thread_waits_is_not_named_from_the_list_copy_taken_at_enqueue() {
+    // The same with replies: a Flat page and the list held the whole thread when it was queued.
+    // Its root is edited and pushed while it waits, and the reader's next Flat page holds the
+    // edited root and every reply. Whatever it is named from, it is not the root the list carried.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 2), 0);
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let mut root = None;
+    h.forum.change(&write_channel(), |threads| {
+        threads[1].root.content = "EDITED ROOT of thread 1".to_owned();
+        root = Some(threads[1].root.id.clone());
+    });
+    h.state
+        .read_ahead
+        .forget(&write_channel(), &root.expect("a root"));
+    run_for(1).await;
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_naming(&h, &["thread 1 starts here", "EDITED ROOT"]).expect("named");
+    assert!(
+        prompt.contains("EDITED ROOT of thread 1"),
+        "named from the list's root copied at enqueue, not the edited root: {prompt}"
+    );
+    assert!(prompt.contains("reply 2 in thread 1"), "{prompt}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_deleted_and_pushed_while_it_waits_is_not_named() {
+    // Its root deleted upstream, and the delete pushed, while it waits for its turn. Its turn
+    // reads it, and the provider says there is no such thread: nothing is sent to the model and
+    // nothing is filed.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let mut root = None;
+    h.forum.change(&write_channel(), |threads| {
+        root = Some(threads.remove(1).root.id);
+    });
+    h.state
+        .read_ahead
+        .forget(&write_channel(), &root.expect("a root"));
+    h.gate.add_permits(10);
+    run_for(5).await;
+    assert_eq!(h.names.pending(), 0);
+    assert!(
+        prompt_naming(&h, &["thread 1 starts here"]).is_none(),
+        "a deleted thread's root, pushed as deleted, was sent to the model"
+    );
+    let filed = h
+        .state
+        .store
+        .cached_summary(&sentence_key(
+            &h.state.summary_version,
+            &write_channel(),
+            &write_thread(1),
+        ))
+        .await
+        .expect("readable");
+    assert!(
+        filed.is_none(),
+        "a sentence filed for a deleted thread: {filed:?}"
+    );
+    assert_eq!(h.names.named(), 1, "only the thread still there");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_deleted_while_it_waits_is_not_put_back_on_the_page_by_a_delta() {
+    // A renamed thread rides every forward delta of its list for fifteen minutes, so a page that
+    // refreshes by delta sees its name. A page folds those threads in as live ones: one named
+    // after it was deleted would be drawn again on every refresh.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let mut cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    run_for(1).await;
+    let mut root = None;
+    h.forum.change(&write_channel(), |threads| {
+        root = Some(threads.remove(1).root.id);
+    });
+    h.state
+        .read_ahead
+        .forget(&write_channel(), &root.expect("a root"));
+    h.gate.add_permits(10);
+    run_for(5).await;
+    let deleted = write_thread(1);
+    for round in 0..3 {
+        let delta = thread_delta(&h, &cursor).await;
+        let removed = delta["delta"]["removed_threads"]
+            .as_array()
+            .is_some_and(|removed| removed.iter().any(|t| t == deleted.as_str()));
+        assert!(
+            carried(&delta, &deleted).is_none() || removed,
+            "round {round}: a delta carried the deleted thread as a live one: {delta}"
+        );
+        cursor = delta["next_after"].as_str().expect("a cursor").to_owned();
+        run_for(60).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_that_grew_while_it_waited_is_not_named_without_its_first_reply() {
+    // Three threads of two replies; the third waits a minute for its channel's read. Meanwhile it
+    // gains a third reply, and just before its turn the reader's newest Flat page of two rows holds
+    // only its replies 2 and 3: as many as the count it was QUEUED with, and as new as the last
+    // activity it was queued with. They are not the thread.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 3, 2));
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(5).await;
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "t0 read; t1 and t2 wait"
+    );
+    let channel = write_channel();
+    h.forum.change(&channel, |threads| {
+        let thread = &mut threads[2];
+        let id = thread.root.id.numeric().unwrap() + 3;
+        let thread_id = thread.id.clone();
+        thread.replies.push(message(
+            &channel,
+            id,
+            "reply 3 in thread 2",
+            &thread_id,
+            false,
+        ));
+    });
+    run_for(50).await;
+    get(
+        &h,
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?view=flat&limit=2"),
+    )
+    .await;
+    run_for(30).await;
+    assert_eq!(h.names.named(), 3, "{} pending", h.names.pending());
+    let prompt = prompt_about(&h, "thread 2 starts here");
+    assert!(
+        prompt.contains("reply 1 in thread 2"),
+        "named without its first reply, from rows that matched a count taken at enqueue: {prompt}"
+    );
+    assert!(prompt.contains("reply 3 in thread 2"), "{prompt}");
+    assert_eq!(thread_reads(&h, &write_channel()), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_renamed_thread_rides_a_delta_with_its_newest_count_not_the_one_it_was_queued_with() {
+    // The third thread is queued with one reply and named a minute later. Meanwhile it gains a
+    // second, and a full read of the list shows the page two. The delta after that read carries
+    // the thread for its new name: with two replies and its newer last activity, or the page
+    // would replace what it has with the record as it was when the thread was queued.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 3, 1));
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(5).await;
+    let channel = write_channel();
+    h.forum.change(&channel, |threads| {
+        let thread = &mut threads[2];
+        let id = thread.root.id.numeric().unwrap() + 2;
+        let thread_id = thread.id.clone();
+        thread.replies.push(message(
+            &channel,
+            id,
+            "reply 2 in thread 2",
+            &thread_id,
+            false,
+        ));
+    });
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let shown = carried(&list, &write_thread(2)).expect("listed");
+    assert_eq!(shown["reply_count"], 2, "{shown}");
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    run_for(70).await;
+    assert_eq!(h.names.named(), 3, "{} pending", h.names.pending());
+    let delta = thread_delta(&h, &cursor).await;
+    let renamed = carried(&delta, &write_thread(2)).expect("a renamed thread rides the delta");
+    assert!(renamed["display_name"].is_string(), "{renamed}");
+    assert_eq!(
+        renamed["reply_count"], 2,
+        "the delta carried thread 2 with the count it had when queued: {renamed}"
+    );
+    assert_eq!(renamed["updated_at"], shown["updated_at"], "{renamed}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_thread_that_grew_and_is_then_opened_is_named_from_that_read_at_once() {
+    // The third thread is queued with three replies and gains a fourth while it waits for its
+    // channel's read. The reader then opens it: that read holds all four and says four, and it is
+    // named from that, now, rather than checked against the three it was queued with, found wanting,
+    // and read again at its turn.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 3, 3));
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(5).await;
+    assert_eq!(h.names.named(), 1);
+    let channel = write_channel();
+    h.forum.change(&channel, |threads| {
+        let thread = &mut threads[2];
+        let id = thread.root.id.numeric().unwrap() + 4;
+        let thread_id = thread.id.clone();
+        thread.replies.push(message(
+            &channel,
+            id,
+            "reply 4 in thread 2",
+            &thread_id,
+            false,
+        ));
+    });
+    get(
+        &h,
+        &format!(
+            "/api/v1/channels/{WRITE_CHANNEL}/timeline?view=thread&thread_id={}",
+            urlencode(&write_thread(2))
+        ),
+    )
+    .await;
+    run_for(1).await;
+    assert_eq!(h.names.named(), 2, "{} pending", h.names.pending());
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        2,
+        "the first naming read and the reader's own; none for the thread the reader opened"
+    );
+    let prompt = prompt_about(&h, "thread 2 starts here");
+    assert!(prompt.contains("reply 4 in thread 2"), "{prompt}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sentence_is_filed_at_the_count_its_messages_show_not_the_count_it_was_queued_with() {
+    // The third thread is queued with three replies; two are deleted upstream while it waits a
+    // minute for its read, and nothing is pushed. Its sentence is written from the root and one
+    // reply, and filed as written at two messages, so the schedule asks for the next at four, not
+    // at eight.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 3, 3));
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(5).await;
+    h.forum.change(&write_channel(), |threads| {
+        threads[2].replies.truncate(1);
+    });
+    run_for(70).await;
+    assert_eq!(h.names.named(), 3, "{} pending", h.names.pending());
+    let filed = h
+        .state
+        .store
+        .cached_summary(&sentence_key(
+            &h.state.summary_version,
+            &write_channel(),
+            &write_thread(2),
+        ))
+        .await
+        .expect("readable")
+        .expect("filed");
+    let sentence: FiledSentence = serde_json::from_str(&filed.text).expect("a filed sentence");
+    assert_eq!(
+        sentence.at, 2,
+        "filed at the count the thread had when it was queued: {sentence:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rows_held_when_a_thread_was_queued_and_gone_by_its_turn_send_it_to_the_provider() {
+    // Read-ahead keeps a row for 30 s, and a thread can wait longer than that for its turn. Rows
+    // that were there when it was queued and are gone when its turn comes (expired; here, cleared
+    // by the storage purge) name nothing, the list's copy of a root included.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    h.state.read_ahead.clear();
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "the first was named from the rows it found at its turn; the second found none and was read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_list_the_provider_could_not_bring_up_to_date_names_nothing_without_a_read() {
+    // A page that carries `as_of` is complete only up to then: its counts are not what the threads
+    // have now, so nothing is named from rows held against them.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 2, 0));
+    *h.forum.list_as_of.lock().unwrap() = Some("2026-10-13T00:00:00Z".to_owned());
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(31).await;
+    assert_eq!(h.names.named(), 2, "{} pending", h.names.pending());
+    assert_eq!(thread_reads(&h, &write_channel()), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_a_delta_removes_is_not_carried_as_renamed_nor_named_from_rows_held() {
+    // A delta that says a thread left the list is a provider saying so, as a push is.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 3, 0), 1);
+    let deps = ThreadDeps::from_state(&h.state);
+    let removal = |thread: String| TimelinePage {
+        has_threads: true,
+        delta: Some(TimelineDelta {
+            more: false,
+            complete: true,
+            deleted: Vec::new(),
+            removed_threads: vec![thread],
+        }),
+        ..TimelinePage::default()
+    };
+    let delta = TimelineRequest {
+        view: TimelineView::Threads,
+        thread_id: None,
+        before: None,
+        after: Some("a cursor".to_owned()),
+        limit: 50,
+    };
+    // Thread 0 is named, from the list alone. Thread 1 is inside its model call, its rows chosen;
+    // thread 2 waits for the naming turn.
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    until_named(&h.names, 1).await;
+    assert!(carried(&thread_delta(&h, &cursor).await, &write_thread(0)).is_some());
+
+    // A delta removes thread 0, renamed, and thread 2, waiting.
+    for thread in [write_thread(0), write_thread(2)] {
+        let mut page = removal(thread);
+        h.names
+            .annotate(
+                &deps,
+                &write_channel(),
+                &delta,
+                &mut page,
+                std::time::Instant::now(),
+                true,
+            )
+            .await;
+        assert!(
+            carried(&serde_json::to_value(&page).unwrap(), &write_thread(0)).is_none(),
+            "a delta carried a thread it removes as renamed: {page:?}"
+        );
+    }
+    h.gate.add_permits(10);
+    until_named(&h.names, 3).await;
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "thread 2, removed while it waited, is named only from a read; thread 1 from the list"
+    );
+
+    // Thread 0 is gone upstream as the delta said; a later delta does not put it back.
+    h.forum.change(&write_channel(), |threads| {
+        threads.remove(0);
+    });
+    assert!(
+        carried(&thread_delta(&h, &cursor).await, &write_thread(0)).is_none(),
+        "a later delta put a removed thread back on the page"
+    );
 }
 
 // --- the allowlist and the queue ------------------------------------------------------------------

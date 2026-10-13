@@ -112,6 +112,16 @@ struct Recent {
     fetched: Instant,
 }
 
+/// One message [`ReadAhead::recall_thread`] found, and how old its copy is.
+#[derive(Clone, Debug)]
+pub struct Recalled {
+    /// The message as it was fetched.
+    pub message: Message,
+    /// When the fetch that read it began. The copy is what the provider answered then or a little
+    /// later.
+    pub fetched: Instant,
+}
+
 /// Everything behind the one lock. See the module documentation.
 #[derive(Debug, Default)]
 struct Held {
@@ -307,15 +317,16 @@ impl ReadAhead {
     }
 
     /// Every message of `thread` in `channel` fetched in the last [`RECENT_TTL`]: fetched in that
-    /// thread, or labelled with it on a page of the channel (a Flat page labels each reply). In no
-    /// particular order. `#278 naming-throttle`, remote-ops audit W5: what thread naming reads
-    /// before it asks the provider for the thread again.
+    /// thread, or labelled with it on a page of the channel (a Flat page labels each reply). Each
+    /// with when the fetch that read it began, in no particular order. `#278 naming-throttle`,
+    /// remote-ops audit W5: what thread naming reads before it asks the provider for the thread
+    /// again, and which it compares with when the thread's reply count was read.
     #[must_use]
-    pub fn recall_thread(&self, channel: &ChannelId, thread: &str) -> Vec<Message> {
+    pub fn recall_thread(&self, channel: &ChannelId, thread: &str) -> Vec<Recalled> {
         self.recall_thread_at(channel, thread, Instant::now())
     }
 
-    fn recall_thread_at(&self, channel: &ChannelId, thread: &str, now: Instant) -> Vec<Message> {
+    fn recall_thread_at(&self, channel: &ChannelId, thread: &str, now: Instant) -> Vec<Recalled> {
         let Ok(held) = self.held.lock() else {
             return Vec::new();
         };
@@ -326,7 +337,10 @@ impl ReadAhead {
                     && entry.thread.as_deref() == Some(thread)
                     && now.saturating_duration_since(entry.fetched) < RECENT_TTL
             })
-            .map(|(_, entry)| entry.message.clone())
+            .map(|(_, entry)| Recalled {
+                message: entry.message.clone(),
+                fetched: entry.fetched,
+            })
             .collect()
     }
 
@@ -743,17 +757,23 @@ mod tests {
         let mut held: Vec<String> = read_ahead
             .recall_thread_at(&channel, "T", later)
             .into_iter()
-            .map(|m| m.id.0)
+            .map(|held| held.message.id.0)
             .collect();
         held.sort();
         assert_eq!(held, ["10", "13"]);
         let after_the_flat_page = then + RECENT_TTL;
-        let held: Vec<String> = read_ahead
-            .recall_thread_at(&channel, "T", after_the_flat_page)
-            .into_iter()
-            .map(|m| m.id.0)
-            .collect();
-        assert_eq!(held, ["13"], "the Flat page's copy expired first");
+        let held = read_ahead.recall_thread_at(&channel, "T", after_the_flat_page);
+        assert_eq!(
+            held.iter()
+                .map(|held| held.message.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["13"],
+            "the Flat page's copy expired first"
+        );
+        assert_eq!(
+            held[0].fetched, later,
+            "each copy says when the fetch that read it began"
+        );
         read_ahead.forget_at(&channel, &MessageId("13".to_owned()), after_the_flat_page);
         assert!(read_ahead
             .recall_thread_at(&channel, "T", after_the_flat_page)
