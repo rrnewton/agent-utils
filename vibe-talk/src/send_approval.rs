@@ -120,8 +120,9 @@ pub async fn set(state: &AppState, ask: bool) -> Result<crate::contract::VoiceSe
     // owner changing his mind, and the time on it is when.
     tracing::info!(
         target: "vibe_talk::access",
+        event = "changed",
         ask_before_send = stored,
-        "voice_settings event=changed"
+        "voice_settings"
     );
     Ok(crate::contract::VoiceSettings {
         ask_before_send: stored,
@@ -216,7 +217,12 @@ pub async fn voice_post(
 /// What a model is told after a direct send: `SENT.` first, then what went where, in words it can
 /// repeat, and that calling again would post again.
 #[must_use]
-pub fn sent_notice(channel: &ChannelInfo, text: &str, reply_to: Option<&str>, parts: usize) -> String {
+pub fn sent_notice(
+    channel: &ChannelInfo,
+    text: &str,
+    reply_to: Option<&str>,
+    parts: usize,
+) -> String {
     let target = match reply_to {
         Some(message) => format!(" as a reply to message {message}"),
         None => String::new(),
@@ -256,7 +262,10 @@ mod tests {
     use std::sync::Arc;
 
     fn direct_toml() -> String {
-        format!("{}\n[conversation]\nask_before_send = false\n", testing::config_toml())
+        format!(
+            "{}\n[conversation]\nask_before_send = false\n",
+            testing::config_toml()
+        )
     }
 
     #[tokio::test]
@@ -279,13 +288,17 @@ mod tests {
 
     #[tokio::test]
     async fn no_store_means_the_configured_default_and_a_switch_that_cannot_be_moved() {
-        let (state, _discord) = testing::state_with(Arc::new(crate::store::disabled::DisabledStore));
+        let (state, _discord) =
+            testing::state_with(Arc::new(crate::store::disabled::DisabledStore));
         assert_eq!(current(&state).await, Approval::Ask);
         let shown = view(&state).await;
         assert!(shown.ask_before_send);
         assert!(!shown.changeable);
         assert_eq!(
-            set(&state, false).await.expect_err("nowhere to keep it").code(),
+            set(&state, false)
+                .await
+                .expect_err("nowhere to keep it")
+                .code(),
             "storage_not_configured"
         );
         assert_eq!(current(&state).await, Approval::Ask);
@@ -336,8 +349,14 @@ mod tests {
         assert_eq!(discord.posted().len(), 1);
         assert!(state.post_gate.pending().is_none());
         let said = sent_notice(&channel, &text, reply_to.as_deref(), parts.len());
-        assert!(said.starts_with("SENT. Posted to lead team (id 2222222222) as a reply to message 42"), "{said}");
-        assert!(said.contains("Exact text posted: rebase onto main"), "{said}");
+        assert!(
+            said.starts_with("SENT. Posted to lead team (id 2222222222) as a reply to message 42"),
+            "{said}"
+        );
+        assert!(
+            said.contains("Exact text posted: rebase onto main"),
+            "{said}"
+        );
         assert!(!said.contains("went as"), "{said}");
     }
 

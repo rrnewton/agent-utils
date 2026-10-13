@@ -823,11 +823,8 @@ pub struct VoiceSettingsRequest {
 pub async fn set_voice_settings(
     State(state): State<AppState>,
     _scope: WriteScope,
-    body: axum::body::Bytes,
+    Json(request): Json<VoiceSettingsRequest>,
 ) -> Result<Response, ApiError> {
-    let request: VoiceSettingsRequest = serde_json::from_slice(&body).map_err(|_| {
-        ApiError::bad_request("expected {\"ask_before_send\": true or false} and nothing else")
-    })?;
     let settings = crate::send_approval::set(&state, request.ask_before_send).await?;
     Ok(no_store(Json(settings)))
 }

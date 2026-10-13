@@ -512,7 +512,10 @@ mod tests {
         let numbered = gate.number();
         assert!(numbered > first.serial);
         assert_eq!(gate.pending(), Some(first.clone()));
-        assert!(!changes.has_changed().expect("the gate is alive"), "a watcher was woken");
+        assert!(
+            !changes.has_changed().expect("the gate is alive"),
+            "a watcher was woken"
+        );
         let (second, _) = gate.propose(binding("next"));
         assert!(second.serial > numbered);
     }

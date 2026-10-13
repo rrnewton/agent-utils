@@ -1055,3 +1055,80 @@ async fn a_tool_call_is_timed_and_an_abandoned_one_still_leaves_a_line() {
         capture.text()
     );
 }
+
+#[tokio::test]
+async fn a_direct_send_and_the_setting_that_allowed_it_are_logged_without_a_word_said() {
+    // `#264 voice-send-approval`. With confirmation off the post is logged as one `sent_direct`
+    // line — a number, the channel and a length — and turning confirmation off is logged as the
+    // boolean alone.
+    const SECRET: &str = "the vault code is 4417 and nobody may read it";
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let (status, body) = json_call(
+        &harness,
+        "PUT",
+        "/api/v1/voice-settings",
+        Some(json!({ "ask_before_send": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let status = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        tools_call(
+            "post_reply",
+            json!({ "channel_id": WRITE_CHANNEL, "text": SECRET }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.discord.posted().len(), 1);
+    harness.discord.fail_next("the chat service is down");
+    let status = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        tools_call(
+            "post_reply",
+            json!({ "channel_id": WRITE_CHANNEL, "text": SECRET }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.discord.posted().len(), 1);
+
+    let lines = capture.access_lines();
+    let sent = lines
+        .iter()
+        .find(|line| line.contains("event=\"sent_direct\""))
+        .unwrap_or_else(|| panic!("no sent_direct line in:\n{}", lines.join("\n")));
+    assert!(sent.contains("post_gate"), "{sent}");
+    assert!(
+        sent.contains(&format!("channel=\"{WRITE_CHANNEL}\""))
+            || sent.contains(&format!("channel={WRITE_CHANNEL}")),
+        "{sent}"
+    );
+    assert!(
+        sent.contains(&format!("text_len={}", SECRET.chars().count())),
+        "{sent}"
+    );
+    assert!(
+        !sent.contains("proposal=-1"),
+        "the direct send was not numbered: {sent}"
+    );
+    let failed = lines
+        .iter()
+        .find(|line| line.contains("event=\"direct_failed\""))
+        .unwrap_or_else(|| panic!("no direct_failed line in:\n{}", lines.join("\n")));
+    // A first part that fails is a partial send of nothing, and is coded as one.
+    assert!(failed.contains("reason=\"partially_posted\""), "{failed}");
+    let changed = lines
+        .iter()
+        .find(|line| line.contains("voice_settings"))
+        .unwrap_or_else(|| panic!("no voice_settings line in:\n{}", lines.join("\n")));
+    assert!(changed.contains("ask_before_send=false"), "{changed}");
+    let everything = capture.text();
+    assert!(
+        !everything.contains("vault code"),
+        "message text reached the INFO log:\n{everything}"
+    );
+}

@@ -341,6 +341,14 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"rules":["Working…"]}"#),
         ),
+        // `#264 voice-send-approval`.
+        route("GET", "/api/v1/voice-settings", Read, Nothing),
+        route(
+            "PUT",
+            "/api/v1/voice-settings",
+            Write,
+            Json(r#"{"ask_before_send":true}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/not-noise",

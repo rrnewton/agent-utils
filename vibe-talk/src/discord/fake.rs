@@ -102,6 +102,9 @@ struct State {
     /// mentioned the wrong person.
     authors: BTreeMap<String, UserId>,
     fail_with: Option<String>,
+    /// A post that fails once this many messages have been posted in all, and why: the middle of
+    /// a long message, which `fail_with` cannot reach because the first part takes it.
+    fail_post_at: Option<(usize, String)>,
     /// Whether this fake's account has revoked the token it is being called with.
     ///
     /// Sticky rather than one-shot, unlike `fail_with`: a revoked credential does not heal on the
@@ -462,6 +465,14 @@ impl FakeDiscord {
         self.lock().fail_with = Some(detail.to_owned());
     }
 
+    /// Let the next `posts` posts succeed and make the one after them fail, so a long message can
+    /// be made to fail PART of the way through.
+    pub fn fail_post_after(&self, posts: usize, detail: &str) {
+        let mut state = self.lock();
+        let at = state.posted.len() + posts;
+        state.fail_post_at = Some((at, detail.to_owned()));
+    }
+
     /// Answer every call from now on with Discord's own 401, as a revoked bot token does.
     ///
     /// The counterpart of [`FakeDiscord::register_channel`] for the CREDENTIAL. Without it this
@@ -496,6 +507,23 @@ impl FakeDiscord {
 
     fn take_failure(&self) -> Option<ChatError> {
         self.lock().fail_with.take().map(ChatError::Transport)
+    }
+
+    /// The failure [`FakeDiscord::fail_post_after`] armed, if this post is the one it is for.
+    fn take_post_failure(&self) -> Option<ChatError> {
+        let mut state = self.lock();
+        let posted = state.posted.len();
+        if state
+            .fail_post_at
+            .as_ref()
+            .is_some_and(|(at, _)| *at == posted)
+        {
+            return state
+                .fail_post_at
+                .take()
+                .map(|(_, detail)| ChatError::Transport(detail));
+        }
+        None
     }
 
     /// Discord's own answer for a token it will not accept, in the shape a live 401 arrives in,
@@ -753,6 +781,9 @@ impl ChatClient for FakeDiscord {
                     return Ok(Attempt::Limited(limit));
                 }
                 if let Some(failure) = self.take_failure() {
+                    return Err(failure);
+                }
+                if let Some(failure) = self.take_post_failure() {
                     return Err(failure);
                 }
                 if let Some(unknown) = self.unknown_channel(channel) {

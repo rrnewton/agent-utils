@@ -511,7 +511,10 @@ mod tests {
         // `#264 voice-send-approval`.
         let confirm = flat(Variant::WriteConfirm);
         for rule in CONFIRM_RULES {
-            assert!(confirm.contains(rule), "write-confirm lost {rule:?}: {confirm}");
+            assert!(
+                confirm.contains(rule),
+                "write-confirm lost {rule:?}: {confirm}"
+            );
         }
         for rule in DIRECT_RULES {
             assert!(!confirm.contains(rule), "write-confirm was told {rule:?}");
@@ -524,12 +527,18 @@ mod tests {
         // and a "Send it?" here would be the friction he removed.
         let direct = flat(Variant::WriteDirect);
         for rule in DIRECT_RULES {
-            assert!(direct.contains(rule), "write-direct lost {rule:?}: {direct}");
+            assert!(
+                direct.contains(rule),
+                "write-direct lost {rule:?}: {direct}"
+            );
         }
         for rule in CONFIRM_RULES {
             assert!(!direct.contains(rule), "write-direct was told {rule:?}");
         }
-        assert!(direct.contains("tell the coding agent something"), "{direct}");
+        assert!(
+            direct.contains("tell the coding agent something"),
+            "{direct}"
+        );
         assert_ne!(
             prompt(Variant::WriteDirect).fingerprint,
             prompt(Variant::WriteConfirm).fingerprint
@@ -598,11 +607,7 @@ mod tests {
     fn the_read_prompt_carries_no_send_instruction_and_says_it_cannot_send() {
         let read = prompt(Variant::Read);
         assert_eq!(read.variant, "read");
-        for rule in SEND_RULES
-            .iter()
-            .chain(&CONFIRM_RULES)
-            .chain(&DIRECT_RULES)
-        {
+        for rule in SEND_RULES.iter().chain(&CONFIRM_RULES).chain(&DIRECT_RULES) {
             assert!(
                 !read.text.contains(rule),
                 "a read-only caller was told {rule:?}"
@@ -650,7 +655,13 @@ mod tests {
     }
 
     fn profile_for(scope: Scope, approval: Approval) -> VoiceAgentProfile {
-        profile(&manifest(approval), scope, "Chat", "America/New_York", approval)
+        profile(
+            &manifest(approval),
+            scope,
+            "Chat",
+            "America/New_York",
+            approval,
+        )
     }
 
     #[test]

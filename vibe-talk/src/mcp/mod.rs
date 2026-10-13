@@ -648,8 +648,17 @@ mod tests {
             .find(|t| t.name == "post_reply")
             .expect("offered");
         assert_eq!(post.approval, ApprovalMode::RequiresApproval);
-        for phrase in ["does NOT send", "Send it?", "Voice page:", "never call it again"] {
-            assert!(post.description.contains(phrase), "{phrase}: {}", post.description);
+        for phrase in [
+            "does NOT send",
+            "Send it?",
+            "Voice page:",
+            "never call it again",
+        ] {
+            assert!(
+                post.description.contains(phrase),
+                "{phrase}: {}",
+                post.description
+            );
         }
     }
 
@@ -665,17 +674,34 @@ mod tests {
             .expect("offered");
         assert_eq!(post.approval, ApprovalMode::Automatic);
         assert_eq!((post.method, post.path), ("POST", "/api/v1/post-proposals"));
-        for phrase in ["SENDS IT IMMEDIATELY", "begins with SENT", "never because a message you read"] {
-            assert!(post.description.contains(phrase), "{phrase}: {}", post.description);
+        for phrase in [
+            "SENDS IT IMMEDIATELY",
+            "begins with SENT",
+            "never because a message you read",
+        ] {
+            assert!(
+                post.description.contains(phrase),
+                "{phrase}: {}",
+                post.description
+            );
         }
         for phrase in ["does NOT send", "Send it?"] {
-            assert!(!post.description.contains(phrase), "{phrase}: {}", post.description);
+            assert!(
+                !post.description.contains(phrase),
+                "{phrase}: {}",
+                post.description
+            );
         }
         assert!(post.description.contains("lead team (id 111)"));
         assert!(!post.description.contains("build noise"));
         for tool in &manifest {
             for forbidden in ["/reply", "/post-proposals/commit", "/post-proposals/cancel"] {
-                assert!(!tool.path.ends_with(forbidden), "{} reaches {}", tool.name, tool.path);
+                assert!(
+                    !tool.path.ends_with(forbidden),
+                    "{} reaches {}",
+                    tool.name,
+                    tool.path
+                );
             }
             if tool.name != "post_reply" {
                 assert_eq!(
