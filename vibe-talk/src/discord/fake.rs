@@ -65,6 +65,17 @@ pub struct FakeDiscord {
     limiter: RateLimiter,
 }
 
+/// How an armed post fails; see [`FakeDiscord::fail_post_after`] and its siblings.
+#[derive(Debug)]
+enum PostFailure {
+    /// The request never completed.
+    Transport(String),
+    /// Discord refused it with this status and body: certainly not posted.
+    Status(u16, String),
+    /// Discord posted it, and the answer was then lost.
+    AnswerLost(String),
+}
+
 #[derive(Debug, Default)]
 struct State {
     known: BTreeSet<ChannelId>,
@@ -102,9 +113,9 @@ struct State {
     /// mentioned the wrong person.
     authors: BTreeMap<String, UserId>,
     fail_with: Option<String>,
-    /// A post that fails once this many messages have been posted in all, and why: the middle of
+    /// A post that fails once this many messages have been posted in all, and how: the middle of
     /// a long message, which `fail_with` cannot reach because the first part takes it.
-    fail_post_at: Option<(usize, String)>,
+    fail_post_at: Option<(usize, PostFailure)>,
     /// Whether this fake's account has revoked the token it is being called with.
     ///
     /// Sticky rather than one-shot, unlike `fail_with`: a revoked credential does not heal on the
@@ -466,11 +477,29 @@ impl FakeDiscord {
     }
 
     /// Let the next `posts` posts succeed and make the one after them fail, so a long message can
-    /// be made to fail PART of the way through.
+    /// be made to fail PART of the way through. The failure is a request that never completed,
+    /// which may or may not have been posted as far as the caller can tell.
     pub fn fail_post_after(&self, posts: usize, detail: &str) {
+        self.arm_post_failure(posts, PostFailure::Transport(detail.to_owned()));
+    }
+
+    /// As [`FakeDiscord::fail_post_after`], but Discord answers the failing post with `status`:
+    /// an answer that says it was certainly not posted. `#264 voice-send-approval`.
+    pub fn refuse_post_after(&self, posts: usize, status: u16, body: &str) {
+        self.arm_post_failure(posts, PostFailure::Status(status, body.to_owned()));
+    }
+
+    /// As [`FakeDiscord::fail_post_after`], but the failing post IS posted and its answer is then
+    /// lost, as a timeout after Discord took it would be. `#264 voice-send-approval`: what makes
+    /// "not confirmed" the only true thing to tell a caller.
+    pub fn lose_answer_after(&self, posts: usize, detail: &str) {
+        self.arm_post_failure(posts, PostFailure::AnswerLost(detail.to_owned()));
+    }
+
+    fn arm_post_failure(&self, posts: usize, failure: PostFailure) {
         let mut state = self.lock();
         let at = state.posted.len() + posts;
-        state.fail_post_at = Some((at, detail.to_owned()));
+        state.fail_post_at = Some((at, failure));
     }
 
     /// Answer every call from now on with Discord's own 401, as a revoked bot token does.
@@ -509,8 +538,9 @@ impl FakeDiscord {
         self.lock().fail_with.take().map(ChatError::Transport)
     }
 
-    /// The failure [`FakeDiscord::fail_post_after`] armed, if this post is the one it is for.
-    fn take_post_failure(&self) -> Option<ChatError> {
+    /// The failure [`FakeDiscord::fail_post_after`] or a sibling armed, if this post is the one
+    /// it is for.
+    fn take_post_failure(&self) -> Option<PostFailure> {
         let mut state = self.lock();
         let posted = state.posted.len();
         if state
@@ -518,10 +548,7 @@ impl FakeDiscord {
             .as_ref()
             .is_some_and(|(at, _)| *at == posted)
         {
-            return state
-                .fail_post_at
-                .take()
-                .map(|(_, detail)| ChatError::Transport(detail));
+            return state.fail_post_at.take().map(|(_, failure)| failure);
         }
         None
     }
@@ -783,9 +810,16 @@ impl ChatClient for FakeDiscord {
                 if let Some(failure) = self.take_failure() {
                     return Err(failure);
                 }
-                if let Some(failure) = self.take_post_failure() {
-                    return Err(failure);
-                }
+                let lost = match self.take_post_failure() {
+                    Some(PostFailure::Transport(detail)) => {
+                        return Err(ChatError::Transport(detail));
+                    }
+                    Some(PostFailure::Status(status, body)) => {
+                        return Err(ChatError::Status { status, body });
+                    }
+                    Some(PostFailure::AnswerLost(detail)) => Some(detail),
+                    None => None,
+                };
                 if let Some(unknown) = self.unknown_channel(channel) {
                     return Err(unknown);
                 }
@@ -811,6 +845,10 @@ impl ChatClient for FakeDiscord {
                     .cloned()
                     .ok_or_else(|| ChatError::Shape("posted message vanished".to_owned()))?;
                 drop(state);
+                if let Some(detail) = lost {
+                    // Posted, and recorded as posted above; only the answer is gone.
+                    return Err(ChatError::Transport(detail));
+                }
                 Ok(Attempt::Done(message, self.success_headers()))
             })
             .await

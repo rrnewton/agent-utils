@@ -240,7 +240,9 @@ fn initialize_result(params: Option<&Value>) -> Value {
             "post_reply's own description says whether it posts at once or proposes a draft ",
             "the speaker confirms outside your tools; the owner chooses which. Never say a ",
             "message was sent unless the post_reply result begins with SENT or the voice page ",
-            "reports that it was sent. Every message you read carries its author's mention token beside the ",
+            "reports that it was sent, and never say it was not sent when the result begins ",
+            "NOT CONFIRMED or there was no result at all: it may have posted, so do not call ",
+            "post_reply again for the same words. Every message you read carries its author's mention token beside the ",
             "name, as <@author id>; to notify that person, put that exact token in the reply. ",
             "Writing @their-name instead is plain text and notifies nobody, and there is no tool ",
             "for looking up someone who has not posted. Every message also carries two times: a ",
@@ -1262,7 +1264,9 @@ async fn run_read(state: &AppState, args: &Value) -> Result<String, OpError> {
 /// not the model's to give. The handle that would commit the proposal is deliberately NOT in it.
 ///
 /// With that turned off it posts through the shared send path and answers
-/// [`crate::send_approval::sent_notice`]: SENT, what, and where.
+/// [`crate::send_approval::sent_notice`]: SENT, what, and where — or, for the same words to the
+/// same place moments after an earlier send, [`crate::send_approval::repeat_notice`], and posts
+/// nothing.
 async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let text = arg_str(args, "text").unwrap_or_default();
@@ -1282,6 +1286,14 @@ async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
             &text,
             reply_to.as_deref(),
             parts.len(),
+        )),
+        // Not an error: nothing failed, and a client that retries errors must not be invited to.
+        crate::send_approval::VoicePost::Repeat {
+            channel,
+            earlier,
+            text,
+        } => Ok(crate::send_approval::repeat_notice(
+            &channel, &earlier, &text,
         )),
     }
 }

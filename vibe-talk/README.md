@@ -2228,7 +2228,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
 | GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting asks first, unless you turn that off" |
-| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does: propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder when only part went) — see "Posting asks first, unless you turn that off" |
+| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does: propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder when only part went; the same words again within a minute post nothing, answering the first send's `{sent: true}` when it posted and `409 post_repeated` when it may have) — see "Posting asks first, unless you turn that off" |
 | POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
@@ -4963,11 +4963,29 @@ agent").
 **Off: `post_reply` posts.** It goes through `ops::reply`, the same function a confirmed proposal
 is posted with — the allowlist, the write policy, the emptiness check, reply targets and the
 splitting of a long message are the ones every other send gets. The model is told `SENT.` first,
-then where it went and the exact text posted (and how many messages, if it was long). A refusal or
-failure starts `NOT SENT.`, and one that failed partway `PARTLY SENT. The rest was NOT sent; do not
-send the whole message again.` — in both modes, so no failure reads as a send. The log gets one
-content-free `post_gate event=sent_direct` line (or `direct_failed`, with the reason): a number,
-the channel, the length. There is no card and no read-back. A read credential is still refused.
+then where it went and the exact text posted (and how many messages, if it was long). A refusal
+starts `NOT SENT.`, and one that failed partway `PARTLY SENT. The rest was NOT sent; do not send
+the whole message again.` — in both modes, so no failure reads as a send. A failure whose answer
+was lost — a timeout, a dropped connection, a gateway's 5xx, a success whose body did not parse —
+may have posted, so it starts `NOT CONFIRMED.` and tells the model not to call again for the same
+words; it is never called `NOT SENT`, because an owner told "not sent" says "try again". The prompt
+and the tool description say the same of a call that fails with no result at all, such as a
+hosted tool call that timed out.
+
+**A direct send is posted at most once.** A commit cannot be repeated — it spends a single-use
+handle — but a direct send has none, and a tool call can be retried by its transport, or asked for
+again, after the post has landed. So the server remembers each direct send while it is on its way
+and for a minute after it ends, and the same channel, text and reply target in that time are
+answered from that memory instead of posted: `SENT already` when the first was posted (the REST
+route answers it as that send did, `{sent: true}` with its serial), and `NOT CONFIRMED` or `PARTLY
+SENT already` when the first may have posted or only partly did (REST: `409 post_repeated`). A send
+that certainly posted nothing — a refusal — is forgotten at once, so it can always be tried again,
+and different words, or the same words as a reply, are a different post. The memory is the
+server's own, in memory: a restart forgets it.
+
+The log gets one content-free `post_gate event=sent_direct` line (or `direct_failed`, with the
+reason, or `direct_repeat`, with what became of the earlier send): a number, the channel, the
+length. There is no card and no read-back. A read credential is still refused.
 
 **On: `post_reply` proposes.** It leaves one pending proposal on this server and answers `NOT SENT`,
 with the channel, the exact text, and the one sentence to read it back with. The owner confirms
@@ -5099,8 +5117,9 @@ The mechanics of a proposal, all over the write-scope REST routes in the table a
   channel id it sends, so the parsers tell a caller without write scope nothing about what they
   accept.
 * **The log is content-free.** One `post_gate` line per step — `proposed`, `committed`, `failed`,
-  `refused`, `cancelled`, `superseded`, `expired`, and `sent_direct` / `direct_failed` for a direct
-  send — with a serial, channel id, text length, refusal code and `confirmed_by`. Never a word of
+  `refused`, `cancelled`, `superseded`, `expired`, and `sent_direct` / `direct_failed` /
+  `direct_repeat` for a direct send — with a serial, channel id, text length, refusal code and
+  `confirmed_by`. Never a word of
   the text, never the handle. Changing the setting logs `voice_settings event="changed"` and the
   boolean alone.
 

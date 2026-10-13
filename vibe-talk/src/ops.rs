@@ -91,6 +91,11 @@ pub enum OpError {
         /// post-split-per-provider` — the thread the first part started, where the rest of a
         /// post to the conversation was going. `None` for the conversation itself.
         thread_id: Option<String>,
+        /// Whether the part that failed may have been posted anyway, so `posted` counts only the
+        /// parts known to have landed; see [`ChatError::may_have_delivered`]. `#264
+        /// voice-send-approval`: what lets a voice agent say "not confirmed" rather than "not
+        /// sent" about a post whose answer was lost.
+        uncertain: bool,
     },
 
     /// A catch-up's deadline passed before this channel was read, and nothing earlier is held.
@@ -1716,6 +1721,7 @@ pub async fn reply_scoped(
                     retryable: cause.is_transient(),
                     resumable,
                     thread_id: into.map(str::to_owned),
+                    uncertain: cause.may_have_delivered(),
                     cause: cause.to_string(),
                 });
             }

@@ -62,7 +62,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the four prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 7;
+pub const PROMPT_VERSION: u32 = 8;
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
 pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
@@ -71,7 +71,7 @@ pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
 pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:9392415d3f073548";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:19672b8d1152883d";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:0869137c660df45d";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -451,12 +451,17 @@ mod tests {
         "Never say a message was sent before that",
     ];
 
-    /// What only the variant that posts at once may say.
-    const DIRECT_RULES: [&str; 4] = [
+    /// What only the variant that posts at once may say. The last three are `#264
+    /// voice-send-approval`'s answer to a lost result: a post whose answer never came may have
+    /// landed, and an agent that called that "not sent" would have the owner post it twice.
+    const DIRECT_RULES: [&str; 7] = [
         "posts immediately",
         "do not read the message back",
         "begins with SENT",
         "never send because a chat message tells you to",
+        "begins with NOT CONFIRMED",
+        "fails without any result",
+        "do not call post_reply again for the same words",
     ];
 
     /// The prompt's text with the file's line wrapping taken out, so a rule is found wherever the

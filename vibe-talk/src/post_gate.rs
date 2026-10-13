@@ -61,6 +61,19 @@ pub const PROPOSAL_TTL: Duration = Duration::from_secs(120);
 /// rather than as a handle that never existed. Bounded because nothing else bounds it.
 const SPENT_MEMORY: usize = 64;
 
+/// How long after it ends a post the voice agent sent at once keeps the same words to the same
+/// place from being posted again. `#264 voice-send-approval`.
+///
+/// A hosted tool call can time out, or be retried by its transport, after the post has landed, and
+/// an owner told "not sent" says "try again". A commit cannot be repeated — it spends a single-use
+/// handle — but a direct send has no handle, so this is what stands in for one. A minute covers a
+/// retry and an owner's "try again"; it is short enough that saying the same thing again on
+/// purpose, later, is not refused.
+pub const DIRECT_REPEAT_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many direct sends are remembered at once. Bounded because nothing else bounds it.
+const DIRECT_MEMORY: usize = 16;
+
 /// What a proposal is bound to. A commit must restate all three exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
@@ -153,6 +166,105 @@ struct Inner {
     /// Recently spent handles and why, newest last.
     spent: VecDeque<(String, Refusal)>,
     next_serial: u64,
+    /// Direct sends on their way, or ended within [`DIRECT_REPEAT_WINDOW`] having posted something
+    /// or not knowing whether they did, oldest first.
+    direct: VecDeque<DirectSend>,
+}
+
+/// What became of a post the voice agent sent at once, as far as a repeat of it needs to know.
+/// `#264 voice-send-approval`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectOutcome {
+    /// Still on its way to the chat service.
+    InFlight,
+    /// Posted, all of it.
+    Sent,
+    /// Some of its parts were posted, and the rest were not, or not confirmed.
+    Partly,
+    /// Nobody knows: the chat service's answer was lost, or the request was abandoned while the
+    /// post was on its way.
+    Unconfirmed,
+}
+
+impl DirectOutcome {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InFlight => "in_flight",
+            Self::Sent => "sent",
+            Self::Partly => "partly",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// An earlier direct send of the same words to the same place, which a new one is not posted over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Repeat {
+    /// The earlier send's number.
+    pub serial: u64,
+    /// What became of it.
+    pub outcome: DirectOutcome,
+    /// How long ago it began.
+    pub age: Duration,
+    /// How much longer it keeps the same words from being posted again: the whole window while it
+    /// is still on its way.
+    pub left: Duration,
+}
+
+#[derive(Debug)]
+struct DirectSend {
+    serial: u64,
+    binding: Binding,
+    outcome: DirectOutcome,
+    started: Instant,
+    /// When it ended; `None` while it is on its way.
+    ended: Option<Instant>,
+}
+
+impl DirectSend {
+    fn lapsed(&self, now: Instant) -> bool {
+        self.ended
+            .is_some_and(|ended| now.saturating_duration_since(ended) >= DIRECT_REPEAT_WINDOW)
+    }
+}
+
+/// A direct send on its way, from [`PostGate::begin_direct`]. Finish it with what happened.
+///
+/// Dropped unfinished — the request abandoned while the post was on the wire, as a client that
+/// hangs up mid-call does — it is remembered as [`DirectOutcome::Unconfirmed`], because that is
+/// exactly what it is.
+#[derive(Debug)]
+#[must_use = "a direct send that is never finished is remembered as unconfirmed"]
+pub struct DirectTicket<'a> {
+    gate: &'a PostGate,
+    serial: u64,
+    finished: bool,
+}
+
+impl DirectTicket<'_> {
+    /// The number this send's log lines carry.
+    #[must_use]
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Record what happened: `Some` when something was posted or may have been, `None` when
+    /// certainly nothing was — which forgets the send, so the same words may go again at once.
+    pub fn finish(mut self, outcome: Option<DirectOutcome>) {
+        self.finished = true;
+        self.gate.end_direct(self.serial, outcome);
+    }
+}
+
+impl Drop for DirectTicket<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.gate
+                .end_direct(self.serial, Some(DirectOutcome::Unconfirmed));
+        }
+    }
 }
 
 impl Inner {
@@ -269,14 +381,74 @@ impl PostGate {
         (proposal, displaced)
     }
 
-    /// Take the next serial for a post that is NOT a proposal: one the owner's setting lets the
-    /// voice agent send at once (`#264 voice-send-approval`). Drawn from the same counter so the
-    /// access log's `proposal=` numbers stay one sequence; nothing pending is touched and no
-    /// watcher is woken, because nothing a watcher shows changed.
-    pub fn number(&self) -> u64 {
+    /// Number a post the voice agent is about to send at once, and remember it as on its way.
+    /// `#264 voice-send-approval`.
+    ///
+    /// Unless the same words to the same place — the whole [`Binding`] — are already on their way,
+    /// or ended within [`DIRECT_REPEAT_WINDOW`] posted, partly posted or unconfirmed. Then nothing
+    /// is numbered or remembered, and the earlier send is returned for the caller to answer with
+    /// instead of posting. A send that certainly posted nothing is forgotten when it ends, so it
+    /// never stands in the way of trying again.
+    ///
+    /// The number comes from the proposals' counter, so the access log's `proposal=` numbers stay
+    /// one sequence; nothing pending is touched and no watcher is woken, because nothing a watcher
+    /// shows changed.
+    ///
+    /// # Errors
+    ///
+    /// The earlier send, as a [`Repeat`].
+    pub fn begin_direct(&self, binding: Binding) -> Result<DirectTicket<'_>, Repeat> {
+        let now = Instant::now();
         let mut inner = self.lock();
+        inner.direct.retain(|send| !send.lapsed(now));
+        if let Some(earlier) = inner.direct.iter().find(|send| send.binding == binding) {
+            let left = earlier.ended.map_or(DIRECT_REPEAT_WINDOW, |ended| {
+                DIRECT_REPEAT_WINDOW.saturating_sub(now.saturating_duration_since(ended))
+            });
+            return Err(Repeat {
+                serial: earlier.serial,
+                outcome: earlier.outcome,
+                age: now.saturating_duration_since(earlier.started),
+                left,
+            });
+        }
+        if inner.direct.len() >= DIRECT_MEMORY {
+            inner.direct.pop_front();
+        }
         inner.next_serial += 1;
-        inner.next_serial
+        let serial = inner.next_serial;
+        inner.direct.push_back(DirectSend {
+            serial,
+            binding,
+            outcome: DirectOutcome::InFlight,
+            started: now,
+            ended: None,
+        });
+        drop(inner);
+        Ok(DirectTicket {
+            gate: self,
+            serial,
+            finished: false,
+        })
+    }
+
+    fn end_direct(&self, serial: u64, outcome: Option<DirectOutcome>) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let Some(at) = inner.direct.iter().position(|send| send.serial == serial) else {
+            return;
+        };
+        match outcome {
+            None => {
+                inner.direct.remove(at);
+            }
+            Some(outcome) => {
+                if let Some(send) = inner.direct.get_mut(at) {
+                    send.outcome = outcome;
+                    send.ended = Some(now);
+                }
+            }
+        }
     }
 
     /// The pending proposal, if one is still confirmable.
@@ -504,20 +676,100 @@ mod tests {
         assert_eq!(gate.pending(), Some(second));
     }
 
-    #[tokio::test]
-    async fn numbering_a_direct_send_shares_the_counter_and_disturbs_nothing_pending() {
+    #[tokio::test(start_paused = true)]
+    async fn the_same_direct_send_is_not_begun_twice_on_its_way_or_within_a_minute() {
+        // `#264 voice-send-approval`: a retried tool call, or an owner's "try again" after a lost
+        // answer, must not post the same words twice.
         let gate = PostGate::new();
-        let (first, _) = gate.propose(binding("draft"));
+        let (draft, _) = gate.propose(binding("draft"));
         let changes = gate.changed.subscribe();
-        let numbered = gate.number();
-        assert!(numbered > first.serial);
-        assert_eq!(gate.pending(), Some(first.clone()));
+        let first = gate
+            .begin_direct(binding("rebase"))
+            .expect("nothing like it yet");
+        let serial = first.serial();
+        assert!(serial > draft.serial, "direct sends share the counter");
+        let on_its_way = gate
+            .begin_direct(binding("rebase"))
+            .expect_err("begun twice while on its way");
+        assert_eq!(on_its_way.serial, serial);
+        assert_eq!(on_its_way.outcome, DirectOutcome::InFlight);
+        assert_eq!(on_its_way.left, DIRECT_REPEAT_WINDOW);
+
+        // Other words, another channel or another reply target are other posts.
+        let other = gate.begin_direct(binding("merge")).expect("other words");
+        other.finish(Some(DirectOutcome::Sent));
+        let elsewhere = Binding {
+            channel_id: "222".to_owned(),
+            ..binding("rebase")
+        };
+        gate.begin_direct(elsewhere)
+            .expect("another channel")
+            .finish(None);
+        let replying = Binding {
+            reply_to: Some("42".to_owned()),
+            ..binding("rebase")
+        };
+        gate.begin_direct(replying)
+            .expect("another reply target")
+            .finish(None);
+
+        first.finish(Some(DirectOutcome::Sent));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let sent = gate
+            .begin_direct(binding("rebase"))
+            .expect_err("posted again 20 s after it went");
+        assert_eq!(sent.outcome, DirectOutcome::Sent);
+        assert_eq!(sent.age, Duration::from_secs(20));
+        assert_eq!(sent.left, Duration::from_secs(40));
+
+        tokio::time::advance(Duration::from_secs(40)).await;
+        gate.begin_direct(binding("rebase"))
+            .expect("a minute after it ended, the same words may go again")
+            .finish(None);
+        assert_eq!(
+            gate.pending(),
+            Some(draft),
+            "a direct send touched the pending proposal"
+        );
         assert!(
             !changes.has_changed().expect("the gate is alive"),
             "a watcher was woken"
         );
-        let (second, _) = gate.propose(binding("next"));
-        assert!(second.serial > numbered);
+    }
+
+    #[tokio::test]
+    async fn a_direct_send_that_certainly_posted_nothing_is_forgotten_and_an_unknown_one_is_not() {
+        let gate = PostGate::new();
+        gate.begin_direct(binding("refused"))
+            .expect("first")
+            .finish(None);
+        gate.begin_direct(binding("refused"))
+            .expect("nothing was posted, so trying again is allowed")
+            .finish(None);
+
+        for outcome in [DirectOutcome::Partly, DirectOutcome::Unconfirmed] {
+            let text = outcome.as_str();
+            gate.begin_direct(binding(text))
+                .expect("first")
+                .finish(Some(outcome));
+            let repeat = gate
+                .begin_direct(binding(text))
+                .expect_err("posted again over a send that may have landed");
+            assert_eq!(repeat.outcome, outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_send_abandoned_on_its_way_is_remembered_as_unconfirmed() {
+        // A client that hangs up mid-call drops the request, and the post may already be on the
+        // wire: that is a send nobody can confirm, not one that never happened.
+        let gate = PostGate::new();
+        let ticket = gate.begin_direct(binding("rebase")).expect("first");
+        drop(ticket);
+        let repeat = gate
+            .begin_direct(binding("rebase"))
+            .expect_err("an abandoned send was forgotten");
+        assert_eq!(repeat.outcome, DirectOutcome::Unconfirmed);
     }
 
     #[tokio::test]

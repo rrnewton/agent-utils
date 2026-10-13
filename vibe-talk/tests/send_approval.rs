@@ -246,10 +246,21 @@ async fn a_long_direct_send_is_split_by_the_shared_send_path_and_says_so() {
     assert_eq!(rejoined, words);
 }
 
+/// Nine hundred words: long enough to go as more than one message.
+fn long_text() -> String {
+    (0..900)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[tokio::test]
 async fn a_direct_send_that_fails_says_not_sent_and_one_that_fails_partway_says_partly_sent() {
+    // A refusal from the chat service is an answer: certainly not posted.
     let harness = sending_at_once().await;
-    harness.discord.fail_next("the chat service is down");
+    harness
+        .discord
+        .refuse_post_after(0, 403, "Missing Permissions");
     let (_status, response) = post_reply(
         &harness,
         WRITE_TOKEN,
@@ -261,17 +272,13 @@ async fn a_direct_send_that_fails_says_not_sent_and_one_that_fails_partway_says_
     assert!(said.starts_with("NOT SENT. "), "{said}");
     assert!(harness.discord.posted().is_empty());
 
-    let text = (0..900)
-        .map(|i| format!("word{i}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     harness
         .discord
-        .fail_post_after(1, "the chat service went away");
+        .refuse_post_after(1, 403, "Missing Permissions");
     let (_status, response) = post_reply(
         &harness,
         WRITE_TOKEN,
-        json!({ "channel_id": WRITE_CHANNEL, "text": text }),
+        json!({ "channel_id": WRITE_CHANNEL, "text": long_text() }),
     )
     .await;
     assert_eq!(response["result"]["isError"], true, "{response}");
@@ -283,6 +290,144 @@ async fn a_direct_send_that_fails_says_not_sent_and_one_that_fails_partway_says_
         "{said}"
     );
     assert_eq!(harness.discord.posted().len(), 1);
+}
+
+#[tokio::test]
+async fn a_direct_send_whose_answer_was_lost_is_not_confirmed_and_never_called_not_sent() {
+    // `#264 voice-send-approval`. A timeout or a dropped connection may come after the chat
+    // service took the post. "NOT SENT" would have the agent tell the owner so, and his "try
+    // again" would post it twice.
+    let harness = sending_at_once().await;
+    harness.discord.fail_next("operation timed out");
+    let (_status, response) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "on it" }),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let said = tool_text(&response);
+    assert!(said.starts_with("NOT CONFIRMED. "), "{said}");
+    assert!(
+        said.contains("do not call post_reply again for these words"),
+        "{said}"
+    );
+    assert!(!said.contains("NOT SENT"), "{said}");
+
+    // Partway, the part whose answer was lost is not called unsent either.
+    harness
+        .discord
+        .fail_post_after(1, "connection reset by peer");
+    let (_status, response) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": long_text() }),
+    )
+    .await;
+    let said = tool_text(&response);
+    assert!(said.starts_with("PARTLY SENT. "), "{said}");
+    assert!(!said.contains("The rest was NOT sent"), "{said}");
+}
+
+#[tokio::test]
+async fn the_same_direct_send_again_is_answered_from_the_first_and_posts_nothing_more() {
+    // `#264 voice-send-approval`. A commit cannot be repeated — it spends a single-use handle — so
+    // a direct send must not be repeatable by a retried tool call or a "try again" either.
+    let harness = sending_at_once().await;
+    let words = json!({ "channel_id": WRITE_CHANNEL, "text": "rebase onto main" });
+    let (_status, first) = post_reply(&harness, WRITE_TOKEN, words.clone()).await;
+    assert!(tool_text(&first).starts_with("SENT. "), "{first}");
+    let (status, again) = post_reply(&harness, WRITE_TOKEN, words.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["result"]["isError"], false, "{again}");
+    let said = tool_text(&again);
+    assert!(said.starts_with("SENT already. "), "{said}");
+    assert!(said.contains("lead team"), "{said}");
+    assert!(said.contains("posted nothing more"), "{said}");
+    assert!(
+        said.contains("Exact text posted: rebase onto main"),
+        "{said}"
+    );
+    assert_eq!(
+        harness.discord.posted().len(),
+        1,
+        "the same words were posted twice"
+    );
+
+    // Through the REST route a bridge maps the tool onto: the first send's answer, replayed.
+    let (status, body) = send(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals",
+        Some(WRITE_TOKEN),
+        Some(words.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sent"], true, "{body}");
+    assert!(
+        body["result"]
+            .as_str()
+            .expect("text")
+            .starts_with("SENT already."),
+        "{body}"
+    );
+    assert_eq!(harness.discord.posted().len(), 1);
+
+    // Other words, or the same words as a reply, are other posts.
+    let (_status, other) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "rebase onto main", "reply_to": "1000" }),
+    )
+    .await;
+    assert!(tool_text(&other).starts_with("SENT. "), "{other}");
+    assert_eq!(harness.discord.posted().len(), 2);
+}
+
+#[tokio::test]
+async fn a_lost_answer_is_not_posted_over_and_a_refusal_can_be_tried_again() {
+    let harness = sending_at_once().await;
+    let words = json!({ "channel_id": WRITE_CHANNEL, "text": "on it" });
+    // The chat service took it; the answer never came back.
+    harness.discord.lose_answer_after(0, "operation timed out");
+    let (_status, first) = post_reply(&harness, WRITE_TOKEN, words.clone()).await;
+    assert!(tool_text(&first).starts_with("NOT CONFIRMED. "), "{first}");
+    assert_eq!(harness.discord.posted().len(), 1, "the post landed");
+    // "Try again": the second call posts nothing, and says why.
+    let (_status, again) = post_reply(&harness, WRITE_TOKEN, words.clone()).await;
+    let said = tool_text(&again);
+    assert!(said.starts_with("NOT CONFIRMED. "), "{said}");
+    assert!(said.contains("posted nothing"), "{said}");
+    assert!(said.contains("check the channel"), "{said}");
+    assert_eq!(
+        harness.discord.posted().len(),
+        1,
+        "the owner's try-again posted it twice"
+    );
+    // The REST route refuses it rather than calling it sent.
+    let (status, body) = send(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals",
+        Some(WRITE_TOKEN),
+        Some(words),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "post_repeated", "{body}");
+    assert_eq!(harness.discord.posted().len(), 1);
+
+    // A refusal posted nothing, so the same words may go again at once.
+    let refused = json!({ "channel_id": WRITE_CHANNEL, "text": "ship it" });
+    harness
+        .discord
+        .refuse_post_after(0, 403, "Missing Permissions");
+    let (_status, first) = post_reply(&harness, WRITE_TOKEN, refused.clone()).await;
+    assert!(tool_text(&first).starts_with("NOT SENT. "), "{first}");
+    let (_status, again) = post_reply(&harness, WRITE_TOKEN, refused).await;
+    assert!(tool_text(&again).starts_with("SENT. "), "{again}");
+    assert_eq!(harness.discord.posted().len(), 2);
 }
 
 #[tokio::test]

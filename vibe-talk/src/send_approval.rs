@@ -14,6 +14,18 @@
 //!   the emptiness check and long-message splitting are the ones every other send gets — and the
 //!   model is told `SENT.` with what went where, or why it did not.
 //!
+//! # A direct send is posted at most once
+//!
+//! A commit cannot be repeated: it spends a single-use handle. A direct send has no handle, and a
+//! hosted tool call can time out, or be retried by its transport, after the post has landed — and
+//! an owner told it failed says "try again". So the server remembers each direct send while it is
+//! on its way and for [`crate::post_gate::DIRECT_REPEAT_WINDOW`] after it ends, and the same words
+//! to the same place again in that time are answered from that memory instead of posted:
+//! `SENT already`, or `NOT CONFIRMED` / `PARTLY SENT already` when the earlier one may have posted.
+//! A send that certainly posted nothing is forgotten, so it can always be tried again. And a post
+//! whose answer was lost is never reported as `NOT SENT`: it is `NOT CONFIRMED`, with the
+//! instruction not to call again for the same words.
+//!
 //! # Where the choice lives
 //!
 //! The configuration file's `[conversation] ask_before_send` is the SHIPPED default; the owner's
@@ -36,6 +48,7 @@
 
 use crate::model::{ChannelInfo, Message};
 use crate::ops::{self, OpError};
+use crate::post_gate::{Binding, DirectOutcome, Repeat};
 use crate::state::AppState;
 use crate::store::StoreError;
 
@@ -153,6 +166,17 @@ pub enum VoicePost {
         /// The message it answered, if any.
         reply_to: Option<String>,
     },
+    /// Not posted, because the same words to the same place were sent moments ago, or are still
+    /// on their way; see [`crate::post_gate::PostGate::begin_direct`].
+    Repeat {
+        /// The channel's name as the owner knows it, or its id when it is not one this server
+        /// lists.
+        channel: String,
+        /// The earlier send.
+        earlier: Repeat,
+        /// The words, as asked for again.
+        text: String,
+    },
 }
 
 /// `post_reply`, as the setting says: propose it, or post it now. The one function the MCP tool and
@@ -176,9 +200,41 @@ pub async fn voice_post(
             Ok(VoicePost::Proposed { channel, proposal })
         }
         Approval::Direct => {
-            let serial = state.post_gate.number();
+            let binding = Binding {
+                channel_id: channel_id.to_owned(),
+                text: text.to_owned(),
+                reply_to: reply_to.map(str::to_owned),
+            };
+            let ticket = match state.post_gate.begin_direct(binding) {
+                Ok(ticket) => ticket,
+                Err(earlier) => {
+                    crate::access::post_gate(
+                        "direct_repeat",
+                        Some(earlier.serial),
+                        Some(channel_id),
+                        Some(text.chars().count()),
+                        Some(earlier.outcome.as_str()),
+                        None,
+                    );
+                    let channel = ops::channels(state)
+                        .await
+                        .into_iter()
+                        .find(|channel| channel.id.as_str() == channel_id)
+                        .map_or_else(
+                            || channel_id.to_owned(),
+                            |channel| channel.display_name().to_owned(),
+                        );
+                    return Ok(VoicePost::Repeat {
+                        channel,
+                        earlier,
+                        text: text.to_owned(),
+                    });
+                }
+            };
+            let serial = ticket.serial();
             match ops::reply(state, channel_id, text, reply_to).await {
                 Ok((channel, _first, parts)) => {
+                    ticket.finish(Some(DirectOutcome::Sent));
                     crate::access::post_gate(
                         "sent_direct",
                         Some(serial),
@@ -196,6 +252,17 @@ pub async fn voice_post(
                     })
                 }
                 Err(error) => {
+                    // Remembered when anything may have reached the channel, so the same words
+                    // are not posted over it; forgotten when certainly nothing did.
+                    ticket.finish(match &error {
+                        OpError::PartiallyPosted { posted, .. } if *posted > 0 => {
+                            Some(DirectOutcome::Partly)
+                        }
+                        OpError::PartiallyPosted {
+                            uncertain: true, ..
+                        } => Some(DirectOutcome::Unconfirmed),
+                        _ => None,
+                    });
                     crate::access::post_gate(
                         "direct_failed",
                         Some(serial),
@@ -239,13 +306,67 @@ pub fn sent_notice(
     )
 }
 
+/// What a model is told when it asked for the same words to the same place again within
+/// [`crate::post_gate::DIRECT_REPEAT_WINDOW`] of an earlier direct send, or while it was still on
+/// its way: nothing was posted this time, and what is known about the earlier one, first.
+#[must_use]
+pub fn repeat_notice(channel: &str, earlier: &Repeat, text: &str) -> String {
+    let ago = earlier.age.as_secs();
+    let left = earlier.left.as_secs().max(1);
+    match earlier.outcome {
+        DirectOutcome::Sent => format!(
+            "SENT already. The same words went to {channel} {ago} seconds ago, so this call posted \
+             nothing more.\n\
+             Exact text posted: {text}\n\
+             Tell the speaker it was sent. Do not call post_reply again for this message. If the \
+             speaker really wants the same words posted a second time, they can ask again in \
+             {left} seconds."
+        ),
+        DirectOutcome::Partly => format!(
+            "PARTLY SENT already. Part of the same words reached {channel} {ago} seconds ago and \
+             the rest did not, so this call posted nothing: sending the whole message again would \
+             repeat the part that went. Tell the speaker that only part was posted and that they \
+             can check the channel. Do not call post_reply again for this message."
+        ),
+        DirectOutcome::Unconfirmed => format!(
+            "NOT CONFIRMED. The same words were sent to {channel} {ago} seconds ago and this \
+             server could not tell whether they were posted, so this call posted nothing, rather \
+             than risk posting them twice. Tell the speaker to check the channel. If they are not \
+             there, the speaker can ask again in {left} seconds."
+        ),
+        DirectOutcome::InFlight => format!(
+            "NOT CONFIRMED. The same words to {channel} are still being posted by an earlier \
+             call, so this call posted nothing more. Tell the speaker it is still going out and to \
+             check the channel. Do not call post_reply again for this message."
+        ),
+    }
+}
+
 /// What goes in front of a `post_reply` failure, so the first word the model reads says whether
 /// anything reached the channel. True in both modes: a refused proposal sends nothing either.
+///
+/// A failure whose answer was lost — a timeout, a dropped connection, a gateway's 5xx, a success
+/// whose body did not parse — may have posted, so it is `NOT CONFIRMED`, never `NOT SENT`: a model
+/// told "not sent" says so, and the owner's "try again" would post it twice.
 #[must_use]
 pub fn failure_prefix(error: &OpError) -> &'static str {
     match error {
-        OpError::PartiallyPosted { posted, .. } if *posted > 0 => {
+        OpError::PartiallyPosted {
+            posted,
+            uncertain: false,
+            ..
+        } if *posted > 0 => {
             "PARTLY SENT. The rest was NOT sent; do not send the whole message again. "
+        }
+        OpError::PartiallyPosted { posted, .. } if *posted > 0 => {
+            "PARTLY SENT. Whether the rest was posted could not be confirmed; do not send the \
+             whole message again, and tell the speaker to check the channel. "
+        }
+        OpError::PartiallyPosted {
+            uncertain: true, ..
+        } => {
+            "NOT CONFIRMED. This server could not tell whether it was posted, so do not call \
+             post_reply again for these words; tell the speaker to check the channel. "
         }
         _ => "NOT SENT. ",
     }
@@ -357,26 +478,79 @@ mod tests {
         assert!(!said.contains("went as"), "{said}");
     }
 
-    #[test]
-    fn a_failure_says_first_whether_anything_reached_the_channel() {
-        assert_eq!(failure_prefix(&OpError::UnknownChannel), "NOT SENT. ");
-        let none = OpError::PartiallyPosted {
-            posted: 0,
-            unsent: "all of it".to_owned(),
-            cause: "down".to_owned(),
-            retryable: true,
-            resumable: true,
-            thread_id: None,
-        };
-        assert_eq!(failure_prefix(&none), "NOT SENT. ");
-        let some = OpError::PartiallyPosted {
-            posted: 1,
+    fn partly(posted: usize, uncertain: bool) -> OpError {
+        OpError::PartiallyPosted {
+            posted,
             unsent: "the rest".to_owned(),
             cause: "down".to_owned(),
             retryable: true,
             resumable: true,
             thread_id: None,
+            uncertain,
+        }
+    }
+
+    #[test]
+    fn a_failure_says_first_whether_anything_reached_the_channel() {
+        assert_eq!(failure_prefix(&OpError::UnknownChannel), "NOT SENT. ");
+        assert_eq!(failure_prefix(&partly(0, false)), "NOT SENT. ");
+        assert_eq!(
+            failure_prefix(&partly(1, false)),
+            "PARTLY SENT. The rest was NOT sent; do not send the whole message again. "
+        );
+        let unknown_rest = failure_prefix(&partly(1, true));
+        assert!(unknown_rest.starts_with("PARTLY SENT."), "{unknown_rest}");
+        assert!(
+            !unknown_rest.contains("NOT sent"),
+            "a part that may have posted was called not sent: {unknown_rest}"
+        );
+    }
+
+    #[test]
+    fn a_failure_whose_answer_was_lost_is_not_confirmed_rather_than_not_sent() {
+        // A timeout after the chat service took the post is the case: "not sent" would have the
+        // owner say "try again", and post it twice.
+        let said = failure_prefix(&partly(0, true));
+        assert!(said.starts_with("NOT CONFIRMED. "), "{said}");
+        assert!(
+            said.contains("do not call post_reply again for these words"),
+            "{said}"
+        );
+        assert!(!said.contains("NOT SENT"), "{said}");
+    }
+
+    #[test]
+    fn a_repeat_says_first_what_is_known_about_the_earlier_send_and_that_nothing_more_went() {
+        let earlier = |outcome| Repeat {
+            serial: 7,
+            outcome,
+            age: std::time::Duration::from_secs(12),
+            left: std::time::Duration::from_secs(48),
         };
-        assert!(failure_prefix(&some).starts_with("PARTLY SENT."));
+        for (outcome, first) in [
+            (DirectOutcome::Sent, "SENT already. "),
+            (DirectOutcome::Partly, "PARTLY SENT already. "),
+            (DirectOutcome::Unconfirmed, "NOT CONFIRMED. "),
+            (DirectOutcome::InFlight, "NOT CONFIRMED. "),
+        ] {
+            let said = repeat_notice("lead team", &earlier(outcome), "rebase onto main");
+            assert!(said.starts_with(first), "{outcome:?}: {said}");
+            assert!(said.contains("lead team"), "{outcome:?}: {said}");
+            assert!(
+                said.contains("posted nothing"),
+                "{outcome:?} did not say this call posted nothing: {said}"
+            );
+        }
+        let sent = repeat_notice(
+            "lead team",
+            &earlier(DirectOutcome::Sent),
+            "rebase onto main",
+        );
+        assert!(sent.contains("12 seconds ago"), "{sent}");
+        assert!(
+            sent.contains("Exact text posted: rebase onto main"),
+            "{sent}"
+        );
+        assert!(sent.contains("ask again in 48 seconds"), "{sent}");
     }
 }

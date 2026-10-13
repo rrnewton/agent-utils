@@ -165,6 +165,25 @@ impl ChatError {
             }
         }
     }
+
+    /// Whether a post that failed this way may have been posted anyway.
+    ///
+    /// `#264 voice-send-approval`. Not the question [`ChatError::is_transient`] answers. A lost
+    /// connection or a timeout may have cut off the answer after the provider took the post; a 5xx
+    /// may come from a gateway in front of a provider that took it; and an answer this server
+    /// could not read was a success whose body did not parse. A rate limit, a 4xx and this
+    /// server's own refusal each say that the post was not taken.
+    #[must_use]
+    pub fn may_have_delivered(&self) -> bool {
+        match self.cause() {
+            Self::Transport(_) | Self::Shape(_) => true,
+            Self::Status { status, .. } => *status >= 500,
+            Self::RateLimited(_)
+            | Self::Refused(_)
+            | Self::CursorExpired(_)
+            | Self::Provider { .. } => false,
+        }
+    }
 }
 
 /// The account a chat backend posts as, as reported by the provider.

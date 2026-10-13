@@ -1083,13 +1083,25 @@ async fn a_direct_send_and_the_setting_that_allowed_it_are_logged_without_a_word
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(harness.discord.posted().len(), 1);
-    harness.discord.fail_next("the chat service is down");
+    // The same words again are answered from the first send, posting nothing, and logged as such.
     let status = rpc(
         &harness,
         Some(WRITE_TOKEN),
         tools_call(
             "post_reply",
             json!({ "channel_id": WRITE_CHANNEL, "text": SECRET }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.discord.posted().len(), 1);
+    harness.discord.fail_next("the chat service is down");
+    let status = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        tools_call(
+            "post_reply",
+            json!({ "channel_id": WRITE_CHANNEL, "text": format!("{SECRET}, again") }),
         ),
     )
     .await;
@@ -1121,6 +1133,13 @@ async fn a_direct_send_and_the_setting_that_allowed_it_are_logged_without_a_word
         .unwrap_or_else(|| panic!("no direct_failed line in:\n{}", lines.join("\n")));
     // A first part that fails is a partial send of nothing, and is coded as one.
     assert!(failed.contains("reason=\"partially_posted\""), "{failed}");
+    let repeat = lines
+        .iter()
+        .find(|line| line.contains("event=\"direct_repeat\""))
+        .unwrap_or_else(|| panic!("no direct_repeat line in:\n{}", lines.join("\n")));
+    // The earlier send's number and what became of it, and still not a word said.
+    assert!(repeat.contains("reason=\"sent\""), "{repeat}");
+    assert!(!repeat.contains("proposal=-1"), "{repeat}");
     let changed = lines
         .iter()
         .find(|line| line.contains("voice_settings"))

@@ -1864,6 +1864,7 @@ pub async fn reply(
             retryable,
             resumable,
             thread_id,
+            ..
         }) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -2038,6 +2039,26 @@ pub async fn propose_post(
             ),
         })
         .into_response()),
+        // The same words to the same place moments after an earlier direct send: nothing posted.
+        // Answered as that send was when it is known to have posted — an idempotent replay — and
+        // refused with the sentence otherwise, so no caller reads a repeat as a new post.
+        Ok(crate::send_approval::VoicePost::Repeat {
+            channel,
+            earlier,
+            text,
+        }) => {
+            let result = crate::send_approval::repeat_notice(&channel, &earlier, &text);
+            if earlier.outcome == crate::post_gate::DirectOutcome::Sent {
+                Ok(Json(ProposedResponse {
+                    sent: true,
+                    serial: earlier.serial,
+                    result,
+                })
+                .into_response())
+            } else {
+                Err(ApiError::new(StatusCode::CONFLICT, "post_repeated", result))
+            }
+        }
         Err(OpError::PartiallyPosted {
             posted,
             unsent,
@@ -2045,6 +2066,7 @@ pub async fn propose_post(
             retryable,
             resumable,
             thread_id,
+            ..
         }) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -2123,6 +2145,7 @@ pub async fn commit_post(
             retryable,
             resumable,
             thread_id,
+            ..
         })) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
