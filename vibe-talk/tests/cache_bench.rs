@@ -218,7 +218,7 @@ fn chan_id(connection: &Connection, chan: &ChanKey) -> i64 {
 /// Run one term through the shape `choose` picks, `RUNS` times, and with Rust re-matching.
 fn search_term(connection: &Connection, chan: i64, term: &str, tag: &str) {
     let terms = vec![term.to_owned()];
-    let path = search::choose(connection, &terms).expect("choose");
+    let path = search::choose(connection, chan, &terms).expect("choose");
     let query = search::fts_query(&terms);
     let scan_sql = search::scan_sql(1);
     let run = |shape: SearchPath| -> Vec<i64> {
@@ -273,7 +273,7 @@ fn search_term(connection: &Connection, chan: i64, term: &str, tag: &str) {
         .expect("fetch");
     for _ in 0..RUNS {
         let started = Instant::now();
-        let shape = search::choose(connection, &terms).expect("choose");
+        let shape = search::choose(connection, chan, &terms).expect("choose");
         let candidates = run(shape);
         let mut kept = 0;
         for row_id in candidates {

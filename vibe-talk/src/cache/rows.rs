@@ -244,6 +244,21 @@ mod tests {
     }
 
     #[test]
+    fn an_incoming_message_keeps_no_field_derived_when_it_is_served() {
+        let mut message = crate::cache::fixtures::message("1", "a", "hello", 5);
+        message.spoken_time = "09:51".to_owned();
+        message.spoken_content = "hello there".to_owned();
+        message.content_html = "<p>hello</p>".to_owned();
+        message.noise = true;
+        message.heading = Some(crate::model::Heading::default());
+        let incoming = Incoming::new(message, Scope::Main);
+        assert_eq!(
+            incoming.message,
+            crate::cache::fixtures::message("1", "a", "hello", 5)
+        );
+    }
+
+    #[test]
     fn the_creation_time_comes_from_the_id_first_then_the_timestamp() {
         let message = crate::cache::fixtures::message("not-a-number", "a", "x", 1_700_000_000_000);
         assert_eq!(created_ms(&message), Some(1_700_000_000_000));

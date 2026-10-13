@@ -545,6 +545,70 @@ fn absence_from_an_exhaustive_home_listing_spares_the_band_and_rows_pushed_meanw
 }
 
 #[test]
+fn a_push_of_the_text_already_held_protects_the_row_from_an_older_listings_absence() {
+    let fx = Fixture::new("cache-push-refresh");
+    let proof = newest_proof(ListStart::At(T0));
+    fx.list(vec![m(1), m(2), m(10)], T0 + 100, Some(proof));
+    let before = fx.cache.stats().rows_written;
+    // The live feed says m2 is there, as it is, at 200.
+    push(&fx, m(2), true, T0 + 200);
+    // A read that started at 150 lacks it: it began before the push saw it, so proves nothing.
+    fx.list(vec![m(1), m(10)], T0 + 150, Some(proof));
+    assert!(content(&fx, "m2").is_some());
+    assert_eq!(
+        held(&fx, "m2").expect("held").observed_ms,
+        T0 + 200,
+        "the push moved the time its text was last seen"
+    );
+    // A re-listing of unchanged rows still writes nothing.
+    fx.list(vec![m(1), m(2), m(10)], T0 + 300, None);
+    assert_eq!(
+        fx.cache.stats().rows_written,
+        before + 1,
+        "only the push wrote"
+    );
+}
+
+#[test]
+fn listing_a_threads_replies_again_rewrites_neither_its_rows_nor_its_record() {
+    let fx = Fixture::new("cache-thread-quiet");
+    let replies = || {
+        vec![
+            reply("r1", "m1", "one", T0 + STEP + 1),
+            reply("r2", "m1", "two", T0 + STEP + 2),
+        ]
+    };
+    let thread = Scope::Thread("m1".to_owned());
+    fx.list_scope(thread.clone(), replies(), T0 + 10, None);
+    let verified = |fx: &Fixture| {
+        sql_count(
+            &fx.cache,
+            "SELECT verified_ms FROM thread WHERE thread_id = 'm1'",
+        )
+    };
+    assert_eq!(verified(&fx), T0 + 10);
+    let written = fx.cache.stats().rows_written;
+    fx.list_scope(thread, replies(), T0 + 50, None);
+    assert_eq!(fx.cache.stats().rows_written, written);
+    assert_eq!(verified(&fx), T0 + 10, "a reply carries no count to verify");
+    // A thread list that counts the replies does verify the record.
+    fx.offer(
+        &fx.chan,
+        Observation::Threads {
+            threads: vec![ThreadRecord {
+                thread_id: "m1".to_owned(),
+                root_id: Some(mid("m1")),
+                reply_count: Some(2),
+                reply_count_exact: true,
+                last_activity_ms: T0 + STEP + 2,
+            }],
+            observed_ms: T0 + 60,
+        },
+    );
+    assert_eq!(verified(&fx), T0 + 60);
+}
+
+#[test]
 fn absence_from_a_listing_of_another_scope_only_drops_that_membership() {
     let fx = Fixture::new("cache-membership");
     // A reply also sent to the channel: home is its thread, and it is listed in main too.
@@ -883,18 +947,6 @@ fn only_a_proof_stamps_and_an_empty_listing_stamps_nothing() {
         intervals(&fx, &Scope::Main).is_empty(),
         "a short read is not a proof"
     );
-    let range = Proof {
-        from: ListStart::At(T0),
-        until: ListEnd::Before(T0 + 100 * STEP),
-        complete: true,
-        full: true,
-        source: Source::Range,
-    };
-    fx.list(Vec::new(), T0 + 200, Some(range));
-    assert!(
-        intervals(&fx, &Scope::Main).is_empty(),
-        "an empty page proves nothing"
-    );
     // A proof from the oldest row, not from the scope's start: the start is never inferred.
     fx.list(
         vec![m(1), m(2), m(3)],
@@ -912,10 +964,36 @@ fn only_a_proof_stamps_and_an_empty_listing_stamps_nothing() {
     assert_eq!(stamped[0].listed_ms, T0 + 300);
     assert_eq!(stamped[0].full_ms, Some(T0 + 300));
     assert!(stamped[0].complete);
+    // An empty page proves nothing, even with a proof, and even where nothing else would keep its
+    // claim back: the head is far above it, so its span is settled.
+    fx.list(
+        vec![m(1), m(60)],
+        T0 + 400,
+        Some(newest_proof(ListStart::At(T0 + 60 * STEP))),
+    );
+    let before = intervals(&fx, &Scope::Main);
+    let range = Proof {
+        from: ListStart::At(T0 + 10 * STEP),
+        until: ListEnd::Before(T0 + 20 * STEP),
+        complete: true,
+        full: true,
+        source: Source::Range,
+    };
+    fx.list(Vec::new(), T0 + 500, Some(range));
+    assert_eq!(
+        intervals(&fx, &Scope::Main),
+        before,
+        "an empty page proves nothing"
+    );
+    // The same span with one row in it is a proof.
+    fx.list(vec![m(15)], T0 + 600, Some(range));
+    assert!(intervals(&fx, &Scope::Main)
+        .iter()
+        .any(|i| i.t0_ms == T0 + 10 * STEP && i.t1_ms == T0 + 20 * STEP));
     // A provider proof that the scope starts here stamps from its start (clamped to the age limit).
     fx.list(
         vec![m(1), m(2), m(3)],
-        T0 + 400,
+        T0 + 700,
         Some(newest_proof(ListStart::ScopeStart)),
     );
     let cutoff = Limits::default().cutoff_ms("C1", T0);
@@ -1073,6 +1151,21 @@ fn an_offer_too_big_for_the_queue_is_dropped_and_marks_the_channel_suspect() {
     // A read of the newest end that started after the drop makes the head trusted again.
     fx.list(vec![m(1)], T0 + 20, Some(newest_proof(ListStart::At(T0))));
     assert!(!fx.cache.is_suspect(&fx.chan));
+}
+
+#[test]
+fn a_barrier_with_nothing_to_wait_for_leaves_the_flush_flag_down() {
+    let fx = Fixture::new("cache-flush-flag");
+    fx.list(vec![m(1)], T0, None);
+    assert!(fx.cache.barrier_blocking(Duration::from_secs(1)));
+    assert!(
+        !fx.cache
+            .shared
+            .seq
+            .flush
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "a raised flag would cut the next batch short for no one"
+    );
 }
 
 #[tokio::test]

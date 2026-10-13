@@ -923,7 +923,7 @@ impl Writer<'_> {
                 .saturating_add(1),
             ListEnd::Before(ms) => ms,
         };
-        let settled = coverage::settled_bound(head.as_ref(), Some(newest)).unwrap_or(until);
+        let settled = coverage::absence_bound(head.as_ref(), newest, listing.observed_ms);
         let end = until.min(settled);
         if from < end {
             self.absent(chan_id, &scope_key, from, end, listing.observed_ms, &seen)?;

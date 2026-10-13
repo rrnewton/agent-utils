@@ -89,18 +89,29 @@ pub enum Path {
 /// The share of rows at or above which a term counts as common.
 pub const COMMON_SHARE: f64 = 0.02;
 
-/// Choose the shape. The scan when any term is shorter than three characters, or when the rarest
-/// trigram of the rarest term is in at least [`COMMON_SHARE`] of the rows, judged from the
-/// index's document counts; the index otherwise.
+/// Choose the shape for a search of the channel interned as `chan`. The scan when any term is
+/// shorter than three characters, or when the rarest trigram of the rarest term is in at least
+/// [`COMMON_SHARE`] of the CHANNEL's rows; the index otherwise.
+///
+/// The index's document counts are for the whole file, so a trigram's count is set against the
+/// channel's own size: the index path costs one probe per document the trigram is in, wherever
+/// it is, and is chosen only while that is a small part of what a scan of the channel would read.
+/// A term common in another channel can therefore send a small channel to the scan, whose cost
+/// that channel's size bounds. A short term (or a common one) that is rare in a large channel
+/// reads the whole channel; the search milestone bounds that scan and says how far back it got.
 ///
 /// # Errors
 ///
 /// When the vocabulary cannot be read.
-pub fn choose(connection: &Connection, terms: &[String]) -> rusqlite::Result<Path> {
+pub fn choose(connection: &Connection, chan: i64, terms: &[String]) -> rusqlite::Result<Path> {
     if terms.is_empty() || terms.iter().any(|t| t.chars().count() < 3) {
         return Ok(Path::Scan);
     }
-    let rows: i64 = connection.query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))?;
+    let rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM message WHERE chan = ?1",
+        [chan],
+        |r| r.get(0),
+    )?;
     if rows == 0 {
         return Ok(Path::Index);
     }
@@ -144,6 +155,56 @@ mod tests {
         assert_eq!(
             fts_query(&["Ab\"c".to_owned(), "x OR y".to_owned()]),
             "\"ab\"\"c\" \"x or y\""
+        );
+    }
+
+    #[test]
+    fn a_term_is_judged_against_the_channels_own_size() {
+        let connection = Connection::open_in_memory().expect("memory");
+        connection
+            .execute_batch(crate::cache::schema::STEPS[0].sql)
+            .expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO channel (chan, provider_key, channel_id) VALUES (1, 'p', 'big');
+                 INSERT INTO channel (chan, provider_key, channel_id) VALUES (2, 'p', 'small');",
+            )
+            .expect("channels");
+        let mut insert = connection
+            .prepare(
+                "INSERT INTO message (chan, message_id, created_ms, observed_ms, home_scope,
+                        author_id, author, author_is_bot, content, content_hash, search_text)
+                 VALUES (?1, ?2, ?3, 0, 'main', 'u', 'a', 0, ?4, '', ?4)",
+            )
+            .expect("insert");
+        for i in 0..1_000_i64 {
+            let text = if i < 15 {
+                format!("zebracrossing {i}")
+            } else {
+                format!("plain words {i}")
+            };
+            insert
+                .execute(rusqlite::params![1, format!("b{i}"), i, text])
+                .expect("row");
+        }
+        for i in 0..10_i64 {
+            insert
+                .execute(rusqlite::params![
+                    2,
+                    format!("s{i}"),
+                    i,
+                    format!("small {i}")
+                ])
+                .expect("row");
+        }
+        let terms = vec!["zebracrossing".to_owned()];
+        // 15 documents: 1.5 % of the big channel, but more than the small one holds.
+        assert_eq!(choose(&connection, 1, &terms).expect("choose"), Path::Index);
+        assert_eq!(choose(&connection, 2, &terms).expect("choose"), Path::Scan);
+        assert_eq!(
+            choose(&connection, 1, &["ze".to_owned()]).expect("choose"),
+            Path::Scan,
+            "no trigram in it"
         );
     }
 

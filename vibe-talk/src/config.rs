@@ -1439,7 +1439,10 @@ fn message_cache_config(
                 detail: format!("{} is relative; give an absolute path", path.display()),
             });
         }
-        if Some(path.as_path()) == storage_path {
+        // Compared once `.` and `..` are resolved, so `/data/./s.sqlite3` is caught too. A
+        // symbolic link is resolved when the cache opens, which checks again.
+        let normalized = crate::cache::file::normalize_lexically;
+        if storage_path.is_some_and(|store| normalized(store) == normalized(path)) {
             return Err(ConfigError::Invalid {
                 field: "message_cache.path".to_owned(),
                 detail: "is the same file as storage.path; the cache is a separate, disposable \
@@ -4076,6 +4079,10 @@ provider = "slack"
             ),
             (
                 "[message_cache]\npath = \"/data/s.sqlite3\"\n",
+                "message_cache.path",
+            ),
+            (
+                "[message_cache]\npath = \"/data/./x/../s.sqlite3\"\n",
                 "message_cache.path",
             ),
             (

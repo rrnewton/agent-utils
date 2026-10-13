@@ -476,3 +476,37 @@ fn two_file_erases_at_once_run_one_after_the_other() {
     assert_eq!(cache.newest(&chan, &Scope::Main, 10), Read::Off);
     drop(dir);
 }
+
+/// A file erase discards whatever control operations were queued before it: they were for the
+/// file being erased, and running them would only delay the erase.
+#[test]
+fn a_file_erase_discards_the_control_operations_queued_before_it() {
+    let fx = Fixture::new("cache-race-discard");
+    fx.list((0..10).map(m).collect(), T0, None);
+    let Fixture {
+        cache, chan, dir, ..
+    } = fx;
+    let cache = Arc::new(cache);
+    let resume = cache.pause_writer();
+    cache.maintain(Maintenance::Hourly);
+    cache.erase_channels(std::slice::from_ref(&chan));
+    let before = cache.stats();
+    let eraser = {
+        let cache = Arc::clone(&cache);
+        std::thread::spawn(move || cache.erase_file(true))
+    };
+    while cache.is_open() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(resume);
+    assert!(eraser.join().expect("eraser").expect("erased").reopened);
+    let after = cache.stats();
+    assert_eq!(
+        after.ops_applied,
+        before.ops_applied + 1,
+        "only the pause ran"
+    );
+    assert_eq!(after.erased_channels, before.erased_channels);
+    assert_eq!(after.expired_rows, before.expired_rows);
+    drop(dir);
+}

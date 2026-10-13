@@ -162,7 +162,44 @@ pub fn erase_registered(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
             }
         }
     }
-    doomed.iter().map(|path| file::unlink_family(path)).sum()
+    doomed.iter().map(|path| erase_one(path)).sum()
+}
+
+/// Erase one cache file and its working files, if it is still ours to erase: what is at the path
+/// now is a cache file this code made (or the empty file it pre-creates, or nothing, leaving only
+/// working files), and no other process has it open. A registered path is only a record of where
+/// a cache WAS; something else may have been put there since, and is left alone.
+fn erase_one(path: &Path) -> u64 {
+    match schema::read_header(path) {
+        Ok(schema::Header::Ours | schema::Header::Empty) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "a registered message cache path now holds something else; it is left alone"
+            );
+            return 0;
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                kind = ?error.kind(),
+                "a registered message cache path cannot be read; it is left alone"
+            );
+            return 0;
+        }
+    }
+    let Ok(lock) = file::PathLock::acquire(path) else {
+        tracing::warn!(
+            path = %path.display(),
+            "a registered message cache is open in another process; it is left alone"
+        );
+        return 0;
+    };
+    let bytes = file::unlink_family(path);
+    let _ = std::fs::remove_file(file::lock_path(path));
+    drop(lock);
+    bytes
 }
 
 /// What [`reconcile_at_start`] did.
@@ -289,6 +326,33 @@ mod tests {
             sidecar_path(Path::new("/d/s.sqlite3")),
             PathBuf::from("/d/s.sqlite3.message-cache.json")
         );
+    }
+
+    #[test]
+    fn erasing_registered_paths_leaves_a_foreign_file_and_an_open_cache_alone() {
+        let scratch = crate::testing::TempDir::new("cache-marker-erase");
+        let dir = scratch.path().join("c");
+        file::ensure_private_dir(&dir).expect("dir");
+        let foreign = dir.join("now-someone-elses.sqlite3");
+        std::fs::write(&foreign, b"their notes").expect("write");
+        let open_one = dir.join("open.message-cache-h.sqlite3");
+        let cache = MessageCache::open(crate::cache::CacheOptions::new(&open_one)).expect("open");
+        let stale = dir.join("stale.message-cache-h.sqlite3");
+        drop(MessageCache::open(crate::cache::CacheOptions::new(&stale)).expect("make one"));
+        let mut sidecar = Sidecar::default();
+        for path in [&foreign, &open_one, &stale] {
+            sidecar.register(path);
+        }
+        let erased = erase_registered(&sidecar, Some(&dir));
+        assert!(erased > 0);
+        assert_eq!(std::fs::read(&foreign).expect("kept"), b"their notes");
+        assert!(
+            open_one.exists(),
+            "a cache another handle holds is not erased under it"
+        );
+        assert!(!stale.exists());
+        assert!(!file::lock_path(&stale).exists());
+        drop(cache);
     }
 
     #[test]

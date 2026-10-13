@@ -344,6 +344,43 @@ mod tests {
         assert!(!host_name().is_empty());
     }
 
+    #[test]
+    fn paths_naming_one_file_are_the_same_however_they_are_spelt() {
+        assert_eq!(
+            normalize_lexically(Path::new("/data/./x/../s.sqlite3")),
+            PathBuf::from("/data/s.sqlite3")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("../a/./b")),
+            PathBuf::from("../a/b")
+        );
+        assert!(same_file(
+            Path::new("/data/./s.sqlite3"),
+            Path::new("/data/s.sqlite3")
+        ));
+        assert!(!same_file(
+            Path::new("/data/s.sqlite3"),
+            Path::new("/data/c.sqlite3")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_or_a_hard_link_to_the_store_is_the_store() {
+        let scratch = crate::testing::TempDir::new("cache-same-file");
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).expect("dir");
+        let store = real.join("s.sqlite3");
+        std::fs::write(&store, b"store").expect("store");
+        let linked_dir = scratch.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked_dir).expect("symlink");
+        assert!(same_file(&store, &linked_dir.join("s.sqlite3")));
+        let hard = scratch.path().join("hard.sqlite3");
+        std::fs::hard_link(&store, &hard).expect("hard link");
+        assert!(same_file(&store, &hard));
+        assert!(!same_file(&store, &real.join("other.sqlite3")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_directory_open_to_others_is_refused_and_a_new_one_is_made_private() {
