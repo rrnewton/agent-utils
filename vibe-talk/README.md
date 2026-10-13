@@ -2427,6 +2427,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
 | POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered` — see "When the voice service stops answering" |
+| POST | `/api/v1/voice-end` | **write** | how a call that opened ended — `hang_up`, `error_frame`, `server_closed`, `connection_lost` or `suspended` — as one content-free line, `voice_call_ended` — see "How a call ended" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
@@ -3072,7 +3073,10 @@ when `greeting` is true, withholds microphone frames until the first `turn_compl
 uses `{"type":"prompt","text":"…"}`. A client switching from an open microphone to typed input
 sends `audio_end`, waits for `turn_complete`, and then sends the prompt; after that response's
 `turn_complete`, it sends a fresh `audio_start` before resuming microphone frames. Server output is
-`transcript`, `turn_complete`, `error`, or binary PCM. `quit` ends the session.
+`transcript`, `turn_complete`, `error`, or binary PCM. `quit` ends the session. The page closes the
+segment only once any spoken turn already under way — the owner's words or the assistant's answer
+— has completed, and resumes microphone frames a moment after every `turn_complete`, the greeting's
+included; see "How a call ended".
 
 A client may send `{"type":"interrupt"}` at any time after `session_started`. During a turn, the
 server stops the response, drops that turn's remaining PCM and transcripts (including any already
@@ -3276,6 +3280,57 @@ What this cannot tell you:
   produces no frames at all, which looks the same as the listener staying quiet. Only the greeting
   and typed prompts are timed.
 - **The hosted vendor's protocol.** It has error frames of its own. This covers `vibe-talk-v1` only.
+
+**How a call ended** (`#268 voice-call-drops`). Calls once ended on their own while the only record
+of why was the voice bridge's log, which saw the page say goodbye and could not see what made it.
+The page ends a call in exactly two ways, and only these send `audio_end` and `quit`: the reader's
+**Hang up**, and an `error` frame, which the protocol says ends the server's session. Everything
+else that ends a call is the far side or the network, and the page says which, how far into the
+call, and that the reader did not hang up — in red, kept until the reader starts a new call or
+dismisses it rather than taken away after twelve seconds like other errors (a driver looks back a
+minute later), and in the transcript's seam:
+
+| Ended by | What the page says |
+|---|---|
+| `hang_up` | "Call ended." and nothing in red |
+| `error_frame` | "The voice service reported an error 9 s into the call, and the call has ended: …" with the server's words |
+| `server_closed` | "The voice service ended the call 1 min 15 s in — you did not hang up." with the reason the server gave, if any |
+| `connection_lost` | "The connection to … failed 22 s into the call: it was cut without a goodbye — by the network, the phone or the voice service, not by Hang up." — a close without a closing handshake (1006), or one after a socket error |
+| `suspended` | "Paused — the app was in the background.", as before, with **Resume** |
+
+Each call that opened is recorded once, when it ends, to `POST /api/v1/voice-end`, for example
+`{"protocol":"vibe-talk-v1","chat":false,"ended_by":"connection_lost","close_code":1006,
+"since_open_ms":22000,"turns":2}`. `close_code` is the code the browser reported, 1000–4999, and is
+absent when the page closed the socket itself; every other field is required. Anything else — a
+free-text reason, an unknown `ended_by`, a code out of range — is refused with 400 `invalid_end`
+and logs nothing. It has its own budget of 30 records a minute (429 `voice_end_throttled` past it,
+announced by one `voice_end_throttled` line a minute), so it cannot crowd out the health record. It
+logs one line of names and numbers, INFO for a hang-up and WARN for anything else:
+`voice_call_ended protocol=vibe-talk-v1 chat=false ended_by=connection_lost close_code=1006
+since_open_ms=22000 turns=2`. A start that never opened is the startup record's (above), not this.
+
+A socket the page has finished with no longer speaks for any call. Its close can arrive seconds
+after the page's `quit` — a server that waits out an interrupt before closing takes that long — and
+it used to tear down whatever call the reader had started since. Now it only adds its close code to
+the connection details; nothing else it delivers is judged or acted on.
+
+A healthy call does not end itself. Nothing the page times — the 9-second open deadline (which only
+applies to a socket that has not opened), the spoken yes's settle window, the hold below, the
+microphone's hand-off, the card's countdown, the no-reply bound — closes a call or sends `quit`;
+the page suite fires every one of them on a working call to hold it to that.
+
+The page also stopped two things it did to the bridge mid-call. **The microphone waits across the
+greeting's end** as it does across every other turn's (`VOICE_CAPTURE_RESUME_MS`): PCM a few
+milliseconds after a `turn_complete` was measured to close the whole session, and only the greeting
+had been exempt. And **a text turn waits for an open spoken turn**: the page's notices, a relayed
+message, or a message typed into a spoken call used to close the microphone's segment at once, even
+while the owner was speaking or the assistant answering. That left two `turn_complete`s in flight;
+the page took the turn's for the segment's, sent its prompt into a turn still running, then took
+the segment's for the prompt's and opened the microphone over the answer. Now the text waits until
+anything of a spoken turn that has arrived — the owner's words, the assistant's, its audio — is
+closed by that turn's `turn_complete`, and only then sends `audio_end`. A turn that sends nothing
+for 8 seconds without completing (`SPOKEN_TURN_HOLD_MS`) is let go, as before, and the connection
+details say so.
 
 ## Signed conversation URLs
 
@@ -5328,6 +5383,32 @@ hold, for both wire protocols:
   send it, send, do it, go ahead, sure, please do* — with punctuation and case ignored and at most
   one word of filler ("yes please", "ok send it"). A yes inside a sentence that adds anything
   ("yes, and tell him I'm late", "send it to Bob") sends nothing, nor does a question ("Send it?").
+
+**What came before the answer, on `vibe-talk-v1`** (`#268 voice-call-drops`). A bridge relays the
+owner's words and the assistant's as two streams, and the answer's final transcript can reach the
+page after the assistant's reply to it has begun: "One moment." arrived before the "Yes." it
+answered, and the page used to hold that reply up as part of the read-back, so an exact read-back
+and a plain yes sent nothing. The rules above are now asked of what was said BEFORE the answer:
+
+* An assistant turn numbered the same as the answer, or later, is its reply — the protocol numbers
+  the owner's words and the answer to them alike — and is no part of the read-back. Without turn
+  numbers nothing tells a reply from more of the read-back (the order of arrival is what cannot be
+  trusted), so a provider that sends none is judged as before, over everything said since the
+  owner last spoke.
+* "Not interrupted" and "completed before the answer" are asked of the read-back's own numbered
+  turn: its `turn_complete`, not interrupted.
+* "Heard to the end" compares the answer with the moment the read-back's audio finished playing —
+  the audio queued when its `turn_complete` arrived, which the server sends after the last of it —
+  not with the reply that may already be playing. The answer began at its first frame, or at its
+  reply's first frame if that came sooner, which is never more lenient.
+* An answer the bridge streams only as hypotheses, never marking one final, is judged when its turn
+  completes, with the words the page shows and stores for it then.
+* "Everything it said once this draft was on the card" is counted in words within a turn as well
+  as by turns: "Sure, let me draft that." before the tool call and the read-back after it can be
+  one numbered turn, which began before the card did.
+
+None of this loosens a rule: the read-back must still be exact, plain words, uninterrupted and heard
+out, the answer the very next one and a plain yes, and the post goes at most once.
 
 A yes that passes waits 1.2 s, so a "wait" transcribed within that time sends nothing, then
 commits exactly the card's server copy through the same function and busy latch as a tap: a tap and

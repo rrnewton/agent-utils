@@ -17,6 +17,10 @@
 //! route writes per minute across every caller, and [`MAX_BODY_BYTES`] caps what it will read.
 //! The first refusal in a window writes one line saying records are being dropped, so throttling
 //! is visible without becoming a flood of its own.
+//!
+//! **How a call ended** (`#268 voice-call-drops`) is the second record here, [`EndReport`]: one
+//! line per call that opened, naming who or what ended it, on the same terms — closed, bounded by
+//! its own [`LogBudget`], and free of anything said.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -152,6 +156,107 @@ impl HealthReport {
             self.silent_turns,
             self.audio_ms,
             self.peak,
+        )
+    }
+}
+
+/// Who or what ended a call that had opened, as the page saw it. `#268 voice-call-drops`. See the
+/// README, "How a call ended".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndedBy {
+    /// The reader pressed Hang up.
+    HangUp,
+    /// The voice service sent an `error` frame, which ends its session, and the page then said
+    /// goodbye (`audio_end`, `quit`) and closed. The only other way the page ends a call.
+    ErrorFrame,
+    /// The voice service's side closed the socket with a closing handshake while the reader was in
+    /// the call and the page was in sight.
+    ServerClosed,
+    /// The connection was lost without a closing handshake (the browser's 1006, or an error on the
+    /// socket before its close): the network, the phone, or the far side cut it.
+    ConnectionLost,
+    /// The socket closed while the page was in the background, or just after it came back.
+    Suspended,
+}
+
+impl EndedBy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::HangUp => "hang_up",
+            Self::ErrorFrame => "error_frame",
+            Self::ServerClosed => "server_closed",
+            Self::ConnectionLost => "connection_lost",
+            Self::Suspended => "suspended",
+        }
+    }
+}
+
+/// One page's record of how a call that opened ended: `POST /api/v1/voice-end`. The field set IS
+/// the allowlist, as for [`HealthReport`]: closed enums, a flag and integers, and nothing anybody
+/// said.
+///
+/// `#268 voice-call-drops`. Calls ended on their own, and the only record of why was the voice
+/// bridge's log, which saw the page say goodbye and could not see what made it. One line per call
+/// here tells a hang-up from a drop from the service ending the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndReport {
+    /// Wire protocol of the call.
+    pub protocol: Protocol,
+    /// Whether the call was typed.
+    pub chat: bool,
+    /// Who or what ended it.
+    pub ended_by: EndedBy,
+    /// The close code the browser reported, `1000`–`4999`; absent when the page closed the socket
+    /// itself.
+    #[serde(default)]
+    pub close_code: Option<u16>,
+    /// Milliseconds from the socket opening to the end.
+    pub since_open_ms: u32,
+    /// Completed turns in the call: an ordinal, not an id.
+    pub turns: u32,
+}
+
+impl EndReport {
+    /// Refuse anything that is not a plausible record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sentence naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.since_open_ms > MAX_SINCE_OPEN_MS {
+            return Err(format!(
+                "since_open_ms is longer than {MAX_SINCE_OPEN_MS} ms"
+            ));
+        }
+        if self
+            .close_code
+            .is_some_and(|code| !(1000..=4999).contains(&code))
+        {
+            return Err("close_code is not a WebSocket close code (1000-4999)".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Whether the reader ended the call, rather than anything ending it for them.
+    #[must_use]
+    pub fn by_the_reader(&self) -> bool {
+        self.ended_by == EndedBy::HangUp
+    }
+
+    /// The single log line: enum names and integers, and nothing anybody said.
+    #[must_use]
+    pub fn log_fields(&self) -> String {
+        format!(
+            "protocol={} chat={} ended_by={} close_code={} since_open_ms={} turns={}",
+            self.protocol.as_str(),
+            self.chat,
+            self.ended_by.as_str(),
+            self.close_code
+                .map_or_else(|| "-".to_owned(), |code| code.to_string()),
+            self.since_open_ms,
+            self.turns,
         )
     }
 }

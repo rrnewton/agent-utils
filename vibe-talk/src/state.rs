@@ -121,6 +121,9 @@ pub struct AppState {
     /// Caps the lines `POST /api/v1/voice-health` writes, across every caller. Per process rather
     /// than per call because the server has no call id to count by, by design.
     pub voice_health_budget: Arc<crate::voice_health::LogBudget>,
+    /// The same cap for `POST /api/v1/voice-end`, kept apart so a flood of one record cannot
+    /// silence the other. `#268 voice-call-drops`.
+    pub voice_end_budget: Arc<crate::voice_health::LogBudget>,
     /// The paren tags each author has started messages with, per channel: what confirms a
     /// `(tag)` heading. `#242 rich-headers`; see [`crate::heading::HeadingTags`]. In memory and
     /// bounded, shared by every read and the live stream.

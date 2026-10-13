@@ -1088,6 +1088,50 @@ pub async fn voice_health(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// `POST /api/v1/voice-end` — how a call that opened ended, as the page saw it. `#268
+/// voice-call-drops`.
+///
+/// Closed like the health record (see [`crate::voice_health::EndReport`]), logged and not stored,
+/// one line per call: `voice_call_ended`, at info when the reader hung up and at warn when anything
+/// else ended the call. Bounded by its own [`crate::voice_health::LogBudget`].
+pub async fn voice_end(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let report: crate::voice_health::EndReport = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_end",
+            "expected a call-end record with only the documented fields and values",
+        )
+    })?;
+    report
+        .validate()
+        .map_err(|detail| ApiError::new(StatusCode::BAD_REQUEST, "invalid_end", detail))?;
+    let spend = state.voice_end_budget.spend();
+    if spend == crate::voice_health::Spend::FirstRefusal {
+        tracing::warn!(
+            "voice_end_throttled max_lines={} window_s={}",
+            crate::voice_health::MAX_LINES_PER_WINDOW,
+            crate::voice_health::BUDGET_WINDOW.as_secs()
+        );
+    }
+    if !spend.allowed() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "voice_end_throttled",
+            "too many call-end records this minute; this one was not logged",
+        ));
+    }
+    if report.by_the_reader() {
+        tracing::info!("voice_call_ended {}", report.log_fields());
+    } else {
+        tracing::warn!("voice_call_ended {}", report.log_fields());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`
 ///
 /// Read a message aloud, and hand back the AUDIO rather than a URL to it.
