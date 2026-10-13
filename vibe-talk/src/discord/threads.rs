@@ -1119,8 +1119,8 @@ impl HttpDiscordClient {
                     )?
                     .url;
                 let value = self.send_with_timeout(request, TIMELINE_TIMEOUT).await?;
-                let message = parse_message(&value)?;
-                validate_bridge_message(&message, channel, Some(id))?;
+                let mut message = parse_message(&value)?;
+                confirm_bridge_post(&mut message, channel, id)?;
                 Ok(message)
             }
             ThreadApi::Native => {
@@ -1206,6 +1206,49 @@ fn validate_bridge_message(
         }
     }
     Ok(())
+}
+
+/// A bridge's answer to a post into one of its threads, read as the confirmation it is.
+/// `send-confirm-thread`.
+///
+/// The answer must be in the channel posted to and, where it names a thread, in the thread posted
+/// to: one naming another channel or thread came from a bridge that put the post somewhere else,
+/// and is refused as before. But a message's `thread` is optional on the wire, and a bridge may
+/// confirm a post it delivered without it. A Google Chat bridge did, on a reply the owner sent
+/// into a thread: its live event stream had stored the new message before the provider's send
+/// command returned, and it answered with that stored copy, which carried no membership. The
+/// reply was in the thread and its recipient answered it; vibe-talk said "Delivery unconfirmed",
+/// and a Retry, asking for the same post again, got the same answer.
+///
+/// The thread route posts into that thread or fails, so a message it answers with and does not
+/// place is in that thread, and a reply there: a thread's root is the message the thread began
+/// with, which was there before anything could be posted into it. The root's id and the reply
+/// count are left unknown rather than guessed. A retry is unchanged by this: it is the same
+/// request under the same nonce, and a bridge that recognises it answers with the same message.
+fn confirm_bridge_post(
+    message: &mut Message,
+    channel: &ChannelId,
+    thread: &str,
+) -> Result<(), ChatError> {
+    if message.channel_id != *channel {
+        return Err(shape("thread post was answered from a different channel"));
+    }
+    match &message.thread {
+        Some(membership) if membership.id != thread => {
+            Err(shape("thread post was answered from a different thread"))
+        }
+        Some(_) => Ok(()),
+        None => {
+            message.thread = Some(MessageThread {
+                id: thread.to_owned(),
+                root_message_id: None,
+                is_root: false,
+                reply_count: None,
+                reply_count_exact: false,
+            });
+            Ok(())
+        }
+    }
 }
 
 fn parse_bridge_summary(mut value: Value, channel: &ChannelId) -> Result<ThreadSummary, ChatError> {
@@ -2237,6 +2280,70 @@ mod tests {
             1,
             "invalid path segments must not be sent"
         );
+    }
+
+    /// `send-confirm-thread`. The owner's reply into a thread was delivered, and the bridge
+    /// answered with a copy of the message that carried no `thread`: its live event stream had
+    /// stored the message before the provider's send command returned. vibe-talk refused that
+    /// answer as "a different thread" and showed a delivered reply as unconfirmed. A message the
+    /// thread route answers with and does not place is in that thread; one placed elsewhere, or
+    /// in another channel, is still refused.
+    #[tokio::test]
+    async fn a_bridge_thread_post_answered_without_membership_is_confirmed_in_that_thread() {
+        let mut routes = Replies::new();
+        routes.insert(
+            "POST /channels/parent/threads/opaque%2Fthread/messages".into(),
+            (StatusCode::OK, message("parent", "new-message", "answer")),
+        );
+        let mut elsewhere = message("parent", "misplaced", "answer");
+        elsewhere["thread"] = json!({"id":"another/thread","root_message_id":"root",
+            "is_root":false,"reply_count":null,"reply_count_exact":false});
+        routes.insert(
+            "POST /channels/parent/threads/wrong-thread/messages".into(),
+            (StatusCode::OK, elsewhere),
+        );
+        routes.insert(
+            "POST /channels/parent/threads/wrong-channel/messages".into(),
+            (
+                StatusCode::OK,
+                message("other-parent", "misplaced", "answer"),
+            ),
+        );
+        let mock = mock(routes, ThreadApi::Bridge).await;
+        let channel = ChannelId("parent".into());
+        let posted = mock
+            .client
+            .post_in_thread(
+                &channel,
+                "opaque/thread",
+                "answer",
+                Some(&MessageId("quoted".into())),
+            )
+            .await
+            .expect("a delivered reply is confirmed");
+        assert_eq!(posted.id.as_str(), "new-message");
+        assert_eq!(
+            posted.thread,
+            Some(MessageThread {
+                id: "opaque/thread".into(),
+                root_message_id: None,
+                is_root: false,
+                reply_count: None,
+                reply_count_exact: false,
+            })
+        );
+        for (thread, said) in [
+            ("wrong-thread", "different thread"),
+            ("wrong-channel", "different channel"),
+        ] {
+            let error = mock
+                .client
+                .post_in_thread(&channel, thread, "answer", None)
+                .await
+                .expect_err("an answer from somewhere else is not a confirmation");
+            assert!(error.to_string().contains(said), "{thread}: {error}");
+            assert!(error.may_have_delivered(), "{thread}: {error}");
+        }
     }
 
     #[tokio::test]
