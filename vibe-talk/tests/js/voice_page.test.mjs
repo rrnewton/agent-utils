@@ -4367,6 +4367,11 @@ const TUNING_BANDS = {
     "how long Send is held after a card appears or a newer proposal replaces it. Under a second, " +
     "a tap already under way when the text appeared still lands on words the owner never read; " +
     "past three, an owner who did read them waits on a button that looks broken"],
+  // `#269 approval-card-inline`.
+  POST_ROOM_KEEP_MS: [400, 2000,
+    "how long the main screen keeps the card's room after the card goes. Under about half a second, " +
+    "a second tap a moment late lands in the message box that sprang back up under it and opens the " +
+    "phone's keyboard; past two, a box the owner wants to type in stays a single line for no reason"],
   // `#261 two-column-connectors`. The links between Main's roots and their cards.
   COLUMN_GLIDE_MS: [800, 3000,
     "how long a selection waits with its link's other end off screen before that column scrolls to " +
@@ -34029,7 +34034,38 @@ test("`#269 approval-card-inline`: the card is the next message under the transc
   await page.settle();
   assert.equal(page.proposalCommits.length, 1);
   assert.equal(card.hidden, true);
+  // The room it made is kept a moment, so a second tap a little late does not land in a message
+  // box that sprang back up under it; then it goes.
+  assert.ok(page.el("screen-main").hasAttribute("data-draft"), "the box sprang back at once");
+  assert.equal(page.expireTimers(1000), 1, "nothing takes the room back");
   assert.ok(!page.el("screen-main").hasAttribute("data-draft"), "the room for the card outlived it");
+});
+
+test("`#269 approval-card-inline`: docked under Reply the card's Send is outlined, so it is never taken for the reply's", async () => {
+  const page = newPage();
+  await proposedDuringACall(page);
+  const card = page.el("post-confirm");
+  await openReplyOn(page, [message({ id: "300", content: "is the build green yet" })]);
+  assert.equal(card.getAttribute("data-place"), "dock");
+  assert.equal(card.getAttribute("data-screen"), "reply");
+  assert.match(cssBlock('#post-confirm[data-screen="reply"] #post-confirm-send'), /background:\s*transparent/,
+    "the docked Send is as filled as Reply's own");
+  await page.el("close-reply").click();
+  await page.settle();
+  assert.equal(card.getAttribute("data-place"), "channel");
+  assert.equal(card.hasAttribute("data-screen"), false, "the card still thinks it is under Reply");
+});
+
+test("`#269 approval-card-inline`: the card's small text and a frozen card's notes are legible on the owner's tile", () => {
+  // `--muted` and `--warn` on `--mine` are 4.1:1 and 3.9:1 in dark, under small text's 4.5:1.
+  const dark = cssBlock(":root");
+  assert.match(dark, /--muted-on-mine:\s*#aab2c0/);
+  assert.match(dark, /--warn-on-mine:\s*#e8a27a/);
+  assert.match(cssBlockIn("(prefers-color-scheme: light)", ":root"), /--muted-on-mine:/, "light has no on-tile muted");
+  for (const selector of ["#post-confirm-title", "#post-confirm-where", "#post-confirm-expiry", ".sent-how"]) {
+    assert.match(cssBlock(selector), /color:\s*var\(--muted-on-mine\)/, `${selector} is drawn in --muted on the tile`);
+  }
+  assert.match(cssBlock('.messages li.sent-card[data-outcome="partial"] .sent-note'), /color:\s*var\(--warn-on-mine\)/);
 });
 
 test("`#269 approval-card-inline`: a reader at the newest line follows the card down, and one reading older turns is told a draft waits", async () => {
@@ -34571,6 +34607,56 @@ test("`#270 voice-transcript-markers`: a server that does not take records is se
   assert.deepEqual(page.claims, []);
   assert.ok(!proposalWatches(page).some((r) => r.includes("sent_after")), "the cursor went to an old server");
   assert.ok(!page.transcriptCalls.some((r) => r.includes("records=1")), "records=1 went to an old server");
+
+  // And a transcript read really is made, without records: a reload with a stored conversation.
+  const reread = newPage();
+  reread.storedTurns.set("conv_old", [{ speaker: "you", text: "what happened overnight", at_ms: 1_700_000_000_000 }]);
+  await signIn(reread);
+  await reread.settle();
+  assert.ok(reread.transcriptCalls.length > 0, "the page never read the stored transcript");
+  assert.ok(!reread.transcriptCalls.some((r) => r.includes("records=1")), "records=1 went to an old server");
+});
+
+test("`#270 voice-transcript-markers`: a frozen card ticks only a whole send, and a partial one shows only what went", async () => {
+  const page = newPage();
+  await recordingCall(page);
+  page.claimStatus = 404;
+  page.propose(proposal({ reply_to: null, text: "first part —\nsecond 😀 part" }));
+  await page.settle();
+  page.expireTimers(2000);
+  page.commitProposal = async () => {
+    page.settleProposal();
+    return json(207, { error: "partially_posted", detail: "chat request failed", posted: 1, unsent: "second 😀 part",
+      uncertain: false, serial: 7 });
+  };
+  await page.el("post-confirm-send").click();
+  await watchTurns(page);
+  const card = sentCards(page)[0];
+  assert.ok(card, "the partial send left no card");
+  const said = wordsOf(card);
+  assert.match(said, /Partly sent to lead team/);
+  assert.match(said, /first part —/);
+  assert.doesNotMatch(said, /second/, "the card shows words that were not sent");
+  // "second 😀 part" is thirteen characters as the server counts them, fourteen UTF-16 units.
+  assert.match(said, /the rest \(13 characters\) was not sent/);
+  const mark = card.children[0].children.find((kid) => kid.hasClass("sent-mark"));
+  assert.equal(mark.textContent, "!", "a partial send is ticked as if it all went");
+
+  // Restored, each outcome has its own glyph: the tick only for a send that went whole.
+  const restored = newPage();
+  restored.transcriptRecordsSupported = true;
+  restored.storedTurns.set("conv_marks", ["sent", "unconfirmed", "partial"].map((outcome, at) => ({
+    speaker: "sent", text: `ship it ${outcome}`, at_ms: 1_700_000_000_000 + at,
+    detail: {
+      kind: "sent", serial: at + 1, send_seq: at + 1, channel_id: CHANNEL.id, channel_name: "lead team",
+      parts_posted: outcome === "sent" ? 1 : 0, parts_total: 1, unsent_chars: 0, outcome, how: "tap",
+      origin: "commit", text_truncated: false, text_chars: 9, begun_at_ms: 1, sent_at_ms: 1,
+    },
+  })));
+  await signIn(restored);
+  await restored.settle();
+  const marks = sentCards(restored).map((li) => li.children[0].children.find((kid) => kid.hasClass("sent-mark")).textContent);
+  assert.deepEqual(marks, ["✓", "?", "!"]);
 });
 
 test("`#270 voice-transcript-markers`: a restored record asks for records and draws its sends as the same frozen cards", async () => {

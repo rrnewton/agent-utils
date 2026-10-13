@@ -20,6 +20,12 @@
 :root {
   --mine: #24405c; /* what YOU said */
   --mine-edge: #33587b;
+  /* Small quiet text and a warning ON `--mine`: the send card's heading, where it goes, its status
+     and a frozen card's notes. `--muted` and `--warn` are 4.1:1 and 3.9:1 there, under the 4.5:1
+     small text needs; these are 5.0:1. In light, the shared ones already pass (4.7:1). `#269
+     approval-card-inline`. */
+  --muted-on-mine: #aab2c0;
+  --warn-on-mine: #e8a27a;
   --theirs: #1d2026; /* what the AGENT said */
   /* Everyone else in the channel: other people, and any bot that is not the coding agent.
      Warm, so it is not read as a lighter or darker version of either principal, but QUIET --
@@ -173,6 +179,8 @@
   :root {
     --mine: #dbeaf8;
     --mine-edge: #b4d0e8;
+    --muted-on-mine: var(--muted);
+    --warn-on-mine: var(--warn);
     --theirs: #ffffff;
     --third: #faf6ee;
     --third-edge: #e8e0cf;
@@ -5542,7 +5550,7 @@ a.search-hit-link {
 
 #post-confirm-title {
   margin: 0 0 0.3rem;
-  color: var(--muted);
+  color: var(--muted-on-mine);
   font-size: 0.78rem;
   font-weight: 600;
 }
@@ -5605,7 +5613,7 @@ a.search-hit-link {
 }
 
 #post-confirm-where {
-  color: var(--muted);
+  color: var(--muted-on-mine);
   font-size: 0.82rem;
 }
 
@@ -5621,7 +5629,7 @@ a.search-hit-link {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  color: var(--muted);
+  color: var(--muted-on-mine);
   font-size: 0.82rem;
 }
 
@@ -5745,6 +5753,15 @@ a.search-hit-link {
     calc(0.75rem + env(safe-area-inset-left));
 }
 
+/* Docked under Reply, whose own filled "Send reply" is the screen's purpose and goes to the same
+   channel: the card's Send is OUTLINED there, so the filled button the thumb finds lower down is
+   never taken for the reply's — a slip that would post the agent's draft instead. */
+#post-confirm[data-screen="reply"] #post-confirm-send {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
 /* ------------------------------------------------------------------- frozen send cards --- */
 /*
  * `#270 voice-transcript-markers`. Every message the voice agent posted stays in the transcript as
@@ -5766,23 +5783,23 @@ a.search-hit-link {
 
 .messages li.sent-card[data-outcome="partial"] .sent-mark,
 .messages li.sent-card[data-outcome="unconfirmed"] .sent-mark {
-  color: var(--warn);
+  color: var(--warn-on-mine);
 }
 
 .sent-how {
-  color: var(--muted);
+  color: var(--muted-on-mine);
 }
 
 .sent-where,
 .sent-note {
   margin: 0.3rem 0 0;
-  color: var(--muted);
+  color: var(--muted-on-mine);
   font-size: 0.82rem;
 }
 
 .messages li.sent-card[data-outcome="partial"] .sent-note,
 .messages li.sent-card[data-outcome="unconfirmed"] .sent-note {
-  color: var(--warn);
+  color: var(--warn-on-mine);
 }
 
 .sent-open {
