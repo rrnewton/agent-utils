@@ -212,9 +212,9 @@ async fn editing_the_message_upstream_regenerates_only_that_summary() {
         .discord
         .edit(&MessageId(edited.clone()), &long_text("rollback reverted"));
     // ...and the server learns of it, as an adapter's pushed update tells it (the ingest route
-    // forgets the message). Until it learns, a summary asked for within thirty seconds of the page's
-    // read is answered from the text the page was shown, the window speech preparation accepts;
-    // see `ops::summarize_message`. `#208 persistent-cache`.
+    // forgets the message). Until it learns, a summary asked for within thirty seconds of the
+    // page's read is answered from the text the page was shown, the window speech preparation
+    // accepts; see `ops::summarize_message`. `#208 persistent-cache`.
     server
         .state
         .read_ahead
@@ -583,7 +583,7 @@ async fn the_cache_tests_exercise_the_key_a_real_deployment_writes() {
     );
 }
 
-// --- #208 persistent-cache, milestone summary-keep ------------------------------------------------
+// --- #208 persistent-cache, milestone summary-keep -------------------------------------------
 //
 // What a summary request does NOT cost: a chat call for a row the page has just read, a second
 // window fetch for rows asked about together, a model call after a restart or a change of a

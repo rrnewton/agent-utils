@@ -4700,7 +4700,11 @@ pub async fn remove_channel(
         }
         state.refresh_routes();
         let summaries_deleted = forget_channel_summaries(&state, &configured.id).await;
-        tracing::info!(channel = %channel_id, summaries_deleted, "configured channel hidden in the app");
+        tracing::info!(
+            channel = %channel_id,
+            summaries_deleted,
+            "configured channel hidden in the app"
+        );
         return Ok(channel_list_answer(&state, configured).await);
     }
     let added_channel = state.added_channels.read().ok().and_then(|added| {

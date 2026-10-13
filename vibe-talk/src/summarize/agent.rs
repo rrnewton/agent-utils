@@ -480,7 +480,8 @@ pub fn plain(reply: &str, requested_chars: usize) -> String {
 }
 
 /// [`plain`]'s flattening, cut only at the stored ceiling ([`super::stored_ceiling_chars`], four
-/// times the hard cap), and the length it was cut at when it ran past that. `#208 persistent-cache`.
+/// times the hard cap), and the length it was cut at when it ran past that.
+/// `#208 persistent-cache`.
 ///
 /// This is what is filed. The cap in force is applied when it is served, so a later cap change
 /// needs no new answer unless this one was cut shorter than the new cap. Every backend's answer,

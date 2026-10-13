@@ -4571,7 +4571,7 @@ mod tests {
         assert!(!store.set_ask_before_send(false).await.expect("save"));
     }
 
-    // --- #208 persistent-cache, milestone summary-keep --------------------------------------------
+    // --- #208 persistent-cache, milestone summary-keep ---------------------------------------
 
     /// Where the `cut_at` step sits in the ladder, found by what it does rather than by its index,
     /// so a step landed before it moves nothing here.
@@ -4627,7 +4627,8 @@ mod tests {
             let row = |version: &str, message: &str, summary: &str| {
                 connection
                     .execute(
-                        "INSERT INTO summaries VALUES (?1, '1111111111', ?2, '0000000000000007', ?3, 5)",
+                        "INSERT INTO summaries
+                         VALUES (?1, '1111111111', ?2, '0000000000000007', ?3, 5)",
                         [version, message, summary],
                     )
                     .expect("a row");

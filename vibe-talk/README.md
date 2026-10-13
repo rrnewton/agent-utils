@@ -1402,8 +1402,9 @@ Every path must be absolute. **Secrets are only ever read from files or a comman
 and never logged**; writing `api_key` or `bearer_token` inline is refused at startup by name. Of
 this section, only `dialect`, `model` and `max_tokens` are part of the summary cache key: changing
 one re-derives every summary and thread sentence (thread names are kept; see below), while
-rotating a credential or moving an endpoint does not. As before, every other `[summaries]` setting
-is part of the key too.
+rotating a credential or moving an endpoint does not. Of the other `[summaries]` settings, every
+one that changes what a summary says is part of the key too; `threshold_chars` and
+`reply_timeout_seconds` are not (see [Summaries are kept](#summaries-are-kept)).
 
 ### No tools, by construction
 
@@ -1448,11 +1449,13 @@ characters); any other answer fails that naming by name rather than being cut in
 * The **sentence** is filed under the summary policy like any summary, so a policy change asks for
   a fresh sentence — and keeps the name.
 
-Names are still subject to `storage.retain_days`, counted from the last time the name was written:
-on every naming and sentence refresh, and at most daily when a thread list read with the write
-token shows the thread active since. A thread that stays quiet, or unread, for longer than that
-gets a new name when it is next listed. The purge removes names with everything else. With no
-`storage.path`, names last for the life of the process.
+Names are still subject to `storage.summary_retain_days`, counted from the last time the name was
+written: on every naming and sentence refresh, and at most daily when a thread list read with the
+write token shows the thread active since (the sentence's row is kept alive at the same time). A
+thread that stays quiet, or unread, for longer than that gets a new name when it is next listed.
+Taking a channel off the list deletes its sentences and keeps its names, so it comes back under
+the names you knew. The purge removes names with everything else. With no `storage.path`, names
+last for the life of the process.
 
 ### What leaves this server
 
@@ -1460,6 +1463,48 @@ gets a new name when it is next listed. The purge removes names with everything 
 model provider you configured**, together with its authors' display names. Nothing else is: no
 read state, no tokens, no other channel. Choose the provider accordingly, and leave
 `[summaries.llm]` out where that is not acceptable.
+
+### Summaries are kept
+
+**The problem.** A summary costs a model call, and the reader sees one row per long message on
+every page load. A summary the store already holds should never be asked for again because the page
+was reloaded, the server restarted, or a setting changed that changes no word of it.
+
+**What you get.** `#208 persistent-cache`, milestone `summary-keep`:
+
+* **A hit costs no chat call.** The page asks for a summary of a row it has just drawn, so the text
+  is still in the server's thirty-second read-ahead memory (the one read-aloud uses); a stored
+  summary of exactly that text is answered from there, without reading the channel again. A page
+  reload in summary mode with twenty long rows therefore costs no chat calls when the summaries are
+  asked for within thirty seconds of the page's own read, and one shared window read otherwise:
+  rows that miss together share one fetch rather than one each. That memory is cleared by an
+  adapter's pushed edit or delete, by a delta that reports a deletion, and by the purge, so a
+  summary is never made from text older than the page was shown and a pushed delete is honoured at
+  once. On a provider whose feed carries no deletes, a message deleted upstream in those thirty
+  seconds can still have its stored summary shown — the same window read-aloud accepts.
+* **Only a change of wording makes a summary unreachable.** The cache key's policy version hashes
+  the prompt and whatever the summariser adds to it, the backend, `model`, `target_chars`,
+  `context_messages`, `max_per_socket`, `socket_idle_seconds`, and `[summaries.llm]`'s `dialect`,
+  `model` and `max_tokens`. `threshold_chars` (which messages are summarised) and
+  `reply_timeout_seconds` (how long one is waited for) are not in it, and neither is the length an
+  answer is cut at. The version is `v2-…`; the first start after this change re-keys every summary
+  filed under the previous `v1-…` version of the same configuration instead of deleting it, and
+  logs `re-keyed=N swept=M` at INFO on every start — `re-keyed=0 swept=0` once there is nothing
+  left to move.
+* **An answer is stored whole and cut when it is shown.** A summary is filed as the model wrote it
+  (flattened, up to four times the cut length, as a backstop against a model that ignored the
+  instruction) together with the length it was cut at, if it was. It is cut to the length in force
+  when it is served: 640 characters for the default `target_chars` of 160. So a change of that
+  length needs no new answer — unless a stored one was cut shorter than the new length: then a
+  write-token request asks for it again and files the whole answer, and a read-token request is
+  shown the shorter text it has, with no model call. Thread sentences are kept the same way.
+* **What is spent is counted.** `GET /api/v1/diagnostics` has a `summaries` section of counts since
+  the server started: `requests`, `hits`, `hits_without_upstream`, `shared_fetch_joins`,
+  `upstream_window_fetches`, `misses`, `generated`, `regenerated_below_cap` and
+  `served_below_cap_read_scope`. Numbers only; no key, id or text is logged for any of it.
+
+**What it depends on.** A store (`storage.path`); without one every summary is generated afresh,
+as before. Nothing else.
 
 ### One config file, two hosts
 
@@ -1534,7 +1579,8 @@ model provider or a real gateway.
 | Turns per conversation | `storage.max_turns_per_conversation` | — | default `1000`, then `413` |
 | Cached summaries kept | `storage.max_summaries` | — | default `2000`, least recently written dropped first |
 | "Dealt with" marks kept | `storage.max_dismissals` | — | default `10000`, oldest dropped first; **not** bounded by age, see below |
-| Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit, and it bounds cached summaries too |
+| Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit; conversations, since their last turn |
+| Summary retention age | `storage.summary_retain_days` | — | default: `retain_days`; `0` means no age limit; cached summaries, thread sentences and thread names, since their last write-token use. Keep it within how long the chat provider keeps messages |
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
@@ -1549,6 +1595,7 @@ model provider or a real gateway.
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
+| Message cache | `[message_cache]` | — | **accepted and ignored** by this build, whatever it holds, and said so at startup: a later build reads it (`#208 persistent-cache`), and accepting it now lets a host overlay that turns it on survive a rollback to this build |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
@@ -1954,9 +2001,19 @@ Retention is enforced **on every write**, not by a sweeper that might never run:
 `max_conversations` conversations (least recently active dropped first), at most
 `max_turns_per_conversation` turns in one of them (further turns are refused, not silently
 dropped), at most `max_summaries` cached summaries (least recently written dropped first; thread
-names are counted separately against the same number), and nothing older than `retain_days` days —
-since its last turn for a conversation, since it was made for a summary. The defaults are 50,
-1000, 2000 and 30.
+names are counted separately against the same number), no conversation older than `retain_days`
+days since its last turn, and no cached summary, thread sentence or thread name older than
+`summary_retain_days` days since it was last **used**: written, or served to a write-token request
+more than a day after it was last kept alive. A read-token request keeps nothing alive, because
+that would be a durable write reachable from the read token. The defaults are 50, 1000, 2000, 30,
+and `summary_retain_days` defaults to whatever `retain_days` is — so a host that lowered
+`retain_days` keeps summaries no longer than it did. **`summary_retain_days` should not exceed how
+long the chat provider itself keeps messages**: the age limit is what finally removes a summary
+whose message was deleted upstream.
+
+**Taking a channel off the list deletes its summaries.** Hiding a configured channel or removing
+an added one, in Settings, deletes that channel's cached summaries and thread sentences at once;
+its thread names are kept, so the channel comes back under the names you knew.
 
 Two tables are deliberately outside all of it: the "dealt with" marks, which an age bound would
 put back into the to-do list purely because time passed, and the **channel aliases**, which an age
@@ -1967,6 +2024,12 @@ The age bound is the only thing that collects an **orphan**: a cached summary wh
 edited or deleted upstream is unreachable by key, is filed under the current policy version, and
 nothing will ever announce that it went. The startup sweep cannot help — it deletes by policy
 version, and an orphan is under the live one.
+
+**Deleted means overwritten.** The store sets SQLite's `secure_delete`, so a purged or pruned row
+is zeroed in the file rather than left in a free page for anyone who reads it. That reaches only
+this file: **copies of the store that something else made — a backup, or a deploy script that
+copies the file before an upgrade — are not reached by the purge**, and have to be pruned where
+they were made.
 
 ### How an operator purges it
 
@@ -2047,11 +2110,13 @@ badly. Regeneration also now costs vendor calls where it previously cost nothing
 
 What is actually load-bearing here is the **cache key**, because a cached derived value has one
 failure mode and it is silent. What decides what a summary says is the prompt, whatever else the
-backend contributes, every number in `[summaries]`, and the message text. All but the last are
-folded into `summarize::policy_version` — one function, one string, part of every key — so
-changing any of them makes every summary produced under the old policy unreachable at once, and a
-startup sweep deletes the entries. The message text is a separate `content_hash`, so an upstream
-**edit** invalidates one entry rather than the whole cache.
+backend contributes, every `[summaries]` setting that changes the wording, and the message text.
+All but the last are folded into `summarize::policy_version` — one function, one string, part of
+every key — so changing any of them makes every summary produced under the old policy unreachable
+at once, and a startup sweep deletes the entries. The message text is a separate `content_hash`, so
+an upstream **edit** invalidates one entry rather than the whole cache. Settings that change no
+word of a summary — the threshold, the reply deadline, the length an answer is cut at — are kept out
+of the key on purpose: see [Summaries are kept](#summaries-are-kept).
 
 The backend's own contribution comes from the trait rather than from a constant beside the
 constructor: `Summarizer::backend` gives the slug and `Summarizer::policy_input` gives everything
@@ -2060,7 +2125,7 @@ else. That matters for the agent backend, whose answers depend on *which agent* 
 writing, and it lives outside `[summaries]` entirely. It goes into `policy_input`, so repointing
 the deployment cannot serve the old agent's summaries.
 
-The version is deliberately legible (`v1-elevenlabs-agent-w3-c160-8f1b…`), because a stale entry is
+The version is deliberately legible (`v2-elevenlabs-agent-w3-c160-8f1b…`), because a stale entry is
 diagnosed by someone with a shell. It is FNV-1a and is **not** a security hash: it detects a
 configuration change, and nothing more.
 
@@ -2081,8 +2146,8 @@ given are two different kinds of input and are framed as two different kinds of 
 is not an exemption.
 
 A cached summary is a second at-rest copy of other people's text under the same file, with the
-same `0600`. It is bounded by the same retention, it goes with the rest on a purge, and it is
-never written by a read-scope caller: `/summary` answers a read token and serves it from the
+same `0600`. It is bounded by retention, it goes with the rest on a purge and with its channel when
+the channel is taken off the list, and it is never written by a read-scope caller: `/summary` answers a read token and serves it from the
 cache, but only a write-scope caller's answer is filed. The read token is the one pasted into the
 voice agent, and a durable write reachable from it is what the two-token split exists to prevent.
 

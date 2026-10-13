@@ -107,9 +107,10 @@ pub const NAME_PREFIX: &str = "thread-name:";
 /// What a thread SENTENCE row's id is prefixed with in the summary cache.
 pub const SENTENCE_PREFIX: &str = "thread-sentence:";
 /// How old a name row may get before a write-scope read that sees its thread active since then
-/// rewrites it. The age limit (`storage.retain_days`) counts from a row's last write, so without
-/// this a thread that stays active but between sentence refreshes for that long — nine messages
-/// after its eighth, say — would lose its name. Once a day per thread at most, and no model call.
+/// rewrites it. The age limit (`storage.summary_retain_days`) counts from a row's last write, so
+/// without this a thread that stays active but between sentence refreshes for that long — nine
+/// messages after its eighth, say — would lose its name. Once a day per thread at most, and no
+/// model call.
 pub const TOUCH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One thread to name, and the prompt that says so.
@@ -221,9 +222,9 @@ pub fn valid_thread_slug(slug: &str) -> bool {
 /// that fails is a FAILED naming, by name, never truncated or patched into shape — a name is the
 /// thing the reader finds the thread by, and a mangled one is worse than none.
 ///
-/// `sentence_chars` is the length the sentence was ASKED for, not where it is cut: it is shown whole
-/// up to [`super::hard_cap_chars`] of that, as a message summary is, and stored whole up to four
-/// times that (see [`super::agent::plain_uncut`]). `#257 summary-truncation`,
+/// `sentence_chars` is the length the sentence was ASKED for, not where it is cut: it is shown
+/// whole up to [`super::hard_cap_chars`] of that, as a message summary is, and stored whole up to
+/// four times that (see [`super::agent::plain_uncut`]). `#257 summary-truncation`,
 /// `#208 persistent-cache`.
 ///
 /// # Errors

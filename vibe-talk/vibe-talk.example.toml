@@ -270,13 +270,18 @@ enabled = true
 # max_summaries = 2000              # least recently written dropped first; at least 1. Thread
 #                                   # names are counted separately against the same number
 # max_dismissals = 10000            # "dealt with" marks, oldest dropped first; at least 1
-# retain_days = 30                  # 0 means no age limit. Applies to conversations (since the
-#                                   # last turn) AND to cached summaries (since they were made) —
-#                                   # for a summary it is the only thing that collects an entry
-#                                   # whose message was edited or deleted upstream, because such
-#                                   # an entry is unreachable by key and nothing announces it.
+# retain_days = 30                  # 0 means no age limit. Applies to conversations, since the
+#                                   # last turn.
+# summary_retain_days = 30          # Defaults to retain_days; 0 means no age limit. Applies to
+#                                   # cached summaries, thread sentences and thread names, since
+#                                   # they were last USED by the write token (a read-token hit
+#                                   # keeps nothing alive). For a summary it is the only thing that
+#                                   # collects an entry whose message was edited or deleted
+#                                   # upstream, because such an entry is unreachable by key and
+#                                   # nothing announces it — so keep it within how long the chat
+#                                   # provider itself keeps messages.
 #                                   #
-#                                   # It does NOT apply to max_dismissals, and that is deliberate:
+#                                   # Neither applies to max_dismissals, and that is deliberate:
 #                                   # expiring a "dealt with" mark would put a message you
 #                                   # cleared last month back into your to-do list because time
 #                                   # passed, with nothing on the row saying why. The count bound
@@ -284,11 +289,13 @@ enabled = true
 #                                   # text, only two snowflakes and an instant.
 
 [summaries]
-# How a long channel message is turned into one short line. EVERY setting here is folded into the
-# cache key (see src/summarize/policy_version), so changing any of them makes every summary
-# produced under the old settings unreachable at once and a startup sweep deletes them. That is
-# the intent: a changed instruction is a changed summary, and serving the old text would be worse
-# than regenerating.
+# How a long channel message is turned into one short line. Every setting here that changes what a
+# summary SAYS is folded into the cache key (see src/summarize/policy_version), so changing one
+# makes every summary produced under the old settings unreachable at once and a startup sweep
+# deletes them. That is the intent: a changed instruction is a changed summary, and serving the old
+# text would be worse than regenerating. threshold_chars and reply_timeout_seconds change no word
+# of a summary and are NOT in the key, and neither is the length an answer is cut at: an answer is
+# stored whole and cut when it is shown, so changing them asks the model for nothing again.
 #
 # threshold_chars: below this a message is not summarised at all — it is already short enough to
 # read, and it must be at least target_chars or the "summary" comes back longer than the original.

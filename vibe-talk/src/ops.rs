@@ -2556,8 +2556,9 @@ pub struct Summarised {
 ///   whose feed carries no deletes, a message deleted upstream in those thirty seconds can still
 ///   have its stored summary served, which is the window speech preparation already accepts.
 /// * **Requests that miss together share one fetch.** Otherwise the channel window is read through
-///   the same per-channel turn speech preparation takes ([`crate::read_ahead::ReadAhead::window_turn`]),
-///   so twenty rows asked for at once cost one window read, not twenty.
+///   the same per-channel turn speech preparation takes
+///   ([`crate::read_ahead::ReadAhead::window_turn`]), so twenty rows asked for at once cost one
+///   window read, not twenty.
 ///
 /// `caller` is the scope the credential actually carries, and it decides what is WRITTEN. A
 /// read-scope token may SPEND the cache and may never FILL it: it is never filed, never keeps an
