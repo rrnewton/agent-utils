@@ -1072,10 +1072,12 @@ declare namespace VibeTalk {
    * What the page hands a hosted agent as a call opens, so the call carries the owner's words.
    * `#272 voice-agent-instructions`.
    *
-   * On a voice session only when the provider is one the page configures, and either the owner has
-   * written something or the agent allows its prompt to be replaced — such an agent is handed the
-   * assembled prompt on every call, so its send rules follow the Sending switch. Absent, the page
-   * sends exactly what it always sent.
+   * On every voice session whose provider is one the page configures, whatever the owner has saved.
+   * An agent that allows its prompt to be replaced is handed the assembled prompt on every call, so
+   * its send rules follow the Sending switch; one that does not is told `not_sent` when nothing of
+   * the owner's can reach it, so the page learns that the agent keeps the prompt in its provider's
+   * console. Absent for a provider that reads the profile instead (a deployment-managed bridge), and
+   * from an older server; the page then sends exactly what it always sent.
    */
   interface SessionPrompt {
     /**
@@ -1603,10 +1605,11 @@ declare namespace VibeTalk {
      * The owner's words for the agent, for the page to hand over as the socket opens. `#272
      * voice-agent-instructions`.
      *
-     * Filled in by `GET /api/v1/voice-session` for a hosted agent the page configures, when the
-     * owner has written something or the agent allows its prompt to be replaced; a provider never
-     * sets it. A deployment-managed bridge reads the same words from `GET /api/v1/voice-agent`
-     * instead.
+     * Filled in by `GET /api/v1/voice-session` on every session of a hosted agent the page
+     * configures, whatever the owner has saved — `not_sent` when none of his words can reach it —
+     * so the page always learns what the call was given; a provider never sets it. A
+     * deployment-managed bridge reads the same words from `GET /api/v1/voice-agent` instead, and
+     * its sessions carry none.
      */
     agent_prompt?: SessionPrompt | null;
     /**

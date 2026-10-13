@@ -43,10 +43,11 @@ pub struct VoiceSession {
     /// The owner's words for the agent, for the page to hand over as the socket opens. `#272
     /// voice-agent-instructions`.
     ///
-    /// Filled in by `GET /api/v1/voice-session` for a hosted agent the page configures, when the
-    /// owner has written something or the agent allows its prompt to be replaced; a provider never
-    /// sets it. A deployment-managed bridge reads the same words from `GET /api/v1/voice-agent`
-    /// instead.
+    /// Filled in by `GET /api/v1/voice-session` on every session of a hosted agent the page
+    /// configures, whatever the owner has saved — `not_sent` when none of his words can reach it —
+    /// so the page always learns what the call was given; a provider never sets it. A
+    /// deployment-managed bridge reads the same words from `GET /api/v1/voice-agent` instead, and
+    /// its sessions carry none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_prompt: Option<crate::contract::SessionPrompt>,
 }

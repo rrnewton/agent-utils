@@ -1052,7 +1052,7 @@
         },
         {
           "const": "not_sent",
-          "description": "Nothing: the owner edited only the base prompt, and this agent does not take one.",
+          "description": "Nothing: the agent does not allow its prompt to be replaced (or its configuration did not\nsay, or could not be read), and the owner has no instructions saved — he saved nothing, or\nedited only the base prompt. The initiation frame is exactly what it always was, and the\nagent keeps the prompt in its provider's console.",
           "type": "string"
         }
       ]
@@ -1188,7 +1188,7 @@
       "type": "object"
     },
     "SessionPrompt": {
-      "description": "What the page hands a hosted agent as a call opens, so the call carries the owner's words.\n`#272 voice-agent-instructions`.\n\nOn a voice session only when the provider is one the page configures, and either the owner has\nwritten something or the agent allows its prompt to be replaced — such an agent is handed the\nassembled prompt on every call, so its send rules follow the Sending switch. Absent, the page\nsends exactly what it always sent.",
+      "description": "What the page hands a hosted agent as a call opens, so the call carries the owner's words.\n`#272 voice-agent-instructions`.\n\nOn every voice session whose provider is one the page configures, whatever the owner has saved.\nAn agent that allows its prompt to be replaced is handed the assembled prompt on every call, so\nits send rules follow the Sending switch; one that does not is told `not_sent` when nothing of\nthe owner's can reach it, so the page learns that the agent keeps the prompt in its provider's\nconsole. Absent for a provider that reads the profile instead (a deployment-managed bridge), and\nfrom an older server; the page then sends exactly what it always sent.",
       "properties": {
         "instructions_applied": {
           "description": "Whether the owner's additional instructions are in what is sent.",
@@ -2135,7 +2135,7 @@
               "type": "null"
             }
           ],
-          "description": "The owner's words for the agent, for the page to hand over as the socket opens. `#272\nvoice-agent-instructions`.\n\nFilled in by `GET /api/v1/voice-session` for a hosted agent the page configures, when the\nowner has written something or the agent allows its prompt to be replaced; a provider never\nsets it. A deployment-managed bridge reads the same words from `GET /api/v1/voice-agent`\ninstead."
+          "description": "The owner's words for the agent, for the page to hand over as the socket opens. `#272\nvoice-agent-instructions`.\n\nFilled in by `GET /api/v1/voice-session` on every session of a hosted agent the page\nconfigures, whatever the owner has saved — `not_sent` when none of his words can reach it —\nso the page always learns what the call was given; a provider never sets it. A\ndeployment-managed bridge reads the same words from `GET /api/v1/voice-agent` instead, and\nits sessions carry none."
         },
         "input_sample_rate": {
           "description": "Microphone PCM sample rate expected by the provider.",

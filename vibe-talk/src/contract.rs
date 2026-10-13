@@ -236,10 +236,12 @@ pub enum PromptDelivery {
 /// What the page hands a hosted agent as a call opens, so the call carries the owner's words.
 /// `#272 voice-agent-instructions`.
 ///
-/// On a voice session only when the provider is one the page configures, and either the owner has
-/// written something or the agent allows its prompt to be replaced — such an agent is handed the
-/// assembled prompt on every call, so its send rules follow the Sending switch. Absent, the page
-/// sends exactly what it always sent.
+/// On every voice session whose provider is one the page configures, whatever the owner has saved.
+/// An agent that allows its prompt to be replaced is handed the assembled prompt on every call, so
+/// its send rules follow the Sending switch; one that does not is told `not_sent` when nothing of
+/// the owner's can reach it, so the page learns that the agent keeps the prompt in its provider's
+/// console. Absent for a provider that reads the profile instead (a deployment-managed bridge), and
+/// from an older server; the page then sends exactly what it always sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SessionPrompt {
     /// How to hand `text` over.
@@ -270,7 +272,10 @@ pub enum PromptTransport {
     /// As a `contextual_update` sent right after the initiation frame. The agent keeps its own
     /// prompt; only the instructions reach it.
     ContextualUpdate,
-    /// Nothing: the owner edited only the base prompt, and this agent does not take one.
+    /// Nothing: the agent does not allow its prompt to be replaced (or its configuration did not
+    /// say, or could not be read), and the owner has no instructions saved — he saved nothing, or
+    /// edited only the base prompt. The initiation frame is exactly what it always was, and the
+    /// agent keeps the prompt in its provider's console.
     NotSent,
 }
 
