@@ -31161,6 +31161,7 @@ test("`#264 voice-send-approval`: a plain yes after an uninterrupted read-back s
   const page = newPage();
   const pending = spokenDraft();
   const socket = await readBackDuringACall(page, { pending });
+  const sources = page.audio.sources.length;
   hostedHears(socket, "Yes.");
   assert.deepEqual(page.proposalCommits, [], "a yes sent before its settle window passed");
   assert.match(page.el("status").textContent, /Heard yes/);
@@ -31185,7 +31186,7 @@ test("`#264 voice-send-approval`: a plain yes after an uninterrupted read-back s
   );
   const seam = page.el("transcript").children.find((li) => li.className === "seam");
   assert.equal(seamLabel(seam), "Sent by voice");
-  assert.ok(page.audio.played >= 1, "no tone said it was sent");
+  assert.deepEqual(tonesSince(page, sources), ["sent"], "no rising pair said it was sent");
 
   // Saying it again is not a second send: there is nothing on the card to send.
   hostedHears(socket, "yes");
@@ -32058,6 +32059,132 @@ test("`#264 voice-send-approval`: a commit the page cannot confirm tells the age
   assert.equal(notices.length, 1, notices.join("\n"));
   assert.match(notices[0], /could not confirm whether the message was sent\. Tell the user to check the channel/);
   assert.doesNotMatch(notices[0], /card is still up/);
+});
+
+// What the agent is told, and what the owner hears, when a commit does not simply succeed. Each of
+// these was once a mutation that still passed: a refusal, a partial post or a lost answer reported
+// as SENT is exactly the claim this feature exists to prevent.
+
+/** What the commit route answers, by case: a refusal, a partial post, or a request that never came back. */
+const COMMIT_FAILURES = [
+  {
+    name: "a 409 refusal",
+    answer: (page) => { page.settleProposal(); return json(409, { error: "proposal_superseded", detail: "server sentence" }); },
+    notice: /^Voice page: the message was NOT sent \(a newer draft replaced it\)\. Tell the user in one short sentence that it was not sent\. Then stop\.$/,
+    tapNotice: /^Voice page: the message was NOT sent \(a newer draft replaced it\)\./,
+    status: "Not sent — a newer draft replaced it.",
+    seam: "Not sent",
+    screen: /replaced that proposal/,
+  },
+  {
+    name: "a 410 refusal",
+    answer: (page) => { page.settleProposal(); return json(410, { error: "proposal_expired", detail: "server sentence" }); },
+    notice: /^Voice page: the message was NOT sent \(the draft lapsed first\)\./,
+    tapNotice: /^Voice page: the message was NOT sent \(the draft lapsed first\)\./,
+    status: "Not sent — the draft lapsed first.",
+    seam: "Not sent",
+    screen: /lapsed before Send reached the server/,
+  },
+  {
+    name: "a 207 that posted nothing",
+    answer: (page) => {
+      page.settleProposal();
+      return json(207, { error: "partially_posted", detail: "chat request failed", posted: 0, unsent: "on it, rebasing now" });
+    },
+    notice: /^Voice page: the message was NOT sent \(the chat service did not accept it\)\./,
+    tapNotice: /^Voice page: the message was NOT sent \(the chat service did not accept it\)\./,
+    status: "Not sent — the chat service did not accept it.",
+    seam: "Not sent",
+    screen: /^Nothing was posted to lead team: /,
+  },
+  {
+    name: "a 207 that posted part",
+    answer: (page) => {
+      page.settleProposal();
+      return json(207, { error: "partially_posted", detail: "chat request failed", posted: 1, unsent: "rebasing now" });
+    },
+    notice: /^Voice page: only part of the message reached lead team; the rest was NOT sent\./,
+    tapNotice: /^Voice page: only part of the message reached lead team; the rest was NOT sent\./,
+    status: "Only part reached lead team — the rest was not sent.",
+    seam: "Partly sent",
+    screen: /^Only part of the message reached lead team: /,
+  },
+  {
+    name: "a request that never came back",
+    answer: () => { throw new TypeError("Failed to fetch"); },
+    notice: /^Voice page: I could not confirm whether the message was sent\. Tell the user to check the channel/,
+    tapNotice: /^Voice page: I could not confirm whether the message was sent\./,
+    status: "Could not confirm the send — check the channel.",
+    seam: "Not confirmed",
+    screen: /Could not reach vibe-talk/,
+  },
+];
+
+test("`#264 voice-send-approval`: a spoken commit that is refused, partly posted or not confirmed is never told or played as sent", async () => {
+  for (const failure of COMMIT_FAILURES) {
+    const page = newPage();
+    const socket = await readBackDuringACall(page);
+    page.commitProposal = async () => failure.answer(page);
+    const sources = page.audio.sources.length;
+    hostedHears(socket, "yes");
+    await settleSpokenYes(page);
+    assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"], failure.name);
+    const notices = pageNotices(socket);
+    assert.equal(notices.length, 1, `${failure.name}: ${notices.join("\n")}`);
+    assert.match(notices[0], failure.notice, failure.name);
+    assert.doesNotMatch(notices[0], /was SENT/, failure.name);
+    assert.equal(page.el("status").textContent, failure.status, failure.name);
+    const seams = page.el("transcript").children.filter((li) => li.className === "seam");
+    assert.equal(seamLabel(seams.at(-1)), failure.seam, failure.name);
+    assert.ok(!seams.some((li) => seamLabel(li) === "Sent by voice"), `${failure.name}: a seam said sent`);
+    assert.deepEqual(tonesSince(page, sources), ["not sent"], failure.name);
+  }
+});
+
+test("`#264 voice-send-approval`: a tap on Send during a call that is refused, partly posted or not confirmed is never told to the agent as sent", async () => {
+  for (const failure of COMMIT_FAILURES) {
+    const page = newPage();
+    const socket = await readBackDuringACall(page);
+    page.commitProposal = async () => failure.answer(page);
+    page.expireTimers(2000); // the card's own hold on Send
+    const sources = page.audio.sources.length;
+    await page.el("post-confirm-send").click();
+    await page.settle();
+    assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["ui"], failure.name);
+    const notices = pageNotices(socket);
+    assert.equal(notices.length, 1, `${failure.name}: ${notices.join("\n")}`);
+    assert.match(notices[0], failure.tapNotice, failure.name);
+    assert.doesNotMatch(notices[0], /SENT to/, failure.name);
+    // The tap's own result is on the screen already, as every tap's is: the error says what happened,
+    // and no seam or tone claims a send the owner can see did not happen.
+    assert.equal(page.el("error").hidden, false, `${failure.name} was not reported on screen`);
+    assert.match(page.el("error").textContent, failure.screen, failure.name);
+    assert.doesNotMatch(page.el("status").textContent, /^(Posted|Sent) to/, failure.name);
+    const seams = page.el("transcript").children.filter((li) => li.className === "seam");
+    assert.ok(!seams.some((li) => seamLabel(li) === "Sent by voice"), `${failure.name}: a seam said sent`);
+    assert.deepEqual(tonesSince(page, sources), [], `${failure.name}: a tone played for a tap`);
+  }
+});
+
+test("`#264 voice-send-approval`: a tap during a yes's settle window that is then refused is reported as the yes's would be: not sent, aloud", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  page.expireTimers(2000);
+  page.commitProposal = async () => {
+    page.settleProposal();
+    return json(409, { error: "proposal_superseded", detail: "server sentence" });
+  };
+  const sources = page.audio.sources.length;
+  hostedHears(socket, "yes");
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["ui"]);
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the message was NOT sent \(a newer draft replaced it\)\./);
+  assert.equal(page.el("status").textContent, "Not sent — a newer draft replaced it.");
+  assert.deepEqual(tonesSince(page, sources), ["not sent"]);
 });
 
 test("`#264 voice-send-approval`: the outcome's tone is queued after the speech already playing, and what comes next waits for it", async () => {
