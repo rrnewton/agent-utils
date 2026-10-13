@@ -112,7 +112,8 @@ impl Fixture {
     pub(crate) fn settle(&self) {
         assert!(
             self.cache.quiesce_blocking(Duration::from_secs(30)),
-            "the writer did not catch up"
+            "the writer did not catch up: {:?}",
+            self.cache.stats()
         );
     }
 

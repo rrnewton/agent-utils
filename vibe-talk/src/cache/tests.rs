@@ -117,7 +117,11 @@ fn every_connection_has_its_pragmas_after_a_close_and_a_reopen() {
     for _ in 0..2 {
         let cache = fixtures::open(&dir, &clock, Limits::default());
         let probed = cache.probe_pragmas();
-        assert_eq!(probed.len(), 3, "the writer and both readers");
+        assert_eq!(
+            probed.len(),
+            4,
+            "the writer, the checkpointer and both readers"
+        );
         for (connection, pragmas) in probed.iter().enumerate() {
             assert_eq!(pragmas, &expected, "connection {connection}");
         }

@@ -84,6 +84,50 @@ fn on_disk(fx_path: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Prose-like text with a large trigram vocabulary: words drawn from letters by a fixed
+/// generator, so the index is as big as real text makes it and a compaction takes many steps.
+fn varied(seed: i64) -> String {
+    let mut state = u64::try_from(seed)
+        .unwrap_or(0)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        | 1;
+    let mut text = String::new();
+    while text.len() < 260 {
+        let mut word = String::new();
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        for k in 0..(3 + state % 7) {
+            let letter = (state >> (k * 5)) % 26;
+            word.push(char::from(b'a' + u8::try_from(letter).unwrap_or(0)));
+        }
+        text.push_str(&word);
+        text.push(' ');
+    }
+    text
+}
+
+fn fill_varied(fx: &Fixture, chan: &ChanKey, from: i64, count: i64) {
+    for chunk in (from..from + count).step_by(250) {
+        let end = (chunk + 250).min(from + count);
+        fx.offer(
+            chan,
+            Observation::Rows {
+                rows: (chunk..end)
+                    .map(|i| {
+                        Incoming::new(
+                            message(&format!("v{i}"), "ada", &varied(i), T0 + i),
+                            Scope::Main,
+                        )
+                    })
+                    .collect(),
+                scope: None,
+                observed_ms: T0,
+            },
+        );
+    }
+}
+
 fn fill(fx: &Fixture, chan: &ChanKey, from: i64, count: i64) {
     let body = "lorem ipsum dolor sit amet ".repeat(4);
     for chunk in (from..from + count).step_by(250) {
@@ -342,5 +386,91 @@ fn an_erased_channels_text_leaves_the_index_the_file_and_the_wal() {
         on_disk(&path, secret)
     );
     assert_eq!(fx.cache.counts().served().expect("counts").messages, 100);
+    integrity(&fx);
+}
+
+/// An erase too small to pay for a compaction takes each row out of the index in place: no
+/// compaction, no segment of markers, nothing left to find.
+#[test]
+fn a_small_erase_takes_its_rows_out_of_the_index_in_place() {
+    let fx = Fixture::new("cache-privacy-small-erase");
+    let other = ChanKey::new("p", "C2");
+    fill(&fx, &other, 0, 2_000);
+    let secret = "quagmirelantern-77b1";
+    fx.list(
+        (0..10)
+            .map(|i| {
+                message(
+                    &format!("s{i}"),
+                    "ada",
+                    &format!("{secret} {i}"),
+                    T0 + 9_000 + i,
+                )
+            })
+            .collect(),
+        T0,
+        None,
+    );
+    let before = segments(&fx.cache);
+    let compactions = fx.cache.stats().compactions;
+    fx.cache.erase_channels(std::slice::from_ref(&fx.chan));
+    fx.settle();
+    assert_eq!(matches(&fx.cache, secret), 0);
+    assert_eq!(fx.cache.stats().compactions, compactions, "no compaction");
+    assert_eq!(segments(&fx.cache), before, "no segment of markers");
+    assert!(on_disk(&fx.path(), secret).is_empty());
+    integrity(&fx);
+}
+
+/// Markers written while a compaction runs are not in its merge, so another compaction follows
+/// it: at the end the index is one segment again, holding nothing erased.
+#[test]
+fn an_erase_landing_during_a_compaction_is_compacted_too() {
+    let fx = Fixture::new("cache-privacy-compact-again");
+    let second = ChanKey::new("p", "C2");
+    fill_varied(&fx, &fx.chan, 0, 3_000);
+    fill_varied(&fx, &second, 10_000, 3_000);
+    let secret = "marsupialtrellis-0c2d";
+    fx.offer(
+        &second,
+        Observation::Rows {
+            rows: vec![Incoming::new(
+                message("hidden", "ada", &format!("only {secret}"), T0 + 50_000),
+                Scope::Main,
+            )],
+            scope: None,
+            observed_ms: T0,
+        },
+    );
+    let started = fx.cache.stats();
+    fx.cache.erase_channels(std::slice::from_ref(&fx.chan));
+    // Wait for the first compaction to be under way, then erase the second channel.
+    let deadline = std::time::Instant::now() + SECONDS;
+    while fx.cache.stats().compaction_slice_max_us == started.compaction_slice_max_us
+        && fx.cache.stats().compactions == started.compactions
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    fx.cache.erase_channels(std::slice::from_ref(&second));
+    fx.settle();
+    assert_eq!(matches(&fx.cache, secret), 0);
+    assert_eq!(fx.cache.counts().served().expect("counts").messages, 0);
+    let structure = fx
+        .cache
+        .read(None, super::structure::read)
+        .served()
+        .expect("served")
+        .expect("parses");
+    assert!(
+        structure.segments() <= 1,
+        "segments the compactions did not take in: {structure:?}"
+    );
+    let stats = fx.cache.stats();
+    assert!(
+        stats.compaction_steps >= stats.compactions * 3,
+        "each compaction went on until its merge was over: {stats:?}"
+    );
+    assert!(on_disk(&fx.path(), secret).is_empty());
     integrity(&fx);
 }

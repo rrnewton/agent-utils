@@ -16,17 +16,24 @@
 //! - **Background work runs in steps** of about [`STEP`], one transaction each, alternating with
 //!   the queue so that neither starves the other: the rows of erased channels, expired
 //!   tombstones, the age and revalidation pass, eviction, rebuilding `search_text`, compacting the
-//!   index after eviction or a rebuild, giving free pages back, checkpoints, merging the index's
-//!   segments, and the hourly integrity check at a quiet moment.
+//!   index after deletions by marker, giving free pages back, checkpoints, merging the index's
+//!   segments (fitted in among long-running work, too), and the hourly integrity check at a quiet
+//!   moment. Steps that write their index entries out at the end learn how long to work first.
 //! - **The full-text index never merges inside a batch.** FTS5 `automerge` is off and merging is
 //!   background work, so a batch's commit writes its own rows' entries and nothing more. A
 //!   deletion's cost in the index is paid where it is measured: whatever deleted index entries
 //!   flushes them before the batch or step decides whether to go on.
-//! - **Deleted text leaves the index at once.** FTS5 `secure-delete` is on at every commit, so a
-//!   message deleted upstream, erased with its channel or aged out is taken out of the index's
-//!   pages in place. Eviction for size and a rebuild of `search_text` alone turn it off INSIDE
-//!   their own transaction, delete by marker, and turn it back on before committing; a compaction
-//!   follows to give the space back. Neither removes anything the owner asked to forget.
+//! - **Deleted text leaves the index at once, or a compaction is owed.** FTS5 `secure-delete` is
+//!   on at every commit, so a tombstone or an edit takes the old text out of the index's pages
+//!   in place. A bulk deletion (an erase or age pass large enough to pay for it, eviction, a
+//!   rebuild of `search_text`) turns it off INSIDE its own transaction, deletes by marker, turns
+//!   it back on before committing, and records the compaction it owes in the same transaction;
+//!   the compaction is tracked to its end through the index's structure record
+//!   ([`super::structure`]).
+//! - **The log is checkpointed off this thread.** SQLite's automatic checkpoint is off; the
+//!   checkpointer copies the log back concurrently, and this thread only checkpoints it itself
+//!   when it has grown large and the checkpointer has nearly caught up, or to truncate it after
+//!   a deletion.
 //! - **Hot statements are prepared once per connection**, in this thread's frame.
 //! - **Every merge rule is in [`crate::cache::merge`]**; this file applies them. It never uses a
 //!   replacing insert: a conflicting row would be deleted without its delete trigger, leaving its
@@ -42,10 +49,12 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension as _, Statement};
 
+use super::checkpoint::Checkpointer;
 use super::coverage::{self, Head, Interval, Params};
 use super::merge::{self, Arrival, Held, Offered, Verdict};
 use super::rows::{self, Extra};
 use super::schema::sqlite_code;
+use super::structure;
 use super::{
     file, lock, CacheError, ChanKey, Envelope, Erasing, Incoming, ListEnd, ListStart, Listing,
     Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp, Stats, ThreadRecord,
@@ -62,12 +71,34 @@ const WEEKLY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const IDLE_FOR: Duration = Duration::from_secs(1);
 /// How long a `TRUNCATE` checkpoint that found a reader waits before it tries again.
 const CHECKPOINT_RETRY: Duration = Duration::from_millis(250);
+/// How long a truncation waits, past its retry time, for the checkpointer to catch up before
+/// it goes ahead anyway.
+const TRUNCATE_PATIENCE: Duration = Duration::from_secs(2);
 /// How long background work rests after a step failed.
 const BACKOFF: Duration = Duration::from_secs(1);
 /// Rows one deletion step picks; the step stops earlier when its time is up.
 const PICK: i64 = 256;
+/// A bulk deletion of at least one row in this many (and at least [`MARKER_MIN`] rows) deletes by
+/// marker and compacts afterwards. Below it, rows leave the index in place: measured on 60k rows,
+/// in place costs about 5 ms and some hundreds of kilobytes of log per row, by marker about a
+/// tenth of a millisecond, and the compaction rewrites the index once, about a kilobyte a row.
+const MARKER_RATIO: i64 = 400;
+/// The fewest rows a bulk deletion deletes by marker.
+const MARKER_MIN: i64 = 32;
+/// Once the write-ahead log is past this, the writer checkpoints it itself between steps, as soon
+/// as the checkpointer has nearly caught up: the checkpointer cannot finish while the writer
+/// never pauses, and a log is restarted only by a write that finds every frame copied back. The
+/// writer then copies only the last few frames, and its sync has little left to write.
+const WAL_HIGH_BYTES: u64 = 32 * 1024 * 1024;
+/// Past this the writer checkpoints the log whether the checkpointer has caught up or not.
+const WAL_CEILING_BYTES: u64 = 128 * 1024 * 1024;
+/// "Nearly caught up": at most this many frames (four kilobytes each) left to copy.
+const SMALL_BACKLOG: i64 = 512;
+/// While one kind of background work runs on, a merge step is fitted in after this many of its
+/// steps, so that the index's segments never pile up into a merge FTS5 would force on a commit.
+const MERGE_EVERY: u32 = 2;
 /// Row ids one step of the revalidation pass examines.
-const WINDOW: i64 = 4_096;
+const WINDOW: i64 = 1_024;
 /// Rows one `search_text` rebuild step picks.
 const REBUILD_PICK: i64 = 128;
 /// Pages of the full-text index one merge step writes.
@@ -130,17 +161,32 @@ pub(crate) fn run(
 ) {
     let ack = match Hot::prepare(&connection) {
         Ok(hot) => {
+            let checkpointer = match Checkpointer::start(path, Arc::clone(shared)) {
+                Ok(checkpointer) => Some(checkpointer),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "the message cache checkpointer did not start; the writer checkpoints itself"
+                    );
+                    None
+                }
+            };
             let mut writer = Writer {
                 conn: &connection,
                 shared,
                 hot,
                 path,
+                checkpointer,
                 generation,
                 work: Work::default(),
                 last_hourly: Instant::now(),
                 last_batch: Instant::now(),
                 backoff_until: None,
                 unflushed: 0,
+                backfill_armed: false,
+                pace_markers: Pace::new(),
+                pace_rebuild: Pace::new(),
+                since_merge: 0,
             };
             writer.start();
             let _ = started.send(());
@@ -342,6 +388,10 @@ fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+fn count_i64(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 /// What became of one observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
@@ -365,6 +415,10 @@ struct Expire {
     week_ago: i64,
     /// The newest row id when the pass began: the revalidation phase stops there.
     until: i64,
+    /// Rows the file held when the pass began, and rows the pass has deleted so far: once it
+    /// has deleted enough to pay for a compaction, it goes on by marker.
+    total: i64,
+    deleted: i64,
     phase: Phase,
 }
 
@@ -382,10 +436,22 @@ enum Phase {
 #[derive(Debug)]
 struct Compact {
     started: Instant,
-    /// Whether its first step (the one that gathers every segment into one merge) has run.
-    began: bool,
-    /// Pages it may still write before it stops, done or not.
-    pages_left: i64,
+    /// The segment its merge writes, once its first step has begun that merge.
+    output: Option<u64>,
+    steps: u32,
+    /// Past this many steps (four times what the index's size suggests) it finishes in one go.
+    cap: u32,
+}
+
+/// What a compaction step found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Progress {
+    /// Its merge, writing this segment, goes on.
+    Going(u64),
+    /// Its merge is over.
+    Done,
+    /// It cannot tell, for this reason.
+    Unsure(&'static str),
 }
 
 /// The background work waiting.
@@ -415,8 +481,13 @@ struct Work {
     checkpoint: bool,
     /// Not before this: the last `TRUNCATE` found a reader.
     checkpoint_after: Option<Instant>,
-    /// The rebuild of `search_text` running now has changed a row.
-    rebuild_changed: bool,
+    /// Since when deleted text has been waiting to leave the log.
+    truncate_since: Option<Instant>,
+    /// Whether the erase in progress deletes by marker; decided at its first step.
+    erase_markers: Option<bool>,
+    /// Markers were written while a compaction ran: its merge did not take them in, so another
+    /// compaction must follow it.
+    compact_again: bool,
 }
 
 /// One kind of background step.
@@ -456,6 +527,9 @@ struct Writer<'c> {
     shared: &'c Shared,
     hot: Hot<'c>,
     path: &'c Path,
+    /// Copies the log back into the database off this thread. `None` if it could not start:
+    /// then SQLite's automatic checkpoint stays on and this thread truncates the log itself.
+    checkpointer: Option<Checkpointer>,
     generation: u64,
     work: Work,
     last_hourly: Instant,
@@ -463,6 +537,42 @@ struct Writer<'c> {
     backoff_until: Option<Instant>,
     /// Index entries deleted since the index last flushed: their cost is paid at the flush.
     unflushed: usize,
+    /// Something has written since this thread last checkpointed the log itself. A checkpoint
+    /// does not shrink the log file (the next write transaction restarts it), so without this
+    /// it would see the same large file and checkpoint again for ever.
+    backfill_armed: bool,
+    /// How long marker deletions, and rebuilds of `search_text`, work before writing their
+    /// index entries out, learnt from how long their steps took.
+    pace_markers: Pace,
+    pace_rebuild: Pace,
+    /// Background steps since the last merge step.
+    since_merge: u32,
+}
+
+/// How long one kind of step works before it writes its index entries out, which takes a time
+/// that grows with the work and that the step cannot see coming: halved when a step overran
+/// [`STEP`], grown by a quarter when one took less than half of it.
+#[derive(Clone, Copy, Debug)]
+struct Pace {
+    budget: Duration,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self { budget: STEP / 2 }
+    }
+
+    fn deadline(self, started: Instant) -> Instant {
+        started + self.budget
+    }
+
+    fn learn(&mut self, took: Duration) {
+        if took > STEP {
+            self.budget = (self.budget / 2).max(Duration::from_millis(1));
+        } else if took < STEP / 2 {
+            self.budget = (self.budget * 5 / 4).min(STEP);
+        }
+    }
 }
 
 impl Writer<'_> {
@@ -494,6 +604,27 @@ impl Writer<'_> {
             || w.integrity_since.is_some()
             || w.checkpoint
             || self.rebuilding()
+    }
+
+    /// Deleted text may be in the write-ahead log: have it emptied.
+    fn request_truncate(&mut self) {
+        self.work.checkpoint = true;
+        self.work.truncate_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Markers have been written: a compaction is owed, and if one is running it does not cover
+    /// them, so another must follow.
+    fn owe_compaction(&mut self) {
+        if self.work.compact.is_some() {
+            self.work.compact_again = true;
+        } else {
+            self.work.compact_due = true;
+        }
+    }
+
+    /// Whether a bulk deletion of `rows` of a file of `total` pays for a compaction.
+    fn by_marker(rows: i64, total: i64) -> bool {
+        rows >= MARKER_MIN && rows.saturating_mul(MARKER_RATIO) >= total
     }
 
     /// Tell waiters whether background work is left. Called before every applied mark moves.
@@ -545,8 +676,12 @@ impl Writer<'_> {
             wait = wait.min(until.saturating_duration_since(now));
         }
         if self.work.checkpoint {
+            // Until it may be tried again, and at most a little longer than the checkpointer
+            // takes to look at the log again.
             let after = self.work.checkpoint_after.unwrap_or(now);
-            wait = wait.min(after.saturating_duration_since(now));
+            wait = wait
+                .min(after.saturating_duration_since(now))
+                .min(Duration::from_millis(100));
         }
         if self.work.integrity_since.is_some() {
             wait = wait.min(IDLE_FOR.saturating_sub(self.last_batch.elapsed()));
@@ -652,6 +787,7 @@ impl Writer<'_> {
         Stats::add(&self.shared.stats.batches, 1);
         Stats::max(&self.shared.stats.batch_max_us, micros(started.elapsed()));
         self.work.merge = true;
+        self.backfill_armed = true;
         self.last_batch = Instant::now();
         // Published now, before any control operation behind it runs: what this batch wrote is
         // visible, and a barrier waiting for it must not wait for an erase or an eviction.
@@ -707,7 +843,9 @@ impl Writer<'_> {
             Op::Maintain { kind } => self.maintain(kind),
             #[cfg(test)]
             Op::Probe { reply } => {
-                let _ = reply.send(super::probe(self.conn));
+                let mut all = vec![super::probe(self.conn)];
+                all.extend(self.checkpointer.as_ref().map(Checkpointer::probe));
+                let _ = reply.send(all);
             }
             #[cfg(test)]
             Op::Pause { paused, resume } => {
@@ -1026,7 +1164,7 @@ impl Writer<'_> {
             .tomb_upsert
             .execute(params![chan_id, message_id, created_ms, deleted_ms])?;
         Stats::add(&self.shared.stats.tombstoned, 1);
-        self.work.checkpoint = true;
+        self.request_truncate();
         Ok(())
     }
 
@@ -1448,7 +1586,7 @@ impl Writer<'_> {
                     params![id, ERASED_PROVIDER],
                 )?;
                 self.work.erase = true;
-                self.work.checkpoint = true;
+                self.request_truncate();
             } else {
                 self.conn
                     .execute("DELETE FROM channel WHERE chan = ?1", [id])?;
@@ -1523,7 +1661,28 @@ impl Writer<'_> {
     fn next_task(&self) -> Option<Task> {
         let w = &self.work;
         let now = Instant::now();
-        if w.erase {
+        let log = file::family(self.path)[1].clone();
+        let merging_due = (w.merge || w.weekly_pages > 0)
+            && w.compact.is_none()
+            && self.since_merge >= MERGE_EVERY;
+        let log_bytes = std::fs::metadata(&log).map_or(0, |m| m.len());
+        let caught_up = self.checkpointer.is_none()
+            || log_bytes <= super::checkpoint::PASSIVE_BYTES
+            || self.shared.log_backlog.load(Ordering::SeqCst) <= SMALL_BACKLOG;
+        let log_due = self.backfill_armed
+            && ((log_bytes > WAL_HIGH_BYTES && caught_up) || log_bytes > WAL_CEILING_BYTES);
+        // Deleted text in the log: truncated soon, but preferably once the checkpointer has
+        // copied nearly everything, so that truncating has next to nothing to copy and sync.
+        let truncate_due = w.checkpoint
+            && w.checkpoint_after.is_none_or(|after| now >= after)
+            && (caught_up
+                || w.truncate_since
+                    .is_some_and(|since| now >= since + TRUNCATE_PATIENCE));
+        if log_due || truncate_due {
+            Some(Task::Checkpoint)
+        } else if merging_due {
+            Some(Task::Merge)
+        } else if w.erase {
             Some(Task::Erase)
         } else if w.tombstones.is_some() {
             Some(Task::Tombstones)
@@ -1537,8 +1696,6 @@ impl Writer<'_> {
             Some(Task::Compact)
         } else if w.vacuum.is_some() {
             Some(Task::Vacuum)
-        } else if w.checkpoint && w.checkpoint_after.is_none_or(|after| now >= after) {
-            Some(Task::Checkpoint)
         } else if w.merge || w.weekly_pages > 0 {
             Some(Task::Merge)
         } else if w
@@ -1593,8 +1750,22 @@ impl Writer<'_> {
             self.backoff_until = Some(Instant::now() + BACKOFF);
             self.abandon(task);
         }
+        let took = started.elapsed();
         Stats::add(&self.shared.stats.steps, 1);
-        Stats::max(&self.shared.stats.step_max_us, micros(started.elapsed()));
+        Stats::max(&self.shared.stats.step_max_us, micros(took));
+        match task {
+            Task::Erase | Task::Expire | Task::Evict => self.pace_markers.learn(took),
+            Task::Rebuild => self.pace_rebuild.learn(took),
+            _ => {}
+        }
+        if task == Task::Merge {
+            self.since_merge = 0;
+        } else {
+            self.since_merge = self.since_merge.saturating_add(1);
+        }
+        if !matches!(task, Task::Checkpoint | Task::Integrity) {
+            self.backfill_armed = true;
+        }
         self.check_bytes();
         self.publish();
         true
@@ -1627,10 +1798,29 @@ impl Writer<'_> {
         }
     }
 
-    /// Delete rows of erased channels, in place, until the step's time is up; once none are
-    /// left, the channel rows themselves, whose cascades take tombstones, coverage, heads and
-    /// thread records.
+    /// Delete rows of erased channels until the step's time is up; once none are left, the
+    /// channel rows themselves, whose cascades take tombstones, coverage, heads and thread
+    /// records. A large erase deletes by marker and leaves a compaction owed; a small one takes
+    /// each row out of the index in place.
     fn erase_step(&mut self, deadline: Instant) -> rusqlite::Result<()> {
+        let markers = match self.work.erase_markers {
+            Some(markers) => markers,
+            None => {
+                let rows: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM message
+                     WHERE chan IN (SELECT chan FROM channel WHERE provider_key = ?1)",
+                    [ERASED_PROVIDER],
+                    |row| row.get(0),
+                )?;
+                let total: i64 =
+                    self.conn
+                        .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))?;
+                let markers = Self::by_marker(rows, total);
+                self.work.erase_markers = Some(markers);
+                markers
+            }
+        };
+        let pick = if markers { CHUNK_LIMIT } else { PICK };
         let finished = self.transaction(|w| {
             let picked: Vec<i64> = {
                 let mut select = w.conn.prepare(
@@ -1638,7 +1828,7 @@ impl Writer<'_> {
                      WHERE chan IN (SELECT chan FROM channel WHERE provider_key = ?1) LIMIT ?2",
                 )?;
                 let picked = select
-                    .query_map(params![ERASED_PROVIDER, PICK], |row| row.get(0))?
+                    .query_map(params![ERASED_PROVIDER, pick], |row| row.get(0))?
                     .collect::<rusqlite::Result<Vec<i64>>>()?;
                 picked
             };
@@ -1649,23 +1839,61 @@ impl Writer<'_> {
                 )?;
                 return Ok(true);
             }
-            let mut deleted = 0;
-            for row_id in picked {
-                w.hot.row_delete.execute([row_id])?;
-                w.hot.fts_flush.execute([])?;
-                deleted += 1;
-                if Instant::now() >= deadline {
-                    break;
-                }
-            }
+            let deleted = w.delete_rows(&picked, markers, deadline)?;
             Stats::add(&w.shared.stats.erased_rows, deleted);
             Ok(false)
         })?;
         if finished {
             self.work.erase = false;
+            self.work.erase_markers = None;
         }
-        self.work.checkpoint = true;
+        self.request_truncate();
         Ok(())
+    }
+
+    /// Delete `rows` inside the current transaction until `deadline`, at least one. By marker:
+    /// FTS5 `secure-delete` off, the deletions, back on (which writes the markers out, cheaply),
+    /// and the compaction owed recorded in the same transaction, so that a crash before it runs
+    /// still leaves it owed. In place: each row's entries leave the index pages before the next
+    /// row, so the clock sees what they cost. Returns how many went.
+    fn delete_rows(
+        &mut self,
+        rows: &[i64],
+        markers: bool,
+        deadline: Instant,
+    ) -> rusqlite::Result<u64> {
+        if markers {
+            self.fts_option("secure-delete", 0)?;
+        }
+        // By marker, the clock stops early: writing the markers out at the end takes the rest of
+        // the step, by an amount the pace has learnt.
+        let deadline = if markers {
+            let started = deadline.checked_sub(STEP).unwrap_or_else(Instant::now);
+            self.pace_markers.deadline(started)
+        } else {
+            deadline
+        };
+        let mut deleted = 0;
+        for row_id in rows {
+            self.hot.row_delete.execute([row_id])?;
+            if !markers {
+                self.hot.fts_flush.execute([])?;
+            }
+            deleted += 1;
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        if markers {
+            self.fts_option("secure-delete", 1)?;
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('compaction_due', '1')
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            self.owe_compaction();
+        }
+        Ok(deleted)
     }
 
     fn tombstone_step(&mut self) -> rusqlite::Result<()> {
@@ -1699,11 +1927,16 @@ impl Writer<'_> {
                 .query_row("SELECT COALESCE(MAX(row_id), 0) FROM message", [], |row| {
                     row.get(0)
                 })?;
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))?;
         Ok(Expire {
             cutoffs,
             max_cutoff,
             week_ago: now.saturating_sub(REVALIDATE_WITHIN_MS),
             until,
+            total,
+            deleted: 0,
             phase: Phase::Age {
                 after: (i64::MIN, i64::MIN),
             },
@@ -1718,7 +1951,7 @@ impl Writer<'_> {
         if !done {
             self.work.expire = Some(plan);
         }
-        self.work.checkpoint = true;
+        self.request_truncate();
         Ok(())
     }
 
@@ -1744,22 +1977,30 @@ impl Writer<'_> {
                     plan.phase = Phase::Floors;
                     return Ok(false);
                 }
-                let mut cursor = after;
-                let mut expired = 0;
-                for (row_id, chan, created) in picked {
-                    cursor = (created, row_id);
-                    // An erased channel has no cutoff here: its rows go by the erase.
-                    let cutoff = plan.cutoffs.get(&chan).copied().unwrap_or(i64::MIN);
-                    if created < cutoff {
-                        self.hot.row_delete.execute([row_id])?;
-                        self.hot.fts_flush.execute([])?;
-                        expired += 1;
+                let last = picked
+                    .last()
+                    .map_or(after, |&(row_id, _, created)| (created, row_id));
+                // An erased channel has no cutoff here: its rows go by the erase.
+                let due: Vec<(i64, (i64, i64))> = picked
+                    .into_iter()
+                    .filter(|&(_, chan, created)| {
+                        created < plan.cutoffs.get(&chan).copied().unwrap_or(i64::MIN)
+                    })
+                    .map(|(row_id, _, created)| (row_id, (created, row_id)))
+                    .collect();
+                let cursor = if due.is_empty() {
+                    last
+                } else {
+                    let ids: Vec<i64> = due.iter().map(|&(row_id, _)| row_id).collect();
+                    let markers = Self::by_marker(plan.deleted + count_i64(ids.len()), plan.total);
+                    let deleted = self.delete_rows(&ids, markers, deadline)?;
+                    plan.deleted += i64::try_from(deleted).unwrap_or(i64::MAX);
+                    Stats::add(&self.shared.stats.expired_rows, deleted);
+                    match usize::try_from(deleted).ok().filter(|&n| n < due.len()) {
+                        Some(n) => due[n.saturating_sub(1)].1,
+                        None => last,
                     }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                }
-                Stats::add(&self.shared.stats.expired_rows, expired);
+                };
                 plan.phase = Phase::Age { after: cursor };
                 Ok(false)
             }
@@ -1793,19 +2034,19 @@ impl Writer<'_> {
                         .collect::<rusqlite::Result<Vec<i64>>>()?;
                     picked
                 };
-                let mut cursor = high;
-                let mut expired = 0;
-                let total = picked.len();
-                for (n, row_id) in picked.into_iter().enumerate() {
-                    self.hot.row_delete.execute([row_id])?;
-                    self.hot.fts_flush.execute([])?;
-                    expired += 1;
-                    if n + 1 < total && Instant::now() >= deadline {
-                        cursor = row_id;
-                        break;
+                let cursor = if picked.is_empty() {
+                    high
+                } else {
+                    let markers =
+                        Self::by_marker(plan.deleted + count_i64(picked.len()), plan.total);
+                    let deleted = self.delete_rows(&picked, markers, deadline)?;
+                    plan.deleted += i64::try_from(deleted).unwrap_or(i64::MAX);
+                    Stats::add(&self.shared.stats.expired_rows, deleted);
+                    match usize::try_from(deleted).ok().filter(|&n| n < picked.len()) {
+                        Some(n) => picked[n.saturating_sub(1)],
+                        None => high,
                     }
-                }
-                Stats::add(&self.shared.stats.expired_rows, expired);
+                };
                 plan.phase = Phase::Revalidate { after: cursor };
                 Ok(cursor >= until)
             }
@@ -1869,7 +2110,7 @@ impl Writer<'_> {
                 if free > 0 {
                     self.work.vacuum = Some(None);
                 }
-                self.work.checkpoint = true;
+                self.request_truncate();
             }
             Err(error) => self.report("size check", Err(error)),
         }
@@ -1896,11 +2137,8 @@ impl Writer<'_> {
             return Ok(());
         };
         let started = Instant::now();
-        // Half the step for the rows; the rest for writing their markers out at the end.
-        let deadline = started + STEP / 2;
         let take = left.min(DELETE_CHUNK);
         let deleted = self.transaction(|w| {
-            w.fts_option("secure-delete", 0)?;
             let picked: Vec<(i64, i64, i64)> = {
                 let mut select = w.conn.prepare(
                     "SELECT row_id, chan, created_ms FROM message
@@ -1913,21 +2151,22 @@ impl Writer<'_> {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 picked
             };
+            if picked.is_empty() {
+                return Ok(0);
+            }
+            let ids: Vec<i64> = picked.iter().map(|&(row_id, _, _)| row_id).collect();
+            let deleted = w.delete_rows(&ids, true, started + STEP)?;
+            let deleted = usize::try_from(deleted)
+                .unwrap_or(usize::MAX)
+                .min(picked.len());
             let mut floors: HashMap<i64, i64> = HashMap::new();
-            let mut deleted = 0;
-            for (row_id, chan, created) in &picked {
-                w.hot.row_delete.execute([row_id])?;
-                let floor = floors.entry(*chan).or_insert(*created);
-                *floor = (*floor).max(*created);
-                deleted += 1;
-                if Instant::now() >= deadline {
-                    break;
-                }
+            for &(_, chan, created) in &picked[..deleted] {
+                let floor = floors.entry(chan).or_insert(created);
+                *floor = (*floor).max(created);
             }
             for (chan, newest) in floors {
                 w.raise_floor(chan, newest.saturating_add(1))?;
             }
-            w.fts_option("secure-delete", 1)?;
             Ok(deleted)
         })?;
         Stats::add(&self.shared.stats.eviction_chunks, 1);
@@ -1937,12 +2176,12 @@ impl Writer<'_> {
         );
         Stats::add(&self.shared.stats.evicted_rows, count(deleted));
         if deleted == 0 || deleted >= left {
+            // The compaction its markers owe gives the space back; the next size check measures.
             self.work.evict = None;
-            self.work.compact_due = true;
         } else {
             self.work.evict = Some(left - deleted);
         }
-        self.work.checkpoint = true;
+        self.request_truncate();
         Ok(())
     }
 
@@ -1952,7 +2191,7 @@ impl Writer<'_> {
     fn rebuild_step(&mut self) -> rusqlite::Result<()> {
         let version = self.shared.search_text.version();
         let source = Arc::clone(&self.shared.search_text);
-        let deadline = Instant::now() + STEP / 2;
+        let deadline = self.pace_rebuild.deadline(Instant::now());
         let (done, changed) = self.transaction(|w| {
             let after: i64 = w
                 .conn
@@ -2008,6 +2247,14 @@ impl Writer<'_> {
                 }
             }
             w.fts_option("secure-delete", 1)?;
+            if changed > 0 {
+                w.conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('compaction_due', '1')
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+                w.owe_compaction();
+            }
             let reached_end =
                 examined == rows.len() && i64::try_from(rows.len()).unwrap_or(0) < REBUILD_PICK;
             if reached_end {
@@ -2029,26 +2276,28 @@ impl Writer<'_> {
             }
             Ok((reached_end, changed))
         })?;
-        if changed > 0 {
-            self.work.rebuild_changed = true;
-        }
+        let _ = changed;
         if done {
             self.shared
                 .search_text_current
                 .store(true, Ordering::SeqCst);
-            if std::mem::take(&mut self.work.rebuild_changed) {
-                self.work.compact_due = true;
-            }
         }
         Ok(())
     }
 
-    /// One compaction step. The first gathers every segment of the index into one merge (FTS5's
-    /// `merge` with a negative page count); the rest go on with it (a positive one), with
-    /// `usermerge` lowered so that neither it nor a level of new segments ever waits on the
-    /// other. It ends when a step finds nothing to merge, or once it has written half again as
-    /// many pages as the index held: a compaction is for space, and whatever merging is left
-    /// the ordinary merge steps finish.
+    /// One compaction step: rewrite the index without what markers cancel, in steps between
+    /// batches, and know when it is really done.
+    ///
+    /// The first step gathers every segment into one merge (FTS5's `merge` with a negative page
+    /// count), whose output is the only segment of a new last level: the kind of merge that
+    /// drops deleted entries and their markers alike. The rest go on with it (a positive count),
+    /// with `usermerge` lowered so that neither it nor a level of segments new since it began
+    /// waits on the other. Batches keep writing segments meanwhile, so "a step found nothing to
+    /// merge" says nothing; [`structure::merge_done`] reads the index's structure record after
+    /// every step, in the step's own transaction, and the compaction is over when that merge is.
+    /// If the structure cannot be read, or the merge is not of the kind that drops markers, or
+    /// it has run four times longer than the index's size suggests, the rest is done in one go
+    /// with `optimize`: slower, but never left undone.
     fn compact_step(&mut self) -> rusqlite::Result<()> {
         let mut compact = match self.work.compact.take() {
             Some(compact) => compact,
@@ -2060,54 +2309,102 @@ impl Writer<'_> {
                         })?;
                 self.transaction(|w| w.fts_option("usermerge", COMPACT_USERMERGE))?;
                 self.work.compact_due = false;
+                self.work.compact_again = false;
+                let expected = pages / COMPACT_PAGES + 1;
                 Compact {
                     started: Instant::now(),
-                    began: false,
-                    pages_left: pages.saturating_mul(3) / 2 + 4 * COMPACT_PAGES,
+                    output: None,
+                    steps: 0,
+                    cap: u32::try_from(expected.saturating_mul(4) + 100).unwrap_or(u32::MAX),
                 }
             }
         };
         let slice_started = Instant::now();
-        let pages = if compact.began {
-            COMPACT_PAGES
-        } else {
-            -COMPACT_PAGES
-        };
-        let before = self.conn.total_changes();
-        let merged = self.transaction(|w| {
+        let output = compact.output;
+        let progress = self.transaction(|w| {
+            let pages = if output.is_some() {
+                COMPACT_PAGES
+            } else {
+                -COMPACT_PAGES
+            };
             w.conn.execute(
                 "INSERT INTO message_fts (message_fts, rank) VALUES ('merge', ?1)",
                 [pages],
             )?;
-            Ok(())
+            let Some(now) = structure::read(w.conn)? else {
+                return Ok(Progress::Unsure(
+                    "the index's structure record did not parse",
+                ));
+            };
+            Ok(match output {
+                Some(output) if structure::merge_done(&now, output) => Progress::Done,
+                Some(output) => Progress::Going(output),
+                None => match now.sole_merge() {
+                    Some(merge) if merge.oldest => Progress::Going(merge.output),
+                    None if now.quiet() => Progress::Done,
+                    _ => Progress::Unsure("the compaction's merge is not one that drops markers"),
+                },
+            })
         });
-        // A failure abandons the compaction, and that puts `usermerge` back.
-        if merged.is_err() {
-            self.work.compact = Some(compact);
-            return merged;
-        }
-        compact.began = true;
-        compact.pages_left -= COMPACT_PAGES;
+        let progress = match progress {
+            Ok(progress) => progress,
+            Err(error) => {
+                // Abandoning it puts `usermerge` back; the debt stays recorded in the file.
+                self.work.compact = Some(compact);
+                return Err(error);
+            }
+        };
+        compact.steps += 1;
+        Stats::add(&self.shared.stats.compaction_steps, 1);
         Stats::max(
             &self.shared.stats.compaction_slice_max_us,
             micros(slice_started.elapsed()),
         );
-        // The command itself counts as one change; any more means the step did work.
-        let idle = self.conn.total_changes().saturating_sub(before) <= 1;
-        if idle || compact.pages_left <= 0 {
-            self.transaction(|w| w.fts_option("usermerge", USERMERGE))?;
-            Stats::add(&self.shared.stats.compactions, 1);
-            Stats::max(
-                &self.shared.stats.compaction_max_us,
-                micros(compact.started.elapsed()),
-            );
-            self.work.vacuum = Some(None);
-            self.work.checkpoint = true;
-            self.work.merge = true;
-        } else {
-            self.work.compact = Some(compact);
+        match progress {
+            Progress::Going(output) if compact.steps < compact.cap => {
+                compact.output = Some(output);
+                self.work.compact = Some(compact);
+                return Ok(());
+            }
+            Progress::Going(_) => self.optimize("the compaction ran past its expected length")?,
+            Progress::Unsure(why) => self.optimize(why)?,
+            Progress::Done => {}
         }
+        self.transaction(|w| {
+            w.fts_option("usermerge", USERMERGE)?;
+            if !w.work.compact_again {
+                w.conn
+                    .execute("DELETE FROM meta WHERE key = 'compaction_due'", [])?;
+            }
+            Ok(())
+        })?;
+        if std::mem::take(&mut self.work.compact_again) {
+            self.work.compact_due = true;
+        }
+        Stats::add(&self.shared.stats.compactions, 1);
+        Stats::max(
+            &self.shared.stats.compaction_max_us,
+            micros(compact.started.elapsed()),
+        );
+        self.work.vacuum = Some(None);
+        self.request_truncate();
+        self.work.merge = true;
         Ok(())
+    }
+
+    /// Finish a compaction in one statement: FTS5's `optimize` merges every segment into one.
+    fn optimize(&mut self, why: &str) -> rusqlite::Result<()> {
+        tracing::warn!(
+            reason = why,
+            "the message cache compacts its index in one go; the writer pauses for it"
+        );
+        self.transaction(|w| {
+            w.conn.execute(
+                "INSERT INTO message_fts (message_fts) VALUES ('optimize')",
+                [],
+            )?;
+            Ok(())
+        })
     }
 
     fn vacuum_step(&mut self) -> rusqlite::Result<()> {
@@ -2122,7 +2419,7 @@ impl Writer<'_> {
         let left = budget.map(|left| left - pages);
         if free == 0 || left.is_some_and(|left| left <= 0) {
             self.work.vacuum = None;
-            self.work.checkpoint = true;
+            self.request_truncate();
         } else {
             self.work.vacuum = Some(left);
         }
@@ -2174,17 +2471,23 @@ impl Writer<'_> {
             .conn
             .pragma_update(None, "cache_size", WRITER_CACHE_KIB.to_string());
         self.report("page cache", cache);
+        if self.checkpointer.is_some() {
+            // The checkpointer copies the log back, off this thread.
+            let automatic = self.conn.pragma_update(None, "wal_autocheckpoint", 0);
+            self.report("automatic checkpoint", automatic);
+        }
         let options = self.transaction(|w| {
             w.fts_option("secure-delete", 1)?;
             w.fts_option("automerge", 0)?;
             w.fts_option("usermerge", USERMERGE)?;
-            // A file from a build that compacted in one pass may carry its flag.
-            let legacy = w
-                .conn
-                .execute("DELETE FROM meta WHERE key = 'compaction_due'", [])?;
-            if legacy > 0 {
-                w.work.compact_due = true;
-            }
+            // Markers a crash (or an earlier build) left uncompacted: the debt is recorded with
+            // them, and cleared only when a compaction has dropped them.
+            let owed: bool = w.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'compaction_due')",
+                [],
+                |row| row.get(0),
+            )?;
+            w.work.compact_due = owed;
             Ok(())
         });
         self.report("index options", options);
@@ -2235,7 +2538,7 @@ impl Writer<'_> {
         }
         self.work.integrity_since.get_or_insert_with(Instant::now);
         self.work.vacuum.get_or_insert(Some(HOURLY_VACUUM_PAGES));
-        self.work.checkpoint = true;
+        self.request_truncate();
         self.work.rounds = 0;
         let last_merge: i64 = self
             .conn
@@ -2287,32 +2590,37 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// A `PASSIVE` checkpoint always; a `TRUNCATE` one only when no read is running, and never
-    /// waiting on one: the busy timeout is zero for that statement, and a busy answer leaves the
-    /// checkpoint due, to be tried again shortly.
+    /// A checkpoint by the writer itself, between its steps: a `TRUNCATE` one when deleted text
+    /// may be in the log and no read is running, a `PASSIVE` one otherwise. Neither waits: the
+    /// busy timeout is zero for it, and a busy answer (a read in progress, or the checkpointer
+    /// in the middle of its own) leaves it to be tried again shortly. With nothing else writing,
+    /// it copies every frame the checkpointer has not, so the next write restarts the log.
     fn checkpoint(&mut self) {
         let started = Instant::now();
-        let passive = self.drain("PRAGMA wal_checkpoint(PASSIVE)");
-        self.report("checkpoint", passive);
-        let mut truncated = Err(rusqlite::Error::QueryReturnedNoRows);
-        if self.shared.readers_in_use.load(Ordering::SeqCst) == 0 {
-            let _ = self.conn.pragma_update(None, "busy_timeout", 0);
-            truncated = self
-                .conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    row.get::<_, i64>(0)
-                });
-            let _ = self.conn.pragma_update(None, "busy_timeout", 2000);
-        }
-        if truncated == Ok(0) {
-            Stats::add(&self.shared.stats.checkpoints_truncated, 1);
-            self.work.checkpoint = false;
-            self.work.checkpoint_after = None;
-        } else {
-            self.work.checkpoint_after = Some(Instant::now() + CHECKPOINT_RETRY);
+        self.backfill_armed = false;
+        let truncate =
+            self.work.checkpoint && self.shared.readers_in_use.load(Ordering::SeqCst) == 0;
+        let mode = if truncate { "TRUNCATE" } else { "PASSIVE" };
+        let _ = self.conn.pragma_update(None, "busy_timeout", 0);
+        let answer = self
+            .conn
+            .query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+                row.get::<_, i64>(0)
+            });
+        let _ = self.conn.pragma_update(None, "busy_timeout", 2000);
+        match answer {
+            Ok(0) if truncate => {
+                Stats::add(&self.shared.stats.checkpoints_truncated, 1);
+                self.work.checkpoint = false;
+                self.work.checkpoint_after = None;
+                self.work.truncate_since = None;
+            }
+            _ => {
+                self.work.checkpoint_after = Some(Instant::now() + CHECKPOINT_RETRY);
+            }
         }
         Stats::max(
-            &self.shared.stats.checkpoint_max_us,
+            &self.shared.stats.writer_checkpoint_max_us,
             micros(started.elapsed()),
         );
     }

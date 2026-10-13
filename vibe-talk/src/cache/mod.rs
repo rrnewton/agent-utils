@@ -52,14 +52,26 @@
 //! # Privacy
 //!
 //! `secure_delete` on every connection, FTS5 `secure-delete` from creation and on at every commit,
-//! no `INSERT OR`-style replacing writes anywhere (a source test enforces it), checkpoints after
-//! every deletion, and a deleted message leaves only a [tombstone](rows) of ids and times. A
-//! message deleted upstream, erased with its channel or aged out leaves the full-text index in
-//! place, at once. Only eviction for size and a rebuild of the index text delete by marker
-//! (switched off and back on inside one transaction), and a compaction follows them: neither
-//! removes anything the owner asked to forget. Logs carry SQLite result codes and counts, never
-//! text, ids or hashes.
-
+//! no `INSERT OR`-style replacing writes anywhere (a source test enforces it), the write-ahead log
+//! truncated after every deletion, and a deleted message leaves only a [tombstone](rows) of ids
+//! and times. Logs carry SQLite result codes and counts, never text, ids or hashes.
+//!
+//! A message deleted upstream, or edited, leaves the full-text index in place, at once. Deleting
+//! a row in place rewrites the index page of every trigram it holds, about five milliseconds and
+//! hundreds of kilobytes of log a row (measured), so a BULK deletion (a large erase or age pass,
+//! eviction, a rebuild of the index text) deletes by marker instead, about a tenth of a
+//! millisecond a row, with `secure-delete` switched off and back on inside its own transaction.
+//! Until a compaction has rewritten the index, the deleted rows' entries stay in its old pages,
+//! unreachable from any query; the compaction is owed in the file from the moment the markers
+//! are written, runs in steps between batches, and is over only when FTS5's own structure record
+//! says its merge has taken in every segment that existed when it began. A crash before then
+//! leaves it owed, and the next open runs it.
+//!
+//! # Files and threads
+//!
+//! The writer, a checkpointer that copies the log back into the database concurrently (the
+//! writer's commits never checkpoint), and two readers, each with its own connection.
+mod checkpoint;
 pub mod coverage;
 pub mod file;
 pub mod marker;
@@ -69,11 +81,12 @@ pub mod rows;
 pub mod schema;
 pub mod search;
 pub mod search_text;
+mod structure;
 mod writer;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -527,8 +540,11 @@ pub struct CacheStats {
     pub step_max_us: u64,
     /// Steps that merged the full-text index's segments (it never merges inside a batch).
     pub merge_steps: u64,
-    /// The longest checkpoint, in microseconds.
+    /// The longest checkpoint on the checkpointer's own thread, in microseconds.
     pub checkpoint_max_us: u64,
+    /// The longest checkpoint the writer ran itself, in microseconds: a step, which a barrier
+    /// can wait behind.
+    pub writer_checkpoint_max_us: u64,
     /// Message rows inserted or changed.
     pub rows_written: u64,
     /// Message rows offered that changed nothing and were not written.
@@ -551,8 +567,11 @@ pub struct CacheStats {
     pub erased_channels: u64,
     /// Message rows those erases have deleted so far.
     pub erased_rows: u64,
-    /// Full-text index compactions after eviction or a rebuild of the index text.
+    /// Full-text index compactions: after deletions by marker (a large erase or age pass,
+    /// eviction, a rebuild of the index text).
     pub compactions: u64,
+    /// Steps those compactions took.
+    pub compaction_steps: u64,
     /// The longest compaction, start to finish, in microseconds.
     pub compaction_max_us: u64,
     /// The longest single compaction slice (one transaction), in microseconds.
@@ -588,6 +607,7 @@ counters!(
     step_max_us,
     merge_steps,
     checkpoint_max_us,
+    writer_checkpoint_max_us,
     rows_written,
     rows_unchanged,
     rows_too_old,
@@ -600,6 +620,7 @@ counters!(
     erased_channels,
     erased_rows,
     compactions,
+    compaction_steps,
     compaction_max_us,
     compaction_slice_max_us,
     integrity_failures,
@@ -796,6 +817,10 @@ pub(crate) struct Shared {
     pub(crate) search_text_current: AtomicBool,
     /// Reads running now. A `TRUNCATE` checkpoint is attempted only at zero.
     pub(crate) readers_in_use: AtomicUsize,
+    /// Frames of the write-ahead log the checkpointer had not copied back when its last pass
+    /// ended: the writer checkpoints the log itself when this is small, so that its own copy,
+    /// and its sync, are cheap.
+    pub(crate) log_backlog: AtomicI64,
     /// Erases asked for and not yet applied, with the sequence number that applies them
     /// (`u64::MAX` until it is known, or when the writer could not be asked).
     pub(crate) erasing: Mutex<HashMap<Erasing, u64>>,
@@ -882,7 +907,7 @@ pub(crate) enum Op {
     /// Report the writer connection's pragmas, for the per-open assertion.
     #[cfg(test)]
     Probe {
-        reply: mpsc::Sender<Vec<(String, String)>>,
+        reply: mpsc::Sender<Vec<Vec<(String, String)>>>,
     },
     /// Hold the writer still until `resume` answers or is dropped: a test's way to order an erase
     /// against a read exactly.
@@ -1031,6 +1056,7 @@ impl MessageCache {
             clock: options.clock,
             search_text_current: AtomicBool::new(true),
             readers_in_use: AtomicUsize::new(0),
+            log_backlog: AtomicI64::new(i64::MAX),
             erasing: Mutex::new(HashMap::new()),
             sweep: Mutex::new(None),
             erase_failed: Mutex::new(HashSet::new()),
@@ -1561,13 +1587,13 @@ impl MessageCache {
         })
     }
 
-    /// The writer connection's pragmas, then each reader's.
+    /// The writer connection's pragmas, the checkpointer's, then each reader's.
     #[cfg(test)]
     pub(crate) fn probe_pragmas(&self) -> Vec<Vec<(String, String)>> {
         let mut all = Vec::new();
         let (reply, answer) = mpsc::channel();
         self.control(Op::Probe { reply });
-        all.push(
+        all.extend(
             answer
                 .recv_timeout(Duration::from_secs(10))
                 .expect("writer answered"),
