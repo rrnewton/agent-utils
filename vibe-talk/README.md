@@ -3964,6 +3964,35 @@ its summary) and by the replies the page has loaded, and the thread selected the
 replies. A walk reads only the routes a scroll up reads: no server route is new. Finding a reply the
 page has never loaded, in two columns, needs a server search, which waits on the persistent cache.
 
+### Nothing moves the list but the reader
+
+`#277 scroll-stability`. The owner: *"I swear I just saw an instance where it jumped me to the bottom of
+the screen in the main message view (two column mode)... I don't think I touched anything. I think it
+was something updating underneath."* It was a read: every refresh took the reader's place as it went
+out and settled to it when it landed, seconds later behind a bridge, so a reader on the newest line who
+scrolled up while it was out was thrown back to the bottom. The rules, in both columns:
+
+- **A read settles to where the reader is when it lands**, never where they were when it was sent: a
+  reader up the list keeps the row they are on, within a pixel, and only a reader still on the newest
+  line follows it. That holds for the first read behind the rows this device saved, too.
+- **A message arriving live is followed only by a reader already on the newest line**, asked before it
+  goes in; everyone else is left exactly where they are and offered the jump to it.
+- **In the right column, a reader on the newest line stays on it** when what is in the list changes size
+  under them with nothing scrolled — above all the card under the pointer drawn whole — and a reader up
+  the list is held by the card or row they are on. Main keeps `#207 scrollback-jump`'s rule: a newest
+  message growing under its reader with nothing redrawn offers the jump to its end.
+- **A thread opens at its foot** when nothing in it is unread, or only its newest message is (unless
+  that message is taller than the screen, when its head shows); one with older unread messages still
+  opens on the first of them (`#221 read-modes`). The list of threads opens at its foot and stays there.
+- **Moving the focus never scrolls a list** unless what takes it is off screen, and then the least that
+  shows it. The other column glides to a selection's counterpart (`#261 two-column-connectors`) only
+  for a selection the reader made, never for one a redraw handed on.
+
+`tests/scroll_stability_browser.py` (DAG step `scroll-stability-browser`) measures them in Chromium at
+1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
+messages, a refresh, the read sent from the newest line and landing after a scroll, summaries and focus
+moves; a reader on the newest line following; the threads and their list opening at the foot.
+
 ### A filter keeps your place
 
 `#243 filter-keeps-selection`. The owner: *"when you adjust the filter, the highlighted message MUST
