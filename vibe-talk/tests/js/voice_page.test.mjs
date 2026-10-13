@@ -52470,3 +52470,165 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
   await press(control, focused(control), "Escape");
   assert.equal(replyBoxAt(control), "screen", "the control kept the reply, so this test cannot see it closed");
 });
+
+// --- `#281 view-keys` with `#279 thread-card-focus` and `#277 reply-in-column` ------------------------
+//
+// The thread list (Ctrl+3) is the right column's cards across the window, so it takes the cards as
+// `#279 thread-card-focus` made them: a press highlights one, its replies button or → goes into its
+// thread — across the window, Back, Esc and ← coming back to the list — and Esc takes the highlight off
+// before it leaves the list. A reply open at the foot of a column (`#277 reply-in-column`) is put down,
+// its words kept, by the view keys that take its column away, and is handed to the reply screen, over
+// the thread list too, by the layout button and a narrowed window, as it was.
+
+test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are two columns' cards — a click highlights one without leaving the list, the highlight goes on through Ctrl+4, and its replies button or → opens its thread across the window", async () => {
+  // The cards' own rules, highlight and way in included, stand outside the desk's block: a phone's thread list has them.
+  for (const selector of [".side-card-row", ".side-card-open", ".side-card-row[data-highlighted]"]) {
+    assert.ok(cssRulesElsewhere(TWO_COLUMN_QUERY, selector) > 0, `${selector} is drawn only in two columns`);
+  }
+  const { page, data } = await manyThreadColumns(4);
+  const layout = () => page.el("screen-main").getAttribute("data-columns");
+  const picker = page.el("thread-select");
+  const [a, b, c] = [data.threads[1].id, data.threads[2].id, data.threads[3].id];
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  assert.equal(layout(), "list", "Ctrl+3 did not show the thread list");
+
+  // A click highlights, and stays in the list; another card takes it; the same card again puts it out.
+  await cardOf(page, a).click();
+  await page.settle();
+  assert.equal(layout(), "list", "a click on a card of the thread list left it");
+  assert.equal(page.el("thread-heading").hidden, true, "a click on a card entered its thread");
+  assert.deepStrictEqual(litCards(page), [a], "a click on a card of the thread list did not highlight it");
+  assert.equal(cardOf(page, a).getAttribute("aria-expanded"), "true");
+  await cardOf(page, b).click();
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [b], "another card did not take the highlight");
+  await cardOf(page, b).click();
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [], "the highlighted card pressed again kept the highlight");
+  await cardOf(page, a).click();
+  await page.settle();
+
+  // One highlight per channel, the same in two columns: Ctrl+4 brings Main in beside the same card, lit.
+  await press(page, focused(page), "4", { ctrlKey: true });
+  assert.equal(layout(), "two");
+  assert.deepStrictEqual(litCards(page), [a], "two columns lost the thread list's highlight");
+  await press(page, focused(page), "3", { ctrlKey: true });
+  assert.equal(layout(), "list");
+  assert.deepStrictEqual(litCards(page), [a], "the thread list lost two columns' highlight");
+
+  // → with the keys on another card is the highlighted card's way in: across the window, one column.
+  await press(page, cardRow(page, c), "ArrowRight");
+  assert.equal(layout(), null, "→ opened the thread inside the thread list");
+  assert.equal(picker.value, `thread:${a}`, "→ did not go into the highlighted card's thread");
+  assert.equal(page.el("thread-heading").hidden, false);
+  // ← is the list again, the card still highlighted; Esc there takes the highlight off and stays.
+  await press(page, focused(page) || page.el("scroll-area"), "ArrowLeft");
+  assert.equal(layout(), "list", "← from a thread opened from the list did not come back to it");
+  assert.deepStrictEqual(litCards(page), [a]);
+  await press(page, focused(page) || page.el("side-scroll"), "Escape");
+  assert.equal(layout(), "list", "the first Esc left the thread list with a card highlighted");
+  assert.deepStrictEqual(litCards(page), [], "Esc did not take the highlight off");
+
+  // With none highlighted, → is the card the keys are on; and a card's replies button opens its own.
+  await press(page, cardRow(page, c), "ArrowRight");
+  assert.equal(picker.value, `thread:${c}`, "→ did not go into the card the keys were on");
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.equal(layout(), "list", "Back did not come back to the thread list");
+  await openerOf(cardRow(page, b)).click();
+  await page.settle();
+  assert.equal(layout(), null, "the replies button opened the thread inside the thread list");
+  assert.equal(picker.value, `thread:${b}`, "the replies button did not open its card's thread");
+  await press(page, focused(page) || page.el("scroll-area"), "Escape");
+  assert.equal(layout(), "list", "Esc from the thread did not come back to the thread list");
+
+  // THE CONTROLS: the replies button selecting on the right only, which is not drawn over the thread
+  // list; and the cards on screen taken to be the right column's in two columns alone.
+  const { page: opener, data: given } = await manyThreadColumns(4, null, brokenScript(
+    "  if (threadListShown) return openThreadFromList(id, summary);\n  const opened = selectSideThread(id, summary);",
+    "  const opened = selectSideThread(id, summary);"));
+  await press(opener, opener.el("scroll-area"), "3", { ctrlKey: true });
+  await openerOf(cardRow(opener, given.threads[1].id)).click();
+  await opener.settle();
+  assert.equal(opener.el("screen-main").getAttribute("data-columns"), "list",
+    "the control's replies button opened the thread, so this test cannot see it fail to");
+  const { page: cards, data: held } = await manyThreadColumns(4, null, brokenScript(
+    "  if (sideColumnUp()) return columns.side.mode === \"list\" ? leftEl(\"side-cards\") : null;",
+    "  if (columnsShown) return columns.side.mode === \"list\" ? leftEl(\"side-cards\") : null;"));
+  await press(cards, cards.el("scroll-area"), "3", { ctrlKey: true });
+  await cardOf(cards, held.threads[1].id).click();
+  await cards.settle();
+  await press(cards, focused(cards) || cards.el("side-scroll"), "Escape");
+  assert.notEqual(cards.el("screen-main").getAttribute("data-columns"), "list",
+    "the control's Esc took the highlight off, so this test cannot see it go first");
+});
+
+test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply open at the foot of a column put it down as Cancel does, its words kept, and show the view; Ctrl+4 leaves it open; the layout button still hands it to the reply screen, over the thread list too", async () => {
+  const { page } = await replyColumnsPage();
+  const layout = () => page.el("screen-main").getAttribute("data-columns");
+  const picker = page.el("thread-select");
+
+  // On the left: Ctrl+2 is All in one column, with no reply screen over it, and the words a draft.
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("left words");
+  const all = await press(page, page.el("reply-text"), "2", { ctrlKey: true });
+  assert.equal(all.defaulted, false, "Ctrl+2 in the box was left to the browser");
+  assert.equal(page.screen(), "main", "Ctrl+2 in a reply open in a column showed the reply screen over All");
+  assert.equal(picker.value, "flat", "Ctrl+2 in a reply open in a column did not choose All");
+  assert.equal(layout(), null);
+  assert.equal(replyBoxAt(page), "screen", "the reply's box was left in a column that went");
+  assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [true, true]);
+  assert.ok(nodeWithinFixture(page.el("scroll-area"), focused(page)), `after Ctrl+2 the keys are on ${focusName(page)}`);
+  assert.equal(draftMarkerOf(rowWithId(page, "200")).hidden, false, "the words of the reply put down were not kept");
+  await replyButton(rowWithId(page, "200")).click();
+  assert.equal(page.screen(), "reply", "the premise is the reply screen in one column");
+  assert.equal(page.el("reply-text").value, "left words", "Reply did not open with the words kept");
+  await page.el("reply-cancel").click();
+
+  // On the right: Ctrl+4, two columns already, changes nothing, the box keeping the focus and the words.
+  await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
+  assert.ok(inTwoColumns(page), "Ctrl+4 did not bring two columns back");
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "two columns came back without their thread on the right");
+  await replyButton(sideRow(page, "202")).click();
+  await page.el("reply-text").setValue("right words");
+  const same = await press(page, page.el("reply-text"), "4", { ctrlKey: true });
+  assert.equal(same.defaulted, false);
+  assert.equal(replyBoxAt(page), "right", "Ctrl+4 in two columns put down the reply open in one");
+  assert.equal(focused(page), page.el("reply-text"), `Ctrl+4 took the focus out of the box to ${focusName(page)}`);
+  assert.equal(page.el("reply-text").value, "right words");
+  // Ctrl+3 shows the right column's cards, not the thread the reply answers: put down, words kept.
+  await press(page, page.el("reply-text"), "3", { ctrlKey: true });
+  assert.equal(layout(), "list", "Ctrl+3 in a reply open in a column did not show the thread list");
+  assert.equal(page.screen(), "main", "Ctrl+3 showed the reply screen over the thread list");
+  assert.equal(replyBoxAt(page), "screen");
+  assert.ok(nodeWithinFixture(page.el("side-scroll"), focused(page)), `after Ctrl+3 the keys are on ${focusName(page)}`);
+  await press(page, focused(page), "4", { ctrlKey: true });
+  assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+  await replyButton(sideRow(page, "202")).click();
+  assert.equal(page.el("reply-text").value, "right words", "the words put down by Ctrl+3 were not kept");
+  await page.el("reply-cancel").click();
+
+  // Two columns chosen from the thread list: their button goes back to it, and hands a reply open in
+  // a column to the reply screen, words and all, over the list; Cancel is the list again.
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  await press(page, focused(page), "4", { ctrlKey: true });
+  assert.equal(page.el("column-toggle").title, "Back to the thread list");
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("handed over");
+  await page.el("column-toggle").click();
+  await page.settle();
+  assert.equal(page.screen(), "reply", "the layout button lost a reply open in a column");
+  assert.equal(page.el("reply-text").value, "handed over", "the words did not go with the reply");
+  assert.equal(layout(), "list", "the layout button did not go back to the thread list under the reply");
+  await page.el("reply-cancel").click();
+  assert.equal(page.screen(), "main");
+  assert.equal(layout(), "list", "Cancel did not come back to the thread list");
+  assert.ok(page.el("side-column").getClientRects().length > 0, "the thread list is not on screen after Cancel");
+
+  // THE CONTROL: the view keys leaving the reply to two columns' going, which hands it to the reply screen.
+  const { page: control } = await replyColumnsPage(brokenScript('  if (replyDocked && which !== "columns") closeReply();\n', ""));
+  await replyButton(rowWithId(control, "200")).click();
+  await control.el("reply-text").setValue("left words");
+  await press(control, control.el("reply-text"), "2", { ctrlKey: true });
+  assert.equal(control.screen(), "reply", "the control put the reply down, so this test cannot see it handed over");
+});

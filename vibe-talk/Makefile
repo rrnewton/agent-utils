@@ -222,7 +222,10 @@ two-column-browser:
 # card's edge and every other link turns the page's grey — by the colour Chromium computes and by the
 # pixels a screenshot holds there — the highlighted card's staying in its colour; its replies button
 # enters its thread, <- or Back comes out to it still highlighted, Esc puts the highlight out, and -> enters
-# the card the keys are on. Pass WEB_ROOT=dir to run it against another copy of the page, and
+# the card the keys are on. `#281 view-keys`: then the phone's thread list, chosen in the view picker, the
+# same cards across the window: the channel's highlight on them, the others grey, each replies button a
+# thumb high, a tap highlighting and showing one whole, its replies button opening the thread across the
+# window and Back coming to the list. Pass WEB_ROOT=dir to run it against another copy of the page, and
 # SCREENSHOTS=dir to keep a PNG of each state.
 thread-card-focus-browser:
 	python3 tests/thread_card_focus_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
@@ -283,9 +286,11 @@ reply-continuity-browser:
 # columns staying where they were to the pixel and the message answered edged and unmoved; Escape, Cancel,
 # Send and Enter put the box back and the column where it was, the keys on its list, a sent reply posted
 # where the reply screen posts it; a message low in a column moves up only as far as shows it over the
-# box; a window narrowed to one column hands an open reply to the reply screen with its words; and one
-# column is the reply screen, as it was. Pass WEB_ROOT=dir to run it against another copy of the page,
-# and SCREENSHOTS=dir to keep a PNG of each open reply.
+# box; a window narrowed to one column hands an open reply to the reply screen with its words; `#281
+# view-keys`: real Ctrl+4 in an open reply leaves it, and Ctrl+2 and Ctrl+3 show All and the thread list
+# with the reply put down, its words kept; and one column is the reply screen, as it was. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each
+# open reply.
 reply-in-column-browser:
 	python3 tests/reply_in_column_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

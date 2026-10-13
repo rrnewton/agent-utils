@@ -36,6 +36,14 @@ At 412x915, with a finger, in one column over the Threads list:
   colour and its pixels, the highlighted card's still its colour -> a tap on its replies button: its
   thread -> Back: the Threads list, the card still highlighted.
 
+`#281 view-keys`. Then, on the same phone, the thread list the view picker chooses (Ctrl+3 on a desk):
+the right column's cards, across the window. The card highlighted on the Threads list is highlighted
+here too, one per channel, and every other card's edge is the grey, by computed colour and pixels;
+every card but it three lines; each card's replies button a thumb's height -> a tap on the long
+question's card: it takes the highlight and shows all of itself, the list still on screen, the card
+that had it now grey -> a tap on its replies button: its thread across the window -> Back: the thread
+list, the card still highlighted.
+
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each
 state for review; --web-root DIR to run the same walk against another copy of the page.
 """
@@ -195,6 +203,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
             if phone:
                 phone_walk(desk)
+                phone_list_walk(desk)
             else:
                 desk_walk(desk)
             check(not errors, f"{label}: the page threw: {errors}")
@@ -546,6 +555,87 @@ def phone_walk(desk: Desk) -> None:
     desk.check(bool(by_id(back)[CANARY]["lit"]), "coming back to the Threads list lost the highlight")
     no_overflow(desk, back, "back on the Threads list")
     desk.notes.append("its replies button entered the thread, and Back came to the list with the card still highlighted")
+
+
+# --- on a phone, the thread list ----------------------------------------------------------------------
+
+
+def phone_list_walk(desk: Desk) -> None:
+    """`#281 view-keys`: the thread list is the right column's cards, and they work as `#279 thread-card-focus` made them."""
+    page = desk.page
+    page.select_option("#thread-select", "threads")
+    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
+                  " && document.getElementById('side-column').getClientRects().length > 0"
+                  " && document.querySelectorAll('#side-cards > li[data-card]').length === 3",
+                  "the view picker did not show the thread list")
+    desk.settled()
+    desk.settled()
+    before = state(desk, "side-cards")
+    shown = by_id(before)
+    grey = colour(before, "grey")
+    drawn = edge_pixels(desk, before)
+    # The highlight is the channel's: the card lit on the Threads list is the one lit here.
+    desk.check(bool(shown[CANARY]["lit"]), f"the thread list does not have the Threads list's highlight: {shown[CANARY]}")
+    for card_id, card in shown.items():
+        edge = colour(card, "edge")
+        if card_id == CANARY:
+            desk.check(chroma(edge) >= COLOURED and chroma(drawn[card_id]) >= COLOURED_PIXEL,
+                       f"the highlighted card's edge is {edge}, drawn {drawn[card_id]}")
+        else:
+            desk.check(near(edge, grey), f"the edge of {card_id} is {edge}, not the grey {grey}")
+            desk.check(chroma(drawn[card_id]) <= GREY, f"the edge of {card_id} is drawn {drawn[card_id]}, not grey")
+            desk.check(number(card, "lines") == 3, f"{card_id} is not three lines: {card['lines']}")
+    # A finger's target: the way into each thread is a thumb high, where the desk's chip is the facts' height.
+    tall = page.evaluate("() => [...document.querySelectorAll('#side-cards .side-card-open')]"
+                         ".map((button) => button.getBoundingClientRect().height)")
+    assert isinstance(tall, list)
+    desk.check(len(tall) == 3 and min(float(height) for height in tall) >= 44,
+               f"a card's replies button is not a thumb's height on a phone: {tall}")
+    no_overflow(desk, before, "the thread list")
+    desk.shot("4-thread-list")
+
+    # A tap on the long question's card: it takes the highlight and shows all of itself; the list stays.
+    page.touchscreen.tap(*card_point(desk, "side-cards", REPLICA, ".side-card-text"))
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").getAttribute('data-highlighted') === 'true'",
+                  "a tap on a card of the thread list did not highlight it")
+    desk.settled()
+    desk.settled()
+    desk.check(page.evaluate("() => document.getElementById('screen-main').getAttribute('data-columns')") == "list"
+               and not page.is_visible("#thread-heading"), "a tap on a card of the thread list entered its thread")
+    lit = state(desk, "side-cards")
+    now = by_id(lit)
+    desk.check(not now[REPLICA]["clamped"] and number(now[REPLICA], "lines") > 3,
+               f"the highlighted card is not shown whole: {now[REPLICA]}")
+    desk.check(not now[CANARY]["lit"] and near(colour(now[CANARY], "edge"), grey),
+               f"the card that had the highlight kept it or its colour: {now[CANARY]}")
+    desk.check(chroma(colour(now[REPLICA], "edge")) >= COLOURED, f"the highlighted card's edge is {colour(now[REPLICA], 'edge')}")
+    no_overflow(desk, lit, "the thread list, a card highlighted")
+    desk.shot("5-thread-list-highlighted")
+
+    # Its replies button: the thread, across the window. Back: the thread list, the card still highlighted.
+    page.touchscreen.tap(*card_point(desk, "side-cards", REPLICA, ".side-card-open"))
+    desk.wait_for("() => !document.getElementById('thread-heading').hidden"
+                  " && !document.getElementById('screen-main').hasAttribute('data-columns')"
+                  f" && document.querySelectorAll('#discord-log > li[data-id]').length === {THREAD_ROWS[REPLICA]}",
+                  "the replies button did not open the card's thread across the window")
+    desk.check(page.evaluate("() => document.getElementById('thread-select').value") == f"thread:{REPLICA}",
+               "the replies button opened another thread")
+    desk.shot("6-thread-from-list")
+    box = page.locator("#thread-back").bounding_box()
+    desk.check(box is not None, "the thread opened from the thread list has no way back")
+    assert box is not None
+    page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
+                  " && !document.getElementById('side-list').hidden",
+                  "Back from the thread did not come back to the thread list")
+    desk.settled()
+    back = state(desk, "side-cards")
+    desk.check(bool(by_id(back)[REPLICA]["lit"]), "coming back to the thread list lost the highlight")
+    no_overflow(desk, back, "back on the thread list")
+    desk.notes.append(f"the thread list the picker chose had the Threads list's highlight, the other edges grey; its "
+                      f"replies buttons {min(float(height) for height in tall):.0f}px tall; a tap highlighted the long "
+                      "question's card, shown whole, without entering it; its replies button opened the thread across "
+                      "the window, and Back came to the list with the card still highlighted")
 
 
 if __name__ == "__main__":

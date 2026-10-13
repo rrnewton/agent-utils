@@ -433,7 +433,10 @@ steps:
   # and every other link turns the page's grey — by the colour Chromium computes and by the pixels a
   # screenshot holds there — the highlighted card's own staying in its thread's colour; its replies button
   # enters its thread, <- or Back comes out to it still highlighted, Esc puts the highlight out, and ->
-  # enters the card the keys are on. Measured on 2026-10-13: about 5s wall.
+  # enters the card the keys are on. `#281 view-keys`: then the phone's thread list from the view picker,
+  # the same cards across the window, the channel's highlight on them and the others grey, each replies
+  # button a thumb high; a tap highlights one, shown whole, its replies button opens the thread across the
+  # window, and Back comes to the list. Measured on 2026-10-13: about 4s wall.
   - group: check
     job: thread-card-focus-browser
     desc: one thread card highlighted and shown whole, every other card's edge and link grey by computed colour and by pixels, its replies button and -> entering it, <- and Esc coming back, in current Chromium at 1280x800 and 412x915
@@ -579,8 +582,10 @@ steps:
   # where they were, the keys on the pressed column's list, and a sent reply is posted where the reply
   # screen posts it (Main's message to Main, the thread's into it). A message low in the left column moves
   # up only as far as shows it over the box, and back on Cancel; a window narrowed to 900px hands a reply
-  # open on the right to the reply screen with its words; and one column is the reply screen, as it was.
-  # Measured on 2026-10-13: about 3s wall.
+  # open on the right to the reply screen with its words; `#281 view-keys`: real Ctrl+4 in an open reply
+  # leaves it open, and Ctrl+2 and Ctrl+3 show All and the thread list with the reply put down, its words
+  # kept and no reply screen over the view; and one column is the reply screen, as it was. Measured on
+  # 2026-10-13: about 4s wall.
   - group: check
     job: reply-in-column-browser
     desc: Reply and Quote reply open in the column they were pressed in, both columns staying put, and Send, Cancel, Escape and Enter putting everything back, in current Chromium at 1280x800

@@ -7039,7 +7039,9 @@ textarea {
 
 /* `#277 thread-card-focus`. The row is the card, its surface and its edge: its first button, what the
    thread is about, spans it, and under that its facts and the button into the thread share a line.
-   A press anywhere on it but that button highlights it, so all of it says it can be pressed. */
+   A press anywhere on it but that button highlights it, so all of it says it can be pressed. Under a
+   finger, in the thread list on a phone (`#281 view-keys`), a tap draws no flash of the browser's own
+   over the card: the highlight it puts on is what says it was pressed, as the bar's buttons do. */
 .side-card-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -7052,6 +7054,8 @@ textarea {
   border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
   border-radius: 0.6rem;
   cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .side-card {

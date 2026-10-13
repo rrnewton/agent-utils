@@ -38,6 +38,13 @@ it brings that row, with Retry, into view in the column, and the chip says Newes
 step, the reply screen's Send landing on the newest message was what showed such a row; Send from a
 column stays put, and the row sat unseen at the column's foot with nothing said.)
 
+Then the view keys pressed in a reply open in a column (`#281 view-keys`), real chords: Ctrl+4, two columns
+already, leaves it open, its words and the focus in the box; Ctrl+2 in the left column's box is All in one
+column with no reply screen over it, the box back on the reply screen out of sight, the words kept as the
+row's draft and the keys on the list; and Ctrl+3 in the right column's box is the thread list across the
+window, the reply put down in the same way. Ctrl+4 brings two columns back each time, the runner's thread
+on the right.
+
 Then one column at the desk's width: Reply is the reply screen, as it was. No page error and no sideways
 scroll at any step.
 
@@ -292,6 +299,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             narrowed_run(desk)
             for column, refusal, said in REFUSALS:
                 refused_run(desk, api, column, refusal, said)
+            view_keys_run(desk)
             one_column_run(desk)
             check(not errors, f"the page threw: {errors}")
             context.close()
@@ -695,6 +703,101 @@ def narrowed_run(desk: Desk) -> None:
                   " && document.getElementById('thread-select').value === 'columns'",
                   "narrowed: two columns did not come back")
     desk.notes.append("narrowed to 900px, the reply open on the right moved to the reply screen with its words")
+
+
+# The view keys' state: the picker, the layout, where the reply's box is and what it holds, and the keys.
+VIEW_STATE_JS = """() => ({
+    picker: document.getElementById('thread-select').value,
+    layout: document.getElementById('screen-main').getAttribute('data-columns'),
+    box: document.querySelector('.reply-compose').parentElement.id,
+    words: document.getElementById('reply-text').value,
+    replyScreen: document.getElementById('screen-reply').getClientRects().length > 0,
+    focus: document.activeElement ? document.activeElement.id || document.activeElement.className : null,
+    leftKeys: document.getElementById('scroll-area').contains(document.activeElement),
+    rightKeys: document.getElementById('side-scroll').contains(document.activeElement),
+    across: document.getElementById('side-column').getBoundingClientRect().width,
+})"""
+
+
+def view_keys_run(desk: Desk) -> None:
+    """`#281 view-keys`: real Ctrl+4, Ctrl+2 and Ctrl+3 in a reply open in a column."""
+    page = desk.page
+
+    def state() -> Json:
+        found = page.evaluate(VIEW_STATE_JS)
+        assert isinstance(found, dict)
+        return found
+
+    def back_to_columns() -> None:
+        # The runner's thread on the right and Main on the left: its reply 213 on the right and not on the
+        # left. Not counted: the replies this walk has sent are in both lists by now.
+        page.keyboard.press("Control+4")
+        desk.wait_for("() => document.getElementById('thread-select').value === 'columns'"
+                      " && document.getElementById('side-column').getClientRects().length > 0"
+                      " && !document.getElementById('side-pane').hidden"
+                      " && Boolean(document.querySelector(\"#side-log > li[data-id='213']\"))"
+                      " && document.querySelectorAll('#discord-log > li[data-id]').length > 0"
+                      " && !document.querySelector(\"#discord-log > li[data-id='213']\")",
+                      "view keys: Ctrl+4 did not bring two columns back with the runner's thread on the right")
+        desk.settled()
+
+    # The left column: Ctrl+4 keeps the reply; Ctrl+2 is All in one column, the reply put down.
+    place_row(desk, "left", "203", top=ROW_OFFSET_PX)
+    button = reply_button(desk, "left", "203")
+    page.mouse.click(button["x"], button["y"])
+    desk.wait_for("() => document.querySelector('.reply-compose').parentElement.id === 'column-reply'",
+                  "view keys: the box did not open in the left column")
+    page.keyboard.type("left words")
+    page.keyboard.press("Control+4")
+    desk.settled()
+    kept = state()
+    desk.check(kept["box"] == "column-reply" and kept["focus"] == "reply-text" and kept["words"] == "left words"
+               and kept["layout"] == "two", f"view keys: Ctrl+4 in two columns did not leave the reply as it was: {kept}")
+    page.keyboard.press("Control+2")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'flat'"
+                  " && document.getElementById('side-column').getClientRects().length === 0"
+                  " && document.querySelector('.reply-compose').parentElement.id === 'screen-reply'",
+                  "view keys: Ctrl+2 in the left column's box did not show All and put the reply down")
+    desk.settled()
+    all_view = state()
+    desk.check(not all_view["replyScreen"], f"view keys: Ctrl+2 showed the reply screen over All: {all_view}")
+    desk.check(all_view["leftKeys"] is True, f"view keys: after Ctrl+2 the keys are on {all_view['focus']!r}, not the list")
+    desk.check(all_view["words"] == "left words", f"view keys: a chord typed into the box: {all_view['words']!r}")
+    draft = page.evaluate("() => { const m = document.querySelector(\"#discord-log > li[data-id='203'] .draft-marker\");"
+                          " return Boolean(m) && !m.hidden; }")
+    desk.check(draft is True, "view keys: the words of the reply Ctrl+2 put down were not kept as the row's draft")
+    desk.shot("view-keys-all")
+    back_to_columns()
+
+    # The right column: Ctrl+3 is the thread list across the window, the reply put down as well.
+    place_row(desk, "right", "213", top=ROW_OFFSET_PX)
+    button = reply_button(desk, "right", "213")
+    page.mouse.click(button["x"], button["y"])
+    desk.wait_for("() => document.querySelector('.reply-compose').parentElement.id === 'side-reply'",
+                  "view keys: the box did not open in the right column")
+    page.keyboard.type("right words")
+    page.keyboard.press("Control+3")
+    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
+                  " && document.querySelectorAll('#side-cards > li[data-card]').length === 3"
+                  " && document.querySelector('.reply-compose').parentElement.id === 'screen-reply'",
+                  "view keys: Ctrl+3 in the right column's box did not show the thread list and put the reply down")
+    desk.settled()
+    listed = state()
+    desk.check(not listed["replyScreen"] and listed["rightKeys"] is True and listed["words"] == "right words"
+               and float(str(listed["across"])) >= WIDTH - 1,
+               f"view keys: the thread list after Ctrl+3 in the box is not what it should be: {listed}")
+    desk.shot("view-keys-thread-list")
+    # Through one column, so that two columns' button goes back to one column again for the walk after this.
+    page.keyboard.press("Control+1")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'main'"
+                  " && document.getElementById('side-column').getClientRects().length === 0",
+                  "view keys: Ctrl+1 did not leave the thread list for Main")
+    back_to_columns()
+    page.mouse.move(WIDTH / 2, 5)
+    desk.settled()
+    desk.notes.append("view keys in a reply open in a column: Ctrl+4 left it open; Ctrl+2 on the left was All in one "
+                      "column and Ctrl+3 on the right the thread list across the window, each putting the reply down "
+                      "with its words kept, no reply screen over the view, nothing typed")
 
 
 def one_column_run(desk: Desk) -> None:
