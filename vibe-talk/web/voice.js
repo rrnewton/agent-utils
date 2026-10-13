@@ -9236,8 +9236,9 @@ function isSpokenYesAcknowledgement(text, open) {
  * answer is judged against, so the yes is refused, whichever side of it they were said on; and an
  * interrupted turn of that kind counts as the read-back cut off (`heardBefore`). If the assumption
  * were wrong, the most it lets through is a yes whose exact, completed read-back was followed by
- * "One moment." before the owner answered — or by a streamed "One" whose turn was still open when
- * the settle window ran out: such a turn that says more, or completes on "One", stops the yes only
+ * "One moment." before the owner answered — or by a streamed "One" whose turn was still open, with
+ * no completion of any kind, when the settle window ran out: such a turn that says more, or
+ * completes on "One" (or is left there by a completion that names no turn), stops the yes only
  * while it is settling (`hearAssistantForSpokenYes`, `noteTurnCompleteForSpokenYes`).
  *
  * Without numbers nothing tells a reply from more of the read-back, so an unnumbered turn is never
@@ -9317,6 +9318,10 @@ function noteCutForSpokenYes(numbered = false) {
  * and what it was may have come before the yes: the yes stops, as for a reply that says more. Run
  * after `closeSpokenTurn`, which marks the turn completed.
  *
+ * A completion that names no turn marks none completed, yet may have closed any of those replies;
+ * so each numbered one is judged as complete, and the yes stops unless it said the whole
+ * acknowledgement.
+ *
  * @param {boolean} interrupted
  * @param {number | null} [turn]
  */
@@ -9332,7 +9337,9 @@ function noteTurnCompleteForSpokenYes(interrupted, turn = null) {
   const settling = spokenYes.settling;
   if (settling && [...settling.replies].some((key) => {
     const entry = spokenYes.said.get(key);
-    return entry !== undefined && !isReplyTo({ turn: settling.turn }, entry);
+    if (entry === undefined) return false;
+    if (turn === null) return entry.turn !== null && !isSpokenYesAcknowledgement(entry.text, false);
+    return !isReplyTo({ turn: settling.turn }, entry);
   })) {
     abortSpokenYes("said_more");
   }

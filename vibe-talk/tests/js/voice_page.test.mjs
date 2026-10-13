@@ -50009,6 +50009,33 @@ test("`#268 voice-call-drops`: a reply excused on a streamed 'One' that then com
   assert.deepEqual(whole.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
 });
 
+test("`#268 voice-call-drops`: a turn_complete that names no turn closes a reply excused on a streamed 'One', and stops the yes still settling", async () => {
+  // The review's probe, one case wider: the same frames as above, but the completion carries no
+  // `turn`. Nothing then marked turn 2 completed, so its "One" still counted as the start of the
+  // acknowledgement and the yes posted. A completion that does not say which turn it closes may
+  // have closed the reply, so each reply is judged as complete.
+  const page = newPage();
+  const socket = await neutralReadBack(page);
+  speech(socket, "assistant", 2, "One", false);
+  speech(socket, "user", 2, "Yes.", true);
+  assert.match(page.el("status").textContent, /Heard yes/);
+  turnDone(socket, undefined);
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a reply left on 'One' by an unnumbered completion did not stop the yes");
+  assert.match(page.el("status").textContent, /^Not sent — the assistant said more than One moment/);
+
+  // A reply that had said the whole acknowledgement is complete as it is, and the yes posts.
+  const whole = newPage();
+  const pending = spokenDraft();
+  const wholeSocket = await neutralReadBack(whole, { pending });
+  speech(wholeSocket, "assistant", 2, "One", false);
+  speech(wholeSocket, "user", 2, "Yes.", true);
+  speech(wholeSocket, "assistant", 2, "One moment.", true);
+  turnDone(wholeSocket, undefined);
+  await settleSpokenYes(whole);
+  assert.deepEqual(whole.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
+});
+
 test("`#268 voice-call-drops`: a new turn numbered at or after the answer that begins inside the settle window stops the yes unless it is 'One moment.'", async () => {
   // The review's probe: "One moment." in turn 2, the owner's "Yes." final in turn 2, then the
   // assistant's turn 3 "Actually, should I cancel it instead?" inside the settle window. Only a

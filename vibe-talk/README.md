@@ -5538,15 +5538,16 @@ and a plain yes sent nothing. The rules above are now asked of what was said BEF
   that goes on to say more, or that completes on "One" alone, stops a yes that is still settling;
   so does a turn numbered the same as the answer or later that first appears while the yes is
   settling ("Actually, should I cancel it instead?") unless it is the acknowledgement, which is
-  then held to the same rule.
+  then held to the same rule. A `turn_complete` that names no turn may have completed any such
+  reply, so each is then judged as completed: one still on "One" stops the yes.
 * That rests on an **assumption the protocol does not state**: that `vibe-talk-v1` numbers the
   owner's words and the assistant's answer to them alike. The safety of the rule does not depend on
   it. Only the acknowledgement is ever left out, whichever side of the answer it was really said
   on, so if the assumption is wrong the most it lets through is a yes whose exact, completed,
   heard-out read-back was followed by "One moment." before the owner answered — or by a "One"
-  whose turn was still streaming when the settle window ran out, since what such a turn goes on to
-  be can stop the yes only while it is settling. Without turn numbers
-  nothing tells a reply from more of the read-back (the order of arrival is what cannot be
+  whose turn was still streaming, with no completion of any kind, when the settle window ran out,
+  since what such a turn goes on to be can stop the yes only while it is settling. Without turn
+  numbers nothing tells a reply from more of the read-back (the order of arrival is what cannot be
   trusted), so a provider that sends none is judged as before, over everything said since the
   owner last spoke.
 * "Not interrupted" and "completed before the answer" are asked of the read-back's own numbered
