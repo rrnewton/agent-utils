@@ -37013,6 +37013,44 @@ test("`#269 approval-card-inline`: on vibe-talk-v1 a yes is out of sight from it
   }
 });
 
+test("`#269 approval-card-inline`: a step back that reaches a yes whose card approved by voice is on the newer page draws it into that card", async () => {
+  // A page of the record can end between a yes and the card it sent: the newer page holds the card,
+  // the step back brings the yes. Approved by tap, the same yes is a turn of its own.
+  for (const how of ["voice", "tap"]) {
+    const page = newPage();
+    page.transcriptRecordsSupported = true;
+    const at = (i) => RECORD_EPOCH + i * 60_000;
+    const filler = (from, count) => Array.from({ length: count }, (_unused, i) => ({
+      speaker: (from + i) % 2 === 0 ? "you" : "agent", text: `paged turn ${from + i}`, at_ms: at(from + i),
+    }));
+    const sent = {
+      speaker: "sent", text: "on it, rebasing now", at_ms: at(8),
+      detail: {
+        kind: "sent", serial: 7, send_seq: 1, channel_id: "1110000000000000001", channel_name: "lead team",
+        parts_posted: 1, parts_total: 1, unsent_chars: 0, outcome: "sent", how, origin: "commit",
+        text_truncated: false, text_chars: 19, begun_at_ms: at(8), sent_at_ms: at(8),
+      },
+    };
+    page.storedTurns.set("conv_paged", [
+      ...filler(0, 5),
+      { speaker: "agent", text: "To lead team: on it, rebasing now. Send it?", at_ms: at(6) },
+      { speaker: "you", text: "yes please", at_ms: at(7), detail: { kind: "answer", serial: 7 } },
+      sent,
+      ...filler(9, TRANSCRIPT_PAGE_LIMIT - 1),
+    ]);
+    await signIn(page);
+    await page.settle();
+    assert.equal(sentCards(page).length, 1, `${how}: the newer page did not draw the card`);
+    assert.equal(rowSaying(page, "yes please"), undefined, `${how}: the yes was on the newer page: this tests nothing`);
+    await page.el("load-older-turns").click();
+    await page.settle();
+    const yes = rowSaying(page, "yes please");
+    assert.ok(yes, `${how}: the step back did not bring the yes`);
+    assert.equal(absorbed(yes), how === "voice",
+      how === "voice" ? "the step back drew the yes beside the card approved by voice" : "a yes was hidden beside a card approved by tap");
+  }
+});
+
 test("`#269 approval-card-inline`: a yes stopped in its settle window, or overtaken by a tap, is shown again in its own place", async () => {
   const page = newPage();
   const socket = await recordedReadBack(page, "conv_wait");
