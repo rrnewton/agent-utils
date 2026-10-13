@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser thread-card-focus-browser bookmark-browser reply-continuity-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -192,13 +192,24 @@ keyboard-browser:
 
 # `#229 desktop-two-column` in a real Chromium at 1440x900 and 1280x800: the layout button draws Main
 # and the right column side by side inside the window, the view picker greyed; the right column's cards
-# are one height, newest activity first, the long one cut to three lines; a card and a Main message's
-# Thread(N) select a thread there under its name, each column scrolls alone under the wheel, the X goes
-# back to the cards, and a window narrowed to 900px is one column in its old view, two again when wide.
-# Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep the list and
-# thread states as PNGs.
+# are one height, newest activity first, the long one cut to three lines; a card's replies button and a
+# Main message's Thread(N) select a thread there under its name, each column scrolls alone under the
+# wheel, the X goes back to the cards, and a window narrowed to 900px is one column in its old view, two
+# again when wide. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
+# keep the list and thread states as PNGs.
 two-column-browser:
 	python3 tests/two_column_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#277 thread-card-focus` in a real Chromium, at 1280x800 over the right column's cards with a mouse and
+# the keys, and on a 412x915 phone over the Threads list with a finger: every card contracted, the one
+# under the mouse too; a click or a tap highlights one, shown whole and not entered, and every other
+# card's edge and every other link turns the page's grey — by the colour Chromium computes and by the
+# pixels a screenshot holds there — the highlighted card's staying in its colour; its replies button
+# enters its thread, <- or Back comes out to it still highlighted, Esc puts the highlight out, and -> enters
+# the card the keys are on. Pass WEB_ROOT=dir to run it against another copy of the page, and
+# SCREENSHOTS=dir to keep a PNG of each state.
+thread-card-focus-browser:
+	python3 tests/thread_card_focus_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#240 reading-bookmark` in a real Chromium at 1280x800 (mouse and keys) and 412x915 (touch): the
 # bookmark set on a message (Shift+B, or the row's menu) is a line in the accent drawn in the room

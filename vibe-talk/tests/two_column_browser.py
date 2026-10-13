@@ -20,13 +20,14 @@ desk size, with a mouse:
   two-column-polish`); the right column is one region, named "Threads" -> the right column lists the
   threads as cards, newest activity at the foot (`#261 two-column-connectors`), every card the same
   height, the summarised one saying its name and summary, the long first message cut to three lines,
-  and shown whole on the card under the mouse (`#257 summary-truncation`) -> a card selects its
-  thread: its rows in the right column under a heading naming it, its region "Thread: " and that
-  name, with the X, and no line saying it is stale -> each column scrolls on its own, under the
+  still three lines under the mouse and shown whole on the card a click highlights (`#257
+  summary-truncation`, `#277 thread-card-focus`) -> a card's replies button selects its thread: its
+  rows in the right column under a heading naming it, its region "Thread: " and that name, with the
+  X, and no line saying it is stale -> each column scrolls on its own, under the
   wheel over it -> the X goes back to the cards, and a Main message's Thread(N) selects its thread on
   the right -> the window narrowed to 900px: one column, as the channel was in one, the button not
   drawn; widened again: two columns, the same thread selected -> the keys, pressed for real: ] gives
-  them to the right column, Esc there is its X, j rings the first card, Enter selects its thread and
+  them to the right column, Esc there is its X, j rings the first card, -> selects its thread and
   [ gives them back to Main -> at a phone's width the button is not drawn -> back at the desk's width
   over the cards, the links between the columns (`#261 two-column-connectors`): with Main scrolled to
   its foot, its head and two places between, the links drawn are exactly the pairs whose root's tag
@@ -393,25 +394,38 @@ def columns_walk(desk: Desk) -> None:
     desk.shot("1-list")
     desk.notes.append(f"three cards {heights.pop()}px each, newest at the foot, the long one cut to three lines")
 
-    # `#257 summary-truncation`: what the clamp cuts is not out of reach. The card under the mouse is
-    # the selected one, and it shows its whole text; the others keep their three lines.
+    # `#257 summary-truncation`, as `#277 thread-card-focus` has it: what the clamp cuts is not out of
+    # reach, and no card grows under the mouse. The card under the mouse is the selected one and keeps
+    # its three lines; a click highlights it, without entering its thread, and it shows its whole text
+    # while the others keep theirs; a second click puts that out.
     replica_box = page.locator(f"#side-cards > li[data-id='{REPLICA}']").bounding_box()
     assert replica_box is not None
     page.mouse.move(replica_box["x"] + replica_box["width"] / 2, replica_box["y"] + 12)
     desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\")"
                   ".getAttribute('data-selected') === 'true'", "the card under the mouse is not the selected one")
     desk.settled()
+    hovered = {str(card["id"]): card for card in desk.cards()}
+    desk.check(bool(hovered[REPLICA]["clamped"]) and int(str(hovered[REPLICA]["lines"])) == 3,
+               f"the card under the mouse grew: {hovered[REPLICA]}")
+    page.mouse.click(replica_box["x"] + replica_box["width"] / 2, replica_box["y"] + 12)
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\")"
+                  ".getAttribute('data-highlighted') === 'true'", "a click on the card did not highlight it")
+    desk.settled()
+    desk.check(page.is_visible("#side-list") and not page.is_visible("#side-pane"), "a click on a card entered its thread")
     lit = {str(card["id"]): card for card in desk.cards()}
     desk.check(not lit[REPLICA]["clamped"] and int(str(lit[REPLICA]["lines"])) > 3,
-               f"the card under the mouse does not show its whole text: {lit[REPLICA]}")
+               f"the card highlighted does not show its whole text: {lit[REPLICA]}")
     unlit = next(card for card in cards if card["id"] == CANARY)
     desk.check(round(float(str(lit[CANARY]["height"]))) == round(float(str(unlit["height"]))),
-               f"a card the mouse is not on changed height: {lit[CANARY]}")
+               f"a card not highlighted changed height: {lit[CANARY]}")
     desk.shot("1-list-lit")
-    desk.notes.append(f"the card under the mouse showed its whole text in {lit[REPLICA]['lines']} lines")
+    desk.notes.append(f"the card under the mouse kept three lines; highlighted, it showed {lit[REPLICA]['lines']}")
+    page.locator(f"#side-cards > li[data-id='{REPLICA}'] .side-card").click()
+    desk.wait_for(f"() => !document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").hasAttribute('data-highlighted')",
+                  "a second click on the highlighted card did not put the highlight out")
 
-    # A card selects its thread on the right, under a heading naming it, with the X.
-    page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card")
+    # A card's replies button selects its thread on the right, under a heading naming it, with the X.
+    page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
     desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 9",
                   "the card did not select its thread on the right")
     desk.settled()
@@ -482,10 +496,10 @@ def columns_walk(desk: Desk) -> None:
                   "widening again lost the thread selected")
     desk.notes.append("at 900px one column in All with the button gone; wide again, two with the same thread")
 
-    # The keys, pressed for real: ] to the right column, Esc its X, j to a card with a ring, Enter
-    # selects it, [ back to the left column. The right column keeps a selected message per thread, and
-    # opening this one from Thread(N) selected its root there, so ] lands on that message: the one row
-    # lit on the page, and the focus on it (`#239 single-selection`).
+    # The keys, pressed for real: ] to the right column, Esc its X, j to a card with a ring, -> selects
+    # it (`#277 thread-card-focus`), [ back to the left column. The right column keeps a selected
+    # message per thread, and opening this one from Thread(N) selected its root there, so ] lands on
+    # that message: the one row lit on the page, and the focus on it (`#239 single-selection`).
     page.focus("#scroll-area")
     page.keyboard.press("]")
     desk.wait_for("() => { const held = document.activeElement;"
@@ -500,15 +514,15 @@ def columns_walk(desk: Desk) -> None:
                   " && document.activeElement.matches(':focus-visible')",
                   "j did not put a ring round a card")
     ringed = str(page.evaluate("() => document.activeElement.getAttribute('data-id')"))
-    page.keyboard.press("Enter")
+    page.keyboard.press("ArrowRight")
     desk.wait_for("() => !document.getElementById('side-pane').hidden"
                   f" && document.querySelectorAll('#side-log > li[data-id]').length === {THREAD_ROWS[ringed]}",
-                  f"Enter on the card of {ringed} did not select its thread")
+                  f"-> on the card of {ringed} did not select its thread")
     page.keyboard.press("[")
     desk.wait_for("() => document.getElementById('scroll-area').contains(document.activeElement)",
                   "[ did not give the keys back to the left column")
     desk.check(len(desk.rows("discord-log")) == 11, "the keys changed the left column")
-    desk.notes.append("] Esc j Enter [ moved the keys between the columns and through the cards")
+    desk.notes.append("] Esc j -> [ moved the keys between the columns and through the cards")
 
     # A phone's width: the button is never drawn.
     page.set_viewport_size({"width": 412, "height": 915})
@@ -536,10 +550,9 @@ LINKS_JS = """() => {
     const ends = {};
     for (const card of document.querySelectorAll('#side-cards > li[data-card]')) {
         const id = card.getAttribute('data-id');
-        const button = card.querySelector('.side-card');
         const root = [...document.querySelectorAll('#discord-log > li[data-id]')].find((row) => row.getAttribute('data-id') === ROOTS[id]);
         const badge = root ? root.querySelector('.thread-badge') : null;
-        ends[id] = {card: box(card), edge: getComputedStyle(button).borderLeftColor,
+        ends[id] = {card: box(card), edge: getComputedStyle(card).borderLeftColor,
                     root: root ? box(root) : null, badge: badge ? box(badge) : null,
                     tag: badge ? getComputedStyle(badge).borderTopColor : null};
     }

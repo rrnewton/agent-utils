@@ -2857,7 +2857,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
 
             # 6b. A thread named longer than the screen: its title is ellipsised, not the page widened.
             view("threads")
-            page.click("#thread-list > li button.thread-open")
+            # The card's replies button goes into the thread; the card itself only highlights (`#277
+            # thread-card-focus`).
+            page.click("#thread-list > li button.thread-card-open")
             page.wait_for_selector("#thread-heading:not([hidden])", timeout=5_000)
             wait_rows(["201", "202"], "the long-titled thread did not open")
             found = page.evaluate(WIDTH_JS)

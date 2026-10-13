@@ -515,8 +515,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
         if not mobile:
             # Two columns, the thread on the right: its headed root and reply measured the same way.
             page.click("#column-toggle")
-            page.wait_for_selector("#side-cards > li .side-card", timeout=10_000)
-            page.click("#side-cards > li .side-card")
+            # A card's replies button goes into its thread; the card itself only highlights (`#277
+            # thread-card-focus`).
+            page.wait_for_selector("#side-cards > li .side-card-open", timeout=10_000)
+            page.click("#side-cards > li .side-card-open")
             page.wait_for_selector(f'#side-log > li[data-id="{200 + REPLY_INDEX}"]', timeout=10_000)
             page.mouse.move(1, 1)
             side = measure(page, f"{label}, two columns", "side-log")

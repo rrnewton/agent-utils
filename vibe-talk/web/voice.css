@@ -161,6 +161,10 @@
      this is a lighter grey that still stands at 3:1 against the lit surface (`--row-hover`), the
      least a ring needs to be seen at all. */
   --read-ring: #99a1b0;
+  /* `#277 thread-card-focus`. What the thread colours go to beside a highlighted thread card: every
+     other card's edge and every other link between the columns. Half `--muted` and half `--edge`, so
+     it is plainly grey, quieter than any thread's colour, and still a line on the panel. */
+  --thread-grey: #626975;
 }
 
 @media (prefers-color-scheme: light) {
@@ -192,6 +196,8 @@
     /* The same six parts of the light scheme's accent in its page colour. */
     --reply-tint: #e9eef3;
     --read-ring: #7f8896;
+    /* Half the light scheme's `--muted` and half its `--edge`. */
+    --thread-grey: #9ba1ac;
   }
 }
 
@@ -995,8 +1001,66 @@ a.search-hit-link {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
+/* `#277 thread-card-focus`. A card of the Threads list: its name, which highlights it, and beside it the
+   button into the thread — or under it, at its end, where the name needs the line, so that a long name
+   or what the thread is about has the card's width rather than a phone's half of it. What the thread is
+   about shows on the card highlighted alone, which is ringed and tinted in its thread's colour; every
+   other card's edge and unread count go grey while it shows. */
 #thread-list .thread-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
   border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+#thread-list .thread-card > .thread-open {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.thread-card-text {
+  display: none;
+}
+
+.thread-card[data-highlighted] .thread-card-text {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+#thread-list .thread-card[data-highlighted] {
+  border-color: hsl(var(--thread-hue, 210) 55% 50%);
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+}
+
+#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) {
+  border-inline-start-color: var(--thread-grey);
+}
+
+#thread-list:has(> .thread-card[data-highlighted]:not([hidden]):not(.search-hidden)) > .thread-card:not([data-highlighted]) .thread-card-unread {
+  color: var(--muted);
+}
+
+.thread-card-open {
+  flex: none;
+  margin-inline-start: auto;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.thread-card-unread {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .thread-open {
@@ -6756,6 +6820,17 @@ textarea {
     stroke-width: 3px;
   }
 
+  /* `#277 thread-card-focus`. Beside a highlighted card every other link is grey, and fainter. */
+  #column-links .column-link[data-dimmed] {
+    stroke: var(--thread-grey);
+    opacity: 0.55;
+  }
+
+  #column-links .column-link-marks[data-dimmed] {
+    fill: var(--thread-grey);
+    opacity: 0.55;
+  }
+
   /* The chips over the foot of the LEFT list: the left half's centre, as wide as its column. */
   #screen-main[data-columns="two"] > #scroll-tools {
     left: 25%;
@@ -6877,8 +6952,8 @@ textarea {
   }
 
   /* The threads, one card each, every card the same height: three lines of what the thread is
-     about, clamped with an ellipsis, then its facts — save the card the reader is on, which shows
-     all of it (below). Edged in the thread's own colour, as its tag. */
+     about, clamped with an ellipsis, then how long since it moved beside the button into it — save the
+     card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
   /* `#261 two-column-connectors`. A little further from the divider than the column's own inset, so
      that a few of the links' lanes fit in the gap beside their arrowheads. */
   .side-cards {
@@ -6889,17 +6964,33 @@ textarea {
     list-style: none;
   }
 
-  .side-card {
+  /* `#277 thread-card-focus`. The row is the card, its surface and its edge: its first button, what the
+     thread is about, spans it, and under that its facts and the button into the thread share a line.
+     A press anywhere on it but that button highlights it, so all of it says it can be pressed. */
+  .side-card-row {
     display: grid;
-    gap: 0.3rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.3rem 0.6rem;
     box-sizing: border-box;
-    width: 100%;
-    padding: 0.55rem 0.75rem;
+    padding: 0 0.6rem 0.45rem 0;
     background: var(--panel);
-    color: inherit;
     border: 1px solid var(--edge);
     border-left: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
     border-radius: 0.6rem;
+    cursor: pointer;
+  }
+
+  .side-card {
+    grid-column: 1 / -1;
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.55rem 0.75rem 0;
+    background: transparent;
+    color: inherit;
+    border: 0;
+    border-radius: 0.6rem 0.6rem 0 0;
     font: inherit;
     text-align: start;
     cursor: pointer;
@@ -6907,17 +6998,28 @@ textarea {
 
   /* `#239 single-selection`. The selected card is lit as a selected message is, by `data-selected`
      alone and whether the mouse or the keys chose it: a `:hover` here was a second lit card beside
-     the keys' one. The card's own button keeps its ring for the Tab that lands on it, in that row. */
-  .side-card:focus-visible,
-  .side-card-row[data-selected="true"] > .side-card {
+     the keys' one. The card's own buttons keep the browser's ring for the Tab that lands on them. */
+  .side-card-row[data-selected="true"] {
     border-color: var(--accent);
     border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
-  }
-
-  .side-card-row[data-selected="true"] {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-radius: 0.6rem;
+  }
+
+  /* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
+  .side-card-row[data-highlighted] {
+    border-color: hsl(var(--thread-hue, 210) 55% 50%);
+    background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+  }
+
+  /* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
+     filters hide greys nothing. */
+  .side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) {
+    border-left-color: var(--thread-grey);
+  }
+
+  .side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread {
+    color: var(--muted);
   }
 
   .side-card-text {
@@ -6931,14 +7033,13 @@ textarea {
     overflow-wrap: anywhere;
   }
 
-  /* `#257 summary-truncation`. The card the reader is on shows its whole text. Three lines keep the
-     list even, but a name and a summary longer than three lines of this column were cut by the clamp
-     with no way to read the rest short of opening the thread, whose heading gives only the name. The
-     card under the mouse is the selected one (`#239 single-selection`), and so is the card the keys
-     are on, so this one rule is both "on hover" and "when selected". Still three lines at least, so
-     a short card does not shrink as it is lit. */
-  .side-card-row[data-selected="true"] > .side-card > .side-card-text,
-  .side-card:focus-visible > .side-card-text {
+  /* `#257 summary-truncation`, made `#277 thread-card-focus`. Three lines keep the list even, but a name
+     and a summary longer than three lines of this column were cut by the clamp with no way to read the
+     rest short of opening the thread, whose heading gives only the name. The card the reader was on
+     showed its whole text, and under a moving mouse that was a card growing and shrinking at every
+     move; the owner: "I also don't like the cards expanding." So the card HIGHLIGHTED, by a press,
+     shows it, and no other. Still three lines at least, so a short card does not shrink as it is. */
+  .side-card-row[data-highlighted] > .side-card > .side-card-text {
     display: block;
     -webkit-line-clamp: none;
     line-clamp: none;
@@ -6948,11 +7049,29 @@ textarea {
   }
 
   .side-card-facts {
+    grid-column: 1;
     display: flex;
     flex-wrap: wrap;
     gap: 0 0.6rem;
+    padding-inline-start: 0.75rem;
     color: var(--muted);
     font-size: 0.8rem;
+  }
+
+  /* `#277 thread-card-focus`. The way into the thread, "3 replies · 2 unread": a chip at the foot of the
+     card, on its facts' line, in their size. */
+  .side-card-open {
+    grid-column: 2;
+    min-height: 1.75rem;
+    padding: 0.15rem 0.6rem;
+    background: transparent;
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    font: inherit;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    cursor: pointer;
   }
 
   .side-card-unread {
