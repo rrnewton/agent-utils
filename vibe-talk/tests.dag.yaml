@@ -485,7 +485,7 @@ steps:
   # about 38s wall.
   - group: check
     job: reply-continuity-browser
-    desc: the replied message kept at the list's size and place, the box under it, the tint, and Quote reply, in current Chromium at 1280x800 and 412x915
+    desc: the replied message kept at the list's size and place, the box under it, the tint, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
