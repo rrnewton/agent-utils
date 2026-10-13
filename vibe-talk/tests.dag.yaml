@@ -342,11 +342,12 @@ steps:
   # `#269 approval-card-inline` in the browser engine: the send card as the next message, in the list
   # on the call's view and the channel and docked on Settings, Send's centre at least 0.62 of the way
   # down a 393x852, 360x780 and 375x667 phone in every run (one and thirty rows, banner up or gone,
-  # short and long draft), uncovered and wholly on screen, and both buttons held when it appears.
-  # Measured on 2026-10-13: about 90s wall.
+  # short and long draft), uncovered and wholly on screen, and both buttons held when it appears;
+  # then Send freezes it into the transcript (`#270 voice-transcript-markers`), the claim of its send
+  # follows the commit, and a reload restores the same card. Measured on 2026-10-13: about 100s wall.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach and hold in current Chromium at 393x852, 360x780 and 375x667
+    desc: the send card's place, thumb reach, hold and frozen card in current Chromium at 393x852, 360x780 and 375x667
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
@@ -354,7 +355,7 @@ steps:
     cpu_timeout: 150
     hint:
       resources: {browser: 1}
-      est_duration_s: 90
+      est_duration_s: 100
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

@@ -29,7 +29,10 @@ struct Harness {
 }
 
 fn harness() -> Harness {
-    harness_with(PostGate::new())
+    harness_with(PostGate::with_ttl_and_numbering(
+        vibe_talk::post_gate::PROPOSAL_TTL,
+        0,
+    ))
 }
 
 fn harness_with(gate: PostGate) -> Harness {
@@ -292,7 +295,10 @@ async fn an_edited_restatement_is_refused_and_spends_the_handle() {
 
 #[tokio::test]
 async fn an_expired_handle_is_refused() {
-    let harness = harness_with(PostGate::with_ttl(Duration::from_millis(150)));
+    let harness = harness_with(PostGate::with_ttl_and_numbering(
+        Duration::from_millis(150),
+        0,
+    ));
     let proposal = propose(&harness, "on my way").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(pending(&harness).await, Value::Null);
