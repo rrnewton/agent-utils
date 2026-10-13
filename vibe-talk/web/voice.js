@@ -30455,15 +30455,15 @@ function renderSideMode() {
  * The right column's heading, and with no thread selected its cards. Drawn only where they changed.
  *
  * `#231 two-column-polish`. The scroller is the column's one named region, and its name is the
- * heading's: "Threads", or "Thread: " and the thread's name, so a screen reader landing in it says
- * which thread it is in, once.
+ * heading's: "Thread list" (`#281 view-keys`: what the picker and the keys call it), or "Thread: " and
+ * the thread's name, so a screen reader landing in it says which thread it is in, once.
  */
 function renderSideColumn() {
   if (!sideColumnUp()) return;
   if (columns.side.mode === "list") {
     renderSideFreshness();
-    setTextIfChanged(leftEl("side-title"), "Threads");
-    nameSideRegion("Threads");
+    setTextIfChanged(leftEl("side-title"), "Thread list");
+    nameSideRegion("Thread list");
     const facts = leftEl("side-facts");
     if (!facts.hidden) facts.hidden = true;
     renderSideCards();

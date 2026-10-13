@@ -27088,7 +27088,7 @@ test("`#281 view-keys`: the thread list pages back on the server's cursor where 
   assert.equal(page.screen(), "main", "the thread list is not a view of the main screen");
   assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
   assert.equal(page.el("thread-select").value, "threads");
-  assert.equal(page.el("side-title").textContent, "Threads");
+  assert.equal(page.el("side-title").textContent, "Thread list");
   const reads = () => page.timelineCalls.filter((call) => /view=threads/.test(call));
   assert.ok(reads().length >= 1, "the thread list was not read for the cards");
   // Newest activity at the foot, as the right column orders them, the summariser's words on a card.
@@ -42907,7 +42907,7 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   assert.equal(page.el("side-list").hidden, false);
   assert.equal(page.el("side-pane").hidden, true);
   assert.equal(page.el("side-close").hidden, true, "an X with nothing to close");
-  assert.equal(page.el("side-title").textContent, "Threads");
+  assert.equal(page.el("side-title").textContent, "Thread list");
   // `#261 two-column-connectors`: newest activity at the foot, as the channel's own lists are.
   assert.deepStrictEqual(cardIds(page), [first.id, second.id], "the cards are not newest activity at the foot");
   assert.equal(cardPart(page, first.id, "side-card-text"), "runner-wedged: The overnight runner hung and was restarted by hand.");
@@ -42976,7 +42976,7 @@ test("`#229 desktop-two-column`: every way into a thread selects it on the right
   await page.settle();
   assert.equal(page.el("side-list").hidden, false, "the X did not go back to the list");
   assert.equal(page.el("side-close").hidden, true);
-  assert.equal(page.el("side-title").textContent, "Threads");
+  assert.equal(page.el("side-title").textContent, "Thread list");
   const reads = page.timelineCalls.length;
   await openerOf(cardRow(page, first.id)).click();
   await page.settle();
@@ -43510,7 +43510,7 @@ test("`#231 two-column-polish`: the right column is one named region, called wha
   const page = await threadPage();
   await twoColumns(page);
   const region = page.el("side-scroll");
-  assert.equal(region.getAttribute("aria-label"), "Threads");
+  assert.equal(region.getAttribute("aria-label"), "Thread list");
   await threadBadge(rowWithId(page, "201")).click();
   await page.settle();
   assert.equal(region.getAttribute("aria-label"), "Thread: First discussion", "the region does not name the thread it shows");
@@ -43520,7 +43520,7 @@ test("`#231 two-column-polish`: the right column is one named region, called wha
   assert.equal(region.getAttribute("aria-label"), "Thread: Second discussion");
   await page.el("side-close").click();
   await page.settle();
-  assert.equal(region.getAttribute("aria-label"), "Threads", "the X left the region naming a thread it no longer shows");
+  assert.equal(region.getAttribute("aria-label"), "Thread list", "the X left the region naming a thread it no longer shows");
 });
 
 /**

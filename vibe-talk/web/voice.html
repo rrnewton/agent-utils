@@ -557,13 +557,13 @@
 
             `#231 two-column-polish`. ONE named region, the scroller, as #scroll-area is the left
             column's: the keys hand the focus to it, and a screen reader landing there hears what the
-            column shows, "Thread: its name" or "Threads", rather than the list read out. The column
+            column shows, "Thread: its name" or "Thread list", rather than the list read out. The column
             around it used to be a second region named "Thread", so every way in said "Thread" twice.
           -->
           <div id="side-column">
             <div id="side-heading">
               <span id="side-facts" class="thread-facts" hidden></span>
-              <span id="side-title">Threads</span>
+              <span id="side-title">Thread list</span>
               <!--
                 `#259 thread-list-unread-filter`. The owner: "Some have "N unread" and others are fully
                 read... I would like a toggle at the top in the banner that says "Threads" in the upper
@@ -587,7 +587,7 @@
               current the channel is. A status, spoken once when it changes, as the pill is.
             -->
             <p id="side-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
-            <div id="side-scroll" tabindex="-1" role="region" aria-label="Threads">
+            <div id="side-scroll" tabindex="-1" role="region" aria-label="Thread list">
               <p id="side-search-empty" class="search-empty" role="status" hidden>
                 Nothing in the messages loaded so far matches that search.
               </p>
@@ -2480,7 +2480,7 @@
               can change it. #thread-select-note describes it while it is inert, on a chat service
               without threads.
             -->
-            <select id="thread-select" class="bar-select" aria-label="thread" aria-describedby="thread-select-note"
+            <select id="thread-select" class="bar-select" aria-label="view" aria-describedby="thread-select-note"
                     title="Which view of the channel to read: Main, All, the thread list, two columns, or one thread."></select>
 
             <!--

@@ -20,7 +20,7 @@ desk size, with a mouse:
   picker chooses there, where `#231 two-column-polish` greyed it: the thread list chosen from it is the
   right column alone, across the window, its heading clear of the search glass and the left column
   out of sight; a real Ctrl+2 is one column in All, and a real Ctrl+4 two columns again; the right
-  column is one region, named "Threads" -> the right column lists the
+  column is one region, named "Thread list" -> the right column lists the
   threads as cards, newest activity at the foot (`#261 two-column-connectors`), every card the same
   height, the summarised one saying its name and summary, the long first message cut to three lines,
   still three lines under the mouse and shown whole on the card a click highlights (`#257
@@ -400,7 +400,7 @@ def columns_walk(desk: Desk) -> None:
     regions = page.evaluate("() => [...document.querySelectorAll('#side-column, #side-column [role=region]')]"
                             ".filter((node) => node.getAttribute('role') === 'region')"
                             ".map((node) => [node.id, node.getAttribute('aria-label')])")
-    desk.check(regions == [["side-scroll", "Threads"]], f"the right column is not one region named for its cards: {regions}")
+    desk.check(regions == [["side-scroll", "Thread list"]], f"the right column is not one region named for its cards: {regions}")
     desk.notes.append("one region on the right")
 
     # The cards: newest activity at the foot (`#261 two-column-connectors`), one height, the summarised

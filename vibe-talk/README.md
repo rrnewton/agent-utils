@@ -35,16 +35,20 @@ threads, and in **Main** — then the whole channel — where it has none, until
 view. The choice belongs to that channel: another channel opens in its own choice or its default,
 and coming back opens this one where you chose, across a reload too (see
 [Reopening where you left off](#reopening-where-you-left-off)). When the backend finds threads,
-three views are offered:
+four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac):
 
 * **Main** shows channel messages, with a reply-count button below each thread root.
-* **Threads** lists root-message previews and reply counts, ordered by most recent activity at the
-  bottom. Opening the list starts at that end; scrolling upward loads older entries.
 * **All** interleaves channel and thread messages chronologically. Colored **Thread** badges
   distinguish conversations; tapping a badge opens that thread.
+* **Thread list** is a card per thread — its name and summary, or its first message, and its reply
+  counts — ordered by most recent activity at the bottom, across the window. Opening the list starts
+  at that end; **Older threads…** above the oldest card reads further back. Esc goes back to the view
+  it was chosen from.
+* **Two columns**, on a desk at least 1000px wide, put Main on the left and the same thread list on
+  the right, where a thread chosen from it opens.
 
 A source added through Settings is always a separate entry in the channel picker, even when that
-source identifies one upstream conversation rather than a whole room. The **Threads** control is a
+source identifies one upstream conversation rather than a whole room. The thread list is a
 different projection: it lists child conversations within the currently selected channel, and is
 absent when the configured backend does not provide thread timelines or when the selected channel
 is itself one conversation. It is not an alternate picker for added sources.
@@ -4199,7 +4203,7 @@ together when a display name arrives later. Ages use one compact scale: `now`, `
 
 The **thread list** is the right column of two columns on its own, across the window, at every
 width, a phone's included: one rendering of the channel's threads, so the two never drift apart. Its
-heading says **Threads**, with **Unread only** beside it; each card is the thread's name and summary
+heading says **Thread list**, with **Unread only** beside it; each card is the thread's name and summary
 where the summariser has given them, else its first message, three lines at most, then how long since
 it moved, its replies and how many are unread, newest activity at the foot. **Older threads…** above
 the oldest card reads the next page of the channel's thread list where the reader is, and a failed
@@ -5423,7 +5427,7 @@ else the thread's first message, three lines at most. The cards run as the chann
 (`#261 two-column-connectors`): the newest activity at the foot, opened scrolled to it, a thread
 that moves going to the foot and followed there only by a reader already at the foot, and a reader up
 the list kept on their card; closing a thread comes back to the card it was chosen from. **Unread
-only**, a toggle beside the column's "Threads" heading (`#259 thread-list-unread-filter`), narrows the
+only**, a toggle beside the column's "Thread list" heading (`#259 thread-list-unread-filter`), narrows the
 cards to the threads with unread replies, by the rule of the card's "N unread" or "N new" chip; it is
 kept per device, works with the search, keeps the selected card where it was as it goes on and off,
 and says "No unread threads." over a list it empties. The search over the cards also reads the
