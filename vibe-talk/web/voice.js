@@ -5502,6 +5502,11 @@ const SEAM_DETAILS = {
   error:
     "The voice service reported an error and the call ended. Anything below this line goes to an " +
     "agent that has never seen anything above it.",
+  // `#270 voice-transcript-markers`. Not an ending: the hosted service began a new session on the
+  // same call, and that session was handed nothing.
+  replaced:
+    "The voice service started a new session inside this call. Anything below this line goes to an " +
+    "agent that has never seen anything above it.",
 };
 
 // ...and what it says when resuming is armed, because every sentence above asserts that the agent
@@ -5524,6 +5529,10 @@ const RESUME_SEAM_DETAILS = {
   error:
     "The voice service reported an error, ending the call. This server will read the lines above " +
     "back to the next one: a reconstruction, not the same conversation.",
+  // A replacement session is never handed the lines above, resuming or not.
+  replaced:
+    "The voice service started a new session inside this call. Anything below this line goes to an " +
+    "agent that has never seen anything above it.",
 };
 
 function seamDetailFor(cause) {
@@ -5538,10 +5547,14 @@ function noteConversationEnded(cause = "ended") {
   conversationOpen = false;
   // The call that just ended is what the NEXT one resumes from. Read here rather than in
   // `teardown`, which clears the session — and only when a conversation was really open, so a
-  // failed mint cannot point the next call at a conversation that has no turns.
-  if (session.conversationId) {
+  // failed mint cannot point the next call at a conversation that has no turns. Nor can a call
+  // that opened and recorded nothing, one that dropped at once: it is not a conversation the
+  // server holds. `#270 voice-transcript-markers`.
+  if (session.conversationId && session.recordedAny) {
     resumeConversationId = session.conversationId;
   }
+  // The next conversation's start marker says how this one ended.
+  lastEndCause = cause;
   // From here the large control is a different offer — a NEW call, from nothing — and it says so.
   hasEnded = true;
   // ...and if the drop was a suspension, the offer has a different WORD on it, because "Start a
@@ -5561,11 +5574,258 @@ function noteConversationEnded(cause = "ended") {
   // The card first: a draft retired by Hang up leaves its "Not sent" line inside the conversation
   // that ended, above the boundary, where a reload draws it. `#269 approval-card-inline`.
   settleCardAtCallEnd(cause);
-  const boundary = transcriptSeam("new conversation", seamDetailFor(cause));
-  // `#270 voice-transcript-markers`. Which conversation this line ends, so a send that settles late
-  // is drawn inside it, above the line, where a reload draws it.
-  if (session.conversationId) boundary.setAttribute("data-ends", session.conversationId);
+  // `#270 voice-transcript-markers`. The line says which conversation it ends, so a send that
+  // settles late is drawn inside it, above the line, where a reload draws it; and how it ended, for
+  // the recap the next call is sent to be said beside (`settleBoundary`).
+  drawBoundary(cause, session.conversationId);
 }
+
+// --- what recap a new conversation was sent ----------------------------------------------------------
+//
+// `#270 voice-transcript-markers`. The "new conversation" seam says what the agent below it was handed
+// of the conversation above: on its surface, a chip — "412-word recap sent", "no recap sent", "recap
+// unsupported" — and inside the disclosure, below the sentence saying how the call before ended
+// (`#268 voice-call-drops`, unchanged), a sentence of its own about the recap. Neither overwrites the
+// other, so each keeps its own budget. "Sent", never "recapped" or "heard": neither transport
+// acknowledges a recap, so sent is all this page knows.
+//
+// The same seam comes back after a reload: the first record of each conversation is a
+// `conversation_start` marker holding its recap and how the call before it ended, written lazily — just
+// before that first record — so a call that recorded nothing leaves no conversation at all, and never
+// becomes the one a new call resumes from.
+
+/** The recap sentence, per state. `{n}` is the words sent, `{d}` the older lines that did not fit. */
+const RECAP_DETAILS = {
+  sent:
+    "This call was sent {n} words of the conversation above as a recap, so it can carry on from " +
+    "there.",
+  dropped:
+    "This call was sent the last {n} words above as a recap; {d} older lines did not fit, so it " +
+    "cannot see those.",
+  client_data:
+    "This call was sent {n} words above as a recap with its start request; the agent's own " +
+    "settings may ignore a recap sent that way.",
+  unsupported:
+    "Nothing was recapped: this server's voice service has no way to take a recap, so the agent " +
+    "below remembers nothing above.",
+  empty:
+    "No recap was sent: the conversation above held nothing said aloud to replay, so the agent " +
+    "below starts from nothing.",
+  too_long:
+    "No recap was sent: not even the last line above fit the recap budget, so the agent below " +
+    "starts from nothing.",
+  failed:
+    "No recap was sent: this page could not read the conversation above from the server, so the " +
+    "agent below starts from nothing.",
+  replaced_session:
+    "The voice service replaced this call's session, and the new session was sent no recap, so it " +
+    "remembers nothing above.",
+};
+
+/** The biggest number a stored marker may hold, as the server checks it. */
+const MARKER_NUMBER_MAX = 1000000;
+
+/** Whether the operator turned replay on where the voice backend cannot carry it, from client-config. */
+let replayUnavailable = false;
+
+/** How the last call on this page ended, as `noteConversationEnded` saw it; null after a load. */
+let lastEndCause = null;
+
+/** The conversation-start markers not yet filed, by conversation: each goes just before that conversation's first record. */
+const startMarkers = new Map();
+
+/**
+ * What a new call was handed, as the marker records it: a recap sent — its words, lines, the older
+ * lines left out, and how it went — or why none was.
+ *
+ * @param {any} resume what `fetchResume` answered, null for nothing
+ * @param {"contextual_update" | "client_data" | null} transport how it went, null when it did not
+ * @returns {{state: "sent", words: number, lines: number, dropped: number, transport: string} | {state: "none", why: string, dropped: number}}
+ */
+function recapFor(resume, transport) {
+  const capped = (value) => Math.min(MARKER_NUMBER_MAX, Math.max(0, Math.round(Number(value) || 0)));
+  const dropped = capped(resumeLast.dropped);
+  if (resume && transport) {
+    return {
+      state: "sent", words: capped(resume.words), lines: capped(resume.included), dropped: capped(resume.dropped), transport,
+    };
+  }
+  const wanted = resumeLast.attempted || (resumeAllowed && resumeWanted());
+  if (replayUnavailable || (session.protocol === "vibe-talk-v1" && (resume || wanted))) {
+    return { state: "none", why: "unsupported", dropped: 0 };
+  }
+  if (resumeLast.failed) return { state: "none", why: "failed", dropped: 0 };
+  if (resumeLast.attempted && dropped > 0) return { state: "none", why: "too_long", dropped };
+  if (resumeLast.attempted) return { state: "none", why: "empty", dropped: 0 };
+  return { state: "none", why: "off", dropped: 0 };
+}
+
+/** The chip a seam shows for `recap`, or null for none. */
+function recapChip(recap) {
+  if (!recap || (recap.state === "none" && recap.why === "off")) return null;
+  if (recap.state === "sent") return `${Number(recap.words).toLocaleString("en-US")}-word recap sent`;
+  return recap.why === "unsupported" ? "recap unsupported" : "no recap sent";
+}
+
+/** The recap sentence for `recap`, or null for none. */
+function recapSentence(recap) {
+  if (!recap || (recap.state === "none" && recap.why === "off")) return null;
+  if (recap.state === "sent") {
+    const which = recap.transport === "client_data" ? "client_data" : recap.dropped > 0 ? "dropped" : "sent";
+    return RECAP_DETAILS[which].replace("{n}", Number(recap.words).toLocaleString("en-US")).replace("{d}", String(recap.dropped));
+  }
+  return RECAP_DETAILS[recap.why] || null;
+}
+
+/**
+ * Everything a "new conversation" seam says, from the recap the new call was handed and how the call
+ * before it ended — the one source for the live seam and the restored one, so a reload says the same.
+ * A seam never promises a read-back that did not happen, nor denies one that did: the cause's
+ * sentence comes from the resuming wording only when a recap was sent. With no cause (the first call
+ * after a load), the stored record's own sentence, or, when a recap went, the resuming one.
+ *
+ * @param {any} recap
+ * @param {string | null | undefined} cause
+ */
+function boundaryFor(recap, cause) {
+  const sent = Boolean(recap && recap.state === "sent");
+  const table = sent ? RESUME_SEAM_DETAILS : SEAM_DETAILS;
+  const detail = cause ? table[cause] || table.ended : sent ? RESUME_SEAM_DETAILS.ended : STORED_SEAM_DETAIL;
+  return { word: "new conversation", chip: recapChip(recap), detail, recapDetail: recapSentence(recap) };
+}
+
+/**
+ * Write `boundary` onto the seam `li`: its label, chip, title and both sentences. Places nothing.
+ *
+ * @param {HTMLElement} li
+ * @param {{word: string, chip: string | null, detail: string, recapDetail: string | null}} boundary
+ */
+function fillBoundary(li, boundary) {
+  const summary = childByClass(li, "seam-summary");
+  const label = childByClass(li, "seam-label");
+  const detail = childByClass(li, "seam-detail");
+  if (!summary || !label || !detail || !detail.parentNode) return;
+  label.textContent = boundary.word;
+  let chip = childByClass(summary, "seam-recap");
+  if (boundary.chip) {
+    if (!chip) {
+      chip = document.createElement("span");
+      chip.className = "seam-recap";
+      summary.insertBefore(chip, label.nextSibling);
+    }
+    chip.textContent = boundary.chip;
+  } else if (chip) {
+    summary.removeChild(chip);
+  }
+  detail.textContent = boundary.detail;
+  const details = detail.parentNode;
+  let recap = childByClass(details, "seam-recap-detail");
+  if (boundary.recapDetail) {
+    if (!recap) {
+      recap = document.createElement("p");
+      recap.className = "seam-recap-detail";
+      details.insertBefore(recap, detail.nextSibling);
+    }
+    recap.textContent = boundary.recapDetail;
+  } else if (recap) {
+    details.removeChild(recap);
+  }
+  summary.setAttribute("title", [boundary.detail, boundary.recapDetail].filter(Boolean).join(" "));
+}
+
+/** {@link fillBoundary} on a seam in the live list, which may wrap at 360: followed only by a reader at the newest line. */
+function setSeamRecap(li, boundary) {
+  const pinned = atBottom(leftEl("scroll-area"));
+  fillBoundary(li, boundary);
+  followIfPinned(pinned);
+}
+
+/**
+ * The call that just opened was handed `recap`: say so on the boundary above it — the one the last
+ * call's end drew, or the one the restored record ends with — while nothing said is between the two.
+ * There is always one when anything is above: a call that opened ended with one, and a restored
+ * record ends with one. A screen with nothing on it has nothing above to have been recapped.
+ *
+ * @param {any} recap
+ */
+function settleBoundary(recap) {
+  const rows = [...leftEl("transcript").children];
+  for (let at = rows.length - 1; at >= 0; at -= 1) {
+    const row = rows[at];
+    if (row.getAttribute("data-ends") !== null) {
+      setSeamRecap(row, boundaryFor(recap, row.getAttribute("data-cause")));
+      return;
+    }
+    // Something said below every boundary: the line above it is not this call's.
+    if (row.getAttribute("data-search") !== null) return;
+  }
+}
+
+/**
+ * The "new conversation" line at the end of the transcript: the one place the live page draws it.
+ *
+ * @param {string | null} cause how the call above it ended, when the page saw that
+ * @param {string | null} endsId which conversation it ends
+ */
+function drawBoundary(cause, endsId) {
+  const boundary = transcriptSeam("new conversation", cause ? seamDetailFor(cause) : STORED_SEAM_DETAIL);
+  if (endsId) boundary.setAttribute("data-ends", endsId);
+  if (cause) boundary.setAttribute("data-cause", cause);
+  return boundary;
+}
+
+/**
+ * The call opened and was handed `recap`: the boundary above it says so, and the conversation it is
+ * filed under — now, or when the voice service names it — starts with a marker saying so.
+ */
+function noteCallRecap(recap) {
+  session.recap = recap;
+  settleBoundary(recap);
+}
+
+/** The conversation `conversationId` has begun: its first record is preceded by its start marker. */
+function expectStartMarker(conversationId, recap, previousEnd) {
+  if (!conversationId) return;
+  startMarkers.set(conversationId, { recap, previous_end: previousEnd || undefined });
+  if (startMarkers.size > 16) startMarkers.delete(startMarkers.keys().next().value);
+}
+
+/**
+ * The hosted voice service named the conversation this call is filed under. The first time, that
+ * conversation starts with a marker of what the call was handed. Again on the same socket, a
+ * replacement session that was handed nothing has begun a conversation of its own: the line between
+ * the two says so, and so does its marker.
+ *
+ * @param {string | null} previous the conversation filed under until now
+ */
+function noteConversationNamed(previous) {
+  if (session.sessionStarts <= 1) {
+    expectStartMarker(session.conversationId, session.recap || recapFor(null, null), lastEndCause);
+    return;
+  }
+  if (!previous || previous === session.conversationId) return;
+  const recap = { state: "none", why: "replaced_session", dropped: 0 };
+  session.recap = recap;
+  setSeamRecap(drawBoundary("replaced", previous), boundaryFor(recap, "replaced"));
+  expectStartMarker(session.conversationId, recap, null);
+}
+
+/**
+ * Something is about to be filed in `conversationId`. A conversation's first record is preceded by
+ * its start marker, and from then on this call has recorded something.
+ */
+function fileStartMarker(conversationId) {
+  if (conversationId === session.conversationId) session.recordedAny = true;
+  const start = startMarkers.get(conversationId);
+  if (!start) return;
+  startMarkers.delete(conversationId);
+  if (!transcriptRecordsSupported) return;
+  /** @type {Record<string, unknown>} */
+  const marker = { kind: "conversation_start", recap: start.recap };
+  if (start.previous_end) marker.previous_end = start.previous_end;
+  void postRecord(conversationId, { speaker: "marker", text: "", marker });
+}
+
 
 // --- clearing the transcript ---------------------------------------------------------------
 //
@@ -10244,6 +10504,18 @@ function flushRecordsAfterLive() {
  */
 function recordRecord(conversationId, body) {
   if (!transcriptRecordsSupported || !conversationId) return Promise.resolve(null);
+  // A conversation's first record is its start marker, a send or a draft not sent included.
+  if (!recordingBroken) fileStartMarker(conversationId);
+  return postRecord(conversationId, body);
+}
+
+/**
+ * {@link recordRecord}'s request, in the queue the turns go through.
+ *
+ * @param {string} conversationId
+ * @param {Record<string, unknown>} body
+ */
+function postRecord(conversationId, body) {
   const done = recordQueue.then(async () => {
     if (recordingBroken) return null;
     try {
@@ -11937,6 +12209,8 @@ function recordTurn(who, text, options = {}) {
   // on, and a turn belongs to the conversation it was spoken in.
   const conversationId = session.conversationId;
   const hold = options.answerOf || null;
+  // `#270 voice-transcript-markers`. A conversation's first record is its start marker.
+  fileStartMarker(conversationId);
   recordQueue = recordQueue.then(() => {
     // Checked here rather than only at call time: a turn queued before the store failed must not
     // be posted after it, or one dead store costs one request per turn for the rest of the call.
@@ -12044,21 +12318,42 @@ const restoredSpeaker = (speaker) =>
  * is, because whatever the live call says next is a different conversation from anything in the
  * record; on a step back it is owed only when the run ends in a different call from the row it is
  * landing above.
+ *
+ * `moreAbove` says whether the record holds anything older than this run, so a conversation that
+ * starts at its head still has a boundary above it (`#270 voice-transcript-markers`).
  */
-function restoredRun(turns, trailingSeam) {
+function restoredRun(turns, trailingSeam, moreAbove = false) {
   const rows = [];
   const absorbed = absorbedAnswers(turns);
   // Drawn from one place on purpose. A boundary between two stored calls and a boundary between
   // the record and the live one are the same boundary, and a second call site here is how the
   // two wordings would come to differ. Each says which conversation it ends, as a live one does
   // (`#270 voice-transcript-markers`), so a late send is drawn above the right line.
-  const rule = (ends) => {
-    transcriptSeam(STORED_SEAM_LABEL, STORED_SEAM_DETAIL, rows).setAttribute("data-ends", ends);
+  //
+  // `#270 voice-transcript-markers`. A conversation that starts with its start marker says what the
+  // live page said above it: "new conversation", the recap it was sent, and how the call before it
+  // ended (`boundaryFor`). One without — recorded before markers — keeps "earlier conversation".
+  const rule = (ends, start = null) => {
+    const li = transcriptSeam(STORED_SEAM_LABEL, STORED_SEAM_DETAIL, rows);
+    if (ends !== null) li.setAttribute("data-ends", ends);
+    if (start) {
+      li.setAttribute("data-marker", "");
+      if (start.previous_end) li.setAttribute("data-cause", String(start.previous_end));
+      fillBoundary(li, boundaryFor(start.recap, start.previous_end));
+    }
   };
+  /** The start marker `turn` is, or null. */
+  const startOf = (turn) => (turn.speaker === "marker" && turn.detail && turn.detail.kind === "conversation_start"
+    ? turn.detail
+    : null);
   let previous = null;
   for (const turn of turns) {
     if (previous !== null && turn.conversation_id !== previous) {
-      rule(previous);
+      rule(previous, startOf(turn));
+    } else if (previous === null && moreAbove && startOf(turn)) {
+      // At the head of the run, with older rows still to come: which conversation it ends is
+      // filled in when they arrive (`loadOlderTurns`).
+      rule(null, startOf(turn));
     }
     // `#270 voice-transcript-markers`. A message the voice agent posted is its frozen card, drawn
     // by the builder the live one is, and a draft that was not sent is the line the live page drew
@@ -12201,7 +12496,7 @@ async function loadStoredConversation() {
   transcriptOlderCursor = payload.next_before || null;
   oldestRestoredConversation = turns.length > 0 ? turns[0].conversation_id : null;
   if (turns.length > 0) {
-    el("transcript").append(...restoredRun(turns, true));
+    el("transcript").append(...restoredRun(turns, true, transcriptMoreAbove === true));
     renderEmptyState();
     renderScrollTools(); // the folds arrived with the rows they are attached to.
     // Entering a view lands on the NEWEST turn, which is what `line()` would have done for the
@@ -12248,9 +12543,14 @@ async function loadOlderTurns() {
       return;
     }
     const endsIn = turns[turns.length - 1].conversation_id;
-    const arriving = restoredRun(turns, endsIn !== oldestRestoredConversation);
-    oldestRestoredConversation = turns[0].conversation_id;
     const list = el("transcript");
+    // `#270 voice-transcript-markers`. A list that starts with a conversation's start marker has
+    // its boundary already: it ends whatever this step brings, and no second, generic one is drawn.
+    const head = list.children[0];
+    const markerHead = Boolean(head && head.hasAttribute("data-marker"));
+    if (markerHead && head.getAttribute("data-ends") === null) head.setAttribute("data-ends", endsIn);
+    const arriving = restoredRun(turns, endsIn !== oldestRestoredConversation && !markerHead, transcriptMoreAbove === true);
+    oldestRestoredConversation = turns[0].conversation_id;
     preservingScroll(() => {
       // Prepending, expressed the way the channel's walk expresses it: the rows already on screen
       // are handed back in place behind the arriving ones, in one mutation.
@@ -13394,6 +13694,9 @@ async function openConversation(options) {
   session.playEndMs = 0;
   session.echoCancellation = false;
   session.sessionStarts = 0;
+  // `#270 voice-transcript-markers`. Nothing recorded and nothing handed over yet in this call.
+  session.recordedAny = false;
+  session.recap = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
@@ -13493,6 +13796,10 @@ async function openConversation(options) {
       conversationOpen = true;
       startPostWatch();
       session.conversationId = conversationIdFrom(null);
+      // `#270 voice-transcript-markers`. What this call was handed of the conversation above — on
+      // this protocol, never a recap — on the line above it, and in its first record.
+      noteCallRecap(recapFor(resume, null));
+      expectStartMarker(session.conversationId, session.recap, lastEndCause);
       setState("live");
       setStatus("Opening the voice session…");
       renderControls();
@@ -13540,6 +13847,11 @@ async function openConversation(options) {
     }
     // Only once the frames are on their way, and unable to throw into the rest of the start.
     renderAfterHandOver();
+    // `#270 voice-transcript-markers`. What went, on the line above the call. Its conversation's
+    // start marker waits for the voice service to name it (`noteConversationNamed`).
+    noteCallRecap(recapFor(resume, resume
+      ? carriedOnInitiation && !handed.replaced ? "client_data" : "contextual_update"
+      : null));
     session.connected = true;
     conversationOpen = true;
     startPostWatch();
@@ -13729,8 +14041,12 @@ function handle(socket, message) {
   switch (message.type) {
     case "conversation_initiation_metadata": {
       const meta = message.conversation_initiation_metadata_event || {};
+      const previous = session.conversationId;
       noteSessionStartedForSpokenYes();
       session.conversationId = conversationIdFrom(meta.conversation_id);
+      // `#270 voice-transcript-markers`. Before the held message is filed below: the conversation's
+      // first record is its start marker.
+      noteConversationNamed(previous);
       // The vendor has accepted the conversation, and named it: the message the box held for it
       // goes now, filed under that name. Before the format is read, which throws for a format this
       // page cannot PLAY — a reason to say so, not to swallow a typed message.
@@ -37035,6 +37351,9 @@ function applyClientConfig(config) {
   // `#270 voice-transcript-markers`. Records, `records=1` and the send memory's cursor go only to a
   // server that says it takes them.
   transcriptRecordsSupported = config.transcript_records_supported === true;
+  // ...and whether replay is on where the voice backend cannot carry it, which each new
+  // conversation's line says ("recap unsupported") rather than saying nothing.
+  replayUnavailable = config.replay_unavailable === "backend";
   renderResumeState();
   renderSpeechPrepState(config.speech_prep_enabled);
   applyNoiseRules(config.noise_rules);
