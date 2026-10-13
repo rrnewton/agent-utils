@@ -236,14 +236,17 @@ pub enum PromptDelivery {
 /// What the page hands a hosted agent as a call opens, so the call carries the owner's words.
 /// `#272 voice-agent-instructions`.
 ///
-/// On a voice session only when the provider is one the page configures and the owner has written
-/// something; absent, the page sends exactly what it always sent.
+/// On a voice session only when the provider is one the page configures, and either the owner has
+/// written something or the agent allows its prompt to be replaced — such an agent is handed the
+/// assembled prompt on every call, so its send rules follow the Sending switch. Absent, the page
+/// sends exactly what it always sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SessionPrompt {
     /// How to hand `text` over.
     pub transport: PromptTransport,
-    /// What to send: the whole assembled prompt for `prompt_override`, the heading and the
-    /// instructions for `contextual_update`; absent for `not_sent`.
+    /// What to send: the whole assembled prompt for `prompt_override` — the shipped one when the
+    /// owner saved nothing — the heading and the instructions for `contextual_update`; absent for
+    /// `not_sent`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
     /// Whether the owner's edited base prompt is in what is sent.

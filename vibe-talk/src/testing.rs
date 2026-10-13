@@ -273,6 +273,7 @@ fn state_pieces_with(
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
+        agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
         post_gate: Arc::new(crate::post_gate::PostGate::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live: Arc::new(crate::live::LiveHub::new()),

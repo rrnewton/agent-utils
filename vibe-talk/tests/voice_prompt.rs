@@ -151,17 +151,58 @@ async fn nothing_saved_is_the_shipped_prompt_everywhere() {
     );
     assert_eq!(write["prompt"]["system_prompt_edited"], false);
     assert_eq!(write["prompt"]["additional_instructions"], false);
+    // The test agent's configuration says nothing about replacing its prompt, so it keeps the one
+    // in its console and is handed nothing.
     assert!(
         session(&harness).await.get("agent_prompt").is_none(),
-        "a call with nothing of the owner's carried something to hand over"
+        "a call with nothing of the owner's carried something to an agent that keeps its prompt"
     );
-    assert!(
-        harness
-            .elevenlabs
-            .requested()
-            .iter()
-            .all(|url| !url.contains("/convai/agents/")),
-        "a call with nothing to hand over still asked the vendor about the agent"
+}
+
+fn agent_reads(harness: &Harness) -> usize {
+    harness
+        .elevenlabs
+        .requested()
+        .iter()
+        .filter(|url| url.contains("/convai/agents/"))
+        .count()
+}
+
+#[tokio::test]
+async fn an_agent_that_allows_it_follows_the_send_switch_with_nothing_saved() {
+    // The review's case: a hosted agent, nothing saved in Settings, and the switch moved. Its send
+    // rules must follow the switch at its next call, not wait for a prompt pasted by hand.
+    let harness = harness();
+    harness.elevenlabs.allow_prompt_override(Some(true));
+    let handed = session(&harness).await["agent_prompt"].clone();
+    assert_eq!(handed["transport"], "prompt_override", "{handed}");
+    assert_eq!(handed["system_prompt_applied"], false);
+    assert_eq!(handed["instructions_applied"], false);
+    assert_eq!(
+        handed["text"],
+        voice_agent::prompt(Variant::WriteConfirm).text,
+        "the shipped prompt for the switch did not go"
+    );
+
+    let (status, _body) = send(
+        &harness,
+        "PUT",
+        "/api/v1/voice-settings",
+        Some(WRITE_TOKEN),
+        Some(json!({ "ask_before_send": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let handed = session(&harness).await["agent_prompt"].clone();
+    assert_eq!(
+        handed["text"],
+        voice_agent::prompt(Variant::WriteDirect).text,
+        "the next call still had the rules for asking first"
+    );
+    assert_eq!(
+        agent_reads(&harness),
+        1,
+        "the vendor was asked again at every call start rather than once for the run"
     );
 }
 
