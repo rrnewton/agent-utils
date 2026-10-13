@@ -2994,8 +2994,9 @@ pub async fn forget_conversations(
 /// Settings says Off.
 ///
 /// And it empties three of the copies of channel text held in memory: read-aloud's recently
-/// fetched messages ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`), the
-/// voice catch-up's channel windows with their journalled pushes
+/// fetched messages, with the timeline answers kept for a few seconds beside them
+/// ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`, `#278
+/// timeline-single-flight`), the voice catch-up's channel windows with their journalled pushes
 /// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`), and the recent reads a
 /// bridge's recent-view shadow holds waiting for their check ([`crate::recent_view::Shadow::clear`],
 /// `#208 persistent-cache`). All three refuse what a read already running when the purge came

@@ -377,8 +377,12 @@ struct Harness {
 
 fn harness() -> Harness {
     let summarizer = Arc::new(FakeSummarizer::naming_threads());
-    let (mut state, _discord, store) =
-        testing::state_with_backend(&testing::config_toml(), summarizer.clone());
+    // These tests grow a thread at the provider, behind this server's back, and read the list again
+    // at once. The timeline memory would answer that read from the one before, which is its job for
+    // a few seconds (`#278 timeline-single-flight`); they are about naming, so it is off.
+    let toml =
+        testing::config_toml().replace("[discord]", "[chat]\ntimeline_memo_ms = 0\n\n[discord]");
+    let (mut state, _discord, store) = testing::state_with_backend(&toml, summarizer.clone());
     let threads = Arc::new(Threads::default());
     state.replace_chat(threads.clone());
     Harness {

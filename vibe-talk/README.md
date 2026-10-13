@@ -1623,6 +1623,7 @@ model provider or a real gateway.
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
 | Fetch size | `chat.default_fetch_limit` / `chat.max_fetch_limit` | — | messages a read returns by default and at most, default `50` / `100`; older files set them under `[discord]`, and setting one in both places is refused |
 | Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
+| Timeline memory | `chat.timeline_memo_ms` | — | how long a newest timeline answer also answers an identical request, in milliseconds, default `3000`, at most `60000`; `0` keeps nothing, and identical requests in flight together still share one read (`#278 timeline-single-flight`; see "One read for identical requests") |
 | Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
 | Live adapter token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; authenticates normalized event push and content-free change hints. Full events for a polled provider are refused with `409 channel_is_polled`; hints may safely coexist because they wake the poller's own cursor |
@@ -1907,6 +1908,21 @@ cursor. A cursor a direct backend did not issue for that view — one a bridge i
 channel moved to the native API, say — is answered `410 cursor_expired`, so the page reads the
 newest page rather than failing every refresh with it. The page keeps its full poll on all such channels, so edits and deletions are as prompt as
 before; forward reads there serve live arrivals and a return to the page.
+
+**One read for identical requests** (`#278 timeline-single-flight`). Identical timeline requests —
+the same channel, view, thread, `before`, forward cursor and `limit` — that are in flight together
+make one read of the provider, and every caller is answered from it. The read runs on its own, so a
+page that gives up after twenty seconds and asks again joins the read it started instead of
+starting a second one behind it. A newest page or a delta that has just landed also answers an
+identical request for `chat.timeline_memo_ms` more (three seconds by default; `0` turns that off,
+and requests in flight together still share). Any change this server hears of — a live message,
+edit or deletion, a post it sends to the channel, the storage purge — makes the next request read
+afresh, so the page's own re-read after one never gets an answer from before it. A change upstream
+that nobody pushes is invisible for at most those few seconds. Only the provider's answer is shared:
+the channel allowlist is checked before a request joins anything, and each caller's spoken forms,
+noise marks, thread names, read state, pins and bookmark are its own, so a read token still queues
+no thread naming. Window reads of a channel's newest messages (`/messages`, the digest, a summary's
+context, speech preparation) likewise share one fetch when they are asked together.
 
 The native backend includes accessible active and archived threads. It bounds discovery at 256
 threads and 100 pages per archived collection, retains pagination inventories for five minutes,
@@ -2449,7 +2465,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not |
-| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
+| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`); identical requests share one provider read (see "One read for identical requests", `#278 timeline-single-flight`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
@@ -6277,6 +6293,8 @@ src/probe.rs          the startup channel reachability probe and its failure tax
 src/diagnostics.rs    those same checks on demand, structured, redacted, and time-bounded
 src/upstream_profile.rs  how long each provider operation and Slack Web API call takes, and how
                       big messages are: numbers only, for diagnostics and one line an hour
+src/timeline_flight.rs  one provider read for identical timeline requests, and a few seconds'
+                      memory of each newest answer
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
 src/bin/mock_elevenlabs.rs     that mock as a process, for a browser or the smoke script

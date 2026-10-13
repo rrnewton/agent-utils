@@ -24,6 +24,15 @@ bind = "0.0.0.0:8080"
 # Environment: VIBE_TALK_TIMEZONE
 # timezone = "America/New_York"
 
+# Limits shared by every chat provider. The fetch limits and the count ceiling may live here or, as
+# below, under [discord]; this one lives only here.
+# [chat]
+# How long, in milliseconds, a newest timeline answer also answers an identical request, so a page
+# asking again a moment later does not read the provider twice. Identical requests in flight
+# together always share one read; `0` keeps nothing beyond that. A live change, a post this server
+# sends, or the storage purge makes the next request read afresh. At most 60000.
+# timeline_memo_ms = 3000
+
 [discord]
 # Source service named in errors, diagnostics, and the app. A compatible bridge can set
 # this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.

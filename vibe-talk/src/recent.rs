@@ -209,6 +209,14 @@ impl ReadMark {
     pub fn started(&self) -> Instant {
         self.started
     }
+
+    /// How many pushes the channel had had, and how many purges there had been, when this mark
+    /// was taken. Two marks with the same pair saw the same changes: a read that began at one
+    /// may answer for the other. `#278 timeline-single-flight`; see [`crate::timeline_flight`].
+    #[must_use]
+    pub fn seen(&self) -> (u64, u64) {
+        (self.pushes, self.purges)
+    }
 }
 
 #[derive(Default)]

@@ -7,16 +7,21 @@
 //! earlier. In a threaded view it was worse: the prepare fetched each message on its own, one
 //! after the other. And the provider warm-up waited for all of it before it started.
 //!
-//! This module holds three things that remove those waits:
+//! This module holds four things that remove those waits:
 //!
 //! - [`ReadAhead::remember`] and [`ReadAhead::recall`]: every message this server fetches for a
 //!   page (`ops::messages`, `ops::page`, `ops::timeline`) is kept for [`RECENT_TTL`], and
 //!   preparation looks there first. Bounded by [`MAX_RECENT`].
-//! - [`ReadAhead::window_turn`]: when several preparations for one channel miss together, one of
-//!   them fetches the window and the others wait for it, rather than queueing a second identical
-//!   fetch behind the first at the chat adapter. The summary route shares the same turn
-//!   (`#208 persistent-cache`), so a page asking for twenty summaries at once costs one fetch, and
-//!   a summary asked for right after the page's own read is answered from here with none.
+//! - [`ReadAhead::window_turn`]: when several window reads of one channel are asked together, one
+//!   of them fetches the window and the others wait for it, rather than queueing a second identical
+//!   fetch behind the first at the chat adapter. Every [`ops::messages`] read takes the turn
+//!   (`#278 timeline-single-flight`), so speech preparation, the summary route (`#208
+//!   persistent-cache`), the digest, a lookup by id and the messages route share it: a page asking
+//!   for twenty summaries at once costs one fetch, and a summary asked for right after the page's
+//!   own read is answered from here with none.
+//! - [`ReadAhead::timelines`]: the same for `/timeline`, where identical requests share one read
+//!   that no caller going away can cancel, and a newest answer is kept for a few seconds. See
+//!   [`crate::timeline_flight`].
 //! - [`ReadAhead::start_warm_up`]: the provider warm-up starts at the top of a preparation and is
 //!   never awaited by it. At most one runs at a time, for at most [`WARM_UP_BOUND`].
 //!
@@ -132,6 +137,10 @@ impl Held {
 /// What the last window fetch made through [`ReadAhead::window_turn`] read.
 #[derive(Clone, Debug)]
 pub struct WindowRead {
+    /// The channel's live-feed pushes and storage purges when the fetch began
+    /// ([`crate::recent::ReadMark::seen`]). A caller that has seen a change since does not take this
+    /// fetch for its own: it may have missed the change.
+    pub seen: (u64, u64),
     /// When it finished.
     pub finished: Instant,
     /// How many messages it asked for ([`ops::window_limit`]).
@@ -146,10 +155,11 @@ pub struct WindowRead {
 }
 
 impl WindowRead {
-    /// What `window` read, finishing now.
+    /// What `window` read, finishing now, from a fetch that began having `seen` the changes it had.
     #[must_use]
-    pub fn of(window: &ops::Window) -> Self {
+    pub fn of(window: &ops::Window, seen: (u64, u64)) -> Self {
         Self {
+            seen,
             finished: Instant::now(),
             limit: window.limit,
             ids: window.messages.iter().map(|m| m.id.clone()).collect(),
@@ -158,11 +168,14 @@ impl WindowRead {
     }
 }
 
-/// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, a bound on
-/// thread lookups, and the provider warm-up. See the module documentation.
+/// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, one read per
+/// identical timeline request, a bound on thread lookups, and the provider warm-up. See the module
+/// documentation.
 #[derive(Debug)]
 pub struct ReadAhead {
     held: Mutex<Held>,
+    /// Timeline reads running and newest answers just landed. `#278 timeline-single-flight`.
+    timelines: Arc<crate::timeline_flight::TimelineFlights>,
     /// Per channel: the last window fetch made through [`ReadAhead::window_turn`].
     windows: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Option<WindowRead>>>>>,
     /// [`THREAD_FETCHES_IN_FLIGHT`] permits, one per thread message lookup.
@@ -174,6 +187,7 @@ impl Default for ReadAhead {
     fn default() -> Self {
         Self {
             held: Mutex::default(),
+            timelines: Arc::default(),
             windows: Mutex::default(),
             lookups: tokio::sync::Semaphore::new(THREAD_FETCHES_IN_FLIGHT),
             warming: Arc::default(),
@@ -353,9 +367,19 @@ impl ReadAhead {
     /// it, though it is not the only copy held in memory: `purge_storage` in `crate::http::api`
     /// lists what the purge leaves.
     ///
-    /// Raises the floor to now, so a fetch already in flight keeps nothing when it lands.
+    /// Raises the floor to now, so a fetch already in flight keeps nothing when it lands. The
+    /// timeline answers kept, and the timeline reads running, go too
+    /// ([`crate::timeline_flight::TimelineFlights::clear`]).
     pub fn clear(&self) {
         self.clear_at(Instant::now());
+        self.timelines.clear();
+    }
+
+    /// The timeline reads running, and the newest timeline answers just landed. `#278
+    /// timeline-single-flight`.
+    #[must_use]
+    pub fn timelines(&self) -> &Arc<crate::timeline_flight::TimelineFlights> {
+        &self.timelines
     }
 
     fn clear_at(&self, now: Instant) {
@@ -381,9 +405,10 @@ impl ReadAhead {
     /// Wait for this channel's window fetch slot.
     ///
     /// The guard holds what the last window fetch through this slot read, and when it finished. A
-    /// caller that finds one that finished after its own start, and was at least as wide as its
-    /// own would be, waited behind a fetch that has just read the window, and should use that
-    /// rather than read it again.
+    /// caller that finds one that finished after its own start, was at least as wide as its own
+    /// would be, and began having seen every change the caller has, waited behind a fetch that has
+    /// just read the window, and should use that rather than read it again. [`ops::messages`] does
+    /// exactly that, for every caller.
     pub async fn window_turn(
         &self,
         channel: &ChannelId,
@@ -481,11 +506,12 @@ pub struct Found {
 /// Find `ids` of `channel` for speech: from what was fetched recently, and fetch only what is
 /// missing.
 ///
-/// Without a thread, the missing ids cost one window fetch, shared with any other preparation of
-/// the same channel that has just made one at least as wide. An id that is not in the window is
-/// simply absent, as it always was. In a thread, each missing id is fetched on its own, up to
-/// [`THREAD_FETCH_CONCURRENCY`] at once for this preparation and [`THREAD_FETCHES_IN_FLIGHT`] for
-/// all of them, and the first failure fails the batch, as it did when they were fetched in series.
+/// Without a thread, the missing ids cost one window fetch, shared with any other window read of
+/// the same channel that has just made one at least as wide ([`ops::messages`]). An id that is not
+/// in the window is simply absent, as it always was. In a thread, each missing id is fetched on
+/// its own, up to [`THREAD_FETCH_CONCURRENCY`] at once for this preparation and
+/// [`THREAD_FETCHES_IN_FLIGHT`] for all of them, and the first failure fails the batch, as it did
+/// when they were fetched in series.
 ///
 /// `began` is when the preparation started. A window fetch that finished after it is fresh
 /// enough to answer this one.
@@ -522,26 +548,14 @@ pub async fn messages_for_speech(
     let fetching = Instant::now();
     match thread {
         None => {
-            let width = ops::window_limit(state, limit);
-            let mut turn = state.read_ahead.window_turn(&channel.id).await;
-            if turn
-                .as_ref()
-                .is_some_and(|read| read.finished >= began && read.limit >= width)
-            {
-                found.joined = true;
-                found
-                    .messages
-                    .extend(state.read_ahead.recall(&channel.id, None, &missing));
-            } else {
-                // `ops::messages` remembers the window for everyone else as well.
-                let window = ops::messages(state, channel.id.as_str(), limit).await?;
-                *turn = Some(WindowRead::of(&window));
-                found.fetches = 1;
-                let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
-                for message in window.messages {
-                    if wanted.contains(message.id.as_str()) {
-                        found.messages.insert(message.id.0.clone(), message);
-                    }
+            // The window read every caller shares, which remembers what it read for everyone else.
+            let (window, joined) = ops::window_shared(state, channel.clone(), limit, began).await?;
+            found.joined = joined;
+            found.fetches = usize::from(!joined);
+            let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
+            for message in window.messages {
+                if wanted.contains(message.id.as_str()) {
+                    found.messages.insert(message.id.0.clone(), message);
                 }
             }
         }
@@ -816,19 +830,22 @@ mod tests {
             message("12", None),
         ];
         read_ahead.remember(&channel, None, &window, Instant::now());
-        let read = WindowRead::of(&ops::Window {
-            channel: crate::model::ChannelInfo {
-                id: channel.clone(),
-                label: String::new(),
-                writable: false,
-                alias: None,
-                added: false,
-                provider: None,
+        let read = WindowRead::of(
+            &ops::Window {
+                channel: crate::model::ChannelInfo {
+                    id: channel.clone(),
+                    label: String::new(),
+                    writable: false,
+                    alias: None,
+                    added: false,
+                    provider: None,
+                },
+                messages: window,
+                limit: 50,
+                as_of: None,
             },
-            messages: window,
-            limit: 50,
-            as_of: None,
-        });
+            (0, 0),
+        );
         let rebuilt = read_ahead.recall_window(&channel, &read).expect("all held");
         assert_eq!(
             rebuilt.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),

@@ -590,6 +590,12 @@ pub struct ChatLimits {
     /// single spoken "how many messages are in there?" could fire dozens of requests at a busy
     /// channel and stall every other read behind it.
     pub max_count_scan: u32,
+    /// How long a newest timeline answer is kept, so an identical request just after it is answered
+    /// without a second read. `chat.timeline_memo_ms`, default
+    /// [`crate::timeline_flight::DEFAULT_MEMO_MS`]; zero keeps nothing, and identical requests in
+    /// flight together still share one read. `#278 timeline-single-flight`; see
+    /// [`crate::timeline_flight`].
+    pub timeline_memo: std::time::Duration,
 }
 
 /// The first key of a multi-provider deployment, and the only one of a legacy configuration.
@@ -929,6 +935,7 @@ struct FileChat {
     default_fetch_limit: Option<u16>,
     max_fetch_limit: Option<u16>,
     max_count_scan: Option<u32>,
+    timeline_memo_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2145,10 +2152,25 @@ fn chat_limits(chat: &FileChat, discord: &FileDiscord) -> Result<ChatLimits, Con
             detail: format!("{default_fetch_limit} exceeds max_fetch_limit {max_fetch_limit}"),
         });
     }
+    // Only under `[chat]`: it is no older than `[chat]` itself.
+    let timeline_memo_ms = chat
+        .timeline_memo_ms
+        .unwrap_or(crate::timeline_flight::DEFAULT_MEMO_MS);
+    if timeline_memo_ms > crate::timeline_flight::MAX_MEMO_MS {
+        return Err(ConfigError::Invalid {
+            field: "chat.timeline_memo_ms".to_owned(),
+            detail: format!(
+                "{timeline_memo_ms} is more than {} milliseconds; a newest timeline answer kept \
+                 that long would hide a change for longer than the page's own poll",
+                crate::timeline_flight::MAX_MEMO_MS
+            ),
+        });
+    }
     Ok(ChatLimits {
         default_fetch_limit,
         max_fetch_limit,
         max_count_scan,
+        timeline_memo: std::time::Duration::from_millis(timeline_memo_ms),
     })
 }
 
@@ -3338,6 +3360,35 @@ provider = "slack"
             matches!(&err, ConfigError::Invalid { field, detail }
                 if field == "server.timezone" && detail.contains("America/Nowhere")),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_timeline_memo_defaults_to_three_seconds_turns_off_at_zero_and_is_bounded() {
+        // `#278 timeline-single-flight`.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.chat.timeline_memo, std::time::Duration::from_secs(3));
+
+        let with = |ms: &str| {
+            FULL.replace(
+                "[discord]",
+                &format!("[chat]\ntimeline_memo_ms = {ms}\n\n[discord]"),
+            )
+        };
+        let cfg = Config::from_toml_and_env(&with("0"), &env(&[])).expect("valid config");
+        assert!(cfg.chat.timeline_memo.is_zero());
+        let cfg = Config::from_toml_and_env(&with("60000"), &env(&[])).expect("valid config");
+        assert_eq!(cfg.chat.timeline_memo, std::time::Duration::from_secs(60));
+
+        let err = Config::from_toml_and_env(&with("60001"), &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "chat.timeline_memo_ms"),
+            "{err}"
+        );
+        let legacy = FULL.replace("[discord]", "[discord]\ntimeline_memo_ms = 0");
+        assert!(
+            Config::from_toml_and_env(&legacy, &env(&[])).is_err(),
+            "the setting is newer than the legacy section and is not read from it"
         );
     }
 

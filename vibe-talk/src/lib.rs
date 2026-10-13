@@ -16,15 +16,17 @@
 //! # What is kept
 //!
 //! Almost nothing. Nothing about a channel is written to disk, and the page and the tools read
-//! channels from the provider, with two short-lived exceptions, held in memory only, kept apart on
-//! purpose, and gone when the process restarts. [`read_ahead`] keeps messages fetched in the last
-//! thirty seconds, and only speech preparation reads them, so a tap does not wait to re-fetch what
+//! channels from the provider, with three short-lived exceptions, held in memory only, kept apart
+//! on purpose, and gone when the process restarts. [`read_ahead`] keeps messages fetched in the
+//! last thirty seconds, so a tap, a summary or a second window read does not wait to re-fetch what
 //! the page has just drawn; a pushed edit or deletion drops a message from it, and the storage
 //! purge empties it. [`recent`] keeps each channel's newest window, with every change pushed to it
 //! since merged in, so the voice agent's catch-up can answer from it while the provider is slow,
 //! and says how old it is when it was not read again in time; the storage purge empties that too,
-//! with the pushes kept beside it. Neither can be refilled by a read that was already running when
-//! the purge came. They are not the only channel text in memory, though, and the purge does not
+//! with the pushes kept beside it. [`timeline_flight`] keeps each newest timeline answer for a few
+//! seconds, so an identical request just after it is not read again; a change this server hears of
+//! makes the next request read afresh, and the purge empties it as well. None of them can be
+//! refilled by a read that was already running when the purge came. They are not the only channel text in memory, though, and the purge does not
 //! empty the rest: the live stream's replay tail, read-aloud tickets and the thread names already
 //! read among them, as `http::api::purge_storage` lists. [`store`] is the single thing kept
 //! at rest, and it holds three things — the `/voice` transcript,
@@ -84,6 +86,7 @@ pub mod summarize;
 pub mod summary;
 pub mod testing;
 pub mod threads;
+pub mod timeline_flight;
 pub mod timeline_forward;
 pub mod untrusted;
 pub mod upstream_clear;

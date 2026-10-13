@@ -378,6 +378,9 @@ impl Window {
 
 /// Recent messages of one channel, oldest first. Read scope.
 ///
+/// Read through the channel's window turn ([`window_shared`]): several asked at once, from any
+/// caller, cost one fetch. `#278 timeline-single-flight`.
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`] for a channel outside the allowlist; [`OpError::Chat`] when the
@@ -387,16 +390,74 @@ pub async fn messages(
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
+    let began = std::time::Instant::now();
     let channel = allowed(state, channel_id).await?;
+    Ok(window_shared(state, channel, limit, began).await?.0)
+}
+
+/// [`messages`] of a channel the caller has already checked against the allowlist, read once for
+/// every caller of the channel that asks at the same time, and whether this caller's window was
+/// another's read. `#278 timeline-single-flight`, remote-ops audit W4.
+///
+/// Every window read takes the channel's turn ([`crate::read_ahead::ReadAhead::window_turn`]). A
+/// caller that waited behind a fetch which finished after `began`, was at least as wide as its
+/// own, and began having seen every change this caller has seen — no live push or storage purge
+/// since — rebuilds that window from memory, cut to its own width, instead of reading it again.
+/// If any message of it has been forgotten since (an edit or a delete was pushed), or the fetch
+/// failed, it reads the window itself.
+///
+/// `began` is when the caller's own request started.
+pub(crate) async fn window_shared(
+    state: &AppState,
+    channel: ChannelInfo,
+    limit: Option<u16>,
+    began: std::time::Instant,
+) -> Result<(Window, bool), OpError> {
     // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
     // preparation compares a remembered window against (`crate::read_ahead`) are one number.
     let limit = window_limit(state, limit);
-    // Before the fetch, not after, like the mark below: see `ReadAhead::remember`.
+    let mut turn = state.read_ahead.window_turn(&channel.id).await;
+    // `#210 voice-catchup-speed`. Taken with the turn held and before the fetch, so it is both
+    // what this caller has seen and where a fetch it makes begins. See `crate::recent`.
+    let mark = state.live.recent().mark(&channel.id);
+    if let Some(read) = turn
+        .as_ref()
+        .filter(|read| read.finished >= began && read.limit >= limit && read.seen == mark.seen())
+    {
+        if let Some(mut messages) = state.read_ahead.recall_window(&channel.id, read) {
+            // The newest `limit`, as this caller's own read would have answered.
+            let excess = messages.len().saturating_sub(usize::from(limit));
+            messages.drain(..excess);
+            let as_of = read.as_of.clone();
+            return Ok((
+                Window {
+                    channel,
+                    messages,
+                    limit,
+                    as_of,
+                },
+                true,
+            ));
+        }
+    }
+    let window = fetch_window(state, channel, limit, mark).await?;
+    *turn = Some(crate::read_ahead::WindowRead::of(&window, mark.seen()));
+    Ok((window, false))
+}
+
+/// One window fetch, with the channel's turn held: kept in `crate::recent` and read-ahead memory,
+/// stamped and noise-marked. `mark` was taken just before.
+async fn fetch_window(
+    state: &AppState,
+    channel: ChannelInfo,
+    limit: u16,
+    mark: crate::recent::ReadMark,
+) -> Result<Window, OpError> {
+    // Before the fetch, not after, like the mark: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
     // `#210 voice-catchup-speed`. Every read of a channel's newest messages is the newest copy of
     // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
     // while it ran applied again on top. See `crate::recent`.
-    let mark = state.live.recent().mark(&channel.id);
     let read = crate::recent_view::read(state, &channel.id, limit).await?;
     state.live.recent().record_as_of(
         &channel.id,
@@ -433,8 +494,8 @@ pub async fn messages(
 /// real client and the fake clamp the request to 100 — so comparing against the unclamped
 /// number would report a FULL 100-message window as the whole channel.
 ///
-/// Public so speech preparation can tell whether another preparation's window was at least as
-/// wide as the one it would have fetched itself (`crate::read_ahead::messages_for_speech`).
+/// Public so a caller can tell whether another caller's window was at least as wide as the one it
+/// would have fetched itself, as [`window_shared`] does, and size a catch-up the same way.
 #[must_use]
 pub fn window_limit(state: &AppState, limit: Option<u16>) -> u16 {
     state
@@ -498,6 +559,11 @@ pub async fn message_by_id_scoped(
 /// with a fresh envelope in `next_after`. A `before` page leaves without one: it says nothing about
 /// the newest end. `#203 incremental-refresh`.
 ///
+/// The provider read is SHARED: identical requests in flight together make one read, which no
+/// caller going away can cancel, and a newest page or delta that has just landed answers an
+/// identical request for a few seconds more. Everything after the read is this caller's own. See
+/// [`crate::timeline_flight`]. `#278 timeline-single-flight`.
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`]; [`OpError::CursorMismatch`] for a forward cursor issued for any
@@ -518,27 +584,11 @@ pub async fn timeline(
         .map(|raw| forward::decode(raw, &channel.id, request.view, thread))
         .transpose()
         .map_err(|_| OpError::CursorMismatch)?;
-    let mut backend = request.clone();
-    // Before the fetch, not after: see `ReadAhead::remember`.
-    let fetch_began = std::time::Instant::now();
-    let (mut page, position) = match resumed {
-        Some(Forward::Native(own)) => {
-            backend.after = Some(own);
-            (
-                state.chat.fetch_timeline(&channel.id, &backend).await?,
-                None,
-            )
-        }
-        Some(Forward::Generic(since)) => {
-            backend.after = None;
-            let read = state
-                .chat
-                .fetch_timeline_since(&channel.id, &backend, &since)
-                .await?;
-            (read.page, Some(read.position))
-        }
-        None => (state.chat.fetch_timeline(&channel.id, request).await?, None),
-    };
+    let fetched = shared_timeline(state, &channel.id, request, resumed).await?;
+    let mut page = fetched.page.clone();
+    let position = fetched.position.clone();
+    // When the shared read began, not this caller: see `ReadAhead::remember`.
+    let fetch_began = fetched.began;
     page.next_after = if request.before.is_some() {
         None
     } else {
@@ -575,6 +625,63 @@ pub async fn timeline(
         state.read_ahead.forget(&channel.id, gone);
     }
     Ok((channel, page))
+}
+
+/// The provider half of [`timeline`]: one read for every identical request, started now or already
+/// running, or a newest answer that has just landed. `resumed` is the decoded forward cursor.
+async fn shared_timeline(
+    state: &AppState,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    resumed: Option<crate::timeline_forward::Forward>,
+) -> Result<std::sync::Arc<crate::timeline_flight::Fetched>, OpError> {
+    use crate::timeline_forward::Forward;
+    let mut backend = request.clone();
+    backend.after = None;
+    // Written so a native cursor and a generic position never meet: the backend reads them apart.
+    let forward = resumed.as_ref().map(|resumed| match resumed {
+        Forward::Native(own) => format!("native:{own}"),
+        Forward::Generic(since) => format!("generic:{since:?}"),
+    });
+    let key = crate::timeline_flight::Key::new(channel, &backend, forward);
+    let seen = state.live.recent().mark(channel).seen();
+    // Only a newest page or a delta is kept: a step back says nothing about the newest end, and the
+    // same one is rarely asked twice in a few seconds.
+    let memo = if request.before.is_none() {
+        state.config.chat.timeline_memo
+    } else {
+        std::time::Duration::ZERO
+    };
+    let (state_for_read, channel_for_read) = (state.clone(), channel.clone());
+    let (answer, shared) = state
+        .read_ahead
+        .timelines()
+        .read(key, seen, memo, move || async move {
+            let (state, channel) = (state_for_read, channel_for_read);
+            match resumed {
+                Some(Forward::Native(own)) => {
+                    backend.after = Some(own);
+                    Ok((state.chat.fetch_timeline(&channel, &backend).await?, None))
+                }
+                Some(Forward::Generic(since)) => {
+                    let read = state
+                        .chat
+                        .fetch_timeline_since(&channel, &backend, &since)
+                        .await?;
+                    Ok((read.page, Some(read.position)))
+                }
+                None => Ok((state.chat.fetch_timeline(&channel, &backend).await?, None)),
+            }
+        })
+        .await;
+    if shared != crate::timeline_flight::Shared::Read {
+        tracing::debug!(
+            view = ?request.view,
+            shared = shared.as_str(),
+            "a timeline request was answered by a read it did not make"
+        );
+    }
+    Ok(answer?)
 }
 
 /// One speakable line per recent message, and what was left out of it.
@@ -1702,6 +1809,9 @@ pub async fn reply_scoped(
                     .await
             }
         };
+        // Landed or not — a failure may have delivered — no timeline read that began before this
+        // post answers a request made after it. `#278 timeline-single-flight`.
+        state.read_ahead.timelines().posted(&info.id);
         match sent {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));
@@ -2853,26 +2963,13 @@ async fn shared_window(
     limit: Option<u16>,
     began: std::time::Instant,
 ) -> Result<Window, OpError> {
-    let width = window_limit(state, limit);
-    let mut turn = state.read_ahead.window_turn(&channel.id).await;
-    if let Some(read) = turn
-        .as_ref()
-        .filter(|read| read.finished >= began && read.limit >= width)
-    {
-        if let Some(messages) = state.read_ahead.recall_window(&channel.id, read) {
-            state.summary_counters.joined();
-            return Ok(Window {
-                channel,
-                messages,
-                limit: read.limit,
-                as_of: read.as_of.clone(),
-            });
-        }
+    // `window_shared` remembers the window for everyone else as well.
+    let (window, joined) = window_shared(state, channel, limit, began).await?;
+    if joined {
+        state.summary_counters.joined();
+    } else {
+        state.summary_counters.fetched(1);
     }
-    // `messages` remembers the window for everyone else as well.
-    let window = messages(state, channel.id.as_str(), limit).await?;
-    state.summary_counters.fetched(1);
-    *turn = Some(crate::read_ahead::WindowRead::of(&window));
     Ok(window)
 }
 
