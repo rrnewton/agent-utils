@@ -1,12 +1,13 @@
 ---
 title: 'voice-bridge-interrupt-ends-session: a barge-in ends the bridge''s whole session and leaves the socket open'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.457422484+00:00
-updated_at: 2026-10-04T10:09:55.457422484+00:00
+updated_at: 2026-10-13T09:48:50.033826107+00:00
+closed_at: 2026-10-13T09:48:50.033825997+00:00
 ---
 
 # Description
