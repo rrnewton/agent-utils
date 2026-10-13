@@ -467,12 +467,17 @@ impl RecentWindows {
     /// or more pushes than are journalled, so that it cannot be told. `#208 persistent-cache`:
     /// what may explain two reads of the channel either side of it disagreeing; see
     /// [`crate::recent_view`].
+    ///
+    /// Across a purge it cannot be told either: [`RecentWindows::clear`] dropped the journal, and
+    /// the count of pushes started again from nothing.
     #[must_use]
     pub fn changed_since(&self, channel: &ChannelId, mark: ReadMark) -> bool {
-        self.windows().slots.get(channel).is_some_and(|slot| {
-            slot.pushes_since(mark)
-                .is_none_or(|pushes| pushes.iter().any(|live| live.kind != LiveKind::Create))
-        })
+        let windows = self.windows();
+        mark.purges != windows.purges
+            || windows.slots.get(channel).is_some_and(|slot| {
+                slot.pushes_since(mark)
+                    .is_none_or(|pushes| pushes.iter().any(|live| live.kind != LiveKind::Create))
+            })
     }
 
     /// Whether `channel`'s window can answer a read of `scan` messages without asking the chat
@@ -1081,6 +1086,28 @@ mod tests {
             windows.changed_since(&other, mark),
             "fell out of the journal"
         );
+    }
+
+    /// `#210 voice-catchup-speed`'s purge drops the journal and starts the push count again, so
+    /// what came after a mark taken before it cannot be told: it may have been an edit. A mark
+    /// taken after it is told as before.
+    #[tokio::test]
+    async fn what_came_after_a_mark_taken_before_the_purge_cannot_be_told() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        windows.merge(&channel, &live(LiveKind::Create, message(id(1), "new")));
+        let before = windows.mark(&channel);
+        windows.clear();
+        assert!(windows.changed_since(&channel, before), "no slot at all");
+        windows.merge(&channel, &live(LiveKind::Create, message(id(2), "new")));
+        assert!(
+            windows.changed_since(&channel, before),
+            "a fresh journal counted from nothing"
+        );
+        let after = windows.mark(&channel);
+        assert!(!windows.changed_since(&channel, after));
+        windows.merge(&channel, &live(LiveKind::Update, message(id(2), "edited")));
+        assert!(windows.changed_since(&channel, after));
     }
 
     #[tokio::test(start_paused = true)]

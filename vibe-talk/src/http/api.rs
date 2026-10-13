@@ -2878,11 +2878,14 @@ pub async fn forget_conversations(
 /// the running loop as well as in the store, so nothing more is marked read at a provider once
 /// Settings says Off.
 ///
-/// And it empties two of the copies of channel text held in memory: read-aloud's recently fetched
-/// messages ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`) and the voice
-/// catch-up's channel windows with their journalled pushes
-/// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`). Both refuse what a read
-/// already running when the purge came brings back, so neither can be refilled from before it.
+/// And it empties three of the copies of channel text held in memory: read-aloud's recently
+/// fetched messages ([`crate::read_ahead::ReadAhead::clear`], `#191 read-aloud-first-lag`), the
+/// voice catch-up's channel windows with their journalled pushes
+/// ([`crate::recent::RecentWindows::clear`], `#210 voice-catchup-speed`), and the recent reads a
+/// bridge's recent-view shadow holds waiting for their check ([`crate::recent_view::Shadow::clear`],
+/// `#208 persistent-cache`). All three refuse what a read already running when the purge came
+/// brings back, so none can be refilled from before it; a shadow check already running keeps only
+/// counts from its read.
 ///
 /// **It does not empty every copy in memory**, and nothing written about it may say it does. These
 /// outlive it until they age out, are evicted, or the process restarts:
@@ -2910,6 +2913,7 @@ pub async fn purge_storage(
     // Not durable, so not in the list below, but channel text all the same.
     state.read_ahead.clear();
     state.live.recent().clear();
+    state.recent_view_shadow.clear();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,

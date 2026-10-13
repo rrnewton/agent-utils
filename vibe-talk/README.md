@@ -1883,12 +1883,13 @@ that holds the slot, runs it again afterwards, and goes ahead of every one waiti
 wait: they run one at a time, from one queue across every channel, each only once no recent read
 has run for three seconds. A channel has at most one read waiting — a newer read of it takes its
 place — and a read that has waited more than two minutes is dropped, since a Flat read that late
-would count every edit and delete in between; both count as `skipped`. That makes a collision
-unlikely, not impossible. A recent read that starts while a check is making the bridge bring its
-copy forward still waits for it, so while the shadow is on, expect a catch-up or a `digest_channel`
-soon after a quiet spell or a bridge restart to be slower, by as much as that scan. Once checked, a
-channel's copy is kept current by the bridge in the background through the same slot, at the
-priority of `/messages` itself: nothing is stopped for that work, but a read can queue behind it.
+would count every edit and delete in between; both count as `skipped`, as does a read the storage
+purge drops, since a waiting read holds the text it read. That makes a collision unlikely, not
+impossible. A recent read that starts while a check is making the bridge bring its copy forward
+still waits for it, so while the shadow is on, expect a catch-up or a `digest_channel` soon after
+a quiet spell or a bridge restart to be slower, by as much as that scan. Once checked, a channel's
+copy is kept current by the bridge in the background through the same slot, at the priority of
+`/messages` itself: nothing is stopped for that work, but a read can queue behind it.
 
 What it does not do: a Flat page the bridge cannot build (a channel past its copy's size limits)
 fails the read rather than falling back to `/messages`, and a bridge copy that is cold is built on
@@ -2115,10 +2116,11 @@ clear-unread setting (back to off, in the running server too) alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
-   leaves the read marks alone, because the two are different records. It also empties two of the
-   copies of channel text held in memory — read-aloud's recent messages and the voice catch-up's
-   channel windows with their pushed changes — and a read already running keeps nothing of what it
-   brings back. It does **not** empty the other copies in memory, listed below;
+   leaves the read marks alone, because the two are different records. It also empties three of
+   the copies of channel text held in memory — read-aloud's recent messages, the voice catch-up's
+   channel windows with their pushed changes, and the reads a bridge's `recent_view_shadow` holds
+   waiting for their check — and a read already running keeps nothing of what it brings back. It
+   does **not** empty the other copies in memory, listed below;
 2. delete the file (`rm ~/.local/share/vibe-talk/vibe-talk.sqlite3`) — with the server stopped; or
 3. delete the mounted directory, which is also what `scripts/run.sh --status` prints.
 

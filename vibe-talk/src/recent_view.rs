@@ -89,18 +89,25 @@ pub async fn read(
     limit: u16,
 ) -> Result<RecentRead, ChatError> {
     // Taken before the read, like every mark: a change pushed while it runs may be in either
-    // answer, so it explains a difference between them. See `crate::recent::ReadMark`.
-    let mark = shadowed(state, channel).then(|| state.live.recent().mark(channel));
+    // answer, so it explains a difference between them. See `crate::recent::ReadMark`. The purge
+    // count is taken then too, so a read the storage purge overtakes is not kept for a check.
+    let mark = shadowed(state, channel).then(|| {
+        (
+            state.live.recent().mark(channel),
+            state.recent_view_shadow.purges(),
+        )
+    });
     let reading = state.recent_view_shadow.reading();
     let read = state.chat.fetch_recent_dated(channel, limit).await;
     drop(reading);
     let read = read?;
-    if let Some(mark) = mark {
+    if let Some((mark, purges)) = mark {
         let waiting = Waiting {
             channel: channel.clone(),
             limit,
             messages: read.messages.clone(),
             mark,
+            purges,
             queued: Instant::now(),
         };
         if state.recent_view_shadow.enqueue(waiting) {
@@ -167,7 +174,8 @@ pub struct Tally {
     /// Flat reads started to check a `/messages` read.
     pub reads: u64,
     /// `/messages` reads never checked: a newer read of the channel took their place in the queue,
-    /// or they waited longer than [`MAX_WAIT`] for their turn.
+    /// they waited longer than [`MAX_WAIT`] for their turn, or the storage purge dropped them
+    /// ([`Shadow::clear`]).
     pub skipped: u64,
     /// Flat reads that failed, so nothing was compared.
     pub failed: u64,
@@ -207,6 +215,8 @@ struct Waiting {
     messages: Vec<Message>,
     /// Taken before the read: see [`Tally::raced`].
     mark: ReadMark,
+    /// [`Shadow::purges`] when the read began: a read the storage purge overtook is not queued.
+    purges: u64,
     queued: Instant,
 }
 
@@ -221,6 +231,8 @@ struct Queue {
     last_read: Option<Instant>,
     /// Whether the checking task is running.
     checking: bool,
+    /// How many times [`Shadow::clear`] has run.
+    purges: u64,
 }
 
 /// Every channel's shadow counts, and the reads waiting to be checked.
@@ -277,12 +289,48 @@ impl Shadow {
         Reading { shadow: self }
     }
 
+    /// How many times [`Shadow::clear`] has run. Taken when a read begins, and handed back with it
+    /// to [`Shadow::enqueue`].
+    fn purges(&self) -> u64 {
+        lock(&self.queue).purges
+    }
+
+    /// Drop every read waiting for its check, and refuse every read that began before now. For the
+    /// storage purge, `DELETE /api/v1/storage`: a waiting read holds the text of the messages it
+    /// read, and the purge empties this copy as it empties the catch-up's windows
+    /// ([`crate::recent::RecentWindows::clear`]). Each read dropped or refused counts as skipped.
+    ///
+    /// A check already running keeps its read until its Flat read answers, then keeps only the
+    /// counts. The counts, numbers per channel id and no text, are not cleared.
+    pub fn clear(&self) {
+        let dropped: Vec<ChannelId> = {
+            let mut queue = lock(&self.queue);
+            queue.purges += 1;
+            queue
+                .waiting
+                .drain(..)
+                .map(|waiting| waiting.channel)
+                .collect()
+        };
+        for channel in dropped {
+            self.count(&channel, |tally| tally.skipped += 1);
+        }
+    }
+
     /// Put a read in the queue, in the place of one of the same channel already waiting. Whether
     /// the caller must start the checking task.
+    ///
+    /// A read that began before the newest [`Shadow::clear`] is refused, as skipped, under the
+    /// same lock the purge takes, so it cannot slip in after it.
     fn enqueue(&self, waiting: Waiting) -> bool {
         let channel = waiting.channel.clone();
         let (replaced, start) = {
             let mut queue = lock(&self.queue);
+            if queue.purges != waiting.purges {
+                drop(queue);
+                self.count(&channel, |tally| tally.skipped += 1);
+                return false;
+            }
             let replaced = match queue.waiting.iter_mut().find(|w| w.channel == channel) {
                 Some(older) => {
                     *older = waiting;
@@ -658,8 +706,45 @@ mod tests {
             channel,
             limit: 50,
             messages: vec![message(10, text)],
+            purges: 0,
             queued: Instant::now(),
         }
+    }
+
+    /// `#210 voice-catchup-speed`'s storage purge empties the reads waiting for a check, which hold
+    /// the text they read, and refuses a read that began before it and lands after; each counts
+    /// as skipped. A read that begins after the purge is queued as before.
+    #[tokio::test(start_paused = true)]
+    async fn the_purge_drops_every_waiting_read_and_refuses_one_that_began_before_it() {
+        let shadow = Shadow::new();
+        let before = shadow.purges();
+        assert!(shadow.enqueue(waiting("1", "first")));
+        assert!(!shadow.enqueue(waiting("2", "other")));
+
+        shadow.clear();
+        assert!(shadow.next().is_none(), "a read outlived the purge");
+        assert_eq!(shadow.tally(&ChannelId("1".to_owned())).skipped, 1);
+        assert_eq!(shadow.tally(&ChannelId("2".to_owned())).skipped, 1);
+
+        let overtaken = Waiting {
+            purges: before,
+            ..waiting("3", "read before the purge")
+        };
+        assert!(!shadow.enqueue(overtaken));
+        assert!(
+            shadow.next().is_none(),
+            "a read from before the purge was kept"
+        );
+        assert_eq!(shadow.tally(&ChannelId("3".to_owned())).skipped, 1);
+
+        let after = Waiting {
+            purges: shadow.purges(),
+            ..waiting("3", "read after the purge")
+        };
+        assert!(shadow.enqueue(after));
+        let next = shadow.next().expect("queued");
+        assert_eq!(next.messages[0].content, "read after the purge");
+        assert_eq!(shadow.tally(&ChannelId("3".to_owned())).skipped, 1);
     }
 
     /// One queue for every channel, one read waiting per channel: a newer read of a channel takes

@@ -29,7 +29,7 @@ use vibe_talk::model::{ChannelId, Message, MessageId};
 use vibe_talk::ops;
 use vibe_talk::recent_view::{self, Shadow, Tally, QUIET};
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
+use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 use vibe_talk::threads::{TimelinePage, TimelineRequest, TimelineView};
 
 /// A bridge whose recent read and Flat view the test can make disagree.
@@ -535,4 +535,88 @@ async fn a_check_waits_until_recent_reads_have_stopped_and_runs_one_at_a_time() 
             Event::FlatEnded => flat -= 1,
         }
     }
+}
+
+/// Ask the server to erase its store, as the operator does.
+async fn purge(state: &AppState) {
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/storage")
+                .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("the route answers");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `#210 voice-catchup-speed`'s storage purge also empties the reads waiting for a check, each of
+/// which holds the text it read: a read waiting when it came, and a read already at the provider
+/// that lands after it, are never checked and count as skipped. A read after the purge is checked.
+#[tokio::test(start_paused = true)]
+async fn the_storage_purge_drops_the_reads_waiting_for_a_check() {
+    let mut h = harness("recent_view_shadow = true");
+    h.state.recent_view_shadow = Arc::new(Shadow::new());
+
+    ops::messages(&h.state, READ_CHANNEL, None)
+        .await
+        .expect("read");
+    // Inside the quiet spell, so the check has not started.
+    purge(&h.state).await;
+    tokio::time::sleep(QUIET * 4).await;
+    assert_eq!(
+        h.bridge.flat_reads.load(Ordering::SeqCst),
+        0,
+        "a read waiting when the purge came was checked"
+    );
+    assert_eq!(
+        h.state.recent_view_shadow.tally(&channel(READ_CHANNEL)),
+        Tally {
+            skipped: 1,
+            ..Tally::default()
+        }
+    );
+
+    // A read at the provider when the purge comes lands after it.
+    let hold = Arc::new(Semaphore::new(0));
+    *h.bridge.hold.lock().expect("hold") = Some(Arc::clone(&hold));
+    let slow = {
+        let state = h.state.clone();
+        tokio::spawn(async move { ops::messages(&state, READ_CHANNEL, None).await })
+    };
+    let started = |log: &[(Instant, Event)]| {
+        log.iter()
+            .filter(|(_, event)| *event == Event::RecentStarted)
+            .count()
+    };
+    while started(&h.bridge.log.lock().expect("log")) < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    purge(&h.state).await;
+    *h.bridge.hold.lock().expect("hold") = None;
+    hold.add_permits(1);
+    let window = slow.await.expect("joined").expect("read");
+    assert_eq!(window.messages.len(), 3, "the caller still gets its read");
+    tokio::time::sleep(QUIET * 4).await;
+    assert_eq!(
+        h.bridge.flat_reads.load(Ordering::SeqCst),
+        0,
+        "a read begun before the purge was checked"
+    );
+    assert_eq!(
+        h.state
+            .recent_view_shadow
+            .tally(&channel(READ_CHANNEL))
+            .skipped,
+        2
+    );
+
+    ops::messages(&h.state, READ_CHANNEL, None)
+        .await
+        .expect("read");
+    let tally = compared(&h.state, READ_CHANNEL, 1).await;
+    assert_eq!((tally.reads, tally.compared, tally.skipped), (1, 1, 2));
 }
