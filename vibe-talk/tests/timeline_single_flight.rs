@@ -55,13 +55,35 @@ fn message(id: u64, content: &str, thread: bool) -> Message {
 /// A threaded provider whose channel holds a root, its reply, and whatever is posted.
 struct Threaded {
     messages: Mutex<Vec<Message>>,
+    /// When set, every read describes the channel as it stood when the read was ASKED and answers
+    /// this long after, as a bridge's scan does, while a post lands at once. Unset, it answers at
+    /// once (`CountingChat` adds the delay).
+    scan: Option<Duration>,
 }
 
 impl Threaded {
     fn new() -> Self {
         Self {
             messages: Mutex::new(vec![message(10, "root", true), message(11, "reply", true)]),
+            scan: None,
         }
+    }
+
+    /// A provider whose slow reads answer with the channel as it stood when they were asked.
+    fn scanning(scan: Duration) -> Self {
+        Self {
+            scan: Some(scan),
+            ..Self::new()
+        }
+    }
+
+    /// The channel now, handed over `scan` later.
+    async fn snapshot(&self) -> Vec<Message> {
+        let snapshot = self.messages.lock().unwrap().clone();
+        if let Some(scan) = self.scan {
+            tokio::time::sleep(scan).await;
+        }
+        snapshot
     }
 
     fn summary(&self) -> ThreadSummary {
@@ -102,7 +124,7 @@ impl ChatClient for Threaded {
         _before: Option<&MessageId>,
         _after: Option<&MessageId>,
     ) -> Result<Vec<Message>, ChatError> {
-        Ok(self.messages.lock().unwrap().clone())
+        Ok(self.snapshot().await)
     }
 
     async fn fetch_timeline(
@@ -111,12 +133,9 @@ impl ChatClient for Threaded {
         request: &TimelineRequest,
     ) -> Result<TimelinePage, ChatError> {
         let threads = request.view == TimelineView::Threads;
+        let snapshot = self.snapshot().await;
         Ok(TimelinePage {
-            messages: if threads {
-                Vec::new()
-            } else {
-                self.messages.lock().unwrap().clone()
-            },
+            messages: if threads { Vec::new() } else { snapshot },
             threads: if threads {
                 vec![self.summary()]
             } else {
@@ -151,9 +170,26 @@ struct Harness {
 }
 
 fn harness_with(toml: &str) -> Harness {
+    harness_over(
+        toml,
+        CountingChat::new(Arc::new(Threaded::new())).with_delay(READ),
+    )
+}
+
+/// Reads that take [`READ`] and describe the channel as it stood when they were asked, and posts
+/// that land at once: the slow bridge scan, against which a read that began before a post can be
+/// told from one that began after it.
+fn scanning_harness() -> Harness {
+    harness_over(
+        &testing::config_toml(),
+        CountingChat::new(Arc::new(Threaded::scanning(READ))),
+    )
+}
+
+fn harness_over(toml: &str, chat: CountingChat) -> Harness {
     let summarizer = Arc::new(vibe_talk::summarize::fake::FakeSummarizer::naming_threads());
     let (mut state, _discord, _store) = testing::state_with_backend(toml, summarizer.clone());
-    let chat = Arc::new(CountingChat::new(Arc::new(Threaded::new())).with_delay(READ));
+    let chat = Arc::new(chat);
     state.replace_chat(chat.clone());
     Harness {
         app: vibe_talk::http::router(state.clone()),
@@ -497,4 +533,92 @@ async fn a_shared_read_is_counted_under_the_reason_of_the_request_that_started_i
         .map(|row| (row.name, row.reason.as_str(), row.count))
         .collect();
     assert_eq!(reasons, [("fetch_timeline", "poll", 1)]);
+}
+
+/// A read of `path` begun at 0 ms, this server's own post at 50 ms, and the same read again at
+/// 100 ms, while the first is still running: what the second answered, and the id posted.
+async fn own_post_during_a_read(h: &Harness, path: &str) -> (Vec<String>, String) {
+    let first = tokio::spawn(call(
+        h.app.clone(),
+        "GET",
+        path.to_owned(),
+        READ_TOKEN,
+        None,
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, posted) = call(
+        h.app.clone(),
+        "POST",
+        format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        WRITE_TOKEN,
+        Some(json!({ "text": "mine" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    let id = posted["posted"]["id"].as_str().unwrap().to_owned();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, body) = get(&h.app, path, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, early) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{early}");
+    assert!(
+        !ids(&early).contains(&id),
+        "the fixture's first read saw a post made after it was asked: {early}"
+    );
+    (ids(&body), id)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_window_read_after_this_servers_own_post_shows_the_post() {
+    // Review of #278: the window turn let a read made after this server's own post reuse a fetch
+    // that began before it, because a post is not a live push until the provider echoes it. The
+    // MCP tools, the digest, a lookup by id and bankruptcy all read the window right after posting.
+    let h = scanning_harness();
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
+    let (answered, id) = own_post_during_a_read(&h, &path).await;
+    assert!(
+        answered.contains(&id),
+        "the window read made after our own post did not show it: {answered:?} (posted {id})"
+    );
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        2,
+        "the read after the post must be its own: {:?}",
+        h.chat.calls()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timeline_read_after_this_servers_own_post_shows_the_post() {
+    let h = scanning_harness();
+    let (answered, id) = own_post_during_a_read(&h, &timeline("view=main")).await;
+    assert!(
+        answered.contains(&id),
+        "the timeline read made after our own post did not show it: {answered:?} (posted {id})"
+    );
+    assert_eq!(
+        h.chat.count("fetch_timeline"),
+        2,
+        "the read after the post must be its own: {:?}",
+        h.chat.calls()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn window_reads_with_no_post_between_them_still_share_one_fetch() {
+    // The control for the two above, against the same slow scan: no post, one fetch.
+    let h = scanning_harness();
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
+    let (a, b) = tokio::join!(get(&h.app, &path, READ_TOKEN), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        get(&h.app, &path, READ_TOKEN).await
+    });
+    assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(ids(&a.1), ids(&b.1));
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        1,
+        "{:?}",
+        h.chat.calls()
+    );
 }

@@ -1935,7 +1935,9 @@ that nobody pushes is invisible for at most those few seconds. Only the provider
 the channel allowlist is checked before a request joins anything, and each caller's spoken forms,
 noise marks, thread names, read state, pins and bookmark are its own, so a read token still queues
 no thread naming. Window reads of a channel's newest messages (`/messages`, the digest, a summary's
-context, speech preparation) likewise share one fetch when they are asked together.
+context, speech preparation, the MCP read tools) share one fetch when they are asked together, by
+the same test: a read made after a live change, the purge or a post this server sent never takes a
+fetch that began before it, so an agent that posts and then reads the channel sees its post.
 
 The native backend includes accessible active and archived threads. It bounds discovery at 256
 threads and 100 pages per archived collection, retains pagination inventories for five minutes,

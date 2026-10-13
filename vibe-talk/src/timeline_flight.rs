@@ -28,10 +28,11 @@
 //! # Which requests are the same
 //!
 //! The same channel, view, thread, step back (`before`), forward cursor as the backend sees it, and
-//! page size — and the same CHANGE GENERATION of the channel: how many changes the live feed has
-//! delivered for it, how many storage purges there have been, and how many posts this server has
-//! sent to it. A request made after any of those is a different request, so it never joins or
-//! reuses a read that began before the change. That is what keeps the page's own re-reads honest:
+//! page size — and the same CHANGE GENERATION of the channel ([`crate::read_ahead::Changes`], the
+//! test the window reads share): how many changes the live feed has delivered for it, how many
+//! storage purges there have been, and how many posts this server has sent to it. A request made
+//! after any of those is a different request, so it never joins or reuses a read that began before
+//! the change. That is what keeps the page's own re-reads honest:
 //! it re-reads after a live message and after its own post, and the read that answers must be one
 //! that began after them. A change upstream that this server is not told of is invisible for at
 //! most the memory's few seconds, as it was invisible until the next read before.
@@ -55,6 +56,7 @@ use tokio::time::Instant;
 
 use crate::chat::ChatError;
 use crate::model::ChannelId;
+use crate::read_ahead::Changes;
 use crate::read_reason::ReadReason;
 use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 use crate::timeline_forward::GenericPosition;
@@ -137,12 +139,11 @@ impl Key {
     }
 }
 
-/// How many changes a channel had had when a request was made. See the module documentation.
+/// How many changes a channel had had when a request was made, and how many times this memory had
+/// been emptied. See the module documentation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct Generation {
-    pushes: u64,
-    purges: u64,
-    posts: u64,
+    changes: Changes,
     clears: u64,
 }
 
@@ -160,7 +161,6 @@ enum Entry {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<Key, Entry>,
-    posts: HashMap<ChannelId, u64>,
     clears: u64,
     next: u64,
 }
@@ -206,12 +206,6 @@ impl TimelineFlights {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Note that this server has just sent a post to `channel`, whether or not it landed: no read
-    /// that began before it answers a request made after it.
-    pub fn posted(&self, channel: &ChannelId) {
-        *self.lock().posts.entry(channel.clone()).or_default() += 1;
-    }
-
     /// Drop every kept answer and forget every read running. For the storage purge.
     pub fn clear(&self) {
         let mut inner = self.lock();
@@ -233,14 +227,14 @@ impl TimelineFlights {
 
     /// The answer to the request `key` names: a kept one, the one running, or a read started now.
     ///
-    /// `seen` is the channel's live-feed pushes and storage purges when the request was made
-    /// ([`crate::recent::ReadMark::seen`]). `memo` is how long a read this call starts is kept once
-    /// it lands; zero keeps nothing. `start` makes the read; it runs in a task of its own, inside
+    /// `changes` is what the channel had been through when the request was made
+    /// ([`crate::read_ahead::ReadAhead::changes`]). `memo` is how long a read this call starts is
+    /// kept once it lands; zero keeps nothing. `start` makes the read; it runs in a task of its own, inside
     /// the caller's [`ReadReason`], and is never cancelled by any caller going away.
     pub async fn read<F, Fut>(
         self: &Arc<Self>,
         mut key: Key,
-        seen: (u64, u64),
+        changes: Changes,
         memo: Duration,
         start: F,
     ) -> (Answer, Shared)
@@ -253,9 +247,7 @@ impl TimelineFlights {
         let (mut receiver, claim) = {
             let mut inner = self.lock();
             key.generation = Generation {
-                pushes: seen.0,
-                purges: seen.1,
-                posts: inner.posts.get(&key.channel).copied().unwrap_or(0),
+                changes,
                 clears: inner.clears,
             };
             inner.prune(Instant::now());
@@ -381,6 +373,15 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// What a channel had been through: `pushes` live changes and `posts` of this server's.
+    fn changes(pushes: u64, posts: u64) -> Changes {
+        Changes {
+            pushes,
+            purges: 0,
+            posts,
+        }
+    }
+
     fn key(view: TimelineView) -> Key {
         Key::new(
             &ChannelId("1".to_owned()),
@@ -421,13 +422,13 @@ mod tests {
         let ((a, how_a), (b, how_b)) = tokio::join!(
             flights.read(
                 key(TimelineView::Main),
-                (0, 0),
+                changes(0, 0),
                 memo,
                 counting(&reads, refused())
             ),
             flights.read(
                 key(TimelineView::Main),
-                (0, 0),
+                changes(0, 0),
                 memo,
                 counting(&reads, refused())
             ),
@@ -439,7 +440,7 @@ mod tests {
         let (again, how) = flights
             .read(
                 key(TimelineView::Main),
-                (0, 0),
+                changes(0, 0),
                 memo,
                 counting(&reads, Ok(())),
             )
@@ -454,28 +455,22 @@ mod tests {
         let flights = Arc::new(TimelineFlights::new());
         let reads = Arc::new(AtomicUsize::new(0));
         let memo = Duration::from_secs(3);
-        let read = |seen| {
+        let read = |changes| {
             flights.read(
                 key(TimelineView::Flat),
-                seen,
+                changes,
                 memo,
                 counting(&reads, Ok(())),
             )
         };
-        assert_eq!(read((0, 0)).await.1, Shared::Read);
-        assert_eq!(read((0, 0)).await.1, Shared::Remembered);
-        assert_eq!(read((1, 0)).await.1, Shared::Read, "after a push");
-        flights.posted(&ChannelId("1".to_owned()));
-        assert_eq!(read((1, 0)).await.1, Shared::Read, "after a post");
-        flights.posted(&ChannelId("elsewhere".to_owned()));
-        assert_eq!(
-            read((1, 0)).await.1,
-            Shared::Remembered,
-            "a post to another channel"
-        );
+        assert_eq!(read(changes(0, 0)).await.1, Shared::Read);
+        assert_eq!(read(changes(0, 0)).await.1, Shared::Remembered);
+        assert_eq!(read(changes(1, 0)).await.1, Shared::Read, "after a push");
+        assert_eq!(read(changes(1, 1)).await.1, Shared::Read, "after a post");
+        assert_eq!(read(changes(1, 1)).await.1, Shared::Remembered);
         flights.clear();
         assert!(flights.is_empty());
-        assert_eq!(read((1, 0)).await.1, Shared::Read, "after the purge");
+        assert_eq!(read(changes(1, 1)).await.1, Shared::Read, "after the purge");
         assert_eq!(reads.load(Ordering::SeqCst), 4);
     }
 
@@ -486,7 +481,7 @@ mod tests {
         let memo = Duration::from_secs(3);
         let waiting = flights.read(
             key(TimelineView::Main),
-            (0, 0),
+            changes(0, 0),
             memo,
             counting(&reads, Ok(())),
         );
@@ -516,7 +511,7 @@ mod tests {
         let (answer, how) = flights
             .read(
                 key(TimelineView::Main),
-                (0, 0),
+                changes(0, 0),
                 Duration::from_secs(3),
                 start,
             )

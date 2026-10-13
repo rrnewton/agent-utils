@@ -134,13 +134,35 @@ impl Held {
     }
 }
 
+/// What a channel had been through, as far as this server knows, when a read of it began: the live
+/// feed's pushes and the storage purges ([`crate::recent::ReadMark::seen`]), and the posts this
+/// server had sent to it ([`ReadAhead::posted`]). `#278 timeline-single-flight`.
+///
+/// The one test of whether a read that is running, or has just landed, may answer for another:
+/// both shared reads, the window ([`ops::window_shared`]) and the timeline
+/// ([`crate::timeline_flight`]), take a read for a caller's own only when the two have the same
+/// changes. A caller that has seen any change since may have missed it in that read.
+///
+/// A post has to be counted here on its own. It is not a live push until the provider echoes it
+/// back, seconds later, so without it a read made right after this server's own post — an MCP
+/// tool's, a digest's, bankruptcy's — could be answered by a fetch from before the post.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Changes {
+    /// Changes the live feed had delivered for the channel.
+    pub pushes: u64,
+    /// Storage purges, every channel together.
+    pub purges: u64,
+    /// Posts this server had sent to the channel, landed or not.
+    pub posts: u64,
+}
+
 /// What the last window fetch made through [`ReadAhead::window_turn`] read.
 #[derive(Clone, Debug)]
 pub struct WindowRead {
-    /// The channel's live-feed pushes and storage purges when the fetch began
-    /// ([`crate::recent::ReadMark::seen`]). A caller that has seen a change since does not take this
-    /// fetch for its own: it may have missed the change.
-    pub seen: (u64, u64),
+    /// What the channel had been through when the fetch began ([`ReadAhead::changes`]). A caller
+    /// that has seen a change since does not take this fetch for its own: it may have missed the
+    /// change.
+    pub changes: Changes,
     /// When it finished.
     pub finished: Instant,
     /// How many messages it asked for ([`ops::window_limit`]).
@@ -155,11 +177,11 @@ pub struct WindowRead {
 }
 
 impl WindowRead {
-    /// What `window` read, finishing now, from a fetch that began having `seen` the changes it had.
+    /// What `window` read, finishing now, from a fetch that began having seen `changes`.
     #[must_use]
-    pub fn of(window: &ops::Window, seen: (u64, u64)) -> Self {
+    pub fn of(window: &ops::Window, changes: Changes) -> Self {
         Self {
-            seen,
+            changes,
             finished: Instant::now(),
             limit: window.limit,
             ids: window.messages.iter().map(|m| m.id.clone()).collect(),
@@ -178,6 +200,8 @@ pub struct ReadAhead {
     timelines: Arc<crate::timeline_flight::TimelineFlights>,
     /// Per channel: the last window fetch made through [`ReadAhead::window_turn`].
     windows: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Option<WindowRead>>>>>,
+    /// Per channel: how many posts this server has sent to it ([`ReadAhead::posted`]).
+    posts: Mutex<HashMap<ChannelId, u64>>,
     /// [`THREAD_FETCHES_IN_FLIGHT`] permits, one per thread message lookup.
     lookups: tokio::sync::Semaphore,
     warming: Arc<AtomicBool>,
@@ -189,6 +213,7 @@ impl Default for ReadAhead {
             held: Mutex::default(),
             timelines: Arc::default(),
             windows: Mutex::default(),
+            posts: Mutex::default(),
             lookups: tokio::sync::Semaphore::new(THREAD_FETCHES_IN_FLIGHT),
             warming: Arc::default(),
         }
@@ -382,6 +407,37 @@ impl ReadAhead {
         &self.timelines
     }
 
+    /// Note that this server has just sent a post to `channel`, whether or not it landed (a failure
+    /// may have delivered): no shared read, window or timeline, that began before now answers a
+    /// request made after it. Call it when the provider has answered the post, not before, so a
+    /// read that began while the post was on its way is still one from before it. See [`Changes`].
+    pub fn posted(&self, channel: &ChannelId) {
+        let mut posts = self
+            .posts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *posts.entry(channel.clone()).or_default() += 1;
+    }
+
+    /// What `channel` has been through, for a read whose mark is `mark`: take the mark first, then
+    /// this, both before the provider is asked. See [`Changes`].
+    #[must_use]
+    pub fn changes(&self, channel: &ChannelId, mark: crate::recent::ReadMark) -> Changes {
+        let (pushes, purges) = mark.seen();
+        let posts = self
+            .posts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(channel)
+            .copied()
+            .unwrap_or(0);
+        Changes {
+            pushes,
+            purges,
+            posts,
+        }
+    }
+
     fn clear_at(&self, now: Instant) {
         if let Ok(mut held) = self.held.lock() {
             held.recent.clear();
@@ -406,8 +462,9 @@ impl ReadAhead {
     ///
     /// The guard holds what the last window fetch through this slot read, and when it finished. A
     /// caller that finds one that finished after its own start, was at least as wide as its own
-    /// would be, and began having seen every change the caller has, waited behind a fetch that has
-    /// just read the window, and should use that rather than read it again. [`ops::messages`] does
+    /// would be, and began having seen every change the caller has ([`Changes`]: pushes, purges and
+    /// this server's own posts), waited behind a fetch that has just read the window, and should use
+    /// that rather than read it again. [`ops::messages`] does
     /// exactly that, for every caller.
     pub async fn window_turn(
         &self,
@@ -846,7 +903,7 @@ mod tests {
                 limit: 50,
                 as_of: None,
             },
-            (0, 0),
+            Changes::default(),
         );
         let rebuilt = read_ahead.recall_window(&channel, &read).expect("all held");
         assert_eq!(
@@ -860,6 +917,28 @@ mod tests {
         assert!(
             read_ahead.recall_window(&channel, &read).is_none(),
             "a window missing a forgotten message was answered as the window"
+        );
+    }
+
+    #[test]
+    fn a_post_changes_its_own_channel_and_no_other() {
+        // `#278 timeline-single-flight`: what makes a read after this server's own post its own.
+        let read_ahead = ReadAhead::new();
+        let recent = crate::recent::RecentWindows::new();
+        let (here, elsewhere) = (ChannelId("1".to_owned()), ChannelId("2".to_owned()));
+        let before = read_ahead.changes(&here, recent.mark(&here));
+        assert_eq!(before, Changes::default());
+        read_ahead.posted(&here);
+        let after = read_ahead.changes(&here, recent.mark(&here));
+        assert_ne!(
+            after, before,
+            "a post left the channel's changes as they were"
+        );
+        assert_eq!(after.posts, 1);
+        assert_eq!(
+            read_ahead.changes(&elsewhere, recent.mark(&elsewhere)),
+            Changes::default(),
+            "a post changed another channel"
         );
     }
 

@@ -401,8 +401,11 @@ pub async fn messages(
 ///
 /// Every window read takes the channel's turn ([`crate::read_ahead::ReadAhead::window_turn`]). A
 /// caller that waited behind a fetch which finished after `began`, was at least as wide as its
-/// own, and began having seen every change this caller has seen — no live push or storage purge
-/// since — rebuilds that window from memory, cut to its own width, instead of reading it again.
+/// own, and began having seen every change this caller has seen ([`crate::read_ahead::Changes`]:
+/// no live push, storage purge or post of this server's since) rebuilds that window from memory,
+/// cut to its own width, instead of reading it again. The post is counted on its own because it is
+/// not a push until the provider echoes it, and a caller reading right after its own post must see
+/// it.
 /// If any message of it has been forgotten since (an edit or a delete was pushed), or the fetch
 /// failed, it reads the window itself.
 ///
@@ -420,9 +423,10 @@ pub(crate) async fn window_shared(
     // `#210 voice-catchup-speed`. Taken with the turn held and before the fetch, so it is both
     // what this caller has seen and where a fetch it makes begins. See `crate::recent`.
     let mark = state.live.recent().mark(&channel.id);
+    let changes = state.read_ahead.changes(&channel.id, mark);
     if let Some(read) = turn
         .as_ref()
-        .filter(|read| read.finished >= began && read.limit >= limit && read.seen == mark.seen())
+        .filter(|read| read.finished >= began && read.limit >= limit && read.changes == changes)
     {
         if let Some(mut messages) = state.read_ahead.recall_window(&channel.id, read) {
             // The newest `limit`, as this caller's own read would have answered.
@@ -441,7 +445,7 @@ pub(crate) async fn window_shared(
         }
     }
     let window = fetch_window(state, channel, limit, mark).await?;
-    *turn = Some(crate::read_ahead::WindowRead::of(&window, mark.seen()));
+    *turn = Some(crate::read_ahead::WindowRead::of(&window, changes));
     Ok((window, false))
 }
 
@@ -644,7 +648,9 @@ async fn shared_timeline(
         Forward::Generic(since) => format!("generic:{since:?}"),
     });
     let key = crate::timeline_flight::Key::new(channel, &backend, forward);
-    let seen = state.live.recent().mark(channel).seen();
+    let changes = state
+        .read_ahead
+        .changes(channel, state.live.recent().mark(channel));
     // Only a newest page or a delta is kept: a step back says nothing about the newest end, and the
     // same one is rarely asked twice in a few seconds.
     let memo = if request.before.is_none() {
@@ -656,7 +662,7 @@ async fn shared_timeline(
     let (answer, shared) = state
         .read_ahead
         .timelines()
-        .read(key, seen, memo, move || async move {
+        .read(key, changes, memo, move || async move {
             let (state, channel) = (state_for_read, channel_for_read);
             match resumed {
                 Some(Forward::Native(own)) => {
@@ -1809,9 +1815,9 @@ pub async fn reply_scoped(
                     .await
             }
         };
-        // Landed or not — a failure may have delivered — no timeline read that began before this
-        // post answers a request made after it. `#278 timeline-single-flight`.
-        state.read_ahead.timelines().posted(&info.id);
+        // Landed or not — a failure may have delivered — no shared read, window or timeline, that
+        // began before this post answers a request made after it. `#278 timeline-single-flight`.
+        state.read_ahead.posted(&info.id);
         match sent {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));
