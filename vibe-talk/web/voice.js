@@ -32391,7 +32391,12 @@ function forgetLiveFactRead() {
  * pull are such reads, and putting the event back over them kept a removed message on screen until
  * the fifteen-minute reconcile.
  *
- * @type {Map<string, {message: VibeTalk.Message | null, channel: string, epoch: number, at: number}>}
+ * `thread`, for a removal of a reply the store held with its thread record: the thread whose counts
+ * it came off. A read sent before the removal whose page does not carry the reply — Main's, which
+ * holds no replies — gave counts that may or may not have counted it, so that thread's views are
+ * owed a read sent after it.
+ *
+ * @type {Map<string, {message: VibeTalk.Message | null, channel: string, epoch: number, at: number, thread: string | null}>}
  */
 const livePatches = new Map();
 /**
@@ -32472,6 +32477,17 @@ function noteLiveArrival(message, live, facts) {
  * which holds no replies, it is usually a reply, and its root's count is on screen; the event does
  * not say which thread it was in. So it gets the read it always got, and every other view is owed.
  *
+ * NOR ONE THE STORE HOLDS BUT NEVER PLACED (`channelCanon.unplaced`): a live message without a thread
+ * record that no read has placed since — the bridge's every message, until its read lands. It may
+ * have been a reply anywhere, so its removal cannot say whose count it lowers; and the read its
+ * arrival owed, if it is still out, was cut with it counted. So it is taken off the rows at once and
+ * gets that same read, which goes behind the one still out.
+ *
+ * A REMOVED REPLY THAT WAS ITS THREAD'S LATEST ACTIVITY takes that activity away, and with it the
+ * place of the thread's card among the others. What the activity falls back to is the provider's to
+ * say (Slack's `latest_reply` moves back; another may keep it), so the list of threads is owed a read
+ * rather than given a guess.
+ *
  * @param {string} event
  * @param {any} payload
  */
@@ -32490,9 +32506,12 @@ function applyLiveMutation(event, payload) {
   if (channelCanon.channel !== channel) loadCanon(channel);
   liveEventEpoch += 1;
   pruneLivePatches();
-  livePatches.set(id, { message: edited, channel, epoch: liveEventEpoch, at: Date.now() });
-  if (edited === null) liveArrivals.delete(id);
   const held = channelCanon.messages.find((message) => String(message.id) === id);
+  livePatches.set(id, {
+    message: edited, channel, epoch: liveEventEpoch, at: Date.now(),
+    thread: edited === null && held ? replyThreadOf(held) : null,
+  });
+  if (edited === null) liveArrivals.delete(id);
   // The threads it is the first message of: by the store's copy, and by any summary's root.
   const rooted = new Set(patchSummaryRoots(id, edited));
   if (held && held.thread && held.thread.is_root === true) rooted.add(String(held.thread.id));
@@ -32500,7 +32519,12 @@ function applyLiveMutation(event, payload) {
     markLiveOwed(null, false);
     return false;
   }
-  if (rooted.size > 0) markLiveOwed(["threads", ...[...rooted].map((thread) => viewKey("thread", thread))]);
+  const unplaced = Boolean(held) && edited === null && channelCanon.unplaced.has(id);
+  if (unplaced) markLiveOwed(null, false);
+  const latest = Boolean(held) && edited === null && latestActivityOf(held);
+  if (rooted.size > 0 || latest) {
+    markLiveOwed(["threads", ...[...rooted].map((thread) => viewKey("thread", thread))]);
+  }
   const positions = document.hidden ? null : liveDrawPositions();
   if (held && edited) foldLiveMessage(edited, true, false);
   else if (held) removeHeldMessage(held);
@@ -32509,10 +32533,34 @@ function applyLiveMutation(event, payload) {
       liveArrivedHidden = true;
       liveChangedHidden = true;
     }
-    return true;
+    return !unplaced;
   }
   if (held || rooted.size > 0) drawLiveChange(positions);
-  return true;
+  return !unplaced;
+}
+
+/**
+ * Whether `held`, a reply, gave its thread's summary the latest activity it carries: none later is
+ * known. A summary whose activity cannot be told apart counts as given by it.
+ *
+ * @param {VibeTalk.Message} held
+ */
+function latestActivityOf(held) {
+  const thread = replyThreadOf(held);
+  if (thread === null) return false;
+  const summary = channelCanon.threads.find((candidate) => String(candidate.id) === thread);
+  return Boolean(summary) && !(timeOf(summary, "updated_at") > timeOf(held, "timestamp"));
+}
+
+/**
+ * The thread whose counts `message` is one of, by its thread record: a reply's, not a root's, and not
+ * in a channel that is that one thread. Null otherwise, and for a message with no record.
+ *
+ * @param {VibeTalk.Message} message
+ */
+function replyThreadOf(message) {
+  const thread = threadOf(message);
+  return thread === null || message.thread.is_root === true || thread === channelCanon.scope ? null : thread;
 }
 
 /**
@@ -32550,8 +32598,8 @@ function removeHeldMessage(held) {
   channelCanon.dismissed.delete(id);
   channelCanon.unplaced.delete(id);
   archivedIds.delete(id);
-  const thread = threadOf(held);
-  if (thread === null || held.thread.is_root === true || thread === channelCanon.scope) return;
+  const thread = replyThreadOf(held);
+  if (thread === null) return;
   const fewer = (record) => (typeof record.reply_count === "number" && record.reply_count > 0
     ? { ...record, reply_count: record.reply_count - 1 } : record);
   channelCanon.messages = channelCanon.messages.map((message) =>
@@ -32570,7 +32618,8 @@ function removeHeldMessage(held) {
  *
  * WHAT THE READ OWNS STANDS. An edit puts back its words; the thread record and the reactions are
  * the read's where it has them. A count the read gave is not lowered by an event it predates
- * (`applyThreadFacts`).
+ * (`applyThreadFacts`) — nor by a removal its page does not carry, whose reply it may or may not
+ * have counted: that thread's views are read again instead (`livePatches`' `thread`).
  *
  * @param {object} payload
  */
@@ -32585,11 +32634,16 @@ function reapplyLivePatches(payload) {
     if (!channelCanon.messages.some((held) => String(held.id) === id)) foldLiveMessage(arrival.message, arrival.live, false);
     if (arrival.facts) applyThreadFacts(arrival.facts);
   }
+  /** The threads whose counts this read gave from before a removal it may not have counted. */
+  const uncertain = new Set();
   for (const [id, patch] of livePatches) {
     if (patch.channel !== channelCanon.channel || patch.epoch <= sent) continue;
     patchSummaryRoots(id, patch.message);
     const held = channelCanon.messages.find((message) => String(message.id) === id);
-    if (!held) continue;
+    if (!held) {
+      if (patch.message === null && patch.thread !== null) uncertain.add(patch.thread);
+      continue;
+    }
     if (patch.message === null) {
       removeHeldMessage(held);
       continue;
@@ -32602,6 +32656,14 @@ function reapplyLivePatches(payload) {
     };
     if (sameMessage(held, kept)) continue;
     channelCanon.messages = channelCanon.messages.map((message) => (message === held ? kept : message));
+  }
+  // A removed reply the page does not carry: its counts were cut before the removal, after the reply
+  // or before it, and nothing here can tell which. So that thread's views are owed a read sent after
+  // the removal, and the columns showing one are read for it once this fold is done.
+  if (uncertain.size > 0) {
+    const keys = ["main", "flat", "threads", ...[...uncertain].map((thread) => viewKey("thread", thread))];
+    markLiveOwed(keys, false);
+    Promise.resolve().then(() => readOwedColumns(keys));
   }
 }
 

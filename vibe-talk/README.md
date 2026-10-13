@@ -3051,7 +3051,10 @@ A read sent *before* a live event, which may answer from before it, does not und
 removal or the placed message is put back over that read's answer, for the server's fifty-second
 bound. A read sent *after* it is the service's answer since, and is believed as it stands — the
 stream reset's read, the reader's pull, entering a view, the poll: a message it lacks is gone, an
-edit it carries is the latest, a count it gives is the count.
+edit it carries is the latest, a count it gives is the count. The one thing a read sent before an
+event cannot be corrected by it for is a count it gave from before a removed reply its page does not
+carry (Main's carries no replies), which it may or may not have counted: that thread's views are
+read again instead.
 
 Some events leave something only a read can say, and then every view they may have changed is
 read: a column showing one now, at most once every ten seconds whatever arrives meanwhile; any other
@@ -3060,7 +3063,11 @@ facts, or whose facts leave a reply's count unsaid, or name a thread the store's
 lacks — without a thread record, as the bridge's stream sends every message today, it may be in any
 thread, the one open on the right included, so Main, the right column and every other view are owed
 a read; a removal of a message the store does not hold, usually a reply behind Main, whose root's
-count only a read corrects, and which gets the read every removal had before; and an edit or
+count only a read corrects, and which gets the read every removal had before — as does a removal of
+a message the stream delivered without a thread record and no read has placed since, which may have
+been a reply anywhere, and whose own read may still be out, cut with it counted; a removal of the
+reply that gave its thread its latest activity, after which only a read of the list of threads says
+what the provider puts that activity back to, and so where the thread's card goes; and an edit or
 removal of a thread's first message, after which only a read of the list of threads, or of the
 thread, says what the provider titles it (Slack titles a thread by its root's first line) or
 whether it outlives its root. On the voice pane a live message is not read for at all; entering the

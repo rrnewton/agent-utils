@@ -52155,3 +52155,99 @@ test("`#278 page-live-reads`: a catch-up reply the adapter replays after the rea
   assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)",
     `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} on coming back`);
 });
+
+test("`#278 page-live-reads`: a reply the stream never placed, removed while the read it owed is out, is taken off its root's count", async () => {
+  const { page, server } = await pushedPage();
+  const root = page.messages.find((m) => m.id === "201");
+  const held = holdCutAnswers(server);
+  const reply = server.post(message({ id: "570", content: "a bridge reply, then removed", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  await deliver(page, page.stream(), sseMessage(bareOf(reply)));
+  await page.settle();
+  assert.equal(held.cut.length, 1, "the arrival was not read for, so this proves nothing");
+  server.remove("570");
+  root.thread.reply_count -= 1;
+  server.edit("201", {});
+  await deliver(page, page.stream(), sseDelete("remove-570", CHANNEL.id, "570"));
+  await page.settle();
+  held.open();
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  await healthyWalk(page, 120000);
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)",
+    `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} after the reply was removed`);
+});
+
+test("`#278 page-live-reads`: removing the reply that was its thread's latest activity reads the list of threads again, which puts its card back", async () => {
+  const { page, server, data } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  const [first, second] = data.threads;
+  assert.deepStrictEqual(cardIds(page), [first.id, second.id], "the cards are not oldest activity first");
+  const was = page.threads.find((t) => t.id === first.id);
+  const reply = server.post(message({ id: "590", content: "a placed answer, later removed",
+    thread: { ...data.messages[1].thread, is_root: false } }));
+  page.threads = page.threads.map((t) => (t.id === first.id ? { ...t, reply_count: 2, updated_at: reply.timestamp } : t));
+  server.threadChanged.set(first.id, ++server.revision);
+  await deliver(page, page.stream(), sseMessage(reply, { thread_facts: placedFacts(reply, 2) }));
+  await page.settle();
+  assert.deepStrictEqual(cardIds(page), [second.id, first.id], "the placed reply did not move its card to the foot, so this proves nothing");
+  // Removed, and the provider puts the thread's activity back, as Slack's latest_reply does.
+  server.remove("590");
+  page.threads = page.threads.map((t) => (t.id === first.id ? { ...t, reply_count: 1, updated_at: was.updated_at } : t));
+  server.threadChanged.set(first.id, ++server.revision);
+  await deliver(page, page.stream(), sseDelete("remove-590", CHANNEL.id, "590"));
+  await page.settle();
+  await healthyWalk(page, 120000);
+  assert.deepStrictEqual(cardIds(page), [first.id, second.id], "the card kept the place the removed reply gave it");
+});
+
+test("`#278 page-live-reads`: a placed reply removed while a read sent before it is out, cut with the reply counted, is taken off its root's count", async () => {
+  const { page, server } = await pushedPage();
+  const root = page.messages.find((m) => m.id === "201");
+  // The reconcile's read goes out before the reply; the service cuts its answer after the reply was
+  // posted and before it was removed, and the answer lands after both events.
+  let cut = null;
+  let land = null;
+  const landed = new Promise((resolve) => { land = resolve; });
+  server.hold = {
+    respond: (path) => new Promise((resolve) => {
+      cut = () => {
+        const answer = server.answer(path).then(async (response) => {
+          const text = await response.text();
+          return { ...response, text: async () => text };
+        });
+        landed.then(() => resolve(answer));
+      };
+    }),
+  };
+  page.setClock(page.clock() + TIMELINE_RECONCILE_MS);
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "no reconcile was armed behind the pushed stream");
+  await page.settle();
+  assert.ok(cut, "the reconcile did not read, so this proves nothing");
+  server.hold = null;
+  const reply = server.post(message({ id: "575", content: "a placed reply, then removed", thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count = 2;
+  server.edit("201", {});
+  await deliver(page, page.stream(), sseMessage(reply, { thread_facts: placedFacts(reply, 2) }));
+  await page.settle();
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(2)", "the placed reply was not counted, so this proves nothing");
+  cut();
+  await page.settle();
+  server.remove("575");
+  root.thread.reply_count = 1;
+  server.edit("201", {});
+  await deliver(page, page.stream(), sseDelete("remove-575", CHANNEL.id, "575"));
+  await page.settle();
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)", "the removal was not counted, so this proves nothing");
+  land();
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  await healthyWalk(page, 120000);
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)",
+    `Main's root says ${threadBadge(rowWithId(page, "201")).textContent}: the read cut before the removal had the last word`);
+});
