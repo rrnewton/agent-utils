@@ -281,7 +281,11 @@ fn state_pieces_with(
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
         message_cache,
-        post_gate: Arc::new(crate::post_gate::PostGate::new()),
+        // Numbered from one, so a test can name the sends it makes; a server numbers from its clock.
+        post_gate: Arc::new(crate::post_gate::PostGate::with_ttl_and_numbering(
+            crate::post_gate::PROPOSAL_TTL,
+            0,
+        )),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),

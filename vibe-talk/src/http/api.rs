@@ -2588,7 +2588,13 @@ mod tests {
         // mutation, so it cannot go through the function that appends to the end and follows.
         // `turnNode` is now the thing that decides what a turn looks like, and therefore the
         // thing that has to fold. The property asserted is unchanged; the name moved.
-        for renderer in ["function turnNode(", "function discordNode("] {
+        // `#270 voice-transcript-markers`: a frozen send card is a row of the transcript too, and
+        // folds a long message as every other row does.
+        for renderer in [
+            "function turnNode(",
+            "function discordNode(",
+            "function sentCardNode(",
+        ] {
             assert!(
                 function_body(VOICE_JS, renderer).contains("foldable("),
                 "`{renderer}` in web/voice.js no longer folds long messages, so the two message \
@@ -2617,7 +2623,15 @@ mod tests {
         // the transcript, and therefore the thing that has to decide whether to follow, is
         // `transcriptSeam`. The property asserted is unchanged; the name of the function that has
         // to satisfy it moved.
-        for renderer in ["function line(", "function transcriptSeam("] {
+        // `#269 approval-card-inline` and `#270 voice-transcript-markers` put two more things at
+        // the end of the list: the send card, and the frozen card it becomes. Both follow only a
+        // reader who was already at the newest line.
+        for renderer in [
+            "function line(",
+            "function transcriptSeam(",
+            "function showPostProposal(",
+            "function placeSentCard(",
+        ] {
             let body = function_body(VOICE_JS, renderer);
             assert!(
                 body.contains("followIfPinned("),
@@ -2629,6 +2643,11 @@ mod tests {
                  defect: a reader looking at older messages gets thrown to the bottom"
             );
         }
+        // And the function that moves the card between the lists never scrolls one.
+        assert!(
+            !function_body(VOICE_JS, "function placePostCard(").contains("scrollToNewest("),
+            "`placePostCard` in web/voice.js scrolls the list it puts the card in"
+        );
     }
 
     #[test]
