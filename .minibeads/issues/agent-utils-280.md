@@ -1,12 +1,13 @@
 ---
 title: 'scroll-stability: the message lists never jump on their own, and a thread opens at its newest message'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-13T21:50:59.211408525+00:00
-updated_at: 2026-10-13T21:50:59.211408525+00:00
+updated_at: 2026-10-13T22:05:40.770356755+00:00
+closed_at: 2026-10-13T22:05:40.770356635+00:00
 ---
 
 # Description
