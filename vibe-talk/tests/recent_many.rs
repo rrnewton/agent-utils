@@ -552,6 +552,7 @@ impl ChatClient for Gathered {
                         messages,
                         as_of: as_of.clone(),
                         exhausted: false,
+                        notice: None,
                     })
             };
             answers.push((channel.clone(), read));

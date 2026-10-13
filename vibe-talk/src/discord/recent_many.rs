@@ -153,6 +153,7 @@ pub fn parse_recent(
             messages,
             as_of,
             exhausted: exhausted && excess == 0,
+            notice: None,
         };
         out.push((channel, crate::chat::since_trimmed(read, ask.since_ms)));
     }

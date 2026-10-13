@@ -427,6 +427,7 @@ impl ChatClient for Recorder {
             messages: vec![self.message.clone()],
             as_of: Some("2026-10-12T09:00:00Z".to_owned()),
             exhausted: false,
+            notice: None,
         })
     }
     fn polls_thread_replies(&self, _channel: &ChannelId) -> bool {
@@ -521,6 +522,7 @@ impl ChatClient for Recorder {
                         messages: vec![self.message.clone()],
                         as_of: Some("2026-10-12T10:00:00Z".to_owned()),
                         exhausted: false,
+                        notice: None,
                     }),
                 )
             })

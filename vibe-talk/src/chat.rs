@@ -387,6 +387,11 @@ pub struct RecentRead {
     /// Never inferred from a short read: a provider can drop rows it cannot represent, so fewer
     /// messages than asked for is not a proof. False by default, and for every provider today.
     pub exhausted: bool,
+    /// What the provider said it left out, when the page this read came from carried a notice
+    /// ([`crate::threads::TimelinePage::notice`]). Such a read lists nothing completely: the
+    /// message cache takes no claim from it (`#208 persistent-cache`). `None` for every read but
+    /// a bridge's Flat page that said so.
+    pub notice: Option<String>,
 }
 
 /// One read the live poller makes of a channel whose provider reads its thread replies apart.
@@ -953,6 +958,7 @@ pub trait ChatClient: Send + Sync {
             messages: self.fetch_recent(channel, limit).await?,
             as_of: None,
             exhausted: false,
+            notice: None,
         })
     }
 
@@ -1589,6 +1595,7 @@ pub fn since_trimmed(read: RecentRead, since_ms: Option<i64>) -> RecentRead {
         messages,
         as_of: read.as_of,
         exhausted: read.exhausted && !trimmed,
+        notice: read.notice,
     }
 }
 
@@ -2091,6 +2098,7 @@ mod recent_many_tests {
                 messages: self.0.fetch_recent(channel, limit).await?,
                 as_of: Some("2026-10-13T12:00:00Z".to_owned()),
                 exhausted: true,
+                notice: None,
             })
         }
 
@@ -2164,6 +2172,7 @@ mod recent_many_tests {
                 messages: vec![old, timeless],
                 as_of: None,
                 exhausted: true,
+                notice: None,
             },
             Some(BASE_MS),
         );
@@ -2173,6 +2182,7 @@ mod recent_many_tests {
             messages: read.messages.clone(),
             as_of: None,
             exhausted: true,
+            notice: None,
         };
         assert_eq!(since_trimmed(untouched.clone(), None), untouched);
     }
@@ -2311,6 +2321,7 @@ mod lookup_tests {
                 messages: self.main.fetch_recent(channel, limit).await?,
                 as_of: self.as_of.clone(),
                 exhausted: self.exhausted,
+                notice: None,
             })
         }
 

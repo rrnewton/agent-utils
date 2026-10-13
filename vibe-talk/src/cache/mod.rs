@@ -78,6 +78,7 @@ pub mod file;
 pub mod grant;
 pub mod marker;
 pub mod merge;
+pub mod observe;
 mod reader;
 pub mod rows;
 pub mod schema;

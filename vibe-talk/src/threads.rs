@@ -222,7 +222,8 @@ impl TimelinePage {
     /// A bridge already pages that way; this holds the shape whatever it sends, so a caller cannot
     /// tell from the shape which endpoint answered. Thread membership is kept: it is true of the
     /// message, and a reader that files messages by thread uses it. Never `exhausted`: a page that
-    /// says it has no more is not a proof of a channel's start that any caller relies on yet.
+    /// says it has no more is not a proof of a channel's start that any caller relies on yet. The
+    /// page's notice is kept: a read the provider says it bounded proves nothing complete.
     #[must_use]
     pub fn into_recent(self, limit: u16) -> crate::chat::RecentRead {
         let mut messages = self.messages;
@@ -234,6 +235,7 @@ impl TimelinePage {
             messages,
             as_of: self.as_of,
             exhausted: false,
+            notice: self.notice,
         }
     }
 }

@@ -121,6 +121,7 @@ impl ChatClient for Bridge {
             messages,
             as_of: self.as_of.lock().expect("as_of").clone(),
             exhausted: false,
+            notice: None,
         })
     }
 

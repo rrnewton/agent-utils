@@ -1469,6 +1469,7 @@ impl ChatClient for HttpDiscordClient {
                 messages: self.fetch_page(channel, limit, None, None).await?,
                 as_of: None,
                 exhausted: false,
+                notice: None,
             }),
             crate::config::RecentView::Flat => self
                 .flat_recent(channel, limit)
