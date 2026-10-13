@@ -1,10 +1,11 @@
 ---
 title: 'voice-send-approval: a Settings switch for approving voice-agent sends, confirmed by voice or tap when on, direct when off'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-13T00:24:34.624786918+00:00
-updated_at: 2026-10-13T00:24:34.624786918+00:00
+updated_at: 2026-10-13T07:33:39.292792233+00:00
+closed_at: 2026-10-13T07:33:39.292792092+00:00
 ---
 
 # Description

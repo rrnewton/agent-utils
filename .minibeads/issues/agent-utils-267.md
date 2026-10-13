@@ -1,10 +1,11 @@
 ---
 title: 'quote-reply: highlighting part of a message turns Reply into Quote Reply, which starts the reply with that text quoted'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-13T02:18:08.520768255+00:00
-updated_at: 2026-10-13T02:18:08.520768255+00:00
+updated_at: 2026-10-13T07:33:39.296788562+00:00
+closed_at: 2026-10-13T07:33:39.296788462+00:00
 ---
 
 # Description
