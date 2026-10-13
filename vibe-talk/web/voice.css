@@ -5566,9 +5566,38 @@ a.search-hit-link {
   overflow: hidden;
 }
 
-/* Docked at the foot of another screen, the words are three lines and More. */
+/* Docked at the foot of another screen, the words are three lines and More — and opened, they are
+   the ONE part of the card that scrolls. The card itself never does: a card that scrolled as a whole
+   put the line saying where it goes, the status line, Don't send and Send below its own fold, which
+   is exactly what a settling spoken yes must never do to Don't send. So the words are bounded by
+   the room the screen has once the rest of the card and a strip of the screen above it are laid
+   out (about 28rem of a phone), never less than two lines, and every other line of the card is
+   always on screen. */
+#post-confirm[data-place="dock"] #post-confirm-text {
+  max-height: max(2.6rem, min(14rem, 100dvh - 28rem));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 #post-confirm[data-place="dock"][data-folded] #post-confirm-text {
-  max-height: 4.5rem;
+  max-height: max(2.6rem, min(4.5rem, 100dvh - 28rem));
+  overflow: hidden;
+}
+
+/* A short screen — a phone turned sideways, or Reply with the keyboard up taking half of it — has
+   no room for the card as a phone held upright does. Docked there it drops the heading, which the
+   card's accessible name still carries, and the words are two lines that scroll in place rather
+   than a fold and a More under them: what the card confirms, where it goes, its status and both
+   buttons, and nothing else. */
+@media (max-height: 500px) {
+  #post-confirm[data-place="dock"] #post-confirm-title,
+  #post-confirm[data-place="dock"] #post-confirm-more {
+    display: none;
+  }
+
+  #post-confirm[data-place="dock"][data-folded] #post-confirm-text {
+    overflow-y: auto;
+  }
 }
 
 #post-confirm-more {
@@ -5687,14 +5716,19 @@ a.search-hit-link {
 }
 
 /* Docked at the foot of Reply, Threads, Settings or Help: its own row of the body, under the screen,
-   so the screen above it still scrolls and nothing is covered. */
+   so the screen above it still scrolls and nothing is covered. Never a scroll box of its own: only
+   its words scroll (above), so its buttons are always laid out on screen.
+
+   EVERY inset, the bottom one included. Off the main screen the control pane, which carries the
+   bottom inset everywhere else, is hidden, and this card is the last thing on the screen: on a phone
+   with a home indicator, Send would sit half under it and Don't send in the corner's curve — the
+   curve that ate the first word of the status line on the owner's iPhone. A desktop browser and
+   Chromium's emulation both report a zero inset, so nothing but this declaration can catch that. */
 #frame-body > #post-confirm {
   grid-row: 3;
   margin: 0;
-  max-height: 60dvh;
-  overflow-y: auto;
   border-radius: 0.5rem 0.5rem 0 0;
-  padding: 0.6rem calc(0.75rem + env(safe-area-inset-right)) 0.6rem
+  padding: 0.6rem calc(0.75rem + env(safe-area-inset-right)) calc(0.6rem + env(safe-area-inset-bottom))
     calc(0.75rem + env(safe-area-inset-left));
 }
 

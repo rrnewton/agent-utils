@@ -310,18 +310,20 @@ steps:
   # down a 393x852, 360x780 and 375x667 phone in every run (one and thirty rows, banner up or gone,
   # short and long draft), uncovered and wholly on screen, and both buttons held when it appears;
   # then Send freezes it into the transcript (`#270 voice-transcript-markers`), the claim of its send
-  # follows the commit, and a reload restores the same card. Measured on 2026-10-13: about 100s wall.
+  # follows the commit, and a reload restores the same card. Docked under Settings the card never
+  # scrolls as a whole: folded and after More, where it goes, its status and both buttons stay on
+  # screen, on the three phones and at 667x375 and 375x330. Measured on 2026-10-13: about 120s wall.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold and frozen card in current Chromium at 393x852, 360x780 and 375x667
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
     timeout: 300
-    cpu_timeout: 150
+    cpu_timeout: 200
     hint:
       resources: {browser: 1}
-      est_duration_s: 100
+      est_duration_s: 120
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
