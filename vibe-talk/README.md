@@ -7561,7 +7561,9 @@ call shows it too, tap only. It goes at its lapse.
 **A draft that was not sent leaves a line where it was waiting** (`#270 voice-transcript-markers`):
 "Not sent", with one sentence saying why — Don't send, a spoken no, a lapse, or a Hang up with it
 still waiting. Each is drawn only on the server's word: a withdrawal once the server took it, a
-lapse once the server says the draft expired. A draft a newer one replaced, or one somebody else
+lapse once the server says the draft expired. A Hang up's line says the draft was not posted then
+and that the page stopped offering it, which stays true if a reloaded page sends it before it
+lapses: its sent card then follows the line. A draft a newer one replaced, or one somebody else
 settled, leaves none. On a server that keeps records the line is kept as a `not_sent` marker in the
 draft's conversation, so a reload draws it in the same words.
 
@@ -7728,8 +7730,10 @@ far are a yes or the start of one ("ye", "ok se") — its row is drawn out of si
 only if that yes sends. Anything else brings it back in its own place: words that cannot be a yes,
 a judgement that does not take it, "wait" or a tap in the settle window, a refused or lost commit,
 the end of the call, or a bound (ten seconds without a judgement, twenty while it sends). So a turn
-that starts like a yes and becomes something else appears a moment late, and a yes never appears and
-then vanishes. The record always keeps the yes as an ordinary `you` turn; on a server that keeps
+that starts like a yes and becomes something else appears a moment late, and a yes that is acted on
+does not flash up first. One exception: a yes whose commit's answer was lost comes back, because
+nobody can yet say it sent, and goes again — drawn into the card — if the server's send memory then
+reports the send approved by voice. The record always keeps the yes as an ordinary `you` turn; on a server that keeps
 records it is tagged as the answer to the proposal when the page had acted on it by the time it was
 filed, and a reload hides it only when a `sent` row approved by voice for that proposal follows it.
 A tag on a yes that then sent nothing hides nothing.
