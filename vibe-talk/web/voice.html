@@ -1452,6 +1452,32 @@
               <p class="hint">Provider id: <code id="agent-id" class="agent-id"></code></p>
             </section>
 
+            <section class="settings-group">
+              <div class="group-head">
+                <h2>Voice</h2>
+                <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="What this changes">?</button>
+              </div>
+              <!--
+                `#264 voice-send-approval`. The SERVER's setting, not this browser's: it decides
+                what the agent's post_reply does and which prompt the server hands the agent, for
+                every device and every voice provider. So it is drawn from client-config and redrawn
+                from what the PUT answers, as the noise rules are, never from the click alone.
+
+                ON by default. Each state has one honest line in `#voice-ask-before-send-state`,
+                written by `renderVoiceSendSetting` in web/voice.js: what the agent does, and — for
+                off — what that exposes. Hidden as a whole, editor and all, when the server does not
+                report the setting, which is an older server that always asks.
+              -->
+              <div id="voice-send-editor" hidden>
+                <label class="toggle">
+                  <input id="voice-ask-before-send" type="checkbox" checked />
+                  Ask me before the voice agent sends
+                </label>
+                <p class="hint">Takes effect from the agent's next call. An agent whose prompt was pasted into a provider console by hand needs the new prompt pasted again.</p>
+              </div>
+              <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
+            </section>
+
             <!--
               LAST, and that is the change. This is a READOUT, not a setting — it says what the
               current conversation is and what the last close code was — and it was occupying the
@@ -2059,6 +2085,38 @@
                 with access to that machine's filesystem can read it, and it holds both your own
                 speech and any channel text the assistant read out to you. Older conversations are
                 dropped automatically once the server's retention limit is reached.
+              </p>
+            </details>
+
+            <details id="help-voice-send" class="help-entry">
+              <summary><h2>Asking before the voice agent sends</h2></summary>
+              <p class="hint">
+                On, which is how this server ships, the voice agent never posts by itself. When you
+                ask it to send something it drafts the message, reads it back word for word and
+                asks <em>Send it?</em>. A card shows the exact text. Tap <strong>Send</strong>, or
+                answer with a plain <em>yes</em>, <em>yeah</em>, <em>yep</em>, <em>send it</em>,
+                <em>do it</em>, <em>go ahead</em>, <em>sure</em> or <em>please do</em> — one word
+                of filler such as <em>yes please</em> is fine. This page, not the agent, decides
+                that you said yes: only right after a read-back that you heard to the end without
+                interrupting, only for the draft this call made, and only if the read-back said
+                every word of the card. <em>No</em>, <em>cancel</em>, <em>stop</em> or
+                <em>wait</em> withdraws the draft. Anything longer — "yes, and tell him I'm late" —
+                sends nothing. The page then tells the agent, and you, whether it was sent.
+              </p>
+              <p class="hint">
+                It cannot tell your voice from anyone else's: a passenger or the radio saying
+                <em>yeah</em> straight after a read-back counts as you. A short word is also the
+                easiest for speech recognition to mishear. Links, code and numbers are rarely read
+                out exactly, so those drafts need a tap. Spoken yes needs echo cancellation on, so
+                the agent's own <em>Send it?</em> is not heard as your answer.
+              </p>
+              <p class="hint">
+                Off, the agent posts as soon as you ask, and tells you once the server says it was
+                sent. There is no read-back and no card. That also means a chat
+                message the agent reads could talk it into posting, which is why this is on unless
+                you turn it off. The change applies to the server at once and to the agent from its
+                next call; an agent whose prompt was pasted into a provider console by hand needs
+                the new prompt pasted again.
               </p>
             </details>
 
