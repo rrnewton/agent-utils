@@ -1,10 +1,11 @@
 ---
 title: 'upstream-clear-polish: a Mark read now button instead of the relabelled checkbox, and fewer read-state quota calls'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T19:42:39.424940790+00:00
-updated_at: 2026-10-12T19:42:39.424940790+00:00
+updated_at: 2026-10-13T03:44:39.861531726+00:00
+closed_at: 2026-10-13T03:44:39.861531597+00:00
 ---
 
 # Description

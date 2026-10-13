@@ -1,12 +1,13 @@
 ---
 title: 'reply-new-thread: offer ''start a new thread'' only where branching is possible'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.469810651+00:00
-updated_at: 2026-10-04T10:09:55.469810651+00:00
+updated_at: 2026-10-13T03:44:39.857656184+00:00
+closed_at: 2026-10-13T03:44:39.857656075+00:00
 ---
 
 # Description
