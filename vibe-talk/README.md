@@ -172,8 +172,9 @@ device that never read All, where every message with replies would otherwise say
 happened to be opened — the page reads All's newest page once, behind Main: no loading line, nothing
 waits on it, and a view switch is drawn from what is held as ever. The counts are then exact for
 every thread All brings the replies of — on Google Chat all of them, on Slack at most ten (below). It
-is not free: on Slack one read of All is about eleven of the chat service's calls (the channel's
-history, and one per thread it brings replies for); on Google Chat it is one more page. So it happens
+is not free: on Slack one read of All is a few of the chat service's calls for the channel's history,
+plus one for each thread with new replies since the server last read it (a thread it has not read
+in fifteen minutes is read in full); on Google Chat it is one more page. So it happens
 at most once every five minutes per channel, counted from the last read of All of any kind, including
 one saved on the device; only for news — a message already seen at the same count by the last such
 read does not ask again; and never while the page is hidden. A read that fails waits out the same
@@ -1074,6 +1075,13 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   where it stopped. The thread list scans the newest 10 pages of history and says so when it
   stopped there; the flat view includes replies for at most 10 threads per page and the newest
   50 replies of each, and says so when either bound applied.
+* **The flat view rereads only threads that moved.** A thread root reports its reply count and
+  latest reply, so a flat read reuses the replies the server already holds for a thread whose
+  root has not changed (no call), and reads only the newer replies of one that has (one call,
+  `conversations.replies` with `oldest=`). A thread whose reply count fell or does not add up is
+  read in full, and so is every thread not read in full for fifteen minutes. An edit to a reply
+  changes nothing on its root, so it can take up to those fifteen minutes to show in the flat
+  view. Opening the thread shows it at once.
 * **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.

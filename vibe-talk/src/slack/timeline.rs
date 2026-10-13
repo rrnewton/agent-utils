@@ -12,7 +12,9 @@
 //!   exists in this conversation.
 //! * **Flat** — the Main page plus the replies of the threads rooted on it, at most
 //!   [`FLAT_MAX_THREADS`] threads and the newest [`FLAT_MAX_REPLIES`] replies of each, merged
-//!   oldest first. A notice states the bound whenever it applied.
+//!   oldest first. A notice states the bound whenever it applied. Only the threads whose root
+//!   moved since the last Flat read are read again, and only from their newest reply held; every
+//!   thread is read in full at least every [`FLAT_RECONCILE`] (`HttpSlackClient::flat_replies`).
 //!
 //! Cursors are opaque, bound to the channel, view and thread they were issued for, and carry a
 //! Slack `ts` (or, for the thread list, an activity instant and a root) as their boundary.
@@ -39,6 +41,12 @@ pub const THREAD_SCAN_PAGES: usize = 10;
 pub const FLAT_MAX_THREADS: usize = 10;
 /// Newest replies of each thread one Flat page includes.
 pub const FLAT_MAX_REPLIES: usize = 50;
+/// How long the replies a Flat read remembers for a thread are trusted before the thread is read
+/// in full again, unless the client was built with another period: the page's
+/// `TIMELINE_RECONCILE_MS`. `#282 slack-flat-skip`.
+pub const FLAT_RECONCILE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Most threads whose Flat replies are remembered at once.
+const FLAT_REMEMBERED_MAX: usize = 256;
 /// Characters of a root's first line used as its thread title.
 pub const THREAD_TITLE_CHARS: usize = 80;
 /// Pages of `users.conversations` one discovery request may read while filtering.
@@ -240,6 +248,21 @@ struct DirectoryCursor {
     c: String,
     /// Conversations of that page already consumed.
     o: usize,
+}
+
+/// The replies a Flat read last held for one thread, and what its root said when they were read.
+/// `#282 slack-flat-skip`.
+#[derive(Clone, Debug)]
+pub(super) struct FlatThread {
+    /// The root's `latest_reply` then, as an instant.
+    latest_reply: i64,
+    /// The root's `reply_count` then.
+    reply_count: u64,
+    /// The thread's newest real replies, oldest first, root excluded, at most
+    /// [`FLAT_MAX_REPLIES`].
+    replies: Vec<Raw>,
+    /// When the thread was last read in full.
+    full_at: std::time::Instant,
 }
 
 /// One backward page of messages, before conversion.
@@ -622,14 +645,10 @@ impl HttpSlackClient {
                 .iter()
                 .take(FLAT_MAX_THREADS)
                 .any(|root| root.reply_count() > FLAT_MAX_REPLIES as u64);
-        let threads: Vec<String> = roots
+        let reads: Vec<_> = roots
             .iter()
             .take(FLAT_MAX_THREADS)
-            .map(|root| root.ts.clone())
-            .collect();
-        let reads: Vec<_> = threads
-            .iter()
-            .map(|thread| self.replies_newest_before(conversation, thread, None, FLAT_MAX_REPLIES))
+            .map(|root| self.flat_replies(conversation, root))
             .collect();
         let replies: Vec<Vec<Raw>> = stream::iter(reads).buffered(4).try_collect().await?;
         let mut raws = page.raws;
@@ -649,6 +668,116 @@ impl HttpSlackClient {
             }),
             ..TimelinePage::default()
         })
+    }
+
+    /// The newest replies of one thread on a Flat page, read only as far as they changed. `#282
+    /// slack-flat-skip`, remote-ops audit W8.
+    ///
+    /// The Flat read has just fetched `root` from history, and a root reports its `reply_count`
+    /// and `latest_reply`. So a thread whose root says what it said when its replies were last
+    /// read has nothing new: the replies held are reused, at no call. A thread whose root names a
+    /// newer latest reply and a higher count is read forward from the newest reply held
+    /// (`conversations.replies oldest=`), one call for up to a page of new replies, and kept only
+    /// when exactly as many new replies came back as the count grew by, ending at the latest the
+    /// root names. Anything else reads the thread's newest replies in full, as every Flat read
+    /// used to: a count that fell or did not add up (a deletion), more new replies than a Flat page
+    /// shows of a thread, a thread never read, or one last read in full [`FLAT_RECONCILE`] ago or
+    /// longer.
+    ///
+    /// An edit to a reply changes nothing on its root, so Flat shows it when that period runs out;
+    /// the thread view, which reads the thread itself, shows it at once.
+    async fn flat_replies(&self, conversation: &str, root: &Raw) -> Result<Vec<Raw>, ChatError> {
+        let key = (conversation.to_owned(), root.ts.clone());
+        let latest = root.activity_micros();
+        let count = root.reply_count();
+        if let Some(held) = self.remembered_flat(&key) {
+            if held.latest_reply == latest && held.reply_count == count {
+                return Ok(held.replies);
+            }
+            let grew = count.saturating_sub(held.reply_count);
+            if latest > held.latest_reply
+                && grew > 0
+                && usize::try_from(grew).is_ok_and(|grew| grew <= FLAT_MAX_REPLIES)
+            {
+                let fresh = self
+                    .replies_oldest_after(
+                        conversation,
+                        &root.ts,
+                        Some(held.latest_reply),
+                        FLAT_MAX_REPLIES + 1,
+                    )
+                    .await?;
+                let adds_up = u64::try_from(fresh.len()).is_ok_and(|added| added == grew)
+                    && fresh.last().is_some_and(|raw| raw.micros == latest);
+                if adds_up {
+                    let mut replies = held.replies;
+                    replies.extend(fresh);
+                    replies.sort_by_key(|raw| raw.micros);
+                    replies.dedup_by_key(|raw| raw.micros);
+                    replies.drain(..replies.len().saturating_sub(FLAT_MAX_REPLIES));
+                    self.remember_flat(
+                        key,
+                        FlatThread {
+                            latest_reply: latest,
+                            reply_count: count,
+                            replies: replies.clone(),
+                            full_at: held.full_at,
+                        },
+                    );
+                    return Ok(replies);
+                }
+            }
+        }
+        let mut replies = self
+            .replies_newest_before(conversation, &root.ts, None, FLAT_MAX_REPLIES)
+            .await?;
+        replies.retain(|raw| raw.micros != root.micros);
+        // Every root here has replies. A walk that could not get past a run of system events
+        // returns none and resumes on the next read (`super::history`); holding that nothing
+        // would stop it resuming.
+        if !replies.is_empty() {
+            self.remember_flat(
+                key,
+                FlatThread {
+                    latest_reply: latest,
+                    reply_count: count,
+                    replies: replies.clone(),
+                    full_at: std::time::Instant::now(),
+                },
+            );
+        }
+        Ok(replies)
+    }
+
+    /// The replies held for a thread, unless they were read in full a reconcile period ago.
+    fn remembered_flat(&self, key: &(String, String)) -> Option<FlatThread> {
+        self.flat_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .filter(|held| held.full_at.elapsed() < self.flat_reconcile)
+            .cloned()
+    }
+
+    /// Hold `thread` for the next Flat read, dropping what a reconcile would re-read anyway and,
+    /// past [`FLAT_REMEMBERED_MAX`] threads, the one read in full longest ago.
+    fn remember_flat(&self, key: (String, String), thread: FlatThread) {
+        let mut held = self
+            .flat_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|_, entry| entry.full_at.elapsed() < self.flat_reconcile);
+        while held.len() >= FLAT_REMEMBERED_MAX && !held.contains_key(&key) {
+            let Some(oldest) = held
+                .iter()
+                .min_by_key(|(_, entry)| entry.full_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            held.remove(&oldest);
+        }
+        held.insert(key, thread);
     }
 
     /// Thread roots with replies, from a bounded scan of recent history, by latest activity.

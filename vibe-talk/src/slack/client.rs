@@ -126,6 +126,12 @@ pub struct HttpSlackClient {
     /// Stretches after a cursor proven to hold no real messages, so a walk that ran out of
     /// requests while crossing system events resumes rather than restarts. See `super::history`.
     pub(super) proven: Mutex<HashMap<(String, i64), (i64, Instant)>>,
+    /// The replies each thread's last Flat read brought, by conversation and root `ts`, and what
+    /// the root said then, so the next Flat read reads only the threads that moved. `#282
+    /// slack-flat-skip`; see `super::timeline`.
+    pub(super) flat_threads: Mutex<HashMap<(String, String), super::timeline::FlatThread>>,
+    /// How long those replies are trusted before a Flat read reads their thread in full again.
+    pub(super) flat_reconcile: Duration,
     /// The most one post may carry, as Slack is sent it; see [`SlackConfig::post_limit`].
     pub(super) post_limit: crate::chat::PostLimit,
     /// Where each Web API request is timed, by method and outcome, when the client was built with
@@ -182,6 +188,8 @@ impl HttpSlackClient {
             users: Mutex::new(HashMap::new()),
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
+            flat_threads: Mutex::new(HashMap::new()),
+            flat_reconcile: super::timeline::FLAT_RECONCILE,
             post_limit: config.post_limit(),
             shim_profile: None,
         })
@@ -196,6 +204,20 @@ impl HttpSlackClient {
     #[must_use]
     pub fn with_shim_profile(mut self, profile: Arc<ProviderProfile>) -> Self {
         self.shim_profile = Some(profile);
+        self
+    }
+
+    /// How long the replies a Flat read remembers for a thread are trusted before a Flat read
+    /// reads that thread in full again: fifteen minutes unless set, the page's own reconcile
+    /// period. `#282 slack-flat-skip`.
+    ///
+    /// Until then a thread whose root reports the same reply count and latest reply costs no call,
+    /// and one with new replies costs one. An edit to a reply changes nothing on its root, so it
+    /// reaches Flat when this period runs out (the thread view shows it at once).
+    /// `Duration::ZERO` reads every thread in full on every Flat read.
+    #[must_use]
+    pub fn with_flat_reconcile(mut self, period: Duration) -> Self {
+        self.flat_reconcile = period;
         self
     }
 
