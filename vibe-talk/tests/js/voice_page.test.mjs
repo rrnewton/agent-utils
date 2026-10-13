@@ -3087,6 +3087,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * keeps exercising the `<audio>` player: a stream to read a response body with, a way to abort
    * it, and an audio context that can be suspended between reads.
    */
+  /** `#262 search-load-older`. A way to abort a request, which a current browser has, and nothing else. */
+  page.enableAbort = () => {
+    context.AbortController = AbortController;
+  };
   page.enableStreamedAudio = () => {
     context.ReadableStream = class {};
     context.AbortController = AbortController;
@@ -48090,4 +48094,290 @@ test("`#262 search-load-older`: the count is in messages, so what is shown and t
   await search(page, "engine");
   await page.settle();
   assert.equal(page.el("search-count").textContent, "2 of 4 loaded", "a combined row was counted as one");
+});
+
+/**
+ * `#262 search-load-older`. A channel whose history really pages, `size` messages a page and `pages`
+ * pages, message `i` (oldest first) saying `content(i)`, three hours apart so the pages reach back over
+ * days. Served on `/page` for a provider without threads, and on the timeline for one with them (every
+ * view the same list: none of these messages is in a thread). Every older read's options are kept, for
+ * its signal; `page.olderHold`, a `searchHold()`, holds the next older read until it is opened, and a
+ * read whose signal aborts meanwhile fails as a browser's does; `page.olderTakes` is how many
+ * milliseconds of the page's clock each older read takes.
+ */
+function searchHistory(page, { pages = 6, size = 4, content = (i) => `message ${i}`, threads = false } = {}) {
+  const newest = Date.UTC(2026, 7, 19, 12, 0, 0);
+  const total = pages * size;
+  const all = [];
+  for (let i = 0; i < total; i += 1) {
+    all.push(message({ id: String(8700000000000000000n + BigInt(i)), content: content(i),
+      timestamp: new Date(newest - (total - 1 - i) * 3 * 3600000).toISOString() }));
+  }
+  page.messages = all;
+  page.pagesServed = [];
+  page.olderOptions = [];
+  page.olderHold = null;
+  page.olderTakes = 0;
+  const window = async (path, options) => {
+    page.pagesServed.push(String(path));
+    const before = /[?&]before=([^&]+)/.exec(String(path));
+    if (before) {
+      page.olderOptions.push(options || {});
+      const hold = page.olderHold;
+      page.olderHold = null;
+      const signal = options && options.signal;
+      if (hold) {
+        await new Promise((resolve, reject) => {
+          hold.promise.then(resolve);
+          if (signal) signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+        });
+      }
+      if (signal && signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      page.setClock(page.clock() + page.olderTakes);
+    }
+    const end = before ? all.findIndex((m) => m.id === decodeURIComponent(before[1])) : all.length;
+    const start = Math.max(0, end - size);
+    return { rows: page.messages.filter((m) => all.indexOf(m) >= start && all.indexOf(m) < end || (!before && all.indexOf(m) < 0)), start };
+  };
+  const dismissed = (rows) => rows.map((m) => String(m.id)).filter((id) => page.dealtWith.has(id));
+  if (threads) {
+    page.threadingSupported = true;
+    page.timeline = async (path, options) => {
+      const url = new URL(path, "http://fixture.test");
+      const view = url.searchParams.get("view");
+      if (view === "threads") return json(200, timelineAnswer({ view, has_threads: false }));
+      const { rows, start } = await window(path, options);
+      return json(200, timelineAnswer({ view, messages: rows, has_threads: false, has_more: start > 0,
+        next_before: start > 0 ? all[start].id : null, dismissed: dismissed(rows) }));
+    };
+  } else {
+    page.channelPage = async (path, options) => {
+      const { rows, start } = await window(path, options);
+      return json(200, { channel: CHANNEL, messages: rows, returned: rows.length, limit: size, has_more: start > 0,
+        next_before: start > 0 ? all[start].id : null, dismissed: dismissed(rows) });
+    };
+  }
+  return all;
+}
+
+/** A read held until `open()`. */
+function searchHold() {
+  let open = () => {};
+  const promise = new Promise((resolve) => { open = resolve; });
+  return { promise, open };
+}
+
+/** The day of `timestamp` on this device as the search says it inside a sentence: "today", "yesterday", "Aug 17". */
+const searchDay = (page, timestamp) => {
+  const key = (at) => at.getFullYear() * 10000 + at.getMonth() * 100 + at.getDate();
+  const at = new Date(timestamp);
+  const now = new Date(page.clock());
+  if (key(at) === key(now)) return "today";
+  if (key(at) === key(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12))) return "yesterday";
+  return `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][at.getMonth()]} ${at.getDate()}`;
+};
+
+/** The rows of `list` the filters let through, by id. */
+const matchedIds = (page, list = "discord-log") =>
+  page.el(list).children.filter((li) => !li.hidden && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+
+const SEARCH_OLDER_PAGES = sourceConstant("SEARCH_OLDER_PAGES");
+const SEARCH_OLDER_TAP_MS = sourceConstant("SEARCH_OLDER_TAP_MS");
+
+/** The older reads so far. */
+const searchReads = (page) => page.pagesServed.filter((path) => /[?&]before=/.test(path));
+
+/** Let a walk run to its end. */
+async function settleWalk(page) {
+  for (let i = 0; i < 40; i += 1) await page.settle();
+}
+
+/** A page signed in on `searchHistory`'s channel, at its newest page. */
+async function searchPage(options = {}) {
+  const page = newPage();
+  const all = searchHistory(page, options);
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  return { page, all };
+}
+
+test("`#262 search-load-older`: while a filter chooses rows the step back offers to search further back, naming the day it reaches", async () => {
+  const { page, all } = await searchPage({ content: (i) => (i === 2 ? "the engine stalled" : `message ${i}`) });
+  const chip = page.el("load-older");
+  assert.equal(chip.hidden, false);
+  assert.equal(chip.textContent, "Older messages", "the step back offered a search with no filter on");
+  assert.equal(chip.getAttribute("aria-label"), null);
+  await search(page, "engine");
+  await page.settle();
+  const day = searchDay(page, all[20].timestamp);
+  assert.equal(chip.textContent, `Search before ${day}`);
+  assert.equal(chip.disabled, false);
+  assert.match(chip.getAttribute("aria-label"), /^Search before .+Enter in the search field does the same\.$/);
+  // The empty sentence says how far back the search has looked, in messages.
+  assert.equal(page.el("search-empty").hidden, false);
+  assert.equal(page.el("search-empty").textContent, `Nothing in the 4 messages loaded so far, back to ${day}, matches that search.`);
+  assert.equal(page.el("search-in-all").hidden, true, "Search All was offered where there are no threads");
+  // Links alone is a filter choosing rows; so is whose messages.
+  await search(page, "");
+  await page.settle();
+  assert.equal(chip.textContent, "Older messages", "an open search with nothing typed offered a search");
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(chip.textContent, `Search before ${day}`, "Links alone did not offer a search further back");
+  await page.el("links-filter").click();
+  await page.el("author-filter").click();
+  await page.settle();
+  assert.equal(chip.textContent, `Search before ${day}`, "Mine alone did not offer a search further back");
+  // Over the Pinned list there is nothing older to find.
+  await page.el("pinned-filter").click();
+  await page.settle();
+  assert.equal(chip.hidden, true, "the step back was offered over the Pinned list");
+  // A thumb's target: the 44px square drawn as nothing.
+  assert.match(cssBlock("#load-older::after"), /inset:\s*min\(0px, calc\(\(100% - 2\.75rem\) \/ 2\)\)/);
+  assert.match(cssBlock("#side-older::after"), /content:\s*""/);
+  assert.match(cssBlock("#load-older"), /position:\s*relative/);
+});
+
+test("`#262 search-load-older`: a tap reads older pages until one brings three new matches, and says what it found under the step back", async () => {
+  const hits = new Set([25, 21, 17, 16]);
+  const { page, all } = await searchPage({ pages: 8, content: (i) => (hits.has(i) ? `engine note ${i}` : `message ${i}`) });
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), []);
+  await page.el("load-older").click();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 3, "the walk did not stop at the end of the page that brought the third match");
+  assert.deepStrictEqual(matchedIds(page), [16, 17, 21, 25].map((i) => all[i].id));
+  const day = searchDay(page, all[16].timestamp);
+  assert.equal(page.el("search-older-note").hidden, false);
+  assert.equal(page.el("search-older-note").textContent, `Found 4 in 3 pages (12 messages), back to ${day}.`);
+  assert.match(HTML_CODE, /<p id="search-older-note" class="hint search-older-note" role="status" hidden><\/p>/);
+  assert.match(HTML_CODE, /<p id="side-search-older-note" class="hint search-older-note" role="status" hidden><\/p>/);
+  assert.equal(page.el("load-older").textContent, `Search before ${day}`);
+  assert.equal(page.el("search-empty").hidden, true);
+  // Nothing of it went to the floating status line.
+  assert.ok(page.el("status-line").hidden || !/Found/.test(page.el("status").textContent), "the walk's result went to the status line");
+  // The note stays while the search does; another search takes it away.
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(page.el("search-older-note").hidden, true, "a change of filter left the last walk's note up");
+  // The count is in messages: every match, of everything loaded.
+  await page.el("links-filter").click();
+  await page.settle();
+  assert.equal(page.el("search-count").textContent, "4 of 16 loaded");
+});
+
+test("`#262 search-load-older`: a walk reads at most five pages, and one that finds nothing says how far back in the empty sentence", async () => {
+  const { page, all } = await searchPage({ pages: 10 });
+  await search(page, "engine");
+  await page.settle();
+  await page.el("load-older").click();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "the walk was not bounded");
+  assert.equal(page.el("search-older-note").hidden, true, "a walk that found nothing said so twice");
+  assert.equal(page.el("search-empty").textContent,
+    `Nothing in the 24 messages loaded so far, back to ${searchDay(page, all[16].timestamp)}, matches that search.`);
+  // Another tap is another walk, from where this one stopped.
+  await page.el("load-older").click();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES + 4, "the second tap did not walk on to the start");
+  assert.equal(page.el("load-older").hidden, true);
+  assert.equal(page.el("search-empty").textContent, "Nothing in this channel matches that search — all of it is loaded.");
+});
+
+test("`#262 search-load-older`: the walk starts no page its last page's time says would end past fifteen seconds", async () => {
+  const { page, all } = await searchPage({ pages: 10, content: (i) => (i === 33 ? "engine" : `message ${i}`) });
+  page.olderTakes = 6000;
+  await search(page, "engine");
+  await page.settle();
+  await page.el("load-older").click();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 2, "a page that would end past the budget was started");
+  assert.equal(page.el("search-older-note").textContent,
+    `Found 1 in 15 s (2 pages, 8 messages), back to ${searchDay(page, all[28].timestamp)}.`);
+});
+
+test("`#262 search-load-older`: Enter in the search field walks back where the step back offers it, and not while composing", async () => {
+  const { page } = await searchPage({ pages: 10 });
+  await search(page, "");
+  let event = await press(page, page.el("search-field"), "Enter");
+  assert.equal(searchReads(page).length, 0, "Enter with nothing typed read older pages");
+  await page.el("search-field").setValue("engine");
+  await page.settle();
+  event = await press(page, page.el("search-field"), "Enter", { isComposing: true });
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 0, "Enter that an input method was composing with walked back");
+  event = await press(page, page.el("search-field"), "Enter");
+  assert.equal(event.defaulted, false, "the field's Enter was left to the page's keys");
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "Enter in the field did not search further back");
+  // The list of keys says so.
+  assert.ok(page.el("keyboard-keys").text().includes("In the search field: search older messages"), "the list of keys does not name Enter in the search field");
+});
+
+test("`#262 search-load-older`: Stop aborts the read on the wire, says Stopping… until it settles, and is no failure; a second tap at once is the same tap", async () => {
+  const { page } = await searchPage({ pages: 10 });
+  page.enableAbort();
+  await search(page, "engine");
+  await page.settle();
+  const chip = page.el("load-older");
+  page.olderHold = searchHold();
+  void chip.click();
+  await page.settle();
+  assert.equal(chip.textContent, "Searching… 1 of 5 · Stop");
+  assert.equal(chip.disabled, false);
+  // A double tap does not stop the walk it started.
+  void chip.click();
+  await page.settle();
+  assert.equal(chip.textContent, "Searching… 1 of 5 · Stop", "a second tap at once stopped the walk");
+  page.setClock(page.clock() + SEARCH_OLDER_TAP_MS);
+  void chip.click();
+  assert.equal(chip.textContent, "Stopping…");
+  assert.equal(chip.disabled, true);
+  assert.equal(page.olderOptions[0].signal.aborted, true, "Stop did not abort the read on the wire");
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, 1, "the walk read on after Stop");
+  assert.equal(page.el("error").hidden, true, "Stop was reported as a failure");
+  assert.match(chip.textContent, /^Search before /);
+  assert.equal(chip.disabled, false);
+  assert.equal(page.el("search-older-note").hidden, true, "a stopped walk that found nothing said something");
+});
+
+test("`#262 search-load-older`: a message arriving mid-walk that matches neither stops it nor counts as found", async () => {
+  const { page, all } = await searchPage({ pages: 10, content: (i) => (i === 30 ? "engine trouble" : `message ${i}`) });
+  const stream = page.stream();
+  await search(page, "engine");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  void page.el("load-older").click();
+  await page.settle();
+  await deliver(page, stream, sseMessage(message({ id: "8700000000000009999", content: "engine is back",
+    timestamp: new Date(Date.UTC(2026, 7, 19, 13, 0, 0)).toISOString() })));
+  assert.ok(matchedIds(page).includes("8700000000000009999"), "the live match is not shown");
+  hold.open();
+  await settleWalk(page);
+  assert.equal(searchReads(page).length, SEARCH_OLDER_PAGES, "a live match stopped the walk, or one older match did");
+  assert.equal(page.el("search-older-note").textContent,
+    `Found 1 in 5 pages (20 messages), back to ${searchDay(page, all[16].timestamp)}.`);
+});
+
+test("`#262 search-load-older`: the step back holds still while the matches open under it, behind a line counting what they skip", async () => {
+  const { page, all } = await searchPage({ pages: 8, content: (i) => (i === 22 ? "engine" : longMessage(`message ${i}`)) });
+  await search(page, "engine");
+  await page.settle();
+  const area = page.el("scroll-area");
+  const chip = page.el("load-older");
+  const top = chip.getBoundingClientRect().top;
+  await chip.click();
+  await settleWalk(page);
+  assert.deepStrictEqual(matchedIds(page), [all[22].id]);
+  assert.equal(area.scrollTop, 0, "the walk moved the reader off the head of the list");
+  assert.equal(chip.getBoundingClientRect().top, top, "the step back moved while the matches arrived");
+  // `#250`'s line before the first match counts the unmatched messages between, the walked ones too.
+  assert.deepStrictEqual(seamsOf(page), [[all[22].id, "… 14 unmatched messages …", "… 9 unmatched messages …"]]);
+  // `#249`'s marks are on what it found.
+  await press(page, page.el("search-field"), "Enter");
+  assert.ok(rowWithId(page, all[22].id).descendants().some((node) => node.tagName === "mark" || node.tagName === "MARK"),
+    "the match found further back is not marked");
 });
