@@ -1,10 +1,11 @@
 ---
 title: 'settings-groups: Settings in a few logical groups, with a Voice agent group and a Messages group'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-13T11:49:51.287703912+00:00
-updated_at: 2026-10-13T11:49:51.287703912+00:00
+updated_at: 2026-10-13T16:32:30.664652732+00:00
+closed_at: 2026-10-13T16:32:30.664652572+00:00
 ---
 
 # Description

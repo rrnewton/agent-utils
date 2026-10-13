@@ -1,10 +1,11 @@
 ---
 title: 'voice-agent-instructions: Settings lets the owner add instructions to the voice agent, and edit its whole system prompt in a folded section'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-13T11:49:51.291108395+00:00
-updated_at: 2026-10-13T11:49:51.291108395+00:00
+updated_at: 2026-10-13T16:32:30.668686169+00:00
+closed_at: 2026-10-13T16:32:30.668685838+00:00
 ---
 
 # Description
