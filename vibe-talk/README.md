@@ -4300,6 +4300,30 @@ on, the seam says the new call will be read the lines above and that this is a r
 the same conversation. A failed replay never aborts the call — it degrades to a fresh one and says
 which it was.
 
+**The seam above a new call says what that call was sent** (`#270 voice-transcript-markers`). Once
+the call opens, the line above it — the one the last call's end drew, or the one the restored
+record ends with — reads "new conversation" with a chip beside the label:
+
+| What the call was sent | Chip | Its own sentence, inside the disclosure |
+|---|---|---|
+| a recap | "412-word recap sent" | how many words went, and how many older lines did not fit; on the start request, that the agent's own settings may ignore it |
+| nothing, though resuming is on | "no recap sent" | why: nothing said aloud to replay, not even the last line fitting the budget, the page unable to read the record, or a replacement voice session |
+| nothing, because the backend cannot take one | "recap unsupported" | the voice service has no way to take a recap, so the agent remembers nothing above |
+| resuming is off | none | none |
+
+"Sent" and not "recapped": neither transport acknowledges a recap, so sent is all the page knows.
+The sentence the line already had, saying how the call before ended (`#268 voice-call-drops`), stays
+as it was, beside its own; it takes the resuming wording only when a recap really went. On the
+`vibe-talk-v1` backend, which has no way to carry a recap, a server with `replay.enabled` on says
+"recap unsupported" on every new call rather than nothing.
+
+The same line comes back after a reload. On a server that keeps records, a conversation's first
+record is a `conversation_start` marker holding the recap its call was sent and how the call before
+it ended; it is written lazily, just before that first record, so a call that recorded nothing —
+one that dropped at once — leaves no conversation behind. Such a call is not the one the next call
+resumes from either: that stays the last call that recorded something. A conversation recorded
+before markers keeps the plain "earlier conversation" line.
+
 ### The budget, and why it is stated rather than discovered
 
 A transcript grows without bound, the payload is billed per call, and the model's window is
@@ -4327,7 +4351,7 @@ name is neutralized like the words, and the preamble says what such a line is. T
 
 Where the voice backend cannot carry a recap at all — `conversation.backend = "websocket"` —
 client-config says `replay_unavailable: "backend"` as well as `replay_enabled: false`, so the page
-can say "recap unsupported" on the new conversation's seam rather than nothing.
+says "recap unsupported" on the new conversation's seam rather than nothing (above).
 
 ### Privacy
 
