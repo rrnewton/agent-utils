@@ -35573,6 +35573,20 @@ test("`#270 voice-transcript-markers`: a replacement voice session is a new conv
   assert.match(seamRecapDetail(line), /^The voice service replaced this call's session/);
   assert.deepEqual(page.storedTurns.get("conv_second_session")[0].detail,
     { kind: "conversation_start", recap: { state: "none", why: "replaced_session", dropped: 0 } });
+
+  // A reload draws the same line, in the same words: its marker names no call that ended, and its
+  // recap says the session was a replacement.
+  const reloaded = newPage();
+  reloaded.transcriptRecordsSupported = true;
+  for (const [id, turns] of page.storedTurns) reloaded.storedTurns.set(id, turns.map((turn) => ({ ...turn })));
+  await signIn(reloaded);
+  await reloaded.settle();
+  const restored = boundaryLines(reloaded).find((li) => li.getAttribute("data-ends") === "conv_first_session");
+  assert.ok(restored, "the reload drew no line between the two sessions");
+  assert.equal(seamLabel(restored), "new conversation");
+  assert.equal(seamChip(restored), seamChip(line));
+  assert.equal(seamDetail(restored), seamDetail(line));
+  assert.equal(seamRecapDetail(restored), seamRecapDetail(line));
 });
 
 test("`#270 voice-transcript-markers`: a replay that does not say how many words it held is a 'recap sent', never a '0-word recap'", async () => {
