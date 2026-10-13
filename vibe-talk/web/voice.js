@@ -9161,6 +9161,9 @@ const postWatch = {
   busy: false,
   // Whether the owner opened a long draft with More. A new draft starts folded again.
   unfolded: false,
+  // Set while the main screen keeps the card's room for a moment after the card went.
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  roomTimer: null,
   // `#270 voice-transcript-markers`. The send memory's cursor, for the page's whole life: the
   // newest `send_seq` this page has read, null until its first read ever says where the server is,
   // and the run of the server (`instance`) whose numbering it is in.
@@ -9596,10 +9599,39 @@ function placePostCard() {
     parent.insertBefore(card, before);
   }
   if (card.getAttribute("data-place") !== place) card.setAttribute("data-place", place);
+  // Which screen it is docked under, so the stylesheet can tell Reply's own Send from the card's.
+  if (place === "dock") card.setAttribute("data-screen", currentScreen);
+  else card.removeAttribute("data-screen");
   card.hidden = !shown || place === "none";
-  leftEl("screen-main").toggleAttribute("data-draft", shown);
+  holdDraftRoom(shown);
   // What the chips and the status pill stand on has just changed.
   placeChipsOverComposer();
+}
+
+/**
+ * How long the main screen keeps the room it made for a card after the card goes. `#269
+ * approval-card-inline`. Taken back at once, the message box sprang from one line to three rows
+ * and its own Send, and covered the spot where the card's Send had just been: a second tap a
+ * moment late landed in the box and opened the phone's keyboard. A second later it is a tap of its
+ * own.
+ */
+const POST_ROOM_KEEP_MS = 1000;
+
+/** Make room for the card on the main screen while one is up, and keep it a moment after. */
+function holdDraftRoom(shown) {
+  const main = leftEl("screen-main");
+  if (postWatch.roomTimer !== null) {
+    clearTimeout(postWatch.roomTimer);
+    postWatch.roomTimer = null;
+  }
+  if (shown) {
+    main.toggleAttribute("data-draft", true);
+  } else if (main.hasAttribute("data-draft")) {
+    postWatch.roomTimer = setTimeout(() => {
+      postWatch.roomTimer = null;
+      if (postWatch.shown === null) main.toggleAttribute("data-draft", false);
+    }, POST_ROOM_KEEP_MS);
+  }
 }
 
 /**
@@ -9868,9 +9900,16 @@ function freezeSentCard(proposal, confirmedBy, outcome, answer) {
   const posted = outcome === "sent" ? parts : Number(answer.posted) || 0;
   const thread = first && first.thread && !first.thread.is_root ? String(first.thread.id) : undefined;
   const now = Date.now();
+  // A partial send shows what went, not the whole draft: the 207 carries what did not, which the
+  // draft ends with. Counted in characters, as the server counts them, not UTF-16 units. The
+  // server's own copy replaces this when the claim is answered.
+  const unsent = outcome === "sent" ? "" : String(answer.unsent || "");
+  const went = outcome === "partial" && unsent && proposal.text.endsWith(unsent)
+    ? proposal.text.slice(0, proposal.text.length - unsent.length)
+    : proposal.text;
   const turn = {
     speaker: "sent",
-    text: proposal.text,
+    text: went,
     at_ms: now,
     detail: {
       kind: "sent",
@@ -9887,12 +9926,12 @@ function freezeSentCard(proposal, confirmedBy, outcome, answer) {
       parts_posted: posted,
       parts_total: outcome === "sent" ? parts : 0,
       uncertain_part: answer.uncertain === true ? posted + 1 : undefined,
-      unsent_chars: outcome === "sent" ? 0 : String(answer.unsent || "").length,
+      unsent_chars: [...unsent].length,
       outcome,
       how: confirmedBy === "ui" ? "tap" : "voice",
       origin: "commit",
       text_truncated: false,
-      text_chars: String(proposal.text).length,
+      text_chars: [...went].length,
       begun_at_ms: now,
       sent_at_ms: now,
     },
@@ -9925,7 +9964,9 @@ function sentCardNode(turn) {
   const mark = document.createElement("span");
   mark.className = "sent-mark";
   mark.setAttribute("aria-hidden", "true");
-  mark.textContent = "✓";
+  // A tick only for what certainly went whole: a part sent, or a send nobody can confirm, is not
+  // ticked beside words that say so, and differs by more than its colour.
+  mark.textContent = SENT_MARKS[String(detail.outcome)] || SENT_MARKS.sent;
   const status = document.createElement("span");
   status.className = "who sent-status";
   status.textContent = detail.outcome === "partial"
@@ -9975,6 +10016,9 @@ function sentCardNode(turn) {
   li.linkText = text;
   return li;
 }
+
+/** The glyph at the head of a frozen card, by outcome. */
+const SENT_MARKS = { sent: "✓", partial: "!", unconfirmed: "?" };
 
 /** What a frozen card says it answered, and where, in words: never an id. */
 function sentWhere(detail) {
