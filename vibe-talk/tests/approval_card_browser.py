@@ -21,7 +21,9 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      and opening the words grows the card upward without moving Send — on the three phones, and on
      two short screens, a phone turned sideways (667x375) and one with the keyboard up (375x330).
   4. The box's own Send is not drawn while the box is empty, and once something is typed it looks
-     different from the card's.
+     different from the card's. Don't send and Send share one row, and writing each of the card's
+     status lines (`POST_CARD_STATUS`), a spoken yes settling among them, moves neither button and
+     cuts none of them, on the call's view and on the channel.
   5. The card stands exactly where a turn of the owner's does: the same left and right edges as an
      `li.mine` of the transcript, within a pixel.
   6. Both buttons are held for the page's POST_CHANGE_HOLD_MS when the card appears: a real tap at
@@ -482,6 +484,53 @@ def propose(page: Page, api: FakeApi, serial: int, text: str) -> None:
     page.locator("#post-confirm").wait_for(state="visible", timeout=10_000)
 
 
+# Every status line the card can show, written in turn, and where the buttons are after each. A
+# spoken yes settling is also driven through the page's own `renderPostExpiry`, so the line it
+# writes is the one measured.
+STATUS_JS = """() => {
+  const line = document.getElementById('post-confirm-expiry');
+  const cancel = document.getElementById('post-confirm-cancel');
+  const send = document.getElementById('post-confirm-send');
+  const read = (said) => ({ said, line: line.getBoundingClientRect().height,
+    cut: line.scrollWidth > line.clientWidth + 1,
+    cancel: cancel.getBoundingClientRect().top, send: send.getBoundingClientRect().top });
+  const out = [];
+  for (const value of Object.values(POST_CARD_STATUS)) {
+    line.textContent = typeof value === 'function' ? value(118) : value;
+    out.push(read(line.textContent));
+  }
+  spokenYes.settling = { handle: postWatch.shown.handle, proposal: postWatch.shown, timer: null };
+  renderPostExpiry();
+  out.push(read(line.textContent));
+  spokenYes.settling = null;
+  renderPostExpiry();
+  out.push(read(line.textContent));
+  return out;
+}"""
+
+
+def status_steady(page: Page, where: str) -> None:
+    """Point 4's second half: the buttons on one row, unmoved by any status line, none of them cut."""
+    readings = page.evaluate(STATUS_JS)
+    check(isinstance(readings, list) and len(readings) > 2, f"{where}: no status lines measured")
+    assert isinstance(readings, list)
+    first = readings[0]
+    assert isinstance(first, dict)
+    for reading in readings:
+        assert isinstance(reading, dict)
+        said = reading["said"]
+        check(abs(rect(reading, "cancel") - rect(first, "cancel")) <= 0.5,
+              f"{where}: writing {said!r} moved Don't send from {rect(first, 'cancel'):.1f} to {rect(reading, 'cancel'):.1f}")
+        check(abs(rect(reading, "send") - rect(reading, "cancel")) <= 0.5,
+              f"{where}: Send is not on Don't send's row with {said!r} up")
+        # Its own height too: scroll anchoring can hide a line that wrapped (the list moves, not
+        # the buttons), and a wrapped line is still one the next write can unwrap under a thumb.
+        check(abs(rect(reading, "line") - rect(first, "line")) <= 0.5,
+              f"{where}: the status line is {rect(reading, 'line'):.1f}px tall with {said!r}, "
+              f"{rect(first, 'line'):.1f}px with {first['said']!r}")
+        check(reading["cut"] is False, f"{where}: the status line {said!r} is cut on screen")
+
+
 def reach_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
                rows: int, banner: bool, draft: str) -> float:
     """One run of points 1 to 5 on the call's view. Answers Send's centre as a share of the screen."""
@@ -568,8 +617,9 @@ def placement_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
     check(not api.commits and not api.cancels,
           f"{where}: a tap during the hold reached the server: {api.commits or api.cancels}")
     page.wait_for_timeout(HOLD_MS)
+    page.evaluate(TO_NEWEST_JS)
+    status_steady(page, f"{where}, call's view")
     if screenshots:
-        page.evaluate(TO_NEWEST_JS)
         page.screenshot(path=str(screenshots / f"card-voice-{width}x{height}.png"), animations="disabled")
 
     page.click("#view-switch")
@@ -587,6 +637,7 @@ def placement_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
     check(m["position"] == "static", f"{where}: on the channel the card is positioned")
     for floating in ("pill", "tools", "jump"):
         check(not overlaps(m["send"], m[floating]), f"{where}: on the channel the {floating} is drawn over Send")
+    status_steady(page, f"{where}, channel")
     if screenshots:
         page.screenshot(path=str(screenshots / f"card-channel-{width}x{height}.png"), animations="disabled")
 
