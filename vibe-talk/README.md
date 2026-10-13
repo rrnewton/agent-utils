@@ -256,18 +256,21 @@ one is still sending, waiting to go again, or not sent, the ones after it wait, 
 it is waiting behind and why ("Waiting to send… “A” goes first, and goes again in 6 s."). When the
 earlier one is sent they follow in order; **Dismiss** or **Edit** on it lets the next one go. A
 message that is waiting can itself be edited or dismissed, but not sent ahead of the one in front of
-it. A thread does not wait for the channel or for another thread, nor one channel for another. Where
-the chat service can recognise a repeated request, a send whose answer was lost goes again on its
-own, under the same request id, after 3, 6 and 12 seconds and then every 20 seconds, six times in
-all, each wait counted from when the failed try started, so a try a slow service took half a minute
-to fail goes again at once; then it waits for **Retry**. Reopening the app keeps the order: a
-message that was waiting still waits, and goes once the one ahead of it is retried, dismissed or
-edited. The server keeps the same order: it posts to each destination one at a time, in the order
-the posts reached it, the parts of a long post together. A post holds its destination until the chat
-service answers it, even after the app has stopped waiting for it, so a retry cannot overtake the
-attempt it repeats — up to the server's own deadline for one request to the chat service
-(`request_timeout_seconds`, 20 seconds by default). Past that deadline the server stops waiting, and
-the next post can reach a slow bridge that is still working on the first.
+it. A thread does not wait for the channel or for another thread, nor one channel for another. A
+reply to a message that came in live, whose thread is not known yet, can still go anywhere in its
+channel, so everything written after it there waits until it has been placed and sent, dismissed or
+edited, even when finding out where it goes failed; a read that failed for a moment is tried again
+on its own. Where the chat service can recognise a repeated request, a send whose answer was lost
+goes again on its own, under the same request id, after 3, 6 and 12 seconds and then every 20
+seconds, six times in all, each wait counted from when the failed try started, so a try a slow
+service took half a minute to fail goes again at once; then it waits for **Retry**. Reopening the
+app keeps the order: a message that was waiting still waits, and goes once the one ahead of it is
+retried, dismissed or edited. The server keeps the same order: it posts to each destination one at a
+time, in the order the posts reached it, the parts of a long post together. A post holds its
+destination until the chat service answers it, even after the app has stopped waiting for it, so a
+retry cannot overtake the attempt it repeats — up to the server's own deadline for one request to
+the chat service (`request_timeout_seconds`, 20 seconds by default). Past that deadline the server
+stops waiting, and the next post can reach a slow bridge that is still working on the first.
 
 **Taking a failed send back** (`#193 compose-draft-loss`). What you type in the channel's box, a
 thread's, Reply and the call's box is saved as you type and comes back after a reload or a sign-in.

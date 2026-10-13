@@ -28116,7 +28116,11 @@ test("a reply whose message cannot be placed is not posted anywhere, and Retry p
   await page.settle();
   assert.equal(page.repliesPosted.length, 0, "a reply was posted before anyone knew where it belonged");
   const held = outgoingRows(page)[0];
-  assert.equal(held.getAttribute("data-send-state"), "failed", "nothing was posted, so nothing is unconfirmed");
+  assert.notEqual(held.getAttribute("data-send-state"), "unconfirmed", "nothing was posted, so nothing is unconfirmed");
+  // `#277 send-order`: a read that timed out goes again on its own, which posting nothing cannot
+  // post anything twice, and says when.
+  assert.equal(held.getAttribute("data-send-state"), "retrying", "a read that timed out was left to the reader");
+  assert.match(held.text(), retryingFirst(), "the receipt did not say when it goes again");
   assert.match(held.text(), /thread/i, "the receipt did not say what the page could not find out");
   assert.match(held.text(), /history read timed out/, "the receipt hid why");
   assert.equal(savedOutgoing(page)[0].remaining, "held until the page knows where");
@@ -29167,29 +29171,114 @@ test("two replies to messages that came in live are placed by one read of the ch
   assert.equal(page.timelineCalls.length - before, 1, "each reply read the channel to place itself");
 });
 
-test("a reply that cannot be placed holds up nothing sent after it", async () => {
-  const { page } = await unplacedArrival();
-  const placing = gate(errorResponse(502, "chat_error", "history read timed out"));
-  page.timeline = placing.respond;
+// `#277 send-order`. A reply that could not be placed posted nothing, but it gave up no place: Retry
+// may still send it anywhere in its channel, so what was written after it there waits for it, until
+// it is placed and sent, dismissed, or edited back into Reply. Before this, a main-channel note
+// written after it went at once, and the reply, placed on the main channel by Retry, landed after
+// the note.
+
+test("`#277 send-order`: a reply that could not be placed holds what was written after it in its channel, and Retry lands it first", async () => {
+  const { page, standard } = await unplacedArrival({ id: "207", content: "an aside on the main channel" });
   distinctReplies(page);
-  await replyQuietly(page, "206", "an answer that will not find its thread");
-  await page.el("channel-compose-text").setValue("a note to the main channel");
-  page.el("channel-send").click();
+  await replyQuietly(page, "207", "A, answering the aside");
+  await sendBehind(page, "B, a note after it");
+  assert.deepEqual(postedWhere(page), [], "the note went while the reply written before it could still go first");
+  const [reply, note] = outgoingRows(page);
+  assert.equal(note.getAttribute("data-send-state"), "queued");
+  assert.match(note.text(), new RegExp("Waiting to send… “A, answering the aside” goes first, " +
+    `and goes again in ${RETRY_FIRST_MS / 1000} s\\.`), "the note did not say what it waits behind");
+  assert.deepEqual(outgoingActions(note), ["Edit", "Dismiss"]);
+
+  page.timeline = standard;
+  await outgoingRetry(reply).click();
+  for (let step = 0; step < 3; step += 1) await page.settle();
+  assert.deepEqual(postedWhere(page), [
+    ["A, answering the aside", null],
+    ["B, a note after it", null],
+  ], "the note landed before the reply written ahead of it");
+  assert.equal(page.repliesPosted[0].body.reply_to, "207");
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#277 send-order`: a reply whose placing read failed for a moment is placed again on its own, and what waits behind it follows", async () => {
+  const { page, first, standard } = await unplacedArrival();
+  distinctReplies(page);
+  await replyQuietly(page, "206", "an answer whose thread could not be read");
+  await sendBehind(page, "a note to the main channel after it");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "retrying");
+  const reads = page.timelineCalls.length;
+  // The read fails again: the reply waits longer, and the note with it.
+  assert.ok(page.expireTimers(retryWait(0)) >= 1, "the placing read was not asked again");
   await page.settle();
-  placing.open();
+  assert.equal(page.timelineCalls.length, reads + 1, "the placing read was not asked again");
+  assert.deepEqual(postedWhere(page), []);
+  assert.match(outgoingRows(page)[1].text(), new RegExp(`goes again in ${retryWait(1) / 1000} s\\.`));
+
+  page.timeline = standard;
+  assert.ok(page.expireTimers(retryWait(1)) >= 1, "the second try was not armed");
+  for (let step = 0; step < 3; step += 1) await page.settle();
+  assert.deepEqual(postedWhere(page), [
+    ["an answer whose thread could not be read", first.id],
+    ["a note to the main channel after it", null],
+  ]);
+});
+
+test("`#277 send-order`: a reply that cannot be placed at all holds its channel until it is dismissed, and then the next message goes", async () => {
+  const { page, standard } = await unplacedArrival({ id: "207", content: "an aside on the main channel" });
+  // The channel reads again, but no longer carries the message answered: an answer, not a moment.
+  page.messages = page.messages.filter((m) => m.id !== "207");
+  page.timeline = standard;
+  distinctReplies(page);
+  await replyQuietly(page, "207", "an answer to a lost message");
+  await sendBehind(page, "a note written after it");
+  const [reply, note] = outgoingRows(page);
+  assert.equal(reply.getAttribute("data-send-state"), "failed");
+  assert.match(reply.text(), /not among the channel's newest messages\. Retry once the channel can be read\./);
+  assert.match(note.text(), new RegExp("Waiting to send… “an answer to a lost message” goes first, " +
+    "and was not sent: which thread it goes in is not known yet\\. Retry, Edit or Dismiss it to let this one go\\."));
+  for (const wait of [0, 1, 2, 3, 4, 5].map(retryWait)) page.expireTimers(wait);
   await page.settle();
-  await page.settle();
-  assert.deepEqual(postedWhere(page), [["a note to the main channel", null]],
-    "an unplaceable reply kept the main channel waiting, or was posted anyway");
-  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "failed");
+  assert.deepEqual(postedWhere(page), [], "the reply was asked again on its own, or the note went past it");
+
+  await outgoingDismiss(reply).click();
+  for (let step = 0; step < 3; step += 1) await page.settle();
+  assert.deepEqual(postedWhere(page), [["a note written after it", null]], "a Dismiss did not let the note go");
+});
+
+test("`#277 send-order`: after a reload a note still waits behind a reply that could not be placed, and goes once Retry has sent it", async () => {
+  const { page } = await unplacedArrival({ id: "207", content: "an aside on the main channel" });
+  await replyQuietly(page, "207", "an answer to the aside");
+  await sendBehind(page, "a note after it");
+  assert.equal(page.repliesPosted.length, 0);
+
+  const again = reloadPage(page.storage, (p) => {
+    p.threadingSupported = true;
+    p.threads = page.threads;
+    p.messages = page.messages;
+  });
+  await reopenedChannel(again);
+  for (const wait of [0, 1, 2, 3].map(retryWait)) again.expireTimers(wait);
+  await again.settle();
+  assert.equal(again.repliesPosted.length, 0, "reopening the app sent a message on its own");
+  const [reply, note] = outgoingRows(again);
+  assert.equal(reply.getAttribute("data-send-state"), "failed");
+  assert.equal(note.getAttribute("data-send-state"), "queued", "the reload let the note stop waiting behind the reply");
+  assert.match(note.text(), /“an answer to the aside” goes first, and was not sent/);
+
+  distinctReplies(again);
+  await outgoingRetry(reply).click();
+  for (let step = 0; step < 3; step += 1) await again.settle();
+  assert.deepEqual(postedWhere(again), [["an answer to the aside", null], ["a note after it", null]]);
+  assert.equal(again.repliesPosted[0].body.reply_to, "207");
 });
 
 test("a page closed while a reply was being placed says nothing was sent, not that delivery is unconfirmed", async () => {
   // As signing out does: only a POST that had started can have arrived. Neither the reply still
-  // finding out where it goes nor the note waiting behind it had one.
+  // finding out where it goes nor the note waiting behind it had one. The note still waits behind
+  // the reply (`#277 send-order`): Retry may yet send the reply to the main channel, ahead of it.
   const { page, standard } = await unplacedArrival();
   page.timeline = gate(standard).respond;
-  await replyQuietly(page, "206", "an answer still finding its thread");
+  await replyQuietly(page, "206", "an answer finding its thread");
   await page.el("channel-compose-text").setValue("a note waiting its turn");
   page.el("channel-send").click();
   await page.settle();
@@ -29199,9 +29288,11 @@ test("a page closed while a reply was being placed says nothing was sent, not th
   await signIn(again);
   await reopenedChannel(again);
   assert.equal(again.repliesPosted.length, 0, "a reload posted on its own");
-  assert.deepEqual(outgoingRows(again).map((row) => row.getAttribute("data-send-state")), ["failed", "failed"]);
-  for (const row of outgoingRows(again)) {
-    assert.match(row.text(), /closed before this message was sent/);
+  const [reply, note] = outgoingRows(again);
+  assert.deepEqual([reply, note].map((row) => row.getAttribute("data-send-state")), ["failed", "queued"]);
+  assert.match(reply.text(), /closed before this message was sent/);
+  assert.match(note.text(), /Waiting to send… “an answer finding its thread” goes first, and was not sent: which thread it goes in is not known yet\./);
+  for (const row of [reply, note]) {
     assert.doesNotMatch(row.text(), /unconfirmed/i, "a message posted nowhere was called possibly delivered");
   }
 });
@@ -34026,6 +34117,80 @@ test("`#277 send-order`: an attempt that took longer to fail than its wait goes 
   await settleSend(page);
   assert.equal(page.repliesPosted.length, 2);
   assert.match(outgoingRows(page)[0].text(), new RegExp(`Retrying in ${retryWait(1) / 1000} s\\.`));
+});
+
+test("`#277 send-order`: the rest of a post continuing in a thread holds a message written into that thread after it", async () => {
+  // `#263 post-split-per-provider`: after a 207 the rest goes to the thread the first part started,
+  // so a message written into that thread later waits for it, as it would behind one sent there.
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.idempotentPostsSupported = true;
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  const thread = data.threads[0].id;
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the rest of A", detail: SLOW_SEND, retryable: true,
+    resumable: true, thread_id: thread,
+  });
+  await sendChannel(page, "the start of A. the rest of A");
+  assert.equal(savedOutgoing(page)[0].continueIn, thread);
+
+  postedAsSent(page);
+  await threadBadge(page.el("discord-log").children[1]).click();
+  await page.settle();
+  await sendBehind(page, "B, into the thread");
+  assert.equal(page.repliesPosted.length, 1, "B went into the thread ahead of the rest of A");
+  const behind = outgoingRows(page).find((row) => row.text().includes("B, into the thread"));
+  assert.match(behind.text(), /Waiting to send… “the rest of A” goes first, and goes again in/);
+
+  assert.ok(page.expireTimers(RETRY_FIRST_MS) >= 1, "the rest of A was not armed to go again");
+  await settleSend(page);
+  await settleSend(page);
+  assert.deepEqual(postedWhere(page).slice(1), [["the rest of A", thread], ["B, into the thread", thread]]);
+});
+
+test("`#277 send-order`: a send put back goes where it was written and holds what came after it, and one dismissed while it waited to go again stays unconfirmed", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await sendChannel(page, "W, refused first");
+  await outgoingDismiss(outgoingRows(page)[0]).click();
+  await page.settle();
+  page.setClock(page.clock() + 2000);
+  page.replyResponse = errorResponse(502, "chat_error", BRIDGE_FAILED);
+  await sendChannel(page, "V, lost second");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "retrying");
+
+  // Undo puts W back where it was written, before V, so V going again waits behind it.
+  await page.el("undo-send-dismiss").click();
+  await page.settle();
+  const rowWith = (text) => outgoingRows(page).find((row) => row.text().includes(text));
+  assert.deepEqual(outgoingRows(page).map((row) => row.text().includes("W, refused first")), [true, false],
+    "W was not put back where it was written");
+  // Not awaited: the attempt it starts is over only once V has gone, and V waits behind W.
+  outgoingRetry(rowWith("V, lost second")).click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 2, "V went again past a message written before it");
+  const waiting = rowWith("V, lost second");
+  assert.equal(waiting.getAttribute("data-send-state"), "queued");
+  assert.match(waiting.text(), /“W, refused first” goes first, and was not sent\. Retry, Edit or Dismiss it to let this one go\./);
+  assert.deepEqual(outgoingActions(waiting), ["Dismiss"], "a message that may have landed offers Edit");
+
+  // Dismissed while it waited, after a try that may have landed: kept as unconfirmed, never as unsent.
+  await outgoingDismiss(waiting).click();
+  page.expireTimers(SEND_UNDO_MS);
+  await page.settle();
+  await putBackOf(dismissedItems(page).find((item) => item.text().includes("V, lost second"))).click();
+  await page.settle();
+  const back = rowWith("V, lost second");
+  assert.equal(back.getAttribute("data-send-state"), "unconfirmed");
+  assert.match(back.text(), /Delivery unconfirmed\. Retrying cannot post it twice\. Dismissed while it waited its turn to go again, after a try whose delivery was not confirmed\./);
+  assert.doesNotMatch(back.text(), /so it was not sent/);
+  assert.deepEqual(outgoingActions(back), ["Retry", "Dismiss"]);
+  assert.equal(page.repliesPosted.length, 2, "putting it back sent it");
 });
 
 // --- messages read automatically -----------------------------------------------------------------
