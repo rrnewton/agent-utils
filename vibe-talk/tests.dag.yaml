@@ -637,6 +637,28 @@ steps:
       preferred_inner_jobs: 8
       rss_baseline_bytes: 3221225472
 
+  # `#277 send-order` in the browser engine, against the real server binary and its real provider
+  # client: a mock Google Chat bridge on loopback fails A at once; B waits behind A, saying so, and
+  # the bridge never sees it; A goes again under the same nonce and lands, then B; across a real
+  # reload a message still waits behind the one before it, and Retry on that one lands both, in
+  # order. It starts the release binary, so it hangs off the build; the server and the bridge are its
+  # own, on free loopback ports, and stopped with it. Measured on 2026-10-13: about 9.3s wall, most
+  # of it the page's own 3 s wait before A goes again and a 4 s watch that a reload sends nothing.
+  - group: check
+    job: send-order-browser
+    desc: messages to one destination land in the order written, through a bridge that fails the first and across a reload, in current Chromium against the real server
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/send_order_browser.py
+    jobs_flag: ""
+    deps: [build.release]
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # THE ONE THAT LEAKED. It starts a real server and drives a real Chromium at it. Boxed, its
   # descendants are reaped with it whether or not the script's own trap fires -- which is the whole
   # reason this file exists, because for six days that trap did not.
