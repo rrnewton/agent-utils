@@ -1208,15 +1208,9 @@ pub async fn page(
     })
 }
 
-/// When a message was created, from its snowflake, falling back to its reported timestamp.
-///
-/// The snowflake is authoritative because it is what Discord's own `before`/`after` compare, so a
-/// range filtered by anything else could disagree with the page it was fetched from.
+/// When a message was created; see [`Message::created_ms`].
 fn message_ms(message: &Message) -> Option<i64> {
-    message
-        .id
-        .created_at_ms()
-        .or_else(|| crate::clock::instant_ms(&message.timestamp))
+    message.created_ms()
 }
 
 /// A bounded, honest answer to "how many messages are in there?".

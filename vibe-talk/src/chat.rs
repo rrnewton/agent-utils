@@ -374,6 +374,113 @@ pub struct RecentRead {
     pub exhausted: bool,
 }
 
+/// Which messages of a channel a range read covers. remote-ops-audit W10 `#287 bulk-reads`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadScope {
+    /// The channel's own messages, exactly as [`ChatClient::fetch_page`] reads them.
+    Main,
+    /// Every message of the channel, thread replies included, in one history.
+    Flat,
+    /// One thread of the channel: its root and its replies.
+    Thread(String),
+}
+
+impl ReadScope {
+    /// The scope in words, for a refusal.
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Main => "channel's own messages",
+            Self::Flat => "whole history, replies included,",
+            Self::Thread(_) => "thread",
+        }
+    }
+}
+
+/// A half-open window of provider time, in Unix milliseconds: `since_ms <= created < until_ms`.
+/// remote-ops-audit W10 `#287 bulk-reads`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeRange {
+    /// The first instant inside the window.
+    pub since_ms: i64,
+    /// The first instant past it. `None` means now: the instant the read began, so a message
+    /// created while it runs may or may not be in it.
+    pub until_ms: Option<i64>,
+}
+
+impl TimeRange {
+    /// Whether an instant is inside the window.
+    #[must_use]
+    pub fn contains(&self, ms: i64) -> bool {
+        ms >= self.since_ms && self.until_ms.is_none_or(|until| ms < until)
+    }
+}
+
+/// Which end of a [`TimeRange`] a range read starts from, and so which way its continuation runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeOrder {
+    /// From `since` toward `until`: the oldest messages of the window first, as a forward walk
+    /// through a span (`/page?since=`) takes them.
+    OldestFirst,
+    /// From `until`, or now, toward `since`: the newest messages of the window first, as a count
+    /// or a backfill takes them.
+    NewestFirst,
+}
+
+/// One step of a range read. remote-ops-audit W10 `#287 bulk-reads`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RangeRead {
+    /// At most the number asked for, every one inside the window, oldest first: the window's
+    /// oldest ones for [`RangeOrder::OldestFirst`], its newest for [`RangeOrder::NewestFirst`].
+    pub messages: Vec<Message>,
+    /// Where the next step starts, in the same order. Opaque, and valid only for the same
+    /// channel, scope, window and order. `None` when the provider has nowhere further to go,
+    /// which on its own proves nothing: see [`RangeRead::exhausted`].
+    pub next: Option<String>,
+    /// Whether the provider PROVED there is nothing more in the window beyond `messages`, in the
+    /// direction of travel: Slack's `has_more: false`, or a bridge's exhaustive answer.
+    ///
+    /// Never inferred from a short step: a provider can drop rows it cannot represent, and a page
+    /// can be cut short, so fewer messages than asked for is not a proof. False by default.
+    pub exhausted: bool,
+    /// The instant, RFC 3339, up to which the provider knows its answer is complete, when it
+    /// served a copy it could not bring up to date just now. `None` means now. As
+    /// [`RecentRead::as_of`].
+    pub as_of: Option<String>,
+}
+
+/// Whether a provider answers a bulk read itself, or the trait's default answers it with
+/// single-channel reads that cost what they always did. remote-ops-audit W10 `#287 bulk-reads`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Support {
+    /// The trait's default body: correct, and no cheaper than the reads it is made of. A caller
+    /// that would use the read only because it is cheap must not use it.
+    #[default]
+    Emulated,
+    /// The provider's own read, cheaper than the default.
+    Native,
+}
+
+/// Which bulk reads a provider answers natively for a channel, and how many rows one of its
+/// upstream calls returns. remote-ops-audit W10 `#287 bulk-reads`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadCaps {
+    /// [`ChatClient::fetch_range`] of the channel's own messages ([`ReadScope::Main`]).
+    pub range: Support,
+    /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
+    /// 100 unless the provider says otherwise.
+    pub page_rows: u16,
+}
+
+impl Default for ReadCaps {
+    fn default() -> Self {
+        Self {
+            range: Support::Emulated,
+            page_rows: crate::discord::http::DISCORD_MAX_LIMIT,
+        }
+    }
+}
+
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
@@ -616,6 +723,43 @@ pub trait ChatClient: Send + Sync {
         })
     }
 
+    /// Which bulk reads this provider answers natively for `channel`. remote-ops-audit W10
+    /// `#287 bulk-reads`.
+    ///
+    /// Everything [`Support::Emulated`] by default, at Discord's 100 rows a call. The router
+    /// answers with the channel's own provider's capabilities.
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps::default()
+    }
+
+    /// One step of a read of the messages of `scope` created inside `range`. remote-ops-audit W10
+    /// `#287 bulk-reads`.
+    ///
+    /// At most `limit` messages, oldest first, from the end of the window `order` names; `cursor`
+    /// is a step's [`RangeRead::next`], for the same channel, scope, window and order. A native
+    /// read ([`ReadCaps::range`]) costs about one upstream call per [`ReadCaps::page_rows`]
+    /// rows it returns, never anything for the messages outside the window.
+    ///
+    /// The default is [`emulated_range`]: one [`ChatClient::fetch_page`] from the window's edge,
+    /// trimmed to the window, exactly the read `/page?since=` has always made. It reads only the
+    /// channel's own messages, and refuses the other scopes.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::Refused`] for a scope or a cursor this provider cannot answer; otherwise the
+    /// errors of [`ChatClient::fetch_page`].
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        scope: &ReadScope,
+        range: TimeRange,
+        order: RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<RangeRead, ChatError> {
+        emulated_range(self, channel, scope, range, order, limit, cursor).await
+    }
+
     /// Post `content` to `channel`, optionally as a reply to an existing message.
     ///
     /// # Errors
@@ -743,5 +887,216 @@ pub trait ChatClient: Send + Sync {
         Err(ChatError::Refused(
             "the configured chat provider cannot clear its unread state automatically".to_owned(),
         ))
+    }
+}
+
+/// [`ChatClient::fetch_range`]'s default: a range read made of one [`ChatClient::fetch_page`].
+/// remote-ops-audit W10 `#287 bulk-reads`.
+///
+/// Oldest first, the page starts just below `since` (`after` the id of the millisecond before
+/// it, Discord's `after` being exclusive); newest first, just below `until` (`before` the id of
+/// that instant), or at the newest message when the window runs to now. A `cursor` replaces that
+/// edge with the message the last step reached. The page is then trimmed to the window by each
+/// message's creation instant ([`Message::created_ms`]); one whose instant cannot be read is
+/// kept, as `/page` has always kept it. Exactly the read and the trim `/page?since=` made before
+/// this method existed, so a provider without a range read of its own answers it as before.
+///
+/// `next` is the id of the last message the page reached, unless the page already reached past
+/// the window's far end. Never `exhausted`: a page that came back short, or one that reached past
+/// the window, is the provider's word for it, not a proof this server can stamp.
+///
+/// # Errors
+///
+/// [`ChatError::Refused`] for any scope but [`ReadScope::Main`]: a channel's threads have no time
+/// window this default can ask for. Otherwise the errors of [`ChatClient::fetch_page`].
+pub async fn emulated_range<C: ChatClient + ?Sized>(
+    client: &C,
+    channel: &ChannelId,
+    scope: &ReadScope,
+    range: TimeRange,
+    order: RangeOrder,
+    limit: u16,
+    cursor: Option<&str>,
+) -> Result<RangeRead, ChatError> {
+    if *scope != ReadScope::Main {
+        return Err(ChatError::Refused(format!(
+            "this backend cannot read a channel's {} by time",
+            scope.describe()
+        )));
+    }
+    let cursor = cursor.map(|raw| MessageId(raw.to_owned()));
+    let raw = match order {
+        RangeOrder::OldestFirst => {
+            let after = cursor.unwrap_or_else(|| MessageId::at_time_ms(range.since_ms - 1));
+            client
+                .fetch_page(channel, limit, None, Some(&after))
+                .await?
+        }
+        RangeOrder::NewestFirst => {
+            let before = cursor.or_else(|| range.until_ms.map(MessageId::at_time_ms));
+            client
+                .fetch_page(channel, limit, before.as_ref(), None)
+                .await?
+        }
+    };
+    let next = match order {
+        RangeOrder::OldestFirst => {
+            let past = raw.iter().any(|m| {
+                m.created_ms()
+                    .is_some_and(|ms| range.until_ms.is_some_and(|until| ms >= until))
+            });
+            raw.last().filter(|_| !past)
+        }
+        RangeOrder::NewestFirst => {
+            let past = raw
+                .iter()
+                .any(|m| m.created_ms().is_some_and(|ms| ms < range.since_ms));
+            raw.first().filter(|_| !past)
+        }
+    }
+    .map(|m| m.id.0.clone());
+    let messages = raw
+        .into_iter()
+        .filter(|m| m.created_ms().is_none_or(|ms| range.contains(ms)))
+        .collect();
+    Ok(RangeRead {
+        messages,
+        next,
+        exhausted: false,
+        as_of: None,
+    })
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::discord::fake::FakeDiscord;
+
+    const BASE_MS: i64 = 1_787_000_000_000;
+
+    /// Ten messages a second apart, and the page requests the fake was sent.
+    fn channel() -> (FakeDiscord, ChannelId) {
+        let fake = FakeDiscord::new();
+        let channel = ChannelId("42".to_owned());
+        for i in 0..10 {
+            fake.seed_at(&channel, "ada", &format!("m{i}"), BASE_MS + i * 1_000);
+        }
+        (fake, channel)
+    }
+
+    fn bodies(read: &RangeRead) -> Vec<&str> {
+        read.messages.iter().map(|m| m.content.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_default_reads_one_page_from_the_windows_edge_and_trims_it_to_the_window() {
+        let (fake, channel) = channel();
+        let range = TimeRange {
+            since_ms: BASE_MS + 2_000,
+            until_ms: Some(BASE_MS + 5_000),
+        };
+        let read = fake
+            .fetch_range(
+                &channel,
+                &ReadScope::Main,
+                range,
+                RangeOrder::OldestFirst,
+                10,
+                None,
+            )
+            .await
+            .expect("read");
+        assert_eq!(bodies(&read), ["m2", "m3", "m4"], "both edges to the ms");
+        assert_eq!(fake.fetch_count(), 1);
+        assert_eq!(read.next, None, "the page reached past the window's end");
+        assert!(!read.exhausted, "a default never claims a proof");
+
+        let read = fake
+            .fetch_range(
+                &channel,
+                &ReadScope::Main,
+                range,
+                RangeOrder::NewestFirst,
+                10,
+                None,
+            )
+            .await
+            .expect("read");
+        assert_eq!(bodies(&read), ["m2", "m3", "m4"]);
+        assert_eq!(read.next, None, "the page reached below the window's start");
+        assert!(!read.exhausted);
+    }
+
+    #[tokio::test]
+    async fn the_default_continues_from_the_last_message_a_step_reached() {
+        let (fake, channel) = channel();
+        let range = TimeRange {
+            since_ms: BASE_MS + 1_000,
+            until_ms: None,
+        };
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let read = fake
+                .fetch_range(
+                    &channel,
+                    &ReadScope::Main,
+                    range,
+                    RangeOrder::OldestFirst,
+                    3,
+                    cursor.as_deref(),
+                )
+                .await
+                .expect("read");
+            seen.extend(read.messages.iter().map(|m| m.content.clone()));
+            cursor = read.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, (1..10).map(|i| format!("m{i}")).collect::<Vec<_>>());
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let read = fake
+                .fetch_range(
+                    &channel,
+                    &ReadScope::Main,
+                    range,
+                    RangeOrder::NewestFirst,
+                    4,
+                    cursor.as_deref(),
+                )
+                .await
+                .expect("read");
+            let mut step: Vec<String> = read.messages.iter().map(|m| m.content.clone()).collect();
+            step.extend(seen);
+            seen = step;
+            cursor = read.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, (1..10).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn the_default_refuses_a_scope_it_cannot_bound_by_time_and_sends_nothing() {
+        let (fake, channel) = channel();
+        let range = TimeRange {
+            since_ms: BASE_MS,
+            until_ms: None,
+        };
+        for scope in [ReadScope::Flat, ReadScope::Thread("t".to_owned())] {
+            let error = fake
+                .fetch_range(&channel, &scope, range, RangeOrder::OldestFirst, 5, None)
+                .await
+                .expect_err("refused");
+            assert!(matches!(error, ChatError::Refused(_)), "{error}");
+        }
+        assert_eq!(fake.fetch_count(), 0);
+        assert_eq!(fake.read_caps(&channel), ReadCaps::default());
+        assert_eq!(fake.read_caps(&channel).range, Support::Emulated);
     }
 }

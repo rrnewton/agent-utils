@@ -17,10 +17,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
-use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
+use vibe_talk::chat::{
+    ChatClient, ChatError, ChatIdentity, RangeOrder, RangeRead, ReadCaps, ReadScope, Support,
+    TimeRange,
+};
 use vibe_talk::discord::fake::FakeDiscord;
-use vibe_talk::model::{ChannelId, Message, MessageId};
-use vibe_talk::providers::ChatRouter;
+use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId};
+use vibe_talk::providers::{ChatRouter, ProviderEntry};
 use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN};
 
 /// 2026-08-17T20:53:20Z, the first message of the fixture.
@@ -267,4 +270,195 @@ async fn a_provider_without_a_range_read_gets_todays_page_and_count_answers_at_t
     assert!(held
         .iter()
         .any(|case| case["body"]["has_more"] == true && case["body"]["next_since"].is_string()));
+}
+
+/// One range read a provider was asked for: channel, order, limit and cursor.
+type Asked = (ChannelId, RangeOrder, u16, Option<String>);
+
+/// A provider that reads by time itself, and records each range read it is asked for.
+struct Native {
+    asked: Mutex<Vec<Asked>>,
+}
+
+#[async_trait]
+impl ChatClient for Native {
+    fn provider_name(&self) -> &str {
+        "Native"
+    }
+
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            range: Support::Native,
+            page_rows: 20,
+        }
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        _scope: &ReadScope,
+        _range: TimeRange,
+        order: RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<RangeRead, ChatError> {
+        self.asked.lock().expect("asked").push((
+            channel.clone(),
+            order,
+            limit,
+            cursor.map(str::to_owned),
+        ));
+        Ok(RangeRead {
+            exhausted: true,
+            ..RangeRead::default()
+        })
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        Ok(ChatIdentity {
+            id: "1".to_owned(),
+            username: "native".to_owned(),
+        })
+    }
+
+    async fn fetch_page(
+        &self,
+        _: &ChannelId,
+        _: u16,
+        _: Option<&MessageId>,
+        _: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        Err(ChatError::Refused(
+            "a range read never pages here".to_owned(),
+        ))
+    }
+
+    async fn post_message(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused("read only".to_owned()))
+    }
+}
+
+fn routed(id: &ChannelId, provider: &str) -> ChannelInfo {
+    ChannelInfo {
+        id: id.clone(),
+        label: provider.to_owned(),
+        writable: false,
+        alias: None,
+        added: false,
+        provider: Some(provider.to_owned()),
+    }
+}
+
+/// remote-ops-audit W10: the router forwards a range read, and the question whether one is cheap,
+/// to the channel's own provider, and each is timed under that provider.
+#[tokio::test]
+async fn the_router_asks_each_channels_own_provider_whether_and_how_it_reads_by_time() {
+    let native = Arc::new(Native {
+        asked: Mutex::new(Vec::new()),
+    });
+    let plain = Arc::new(FakeDiscord::new());
+    let (on_native, on_plain) = (ChannelId("10".to_owned()), ChannelId("20".to_owned()));
+    plain.register_channel(&on_plain);
+    plain.seed_at(&on_plain, "ada", "inside", BASE_MS + 1_000);
+    plain.seed_at(&on_plain, "ada", "past the end", BASE_MS + 9_000);
+    let router = ChatRouter::new(
+        vec![
+            ProviderEntry {
+                key: "native".to_owned(),
+                namespace: "native".to_owned(),
+                client: Arc::clone(&native) as Arc<dyn ChatClient>,
+                live_poll_seconds: 0,
+            },
+            ProviderEntry {
+                key: "plain".to_owned(),
+                namespace: "plain".to_owned(),
+                client: Arc::clone(&plain) as Arc<dyn ChatClient>,
+                live_poll_seconds: 0,
+            },
+        ],
+        Some("plain"),
+    );
+    router.replace_routes(&[routed(&on_native, "native"), routed(&on_plain, "plain")]);
+    let nowhere = ChannelId("30".to_owned());
+
+    assert_eq!(router.read_caps(&on_native).range, Support::Native);
+    assert_eq!(router.read_caps(&on_native).page_rows, 20);
+    assert_eq!(router.read_caps(&on_plain), ReadCaps::default());
+    assert_eq!(
+        router.read_caps(&nowhere),
+        ReadCaps::default(),
+        "an unrouted channel is not claimed to be cheap"
+    );
+
+    let range = TimeRange {
+        since_ms: BASE_MS,
+        until_ms: Some(BASE_MS + 5_000),
+    };
+    let read = router
+        .fetch_range(
+            &on_native,
+            &ReadScope::Main,
+            range,
+            RangeOrder::NewestFirst,
+            40,
+            Some("c"),
+        )
+        .await
+        .expect("native read");
+    assert!(read.exhausted);
+    assert_eq!(
+        native.asked.lock().expect("asked").clone(),
+        [(
+            on_native.clone(),
+            RangeOrder::NewestFirst,
+            40,
+            Some("c".to_owned())
+        )]
+    );
+    assert_eq!(plain.fetch_count(), 0);
+
+    let read = router
+        .fetch_range(
+            &on_plain,
+            &ReadScope::Main,
+            range,
+            RangeOrder::OldestFirst,
+            40,
+            None,
+        )
+        .await
+        .expect("plain read");
+    assert_eq!(read.messages.len(), 1, "trimmed to the window: {read:?}");
+    assert_eq!(read.messages[0].content, "inside");
+    assert_eq!(plain.fetch_count(), 1);
+    assert_eq!(native.asked.lock().expect("asked").len(), 1);
+
+    let error = router
+        .fetch_range(
+            &nowhere,
+            &ReadScope::Main,
+            range,
+            RangeOrder::OldestFirst,
+            40,
+            None,
+        )
+        .await
+        .expect_err("unrouted");
+    assert!(matches!(error.cause(), ChatError::Refused(_)), "{error}");
+
+    let report = router.profile().report();
+    for provider in &report.providers {
+        let timed = provider
+            .operations
+            .iter()
+            .filter(|row| row.name == "fetch_range")
+            .map(|row| row.count)
+            .sum::<u64>();
+        assert_eq!(timed, 1, "{} timed its range read", provider.provider);
+    }
 }

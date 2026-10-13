@@ -22,8 +22,8 @@ use serde_json::Value;
 use slack_fake::{profiled, ts, Fake, FakeState, METHODS, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
-    ChatClient, ChatError, ChatIdentity, PostLimit, RecentRead, RegisteredChannel, SourceClaim,
-    UpstreamClearOutcome,
+    ChatClient, ChatError, ChatIdentity, PostLimit, RangeOrder, RangeRead, ReadCaps, ReadScope,
+    RecentRead, RegisteredChannel, SourceClaim, Support, TimeRange, UpstreamClearOutcome,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -427,6 +427,30 @@ impl ChatClient for Recorder {
             exhausted: false,
         })
     }
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        self.note("read_caps");
+        ReadCaps {
+            range: Support::Native,
+            page_rows: 7,
+        }
+    }
+    async fn fetch_range(
+        &self,
+        _channel: &ChannelId,
+        _scope: &ReadScope,
+        _range: TimeRange,
+        _order: RangeOrder,
+        _limit: u16,
+        _cursor: Option<&str>,
+    ) -> Result<RangeRead, ChatError> {
+        self.note("fetch_range");
+        Ok(RangeRead {
+            messages: vec![self.message.clone()],
+            next: Some("next".to_owned()),
+            exhausted: true,
+            as_of: None,
+        })
+    }
     async fn post_message(
         &self,
         _channel: &ChannelId,
@@ -602,6 +626,24 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     assert_eq!(dated.as_of.as_deref(), Some("2026-10-12T09:00:00Z"));
     assert_eq!(dated.messages.len(), 1);
     ran("fetch_recent_dated");
+    assert_eq!(client.read_caps(&channel).page_rows, 7);
+    ran("read_caps");
+    let range = client
+        .fetch_range(
+            &channel,
+            &ReadScope::Thread("t".to_owned()),
+            TimeRange {
+                since_ms: 0,
+                until_ms: None,
+            },
+            RangeOrder::NewestFirst,
+            5,
+            Some("cursor"),
+        )
+        .await
+        .expect("range");
+    assert!(range.exhausted && range.next.as_deref() == Some("next"));
+    ran("fetch_range");
     client
         .post_message(&channel, "hi", None)
         .await
@@ -678,10 +720,11 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         Some(0),
         "an empty directory page"
     );
-    // Seven reads each return the one message; posts return ours and are not counted.
+    assert_eq!(rows("fetch_range"), Some(1));
+    // Eight reads each return the one message; posts return ours and are not counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 7, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 7 * bytes);
+    assert_eq!(rec.content_bytes.messages, 8, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 8 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),

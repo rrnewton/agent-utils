@@ -542,6 +542,31 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    /// The channel's own provider's capabilities: a Slack channel and a bridge channel in one
+    /// server read by time each their own way. remote-ops-audit W10 `#287 bulk-reads`. A channel no
+    /// provider holds cannot be read at all, so it is answered as emulated.
+    fn read_caps(&self, channel: &ChannelId) -> crate::chat::ReadCaps {
+        match self.route(channel) {
+            Ok(entry) => entry.client.read_caps(channel),
+            Err(_) => crate::chat::ReadCaps::default(),
+        }
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        scope: &crate::chat::ReadScope,
+        range: crate::chat::TimeRange,
+        order: crate::chat::RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::RangeRead, ChatError> {
+        self.route(channel)?
+            .client
+            .fetch_range(channel, scope, range, order, limit, cursor)
+            .await
+    }
+
     fn supports_channel_registration(&self) -> bool {
         match self.entries.as_slice() {
             [only] => only.client.supports_channel_registration(),

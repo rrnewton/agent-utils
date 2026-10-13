@@ -945,6 +945,15 @@ impl Rows for RecentRead {
     }
 }
 
+impl Rows for crate::chat::RangeRead {
+    fn rows(&self) -> usize {
+        self.messages.len()
+    }
+    fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+}
+
 impl Rows for crate::directory::DirectoryPage {
     fn rows(&self) -> usize {
         self.entries.len()
@@ -1205,6 +1214,28 @@ impl ChatClient for ProfiledClient {
             "fetch_recent_dated",
             Direction::Read,
             self.inner.fetch_recent_dated(channel, limit),
+        )
+        .await
+    }
+
+    fn read_caps(&self, channel: &ChannelId) -> crate::chat::ReadCaps {
+        self.inner.read_caps(channel)
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        scope: &crate::chat::ReadScope,
+        range: crate::chat::TimeRange,
+        order: crate::chat::RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::RangeRead, ChatError> {
+        self.timed(
+            "fetch_range",
+            Direction::Read,
+            self.inner
+                .fetch_range(channel, scope, range, order, limit, cursor),
         )
         .await
     }

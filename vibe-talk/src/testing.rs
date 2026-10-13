@@ -794,6 +794,31 @@ impl crate::chat::ChatClient for CountingChat {
         .await
     }
 
+    fn read_caps(&self, channel: &crate::model::ChannelId) -> crate::chat::ReadCaps {
+        self.inner.read_caps(channel)
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &crate::model::ChannelId,
+        scope: &crate::chat::ReadScope,
+        range: crate::chat::TimeRange,
+        order: crate::chat::RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::RangeRead, crate::chat::ChatError> {
+        let call = match scope {
+            crate::chat::ReadScope::Thread(thread) => thread_call("fetch_range", channel, thread),
+            _ => call_in("fetch_range", channel),
+        };
+        self.counted(
+            call,
+            self.inner
+                .fetch_range(channel, scope, range, order, limit, cursor),
+        )
+        .await
+    }
+
     async fn post_message(
         &self,
         channel: &crate::model::ChannelId,

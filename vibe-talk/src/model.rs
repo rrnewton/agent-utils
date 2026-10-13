@@ -342,6 +342,18 @@ impl Message {
             &self.spoken_content
         }
     }
+
+    /// When this message was created, in Unix milliseconds: from its snowflake, falling back to
+    /// its reported timestamp. `None` when neither can be read.
+    ///
+    /// The snowflake is authoritative because it is what Discord's own `before`/`after` compare,
+    /// so a range filtered by anything else could disagree with the page it was fetched from.
+    #[must_use]
+    pub fn created_ms(&self) -> Option<i64> {
+        self.id
+            .created_at_ms()
+            .or_else(|| crate::clock::instant_ms(&self.timestamp))
+    }
 }
 
 /// Sort a batch of messages oldest-first, by snowflake where possible.
