@@ -749,3 +749,66 @@ async fn the_owners_choice_survives_a_restart_of_the_server() {
     assert!(tool_text(&response).starts_with("SENT."), "{response}");
     assert_eq!(second.discord.posted().len(), 1);
 }
+
+/// `#270 voice-transcript-markers`. A direct send is filed in the send memory too, so the voice page
+/// can draw it as "sent without asking", and the memory keeps which door it came through.
+#[tokio::test]
+async fn a_direct_send_is_published_in_the_send_memory_with_the_door_it_came_through() {
+    let harness = sending_at_once().await;
+    let (status, response) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "rebase onto main" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, body) = send(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals",
+        Some(WRITE_TOKEN),
+        Some(json!({ "channel_id": WRITE_CHANNEL, "text": "and run the tests" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sent"], true, "{body}");
+
+    let (status, polled) = send(
+        &harness,
+        "GET",
+        "/api/v1/post-proposals?sent_after=0",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{polled}");
+    let sends = polled["sends"].as_array().expect("sends");
+    assert_eq!(sends.len(), 2, "{polled}");
+    assert_eq!(sends[0]["text"], "rebase onto main");
+    assert_eq!(sends[0]["detail"]["how"], "direct");
+    assert_eq!(sends[0]["detail"]["origin"], "mcp");
+    assert_eq!(sends[1]["detail"]["origin"], "rest");
+    assert_eq!(sends[1]["detail"]["serial"], body["serial"]);
+    assert!(polled["proposal"].is_null(), "{polled}");
+    // Nothing was proposed, so nothing has a fate.
+    assert!(polled.get("settled").is_none(), "{polled}");
+
+    // The repeat posted nothing more, and files nothing more.
+    let (_, again) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "rebase onto main" }),
+    )
+    .await;
+    assert!(tool_text(&again).starts_with("SENT already."), "{again}");
+    let (_, polled) = send(
+        &harness,
+        "GET",
+        "/api/v1/post-proposals?sent_after=2",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert!(polled.get("sends").is_none(), "{polled}");
+    assert_eq!(polled["sends_through"], 2);
+}

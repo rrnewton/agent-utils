@@ -1857,7 +1857,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       const url = new URL(path, "http://fixture.test");
       const wait = Number(url.searchParams.get("wait") || 0);
       const seen = url.searchParams.get("seen");
-      const answer = () => json(200, { proposal: page.proposal });
+      // `sends_through` and `now_ms` ride on every answer, as the server's do (`#270
+      // voice-transcript-markers`).
+      const answer = () => json(200, { proposal: page.proposal, sends_through: 0, now_ms: Date.now() });
       const current = page.proposal ? String(page.proposal.serial) : null;
       if (wait === 0 || current !== seen) return answer();
       return new Promise((resolve) => page.proposalWaiters.push(() => resolve(answer())));

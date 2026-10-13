@@ -775,3 +775,262 @@ async fn the_read_scope_tool_list_is_unchanged() {
         assert!(!listing.contains(absent), "{absent}: {listing}");
     }
 }
+
+// --- #270 voice-transcript-markers: the send memory, through the router --------------------------
+
+/// The long poll, read at once, as a page that reads the send memory reads it.
+async fn sends_after(harness: &Harness, after: u64) -> Value {
+    let (status, body) = send(
+        harness,
+        "GET",
+        &format!("/api/v1/post-proposals?sent_after={after}"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// A message long enough to go as three parts at Discord's limit.
+fn three_parts() -> String {
+    format!(
+        "{}{}{}",
+        "alpha ".repeat(250),
+        "bravo ".repeat(250),
+        "charlie ".repeat(200)
+    )
+}
+
+/// Another proposal, after something has already been posted.
+async fn propose_again(harness: &Harness, text: &str) -> Value {
+    let (status, response) = post_reply(
+        harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": text }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(tool_text(&response).starts_with("NOT SENT."), "{response}");
+    pending(harness).await
+}
+
+#[tokio::test]
+async fn a_tap_and_a_spoken_yes_each_publish_one_send_saying_how_it_was_approved() {
+    let harness = harness();
+    let before = sends_after(&harness, 0).await;
+    assert!(before.get("sends").is_none(), "{before}");
+    assert_eq!(before["sends_through"], 0);
+    assert!(
+        before["now_ms"].as_i64().is_some_and(|ms| ms > 0),
+        "{before}"
+    );
+
+    let tapped = propose(&harness, "on my way").await;
+    let (status, body) = commit(&harness, restated(&tapped)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["send_seq"], 1, "the commit names its send: {body}");
+
+    let spoken = propose_again(&harness, "right behind you").await;
+    let mut confirmed = restated(&spoken);
+    confirmed["confirmed_by"] = json!("speaker_turn");
+    let (status, body) = commit(&harness, confirmed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["send_seq"], 2);
+
+    let after = sends_after(&harness, 0).await;
+    let sends = after["sends"].as_array().expect("sends");
+    assert_eq!(sends.len(), 2, "{after}");
+    // `#303 voice-post-prefix`: the text that went, the owner's tag in front.
+    assert_eq!(sends[0]["text"], tagged("on my way"));
+    assert_eq!(sends[0]["detail"]["how"], "tap");
+    assert_eq!(sends[0]["detail"]["origin"], "commit");
+    assert_eq!(sends[0]["detail"]["serial"], tapped["serial"]);
+    assert_eq!(sends[0]["detail"]["outcome"], "sent");
+    assert_eq!(sends[0]["detail"]["channel_name"], "lead team");
+    assert_eq!(sends[0]["detail"]["parts_posted"], 1);
+    assert!(sends[0]["detail"]["message_id"].is_string(), "{after}");
+    assert_eq!(sends[1]["detail"]["how"], "voice");
+    assert_eq!(after["sends_through"], 2);
+    let settled = after["settled"].as_array().expect("settled");
+    assert!(
+        settled.iter().all(|entry| entry["fate"] == "committed"),
+        "{after}"
+    );
+    // Past the cursor, nothing again; and without a cursor, never any sends.
+    assert!(sends_after(&harness, 2).await.get("sends").is_none());
+    let (_, plain) = send(&harness, "GET", "/api/v1/post-proposals", WRITE_TOKEN, None).await;
+    assert!(plain.get("sends").is_none(), "{plain}");
+    assert_eq!(plain["sends_through"], 2);
+}
+
+#[tokio::test]
+async fn a_partial_commit_answers_207_with_its_serial_and_files_the_parts_that_went() {
+    let harness = harness();
+    let long = three_parts();
+    let proposal = propose(&harness, &long).await;
+    // The second part's request never completes: it may or may not be in the channel.
+    harness.discord.fail_post_after(1, "connection reset");
+    let (status, body) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{body}");
+    assert_eq!(body["posted"], 1, "{body}");
+    assert_eq!(body["uncertain"], true, "{body}");
+    assert_eq!(body["serial"], proposal["serial"], "{body}");
+    assert_eq!(body["send_seq"], 1, "{body}");
+
+    let after = sends_after(&harness, 0).await;
+    let detail = &after["sends"][0]["detail"];
+    assert_eq!(detail["outcome"], "partial", "{after}");
+    assert_eq!(detail["parts_posted"], 1);
+    assert_eq!(detail["parts_total"], 3);
+    assert_eq!(detail["uncertain_part"], 2);
+    let first = harness.discord.posted()[0].content.clone();
+    assert_eq!(after["sends"][0]["text"], first.as_str(), "only what went");
+    assert!(
+        detail["message_id"].is_string(),
+        "the first part can be opened: {after}"
+    );
+    let unsent = detail["unsent_chars"].as_u64().expect("a count");
+    assert!(unsent > 0 && unsent < 1000, "the third part only: {unsent}");
+}
+
+#[tokio::test]
+async fn a_commit_whose_first_answer_was_lost_is_unconfirmed_and_one_refused_is_not_filed() {
+    let harness = harness();
+    let proposal = propose(&harness, "on my way").await;
+    harness.discord.lose_answer_after(0, "timed out");
+    let (status, body) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{body}");
+    assert_eq!(body["posted"], 0, "{body}");
+    assert_eq!(body["uncertain"], true, "{body}");
+    let after = sends_after(&harness, 0).await;
+    assert_eq!(
+        after["sends"][0]["detail"]["outcome"], "unconfirmed",
+        "{after}"
+    );
+    assert_eq!(after["sends"][0]["text"], tagged("on my way"));
+
+    let refused = propose_again(&harness, "not this one").await;
+    harness
+        .discord
+        .refuse_post_after(0, 400, "{\"message\":\"no\"}");
+    let (status, body) = commit(&harness, restated(&refused)).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{body}");
+    assert_eq!(body["uncertain"], false, "{body}");
+    assert!(body.get("send_seq").is_none(), "{body}");
+    assert_eq!(
+        sends_after(&harness, 0).await["sends_through"],
+        1,
+        "a post that certainly went nowhere was filed"
+    );
+}
+
+#[tokio::test]
+async fn the_long_poll_wakes_for_a_send_only_when_it_reads_the_send_memory() {
+    let harness = Arc::new(harness());
+    let proposal = propose(&harness, "on my way").await;
+    let serial = proposal["serial"].as_u64().expect("serial");
+    let reader = {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move {
+            send(
+                &harness,
+                "GET",
+                &format!("/api/v1/post-proposals?wait=5&seen={serial}&sent_after=0"),
+                WRITE_TOKEN,
+                None,
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // A direct send changes nothing pending; only the send memory moves.
+    let (status, _) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = tokio::time::timeout(Duration::from_secs(3), reader)
+        .await
+        .expect("the wait ended")
+        .expect("task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["sends"][0]["text"], tagged("on my way"), "{body}");
+}
+
+#[tokio::test]
+async fn a_proposal_names_who_it_answers_and_never_the_id_when_this_server_holds_the_message() {
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    harness.discord.seed(
+        &channel,
+        "Alex",
+        "is the build green yet <@1234567890123> because the release is waiting on it",
+    );
+    let (_status, window) = send(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    let target = window["messages"][0]["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    let (_status, _response) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "yes", "reply_to": target }),
+    )
+    .await;
+    let proposal = pending(&harness).await;
+    assert_eq!(proposal["reply_to_author"], "Alex", "{proposal}");
+    let excerpt = proposal["reply_to_excerpt"].as_str().expect("an excerpt");
+    assert_eq!(excerpt, "is the build green yet because the release…");
+    assert!(
+        !excerpt.chars().any(|c| c.is_ascii_digit()),
+        "an id reached the card: {excerpt}"
+    );
+
+    let (status, body) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = sends_after(&harness, 0).await["sends"][0]["detail"].clone();
+    assert_eq!(detail["reply_to"], target.as_str());
+    assert_eq!(detail["reply_to_author"], "Alex");
+    assert_eq!(detail["reply_to_excerpt"], excerpt);
+
+    // A reply to a message this server does not hold is still proposed, with nothing to say.
+    let (_status, _response) = post_reply(
+        &harness,
+        WRITE_TOKEN,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "yes", "reply_to": "300" }),
+    )
+    .await;
+    let unknown = pending(&harness).await;
+    assert!(unknown.get("reply_to_author").is_none(), "{unknown}");
+    assert!(unknown.get("reply_to_excerpt").is_none(), "{unknown}");
+}
+
+#[tokio::test]
+async fn forgetting_the_stored_conversations_or_purging_empties_the_send_memory() {
+    for route in ["/api/v1/conversations", "/api/v1/storage"] {
+        let (state, discord, _store) = vibe_talk::testing::state_with_store();
+        let harness = Harness {
+            router: router(state),
+            discord,
+        };
+        let proposal = propose(&harness, "on my way").await;
+        let (status, _) = commit(&harness, restated(&proposal)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sends_after(&harness, 0).await["sends"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let (status, body) = send(&harness, "DELETE", route, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        let after = sends_after(&harness, 0).await;
+        assert!(after.get("sends").is_none(), "{route} left a send: {after}");
+        assert_eq!(after["sends_through"], 1, "the counter never goes back");
+    }
+}
