@@ -1829,13 +1829,13 @@ that registration imposes. Posts use the existing message body and nonce contrac
 post responses use the existing message wire format.
 
 A thread post's response is vibe-talk's confirmation that the message was delivered, so it must be
-the posted message in the parent channel. Its `thread` should name the thread posted to, and may be
-left out — by a bridge answering, for a post or for a retry under the same nonce, with a copy of
-the message its live event stream stored before the provider confirmed the send, for example.
-vibe-talk then takes the message to be a reply in that thread, since the route posts there or
-fails. A response in another channel, or naming another thread, is refused and the post reported
-as unconfirmed: the bridge answered, but not for the post vibe-talk asked for
-(`send-confirm-thread`).
+the posted message in the parent channel. Its `thread` should name the thread posted to, but it may
+be absent; vibe-talk then takes the message to be a reply in that thread, since the route posts
+there or fails. A bridge can legitimately leave it out: for example, when its live event stream
+stored the message before the provider confirmed the send, and the bridge answers the post (or a
+retry under the same nonce) with that stored copy. A response in another channel, or naming another
+thread, is refused and the post reported as unconfirmed: the bridge answered, but not for the post
+vibe-talk asked for (`send-confirm-thread`).
 
 A message wire object may carry Discord's `reactions` array, each entry
 `{"emoji": {"name": "👀", "id": null}, "count": 1}` — a custom emoji has an `id`, and its `name` is
