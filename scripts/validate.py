@@ -251,8 +251,9 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # every plan output true so the edited compatibility lanes run as well.
     (".github/", frozenset(GROUPS)),
     # The one exception: the Pages workflow has no compatibility lane and no validation of its own.
-    # It runs scripts/check_site.py and uploads site/, and the hygiene group already runs that
-    # checker on every change. The component manifest still selects the infrastructure tests.
+    # It checks and stages site/ (minus demos/ and README.md) with scripts/check_site.py and
+    # uploads the staged copy, and the hygiene group already runs that checker on every change.
+    # The component manifest still selects the infrastructure tests.
     (".github/workflows/pages.yml", frozenset()),
 )
 

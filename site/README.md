@@ -63,8 +63,14 @@ renaming a document or rewording a heading anywhere in the repository can break 
 
 ## Deploy
 
-`.github/workflows/pages.yml` runs the checker on every push to `main` that touches `site/` or
-the workflow, and on manual dispatch. `python3 scripts/check_site.py --stage DIR` then copies
-exactly the published files, everything here except `demos/`, into a staging directory, and the
-workflow publishes that. It needs one repository setting: Settings, Pages, Build and deployment,
-Source: GitHub Actions.
+`.github/workflows/pages.yml` runs on every push to `main` that touches `site/`,
+`scripts/check_site.py` or the workflow, and on manual dispatch. `python3 scripts/check_site.py
+--stage DIR` checks the pages and then copies exactly the published files, everything here except
+`demos/` and this `README.md`, into a staging directory, and the workflow publishes that.
+
+It needs one repository setting, which no workflow can change: Settings, Pages, Build and
+deployment, Source: GitHub Actions. Until it is set, the workflow's configure-pages step fails
+with "Get Pages site failed" (Not Found). After setting it, run the workflow once by hand
+(Actions, pages, Run workflow; or `gh workflow run pages.yml`), then open
+<https://rrnewton.github.io/agent-utils/> to confirm it serves the overview. Links to the site
+from outside `site/`, such as the README's, should land only after that first deploy succeeds.
