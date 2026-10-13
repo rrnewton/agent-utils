@@ -4482,7 +4482,17 @@ const TUNING_BANDS = {
     "under five fails a slow start that would have worked; past fifteen the reader has given up " +
     "on a call that says Connecting and pressed something else"],
   // `#270 voice-transcript-markers`.
-  // `#269 approval-card-inline`.
+  // `#269 approval-card-inline`. How long a user turn that may be a yes to the card stays out of sight.
+  YES_HOLD_JUDGE_MS: [9000, 30000,
+    "how long a turn drawn out of sight as a possible yes waits, after its last frame, to be judged. " +
+    "Under nine seconds it can run out before `#268`'s eight-second bound closes a quiet turn and " +
+    "judges it, and a yes that then sends flashes on screen; past thirty, a turn nothing judges stays " +
+    "hidden long after the owner said it"],
+  YES_HOLD_MAX_MS: [10000, 60000,
+    "how long a yes the page took stays out of sight while it settles and sends. Under ten seconds, " +
+    "a send to a slow chat service is still on its way when its yes comes back, and the card then " +
+    "freezes beside the yes it should have taken in; past a minute, a send that hung keeps the " +
+    "owner's words out of sight long after anyone could say why"],
   POST_FATE_RECHECK_MS: [500, 5000,
     "how long after a card kept through a dropped call lapses the page asks the server what became of " +
     "it. Under half a second, the server may not have counted it lapsed yet and the draft leaves no " +
@@ -36606,6 +36616,241 @@ test("`#264 voice-send-approval`: every seam a spoken yes can draw is inside the
     const spent = words(text);
     assert.ok(spent >= SEAM_DETAIL_MIN_WORDS && spent <= SEAM_DETAIL_MAX_WORDS, `${kind}: ${spent} words: "${text}"`);
   }
+});
+
+// --- `#269 approval-card-inline`: a spoken yes the page acts on shows no turn -----------------------
+
+/**
+ * A hosted call on a server that keeps records, in `conversationId`, in which this call's agent
+ * proposed `pending` and read it back. Returns the socket.
+ */
+async function recordedReadBack(page, conversationId, pending = spokenDraft()) {
+  const socket = await recordingCall(page, conversationId);
+  hostedHears(socket, "tell lead team I'm on it, rebasing now");
+  page.propose(pending);
+  await page.settle();
+  hostedSays(socket, `To lead team: ${pending.text}. Send it?`);
+  return socket;
+}
+
+/** The newest row of the transcript whose words are `said`, absorbed or not. */
+const rowSaying = (page, said) =>
+  [...page.el("transcript").children].reverse().find((li) => !li.hasClass("sent-card") && li.className !== "seam" &&
+    li.children.some((kid) => kid.className === "body" && kid.textContent === said));
+
+/** Whether `li` is out of sight: drawn into the card it sent. */
+const absorbed = (li) => Boolean(li) && li.hasAttribute("data-absorbed");
+
+/** A stored conversation's rows, as `speaker: text` with an answer's serial or a record's kind. */
+const storedShapes = (page, id) => (page.storedTurns.get(id) || []).map((turn) =>
+  turn.speaker === "sent" ? `sent ${turn.detail.how}`
+    : turn.speaker === "marker" ? `marker ${turn.detail.kind}`
+      : `${turn.speaker}: ${turn.text}${turn.detail && turn.detail.kind === "answer" ? ` [answer ${turn.detail.serial}]` : ""}`);
+
+test("`#269 approval-card-inline`: a spoken yes that sends is never on screen; the card says approved by voice, and the record keeps the yes, tagged, in screen order", async () => {
+  const page = newPage();
+  const pending = spokenDraft({ serial: 7 });
+  const socket = await recordedReadBack(page, "conv_yes", pending);
+  const hiddenNow = (when) => assert.ok(absorbed(rowSaying(page, "yes please")), `the yes was on screen ${when}`);
+  hostedHears(socket, "yes please");
+  hiddenNow("as it arrived");
+  await page.settle();
+  hiddenNow("while it settled");
+  hostedSays(socket, "One moment.");
+  hiddenNow("beside the agent's reply");
+  await settleSpokenYes(page);
+  await watchTurns(page);
+  hiddenNow("once it had sent");
+  assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"]);
+  const card = sentCards(page)[0];
+  assert.match(wordsOf(card), /approved by voice/);
+  assert.equal(rowSaying(page, "yes please").getAttribute("data-answer"), "7");
+  // Kept, and in the order the screen holds them, the hidden yes included.
+  const order = ["agent: To lead team: on it, rebasing now. Send it?", "you: yes please [answer 7]", "agent: One moment.", "sent voice"];
+  assert.deepEqual(storedShapes(page, "conv_yes").slice(-4), order);
+  const rows = page.el("transcript").children;
+  const at = [rowSaying(page, `To lead team: ${pending.text}. Send it?`), rowSaying(page, "yes please"), rowSaying(page, "One moment."), card]
+    .map((li) => rows.indexOf(li));
+  assert.deepEqual([...at].sort((a, b) => a - b), at, `the screen's order is not the record's: ${at.join(", ")}`);
+  // Only the yes is out of sight.
+  assert.equal(page.el("transcript").children.filter((li) => absorbed(li)).length, 1);
+});
+
+test("`#269 approval-card-inline`: on vibe-talk-v1 a yes is out of sight from its first hypothesis, and filed tagged before the reply, with or without a final", async () => {
+  for (const finalFirst of [false, true]) {
+    const label = finalFirst ? "with a final" : "hypotheses only";
+    const page = newPage();
+    page.transcriptRecordsSupported = true;
+    const pending = spokenDraft({ serial: 9 });
+    const socket = await neutralReadBack(page, { pending });
+    const yes = () => [...page.el("transcript").children].reverse().find((li) =>
+      li.children.some((kid) => kid.className === "body" && /^ye/i.test(kid.textContent)));
+    const hiddenNow = (when) => assert.ok(absorbed(yes()), `${label}: the yes was on screen ${when}`);
+    speech(socket, "user", 2, "ye", false);
+    hiddenNow("at its first hypothesis");
+    speech(socket, "user", 2, "yes", false);
+    hiddenNow("as its hypothesis grew");
+    if (finalFirst) {
+      speech(socket, "user", 2, "Yes.", true);
+      hiddenNow("at its final");
+    }
+    speech(socket, "assistant", 2, "One moment.", true);
+    hiddenNow("beside the reply");
+    turnDone(socket, 2);
+    hiddenNow("at its turn's end");
+    await settleSpokenYes(page);
+    await watchTurns(page);
+    hiddenNow("once it had sent");
+    assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"], label);
+    assert.match(wordsOf(sentCards(page)[0]), /approved by voice/, label);
+    const [id] = [...page.storedTurns.keys()];
+    const said = finalFirst ? "Yes." : "yes";
+    assert.deepEqual(storedShapes(page, id).slice(-3), [`you: ${said} [answer 9]`, "agent: One moment.", "sent voice"], label);
+  }
+});
+
+test("`#269 approval-card-inline`: a yes stopped in its settle window, or overtaken by a tap, is shown again in its own place", async () => {
+  const page = newPage();
+  const socket = await recordedReadBack(page, "conv_wait");
+  hostedHears(socket, "yes");
+  assert.ok(absorbed(rowSaying(page, "yes")));
+  hostedHears(socket, "wait");
+  const yes = rowSaying(page, "yes");
+  assert.ok(!absorbed(yes), "a yes stopped by 'wait' stayed out of sight");
+  const rows = page.el("transcript").children;
+  assert.equal(rows.indexOf(rowSaying(page, "wait")), rows.indexOf(yes) + 1, "the yes came back somewhere other than its place");
+  await settleSpokenYes(page);
+  await watchTurns(page);
+  assert.deepEqual(page.proposalCommits, []);
+  const kept = storedShapes(page, "conv_wait");
+  assert.ok(kept.findIndex((row) => row.startsWith("you: yes")) === kept.indexOf("you: wait") - 1, kept.join(" | "));
+  // Nothing was sent, so a reload draws the yes as the turn it was, whatever its tag.
+  const reloaded = newPage();
+  reloaded.transcriptRecordsSupported = true;
+  reloaded.storedTurns.set("conv_wait", page.storedTurns.get("conv_wait").map((turn) => ({ ...turn })));
+  await signIn(reloaded);
+  await reloaded.settle();
+  assert.ok(rowSaying(reloaded, "yes") && !absorbed(rowSaying(reloaded, "yes")), "a reload hid a yes that sent nothing");
+
+  // A tap during the settle window is what approved it: the yes is a turn again, and the card says so.
+  const tapped = newPage();
+  const tappedSocket = await recordedReadBack(tapped, "conv_tapped");
+  tapped.expireTimers(2000);
+  hostedHears(tappedSocket, "yes");
+  assert.ok(absorbed(rowSaying(tapped, "yes")));
+  await tapped.el("post-confirm-send").click();
+  await watchTurns(tapped);
+  assert.deepEqual(tapped.proposalCommits.map((c) => c.confirmed_by), ["ui"]);
+  assert.ok(!absorbed(rowSaying(tapped, "yes")), "a tapped send hid the yes");
+  assert.match(wordsOf(sentCards(tapped)[0]), /approved by tap/);
+});
+
+test("`#269 approval-card-inline`: a yes whose commit is refused, or hangs, comes back; one that grows past a yes is shown and never hidden again", async () => {
+  const refused = newPage();
+  const socket = await recordedReadBack(refused, "conv_refused");
+  refused.commitProposal = async () => {
+    refused.settleProposal("superseded");
+    return json(409, { error: "proposal_superseded", detail: "newer" });
+  };
+  hostedHears(socket, "yes");
+  await settleSpokenYes(refused);
+  await watchTurns(refused);
+  assert.ok(!absorbed(rowSaying(refused, "yes")), "a yes whose send was refused stayed out of sight");
+  const seam = refused.el("transcript").children.find((li) => li.className === "seam" && !li.getAttribute("data-not-sent"));
+  assert.ok(seam && seamLabel(seam) === "Not sent", "the refused send drew no line");
+  assert.deepEqual(sentCards(refused), []);
+
+  // A commit that never answers: the row comes back after YES_HOLD_MAX_MS, and the turns after it
+  // were filed without waiting for it.
+  const hung = newPage();
+  const hungSocket = await recordedReadBack(hung, "conv_hung_commit");
+  hung.commitProposal = () => new Promise(() => {});
+  hostedHears(hungSocket, "yes");
+  hung.expireTimers(SPOKEN_SETTLE_MS);
+  await hung.settle();
+  hostedSays(hungSocket, "One moment.");
+  await watchTurns(hung);
+  assert.ok(absorbed(rowSaying(hung, "yes")), "the yes came back while its send was still on its way");
+  assert.ok(storedShapes(hung, "conv_hung_commit").includes("agent: One moment."), "a turn after the yes waited for the send");
+  const max = optionalSourceConstant("YES_HOLD_MAX_MS");
+  assert.ok(max !== undefined, "web/voice.js states no YES_HOLD_MAX_MS");
+  assert.ok(hung.expireTimers(max) >= 1, "nothing bounds how long a yes stays out of sight");
+  assert.ok(!absorbed(rowSaying(hung, "yes")), "a yes whose send hung stayed out of sight");
+
+  // vibe-talk-v1: "ye" grows into something that is no yes.
+  const grows = newPage();
+  const v1 = await neutralReadBack(grows);
+  const row = () => [...grows.el("transcript").children].reverse().find((li) =>
+    li.children.some((kid) => kid.className === "body" && /^ye/i.test(kid.textContent)));
+  speech(v1, "user", 2, "ye", false);
+  assert.ok(absorbed(row()), "a hypothesis that may be a yes was on screen");
+  speech(v1, "user", 2, "yesterday's build failed", false);
+  assert.ok(!absorbed(row()), "a turn that is no yes stayed out of sight");
+  speech(v1, "user", 2, "yes", false);
+  assert.ok(!absorbed(row()), "a row once shown was hidden again");
+});
+
+test("`#269 approval-card-inline`: a yes the page did not act on — an echo, one said early, one after an interruption — is shown, and filed untagged", async () => {
+  const playedMs = (0.25 + 1) * 1000;
+  for (const [what, arrange, said] of [
+    ["an echo", (page, socket) => { hostedAudio(socket); page.setClock(page.clock() + playedMs + 500); }, "send it"],
+    ["said early", (_page, socket) => hostedAudio(socket), "yes"],
+    ["after an interruption", (_page, socket) => hosted(socket, { type: "interruption", interruption_event: {} }), "yes"],
+  ]) {
+    const page = newPage();
+    const socket = await recordedReadBack(page, "conv_refused_yes");
+    arrange(page, socket);
+    hostedHears(socket, said);
+    assert.ok(rowSaying(page, said) && !absorbed(rowSaying(page, said)), `${what}: the yes stayed out of sight`);
+    await settleSpokenYes(page);
+    await watchTurns(page);
+    assert.deepEqual(page.proposalCommits, [], what);
+    assert.ok(storedShapes(page, "conv_refused_yes").includes(`you: ${said}`), `${what}: ${storedShapes(page, "conv_refused_yes").join(" | ")}`);
+  }
+
+  // THE CONTROL: a judged turn the page did not take is left out of sight. It must stay hidden.
+  const control = newPage(new Map(), brokenScript(
+    '  if (hold && hold.state === "tentative" && spokenYes.answered === key) releaseYesHold(hold);',
+    "  void hold;"
+  ));
+  const controlSocket = await recordedReadBack(control, "conv_control");
+  hosted(controlSocket, { type: "interruption", interruption_event: {} });
+  hostedHears(controlSocket, "yes");
+  assert.ok(absorbed(rowSaying(control, "yes")), "the control showed the yes: this test cannot see the defect");
+});
+
+test("`#269 approval-card-inline`: restored, a tagged yes is drawn into the voice-approved card after it, and only the newest yes for that card", async () => {
+  const send = (serial, how) => ({
+    speaker: "sent", text: "on it, rebasing now", at_ms: 1_700_000_000_010,
+    detail: {
+      kind: "sent", serial, send_seq: serial, channel_id: CHANNEL.id, channel_name: "lead team", parts_posted: 1,
+      parts_total: 1, unsent_chars: 0, outcome: "sent", how, origin: "commit", text_truncated: false, text_chars: 19,
+      begun_at_ms: 1, sent_at_ms: 1,
+    },
+  });
+  const yes = (text, serial) => ({ speaker: "you", text, at_ms: 1_700_000_000_001, detail: { kind: "answer", serial } });
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  page.storedTurns.set("conv_restored", [
+    { speaker: "agent", text: "To lead team: on it, rebasing now. Send it?", at_ms: 1_700_000_000_000 },
+    yes("yes", 4),
+    { speaker: "you", text: "wait", at_ms: 1_700_000_000_002 },
+    yes("yes please", 4),
+    { speaker: "agent", text: "One moment.", at_ms: 1_700_000_000_003 },
+    send(4, "voice"),
+    // A tagged yes whose send was tapped, and one whose send never came: both are turns.
+    yes("sure", 5),
+    send(5, "tap"),
+    yes("yeah", 6),
+  ]);
+  await signIn(page);
+  await page.settle();
+  assert.ok(absorbed(rowSaying(page, "yes please")), "the yes that sent the card was drawn as a turn");
+  assert.equal(rowSaying(page, "yes please").getAttribute("data-answer"), "4");
+  for (const said of ["yes", "wait", "sure", "yeah", "One moment."]) {
+    assert.ok(rowSaying(page, said) && !absorbed(rowSaying(page, said)), `"${said}" was drawn out of sight`);
+  }
+  assert.equal(sentCards(page).length, 2);
 });
 
 // --- a reload's replay burst ----------------------------------------------------------------------
