@@ -1980,7 +1980,8 @@ EMPTY_SIZES = (("font-150", 412, 800, 150, "kinds"), ("font-150", 412, 800, 150,
 EMPTY_SENTENCES = {
     "kinds": "No links left once PRs, Commits and Actions are hidden — turn them back on under the Links button.",
     "typed": "None of the loaded messages with a link match that search.",
-    "search": "Nothing in the messages loaded so far matches that search.",
+    # `#262 search-load-older`: how far back the search looked — here, the whole of All.
+    "search": "Nothing in All matches that search — all of it is loaded.",
     "linkless": "No links in the messages loaded so far.",
 }
 
