@@ -488,9 +488,11 @@ Open the agent in ElevenLabs and start a conversation. Ask, roughly in this orde
 3. *"Read me the one about the mac runner."* — exercises `find_message`; this is the feature that
    makes it more than a text-to-speech bot.
 4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. With "Ask me before the
-   voice agent sends" on, **it must read the exact text back and end with "Send it?", and nothing is
-   posted until you confirm** — on the voice page a card appears with that text and a Send button,
-   and on that page a plain "yes" right after the read-back also sends it. If a message appears in
+   voice agent sends" on, **it must read the draft back as one fixed sentence — "To lead team:
+   I'll look at it tonight. Send it?" — and nothing is posted until you confirm**. On the voice page
+   a card appears with that text and a Send button, and on that page a plain "yes" as your very next
+   answer to a read-back that was exactly that sentence also sends it; the agent says "One moment."
+   and then tells you what the page reports. If a message appears in
    the channel before you confirm, stop: the server is not the one this guide describes. With the
    setting off, it posts at once and says so only after the server answered `SENT`. Switching the
    agent to the read token removes the capability rather than gating it.

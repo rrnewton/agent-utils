@@ -1667,7 +1667,12 @@ one store, `src/store/`, and it holds these:
 * **hidden configured channels** — which channels from the configuration file you took off your
   list. One id and an instant per row, one row per configured channel at most. Like the channels
   added in the app, these are the shape of the list rather than a record of anything read, so the
-  purge leaves both alone. See "Taking a channel off the list". `#199 removable-config-channels`.
+  purge leaves both alone. See "Taking a channel off the list". `#199 removable-config-channels`;
+  and
+* **the voice send setting** — whether the voice agent asks before it sends, as the owner last
+  chose it: one row, one boolean and an instant. No row means the configured default applies, and
+  the purge deletes the row, restoring that default. See "Posting asks first, unless you turn that
+  off". `#264 voice-send-approval`.
 
 The first three are your own record. The last is a derived cache, bounded by the same
 retention as the rest, erased by the same purge, and never filled by a read-scope token.
@@ -2954,8 +2959,9 @@ instructions under [`prompts/`](prompts/): the scope-neutral
 sections: [`voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt) for a read credential,
 which tells the agent plainly that it can read but cannot send; or, for a credential that may post,
 [`voice-agent-send.txt`](prompts/voice-agent-send.txt) while the owner has "Ask me before the voice
-agent sends" on — propose, read the draft back word for word, end with "Send it?", and leave the
-confirmation and its result to the voice page — or
+agent sends" on — propose, say the tool result's read-back (`To {channel}: {text}. Send it?`)
+word for word, say only "One moment." on a yes, and leave the confirmation and its result to the
+voice page — or
 [`voice-agent-send-direct.txt`](prompts/voice-agent-send-direct.txt) with it off — post when asked,
 ask no confirmation question, and say it was sent only on a `SENT` result. The prompt follows the
 credential because an agent told it may send while holding a read token promises a send, has it
@@ -4948,7 +4954,9 @@ The checkbox says, for each state, what that means:
   sending."
 
 The server reads the setting on every `tools/list`, profile and `post_reply`, so its behaviour
-changes at once; the agent's prompt changes at its next call. **Change it between calls**, and
+changes at once; the agent's prompt changes at its next call. An agent still on the asking prompt
+whose `post_reply` now posts at once is kept honest by the `SENT.` result, but **change it between
+calls**, and
 re-paste the prompt of a hosted agent configured by hand (see "Registering it with an ElevenLabs
 agent").
 
@@ -4962,8 +4970,8 @@ content-free `post_gate event=sent_direct` line (or `direct_failed`, with the re
 the channel, the length. There is no card and no read-back. A read credential is still refused.
 
 **On: `post_reply` proposes.** It leaves one pending proposal on this server and answers `NOT SENT`,
-with the channel and the exact text to read back. The owner confirms it outside anything a model can
-call:
+with the channel, the exact text, and the one sentence to read it back with. The owner confirms
+it outside anything a model can call:
 
 * **on the voice page**, where a card shows the server's own copy — channel, reply target, text —
   with **Send** and **Don't send**; or
@@ -4976,49 +4984,71 @@ way does not land on the new words. A draft whose card was showing when a call e
 again in the next call on the same page; it lapses on the server. The page remembers that only
 until it is reloaded, so a new call from a reloaded page within the 120 seconds shows it again.
 
-**A spoken yes, judged by the page.** The agent reads the draft back word for word and ends with
-"Send it?". The page takes the owner's next final transcript as a yes only when all of these hold,
-for both wire protocols:
+**A spoken yes, judged by the page.** The agent's tool result hands it one sentence to say,
+`To {channel}: {text}. Send it?` (`ops::read_back`), and its prompt tells it to say exactly that,
+adding nothing. The page takes the owner's next final transcript as a yes only when all of these
+hold, for both wire protocols:
 
 * **The draft is this call's.** The card shows a proposal this call's agent made — not one already
   pending when the call opened, not one from before a replacement voice session on the same socket
   (a second `session_started` or `conversation_initiation_metadata`), and never one from another
   call. It has not lapsed, and holds no sign-in token. Only the newest proposal is ever on the card.
-* **It is a spoken call with echo cancellation on.** A typed call never commits by voice.
+* **It is a spoken call with echo cancellation on.** A typed call never commits by voice, and
+  neither does a yes typed into a spoken call.
 * **The read-back was not interrupted.** No `interruption` (hosted protocol), no
   `turn_complete{interrupted: true}`, and on `vibe-talk-v1` the read-back's own `turn_complete`
   arrived before the answer.
-* **The read-back said the card.** Every word of the card's text appears, in order, in what the
-  assistant said since the owner last spoke and since this draft reached the card (mention tokens
-  excepted, since the model says the name), followed by the word "send". A model talked into a bad
-  draft therefore cannot read back something harmless and have the bad text sent on a yes to what
-  it said, and a draft replaced after its read-back — "don't merge the PR" by "merge the PR" — needs
-  a read-back of its own.
-* **It was heard to the end.** The answer began after the read-back's audio finished playing.
-* **It is not an echo.** A bare "send it" within 1.5 s of the end of "…Send it?" may be the
-  agent's own voice and is refused; a plain "yes" is never taken for an echo.
-* **It is the very next answer, and a yes.** Only the answer right after the read-back can match
-  it. A yes is a phrase from a closed list — *yes, yeah, yep, send it, send, do it, go ahead, sure,
-  please do* — with punctuation and case ignored and at most one word of filler ("yes please",
-  "ok send it"). A yes inside a sentence that adds anything ("yes, and tell him I'm late", "send it
-  to Bob") sends nothing, nor does a question ("Send it?").
+* **The read-back was exactly the template.** Everything the assistant said since the owner's last
+  turn — spoken, typed, a relayed chat message, or one of the page's own notices — or everything it
+  said once this draft was on the card, is word for word `To {channel}: {text}. Send it?`, ignoring
+  case and punctuation. At most one lead-in (*okay*, *ok*, *alright*, *all right*, *sure* or *got
+  it*) and an optional "the" before the channel's name and "channel" after it are allowed; nothing
+  else is — no inserted word, nothing between the text and the question, nothing after the
+  question. So the owner has heard exactly what would be posted and where, and nothing else since
+  they last spoke.
+  A read-back that adds a "not", a chat message read aloud, an answer to a different question that
+  happens to contain the card's words, or a re-read of new words while the old card is still up
+  cannot stand in for it. Any turn of the owner's ends the read-back; only a fresh one — "read it
+  back again" — or a new draft read back in full arms a yes again. A draft with a mention, or any
+  other `<…>` token, is never confirmed by voice: the model says a name there, so no read-back can
+  be held to the card exactly.
+* **It was heard to the end.** The answer arrived after the read-back's audio finished playing. On
+  `vibe-talk-v1`, which sends partial transcripts, that is when the answer began; on the hosted
+  protocol, which sends only final transcripts, it is when the answer's transcript arrived, so a
+  short "yeah" said during the last of the read-back that the provider did not treat as an
+  interruption can still count.
+* **It is not an echo.** An answer made only of the read-back's last words — a bare "send it"
+  within 1.5 s of the end of "…Send it?" — may be the agent's own voice and is refused. A plain
+  "yes" is not among those words unless the card's text ends with it.
+* **It is the very next answer, and a yes.** A yes is a phrase from a closed list — *yes, yeah, yep,
+  send it, send, do it, go ahead, sure, please do* — with punctuation and case ignored and at most
+  one word of filler ("yes please", "ok send it"). A yes inside a sentence that adds anything
+  ("yes, and tell him I'm late", "send it to Bob") sends nothing, nor does a question ("Send it?").
 
 A yes that passes waits 1.2 s, so "yes… wait" sends nothing, then commits exactly the card's server
 copy through the same function and busy latch as a tap: a tap and a yes racing commit once, and the
 single-use handle is the backstop. An answer that starts *no, nope, cancel, stop, wait, don't, do
-not* or *never mind*, given to a question about sending, withdraws the draft. Anything else leaves
-the card for a tap.
+not* or *never mind*, given while sending is the subject, withdraws this call's draft. Anything else
+leaves the card for a tap.
 
-**Every outcome is said, three ways.** The agent is told through the call's existing text channel
-— the `user_message` the composer and the live relay already send, which `vibe-talk-v1` carries as
-a queued `prompt` once the spoken turn has closed (`#241 voice-composer`) — in one fixed sentence
-starting `Voice page:`: SENT, partly sent, NOT sent with the reason, or not confirmed. Its prompt
-tells it to wait for that and never to say "sent" before it, so the agent never claims a send that
-did not happen, and its context stays truthful for a later "did it go?". The page also says it
-itself, because a model's sentence needs a cooperative model: the status line ("Sent to lead
-team." / "Not sent — the read-back was interrupted."), a transcript seam, and a short tone — a
-rising pair for sent, one low note for not sent; none when Sound is off or in a typed call. A yes
-to a question that was not about sending changes nothing and says so only on the status line.
+**Every yes is answered, and every outcome is said, three ways.** On a yes the agent says only "One
+moment." and waits for the page; it is never told to say "Sending.", which would be a claim before
+the fact. So whenever the owner says or types anything like a yes while this call's draft is on the
+card — a plain yes, "yep that's right, send it", a yes after a paraphrased "Shall I post that?" or
+after a digression — the page answers it: SENT, or NOT sent and why. A draft the call did not make
+is answered only when sending was the subject. The agent is told through the call's existing text
+channel — the `user_message` the composer and the live relay already send, which `vibe-talk-v1`
+carries as a queued `prompt` once the spoken turn has closed (`#241 voice-composer`) — in one fixed
+sentence starting `Voice page:`: SENT, partly sent, NOT sent with the reason, or not confirmed. The
+notice for a yes the page did not take ends "Otherwise carry on", so a yes that was in fact about
+something else does not derail the conversation. The prompt tells the agent never to say "sent"
+before that notice, so it never claims a send that did not happen, and its context stays truthful
+for a later "did it go?".
+The page also says it itself, because a model's sentence needs a cooperative model: the status line
+("Sent to lead team." / "Not sent — the read-back was interrupted."), a transcript seam, and a short
+tone queued after the speech already playing — a rising pair for sent, one low note for not sent;
+none when Sound is off or in a typed call. A tap on **Send** or **Don't send** during a call is told
+to the agent too (the screen already says it), so an agent waiting on "Send it?" hears the result.
 
 **What a spoken yes cannot know**, stated plainly:
 
@@ -5028,10 +5058,17 @@ to a question that was not about sending changes nothing and says so only on the
   not eliminated.
 * **Misrecognition.** Short words are the commonest false transcripts, and the page has no
   confidence score to consult.
+* **The audio itself.** The read-back is checked against the provider's text of the agent's turn,
+  which is what its voice speaks; the page does not listen to the audio.
 * **Echo.** It needs echo cancellation on; say a plain "yes" rather than "send it" right after the
   question.
-* **Coverage.** Links, code and numbers are rarely read out exactly as written, so those drafts fall
-  back to a tap, and the agent and the status line say so.
+* **Which message a reply answers.** The read-back names the channel, not the message a reply is
+  attached to; the card shows that.
+* **What a no meant.** Any answer that starts like a no withdraws the draft while sending is the
+  subject — "no problem, send it" included, and a "stop" said only to stop the agent talking. That
+  is the safe direction; ask for the draft again.
+* **Coverage.** Mentions, links, code and numbers are rarely read out exactly as written, so those
+  drafts fall back to a tap, and the agent and the status line say so.
 
 The mechanics of a proposal, all over the write-scope REST routes in the table above:
 
