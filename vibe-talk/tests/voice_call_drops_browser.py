@@ -10,7 +10,9 @@ Playwright mock of the deployed `vibe-talk-v1` protocol:
   a greeting: no microphone frame reaches the server straight after its `turn_complete`, and they
   resume after the hand-off -> the owner asks, the agent proposes and reads the draft back word for
   word -> the owner's "Yes" arrives as a hypothesis, then the agent's reply "One moment." with its
-  audio, then the final "Yes." -> the card is committed once, as the speaker's turn -> the page's
+  audio, then the final "Yes." -> the card is committed once, as the speaker's turn, and the yes is
+  never laid out as a turn of its own: the frozen card says "approved by voice" (`#269
+  approval-card-inline`) -> the page's
   notice does not close the microphone's segment while that turn is open, closes it once the hand-off
   after the turn's completion has passed, and goes as a prompt at the segment's boundary -> the server
   closes the call: the page says so in red, that the reader did not hang up, and records
@@ -296,6 +298,13 @@ def live(page: Page) -> None:
                            timeout=10_000)
 
 
+# How many rows of the owner's "Yes" the transcript lays out: a row out of sight has no box.
+YES_ROWS_SHOWN_JS = """() => [...document.querySelectorAll('#transcript li')].filter((li) => {
+  const body = li.querySelector('.body');
+  return body !== null && /^yes\\.?$/i.test(body.textContent || '') && li.getClientRects().length > 0;
+}).length"""
+
+
 def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     """The call, the yes, the service's close, and a hang-up. Answers a line for the summary."""
     page.fill("#api-token", TOKEN)
@@ -343,6 +352,11 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
                            "confirmed_by": "speaker_turn"}],
           f"the yes did not commit the card once, as the speaker's turn: {api.commits}")
     page.wait_for_function("() => document.getElementById('post-confirm').hidden", timeout=5_000)
+    # `#269 approval-card-inline`: the yes that sent it is drawn into the frozen card, never laid out
+    # as a turn of its own, hypothesis or final.
+    shown = page.evaluate(YES_ROWS_SHOWN_JS)
+    check(shown == 0, f"{shown} row(s) of the yes that sent the card are laid out on screen")
+    check("approved by voice" in page.inner_text("#transcript"), "the frozen card does not say it was approved by voice")
 
     # 4. The page's notice waits for the owner's turn to complete before it closes the segment, and
     # then for the hand-off after that turn_complete, as the microphone does.

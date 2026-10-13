@@ -150,7 +150,8 @@ post-confirm-browser:
 
 # `#268 voice-call-drops` in a real Chromium: a spoken call on the fake microphone replaying the
 # voice bridge's event order -- no microphone frame inside the greeting's hand-off, a "Yes." whose
-# final transcript arrives after the agent's reply committing the card once, the page's notice
+# final transcript arrives after the agent's reply committing the card once and never laid out as a
+# turn of its own (`#269 approval-card-inline`: it is drawn into the frozen card), the page's notice
 # waiting for that turn, the server's close said and recorded, and a hang-up sending one goodbye.
 # Pass WEB_ROOT=dir to run it against another copy of the page.
 voice-call-drops-browser:
