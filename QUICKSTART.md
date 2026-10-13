@@ -4,7 +4,8 @@ This walks through adopting the agent-utils suite for a project, using a real ru
 one-commit repository called `foobar`. You do not run the steps yourself: your coding agent does,
 following the [`agent-utils-setup`](skills/agent-utils-setup/SKILL.md) skill. This page shows
 what to expect, what you will be asked, and what you end up with. For how the pieces fit
-together, see [the suite](README.md#the-suite).
+together, see [the suite](README.md#the-suite) or the
+[website](https://rrnewton.github.io/agent-utils/).
 
 ## Before you start
 

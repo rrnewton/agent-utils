@@ -6,6 +6,10 @@ in their own isolated checkout, and the plumbing that keeps their work
 visible, recoverable, and landed. Every tool also stands alone and has an
 independently installable distribution.
 
+**Website:** <https://rrnewton.github.io/agent-utils/> gives the overview (why the
+suite exists, how the pieces fit together, and what each tool is for) and links
+back into the documents here.
+
 **To adopt the suite for a project**, open your coding agent in the project's
 Git checkout and tell it:
 
@@ -145,6 +149,7 @@ vibe-talk/         a deployable service, outside the workspaces (see below)
 py/                independently publishable Python distributions
 rs/                independently publishable Rust crates
 scripts/           documentation, package, and dependency contract checks
+site/              the public website: hand-written HTML, checked by scripts/check_site.py
 skills/            agent-facing skills: suite setup, the coordinator, and one per tool
 ```
 
