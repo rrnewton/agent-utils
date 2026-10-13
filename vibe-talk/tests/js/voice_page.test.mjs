@@ -41908,6 +41908,40 @@ test("...and only while Settings shows that channel: leaving it, saving, or pres
   }
 });
 
+test("...and a mode chosen while the box asks stays chosen, with Save offered, until it is saved", async () => {
+  // `#253 upstream-clear-polish`. Each re-read put the saved mode back in the select: a choice made
+  // in the thirty seconds of asking went back to On, and Save went grey under the owner's hand.
+  const { page, on } = await waitingPress();
+  page.el("upstream-clear-mode").value = "off";
+  await page.el("upstream-clear-mode").dispatch("change");
+  assert.equal(page.el("upstream-clear-save").disabled, false);
+  // Nothing new yet: asked, still waiting, and the choice left alone.
+  assert.equal(await recheck(page), 1);
+  assert.match(page.el("upstream-clear-state").textContent, /^Still waiting for Google Chat to answer\./);
+  assert.equal(page.el("upstream-clear-mode").value, "off", "a re-read took back a mode chosen and not saved");
+  assert.equal(page.el("upstream-clear-save").disabled, false, "a re-read left the unsaved choice nothing to save");
+  assert.equal(page.el("upstream-clear-push").hidden, true, "Mark read now offered beside an unsaved Off");
+  // The press's own push lands: said, and the choice still left alone.
+  page.upstreamClear.set(CHANNEL.id, { ...on, last: clearAttempt(), pushed: clearAttempt() });
+  assert.equal(await recheck(page), 1);
+  assert.match(page.el("upstream-clear-state").textContent, /^Done: marked read in Google Chat through the message from .+\.$/);
+  assert.equal(page.el("upstream-clear-mode").value, "off", "the answering read took back the unsaved choice");
+  assert.equal(page.el("upstream-clear-save").disabled, false);
+  // Saved, it is the saved mode...
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.equal(page.upstreamClearCalls.at(-1), `PUT ${CHANNEL.id} {"mode":"off"}`);
+  assert.equal(page.el("upstream-clear-mode").value, "off");
+  assert.equal(page.el("upstream-clear-save").disabled, true);
+  // ...and the select follows the server again: another device's change is shown on the next read.
+  page.upstreamClear.set(CHANNEL.id, { ...on, mode: "dry_run" });
+  await page.el("close-settings").click();
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("upstream-clear-mode").value, "dry_run", "a saved choice stopped the select following the server");
+  assert.equal(page.el("upstream-clear-save").disabled, true);
+});
+
 test("...turning it off sends off and nothing else, and a failed save says so and keeps the choice", async () => {
   const page = await clearingPage((page) => {
     page.upstreamClear.set(CHANNEL.id, {

@@ -1838,10 +1838,11 @@ replies too. That is a possible future path, not something any bridge here does 
   while it was on its way, or still on its way. The server holds the request at most 45 seconds, so
   a common 60-second proxy timeout never cuts it off; still on its way by then, Settings asks again
   every 4 seconds for up to 30 seconds, says what it came to as soon as that is recorded, and
-  otherwise says it has not been answered yet. It changes no setting, and a channel that is off
-  refuses it, so a page still showing On after another device turned it off cannot turn it back on.
-  Turning a channel on pushes nothing by itself: the next message that arrives is pushed, and with it
-  everything before it.
+  otherwise says it has not been answered yet. A mode chosen meanwhile and not saved stays chosen,
+  with Save offered: no read puts the saved mode back over it. It changes no setting, and a channel
+  that is off refuses it, so a page still showing On after another device turned it off cannot turn
+  it back on. Turning a channel on pushes nothing by itself: the next message that arrives is pushed,
+  and with it everything before it.
 * **Every attempt is logged on one line** beginning `upstream-clear:`, naming the mode, the channel,
   the message and its time, and the outcome (`advanced`, `already-read`, `dry-run`, `skipped`, or
   `failed`). A dry run decides everything and writes nothing, so an operator can check what would be

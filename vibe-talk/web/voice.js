@@ -29412,8 +29412,20 @@ function renderUpstreamClear() {
   drawUpstreamClear();
 }
 
-/** Draw what the server last said, or why there is nothing to draw. */
-function drawUpstreamClear() {
+/**
+ * Draw what the server last said, or why there is nothing to draw.
+ *
+ * A mode the owner has chosen and not saved is not the server's to take back. `#253
+ * upstream-clear-polish`: after a "Mark read now" the server answered `waiting`, the box reads the
+ * channel every few seconds for up to thirty, and each read put the saved mode back in the select,
+ * so a choice made meanwhile went back under the owner's hand and Save went grey. So the select
+ * follows the server only while it still shows the mode saved before this answer, `savedBefore`; a
+ * choice moved off it stays, with Save offered for it, until it is saved or put back.
+ *
+ * @param {VibeTalk.UpstreamClearMode | null} [savedBefore] The saved mode the box showed before this
+ *   answer, or null when it showed none: the box's first answer for a channel sets the select.
+ */
+function drawUpstreamClear(savedBefore = upstreamClear && upstreamClear.view ? upstreamClear.view.mode : null) {
   if (!upstreamClear) return;
   const view = upstreamClear.view;
   if (!view) {
@@ -29421,7 +29433,8 @@ function drawUpstreamClear() {
     renderUpstreamClearChoice();
     return;
   }
-  el("upstream-clear-mode").value = view.mode;
+  const select = el("upstream-clear-mode");
+  if (savedBefore === null || select.value === savedBefore) select.value = view.mode;
   el("upstream-clear-state").textContent = upstreamClearSentence(view, view.provider_name || chatServiceOf(upstreamClear.channel));
   renderUpstreamClearChoice();
 }
@@ -29429,8 +29442,9 @@ function drawUpstreamClear() {
 /** Take the server's answer for `channel` as the truth, unless the box has moved on. */
 function adoptUpstreamClear(channel, view) {
   if (!upstreamClear || upstreamClear.channel !== channel) return;
+  const savedBefore = upstreamClear.view ? upstreamClear.view.mode : null;
   upstreamClear = { channel, view, failure: "" };
-  drawUpstreamClear();
+  drawUpstreamClear(savedBefore);
 }
 
 /** Ask the server what it does for `channel`. */
