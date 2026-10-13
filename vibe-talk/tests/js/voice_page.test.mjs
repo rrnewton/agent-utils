@@ -3662,6 +3662,11 @@ const TUNING_BANDS = {
     "how long a view whose read the page gave up on is not asked again (#278 page-live-reads): the " +
     "server's own fifty-second bound. Under thirty, a second scan of the space starts while the first " +
     "still runs; past two minutes a view stays stale long after the server stopped reading it"],
+  LIVE_QUIET_MS: [20000, 120000,
+    "how long a pushed stream may say nothing before it is let go (#278 page-live-reads), against " +
+    "the server's keep-alive every fifteen seconds: under twenty seconds one late keep-alive drops a " +
+    "healthy stream and polls the channel for it; past two minutes a half-open connection keeps the " +
+    "poll at fifteen minutes while nothing arrives"],
   VISIBLE_REFRESH_MS: [5000, 60000,
     "how long the page is hidden before coming back refreshes it: under five seconds a glance at " +
     "another app costs a read; past a minute the reader comes back to rows the held poll left stale"],
@@ -51215,7 +51220,7 @@ test("`#278 page-live-reads`: an edit that lands while a read sent before it is 
   assert.ok(drawn, "the edit was not drawn at once");
   assert.ok(kept, "a read sent before the edit put its old words back");
   // THE CONTROL: the edit not applied again over that read's answer.
-  const control = await run(brokenScript("  if (livePatches.size === 0) return;", "  return;"));
+  const control = await run(brokenScript("  if (livePatches.size === 0 && liveArrivals.size === 0) return;", "  return;"));
   assert.ok(control.drawn && !control.kept, "the control kept the edit anyway, so this test cannot see it lost");
 });
 
@@ -51314,10 +51319,10 @@ test("`#278 page-live-reads`: after a read gives up at twenty seconds its view i
   await pollOnce(page);
   assert.equal(page.timelineCalls.length - calls, 1,
     `a view whose read the page gave up on was asked again inside the server's bound: ${page.timelineCalls.slice(calls)}`);
-  // Past it, the next poll asks again.
-  page.setClock(sent + 60000);
-  await pollOnce(page);
-  assert.equal(page.timelineCalls.length - calls, 2, "the view was never asked again");
+  // At it, the poll asks again: what the hold put off was not dropped, and the poll was put no later
+  // than the hold's end to read it (`readPutOff`).
+  await passTime(page, 1);
+  assert.equal(page.timelineCalls.length - calls, 2, "the view was not asked again at the server's bound");
 });
 
 test("`#278 page-live-reads`: a live message ends that wait, and the read it calls for goes", async () => {
@@ -51333,4 +51338,331 @@ test("`#278 page-live-reads`: a live message ends that wait, and the read it cal
   await deliver(page, page.stream(), sseMessage(bareOf(arriving)));
   await page.settle();
   assert.equal(page.timelineCalls.length - calls, 2, "a live message did not end the wait for its read");
+});
+
+// --- `#278 page-live-reads`, after review: a failure or a hold never leaves the poll at fifteen minutes
+
+test("`#278 page-live-reads`: behind a pushed stream, a first read that fails with nothing on screen is retried at forty-five seconds", async () => {
+  // A new device, or a channel change, whose first read fails: an empty list and the error, and no
+  // rows for the freshness pill to call stale.
+  const data = threadData();
+  const first = newPage(new Map());
+  first.threadingSupported = true;
+  first.threads = data.threads;
+  first.messages = data.messages;
+  await signIn(first);
+  await showDiscord(first, data.messages);
+  await pickThread(first, "main");
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  let failing = true;
+  const page = newPage(first.storage, SCRIPT, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.messages = data.messages;
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+    forwardTimeline(p, {});
+    const healthy = p.timeline;
+    const broken = errorResponse(502, "chat_error", "upstream command exited 1");
+    p.timeline = (path, options) => (failing ? broken(path) : healthy(path, options));
+    holdCountsRead(p);
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  await page.settle();
+  assert.equal(page.streamOpens.length, 1, "the pushed stream did not attach, so this proves nothing");
+  assert.equal(page.el("discord-log").children.length, 0, "the first read drew rows, so this proves nothing");
+  failing = false;
+  const calls = page.timelineCalls.length;
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 0, "an empty list whose read failed waits fifteen minutes to be read again");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 1, "no poll was armed at forty-five seconds");
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 1, "the poll did not read");
+  assert.ok(page.el("discord-log").children.length > 0, "the poll's read drew nothing");
+});
+
+test("`#278 page-live-reads`: behind a pushed stream, a thread on the right whose read fails is read again at forty-five seconds, and the reconcile comes back once it lands", async () => {
+  const { page } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the first thread is not open on the right");
+  const healthy = page.timeline;
+  const broken = errorResponse(502, "chat_error", "upstream command exited 1");
+  page.timeline = (path, options) => (path.includes("view=thread") ? broken(path) : healthy(path, options));
+  const threadReads = () => page.timelineCalls.filter((path) => path.includes("view=thread")).length;
+  page.setClock(page.clock() + TIMELINE_RECONCILE_MS);
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "no reconcile was armed behind the pushed stream");
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.match(page.el("side-column").text(), /Refresh failed/, "the read of the thread on the right did not fail");
+  page.timeline = healthy;
+  const before = threadReads();
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 0, "a thread on the right whose read failed waits fifteen minutes to be read again");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 1, "no poll was armed at forty-five seconds");
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.equal(threadReads() - before, 1, "the poll did not read the thread on the right again");
+  assert.doesNotMatch(page.el("side-column").text(), /Refresh failed/, "the thread's read did not land");
+  assert.equal(page.expireTimers(DISCORD_POLL_MS), 0, "the poll kept forty-five seconds once the thread's read landed");
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "the poll did not go back to fifteen minutes");
+});
+
+test("`#278 page-live-reads`: a placed live message that lands while a full read sent before it is out survives that read, with no read after it", async () => {
+  /** A placed live message delivered while the reconcile's full read is on the wire, cut before it. */
+  const run = async (script) => {
+    const { page, server } = await pushedPage({ complete: false }, script);
+    // The reconcile's answer is cut when it is sent, and held until the test lets it land.
+    let open = null;
+    const opened = new Promise((resolve) => { open = resolve; });
+    let answer = null;
+    server.hold = { respond: (path) => { answer = server.answer(path); return opened.then(() => answer); } };
+    page.setClock(page.clock() + TIMELINE_RECONCILE_MS);
+    assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "no reconcile was armed behind the pushed stream");
+    await page.settle();
+    const reads = server.reads.length;
+    assert.ok(answer, "the reconcile did not read");
+    assert.deepStrictEqual(server.reads.at(-1), { view: "main", after: null, before: null }, "the reconcile was not a full read");
+    server.hold = null;
+    const arriving = server.post(message({ id: "495", content: "said while the reconcile was out" }));
+    await deliver(page, page.stream(), sseMessage(arriving, { thread_facts: placedFacts(arriving) }));
+    await page.settle();
+    const drawn = shownIds(page).includes("495");
+    open();
+    await page.settle();
+    await page.settle();
+    await page.settle();
+    return { drawn, kept: shownIds(page).includes("495"), reads: server.reads.length - reads };
+  };
+  const { drawn, kept, reads } = await run(SCRIPT);
+  assert.ok(drawn, "the live message was not drawn at once");
+  assert.ok(kept, "a read sent before the live message took it off again");
+  assert.equal(reads, 0, "a placed live message was read for");
+  // THE CONTROL: no live message put back over that read.
+  const control = await run(brokenScript(
+    "    if ((before || !arrival.live) && !channelCanon.messages.some((held) => String(held.id) === id)) {",
+    "    if (false) {"));
+  assert.ok(control.drawn && !control.kept, "the control kept the live message anyway, so this test cannot see it lost");
+});
+
+test("`#278 page-live-reads`: an edit and a placed message are kept over a read sent after them that the service answered from before them", async () => {
+  // A service may answer a read from a copy it cut a few seconds before; behind a pushed stream the
+  // next read may be fifteen minutes away.
+  const run = async (script) => {
+    const { page, server } = await pushedPage({ complete: false }, script);
+    server.edit("200", { content: "edited live" });
+    await deliver(page, page.stream(), sseUpdate("edit-200", page.messages.find((m) => m.id === "200")));
+    await page.settle();
+    const arriving = server.post(message({ id: "497", content: "placed live" }));
+    await deliver(page, page.stream(), sseMessage(arriving, { thread_facts: placedFacts(arriving) }));
+    await page.settle();
+    const drawn = Boolean(rowShowing(page, "edited live")) && shownIds(page).includes("497");
+    // The service's copy from before both: the old words, and no 497.
+    const stale = page.messages.find((m) => m.id === "200");
+    stale.content = "main channel announcement";
+    page.messages = page.messages.filter((m) => m.id !== "497");
+    page.setClock(page.clock() + 2000);
+    const reads = server.reads.length;
+    // A stream reset, which reads the newest page in full: the server restarted, say.
+    await deliver(page, page.stream(), `event: reset\ndata: ${JSON.stringify({ missed: 1 })}\n\n`);
+    await page.settle();
+    await page.settle();
+    return {
+      drawn, reads: server.reads.slice(reads),
+      kept: Boolean(rowShowing(page, "edited live")) && shownIds(page).includes("497"),
+    };
+  };
+  const { drawn, reads, kept } = await run(SCRIPT);
+  assert.ok(drawn, "the edit and the message were not drawn at once");
+  assert.deepStrictEqual(reads, [{ view: "main", after: null, before: null }], "the reset did not read the newest page in full");
+  assert.ok(kept, "a read answered from before the edit and the message put the old words back or took the message off");
+  // THE CONTROL: patches and arrivals applied only over reads sent before them.
+  const control = await run(brokenScript("  const cutBefore = (epoch) => typeof sent === \"number\" && epoch > sent;",
+    "  const cutBefore = (epoch) => typeof sent === \"number\" && epoch > sent;\n  if (typeof sent === \"number\" && [...livePatches.values(), ...liveArrivals.values()].every((one) => one.epoch <= sent)) return;"));
+  assert.ok(control.drawn && !control.kept, "the control kept both anyway, so this test cannot see either lost");
+});
+
+test("`#278 page-live-reads`: a read of the view that lands ends a give-up's hold, so the poll reads it inside the server's bound", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  server.hold = gate(server.answer);
+  await pollOnce(page);
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+  assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the read");
+  await page.settle();
+  await page.settle();
+  // The reader pulls to refresh, and the service answers.
+  server.hold = null;
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS + 3000);
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 2, "the pull did not read");
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh", "the pull's read did not land");
+  // Inside the bound of the read given up on, the poll is not held by it any longer.
+  page.setClock(sent + SERVER_READ_BOUND_MS - 5000);
+  await pollOnce(page);
+  assert.equal(page.timelineCalls.length - calls, 3,
+    `a view read successfully after a give-up was still held: ${page.timelineCalls.slice(calls)}`);
+});
+
+test("`#278 page-live-reads`: a stream reset inside a give-up's hold reads the channel at once", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  server.hold = gate(server.answer);
+  await pollOnce(page);
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+  assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the read");
+  await page.settle();
+  await page.settle();
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS + 5000);
+  await deliver(page, page.stream(), `event: reset\ndata: ${JSON.stringify({ missed: 1 })}\n\n`);
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 2, "the read a declared gap calls for was held");
+});
+
+test("`#278 page-live-reads`: a reconnect's poll a give-up's hold puts off is read at the hold's end, not fifteen minutes on", async () => {
+  const { page, server } = await pushedPage();
+  server.hold = gate(server.answer);
+  page.setClock(page.clock() + TIMELINE_RECONCILE_MS);
+  const sent = page.clock();
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "no reconcile was armed behind the pushed stream");
+  await page.settle();
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+  assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the read");
+  await page.settle();
+  await page.settle();
+  // The stream drops and comes back inside the server's bound, missing a message meanwhile.
+  server.hold = null;
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS + 2000);
+  page.stream().drop();
+  await page.settle();
+  const missed = server.post(message({ id: "491", content: "said while the stream was down" }));
+  const calls = page.timelineCalls.length;
+  page.setClock(page.clock() + sourceConstant("LIVE_RETRY_MS"));
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  await page.settle();
+  assert.equal(page.streamOpens.length, 2, "the stream did not reconnect");
+  assert.equal(page.timelineCalls.length - calls, 0, "the reconnect's poll was not held, so this proves nothing");
+  assert.ok(!shownIds(page).includes(missed.id), "the missed message is shown already, so this proves nothing");
+  // The poll comes at the hold's end and reads what the reconnect owed.
+  await passTime(page, sent + SERVER_READ_BOUND_MS - page.clock());
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 1, "the read a reconnect owed was not made at the hold's end");
+  assert.ok(shownIds(page).includes(missed.id), "the message missed while the stream was down is still not shown");
+});
+
+test("`#278 page-live-reads`: a reconnect and a reset after the view read again, inside a give-up's hold, bring back what the drop missed", async () => {
+  const { page, server } = await pushedPage();
+  server.hold = gate(server.answer);
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "no reconcile was armed behind the pushed stream");
+  await page.settle();
+  page.setClock(page.clock() + CHANNEL_READ_TIMEOUT_MS);
+  page.expireTimers(CHANNEL_READ_TIMEOUT_MS);
+  await page.settle();
+  await page.settle();
+  server.hold = null;
+  page.setClock(page.clock() + 3000);
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  await page.settle();
+  page.setClock(page.clock() + 2000);
+  page.stream().drop();
+  await page.settle();
+  const missed = server.post(message({ id: "491", content: "said while the server restarted" }));
+  const calls = page.timelineCalls.length;
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  await page.settle();
+  await deliver(page, page.stream(), `event: reset\ndata: ${JSON.stringify({ missed: 1 })}\n\n`);
+  await page.settle();
+  await page.settle();
+  assert.ok(shownIds(page).includes(missed.id), "a message the stream reset over is still missing");
+  const reads = page.timelineCalls.length - calls;
+  assert.ok(reads >= 1 && reads <= 2, `the reconnect and the reset read ${reads} times`);
+});
+
+test("`#278 page-live-reads`: on a channel without threads, a live edit ends a give-up's hold, and the read it calls for goes", async () => {
+  const page = newPage();
+  const original = [message({ id: "360", content: "before the edit" })];
+  const stream = await withLiveChannel(page, original);
+  const serve = page.channelPage;
+  let open = null;
+  page.channelPage = (path, options) => new Promise((resolve) => { open = () => resolve(serve(path, options)); });
+  const reads = page.pageReads;
+  await pollOnce(page);
+  assert.equal(page.pageReads - reads, 1, "the poll did not read");
+  page.setClock(page.clock() + CHANNEL_READ_TIMEOUT_MS);
+  assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the read");
+  await page.settle();
+  await page.settle();
+  page.channelPage = serve;
+  const edited = { ...original[0], content: "after the edit" };
+  page.messages = [edited];
+  await deliver(page, stream, sseUpdate("edit-360", edited));
+  await page.settle();
+  await page.settle();
+  assert.equal(page.pageReads - reads, 2, "a live edit did not end the wait for its read");
+  assert.match(page.el("discord-log").text(), /after the edit/, "the edit's read did not draw it");
+  if (open) open();
+});
+
+test("`#278 page-live-reads`: a live event a read has overtaken does not lower the count that read gave", async () => {
+  const { page, server, data } = await twoColumnServer((p, d) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+    // Read after two replies this page does not hold: the thread's count and activity are theirs.
+    d.threads[0].reply_count = 3;
+    d.threads[0].updated_at = new Date(Date.parse(d.threads[0].updated_at) + 600000).toISOString();
+    d.messages[1].thread.reply_count = 3;
+  });
+  const [first] = data.threads;
+  assert.match(cardFacts(page, first.id), / · 3 replies$/, "the card does not carry the read's count, so this proves nothing");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(3)", "the root does not either");
+  const reads = server.reads.length;
+  // The stream's event for the second of those replies, delivered after that read: it counted two.
+  const at = new Date(Date.parse(data.messages[2].timestamp) + 1000).toISOString();
+  const late = message({ id: "471", content: "the second answer, delivered late", timestamp: at,
+    thread: { ...data.messages[1].thread, is_root: false } });
+  await deliver(page, page.stream(), sseMessage(late, { thread_facts: placedFacts(late, 2) }));
+  await page.settle();
+  assert.deepStrictEqual(server.reads.slice(reads), [], "a placed reply was read for");
+  assert.match(cardFacts(page, first.id), / · 3 replies$/, "a late event lowered the card's count");
+  assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(3)", "a late event lowered the root's count");
+});
+
+test("`#278 page-live-reads`: a pushed stream that says nothing for forty seconds, not even a keep-alive, is let go: the poll is forty-five seconds until it is back, and coming back polls", async () => {
+  const LIVE_QUIET_MS = sourceConstant("LIVE_QUIET_MS");
+  const { page, server } = await pushedPage();
+  const stream = page.stream();
+  // A keep-alive every fifteen seconds keeps the stream trusted, however long that goes on.
+  for (let n = 0; n < 4; n += 1) {
+    await passTime(page, 15000);
+    await deliver(page, stream, ": keep-alive\n\n");
+  }
+  assert.equal(stream.cancels, 0, "a stream sending its keep-alives was let go");
+  assert.equal(page.streamOpens.length, 1, "a stream sending its keep-alives was reopened");
+  // Then nothing at all, as from a connection gone half-open.
+  const reads = server.reads.length;
+  await passTime(page, LIVE_QUIET_MS);
+  assert.equal(stream.cancels, 1, "a stream that went quiet was still trusted");
+  assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 0, "the poll kept fifteen minutes behind a stream that went quiet");
+  assert.equal(server.reads.length - reads, 0, "letting the quiet stream go read the channel by itself");
+  await passTime(page, sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  assert.equal(page.streamOpens.length, 2, "the quiet stream was not reopened");
+  assert.equal(server.reads.length - reads, 1, "reopening it did not poll the channel");
+  // THE CONTROL: the server polling its provider, whose poll is forty-five seconds anyway, is not watched.
+  const { page: polled } = await forwardPage();
+  assert.equal(polled.expireTimers(LIVE_QUIET_MS), 0, "a stream with no push behind it was watched");
 });

@@ -3042,19 +3042,33 @@ attached** (`#278 page-live-reads`, remote-ops audit W6 and W7). Behind a bridge
 channel can cost the adapter a scan of the whole space, and the page used to send one for every
 live message and two for every edit or removal. Now, on a channel with threads, an edit or removal
 is applied from its event and drawn from the store, in both columns, with no read; an edit that
-lands while a read sent before it is out is applied again over that read's answer. A live message
-whose event carries `thread_facts` — its producer placed it — is placed by them, and its thread's
-root and card take the count and latest activity they give, with no read. One without them, or
-whose facts leave a reply's count unsaid, or name a thread the store's list of threads lacks, is
-read for at most once every ten seconds, whatever arrives meanwhile; on the voice pane it is not read
-at all, entering the channel reads it. While an adapter's pushed stream is attached the poll waits
-fifteen minutes instead of forty-five seconds, since the stream carries every creation, edit and
-removal; it goes back to forty-five seconds the moment the stream drops, and the stream coming back
-polls at once. A server that polls its provider itself sees creations only, so its channels keep
-the forty-five seconds. And when a view's read is given up on at twenty seconds, nothing the reader
-did not ask for — the poll, a live message's read, coming back to the page, a stream reset — reads
-that view again until the server's own fifty-second bound has passed or a live event arrives;
-entering the view and pull-to-refresh still read.
+lands while a read sent before it is out is applied again over that read's answer, and so is one a
+read sent after it answers from a copy the service cut before it. A live message whose event carries
+`thread_facts` — its producer placed it — is placed by them, and its thread's root and card take
+the count and latest activity they give, with no read, unless a read has since seen later activity
+in that thread, whose count stands. A read sent before such a message arrived, which does not carry
+it, does not take it off the screen: it is put back over that read's answer, for the server's
+fifty-second bound. One without facts, or whose facts leave a reply's count unsaid, or name a
+thread the store's list of threads lacks, is read for at most once every ten seconds, whatever
+arrives meanwhile; on the voice pane it is not read at all, entering the channel reads it.
+
+While an adapter's pushed stream is attached the poll waits fifteen minutes instead of forty-five
+seconds, since the stream carries every creation, edit and removal. It goes back to forty-five
+seconds when the stream drops; when the last read of either column failed, whether or not any rows
+were on screen; and when the stream says nothing for forty seconds, not even the keep-alive the
+server sends every fifteen, which lets the stream go as a drop does. The stream coming back polls
+at once. Attached is not proof that the adapter behind the server is alive: its own feed can stop
+while the server's keep-alives go on, and nothing here checks it. **The tradeoff:** the stream does
+not carry reactions, what is read or Done, the reading bookmark, or the pins revision, which only a
+read brings; behind a pushed stream a change of those made on another device takes up to fifteen
+minutes to show here, where it took forty-five seconds. A server that polls its provider itself
+sees creations only, so its channels keep the forty-five seconds.
+
+When a view's read is given up on at twenty seconds, nothing the reader did not ask for — the poll,
+a live message's read, coming back to the page — reads that view again until the server's own
+fifty-second bound has passed, a live event (a message, an edit or a removal) arrives, or a read of
+that view lands; a read put off so is not dropped, the poll comes at the bound and makes it.
+Entering the view, pull-to-refresh and a stream reset, which declares a gap, still read.
 
 **`user_message`, not `contextual_update`, and that is the substance of the feature.** A
 contextual update injects text into the agent's context *without consuming a turn*: the agent
