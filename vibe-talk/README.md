@@ -1519,12 +1519,22 @@ of the thread reads a deployment made. So:
 
 * A thread whose messages this server has **just read** is named from them, with no read: the
   thread list's own root, which is all of a thread with no replies, and what a thread page you
-  opened or a Flat page (which on a bridge carries every reply) brought in the last 30 seconds,
-  provided it holds every reply the thread's exact count says it has, or the newest 50. A queued
-  thread you open is named from that read straight away.
+  opened or a Flat page (which on a bridge carries every reply) brought in the last 30 seconds. A
+  queued thread you open is named from that read straight away.
+* Those messages stand in for a read only when they are what the read would bring, because a name
+  is kept for good. The thread's reply count must be exact and at most 50, exactly that many
+  replies must be held, and the newest of them must be no older than the thread's last activity.
+  They are looked up when the thread's turn comes, so an edit or delete pushed while it waits
+  sends it to the provider instead. A thread of more than 50 replies is always read: the replies
+  held might be an older page you scrolled to rather than its newest.
+* One staleness remains: a reply edited upstream with nothing pushed, within those 30 seconds,
+  changes neither the count nor the last activity, so the thread is named from the text as the
+  page read it. A provider that pushes edits (a bridge with a tail) closes it.
 * Any other thread costs one read, and naming reads **at most one thread per channel every 30
   seconds**. Twenty unnamed threads in one channel are named over ten minutes, not in one burst;
-  other channels are not held behind them.
+  at most 64 of one channel's threads wait at a time, so other channels are not held behind
+  them. A channel taken off the list while its threads wait is not read for them, and nothing is
+  filed for it.
 * A thread read that fails with a 5xx, a timeout or a rate limit **stops naming reads of that
   channel for ten minutes**. Threads of it that need a read are not queued meanwhile; the next
   thread-list read after the pause queues them again.

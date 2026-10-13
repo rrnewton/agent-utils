@@ -31,9 +31,22 @@
 //!   what [`crate::read_ahead::ReadAhead`] holds of a Thread page the reader opened or a Flat page
 //!   (on a bridge, Flat holds every reply), for the 30 s it holds them. A queued thread the reader
 //!   then opens is named from that read at once.
+//! * Held rows stand in for a read only when they are what the read would bring, because a name is
+//!   kept for good and a sentence until the next milestone. So they are looked up when the
+//!   thread's naming turn comes, never copied when it is queued (an edit or delete pushed while it
+//!   waits drops a row from read-ahead, and sends the thread to the provider). They count only
+//!   against an EXACT reply count of at most [`THREAD_FETCH_LIMIT`], with exactly that many replies
+//!   held and the newest no older than the thread's last activity. A longer thread is read: rows
+//!   held cannot show they are its newest replies rather than an older page of them.
+//! * What that still accepts: a reply edited upstream with nothing pushed, inside read-ahead's
+//!   30 s, changes neither the count nor the last activity, so the thread is named from the text
+//!   as it was when the page read it. The same 30 s read-ahead allows speech; here the name it
+//!   gives is kept. A provider that pushes edits (a bridge with a tail) closes it.
 //! * Any other thread costs one read, and naming reads at most one thread per channel per
 //!   [`READ_INTERVAL`]. A thread over the budget waits for its channel's next turn without holding
-//!   up the queue, so another channel is not held behind it.
+//!   up the queue, and at most [`MAX_PENDING_PER_CHANNEL`] wait per channel, so another channel is
+//!   not held behind it. A thread whose channel has been taken off the list when its turn comes is
+//!   neither read nor named, and nothing is filed for it.
 //! * A read that fails in a way that says the provider is struggling (a 5xx, a timeout, a rate
 //!   limit: [`crate::chat::ChatError::is_transient`]) stops naming reads of that CHANNEL for
 //!   [`PAUSE_AFTER_PROVIDER_FAILURE`]; every thread of it waiting for a read is dropped from the
@@ -128,8 +141,14 @@ pub const READ_INTERVAL: Duration = Duration::from_secs(30);
 /// a channel fails the next one too, and every retry spends what it is short of.
 /// `#278 naming-throttle`, remote-ops audit W5.
 pub const PAUSE_AFTER_PROVIDER_FAILURE: Duration = Duration::from_secs(10 * 60);
-/// The most threads queued at once. A thread past this is queued by a later read.
-const MAX_PENDING: usize = 256;
+/// The most threads queued at once, across every channel. A thread past this is queued by a later
+/// read.
+const MAX_PENDING: usize = 1_024;
+/// The most threads of ONE channel queued at once: about half an hour of that channel's naming
+/// reads at [`READ_INTERVAL`]. A thread past this is queued by a later read of the list. Without
+/// it, one channel with hundreds of due threads would fill [`MAX_PENDING`] for hours and keep every
+/// other channel's threads out. `#278 naming-throttle`.
+const MAX_PENDING_PER_CHANNEL: usize = 64;
 /// The most thread records held in memory before the cache is dropped and re-read from the store.
 const MAX_KNOWN: usize = 10_000;
 /// What a thread NAME row's id is prefixed with in the summary cache. No provider's message id
@@ -414,12 +433,19 @@ pub struct ThreadDeps {
     /// What this server has read in the last 30 s, looked at before the thread is read from
     /// `chat`. `#278 naming-throttle`.
     pub read_ahead: Arc<ReadAhead>,
+    /// Whether a channel is on this server's list NOW. A thread can wait minutes for its turn, and
+    /// a channel taken off the list meanwhile is not read for it, nor is anything filed for it
+    /// afterwards. `#278 naming-throttle`.
+    pub listed: Arc<dyn Fn(&ChannelId) -> bool + Send + Sync>,
 }
 
 impl ThreadDeps {
     /// The parts of `state` naming needs.
     #[must_use]
     pub fn from_state(state: &crate::state::AppState) -> Self {
+        let config = Arc::clone(&state.config);
+        let added = Arc::clone(&state.added_channels);
+        let hidden = Arc::clone(&state.hidden_channels);
         Self {
             chat: Arc::clone(&state.chat),
             store: Arc::clone(&state.store),
@@ -427,8 +453,30 @@ impl ThreadDeps {
             version: Arc::clone(&state.summary_version),
             sentence_chars: state.config.summaries.target_chars,
             read_ahead: Arc::clone(&state.read_ahead),
+            listed: Arc::new(move |channel: &ChannelId| listed(&config, &added, &hidden, channel)),
         }
     }
+}
+
+/// Whether `channel` is on the list, by the rule [`crate::state::AppState::channel`] applies: a
+/// configured channel unless the owner hid it, otherwise one he added. From the three pieces of
+/// state that rule reads, so a naming waiting for its turn holds no more of the server than that.
+fn listed(
+    config: &crate::config::Config,
+    added: &std::sync::RwLock<Vec<crate::store::AddedChannel>>,
+    hidden: &std::sync::RwLock<std::collections::BTreeSet<ChannelId>>,
+    channel: &ChannelId,
+) -> bool {
+    if config
+        .channels
+        .iter()
+        .any(|configured| configured.id == *channel)
+    {
+        return !hidden.read().is_ok_and(|hidden| hidden.contains(channel));
+    }
+    added
+        .read()
+        .is_ok_and(|added| added.iter().any(|row| row.channel == *channel))
 }
 
 type Key = (ChannelId, String);
@@ -454,10 +502,6 @@ pub struct ThreadNames {
     turn: tokio::sync::Semaphore,
     /// The least time between two naming reads of one channel: [`READ_INTERVAL`] by default.
     read_interval: Duration,
-    /// Wakes the threads waiting for their channel's next read to look again: when a page has just
-    /// read one of them, so it is named from that read now rather than read again later, and when
-    /// a channel's reads are paused, so its waiting threads leave the queue now.
-    recheck: tokio::sync::Notify,
 }
 
 #[derive(Debug, Default)]
@@ -472,6 +516,11 @@ struct NamesState {
     /// Per channel: when naming last read a thread of it, and until when it reads none.
     /// `#278 naming-throttle`. One entry per channel ever named in, which the allowlist bounds.
     reads: HashMap<ChannelId, ChannelReads>,
+    /// Per channel: wakes that channel's threads waiting for its next read to look again, when a
+    /// page has just read one of them (so it is named from that read now rather than read again
+    /// later) and when the channel's reads are paused (so they leave the queue now). Per channel,
+    /// so a page read in one channel does not wake every waiting thread of every other.
+    rechecks: HashMap<ChannelId, Arc<tokio::sync::Notify>>,
 }
 
 impl NamesState {
@@ -481,6 +530,19 @@ impl NamesState {
             .get(channel)
             .and_then(|reads| reads.paused_until)
             .is_some_and(|until| now < until)
+    }
+
+    /// What wakes `channel`'s waiting threads.
+    fn recheck(&mut self, channel: &ChannelId) -> Arc<tokio::sync::Notify> {
+        Arc::clone(self.rechecks.entry(channel.clone()).or_default())
+    }
+
+    /// How many of `channel`'s threads are queued or being named.
+    fn pending_in(&self, channel: &ChannelId) -> usize {
+        self.pending
+            .iter()
+            .filter(|(pending, _)| pending == channel)
+            .count()
     }
 }
 
@@ -510,6 +572,9 @@ enum Work {
     /// Left unnamed, and not counted as a failure: it needed a read while its channel's reads were
     /// paused. A later read of the list queues it again.
     Deferred,
+    /// Left unnamed, and nothing filed: its channel was taken off the list while it waited, or
+    /// while it was being named.
+    Unlisted,
 }
 
 impl Default for ThreadNames {
@@ -541,7 +606,6 @@ impl ThreadNames {
             state: Mutex::new(NamesState::default()),
             turn: tokio::sync::Semaphore::new(1),
             read_interval: interval,
-            recheck: tokio::sync::Notify::new(),
         }
     }
 
@@ -779,15 +843,17 @@ impl ThreadNames {
         prior: Option<ThreadRecord>,
     ) {
         let key = (channel.clone(), snapshot.id.clone());
-        // What this server already holds of the thread, so it costs no read. `#278 naming-throttle`.
-        let held = held_thread(&deps.read_ahead, channel, &snapshot);
+        // Whether this server holds the thread now, so naming it would cost no read. Only whether:
+        // the rows themselves are looked up again when its turn comes (see `work`), because a copy
+        // taken now would outlive an edit or delete pushed while it waits. `#278 naming-throttle`.
+        let held = held_thread(&deps.read_ahead, channel, &snapshot).is_some();
         {
             let mut state = self.lock();
             if state.pending.contains(&key) {
-                if held.is_some() {
+                if held {
                     // Queued already, and perhaps waiting for its channel's next read, which the
                     // read that brought this page has just made unnecessary.
-                    self.recheck.notify_waiters();
+                    state.recheck(channel).notify_waiters();
                 }
                 return;
             }
@@ -796,8 +862,12 @@ impl ThreadNames {
                 .get(&key)
                 .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE);
             // A thread that would need a read is not queued while its channel's reads are paused.
-            let paused = held.is_none() && state.paused(channel, Instant::now());
-            if recently_failed || paused || state.pending.len() >= MAX_PENDING {
+            let paused = !held && state.paused(channel, Instant::now());
+            if recently_failed
+                || paused
+                || state.pending.len() >= MAX_PENDING
+                || state.pending_in(channel) >= MAX_PENDING_PER_CHANNEL
+            {
                 return;
             }
             state.pending.insert(key.clone());
@@ -809,15 +879,16 @@ impl ThreadNames {
         let this = Arc::clone(self);
         let deps = deps.clone();
         runtime.spawn(async move {
-            let outcome = this
-                .work(&deps, &key.0, &snapshot, prior.as_ref(), held)
-                .await;
+            let outcome = this.work(&deps, &key.0, &snapshot, prior.as_ref()).await;
             let mut state = this.lock();
             state.pending.remove(&key);
             match outcome {
                 Work::Deferred => tracing::debug!(
                     "a thread was left unnamed: it needs a read, and its channel's naming reads are \
                      paused after a provider failure"
+                ),
+                Work::Unlisted => tracing::debug!(
+                    "a thread was left unnamed: its channel was taken off the list while it waited"
                 ),
                 Work::Named(record) => {
                     state.failed.remove(&key);
@@ -856,29 +927,29 @@ impl ThreadNames {
         });
     }
 
-    /// Name one queued thread: from rows already held when there are any, at the time it was
-    /// queued or by the time its turn comes, and otherwise with one read inside its channel's
-    /// budget. `#278 naming-throttle`.
+    /// Name one queued thread: from rows held when its turn comes, looked up then and not when it
+    /// was queued, and otherwise with one read inside its channel's budget. Neither, if its channel
+    /// has been taken off the list by then. `#278 naming-throttle`.
     async fn work(
         &self,
         deps: &ThreadDeps,
         channel: &ChannelId,
         snapshot: &ThreadSummary,
         prior: Option<&ThreadRecord>,
-        mut held: Option<Vec<Message>>,
     ) -> Work {
+        let recheck = self.lock().recheck(channel);
         loop {
             // Armed before anything is looked at, so a page read or a pause that lands while this
             // waits for the turn, or decides to wait for the budget, still wakes it.
-            let woken = self.recheck.notified();
+            let woken = recheck.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
             // The semaphore is never closed, so this only ever waits.
             let turn = self.turn.acquire().await;
-            let rows = match held
-                .take()
-                .or_else(|| held_thread(&deps.read_ahead, channel, snapshot))
-            {
+            if !(deps.listed)(channel) {
+                return Work::Unlisted;
+            }
+            let rows = match held_thread(&deps.read_ahead, channel, snapshot) {
                 Some(rows) => Rows::Held(rows),
                 None => match self.take_read(channel) {
                     Gate::Open => Rows::Read,
@@ -895,6 +966,7 @@ impl ThreadNames {
             };
             return match name_one(deps, channel, snapshot, prior, rows).await {
                 Ok(record) => Work::Named(record),
+                Err(NameError::Unlisted) => Work::Unlisted,
                 Err(NameError::Read(error)) => {
                     if error.is_transient() {
                         self.pause_reads(channel);
@@ -928,13 +1000,13 @@ impl ThreadNames {
     /// Read nothing more from `channel` for [`PAUSE_AFTER_PROVIDER_FAILURE`].
     fn pause_reads(&self, channel: &ChannelId) {
         let until = Instant::now() + PAUSE_AFTER_PROVIDER_FAILURE;
-        self.lock()
-            .reads
-            .entry(channel.clone())
-            .or_default()
-            .paused_until = Some(until);
+        let recheck = {
+            let mut state = self.lock();
+            state.reads.entry(channel.clone()).or_default().paused_until = Some(until);
+            state.recheck(channel)
+        };
         // The threads waiting for this channel's next read leave the queue now, not at that read.
-        self.recheck.notify_waiters();
+        recheck.notify_waiters();
         tracing::warn!(
             channel = %channel,
             pause_seconds = PAUSE_AFTER_PROVIDER_FAILURE.as_secs(),
@@ -956,6 +1028,8 @@ enum NameError {
     /// The chat provider could not be read. Kept typed, so a failure that says the provider is
     /// struggling pauses the channel's naming reads.
     Read(ChatError),
+    /// The channel was taken off the list before the result was filed, so it was not.
+    Unlisted,
     /// Anything else: the store, the summariser, or a thread with no text.
     Naming(SummaryError),
 }
@@ -966,16 +1040,25 @@ impl From<SummaryError> for NameError {
     }
 }
 
-/// The thread as rows this server has already read, when they are as much of it as a thread read
-/// would bring, root first and then the replies oldest first; `None` when they are not.
-/// `#278 naming-throttle`, remote-ops audit W5.
+/// The thread as rows this server has already read, when they are what a thread read would bring,
+/// root first and then the replies oldest first; `None` when that is not shown. Called when the
+/// thread's naming turn comes, so what it answers is what read-ahead holds THEN: a row an edit or
+/// delete has since dropped is gone from it. `#278 naming-throttle`, remote-ops audit W5.
 ///
 /// Two sources, both free: the root the thread list itself carries, which is all there is of a
 /// thread with no replies, and what `read_ahead` holds of the thread, read in it or labelled with
 /// it in the last [`crate::read_ahead::RECENT_TTL`] (a Thread page the reader opened; a Flat page,
-/// which on a bridge carries every reply). They count only against an EXACT reply count, and only
-/// when they hold every reply it counts, or at least the [`THREAD_FETCH_LIMIT`] newest a read
-/// would bring. An estimate, or no count at all, proves nothing, and the thread is read.
+/// which on a bridge carries every reply). They stand in for a read only when all of these hold:
+///
+/// * the reply count is EXACT. An estimate, or no count at all, proves nothing.
+/// * it is at most [`THREAD_FETCH_LIMIT`]. Past that a read brings the newest replies, and rows
+///   held cannot show they are those rather than an older page the reader scrolled to, or a newest
+///   page that has expired while an older one has not.
+/// * EXACTLY that many replies are held. Fewer misses a reply. More holds one that is no longer in
+///   the thread: deleted upstream with nothing pushed.
+/// * the newest reply held is no older than the thread's last activity (`updated_at`). Activity
+///   newer than every reply held means a reply was added since they were read (and, as the count
+///   still matches, another removed). An activity time that cannot be read proves nothing.
 fn held_thread(
     read_ahead: &ReadAhead,
     channel: &ChannelId,
@@ -985,6 +1068,9 @@ fn held_thread(
         return None;
     }
     let counted = snapshot.reply_count?;
+    if counted > u64::from(THREAD_FETCH_LIMIT) {
+        return None;
+    }
     let root_id = snapshot.root.as_ref().map(|root| root.id.clone());
     let (mut roots, mut replies): (Vec<Message>, Vec<Message>) = read_ahead
         .recall_thread(channel, &snapshot.id)
@@ -993,8 +1079,7 @@ fn held_thread(
             root_id.as_ref() == Some(&message.id)
                 || message.thread.as_ref().is_some_and(|thread| thread.is_root)
         });
-    let wanted = counted.min(u64::from(THREAD_FETCH_LIMIT));
-    if (replies.len() as u64) < wanted {
+    if replies.len() as u64 != counted {
         return None;
     }
     replies.sort_by_cached_key(|message| {
@@ -1003,12 +1088,15 @@ fn held_thread(
             message.id.numeric(),
         )
     });
-    let excess = replies
-        .len()
-        .saturating_sub(usize::from(THREAD_FETCH_LIMIT));
-    replies.drain(..excess);
-    let root = snapshot.root.clone().or_else(|| roots.pop());
-    Some(root.into_iter().chain(replies).collect())
+    if let Some(newest) = replies.last() {
+        let newest = newest.timestamp.parse::<jiff::Timestamp>().ok()?;
+        let active = snapshot.updated_at.parse::<jiff::Timestamp>().ok()?;
+        if newest < active {
+            return None;
+        }
+    }
+    let root = snapshot.root.clone().or_else(|| roots.pop())?;
+    Some(std::iter::once(root).chain(replies).collect())
 }
 
 /// Whether a thread needs a name, or a fresh sentence.
@@ -1157,6 +1245,12 @@ async fn name_one(
     let request = ThreadRequest::new(&messages, deps.sentence_chars);
     let began = std::time::Instant::now();
     let naming = deps.summarizer.name_thread(&request).await?;
+    // Taking a channel off the list deletes its sentences; one filed after that would be shown
+    // again if it came back. Checked after the model call, the step that can take a while, so the
+    // race is narrowed to the two store writes below. `#278 naming-throttle`.
+    if !(deps.listed)(channel) {
+        return Err(NameError::Unlisted);
+    }
     let renamed = kept.is_none();
     let cut_at = naming.cut_at;
     let record = ThreadRecord {
@@ -1441,9 +1535,10 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_is_held_only_when_the_rows_read_cover_what_its_exact_count_says() {
+    fn a_thread_is_held_only_when_the_rows_read_are_exactly_what_its_exact_count_says() {
         // `#278 naming-throttle`. What a thread read would bring, from rows already read, or
-        // nothing: a thread named from part of itself would be named wrong, and kept that way.
+        // nothing: a thread named from part of itself, or from a reply no longer in it, would be
+        // named wrong, and kept that way.
         let channel = ChannelId("c".to_owned());
         let at = |id: u64| {
             jiff::Timestamp::from_second(1_790_000_000 + i64::try_from(id).unwrap())
@@ -1473,16 +1568,18 @@ mod tests {
             reactions: None,
             heading: None,
         };
-        let snapshot = |replies: Option<u64>, exact: bool| ThreadSummary {
+        // The thread as the list says it is: an exact or estimated count, and its last activity.
+        let as_listed = |replies: Option<u64>, exact: bool, active: &str| ThreadSummary {
             id: "T".to_owned(),
             root: Some(message(100, true)),
             title: String::new(),
             reply_count: replies,
             reply_count_exact: exact,
-            updated_at: String::new(),
+            updated_at: active.to_owned(),
             display_name: None,
             summary: None,
         };
+        let snapshot = |replies: Option<u64>, exact: bool| as_listed(replies, exact, &at(103));
         let ids = |held: Option<Vec<Message>>| -> Option<Vec<u64>> {
             held.map(|messages| {
                 messages
@@ -1493,7 +1590,11 @@ mod tests {
         };
         let empty = ReadAhead::new();
         assert_eq!(
-            ids(held_thread(&empty, &channel, &snapshot(Some(0), true))),
+            ids(held_thread(
+                &empty,
+                &channel,
+                &as_listed(Some(0), true, &at(100))
+            )),
             Some(vec![100]),
             "no replies: the list's root is the whole thread"
         );
@@ -1504,6 +1605,14 @@ mod tests {
         );
         assert!(held_thread(&empty, &channel, &snapshot(None, true)).is_none());
         assert!(held_thread(&empty, &channel, &snapshot(Some(1), true)).is_none());
+        let rootless = ThreadSummary {
+            root: None,
+            ..as_listed(Some(0), true, &at(100))
+        };
+        assert!(
+            held_thread(&empty, &channel, &rootless).is_none(),
+            "no root anywhere: nothing to name it by but a read"
+        );
 
         // A page read the thread, the root included, out of order.
         let read_ahead = ReadAhead::new();
@@ -1522,27 +1631,67 @@ mod tests {
             held_thread(&read_ahead, &channel, &snapshot(Some(3), true)).is_none(),
             "a reply the count says exists and nothing holds"
         );
+        assert!(
+            held_thread(&read_ahead, &channel, &snapshot(Some(1), true)).is_none(),
+            "a reply held that the count says is no longer there"
+        );
         assert!(held_thread(
             &read_ahead,
             &ChannelId("d".to_owned()),
             &snapshot(Some(2), true)
         )
         .is_none());
-
-        // A long thread: the newest replies a read would bring are enough, and no more are used.
-        let long = ReadAhead::new();
-        let replies: Vec<Message> = (1..=u64::from(THREAD_FETCH_LIMIT) + 5)
-            .map(|n| message(100 + n, false))
-            .collect();
-        long.remember(&channel, Some("T"), &replies, std::time::Instant::now());
-        let held = ids(held_thread(&long, &channel, &snapshot(Some(500), true))).expect("held");
-        assert_eq!(held.len(), usize::from(THREAD_FETCH_LIMIT) + 1);
-        assert_eq!(held[0], 100);
-        assert_eq!(held[1], 106, "the oldest five replies are left out");
-        assert_eq!(
-            *held.last().unwrap(),
-            100 + u64::from(THREAD_FETCH_LIMIT) + 5
+        assert!(
+            held_thread(&read_ahead, &channel, &as_listed(Some(2), true, &at(104))).is_none(),
+            "active after the newest reply held: a reply came since, and one went"
         );
+        assert!(
+            held_thread(&read_ahead, &channel, &as_listed(Some(2), true, "")).is_none(),
+            "an activity time that cannot be read proves nothing"
+        );
+        assert_eq!(
+            ids(held_thread(
+                &read_ahead,
+                &channel,
+                &as_listed(Some(2), true, &at(102))
+            )),
+            Some(vec![100, 101, 103]),
+            "rows held that are newer than the list are not older than the thread"
+        );
+        read_ahead.forget(&channel, &MessageId("101".to_owned()));
+        assert!(
+            held_thread(&read_ahead, &channel, &snapshot(Some(2), true)).is_none(),
+            "an edit or delete pushed since drops the reply, and the rows are not the thread"
+        );
+
+        // A thread of exactly as many replies as a read brings is held whole...
+        let limit = u64::from(THREAD_FETCH_LIMIT);
+        let replies: Vec<Message> = (1..=limit).map(|n| message(100 + n, false)).collect();
+        let full = ReadAhead::new();
+        full.remember(&channel, Some("T"), &replies, std::time::Instant::now());
+        let held = ids(held_thread(
+            &full,
+            &channel,
+            &as_listed(Some(limit), true, &at(100 + limit)),
+        ))
+        .expect("held");
+        assert_eq!(held.len(), usize::from(THREAD_FETCH_LIMIT) + 1);
+        // ...but a longer one is read, whatever is held: fifty of its replies are not shown to be
+        // its fifty newest.
+        let long = ReadAhead::new();
+        let replies: Vec<Message> = (1..=limit + 5).map(|n| message(100 + n, false)).collect();
+        long.remember(&channel, Some("T"), &replies, std::time::Instant::now());
+        for counted in [limit + 1, limit + 5, 500] {
+            assert!(
+                held_thread(
+                    &long,
+                    &channel,
+                    &as_listed(Some(counted), true, &at(100 + limit + 5))
+                )
+                .is_none(),
+                "{counted} replies"
+            );
+        }
     }
 
     #[test]
