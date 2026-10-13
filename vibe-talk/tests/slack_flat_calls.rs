@@ -1088,3 +1088,50 @@ async fn the_reconcile_period_counts_from_when_a_full_read_began() {
     );
     assert!(next.texts.iter().any(|text| text == "edited mid-read"));
 }
+
+/// A reply the replies feed lists but its root does not yet count is the one thing trusting the
+/// root can hide: the bound on it is that it shows once the root counts it, at one forward read,
+/// and, if the root never does, at the thread's next full read, one reconcile period on. Here the
+/// period is a second. Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_reply_its_root_does_not_yet_count_shows_once_it_does_or_at_the_reconcile() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client().with_flat_reconcile(Duration::from_secs(1));
+    assert_eq!(flat(&fake, &client).await.calls(), 23);
+
+    // The root catches up: one forward read brings the reply.
+    let (caught, _) = roots[3].clone();
+    let news = ts(9000, 0);
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), caught.clone()))
+            .expect("thread")
+            .push(
+                json!({"type": "message", "ts": news, "thread_ts": caught, "user": "UREPLIER1",
+                "text": "news", "user_profile": {"display_name": "Replier"}}),
+            );
+    });
+    fake.with(|state| restate_root(state, &caught));
+    let read = flat(&fake, &client).await;
+    assert_eq!(read.threads(), std::slice::from_ref(&caught));
+    assert!(read.messages.contains(&news));
+
+    // The root never catches up: the reconcile brings it.
+    let (lagging, _) = roots[5].clone();
+    let late = ts(9100, 0);
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), lagging.clone()))
+            .expect("thread")
+            .push(
+                json!({"type": "message", "ts": late, "thread_ts": lagging, "user": "UREPLIER1",
+                "text": "late", "user_profile": {"display_name": "Replier"}}),
+            );
+    });
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let reconciled = flat(&fake, &client).await;
+    assert!(reconciled.messages.contains(&late));
+}
