@@ -446,8 +446,10 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         .map(|t| t.chars().count());
     access::tool_arguments(name, &args);
 
-    let approval = crate::send_approval::current(state).await;
-    let Some(tool) = tool_manifest(&state.config.channels, approval)
+    // Only the name, the exposure and whether the tool mutates are read here, and the owner's
+    // setting changes none of them — so no store read for every call. `post_reply` reads the
+    // setting itself, at the moment it decides whether to post. `#264 voice-send-approval`.
+    let Some(tool) = tool_manifest(&state.config.channels, crate::send_approval::Approval::Ask)
         .into_iter()
         .find(|t| t.name == name && t.mcp_exposed)
     else {
