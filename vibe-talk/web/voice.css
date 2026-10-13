@@ -4866,12 +4866,26 @@ a.search-hit-link {
    Draft beside it is, whether or not the row is selected or holds the focus. As specific as the
    touch rule just above and after it, so it is drawn over that and the rules before it, which would
    otherwise draw it in the ink. */
-:root #side-log li.discord-message .meta .reply-button[data-quote="true"],
-:root #discord-log li.discord-message .meta .reply-button[data-quote="true"],
-:root #pinned-log li.discord-message .meta .reply-button[data-quote="true"] {
+:root #side-log li.discord-message .meta .reply-button[data-quote],
+:root #discord-log li.discord-message .meta .reply-button[data-quote],
+:root #pinned-log li.discord-message .meta .reply-button[data-quote] {
   color: var(--accent);
   border-color: var(--accent);
   font-weight: 600;
+}
+
+/* ...and where the header line has no room for "Quote reply", "Quote" in the box Reply had: web/voice.js
+   sets the width Reply was drawn at, and this keeps the words inside it, at Reply's own weight, so
+   nothing on the line, and nothing under it, moves (`drawReplyLabel`). */
+:root #side-log li.discord-message .meta .reply-button[data-quote="short"],
+:root #discord-log li.discord-message .meta .reply-button[data-quote="short"],
+:root #pinned-log li.discord-message .meta .reply-button[data-quote="short"] {
+  box-sizing: border-box;
+  padding-left: 0;
+  padding-right: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-weight: inherit;
 }
 
 /* THE CHANNEL ROW'S METADATA LINE MUST WRAP, and this is not tidying.

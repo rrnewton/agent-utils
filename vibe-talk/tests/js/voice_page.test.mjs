@@ -1018,15 +1018,17 @@ class FakeElement {
 
 /**
  * The document's text selection, as `getSelection()` returns it, with only what the page reads: its
- * ranges' common ancestors, whether it is collapsed, its text, and `removeAllRanges`. `#267
+ * ranges' ends and common ancestors, whether it is collapsed, its text, and `removeAllRanges`. `#267
  * quote-reply`. Nothing is laid out, so a test says what the selection holds and what its text reads
- * as (`page.selectText`); the page decides from where it lies and what it says.
+ * as (`page.selectText`); the page decides from where it lies and what it says. `reads` counts the
+ * times the page asked for the selection's text as drawn, which is the costly read in a browser.
  */
 class FakeSelection {
   constructor() {
     this.ranges = [];
     this.text = "";
     this.cleared = 0;
+    this.reads = 0;
   }
 
   get rangeCount() {
@@ -1048,8 +1050,25 @@ class FakeSelection {
   }
 
   toString() {
+    this.reads += 1;
     return this.text;
   }
+}
+
+/**
+ * One range of a `FakeSelection`, from offset `startOffset` of `from` to offset `endOffset` of `to`,
+ * whose own text (the DOM's, which a browser reads without laying anything out) is `text`. The ends
+ * default to the start of `from` and the end of `to`, as a drag over them leaves them.
+ */
+function fakeRange(from, to, text, { startOffset = 0, endOffset = null } = {}) {
+  const last = to || from;
+  const end = endOffset !== null ? endOffset
+    : last.childNodes.length > 0 ? last.childNodes.length : last.textContent.length;
+  return {
+    startContainer: from, startOffset, endContainer: last, endOffset: end,
+    commonAncestorContainer: commonAncestor(from, last),
+    toString: () => text,
+  };
 }
 
 /** The nearest element holding both `a` and `b`, as a range's `commonAncestorContainer` is. */
@@ -2244,10 +2263,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   page.selection = new FakeSelection();
   /**
    * Select text from `from` to `to` (one node, or two), reading as `text`, and tell the page as a
-   * browser does, by `selectionchange` on the document.
+   * browser does, by `selectionchange` on the document. `ends` places the range's ends at offsets of
+   * their nodes (`fakeRange`), and `own` is the range's own text where it is not `text`.
    */
-  page.selectText = async (from, to, text) => {
-    page.selection.ranges = [{ commonAncestorContainer: commonAncestor(from, to || from) }];
+  page.selectText = async (from, to, text, ends = {}, own = text) => {
+    page.selection.ranges = [fakeRange(from, to, own, ends)];
     page.selection.text = text;
     await page.documentEvent("selectionchange");
   };
@@ -3774,6 +3794,11 @@ const TUNING_BANDS = {
     "how long after a touch a selection that went away still quotes. Under half a second, a phone " +
     "that clears the selection as the tap on Reply lands, before its click, loses the quote; past " +
     "three, a Reply pressed long after the words were let go still quotes words no longer shown"],
+  QUOTE_EDGE_NODES: [50, 2000,
+    "how many nodes the page walks past a message's words to see that a range running on (a " +
+    "triple-click's) takes in nothing drawn. Under fifty, a row's header and buttons between the " +
+    "words and the next row's first word use it up and the triple-click is no quote; past two " +
+    "thousand, a drag across many rows walks the whole list at every move of the mouse"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -47813,7 +47838,132 @@ test("`#267 quote-reply`: Help says what Quote reply does, where it posts, and h
   assert.match(entry, new RegExp(`Up to ${max.toLocaleString("en-US")} characters are quoted`), "Help does not state the cap the code keeps");
   // Drawn in the accent, over the selected row's and a focused row's ink.
   for (const list of ["#side-log", "#discord-log", "#pinned-log"]) {
-    const block = cssBlock(`:root ${list} li.discord-message .meta .reply-button[data-quote="true"]`);
+    const block = cssBlock(`:root ${list} li.discord-message .meta .reply-button[data-quote]`);
     assert.match(block, /color:\s*var\(--accent\)/);
+    // "Quote" in the width Reply had: its words kept inside it, at Reply's weight.
+    const short = cssBlock(`:root ${list} li.discord-message .meta .reply-button[data-quote="short"]`);
+    for (const rule of [/box-sizing:\s*border-box/, /padding-left:\s*0/, /padding-right:\s*0/, /overflow:\s*hidden/,
+      /white-space:\s*nowrap/, /font-weight:\s*inherit/]) {
+      assert.match(short, rule, `${list}: the short Quote rule lacks ${rule}`);
+    }
   }
+});
+
+test("`#267 quote-reply`: where Quote reply would wrap the header line, the button keeps Reply's width and reads Quote, so the message's words do not move", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  const second = rowWithId(page, "1000000000000000002");
+  const third = rowWithId(page, "1000000000000000003");
+  // A header line with room for Reply and not for Quote reply: as wide as Quote reply the button
+  // wraps it, a line taller, as a long author's name and a reply count do on a phone.
+  let measured = 0;
+  for (const li of [first, second]) {
+    const meta = replyButton(li).parentNode;
+    const drawn = meta.getBoundingClientRect.bind(meta);
+    meta.getBoundingClientRect = () => {
+      measured += 1;
+      const box = drawn();
+      const wraps = replyLabel(li).startsWith("Quote reply") ? 22 : 0;
+      return { ...box, height: box.height + wraps, bottom: box.bottom + wraps };
+    };
+    replyButton(li).clientWidth = 52;
+  }
+  await page.selectText(wordsIn(first), null, "about the runner");
+  assert.equal(replyLabel(first), "Quote", "Quote reply was drawn where it wraps the header line");
+  assert.equal(replyButton(first).getAttribute("data-quote"), "short");
+  assert.equal(replyButton(first).style.width, "52px", "the button did not keep the width it had as Reply");
+  assert.equal(replyButton(first).getAttribute("aria-label"), "Quote reply", "cut to Quote, its name lost the rest");
+  assert.equal(replyButton(first).getAttribute("title"), sourceString("QUOTE_REPLY_TITLE"));
+  // Decided once, as the selection begins, not again at every change while it grows.
+  const once = measured;
+  for (const text of ["about the", "about the run", "about the runner"]) await page.selectText(wordsIn(first), null, text);
+  assert.equal(measured, once, "the header line was measured again at every change of the selection");
+  // A press quotes as the full label does.
+  await replyButton(first).click();
+  assert.equal(page.el("reply-text").value, "> about the runner\n\n", "Quote did not quote");
+  await page.el("reply-cancel").click();
+  await page.settle();
+  assert.equal(replyLabel(first), "Reply");
+  assert.equal(replyButton(first).style.width, "", "Reply kept the width Quote was held at");
+  assert.equal(replyButton(first).hasAttribute("data-quote"), false);
+  assert.equal(replyButton(first).getAttribute("aria-label"), null);
+  // With its count: "Quote (1)", named in full; Reply (1) again when the selection goes.
+  await page.selectText(wordsIn(second), null, "the deploy");
+  assert.equal(replyLabel(second), "Quote (1)");
+  assert.equal(replyButton(second).getAttribute("aria-label"), "Quote reply, 1 reply already");
+  await page.clearSelection();
+  assert.equal(replyLabel(second), "Reply (1)");
+  assert.equal(replyButton(second).getAttribute("aria-label"), "Reply, 1 reply already");
+  assert.equal(replyButton(second).style.width, "");
+  // The control: where the line keeps its height, Quote reply in full.
+  await page.selectText(wordsIn(third), null, "an answer");
+  assert.equal(replyLabel(third), "Quote reply", "a header line with room was given the short label");
+  assert.equal(replyButton(third).getAttribute("data-quote"), "true");
+  assert.equal(replyButton(third).style.width || "", "");
+});
+
+test("`#267 quote-reply`: a range that runs past the message's words to the very start of the next row, as a triple-click leaves one, is the message's; one that takes in a word outside them is not", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  const second = rowWithId(page, "1000000000000000002");
+  const part = (li, name) => li.descendants().find((node) => node.hasClass(name));
+  const words = "the first message, about the runner";
+  assert.equal(part(second, "msg-author").hidden, false, "the premise: the next row draws its author's name first");
+  // As Chromium's triple-click leaves it: the paragraph and the break after it, the range ending at
+  // the start of the next row's first word.
+  await page.selectText(wordsIn(first), part(second, "msg-author"), `${words}\n\n`, { endOffset: 0 });
+  assert.equal(replyLabel(first), "Quote reply", "a triple-click's paragraph was not offered as a quote");
+  assert.match(replyLabel(second), /^Reply/, "the next row, none of it selected, became Quote reply");
+  await replyButton(first).click();
+  assert.equal(page.el("reply-text").value, `> ${words}\n\n`, "the triple-click's paragraph was not quoted");
+  await page.el("reply-cancel").click();
+  await page.settle();
+  // Words drawn nowhere between the two do not count; drawn, they do.
+  const aside = page.document.createElement("span");
+  aside.textContent = "words the row does not draw";
+  aside.hidden = true;
+  first.append(aside);
+  await page.selectText(wordsIn(first), part(second, "msg-author"), `${words}\n\n`, { endOffset: 0 });
+  assert.equal(replyLabel(first), "Quote reply", "words hidden after the message's own counted as selected");
+  aside.hidden = false;
+  await page.selectText(wordsIn(first), part(second, "msg-author"), `${words}\n\naside`, { endOffset: 0 });
+  assert.equal(replyLabel(first), "Reply", "words drawn after the message's own were quoted as if they were not there");
+  first.removeChild(aside);
+  // Run on into the next row, or start in this row's own header line: words outside the message are
+  // selected, and that is no quote.
+  for (const [from, to, ends, what] of [
+    [wordsIn(first), part(second, "msg-author"), { endOffset: 2 }, "two letters of the next row's author"],
+    [wordsIn(first), part(second, "msg-time"), { endOffset: 0 }, "the next row's author's name, up to its time"],
+    [wordsIn(first), wordsIn(second), { endOffset: 3 }, "the next row's words"],
+    [part(first, "msg-time"), wordsIn(first), { startOffset: 0 }, "this row's time"],
+  ]) {
+    await page.selectText(from, to, "some words", ends);
+    assert.equal(replyLabel(first), "Reply", `a selection taking in ${what} was offered as a quote`);
+    assert.match(replyLabel(second), /^Reply/, `a selection taking in ${what} made the next row Quote reply`);
+  }
+});
+
+test("`#267 quote-reply`: after the mouse a selection's words as drawn are read once, when Quote reply is pressed; after a touch, at each change", async () => {
+  const page = await quotePage();
+  const first = rowWithId(page, "1000000000000000001");
+  await page.documentEvent("pointerdown", { pointerType: "mouse", target: wordsIn(first) });
+  for (const text of ["the", "the first", "the first message"]) await page.selectText(wordsIn(first), null, text);
+  assert.equal(replyLabel(first), "Quote reply");
+  assert.equal(page.selection.reads, 0, "a drag read the words as drawn at every move of the mouse");
+  await replyButton(first).click();
+  assert.equal(page.el("reply-text").value, "> the first message\n\n");
+  assert.ok(page.selection.reads >= 1, "the press did not read the words it quotes");
+  await page.el("reply-cancel").click();
+  await page.settle();
+  // After a touch the phone may take the selection before its tap on Reply arrives, so they are read
+  // as they change, and the last of them is what a tap after it quotes.
+  const touch = await quotePage();
+  const row = rowWithId(touch, "1000000000000000001");
+  await touch.documentEvent("pointerdown", { pointerType: "touch", target: wordsIn(row) });
+  await touch.selectText(wordsIn(row), null, "the first");
+  await touch.selectText(wordsIn(row), null, "the first message");
+  assert.equal(touch.selection.reads, 2, "after a touch the words were not read as they changed");
+  await touch.clearSelection();
+  await replyButton(row).click();
+  assert.equal(touch.el("reply-text").value, "> the first message\n\n", "the tap did not quote the last words selected");
 });

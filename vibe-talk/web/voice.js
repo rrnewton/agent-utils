@@ -20944,18 +20944,40 @@ function labelReplyButton(button, count) {
  * A row's Reply as it stands: how many replies it has (`labelReplyButton`), and whether a press now
  * quotes the text selected in its message, as "Quote reply" (`#267 quote-reply`). Writes only what
  * changed.
+ *
+ * `#267 quote-reply`. QUOTE REPLY NEVER MOVES THE MESSAGE'S WORDS. It is wider than Reply, and where
+ * the header line has no room left for that it would wrap, and the words under it would drop a line
+ * at the very moment the reader starts selecting them, under their finger on a phone. So the full
+ * label is tried once, as the selection begins (`quoteLabelFits`), and kept only where nothing on the
+ * header line moved; anywhere else the button keeps the width it had as Reply and reads "Quote", in
+ * the same accent, its name still "Quote reply".
  */
 function drawReplyLabel(button) {
   const count = Number(button.replyCount) || 0;
   const quoting = quoteHeld !== null && quoteHeld.button === button;
-  const word = quoting ? "Quote reply" : "Reply";
-  const counted = quoting ? `Quote reply (${count})` : `Reply (${count})`;
-  const text = count > 0 ? counted : word;
-  if (button.textContent !== text) button.textContent = text;
-  if (quoting !== button.hasAttribute("data-quote")) {
-    if (quoting) button.setAttribute("data-quote", "true");
-    else button.removeAttribute("data-quote");
+  const counted = (word) => (count > 0 ? `${word} (${count})` : word);
+  const plain = count > 0 ? `Reply (${count})` : "Reply";
+  let short = false;
+  if (quoting) {
+    const full = counted("Quote reply");
+    if (button.quoteFor !== full) {
+      button.quoteFor = full;
+      button.quoteShort = !quoteLabelFits(button, plain, full);
+    }
+    short = button.quoteShort === true;
+  } else {
+    button.quoteFor = undefined;
   }
+  const word = quoting ? "Quote reply" : "Reply";
+  const text = quoting ? counted(short ? "Quote" : word) : plain;
+  if (button.textContent !== text) button.textContent = text;
+  const state = quoting ? (short ? "short" : "true") : null;
+  if (button.getAttribute("data-quote") !== state) {
+    if (state === null) button.removeAttribute("data-quote");
+    else button.setAttribute("data-quote", state);
+  }
+  const width = short ? String(button.quoteWidth || "") : "";
+  if ((button.style.width || "") !== width) button.style.width = width;
   const lead = quoting ? QUOTE_REPLY_TITLE : REPLY_BUTTON_TITLE;
   if (count > 0) {
     const name = `${word}, ${countOf(count)} already`;
@@ -20964,8 +20986,49 @@ function drawReplyLabel(button) {
     if (button.getAttribute("title") !== title) button.setAttribute("title", title);
     return;
   }
-  if (button.hasAttribute("aria-label")) button.removeAttribute("aria-label");
+  // Named by its words, except where they are cut to "Quote": its name is still all of it.
+  if (short) {
+    if (button.getAttribute("aria-label") !== word) button.setAttribute("aria-label", word);
+  } else if (button.hasAttribute("aria-label")) {
+    button.removeAttribute("aria-label");
+  }
   if (button.getAttribute("title") !== lead) button.setAttribute("title", lead);
+}
+
+/**
+ * Where everything on a row's header line stands: the line's height, and the top of each thing on it
+ * measured from the line's own top. Empty where the engine lays nothing out.
+ */
+function headerLayout(meta) {
+  if (!meta || typeof meta.getBoundingClientRect !== "function") return [];
+  const line = meta.getBoundingClientRect();
+  const kids = meta.children || [];
+  const tops = [];
+  for (let at = 0; at < kids.length; at += 1) {
+    const kid = kids[at];
+    if (typeof kid.getBoundingClientRect === "function") tops.push(kid.getBoundingClientRect().top - line.top);
+  }
+  return [line.height, ...tops];
+}
+
+/**
+ * `#267 quote-reply`. Whether `button` can read `full` without moving anything on its row's header
+ * line from where it stands as `plain`: drawn both ways in one go, which the reader never sees, and
+ * measured. Leaves the button as `full`, and its width as `plain` in `quoteWidth`, for
+ * `drawReplyLabel` to finish.
+ */
+function quoteLabelFits(button, plain, full) {
+  const meta = button.parentNode;
+  if (!meta || typeof button.getBoundingClientRect !== "function") return true;
+  button.removeAttribute("data-quote");
+  button.style.width = "";
+  button.textContent = plain;
+  const before = headerLayout(meta);
+  button.quoteWidth = `${button.getBoundingClientRect().width}px`;
+  button.setAttribute("data-quote", "true");
+  button.textContent = full;
+  const after = headerLayout(meta);
+  return before.length === after.length && before.every((value, at) => Math.abs(value - after[at]) <= 0.5);
 }
 
 /**
@@ -26303,10 +26366,13 @@ function renderDraftMarkers() {
 //
 //   * WHAT IS QUOTED: text selected inside ONE message's drawn body. Not a selection across two rows,
 //     nor one reaching into the row's header line or its buttons, a message box, or the page's own
-//     controls: those leave every Reply as it was.
+//     controls: those leave every Reply as it was. A range that runs past the body without taking in
+//     a word drawn outside it is the body's, as a triple-click leaves one (`rowQuotedBy`).
 //   * THE BUTTON SAYS WHAT A PRESS DOES. While there is such a selection, that row's Reply reads
 //     "Quote reply" ("Quote reply (2)" where it counts replies), in the accent. The label and the press
-//     read one record, `quoteHeld`, so they cannot disagree.
+//     read one record, `quoteHeld`, so they cannot disagree. It never moves the message's words: where
+//     the header line has no room for the longer label it reads "Quote" at Reply's width instead
+//     (`drawReplyLabel`).
 //   * NO NEW WAY TO POST. The press opens the reply screen Reply opens, routed as Reply routes on that
 //     provider (`replyRoute`): a reply by pointer where the provider has one, and on Slack, which has
 //     none, the message's thread. Only the box's first lines differ.
@@ -26337,40 +26403,131 @@ const QUOTE_HOLD_MS = 2000;
 const QUOTE_REPLY_TITLE = "Reply to this message, starting with the words you selected in it quoted";
 
 /**
- * The selection a press of its row's Reply quotes, or null: the row, its Reply, the text, and the
- * timer that lets it go when a touch has taken the selection away.
+ * The selection a press of its row's Reply quotes, or null: the row, its Reply, the words as drawn
+ * where they have been read (after a touch; null after the mouse or the keys, which read them when
+ * Reply is pressed), and the timer that lets it go when a touch has taken the selection away.
  *
- * @type {{row: any, button: any, text: string, timer: any} | null}
+ * @type {{row: any, button: any, text: string | null, timer: any} | null}
  */
 let quoteHeld = null;
 
+/** The row `node` is in, while that row is on a list and has a Reply; else null. */
+function replyRowOf(node) {
+  for (let at = node; at; at = at.parentNode) {
+    if (at.replyButton) return at.parentNode ? at : null;
+  }
+  return null;
+}
+
 /** The row whose drawn body holds `node`, while that row is on a list and has a Reply; else null. */
 function quotableRow(node) {
-  let row = null;
-  for (let at = node; at && !row; at = at.parentNode) {
-    if (at.replyButton) row = at;
-  }
-  if (!row || !row.parentNode) return null;
-  const body = childByClass(row, "body");
+  const row = replyRowOf(node);
+  const body = row ? childByClass(row, "body") : null;
   return body && nodeWithin(body, node) ? row : null;
 }
 
+/** How many nodes `drawnWordsBetween` walks before it takes the stretch for one with words in it. */
+const QUOTE_EDGE_NODES = 400;
+
 /**
- * What is selected on the page, for Quote reply: `found`, the row and the text where every range of
- * the selection lies in that one row's body and holds more than spaces; `stray`, whether something
- * else is selected. Neither, where nothing is.
+ * Whether the page draws any words between two points of the document, each a node and an offset as
+ * a range's ends are, the first not after the second: text that is more than spaces, outside every
+ * `hidden` element, in an element the engine gives a box (where it can say). Walked by hand, as
+ * `nodeWithin` is, and given up as worded after `QUOTE_EDGE_NODES`. `#267 quote-reply`.
+ */
+function drawnWordsBetween(from, fromOffset, to, toOffset) {
+  const kids = (node) => node.childNodes || [];
+  const leaf = (node) => kids(node).length === 0;
+  const textOf = (node) => (node.nodeType === 3 || node.nodeType === 1 ? String(node.textContent || "") : "");
+  const after = (node) => {
+    for (let at = node; at; at = at.parentNode) {
+      if (at.nextSibling) return at.nextSibling;
+    }
+    return null;
+  };
+  const worded = (node, text) => {
+    if (!/\S/.test(text)) return false;
+    const box = node.nodeType === 3 ? node.parentNode : node;
+    return !box || typeof box.getClientRects !== "function" || box.getClientRects().length > 0;
+  };
+  const stop = leaf(to) ? to : kids(to)[toOffset] || after(to);
+  let at = null;
+  if (leaf(from)) {
+    if (from === stop) return worded(from, textOf(from).slice(fromOffset, toOffset));
+    if (worded(from, textOf(from).slice(fromOffset))) return true;
+    at = after(from);
+  } else {
+    at = kids(from)[fromOffset] || after(from);
+  }
+  for (let walked = 0; at; walked += 1) {
+    if (walked > QUOTE_EDGE_NODES) return true;
+    if (at === stop) return leaf(to) && worded(at, textOf(at).slice(0, toOffset));
+    if (at.hidden === true) {
+      if (nodeWithin(at, stop)) return false;
+      at = after(at);
+    } else if (leaf(at)) {
+      if (worded(at, textOf(at))) return true;
+      at = after(at);
+    } else {
+      at = at.firstChild;
+    }
+  }
+  return false;
+}
+
+/**
+ * The row one range of the selection quotes from, or null: the row whose drawn body holds all of it,
+ * or holds one end of it where what lies between the body and the other end has no words drawn.
+ *
+ * That second case is a TRIPLE-CLICK. Chromium selects the paragraph and the break after it, and
+ * where the paragraph is the last of its message it says so by ending the range at the very start of
+ * the next row: the range's common ancestor is the list, as a selection across two rows would have
+ * it, while nothing of the next row is selected or drawn as selected. A drag that runs on into the
+ * row's own padding ends in the same way. A selection that really takes in the next row's time or
+ * name, or this row's own header line, does have words there, and is not a quote.
+ */
+function rowQuotedBy(range) {
+  const whole = quotableRow(range.commonAncestorContainer);
+  if (whole) return whole;
+  const first = range.startContainer ? quotableRow(range.startContainer) : null;
+  const last = range.endContainer ? quotableRow(range.endContainer) : null;
+  if (first && !last) {
+    const body = childByClass(first, "body");
+    const end = (body.childNodes || []).length || String(body.textContent || "").length;
+    return drawnWordsBetween(body, end, range.endContainer, range.endOffset) ? null : first;
+  }
+  if (last && !first) {
+    const body = childByClass(last, "body");
+    return drawnWordsBetween(range.startContainer, range.startOffset, body, 0) ? null : last;
+  }
+  return null;
+}
+
+/**
+ * What is selected on the page, for Quote reply: `found`, the row where every range of the selection
+ * is that one row's (`rowQuotedBy`) and holds more than spaces, with its words as drawn after a touch;
+ * `stray`, whether something else is selected. Neither, where nothing is.
+ *
+ * Every `selectionchange` asks, which is every move of the mouse in a drag. So the words are told from
+ * spaces by each range's own text, which reads no layout, and the words as drawn, which bring the
+ * layout up to date first, are read here only after a touch: a phone may take the selection away
+ * before its tap on Reply arrives. After the mouse or the keys they are read once, when Reply is
+ * pressed (`takeQuote`).
  */
 function quotableSelection() {
   const selection = typeof getSelection === "function" ? getSelection() : null;
   if (!selection || selection.isCollapsed || !(selection.rangeCount > 0)) return { found: null, stray: false };
   let row = null;
+  let words = false;
   for (let at = 0; at < selection.rangeCount; at += 1) {
-    const own = quotableRow(selection.getRangeAt(at).commonAncestorContainer);
+    const range = selection.getRangeAt(at);
+    const own = rowQuotedBy(range);
     if (!own || (row !== null && own !== row)) return { found: null, stray: true };
     row = own;
+    words = words || /\S/.test(String(range));
   }
-  const text = String(selection);
-  return text.trim() ? { found: { row, text }, stray: false } : { found: null, stray: true };
+  if (!words) return { found: null, stray: true };
+  return { found: { row, text: inputKind === "touch" ? String(selection) : null }, stray: false };
 }
 
 /** Hold `next` as the selection to quote, or nothing, and redraw the Reply of each row it changes. */
@@ -26387,8 +26544,10 @@ function holdQuote(next) {
 function noteQuoteSelection() {
   const { found, stray } = quotableSelection();
   if (found) {
-    if (!quoteHeld || quoteHeld.row !== found.row || quoteHeld.text !== found.text || quoteHeld.timer !== null) {
+    if (!quoteHeld || quoteHeld.row !== found.row || quoteHeld.timer !== null) {
       holdQuote({ row: found.row, button: found.row.replyButton, text: found.text, timer: null });
+    } else {
+      quoteHeld.text = found.text;
     }
   } else if (quoteHeld && (stray || inputKind !== "touch")) {
     holdQuote(null);
@@ -26398,15 +26557,16 @@ function noteQuoteSelection() {
 }
 
 /**
- * What a press of `button` quotes: the selection held for its row, taken and cleared from the page,
- * or "" for a plain Reply.
+ * What a press of `button` quotes, or "" for a plain Reply: the words as drawn of the selection held
+ * for its row, read now where they are still selected, else as a touch last read them; taken, and
+ * cleared from the page.
  */
 function takeQuote(button) {
   noteQuoteSelection();
   if (!quoteHeld || quoteHeld.button !== button) return "";
-  const { text } = quoteHeld;
-  holdQuote(null);
   const selection = typeof getSelection === "function" ? getSelection() : null;
+  const text = quoteHeld.timer === null && selection ? String(selection) : quoteHeld.text || "";
+  holdQuote(null);
   if (selection && typeof selection.removeAllRanges === "function") selection.removeAllRanges();
   return text;
 }
