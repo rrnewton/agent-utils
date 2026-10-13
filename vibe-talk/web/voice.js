@@ -812,6 +812,22 @@ const outgoingJobs = new Map();
 const outgoingRetries = new Map();
 let outgoingSequence = 0;
 let outgoingStorageOkay = true;
+/**
+ * `#277 reply-in-column`. Replies sent from a column, by outbox id, and the column each was sent from:
+ * every attempt at one that settles is told (`reportColumnReply`) until it is sent or leaves the
+ * outbox. For this page only: a reload shows the outbox as it is, with nothing to tell.
+ *
+ * @type {Map<string, typeof activeColumn>}
+ */
+const columnReplies = new Map();
+/**
+ * `#277 reply-in-column`. By column, the outbox id of a reply sent from it that did not go, while the
+ * reader has not been down to the foot of that column, where its row is, since they were told: what
+ * the column's Newest chip says (`unseenColumnReply`).
+ *
+ * @type {{main: string | null, side: string | null}}
+ */
+const unseenColumnReplies = { main: null, side: null };
 
 // `#193 compose-draft-loss`. A send dismissed from the outbox, kept for Undo and then for a while
 // longer. See "taking a send back".
@@ -2402,6 +2418,7 @@ const JUMP_COUNT_MAX = 99;
 function renderJumpNewest() {
   const button = el("jump-newest");
   let shown = false;
+  let unsent = null;
   // Only over a list on screen. Anywhere else #scroll-area is hidden and measures nothing at all,
   // and taking that zero for "at the newest" would forget where the list was left.
   if (currentScreen === "main") {
@@ -2412,6 +2429,9 @@ function renderJumpNewest() {
       // to, and nothing that arrived is still unseen.
       inScrollback[currentView] = false;
       jumpNewestWanted[currentView] = false;
+      // ...nor a reply that did not go, whose outbox row is down here (`#277 reply-in-column`). Only
+      // from a list with a height: a column not drawn is at no foot.
+      if ((area.clientHeight || 0) > 0 && currentView === "discord") unseenColumnReplies[activeColumn.name] = null;
     } else if (gap > SCROLLBACK_PX) {
       inScrollback[currentView] = true;
     }
@@ -2419,21 +2439,32 @@ function renderJumpNewest() {
     // it is hidden, so there is no newest message to go to: the jump would only take the reader past
     // the sentence saying why to the composer under it, which `placeFilterAnchor` scrolled them up from.
     shown = !listEmptied() && (inScrollback[currentView] || jumpNewestWanted[currentView] !== false);
+    // `#277 reply-in-column`. A reply sent from this column that did not go raises it too, over the same
+    // lists: the way down is the way to its Retry.
+    if (currentView === "discord") unsent = unseenColumnReply();
+    if (unsent !== null && !shown) shown = !listEmptied();
   }
   // The arrival changes what the ONE control says, rather than raising a second one beside it.
   const arrived = jumpNewestWanted[currentView];
   const count = typeof arrived === "number" && arrived > 0 ? arrived : 0;
   const many = count > JUMP_COUNT_MAX ? `${JUMP_COUNT_MAX}+` : String(count);
-  const label = arrived === false ? "Newest" : count ? `${many} new` : "New";
-  const name = arrived === false
-    ? "Jump to the newest message"
-    : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
+  // `#277 reply-in-column`. So does a reply sent from this column that did not go, before anything
+  // else: the way down is the way to its Retry. In the orange of the outbox row it leads to.
+  const failed = unsent !== null && unsent.state === "failed";
+  const label = unsent !== null ? (failed ? "Reply not sent" : "Reply unconfirmed")
+    : arrived === false ? "Newest" : count ? `${many} new` : "New";
+  const name = unsent !== null
+    ? `Jump to your reply, which ${failed ? "was not sent" : "may not have been posted"}, at the foot of the list`
+    : arrived === false
+      ? "Jump to the newest message"
+      : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
   if (button.hidden === shown) button.hidden = !shown;
   if (el("jump-newest-label").textContent !== label) el("jump-newest-label").textContent = label;
   if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
   if (button.hasAttribute("data-arrivals") === (arrived === false)) {
     button.toggleAttribute("data-arrivals", arrived !== false);
   }
+  if (button.hasAttribute("data-unsent") !== (unsent !== null)) button.toggleAttribute("data-unsent", unsent !== null);
   // `#240 reading-bookmark`. The chip beside it, on the same occasions: every scroll, restore and
   // screen change asks this one.
   renderJumpBookmark();
@@ -7404,11 +7435,17 @@ function replyOnScreen() {
   return currentScreen === "reply" || (replyDocked && currentScreen === "main");
 }
 
-/** Where Back goes from the screen that is up, taken; false when there is no Back to take. */
+/**
+ * Where Back goes from the screen that is up, taken; false when there is no Back to take.
+ *
+ * `#277 reply-in-column`. A reply open in a column is that column's Back, not the other's: Escape on
+ * the other column's list does there what it does with no reply open, and leaves the reply, out of
+ * sight of the keys, as it is. Escape runs in the column of the keys (`paneColumn`).
+ */
 function goBack() {
   if (currentScreen === "settings") closeSettings();
   else if (currentScreen === "help") closeHelp();
-  else if (replyOnScreen()) closeReply();
+  else if (replyOnScreen() && (currentScreen === "reply" || activeColumn === replyColumn)) closeReply();
   else if (currentScreen === "threads") closeThreadDirectory();
   else if (channelOnScreen() && channelView === "thread") leaveThread();
   else return false;
@@ -18046,7 +18083,15 @@ function answeredThread(message) {
   return thread && message.thread.is_root !== true ? thread : null;
 }
 
-function queueOutgoingMessage(request) {
+/**
+ * Put `request` in the outbox and send it. `column` is given for a reply sent from a column, which
+ * the reader is not shown the outbox row of when it goes, and so is told how it went
+ * (`reportColumnReply`, `#277 reply-in-column`). Never saved: a reload shows the outbox as it is.
+ *
+ * @param {any} request
+ * @param {typeof activeColumn | null} [column]
+ */
+function queueOutgoingMessage(request, column = null) {
   let id;
   do {
     id = `outgoing-${Date.now().toString(36)}-${++outgoingSequence}-${Math.random().toString(36).slice(2, 9)}`;
@@ -18058,6 +18103,7 @@ function queueOutgoingMessage(request) {
     continueIn: null,
   };
   outgoingMessages.set(id, entry);
+  if (column) columnReplies.set(id, column);
   return scheduleOutgoingMessage(entry);
 }
 
@@ -18336,6 +18382,9 @@ async function dispatchOutgoingMessage(entry, job, placing = null) {
     if (transient && !job.stopped) planOutgoingRetry(entry);
     persistOutgoingMessages();
     eachColumn(renderChannelRows);
+    // `#277 reply-in-column`. After the rows, the outbox's among them: what is said points at one. Not
+    // for a send that signing out stopped, which is the sign-in screen's to explain.
+    if (columnReplies.has(entry.id) && !job.stopped) reportColumnReply(entry);
   }
 }
 
@@ -28393,7 +28442,7 @@ async function sendReply() {
     channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
-  });
+  }, replyDocked ? replyColumn : null);
   drafts.delete(String(target.id));
   draftStartsThread.delete(String(target.id));
   if (outgoingStorageOkay) persistDrafts();
@@ -28409,7 +28458,9 @@ async function sendReply() {
   replyScrollMark = null;
   // `#277 reply-in-column`. Sent from a column, the column goes back to where it was, as on Cancel: the
   // reply is posted at the foot of its list, which a reader there follows, and the message answered
-  // turns Done where it stands (`markAnsweredDone`), which says the reply went.
+  // turns Done where it stands (`markAnsweredDone`), which says the reply went. A reply that does not
+  // go says so where the reader is, the outbox row that offers Retry being down at that foot
+  // (`reportColumnReply`).
   if (replyDocked) {
     leaveDockedReply(mark, true);
     await completion;
@@ -28447,10 +28498,18 @@ async function sendReply() {
 //     was pressed (`captureScroll`, the anchor the reply screen comes back to), and the keys to its list.
 //     A column that changes under it — another channel, thread or view — puts it away, its words kept as
 //     a draft, which the row's Draft opens again.
+//   * A REPLY THAT DOES NOT GO SAYS SO WHERE THE READER IS. The reply screen's Send lands on the newest
+//     message, where the outbox row of a send that failed offers Retry; Send from a column stays where
+//     the reader was, and that row is down at the column's foot, unseen. So the status line says it
+//     (aloud too: it is a polite live region), and the column's Newest chip reads "Reply not sent" in
+//     the outbox's own orange until the reader has been down to it (`reportColumnReply`).
 //   * ONE COLUMN IS THE REPLY SCREEN, as it was: on a phone the box under a list is what the keyboard
 //     covers (`#51 reply-view`), and the one-column desk keeps the screen `#247 reply-continuity` made.
 //     Two columns that go while a reply is open in one — the window narrowed, the layout button — hand
-//     it to the reply screen, words and all (`moveReplyToScreen`).
+//     it to the reply screen, words and all (`moveReplyToScreen`). Not the other way: a window widened
+//     under the reply screen leaves the reply there, the screen the reader is writing on, and two
+//     columns come back when it closes. Two columns are decided only on the main screen
+//     (`renderColumns`), and moving a box from under the reader's hands is the disruption this avoids.
 
 /** The keys' list of `column`: the left column's, or the right one's. */
 const columnPane = (column) => (column === columns.side ? sidePane : channelPane);
@@ -28513,6 +28572,10 @@ function leaveDockedReply(mark, refocus) {
  * column): the reply screen takes it, words, quote, route and all, as one column opens Reply. The
  * message is placed as one opened with no row to measure, and the place to come back to is the left
  * column's as it is now, the one list there is. `typing`: the box had the focus, and has it again.
+ *
+ * Only ever from the main screen: two columns are decided there and nowhere else (`renderColumns`), so
+ * a window narrowed behind Settings or Help changes nothing until the reader is back, and showing the
+ * reply screen here never takes them from another.
  *
  * @param {boolean} typing
  */
@@ -28578,6 +28641,65 @@ function placeToolsOverReply() {
   const room = mount.hidden ? 0 : Math.max(0, Math.round(side.getBoundingClientRect().bottom - mount.getBoundingClientRect().top));
   const value = `${room}px`;
   if (side.style.getPropertyValue("--side-reply-room") !== value) side.style.setProperty("--side-reply-room", value);
+}
+
+/**
+ * An attempt at a reply sent from a column has settled (`dispatchOutgoingMessage`). Sent: nothing to
+ * say, the row it answers turning Done says it. Not sent: the status line says so, and where the row
+ * with Retry is, and the column's Newest chip says "Reply not sent" until the reader gets there. Held
+ * for a retry the page makes itself, offline or after a provider's blip: the status line says it will
+ * go again, and the chip waits for how that ends. `#277 reply-in-column`.
+ *
+ * @param {any} entry
+ */
+function reportColumnReply(entry) {
+  const column = columnReplies.get(entry.id);
+  // Those dismissed, or taken back into a box by Edit, since: nothing more to tell of them.
+  for (const id of [...columnReplies.keys()]) if (!outgoingMessages.has(id)) columnReplies.delete(id);
+  if (!column || entry.state === "sending") return;
+  if (entry.state === "sent") {
+    columnReplies.delete(entry.id);
+    return;
+  }
+  const waiting = outgoingRetries.get(entry.id);
+  if (waiting) {
+    setStatus(waiting.offline
+      ? "Your reply is not sent yet: this device is offline. It goes when the connection is back."
+      : "Your reply is not sent yet. The page tries again in a moment.");
+    return;
+  }
+  // Where the row is: in the column it was sent from while that column shows where it went.
+  const named = columnsShown ? (column === columns.side ? "the right column" : "the left column") : "the list";
+  const drawn = (column === columns.main || sideShowing()) && inColumn(column, () => outboxRow(entry.id) !== null);
+  const where = drawn ? `at the foot of ${named}` : "with it where it was sent";
+  setStatus(entry.state === "failed"
+    ? `Your reply was not sent. Retry is ${where}.`
+    : `Your reply may not have been posted. Check it ${where}.`);
+  unseenColumnReplies[column.name] = entry.id;
+  if (drawn) inColumn(column, renderJumpNewest);
+}
+
+/** The outbox row of entry `id` in the column being worked on, while it is drawn there; else null. */
+function outboxRow(id) {
+  const host = el("outgoing-log");
+  if (host.hidden) return null;
+  return /** @type {HTMLElement | undefined} */ ([...host.children].find((row) => row.getAttribute("data-outgoing-id") === id)) || null;
+}
+
+/**
+ * The reply sent from the column being worked on that did not go, while its outbox row is drawn in
+ * this column and the reader has not been down to it since they were told: the entry, or null. One
+ * sent since, Retried, or dismissed is let go.
+ */
+function unseenColumnReply() {
+  const id = unseenColumnReplies[activeColumn.name];
+  if (id === null) return null;
+  const entry = outgoingMessages.get(id);
+  if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed") || outgoingRetries.has(id)) {
+    unseenColumnReplies[activeColumn.name] = null;
+    return null;
+  }
+  return outboxRow(id) ? entry : null;
 }
 
 // --- a reply that is sent marks what it answers Done ---------------------------------------------

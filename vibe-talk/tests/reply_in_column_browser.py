@@ -26,9 +26,20 @@ over with the mouse, so Reply reads "Quote reply") in EACH column:
 
 Then a message low in the left column, which the box would cover: the column moves up by as little as
 shows it above the box and its chips, never taking its top under the column's, and Cancel puts it back
-to the pixel. Then a reply open in the right column when the window is narrowed to one column: the
-reply screen takes it, words and all. Then one column at the desk's width: Reply is the reply screen, as
-it was. No page error and no sideways scroll at any step.
+to the pixel. Then the box dragged far taller than the window: it stops at a quarter of the window, and
+the list over it keeps its height. Then a reply open in the right column when the window is narrowed to
+one column: the reply screen takes it, words and all.
+
+Then the service refusing a reply sent from each column, as a chat service that is down does: the
+column still goes back to where it was, and the failure is ON SCREEN — the status line, a polite live
+region, says the reply did not go and where its Retry is, and the column's own Newest chip, inside the
+column, reads "Reply not sent" or "Reply unconfirmed" in the orange of the outbox row's words. Pressing
+it brings that row, with Retry, into view in the column, and the chip says Newest again. (Before this
+step, the reply screen's Send landing on the newest message was what showed such a row; Send from a
+column stays put, and the row sat unseen at the column's foot with nothing said.)
+
+Then one column at the desk's width: Reply is the reply screen, as it was. No page error and no sideways
+scroll at any step.
 
 Pass --screenshots DIR to keep a PNG of each open reply for review; --web-root DIR to run the same walk
 against another copy of the page.
@@ -63,6 +74,12 @@ RUNS = (
 )
 # The message put low in the left column, where the box would cover it.
 LOW = "220"
+# The replies the service refuses: (column, message, its answer, what the column's chip then says). A
+# chat service that is down (503: the reply may have gone, unconfirmed), and one that says no (422).
+REFUSALS: tuple[tuple[str, tuple[str, tuple[int, Json]], str], ...] = (
+    ("left", ("205", (503, {"error": "upstream_unavailable", "detail": "chat service down"})), "Reply unconfirmed"),
+    ("right", ("208", (422, {"error": "chat_error", "detail": "Google Chat returned HTTP 400"})), "Reply not sent"),
+)
 # Where a pressed row's top is put, below the top of its column's list, in px.
 ROW_OFFSET_PX = 90
 # The words a drag selects in a message, from its first character.
@@ -77,10 +94,17 @@ class ReplyColumnsApi(ColumnsApi):
         super().__init__()
         self.replies: list[Json] = []
         self.dismissed: set[str] = set()
+        # While set, a reply is refused with this answer, as a chat service that is down refuses one, and
+        # kept apart from those posted.
+        self.refusing: tuple[int, Json] | None = None
+        self.refused: list[Json] = []
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
         if path.endswith("/reply"):
             with self.lock:
+                if self.refusing is not None:
+                    self.refused.append(body)
+                    return self.refusing
                 self.replies.append(body)
                 thread_id = body.get("thread_id")
                 root = next((m for m in self.messages if thread_id and thread_of(m).get("id") == thread_id
@@ -264,7 +288,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             for column, how, close, message_id in RUNS:
                 reply_run(desk, api, column, how, close, message_id)
             low_run(desk)
+            tall_box_run(desk)
             narrowed_run(desk)
+            for column, refusal, said in REFUSALS:
+                refused_run(desk, api, column, refusal, said)
             one_column_run(desk)
             check(not errors, f"the page threw: {errors}")
             context.close()
@@ -508,6 +535,140 @@ def low_run(desk: Desk) -> None:
     desk.check(abs(after.num("leftScroll") - before.num("leftScroll")) <= 1 and abs(after.box("row")["top"] - row_before["top"]) <= 1,
                f"low: Cancel did not put the column back: {before.num('leftScroll'):.0f} -> {after.num('leftScroll'):.0f}")
     desk.notes.append(f"a message low on the left moved up {moved:.0f}px of the {needed:.0f}px the box covered, and back on Cancel")
+
+
+def tall_box_run(desk: Desk) -> None:
+    """The box dragged far taller than the window, as its resize handle does: the list keeps its room."""
+    page = desk.page
+    place_row(desk, "right", "206", top=ROW_OFFSET_PX)
+    button = reply_button(desk, "right", "206")
+    page.mouse.click(button["x"], button["y"])
+    desk.wait_for("() => document.querySelector('.reply-compose').parentElement.id === 'side-reply'",
+                  "tall box: the box did not open in the right column")
+    # What dragging the handle down past the window's foot leaves: an inline height far over the window.
+    page.evaluate("() => { document.getElementById('reply-text').style.height = '2000px'; }")
+    desk.settled()
+    now = measure(desk, "right", "206")
+    text = page.evaluate("() => document.getElementById('reply-text').getBoundingClientRect().height")
+    desk.shot("right-tall-box")
+    cap = HEIGHT / 4
+    desk.check(float(text) <= cap + 1, f"tall box: the box was dragged to {float(text):.0f}px, over a quarter of the window ({cap:.0f}px)")
+    desk.check(now.box("right")["height"] >= 200, f"tall box: the list over the box is only {now.box('right')['height']:.0f}px tall")
+    compose, dock = now.box("compose"), now.box("dock")
+    desk.check(compose["bottom"] <= dock["top"] + 0.5, f"tall box: the box runs under the dock: {compose} {dock}")
+    page.evaluate("() => { document.getElementById('reply-text').style.height = ''; }")
+    page.click("#reply-cancel")
+    desk.wait_for("() => document.querySelector('.reply-compose').parentElement.id === 'screen-reply'",
+                  "tall box: Cancel left the box in the column")
+    desk.settled()
+    desk.notes.append(f"the box dragged to 2000px stopped at {float(text):.0f}px, a {now.box('right')['height']:.0f}px list over it")
+
+
+# What the walk reads after a refused reply: the status line, the column's chip, the outbox row the chip
+# leads to and whether it is inside the column's list as drawn, and the colours of the chip and the row.
+REFUSED_JS = """([column, text]) => {
+    const box = (node) => {
+        if (!node || !node.getClientRects().length) return null;
+        const r = node.getBoundingClientRect();
+        return {left: r.left, right: r.right, top: r.top, bottom: r.bottom};
+    };
+    const line = document.getElementById('status-line');
+    const said = document.getElementById('status');
+    const jump = document.getElementById(column === 'left' ? 'jump-newest' : 'side-jump-newest');
+    const area = document.getElementById(column === 'left' ? 'scroll-area' : 'side-scroll');
+    const host = document.getElementById(column === 'left' ? 'outgoing-log' : 'side-outgoing-log');
+    const row = [...host.children].find((li) => li.textContent.includes(text)) || null;
+    const a = area.getBoundingClientRect();
+    const r = row && row.getClientRects().length ? row.getBoundingClientRect() : null;
+    const retry = row ? row.querySelector('.outgoing-retry') : null;
+    return {
+        line: line.hidden ? null : box(line), status: said.textContent, live: said.getAttribute('aria-live'),
+        role: said.getAttribute('role'),
+        jump: jump.hidden ? null : box(jump), jumpText: jump.textContent.trim(), jumpName: jump.getAttribute('aria-label') || '',
+        jumpColour: getComputedStyle(jump).color,
+        column: box(column === 'left' ? area : document.getElementById('side-column')),
+        rowColour: row ? getComputedStyle(row.querySelector('.outgoing-status')).color : '',
+        retry: Boolean(retry && retry.getClientRects().length),
+        rowInView: Boolean(r && r.top >= a.top - 0.5 && r.bottom <= a.top + area.clientHeight + 0.5),
+        scroll: area.scrollTop,
+        window: {width: innerWidth, height: innerHeight},
+    };
+}"""
+
+
+def refused_run(desk: Desk, api: ReplyColumnsApi, column: str, refusal: tuple[str, tuple[int, Json]], said: str) -> None:
+    """The service refuses a reply sent from `column`: the column goes back where it was, and the
+    failure is on screen and spoken, with a way down to its Retry. `#195 send-resilience`'s outbox row is
+    what offers Retry; it is the one thing this step leads to rather than checks."""
+    page = desk.page
+    message_id, answer = refusal
+    where = f"refused {column}"
+    words = f"this one will not go ({column})"
+    place_row(desk, column, message_id, top=ROW_OFFSET_PX)
+    before = measure(desk, column, message_id)
+    refused_before = len(api.refused)
+    api.refusing = answer
+    try:
+        button = reply_button(desk, column, message_id)
+        page.mouse.click(button["x"], button["y"])
+        mount = "column-reply" if column == "left" else "side-reply"
+        desk.wait_for(f"() => document.querySelector('.reply-compose').parentElement.id === '{mount}'",
+                      f"{where}: the box did not open in its column")
+        page.keyboard.type(words)
+        # Nothing said before the press, so what is said after it is about this reply.
+        page.evaluate("() => { document.getElementById('status').textContent = ''; }")
+        page.click("#reply-send")
+        desk.wait_for("() => /^Your reply /.test(document.getElementById('status').textContent)"
+                      " && !document.getElementById('status-line').hidden",
+                      f"{where}: nothing on screen said the reply did not go")
+    finally:
+        api.refusing = None
+    desk.settled()
+    desk.settled()
+    desk.check(len(api.refused) == refused_before + 1, f"{where}: the reply was asked {len(api.refused) - refused_before} times, not once")
+    found = page.evaluate(REFUSED_JS, [column, words])
+    assert isinstance(found, dict)
+    desk.shot(f"{column}-refused")
+    after = measure(desk, column, message_id)
+    # Where the reader was, as on every Send from a column.
+    desk.check(abs(after.num(f"{column}Scroll") - before.num(f"{column}Scroll")) <= 1,
+               f"{where}: the column did not go back where it was: {before.num(f'{column}Scroll'):.0f} -> {after.num(f'{column}Scroll'):.0f}")
+    desk.check(after.text("focusIn") == column, f"{where}: the keys are on {after.text('focus')}, not the column's list")
+    # Said: the status line, on screen, a polite live region, naming the column the Retry is in.
+    window = found["window"]
+    line = found["line"]
+    status = str(found["status"])
+    side = "left" if column == "left" else "right"
+    desk.check(isinstance(line, dict) and line["top"] >= 0 and line["bottom"] <= window["height"] and line["right"] <= window["width"],
+               f"{where}: the status line is not on screen: {line}")
+    desk.check(found["live"] == "polite" and found["role"] == "status", f"{where}: the status line is not announced ({found['role']}, {found['live']})")
+    desk.check(status.startswith("Your reply ") and f"the foot of the {side} column" in status,
+               f"{where}: the status line says {status!r}")
+    # Shown: the column's own chip, inside the column, saying why, in the outbox row's orange.
+    jump = found["jump"]
+    columns = found["column"]
+    desk.check(isinstance(jump, dict) and isinstance(columns, dict) and jump["left"] >= columns["left"] - 0.5
+               and jump["right"] <= columns["right"] + 0.5 and jump["bottom"] <= window["height"],
+               f"{where}: the column's chip is not on screen inside it: {jump} in {columns}")
+    desk.check(found["jumpText"] == said, f"{where}: the chip says {found['jumpText']!r}, not {said!r}")
+    desk.check(str(found["jumpName"]).startswith("Jump to your reply, which "), f"{where}: the chip is named {found['jumpName']!r}")
+    desk.check(found["jumpColour"] == found["rowColour"] and found["rowColour"] != "",
+               f"{where}: the chip is drawn in {found['jumpColour']}, not the outbox row's {found['rowColour']}")
+    desk.check(not found["rowInView"], f"{where}: the outbox row is in view already, so the chip proves nothing")
+    # Led: the chip brings the row with Retry into view in the column, and says Newest again.
+    page.click(f"#{'jump-newest' if column == 'left' else 'side-jump-newest'}")
+    desk.settled()
+    desk.settled()
+    down = page.evaluate(REFUSED_JS, [column, words])
+    assert isinstance(down, dict)
+    desk.shot(f"{column}-refused-down")
+    desk.check(down["rowInView"] and down["retry"], f"{where}: the chip did not bring the row with Retry into view")
+    desk.check(down["jump"] is None or down["jumpText"] in ("Newest", ""), f"{where}: down by the row, the chip still says {down['jumpText']!r}")
+    # Out of the outbox, so the walk after this one reads the columns as they were.
+    page.click(f"#{'outgoing-log' if column == 'left' else 'side-outgoing-log'} > li .outgoing-dismiss")
+    desk.wait_for(f"() => ![...document.getElementById('{'outgoing-log' if column == 'left' else 'side-outgoing-log'}').children]"
+                  f".some((li) => li.textContent.includes({words!r}))", f"{where}: Dismiss left the row")
+    desk.notes.append(f"{where}: said \"{status}\", the chip read {said!r}, and led to Retry")
 
 
 def narrowed_run(desk: Desk) -> None:

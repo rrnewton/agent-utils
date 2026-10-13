@@ -4560,8 +4560,21 @@ pressed, with the keys on its list. A column that changes under an open reply (a
 or view) puts it away as a draft. One column — a phone, or a desk with the layout button off — keeps
 the reply screen: on a phone a box under the list is what the on-screen keyboard covers, and the
 one-column desk keeps the continuity above. A window narrowed to one column while a reply is open in a
-column hands it to the reply screen, words and all. `make -C vibe-talk reply-in-column-browser`
-measures this in Chromium at 1280x800.
+column hands it to the reply screen, words and all. The other way round is left alone on purpose: a
+window widened while the reply screen is up keeps the reply there, the screen you are writing on, and
+two columns come back when it closes.
+
+Because Send from a column stays where you were, a reply that does not go would otherwise be
+invisible: its outbox row, with Retry, is down at the column's foot. So the status line says so — "Your
+reply was not sent. Retry is at the foot of the left column.", or "may not have been posted" where
+delivery is unconfirmed, and a screen reader hears it — and that column's Newest chip reads **Reply not
+sent** (or **Reply unconfirmed**) in the outbox's orange until you have been down to the row; pressing
+it takes you there. A reply the page will send again by itself (offline, or after a provider's blip
+where retrying cannot post twice) is said to be waiting, and the chip changes only if it finally
+fails. Esc on the other column's list acts on that column and leaves the reply alone. The box can be
+dragged taller only to a quarter of the window, so the list over it keeps its room.
+`make -C vibe-talk reply-in-column-browser` measures all of this in Chromium at 1280x800, a refused
+reply from each column included.
 
 ### Enter sends, in every message box, until you say otherwise
 

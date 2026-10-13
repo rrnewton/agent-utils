@@ -50599,7 +50599,7 @@ test("`#268 voice-call-drops`: every timer a healthy call arms, fired, never end
 // disruption. Reply in the right column or left column, whichever I clicked the reply button in. But
 // instead the whole screen got replaced with the reply interface." In two columns the reply screen's
 // own box opens at the foot of the column pressed in; one column keeps the reply screen.
-// tests/two_column_browser.py measures where it is drawn in a real browser.
+// tests/reply_in_column_browser.py measures where it is drawn in a real browser.
 
 /** Where the reply's box is: "left", "right", or "screen", its place on the reply screen. */
 const replyBoxAt = (page) => {
@@ -50817,4 +50817,134 @@ test("`#277 reply-in-column`: two columns going while a reply is open hand it to
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(replyBoxAt(page), "screen", "the call's view kept a reply open in a column");
+});
+
+/**
+ * Two columns as `replyColumnsPage` has them, each tall enough to stand part way up: Main with earlier
+ * messages over the announcement, and the first thread with more answers under its root.
+ */
+async function tallReplyColumnsPage(script = SCRIPT) {
+  const { page, data } = await twoColumnServer((_page, given) => {
+    const root = given.messages.find((one) => one.id === "201");
+    const answer = given.messages.find((one) => one.id === "202");
+    const earlier = Array.from({ length: 6 }, (_unused, at) =>
+      message({ id: `19${at}`, content: longMessage(`earlier ${at}`) }));
+    const more = Array.from({ length: 6 }, (_unused, at) =>
+      message({ id: `21${at}`, content: longMessage(`more ${at}`), thread: { ...answer.thread } }));
+    given.messages.unshift(...earlier);
+    given.messages.push(...more);
+    root.thread.reply_count = 1 + more.length;
+  }, script);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  return { page, data };
+}
+
+test("`#277 reply-in-column`: a reply sent from a column that does not go says so where the reader is — the status line, aloud, and that column's Newest chip reading Reply not sent until the reader has been down to the row with Retry", async () => {
+  const { page } = await tallReplyColumnsPage();
+  const left = page.el("scroll-area");
+  const right = page.el("side-scroll");
+  assert.ok(left.scrollHeight > left.clientHeight * 2 && right.scrollHeight > right.clientHeight * 2,
+    "the columns are too short to stand part way up, so this proves nothing");
+  assert.match(HTML_CODE, /<span id="status" role="status" aria-live="polite">/, "the status line is not a live region");
+  for (const [column, row, area, jump, label, answer, said] of [
+    ["left", () => rowWithId(page, "200"), left, "jump-newest", "jump-newest-label", errorResponse(422, "chat_error", "Google Chat returned HTTP 400"),
+      { chip: "Reply not sent", status: /^Your reply was not sent\. Retry is at the foot of the left column\.$/ }],
+    ["right", () => sideRow(page, "202"), right, "side-jump-newest", "side-jump-newest-label", errorResponse(502, "chat_error", "Google Chat returned HTTP 502"),
+      { chip: "Reply unconfirmed", status: /^Your reply may not have been posted\. Check it at the foot of the right column\.$/ }],
+  ]) {
+    area.scrollTop = 0;
+    await area.dispatch("scroll");
+    page.replyResponse = answer;
+    await replyButton(row()).click();
+    assert.equal(replyBoxAt(page), column);
+    await page.el("reply-text").setValue("this will not go");
+    await page.el("reply-send").click();
+    await page.settle();
+    assert.equal(replyBoxAt(page), "screen", `${column}: Send left the box in the column`);
+    assert.equal(area.scrollTop, 0, `${column}: the column did not go back to where it was`);
+    // Where the reader is: the status line, which a screen reader hears.
+    assert.equal(page.el("status-line").hidden, false, `${column}: the status line said nothing of the failure`);
+    assert.match(page.el("status").textContent, said.status, `${column}: the status line said the wrong thing`);
+    // The way down, saying why: the column's Newest chip, in the outbox's orange.
+    assert.equal(page.el(jump).hidden, false, `${column}: no way down to the reply that did not go`);
+    assert.equal(page.el(label).textContent, said.chip, `${column}: the chip does not say the reply did not go`);
+    assert.ok(page.el(jump).hasAttribute("data-unsent"), `${column}: the chip is not marked as a reply not sent`);
+    assert.match(page.el(jump).getAttribute("aria-label"), /^Jump to your reply, which (was not sent|may not have been posted)/);
+    const host = column === "left" ? page.el("outgoing-log") : page.el("side-outgoing-log");
+    const held = host.children.find((one) => one.descendants().some((node) => node.textContent === "this will not go"));
+    assert.ok(held && outgoingRetry(held), `${column}: no outbox row with Retry for the chip to lead to`);
+    // Down to it: the chip takes the reader to the foot, where the row is, and goes back to saying Newest.
+    await page.el(jump).click();
+    await page.settle();
+    assert.ok(atBottomOf(area), `${column}: the chip did not go down to the foot of the list`);
+    assert.equal(page.el(jump).hasAttribute("data-unsent"), false, `${column}: the chip still says the reply did not go, down by it`);
+    area.scrollTop = 0;
+    await area.dispatch("scroll");
+    assert.equal(page.el(label).textContent, "Newest", `${column}: once seen, the failure still holds the chip`);
+    page.replyResponse = undefined;
+  }
+
+  // THE CONTROL: nothing told. The walk above sees the status line and the chip only through it.
+  const { page: control } = await tallReplyColumnsPage(brokenScript(
+    "if (columnReplies.has(entry.id) && !job.stopped) reportColumnReply(entry);", ""));
+  const area = control.el("scroll-area");
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  control.replyResponse = errorResponse(422, "chat_error", "Google Chat returned HTTP 400");
+  await replyButton(rowWithId(control, "200")).click();
+  await control.el("reply-text").setValue("this will not go");
+  await control.el("reply-send").click();
+  await control.settle();
+  assert.doesNotMatch(control.el("status").textContent, /reply/i, "the control told the reader, so this test cannot tell");
+  assert.equal(control.el("jump-newest-label").textContent, "Newest");
+});
+
+test("`#277 reply-in-column`: a reply sent from a column that the page sends by itself later says it is waiting and leaves the chip alone; sent, nothing more is said of it", async () => {
+  const { page } = await tallReplyColumnsPage();
+  const left = page.el("scroll-area");
+  left.scrollTop = 0;
+  await left.dispatch("scroll");
+  await page.setOnline(false);
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("when the wifi is back");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /^Your reply is not sent yet: this device is offline\./,
+    "a reply held while offline was not said to be waiting");
+  assert.notEqual(page.el("jump-newest-label").textContent, "Reply not sent", "a reply that goes by itself was called not sent");
+  assert.equal(page.el("jump-newest").hasAttribute("data-unsent"), false);
+  page.el("status").textContent = "";
+  await page.setOnline(true);
+  await page.settle();
+  assert.equal(page.repliesPosted.at(-1).body.text, "when the wifi is back", "the held reply did not go when the device was online");
+  assert.doesNotMatch(page.el("status").textContent, /your reply/i, "a reply that went was reported as one that did not");
+  assert.equal(page.el("jump-newest").hasAttribute("data-unsent"), false);
+});
+
+test("`#277 reply-in-column`: Escape on the other column's list does what it does there, and leaves a reply open in the first as it is", async () => {
+  const { page } = await replyColumnsPage();
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("still writing on the left");
+  await press(page, page.el("reply-text"), "Escape");
+  await press(page, focused(page), "]");
+  assert.ok(nodeWithinFixture(page.el("side-scroll"), focused(page)), `] went to ${focusName(page)}, not the right column's list`);
+  await press(page, focused(page), "Escape");
+  assert.equal(replyBoxAt(page), "left", "Escape on the right column's list closed the reply open on the left");
+  assert.equal(page.el("reply-text").value, "still writing on the left");
+  await press(page, focused(page), "[");
+  await press(page, focused(page), "Escape");
+  assert.equal(replyBoxAt(page), "screen", "Escape on the reply's own column did not put it down");
+  assert.equal(draftMarkerOf(rowWithId(page, "200")).hidden, false, "the words were not kept as a draft");
+
+  // THE CONTROL: Back that puts down whatever reply is open, wherever the keys are.
+  const { page: control } = await replyColumnsPage(brokenScript(
+    'else if (replyOnScreen() && (currentScreen === "reply" || activeColumn === replyColumn)) closeReply();',
+    "else if (replyOnScreen()) closeReply();"));
+  await replyButton(rowWithId(control, "200")).click();
+  await control.el("reply-text").setValue("still writing on the left");
+  await press(control, control.el("reply-text"), "Escape");
+  await press(control, focused(control), "]");
+  await press(control, focused(control), "Escape");
+  assert.equal(replyBoxAt(control), "screen", "the control kept the reply, so this test cannot see it closed");
 });

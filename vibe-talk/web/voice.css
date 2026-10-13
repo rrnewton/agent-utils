@@ -3812,6 +3812,16 @@ a.search-hit-link {
   border-color: var(--accent);
 }
 
+/* `#277 reply-in-column`. A reply sent from this column did not go, and its outbox row, with Retry, is
+   down at the foot of the list: "Reply not sent", in the orange that row's own words are in
+   (`.outgoing-message[data-send-state="failed"]`), so the chip and what it leads to read as one thing.
+   After the arrivals rule, which it outranks: the failure is the reason to go down. */
+#jump-newest[data-unsent],
+#side-jump-newest[data-unsent] {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
 /* `#68 pull-to-refresh`. What the gesture says while it is happening, at the top edge of the list
    and over it — positioned against #screen-main exactly as #scroll-tools is, and for the same
    reason: inside #scroll-area it would be faded by the header mask, which is strongest at precisely
@@ -6924,6 +6934,14 @@ textarea {
     padding: 0.6rem 0 0.75rem;
     border-top: 1px solid var(--edge);
     background: var(--reply-tint);
+  }
+
+  /* The box a reply is written in, dragged taller or in a short window, never takes the list over it
+     away: no taller than a quarter of the window (its own 5rem where that is less), so the list keeps
+     the rest of the column and the message answered stays in sight. Longer words scroll in the box. */
+  #column-reply #reply-text,
+  #side-reply #reply-text {
+    max-height: max(5rem, 25vh);
   }
 
   /* The threads, one card each, every card the same height: three lines of what the thread is
