@@ -1,10 +1,11 @@
 ---
 title: 'voice-catchup-speed: keep recent_activity well inside the voice client''s 15 s tool limit'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-10-07T09:51:50.417611815+00:00
-updated_at: 2026-10-07T09:51:50.417611815+00:00
+updated_at: 2026-10-13T02:44:47.068823367+00:00
+closed_at: 2026-10-13T02:44:47.068823257+00:00
 ---
 
 # Description

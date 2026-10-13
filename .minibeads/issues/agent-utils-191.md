@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-first-lag: the first agent read starts about 5 s after the tap'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.545988303+00:00
-updated_at: 2026-10-04T10:09:55.545988303+00:00
+updated_at: 2026-10-13T02:44:47.059168131+00:00
+closed_at: 2026-10-13T02:44:47.059167981+00:00
 ---
 
 # Description

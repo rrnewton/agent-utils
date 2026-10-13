@@ -1,10 +1,11 @@
 ---
 title: 'voice-socket-open: some voice starts never open the voice socket'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-10-07T09:26:25.765835410+00:00
-updated_at: 2026-10-07T09:26:25.765835410+00:00
+updated_at: 2026-10-13T02:44:47.063337145+00:00
+closed_at: 2026-10-13T02:44:47.063337055+00:00
 ---
 
 # Description
