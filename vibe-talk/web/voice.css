@@ -5755,8 +5755,11 @@ a.search-hit-link {
 
 /* Docked under Reply, whose own filled "Send reply" is the screen's purpose and goes to the same
    channel: the card's Send is OUTLINED there, so the filled button the thumb finds lower down is
-   never taken for the reply's — a slip that would post the agent's draft instead. */
-#post-confirm[data-screen="reply"] #post-confirm-send {
+   never taken for the reply's — a slip that would post the agent's draft instead. The same in two
+   columns while a reply is open at the foot of one (`#277 reply-in-column`): its box and filled Send
+   stand just under the list the card ends, or level with it in the other column. */
+#post-confirm[data-screen="reply"] #post-confirm-send,
+#post-confirm[data-beside-reply] #post-confirm-send {
   background: transparent;
   color: var(--accent);
   border: 1px solid var(--accent);
