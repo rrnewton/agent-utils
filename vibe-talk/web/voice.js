@@ -22648,7 +22648,8 @@ async function toggleArchived(ids, row = null) {
 //     transition has no earlier style to start from. A row still selected keeps its grey ring: the
 //     fading phase lets go only of a ring the selection is not drawing anyway.
 //   * Every way of marking comes through it: the Done button, the e key and a swipe through
-//     `toggleArchived`, Done through here (Shift+E, or the ⋯ menu) on the row it was asked from.
+//     `toggleArchived`, Done through here (Shift+E, or the ⋯ menu) on the row it was asked from,
+//     and a sent reply's Done (`markAnsweredDone`) on the row standing for the message it answers.
 //   * EVERY WAY BACK ENDS IT AT ONCE, though its timers have most of a second to run: a Done the
 //     server refused, the Undo chip, z, the row's own button, or another device putting the message
 //     back. A row drawn unread never wears the grey ring (`drawDoneFlash`).
@@ -24028,7 +24029,8 @@ function doneWhereNotDrawn(id) {
  * of its row, since the Done button reads a row half Done as unread and would go on offering Done.
  * Where no column draws it any more, the message alone. A reply that went to another channel than
  * the one on screen is marked on the server only: nothing of that channel is drawn, and an Undo here
- * would put back a message of this one.
+ * would put back a message of this one. `#245 done-feedback`: the moment of the Done is drawn on the
+ * row answered, the one found here, and on no row where no column draws it.
  *
  * @param {{channel: string, replyTo: string}} entry
  */
@@ -24043,7 +24045,7 @@ async function markAnsweredDone(entry) {
   const marking = inColumn(found ? found.column : columns.main, () => {
     const ids = found ? idsOf(found.row) : [id];
     const done = found ? ids.every((one) => archivedIds.has(one)) : doneWhereNotDrawn(id);
-    return done ? null : toggleArchived(ids);
+    return done ? null : toggleArchived(ids, found ? found.row : null);
   });
   if (marking === null) return;
   await marking;

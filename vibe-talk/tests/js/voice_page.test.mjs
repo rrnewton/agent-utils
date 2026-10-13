@@ -42110,6 +42110,47 @@ test("`#256 reply-marks-read`: a reply sent after you moved to another channel i
   assert.equal(page.el("undo-dismiss").hidden, true, "an Undo here would put back a message of this channel");
 });
 
+test("`#245 done-feedback`: a SENT reply's Done draws its moment on the row it answers, in the column Reply was opened from", async () => {
+  // `markAnsweredDone` marks through `toggleArchived`, as the Done button does, and hands it the row
+  // standing for the message answered: without that row the Done is made and drawn read, but the
+  // moment of marking it, which every other way of marking draws, is not.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, conversation());
+    return page;
+  };
+  const target = "1000000000000000003";
+  const page = await run(SCRIPT);
+  await replyAndSend(page, target, "answering the open one");
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "true", "the premise is the reply's Done");
+  assert.equal(rowWithId(page, target).getAttribute("data-done-flash"), "marking",
+    "the reply's Done drew nothing of the moment on the row it answered");
+  assert.equal(rowWithId(page, "1000000000000000001").hasAttribute("data-done-flash"), false,
+    "a row the reply did not answer was drawn as marked");
+  assert.ok(page.expireTimers(DONE_FLASH_HOLD_MS) >= 1, "nothing ends the grey ring's hold");
+  assert.equal(rowWithId(page, target).getAttribute("data-done-flash"), "fading", "the ring was not let go after its hold");
+  assert.ok(page.expireTimers(DONE_FLASH_FADE_MS) >= 1, "nothing ends the ring's letting go");
+  assert.equal(rowWithId(page, target).hasAttribute("data-done-flash"), false, "the moment outlived its timers");
+
+  // In two columns, from the right: the row there is the one answered.
+  const { page: two } = await twoColumnServer();
+  await threadBadge(rowWithId(two, "201")).click();
+  await two.settle();
+  await replyAndSend(two, "202", "agreed", "side-log");
+  assert.equal(sideRow(two, "202").getAttribute("data-archived"), "true", "the premise is the reply's Done on the right");
+  assert.equal(sideRow(two, "202").getAttribute("data-done-flash"), "marking",
+    "the reply's Done drew nothing on the right column's row it answered");
+  assert.equal(sideRow(two, "201").hasAttribute("data-done-flash"), false, "the thread's root was drawn as marked");
+
+  // THE CONTROL: the reply's Done handed no row, as it was, marks the message and draws no moment.
+  const control = await run(brokenScript("toggleArchived(ids, found ? found.row : null)", "toggleArchived(ids)"));
+  await replyAndSend(control, target, "answering the open one");
+  assert.equal(rowWithId(control, target).getAttribute("data-archived"), "true", "the control made no Done");
+  assert.equal(rowWithId(control, target).hasAttribute("data-done-flash"), false,
+    "with no row handed over the moment was drawn anyway, so this test cannot see it");
+});
+
 // --- `#252 thread-button-state` -----------------------------------------------------------------
 //
 // The owner, 2026-10-12: a brand-new message in the main chat had a coloured Thread tag, although
