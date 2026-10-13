@@ -1930,12 +1930,16 @@ starting a second one behind it. A newest page or a delta that has just landed a
 identical request for `chat.timeline_memo_ms` more (three seconds by default; `0` turns that off,
 and requests in flight together still share). Any change this server hears of — a live message,
 edit or deletion, a post it sends to the channel, the storage purge — makes the next request read
-afresh, so the page's own re-read after one never gets an answer from before it. A change upstream
-that nobody pushes is invisible for at most those few seconds, and never to pull to refresh or to
-opening a channel (`reason=pull`, `reason=enter`), which are not answered from that memory though
-they still join a read already running. A kept answer is dropped when its time is up, and a shared
-read is given up after 150 seconds, longer than any provider's own bound, so a provider call that
-hangs cannot hold the requests waiting on it for longer. Only the provider's answer is shared:
+afresh, so the page's own re-read after one never gets an answer from before it. A post counts
+however its send ends, including one whose request was dropped while the provider had it, which
+may have delivered it. A change upstream that nobody pushes is invisible for at most those few
+seconds, and never to pull to refresh or to opening a channel (`reason=pull`, `reason=enter`),
+which are not answered from that memory though they still join a read already running; a page
+load that stands for several refreshes queued behind a read in flight sends the one that asks for
+a fresh read. Nor does an answer from that memory put older text back over a newer copy another
+read has since brought into read-ahead memory. A kept answer is dropped when its time is up, and a
+shared read is given up after 150 seconds, longer than any provider's own bound, so a provider call
+that hangs cannot hold the requests waiting on it for longer. Only the provider's answer is shared:
 the channel allowlist is checked before a request joins anything, and each caller's spoken forms,
 noise marks, thread names, read state, pins and bookmark are its own, so a read token still queues
 no thread naming. Window reads of a channel's newest messages (`/messages`, the digest, a summary's
@@ -2491,7 +2495,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not |
-| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=&reason=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`); identical requests share one provider read (see "One read for identical requests"); optional `reason=` says what the read is for, for the access log and the upstream profile only (`#278 timeline-single-flight`) |
+| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=&reason=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`); identical requests share one provider read (see "One read for identical requests"); optional `reason=` says what the read is for, for the access log and the upstream profile; `reason=pull` and `reason=enter` are also never answered from the few seconds' memory of a newest answer (`#278 timeline-single-flight`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |

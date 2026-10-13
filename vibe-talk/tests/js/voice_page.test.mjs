@@ -50963,3 +50963,58 @@ test("every timeline read says what it is for, in the refresh's own word", async
   const silent = page.timelineCalls.filter((path) => reasonOf(path) === null);
   assert.deepStrictEqual(silent, [], "a timeline read said nothing about why it was made");
 });
+
+test("a pull queued behind a read in flight still says pull, so the server reads the channel afresh", async () => {
+  // Review of `#278 timeline-single-flight`: a load queued behind a read in flight stands for every
+  // refresh asked for while it waited, and sent only the FIRST of their reasons. A pull queued after
+  // a live message's re-read went to the server as `live`, which it may answer from the few seconds'
+  // memory of the read the pull queued behind — begun before the pull — so a message posted upstream
+  // and not pushed stayed hidden from pull to refresh. The word that asks for a fresh read goes now.
+  const page = await threadPage();
+  const readReasonOf = page.pure("readReasonOf");
+  assert.equal(readReasonOf(["poll", "pull"]), "pull");
+  assert.equal(readReasonOf(["visible", "pull"]), "pull");
+  assert.equal(readReasonOf(["poll", "enter"]), "enter");
+  assert.equal(readReasonOf(["live", "poll", undefined]), "live", "with none fresh, the first");
+  assert.equal(readReasonOf("poll"), "poll");
+  assert.equal(readReasonOf(undefined), null);
+
+  const reasonOf = (path) => new URL(path, "http://fixture.test").searchParams.get("reason");
+  const reads = page.timelineCalls.length;
+  const held = gate(page.timeline);
+  page.timeline = held.respond;
+  // The finger lands at the top with nothing on the wire, so the top's pull is offered...
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await area.dispatch("touchstart", touchAt(120));
+  // ...and while it is down the poll's read goes out, and is held there,
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(reasonOf), ["poll"], "fixture: the poll did not read");
+  // a live message queues its re-read behind it, and the pull is released.
+  await deliver(page, page.stream(), sseMessage(message({ id: "205", content: "arrived while the poll was out" })));
+  await page.settle();
+  await area.dispatch("touchmove", touchAt(120 + PULL_ARM_PX));
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).map(reasonOf), ["poll"],
+    "fixture: a read was sent beside the one in flight instead of queued behind it");
+
+  held.open();
+  await page.settle();
+  const after = page.timelineCalls.slice(reads + 1).map(reasonOf);
+  assert.ok(after.length > 0, "the queued load never read");
+  assert.equal(after[0], "pull", `the load the pull queued behind the poll went as: ${after.join(", ")}`);
+});
+
+test("a pull up from the newest line says pull as well, so the server reads the channel afresh for it too", async () => {
+  // `#278 timeline-single-flight`: the foot's pull sent no reason at all, so the server could answer
+  // it from the few seconds' memory of the poll's read a moment before, which a pull never is.
+  const page = await threadPage();
+  const reasonOf = (path) => new URL(path, "http://fixture.test").searchParams.get("reason");
+  const reads = page.timelineCalls.length;
+  await pullUp(page, PULL_ARM_PX);
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  const sent = page.timelineCalls.slice(reads).map(reasonOf);
+  assert.equal(sent[0], "pull", `the pull up's read went as: ${sent.join(", ")}`);
+});

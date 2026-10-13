@@ -17168,15 +17168,25 @@ function timelinePath(before = null, after = null, reason = null) {
 }
 
 /**
- * The one word a refresh's `reason` names for the server: the first of several merged into one
- * queued load, or null when it named none. `#278 timeline-single-flight`.
+ * The refreshes that ask for the channel as it stands NOW: pull to refresh, and opening a channel or
+ * a view. The server never answers one from the few seconds it keeps a newest answer — its
+ * `ReadReason::wants_fresh` names the same two words. `#278 timeline-single-flight`.
+ */
+const FRESH_READ_REASONS = ["pull", "enter"];
+
+/**
+ * The one word a refresh's `reason` names for the server, or null when it named none. A load queued
+ * behind a read in flight stands for every refresh asked for while it waited (`queueDiscordLoad`),
+ * and may send only one word: the first that asks for a fresh read, so a pull queued behind a poll
+ * is still a pull to the server and is not answered from the read it queued behind; otherwise the
+ * first. `#278 timeline-single-flight`.
  *
  * @param {string | (string | undefined)[] | undefined} reason
  * @returns {string | null}
  */
 function readReasonOf(reason) {
-  const first = Array.isArray(reason) ? reason.find((one) => typeof one === "string") : reason;
-  return typeof first === "string" ? first : null;
+  const words = (Array.isArray(reason) ? reason : [reason]).filter((one) => typeof one === "string");
+  return words.find((one) => FRESH_READ_REASONS.includes(one)) || words[0] || null;
 }
 
 /**
@@ -25338,7 +25348,10 @@ async function refreshFromNewest() {
         await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
       }
     } else {
-      await loadDiscord({ keepPosition: true });
+      // A pull as much as the top's, and said so: the server never answers a pull from the few
+      // seconds it keeps a newest answer. Unsaid, this read could be given the poll's of a moment
+      // ago. `#278 timeline-single-flight`.
+      await loadDiscord({ keepPosition: true, reason: "pull" });
     }
   } catch (error) {
     failure = error;
