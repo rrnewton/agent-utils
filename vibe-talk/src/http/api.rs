@@ -2582,14 +2582,15 @@ mod tests {
         // the transcript, and therefore the thing that has to decide whether to follow, is
         // `transcriptSeam`. The property asserted is unchanged; the name of the function that has
         // to satisfy it moved.
-        // `#269 approval-card-inline` and `#270 voice-transcript-markers` put two more things at
-        // the end of the list: the send card, and the frozen card it becomes. Both follow only a
-        // reader who was already at the newest line.
+        // `#269 approval-card-inline` and `#270 voice-transcript-markers` put more things at the
+        // end of the list: the send card, and what it becomes — a frozen card, or a draft's "Not
+        // sent" line — which `placeInConversation` puts there. Each follows only a reader who was
+        // already at the newest line.
         for renderer in [
             "function line(",
             "function transcriptSeam(",
             "function showPostProposal(",
-            "function placeSentCard(",
+            "function placeInConversation(",
         ] {
             let body = function_body(VOICE_JS, renderer);
             assert!(
