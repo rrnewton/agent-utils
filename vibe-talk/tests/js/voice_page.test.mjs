@@ -35259,20 +35259,27 @@ test("turning Links on keeps the reader's place — the newest line, or the mess
 // PRs Commits Actions and be toggled on by default. Unselecting them filters out all the links that
 // are just GitHub links to commits PRs etc, which match a certain URL pattern. The reason for this is
 // I usually want to look for DOCUMENTS but these are the 3 main sources of noise in my url view."
-// What is pinned down here: which addresses are which kind and which are of none, the three buttons
-// and where they live, what turning one off does to the rows, the count, the numbers on the buttons
-// and the empty sentences, how all of it combines with the text and with Pinned, and that the choice
-// outlasts a reload. tests/offline_cache_browser.py measures where the buttons are drawn.
+// `#266 link-filter-kinds`, later: "we should add Issues and Files and Other... together that should
+// be all of them." and "Other is the catch all".
+// What is pinned down here: which addresses are which kind, and that every address is of exactly one;
+// the six buttons and where they live; what turning one off does to the rows; the count, the numbers
+// on the buttons — which add up to every link — and the empty sentences; how all of it combines with
+// the text and with Pinned; and that the choice outlasts a reload. tests/offline_cache_browser.py
+// measures where the buttons are drawn.
 
 /** A neutral example repository, which every GitHub address below is in. */
 const REPO = "https://github.com/example/project";
-/** The three buttons under Links, in the order they stand. */
-const KIND_CHIPS = ["link-kind-pr", "link-kind-commit", "link-kind-action"];
+/** The kinds, in the order their buttons stand under Links. */
+const KINDS = ["pr", "commit", "action", "issue", "file", "other"];
+/** The buttons under Links, in the order they stand. */
+const KIND_CHIPS = KINDS.map((kind) => `link-kind-${kind}`);
+/** What `kindsPressed` reads with every kind on. */
+const ALL_ON = KINDS.map(() => "true");
 const kindsPressed = (page) => KIND_CHIPS.map((id) => page.el(id).getAttribute("aria-pressed"));
 const kindsCounted = (page) => KIND_CHIPS.map((id) => page.el(`${id}-count`).textContent);
 const HIDDEN_KINDS_KEY = "vibe-talk.voice.hidden-link-kinds";
 
-/** Tap one kind's button: "pr", "commit" or "action". */
+/** Tap one kind's button: one of `KINDS`. */
 async function tapKind(page, kind) {
   await page.el(`link-kind-${kind}`).click();
   await page.settle();
@@ -35282,7 +35289,7 @@ async function tapKind(page, kind) {
 const shownHrefs = (page, id = "discord-log") => Object.fromEntries(
   unfiltered(page, id).map((li) => [li.getAttribute("data-id"), linkPairs(li).map(([, href]) => href)]));
 
-test("a link's kind is read from its address alone: pull requests, commits and runs on GitHub, and nothing else", () => {
+test("a link's kind is read from its address alone, and every address is of exactly one of the six", () => {
   const kindOf = newPage().pure("linkKind");
   const cases = {
     pr: [
@@ -35313,29 +35320,68 @@ test("a link's kind is read from its address alone: pull requests, commits and r
       `${REPO}/runs/987654`, `${REPO}/runs/987654?check_suite_focus=true`, `${REPO}/checks`, `${REPO}/checks?sha=abc1234`,
       "https://GITHUB.com/example/project/actions/runs/5",
     ],
-    none: [
-      // GitHub, but not one of the three: these are the documents, and nothing ever hides them.
-      `${REPO}/issues/7`, `${REPO}/issues`, `${REPO}/blob/main/README.md`, `${REPO}/tree/main/docs`,
-      `${REPO}/wiki/Home`, `${REPO}/releases/tag/v1.0`, `${REPO}/discussions/3`, REPO, `${REPO}/`,
+    // `#266 link-filter-kinds`. An issue, a comment on one, a new one, and the lists of them.
+    issue: [
+      `${REPO}/issues/7`, `${REPO}/issues/7/`, `${REPO}/issues/7#issuecomment-1234567`,
+      `${REPO}/issues`, `${REPO}/issues?q=is%3Aopen+label%3Abug`, `${REPO}/issues/new`,
+      `${REPO}/issues/new?template=bug.md`,
+      // A keyword in the query is not the path: this is the issue.
+      `${REPO}/issues/7?ref=pull/41`,
+      "https://www.github.com/example/project/issues/7", "HTTP://GITHUB.COM/example/project/issues/7",
+    ],
+    // ...and a file or a folder of the code, at a branch, a tag or a commit, as GitHub shows it and as
+    // it serves it raw.
+    file: [
+      `${REPO}/blob/main/README.md`, `${REPO}/blob/main/src/lib.rs#L10-L20`,
+      `${REPO}/blob/abc1234def/docs/design.md?plain=1`,
+      // A keyword in the fragment is not the path either.
+      `${REPO}/blob/main/notes.md#pull/41`,
+      `${REPO}/tree/main`, `${REPO}/tree/main/docs`, `${REPO}/tree/v1.0/`,
+      `${REPO}/raw/main/data.csv`, `${REPO}/blame/main/src/lib.rs#L4`,
+      "https://www.github.com/example/project/blob/main/README.md",
+      "https://raw.githubusercontent.com/example/project/main/README.md",
+      "https://RAW.githubusercontent.com/example/project/abc1234/src/lib.rs",
+    ],
+    // THE CATCH-ALL: every address no kind above claims. These are the documents.
+    other: [
+      // GitHub, but none of the five.
+      `${REPO}/wiki/Home`, `${REPO}/releases/tag/v1.0`, `${REPO}/releases`, `${REPO}/discussions/3`,
+      `${REPO}/labels`, REPO, `${REPO}/`,
       "https://github.com/example", "https://github.com/", "https://github.com",
       // A keyword where an owner or a repository stands is that owner or repository.
-      "https://github.com/pulls", "https://github.com/actions/checkout", "https://github.com/example/actions",
-      // Not what the path says it is: too short, not hex, no number, or no commit at all.
+      "https://github.com/pulls", "https://github.com/issues", "https://github.com/actions/checkout",
+      "https://github.com/example/actions", "https://github.com/example/issues",
+      // Not what the path says it is: too short, not hex, no number, no commit, no ref, or a capital.
       `${REPO}/commit/abc12`, `${REPO}/commit/xyz1234`, `${REPO}/commit`, `${REPO}/pull/new/feature`,
-      `${REPO}/pull`, `${REPO}/runs/latest`, `${REPO}/Pull/41`,
-      // A keyword in the query or the fragment is not the path.
-      `${REPO}/issues/7?ref=pull/41`, `${REPO}/blob/main/notes.md#pull/41`,
+      `${REPO}/pull`, `${REPO}/runs/latest`, `${REPO}/Pull/41`, `${REPO}/Issues/7`, `${REPO}/blob`,
+      `${REPO}/tree/`, `${REPO}/Blob/main/README.md`,
+      // A raw file host's address that is not a file, and a host that merely begins with it.
+      "https://raw.githubusercontent.com/example/project", "https://raw.githubusercontent.com/",
+      "https://raw.githubusercontent.com.example.com/example/project/main/README.md",
       // Other hosts, however much they look like it.
       "https://example.com/example/project/pull/41", "https://github.com.example.com/example/project/pull/41",
       "https://notgithub.com/example/project/pull/41", "https://api.github.com/repos/example/project/pulls/41",
-      "https://docs.github.com/en/actions", "https://raw.githubusercontent.com/example/project/main/README.md",
+      "https://docs.github.com/en/actions", "https://pages.example.com/project/",
       "https://gitlab.example.com/example/project/-/merge_requests/4",
-      `https://example.com/redirect?to=${REPO}/pull/41`,
+      "https://gitlab.example.com/example/project/-/issues/4",
+      `https://example.com/redirect?to=${REPO}/pull/41`, "https://example.com/docs/design.html",
+      // And what is not an address at all still has a kind: nothing is left out of the six.
+      "", "not an address",
     ],
   };
+  const kinds = Array.from(newPage().pure("LINK_KINDS"), ({ kind }) => kind);
+  assert.deepStrictEqual(kinds, KINDS, "the kinds are not the six, in the order the owner named them");
+  assert.deepStrictEqual(Object.keys(cases), KINDS);
+  // Each address is listed once, so none is expected of two kinds...
+  const listed = Object.values(cases).flat();
+  assert.equal(new Set(listed).size, listed.length, "an address is listed under two kinds");
+  // ...and each is read as exactly the kind it is listed under: one of the six, never none.
   for (const [kind, addresses] of Object.entries(cases)) {
+    assert.ok(addresses.length >= 8, `${kind} is tried on too few forms`);
     for (const address of addresses) {
-      assert.equal(kindOf(address), kind === "none" ? null : kind, `${address} is not read as ${kind}`);
+      const read = kindOf(address);
+      assert.ok(kinds.includes(read), `${address} is of no kind: ${read}`);
+      assert.equal(read, kind, `${address} is not read as ${kind}`);
     }
   }
 
@@ -35343,10 +35389,14 @@ test("a link's kind is read from its address alone: pull requests, commits and r
   const control = newPage(new Map(), brokenScript(
     '      return second === "commits" && COMMIT_ID.test(third) ? "commit" : "pr";', '      return "pr";')).pure("linkKind");
   assert.equal(control(`${REPO}/pull/41/commits/abc1234def`), "pr", "the test cannot see the pull request's commit");
+  // ...and with the catch-all taken away, an address no kind claims is of none, which this sees.
+  const unclaimed = newPage(new Map(), brokenScript(
+    '  if (!found) return "other";', '  if (!found) return null;')).pure("linkKind");
+  assert.equal(unclaimed("https://example.com/docs/design.html"), null, "the test cannot see a link left out of every kind");
 });
 
-test("PRs, Commits and Actions come up under Links, all on, only while it is on, and go with it", async () => {
-  // Markup: a group of three toggles in the bar, after the glass, so it stands between none of the
+test("PRs, Commits, Actions, Issues, Files and Other come up under Links, all on, only while it is on, and go with it", async () => {
+  // Markup: a group of six toggles in the bar, after the glass, so it stands between none of the
   // filters on the bar's line; web/voice.css hangs it under Links.
   assertMarkupContains("search-float", "link-kinds");
   const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="search-float"'));
@@ -35354,10 +35404,12 @@ test("PRs, Commits and Actions come up under Links, all on, only while it is on,
   assert.ok(at("search-toggle") < at("link-kinds"), "the kinds stand between the filters on the bar");
   const group = bar.slice(at("link-kinds"), bar.indexOf("</div>", at("link-kinds")));
   assert.match(group, /role="group"/);
-  assert.match(group, /aria-label="Kinds of GitHub link to show"/);
+  // Other is of every host, so the group is not only GitHub's. `#266 link-filter-kinds`.
+  assert.match(group, /aria-label="Kinds of link to show"/);
   assert.match(group, /hidden>/, "the kinds are served on screen");
   const buttons = [...group.matchAll(/<button ([^>]*)>([^<]*)</g)];
-  assert.deepStrictEqual(buttons.map((b) => b[2]), ["PRs", "Commits", "Actions"], "the kinds are not named as the owner named them");
+  assert.deepStrictEqual(buttons.map((b) => b[2]), ["PRs", "Commits", "Actions", "Issues", "Files", "Other"],
+    "the kinds are not named as the owner named them, in his order");
   assert.deepStrictEqual(buttons.map((b) => /id="([^"]+)"/.exec(b[1])[1]), KIND_CHIPS);
   for (const [, attributes] of buttons) {
     assert.match(attributes, /class="link-kind"/);
@@ -35376,6 +35428,15 @@ test("PRs, Commits and Actions come up under Links, all on, only while it is on,
   assert.match(row, /right: var\(--links-mid\)/);
   assert.match(row, /transform: translateX\(min\(50%, var\(--links-mid\)\)\)/, "the kinds are not centred under Links, or not kept to the bar's end");
   assert.match(row, /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 1\.5 \* var\(--toggle-hit\)\)/);
+  // `#266 link-filter-kinds`. Six are wider than a phone: never wider than the bar, the row scrolls
+  // sideways inside it, no button squeezed narrower than its words, and with no scrollbar to make it
+  // taller than the room the list leaves it. A focus ring is drawn inside the button the row clips.
+  assert.match(row, /max-width: 100%/, "the kinds can be wider than the bar, and so than a phone");
+  assert.match(row, /overflow-x: auto/, "the kinds wider than the bar cannot be scrolled to");
+  assert.match(row, /scrollbar-width: none/);
+  assert.match(cssBlock("#link-kinds::-webkit-scrollbar"), /display: none/);
+  assert.match(kind, /flex: 0 0 auto/, "a kind can be squeezed narrower than its words");
+  assert.match(cssBlock(".link-kind:focus-visible"), /outline-offset: -2px/, "the focus ring is drawn where the row clips it");
   assert.match(cssBlock("#pinned-filter[hidden] ~ #link-kinds"),
     /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 0\.5 \* var\(--toggle-hit\)\)/,
     "over the call view the kinds are placed as if Pinned were beside Links");
@@ -35400,7 +35461,7 @@ test("PRs, Commits and Actions come up under Links, all on, only while it is on,
   await page.settle();
   assert.equal(kinds.hidden, false, "Links came on without its kinds");
   assert.equal(room(), true, "the list made no room for the kinds");
-  assert.deepStrictEqual(kindsPressed(page), ["true", "true", "true"], "with nothing kept, a kind starts off");
+  assert.deepStrictEqual(kindsPressed(page), ALL_ON, "with nothing kept, a kind starts off");
   // Off with Links.
   await page.el("links-filter").click();
   await page.settle();
@@ -35458,11 +35519,12 @@ test("a kind turned off takes its links out of each row, and a row with none lef
   };
   assert.deepStrictEqual(shownHrefs(page), all, "with every kind on, a link is missing");
   assert.equal(page.el("search-count").textContent, "5 of 6 loaded");
-  assert.deepStrictEqual(kindsCounted(page), ["2", "1", "1"], "a kind's button does not say how many links it holds");
+  // Two pull requests, a commit, a run, the issue, no file, and three documents: Other's.
+  assert.deepStrictEqual(kindsCounted(page), ["2", "1", "1", "1", "", "3"], "a kind's button does not say how many links it holds");
 
   // PRs off: out of both rows that hold one, and each row keeps the rest — named as it was.
   await tapKind(page, "pr");
-  assert.deepStrictEqual(kindsPressed(page), ["false", "true", "true"]);
+  assert.deepStrictEqual(kindsPressed(page), ["false", "true", "true", "true", "true", "true"]);
   assert.deepStrictEqual(shownHrefs(page), {
     ...all,
     "860000000000000000": ["https://example.com/docs/design.html"],
@@ -35474,7 +35536,7 @@ test("a kind turned off takes its links out of each row, and a row with none lef
   assert.equal(page.el("search-count").textContent, "5 of 6 loaded", "a row with links left went");
   // The number on a button is what it holds whether it is on or off, so a reader can see what
   // turning it back on would bring.
-  assert.deepStrictEqual(kindsCounted(page), ["2", "1", "1"]);
+  assert.deepStrictEqual(kindsCounted(page), ["2", "1", "1", "1", "", "3"]);
 
   // Actions off too: the row of a run and a commit keeps the commit.
   await tapKind(page, "action");
@@ -35511,6 +35573,113 @@ test("a kind turned off takes its links out of each row, and a row with none lef
     "the test cannot tell a hidden pull request from a shown one");
 });
 
+test("Issues, Files and Other take every link the first three do not: the six numbers add up to every link, and each kind alone shows its own", async () => {
+  // `#266 link-filter-kinds`. The owner: "together that should be all of them", and "Other is the
+  // catch all". Every link of this channel by the kind it is, and the messages that hold them.
+  const byKind = {
+    pr: [`${REPO}/pull/41`, `${REPO}/pull/42/files`],
+    commit: [`${REPO}/commit/abc1234def`, `${REPO}/compare/main...feature`],
+    action: [`${REPO}/actions/runs/123456`],
+    issue: [`${REPO}/issues/7`, `${REPO}/issues/8#issuecomment-99`, `${REPO}/issues/new`],
+    file: [`${REPO}/blob/main/README.md`, `${REPO}/tree/main/docs`, "https://raw.githubusercontent.com/example/project/main/data.csv"],
+    other: ["https://example.com/docs/design.html", `${REPO}/wiki/Home`, `${REPO}/releases/tag/v1.0`, "https://example.org/guide"],
+  };
+  const contents = [
+    `review ${REPO}/pull/41 against the design https://example.com/docs/design.html`,
+    `filed ${REPO}/issues/7 and ${REPO}/issues/8#issuecomment-99 and see [the readme](${REPO}/blob/main/README.md)`,
+    `landed [abc1234](${REPO}/commit/abc1234def) in ${REPO}/compare/main...feature by ${REPO}/actions/runs/123456 today`,
+    `the docs are in ${REPO}/tree/main/docs and the data at https://raw.githubusercontent.com/example/project/main/data.csv now`,
+    `notes in ${REPO}/wiki/Home and ${REPO}/releases/tag/v1.0 and https://example.org/guide today`,
+    `open one at ${REPO}/issues/new once [the fix](${REPO}/pull/42/files) lands`,
+    "nothing to open here",
+  ];
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, contents.map((content, i) => message({ id: `86100000000000000${i}`, content })));
+    await showLinks(page);
+    return page;
+  };
+  const sorted = (list) => [...list].sort();
+  const shownLinks = (page) => Object.values(shownHrefs(page)).flat();
+  const added = (counts) => counts.reduce((sum, count) => sum + Number(count || 0), 0);
+  /** Turn on exactly the kinds in `on`, by taps on the buttons that differ. */
+  const showOnly = async (page, on) => {
+    for (const kind of KINDS) {
+      if ((page.el(`link-kind-${kind}`).getAttribute("aria-pressed") === "true") !== on.includes(kind)) await tapKind(page, kind);
+    }
+  };
+
+  const page = await run(SCRIPT);
+  const every = Object.values(byKind).flat();
+  assert.deepStrictEqual(sorted(shownLinks(page)), sorted(every), "with every kind on, a link is missing or doubled");
+  // Each kind's number is its own links, and together they are every link on screen.
+  assert.deepStrictEqual(kindsCounted(page), KINDS.map((kind) => String(byKind[kind].length)));
+  assert.equal(added(kindsCounted(page)), shownLinks(page).length, "the kinds' numbers do not add up to the links shown");
+  assert.equal(page.el("search-count").textContent, "6 of 7 loaded");
+
+  // Each kind alone shows exactly its own links, and the six between them show every link once.
+  const seen = [];
+  for (const kind of KINDS) {
+    await showOnly(page, [kind]);
+    assert.deepStrictEqual(sorted(shownLinks(page)), sorted(byKind[kind]), `${kind} alone does not show its own links, and only them`);
+    seen.push(...shownLinks(page));
+    // The numbers are what each kind holds whether it is on or off.
+    assert.deepStrictEqual(kindsCounted(page), KINDS.map((one) => String(byKind[one].length)));
+  }
+  assert.deepStrictEqual(sorted(seen), sorted(every), "a link is in two kinds, or in none");
+
+  // OTHER IS THE CATCH-ALL: with the other five off, what is left is the documents, every one.
+  await showOnly(page, ["other"]);
+  assert.deepStrictEqual(shownHrefs(page), {
+    "861000000000000000": ["https://example.com/docs/design.html"],
+    "861000000000000004": [`${REPO}/wiki/Home`, `${REPO}/releases/tag/v1.0`, "https://example.org/guide"],
+  }, "Other does not show the leftovers");
+  assert.equal(page.el("search-count").textContent, "2 of 7 loaded");
+  // Every kind off: nothing left, and the sentence names all six — Other as a plural like the rest.
+  await tapKind(page, "other");
+  assert.equal(page.el("search-count").textContent, "0 of 7 loaded");
+  assert.equal(page.el("search-empty").textContent,
+    "No links left once PRs, Commits, Actions, Issues, Files and Other links are hidden — turn them back on under the Links button.");
+  // Every kind but Other: the row of documents alone goes, and a row with a document and more keeps the rest.
+  await showOnly(page, ["pr", "commit", "action", "issue", "file"]);
+  assert.equal(page.el("search-empty").hidden, true);
+  assert.equal(page.el("search-count").textContent, "5 of 7 loaded");
+  assert.deepStrictEqual(shownHrefs(page)["861000000000000000"], [`${REPO}/pull/41`]);
+
+  // A kind with no link in view: its button is a plain word, turning it off takes nothing away, and
+  // an emptied list does not name it.
+  const sparse = newPage();
+  await signIn(sparse);
+  await showDiscord(sparse, [
+    message({ id: "8610000000000000101", content: `review ${REPO}/pull/41` }),
+    message({ id: "8610000000000000102", content: "the design https://example.com/docs/design.html" }),
+  ]);
+  await showLinks(sparse);
+  assert.deepStrictEqual(kindsCounted(sparse), ["1", "", "", "", "", "1"]);
+  const before = shownHrefs(sparse);
+  await tapKind(sparse, "file");
+  assert.equal(sparse.el("link-kind-file").getAttribute("aria-pressed"), "false");
+  assert.deepStrictEqual(shownHrefs(sparse), before, "a kind with no link took something away");
+  assert.equal(sparse.el("search-count").textContent, "2 of 2 loaded");
+  await tapKind(sparse, "pr");
+  await tapKind(sparse, "other");
+  assert.equal(sparse.el("search-empty").textContent,
+    "No links left once PRs and Other links are hidden — turn them back on under the Links button.",
+    "the sentence named a kind that hid nothing, or not the ones that did");
+  // Other back on: the leftover is back, and only it.
+  await tapKind(sparse, "other");
+  assert.deepStrictEqual(shownHrefs(sparse), { "8610000000000000102": ["https://example.com/docs/design.html"] });
+  assert.equal(sparse.el("search-empty").hidden, true);
+
+  // THE CONTROL: with the catch-all gone, a link on another host is of no kind — no number counts it,
+  // and no button hides it — which this test sees.
+  const control = await run(brokenScript('  if (!found) return "other";', "  if (!found) return null;"));
+  assert.notEqual(added(kindsCounted(control)), shownLinks(control).length, "the test cannot see a link no kind counts");
+  await showOnly(control, []);
+  assert.notEqual(control.el("search-count").textContent, "0 of 7 loaded", "the test cannot see a link no button hides");
+});
+
 test("with every link of a hidden kind, the list says which kinds hid them and how to bring them back", async () => {
   const page = newPage();
   await signIn(page);
@@ -35531,12 +35700,12 @@ test("with every link of a hidden kind, the list says which kinds hid them and h
   assert.equal(page.el("search-empty").hidden, false, "a blank list and no word about why");
   assert.equal(page.el("search-empty").textContent, "None of the loaded messages with a link match that search once PRs are hidden.");
   // The numbers on the buttons follow the text: only what it matched.
-  assert.deepStrictEqual(kindsCounted(page), ["1", "", ""], "the buttons count links the text did not match");
+  assert.deepStrictEqual(kindsCounted(page), ["1", "", "", "", "", ""], "the buttons count links the text did not match");
   // Text that matches no row with a link at all says so, as it did before the kinds.
   await page.el("search-field").setValue("no link");
   assert.equal(page.el("search-empty").textContent, "None of the loaded messages with a link match that search.");
   await page.el("search-field").setValue("");
-  assert.deepStrictEqual(kindsCounted(page), ["2", "1", ""]);
+  assert.deepStrictEqual(kindsCounted(page), ["2", "1", "", "", "", ""]);
 
   // Every link's kind off: no links left, which kinds did it, and where the way back is.
   await tapKind(page, "commit");
@@ -35570,7 +35739,7 @@ test("with every link of a hidden kind, the list says which kinds hid them and h
   await signIn(busy);
   await showDiscord(busy, [message({ content: Array.from({ length: 120 }, (_unused, n) => `${REPO}/pull/${n + 1}`).join(" ") })]);
   await showLinks(busy);
-  assert.deepStrictEqual(kindsCounted(busy), [`${sourceConstant("LINK_KIND_COUNT_MAX")}+`, "", ""]);
+  assert.deepStrictEqual(kindsCounted(busy), [`${sourceConstant("LINK_KIND_COUNT_MAX")}+`, "", "", "", "", ""]);
 });
 
 test("the kinds are ANDed with the text and with Pinned, and over Pinned the empty list names them too", async () => {
@@ -35617,7 +35786,7 @@ test("the kinds are ANDed with the text and with Pinned, and over Pinned the emp
   assert.equal(page.el("search-empty").hidden, true);
 });
 
-test("the kinds turned off are kept on this device, and with nothing kept all three are on", async () => {
+test("the kinds turned off are kept on this device, and with nothing kept every kind is on", async () => {
   const page = newPage();
   await signIn(page);
   const contents = [`a pull request ${REPO}/pull/41`, `a commit ${REPO}/commit/abc1234`, "a document https://example.com/doc"];
@@ -35637,16 +35806,19 @@ test("the kinds turned off are kept on this device, and with nothing kept all th
   await reopenedChannel(again);
   assert.equal(again.el("link-kinds").hidden, true, "the kinds came back without Links");
   await showLinks(again);
-  assert.deepStrictEqual(kindsPressed(again), ["false", "true", "true"], "PRs came back on by itself");
+  assert.deepStrictEqual(kindsPressed(again), ["false", "true", "true", "true", "true", "true"], "PRs came back on by itself");
   assert.deepStrictEqual(Object.keys(shownHrefs(again)), ["8900000000000000001", "8900000000000000002"],
     "the kept choice did not hide the pull request");
 
   // What a device may hold instead: damaged, of another shape, or naming a kind this page does not
-  // know. Each reads as on, kind by kind, and nothing in it is trusted to hide anything else.
+  // know. Each reads as on, kind by kind, and nothing in it is trusted to hide anything else. A choice
+  // kept before Issues, Files and Other existed still holds, and they start on. `#266
+  // link-filter-kinds`.
   for (const [held, pressed] of [
-    ["not json", ["true", "true", "true"]],
-    ['{"pr":true}', ["true", "true", "true"]],
-    ['["action","issues",7,"pr"]', ["false", "true", "false"]],
+    ["not json", ALL_ON],
+    ['{"pr":true}', ALL_ON],
+    ['["pr","commit","action"]', ["false", "false", "false", "true", "true", "true"]],
+    ['["action","issues","wiki",7,"pr","other"]', ["false", "true", "false", "true", "true", "false"]],
   ]) {
     const store = new Map(page.storage);
     store.set(HIDDEN_KINDS_KEY, held);

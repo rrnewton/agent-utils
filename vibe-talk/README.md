@@ -3655,27 +3655,38 @@ complete and well formed — brackets that do not pair, an empty name, a target 
 shows the address written inside it, if there is one, and never a name. An address that appears
 twice in a message, or in the messages one combined row stands for, is one line.
 
-**PRs, Commits and Actions** (`#212 link-filter`). While Links is on, three toggles hang just under
-its button — centred under it, or right-aligned under the end of the bar where centred would run
-off a narrow phone — each a full 44px target, all on until the reader turns one off. Each takes one
-kind of GitHub link out of the view, so what is left is the documents:
+**PRs, Commits, Actions, Issues, Files and Other** (`#212 link-filter`, `#266 link-filter-kinds`).
+While Links is on, six toggles hang just under its button — centred under it, or right-aligned under
+the end of the bar where centred would run off the screen — each a full 44px target, all on until the
+reader turns one off. Every link is of exactly one kind, so between them the six cover every link,
+and turning one off takes that kind out of the view:
 
 - **PRs** — a pull request, `/OWNER/REPO/pull/N` and anything under it (its files, its checks, a
   comment), and the `/pulls` lists;
 - **Commits** — `/commit/SHA` (seven hex digits or more), `/commits/…`, `/compare/…`, and one commit
   seen from its pull request, `/pull/N/commits/SHA`;
-- **Actions** — `/actions/…` (runs, jobs, workflows), a check run's `/runs/ID`, and `/checks`.
+- **Actions** — `/actions/…` (runs, jobs, workflows), a check run's `/runs/ID`, and `/checks`;
+- **Issues** — `/issues` and anything under it: an issue, a comment on one, a new one, a list;
+- **Files** — a file or a folder of the code at a branch, a tag or a commit: `/blob/REF/…`,
+  `/tree/REF/…`, `/raw/REF/…` and `/blame/REF/…`, and a file on `raw.githubusercontent.com`;
+- **Other** — every link none of those claims: a document, a wiki page, a release, a discussion, a
+  repository's own page, and anything on any other host. It is the catch-all, so turning the first
+  five off leaves exactly the documents.
 
-Only addresses on `github.com` or `www.github.com`, in any case, inside a repository, count; the
-query, the fragment and a trailing slash are ignored, and a Markdown link is judged by its address,
-not its name. An issue, a file, a wiki page, a release, and anything on any other host is never
-hidden. A row left with other links shows those; a row left with none goes, and the count says so.
-The number beside each name is how many links of that kind the messages in view hold, on or off, so
-a reader can see what turning it back on would bring ("99+" past ninety-nine). When nothing is
-left, the list names the kinds that did it — "No links left once PRs and Commits are hidden — turn
-them back on under the Links button." — and over Pinned or a search it says the same of the pins or
-the matches. The choice is kept on the device, as the page's other view preferences are, so a
-reader who always turns them off does it once; with nothing kept, all three are on.
+The first five are read from addresses on `github.com` or `www.github.com`, in any case, inside a
+repository (and, for Files, `raw.githubusercontent.com`); the query, the fragment and a trailing
+slash are ignored, and a Markdown link is judged by its address, not its name. A row left with other
+links shows those; a row left with none goes, and the count says so. The number beside each name is
+how many links of that kind the messages in view hold, on or off, so a reader can see what turning
+it back on would bring ("99+" past ninety-nine), and the six numbers add up to every link in view.
+On a phone the six with their numbers are wider than the screen, so the row stays inside the bar and
+scrolls sideways: a swipe across it brings Other into view, and a button reached by Tab or a tap is
+scrolled wholly into view. When nothing is left, the list names the kinds that did it — "No links left
+once PRs and Other links are hidden — turn them back on under the Links button." — and over Pinned or
+a search it says the same of the pins or the matches. The choice is kept on the device, as the page's
+other view preferences are, so a reader who always turns them off does it once; with nothing kept,
+every kind is on, and a choice kept before Issues, Files and Other existed still holds with those
+three on.
 
 ### Choosing a thread sits beside choosing the channel
 

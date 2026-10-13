@@ -144,6 +144,7 @@ let sideActive = false;
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
  *   | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
+ *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
@@ -2716,8 +2717,8 @@ function applySearch() {
         if (said && held.length > 0) {
           tally.saidLinked += 1;
         }
+        // `#266 link-filter-kinds`. Every link is of exactly one kind, so these add up to every link held.
         for (const link of held) {
-          if (link.kind === null) continue;
           tally.everywhere.set(link.kind, tally.everywhere.get(link.kind) + 1);
           if (said) tally.matching.set(link.kind, tally.matching.get(link.kind) + 1);
         }
@@ -4664,44 +4665,62 @@ function authorEmptySentence(author, searching, pinned) {
 // are just GitHub links to commits PRs etc, which match a certain URL pattern. The reason for this is
 // I usually want to look for DOCUMENTS but these are the 3 main sources of noise in my url view."
 //
-// WHAT A KIND IS: an address on github.com itself, inside one repository, whose path says it is a
-// pull request, a commit or a run of Actions — `linkKind`, and nothing but the address decides it.
-// The name a Markdown link gives it does not: "the fix" written over a pull request's address is a
-// pull request. Everything else — an issue, a file, a wiki page, a release, any page on any other
-// host — is of no kind, and no button ever hides it. Those are the documents the reader came for.
+// `#266 link-filter-kinds`. The owner again, once he had used them: "Our filters for hyperlinks --
+// PRs Commits Actions is good... but we should add Issues and Files and Other... together that should
+// be all of them." and "Other is the catch all". So there are six, and between them they cover every
+// link: each link is of exactly one kind, and the numbers on the six add up to every link counted.
+//
+// WHAT A KIND IS: `linkKind`, and nothing but the address decides it. PRs, Commits, Actions, Issues
+// and Files are addresses on GitHub, inside one repository, whose path says they are a pull request,
+// a commit, a run of Actions, an issue, or a file or a folder of the code (and a file as GitHub serves
+// it raw). Other is every address none of those claims — a wiki page, a release, a repository's own
+// page, any page on any other host. The name a Markdown link gives it does not count: "the fix"
+// written over a pull request's address is a pull request.
 //
 // WHAT TURNING ONE OFF DOES: its links leave the Links view, row by row. A row left with other links
 // shows those; a row left with none goes, as a row with no link does. The count and the sentence in
 // an empty list speak for what is left, and an empty list names the kinds that emptied it.
 //
 // REMEMBERED on this device (LINK_KINDS_KEY), as the page's other view preferences are: a reader who
-// always turns them off should not have to every time. With nothing kept, all three are on.
+// always turns them off should not have to every time. With nothing kept, every kind is on; a choice
+// kept before Issues, Files and Other existed still holds, and those three start on.
 
 const LINK_KINDS_KEY = "vibe-talk.voice.hidden-link-kinds";
 
 /**
  * The kinds, in the order their buttons stand under Links, each with its button's id and the word
- * on it. The number of links of that kind in view is in `<chip>-count`, inside the button.
+ * on it. The number of links of that kind in view is in `<chip>-count`, inside the button. `said` is
+ * how a sentence names a kind whose word is not a plural of its own: "once Other links are hidden".
+ * Other is last, and is what `linkKind` answers for every address no kind before it claims.
  */
 const LINK_KINDS = [
   { kind: "pr", chip: "link-kind-pr", name: "PRs" },
   { kind: "commit", chip: "link-kind-commit", name: "Commits" },
   { kind: "action", chip: "link-kind-action", name: "Actions" },
+  { kind: "issue", chip: "link-kind-issue", name: "Issues" },
+  { kind: "file", chip: "link-kind-file", name: "Files" },
+  { kind: "other", chip: "link-kind-other", name: "Other", said: "Other links" },
 ];
 
 /**
- * The largest number a kind's button prints; past it, the number and a plus. It keeps the three
- * buttons inside a 360px screen under the reader's largest type, where the row is right-aligned and
- * every digit it grows by comes off its left end.
+ * The largest number a kind's button prints; past it, the number and a plus. It keeps each button
+ * short: six of them are wider than a phone once their numbers are up, and the row scrolls sideways
+ * there (web/voice.css), but no one button grows past what a phone shows of it at once.
  */
 const LINK_KIND_COUNT_MAX = 99;
 
 /**
  * An address on GitHub itself — `github.com` or `www.github.com`, in any case, and nothing longer
  * that merely begins with it — and its path, up to the query or the fragment. A port, a user name
- * or any other host is not GitHub's site as people link to it, and is of no kind.
+ * or any other host is not GitHub's site as people link to it, and is Other.
  */
 const GITHUB_PATH = /^https?:\/\/(?:www\.)?github\.com(?=[/?#]|$)([^?#]*)/i;
+
+/**
+ * `#266 link-filter-kinds`. The host GitHub serves a repository's files from as they are written —
+ * where a file's Raw button goes — and the path after it, `/OWNER/REPO/REF/PATH`.
+ */
+const GITHUB_RAW_PATH = /^https?:\/\/raw\.githubusercontent\.com(?=[/?#]|$)([^?#]*)/i;
 
 /**
  * A commit as GitHub writes it in a path: seven hex digits or more, which is the short form and the
@@ -4714,32 +4733,42 @@ const PULL_NUMBER = /^\d+(?:\.(?:patch|diff))?$/;
 const RUN_NUMBER = /^\d+$/;
 
 /**
- * The kind of link an address is: "pr", "commit" or "action", or null for every other address.
- * The address alone decides, and the same address always answers the same.
+ * The kind of link an address is — one of `LINK_KINDS`, and always exactly one: "pr", "commit",
+ * "action", "issue" or "file" where the address says so, and "other" for every address that does
+ * not. The address alone decides, and the same address always answers the same.
  *
- * Inside one repository, `/OWNER/REPO/…`, by the part of the path after it, as GitHub routes them:
+ * Inside one repository on GitHub, `/OWNER/REPO/…`, by the part of the path after it, as GitHub
+ * routes them:
  *   - "pr": `/pull/N` and anything under it — its files, its checks, a comment's fragment — but
  *     not `/pull/N/commits/SHA`, which is one commit seen from the pull request; and `/pulls`.
  *   - "commit": `/commit/SHA`, `/commits` and anything under it, `/pull/N/commits/SHA`, and
  *     `/compare`, which is a run of commits.
  *   - "action": `/actions` and anything under it, a check run's `/runs/ID`, and `/checks`.
+ *   - "issue": `/issues` and anything under it — one issue, a comment on it, a new one, a list.
+ *   - "file": a file or a folder of the code at a branch, a tag or a commit — `/blob/REF/…`,
+ *     `/tree/REF/…`, `/raw/REF/…` and `/blame/REF/…` — and any file on raw.githubusercontent.com,
+ *     `/OWNER/REPO/REF/PATH`.
  * A trailing slash, the query and the fragment never change the answer. Keywords are matched as
  * GitHub writes them, lowercase, and only in the third place: `github.com/actions/checkout` is the
- * repository named checkout, not a run.
+ * repository named checkout, not a run, and so is Other.
  */
 function linkKind(href) {
-  const found = GITHUB_PATH.exec(String(href));
-  if (!found) return null;
+  const address = String(href);
+  const raw = GITHUB_RAW_PATH.exec(address);
+  // Owner, repository, ref and at least one name under it: the path a raw file is served at.
+  if (raw) return raw[1].split("/").filter(Boolean).length >= 4 ? "file" : "other";
+  const found = GITHUB_PATH.exec(address);
+  if (!found) return "other";
   // Empty segments dropped, so a trailing slash, or a doubled one, changes nothing.
   const [, , section, first = "", second = "", third = ""] = found[1].split("/").filter(Boolean);
   switch (section) {
     case "pull":
-      if (!PULL_NUMBER.test(first)) return null;
+      if (!PULL_NUMBER.test(first)) return "other";
       return second === "commits" && COMMIT_ID.test(third) ? "commit" : "pr";
     case "pulls":
       return "pr";
     case "commit":
-      return COMMIT_ID.test(first) ? "commit" : null;
+      return COMMIT_ID.test(first) ? "commit" : "other";
     case "commits":
     case "compare":
       return "commit";
@@ -4747,9 +4776,17 @@ function linkKind(href) {
     case "checks":
       return "action";
     case "runs":
-      return RUN_NUMBER.test(first) ? "action" : null;
+      return RUN_NUMBER.test(first) ? "action" : "other";
+    case "issues":
+      return "issue";
+    case "blob":
+    case "tree":
+    case "raw":
+    case "blame":
+      // A file view names the ref it is read at; the word alone is not a file.
+      return first === "" ? "other" : "file";
     default:
-      return null;
+      return "other";
   }
 }
 
@@ -4761,7 +4798,7 @@ function linkKind(href) {
 let hiddenLinkKinds = storedHiddenLinkKinds();
 
 /**
- * What this device kept. Nothing kept is all three on, and so is a record that does not parse;
+ * What this device kept. Nothing kept is every kind on, and so is a record that does not parse;
  * a kind this page does not know is dropped, so one retired later cannot hide anything.
  */
 function storedHiddenLinkKinds() {
@@ -4819,7 +4856,8 @@ function renderLinkKinds() {
 /**
  * How many of the links in view are of each kind, beside its name: what turning it off takes away,
  * or brings back. Counted over the messages the other filters let through, every kind whether shown
- * or not (`applySearch`). Blank at none, so a channel with no GitHub links shows three plain words.
+ * or not (`applySearch`); every link is of one kind, so together they count every link. Blank at
+ * none, so a kind with no link in view is a plain word.
  */
 function renderLinkKindCounts(kinds) {
   for (const { kind, chip } of LINK_KINDS) {
@@ -4832,13 +4870,13 @@ function renderLinkKindCounts(kinds) {
 /**
  * The kinds turned off that took something away — `counts` holds how many links of each kind there
  * are in what the sentence speaks for — named as their buttons are and joined as a sentence joins
- * them: "PRs", "PRs and Actions", "PRs, Commits and Actions". A kind that is off but had no link
- * there is left out, because turning it back on would bring nothing back. Every name is a plural,
- * so "are" and "them" fit whichever it is.
+ * them: "PRs", "PRs and Actions", "PRs, Commits and Other links". A kind that is off but had no
+ * link there is left out, because turning it back on would bring nothing back. Every name is a
+ * plural — Other is said as "Other links" — so "are" and "them" fit whichever it is.
  */
 function hiddenKindNames(counts) {
   const names = LINK_KINDS.filter(({ kind }) => hiddenLinkKinds.has(kind) && counts.get(kind) > 0)
-    .map(({ name }) => name);
+    .map(({ name, said }) => said || name);
   return names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
@@ -30711,6 +30749,13 @@ el("author-filter").addEventListener("click", cycleAuthorFilter);
 for (const { kind, chip } of LINK_KINDS) {
   el(chip).addEventListener("click", () => setLinkKindShown(kind, hiddenLinkKinds.has(kind)));
 }
+// `#266 link-filter-kinds`. The row of six scrolls sideways on a phone, and a browser scrolls it to a
+// button taking the focus only when none of that button shows: one cut off at the row's end stayed cut
+// off under Tab. So the button the focus reaches is brought wholly into the row, by Tab or by a tap.
+el("link-kinds").addEventListener("focusin", (event) => {
+  const target = /** @type {HTMLElement | null} */ (event.target);
+  if (target && typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "nearest", inline: "nearest" });
+});
 // Typed or cleared — by the keyboard, the field's own clear button, or a paste — the text is a filter
 // change, and the reader's message stays where it is on the screen (`#243 filter-keeps-selection`).
 // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence saying

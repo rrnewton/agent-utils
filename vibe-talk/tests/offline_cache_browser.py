@@ -86,22 +86,28 @@ its field still leaves room for a query's text, which buttons that grew with the
 Links view under it shows each link on its own 44px line, clear of the bar; and the kinds of link
 under Links measure as below.
 
-Then the kinds of link under Links (`#212 link-filter`), in the dark theme at 412px, 360px, 360px at
-150% type and a 1280px desk, over a channel holding GitHub pull requests, commits and runs of Actions
-beside documents: a real tap on Links brings up PRs, Commits and Actions, all on, with how many links
-of each are in view, in a row below the bar and under the Links icon — centred on it, or right-aligned
-under the bar's end where centred would run past it — wholly inside the viewport, each a target at
-least 44px each way every point of which presses it, covering neither the field, the glass, the
-filters, the pill nor the first row, its words legible on and off and the two states drawn apart. A
-real tap on PRs takes the pull requests out of the rows that hold them, and a row left with nothing
-goes; Commits and Actions off as well leave only the documents and the GitHub issue, which is no kind.
-After a reload the three are still off; turned on again every link is back; the glass takes the row
-away; and over the call view, where Links stands beside the glass, the row is right-aligned under the
-bar's end and still inside the screen. With over a hundred links of each kind loaded, every button
-reading "99+", the row measures the same at 313px, and at 360px under 130% and 150% type.
+Then the kinds of link under Links (`#212 link-filter`, `#266 link-filter-kinds`), in the dark theme
+at 412px, 360px, 360px at 150% type and a 1280px desk, over a channel holding GitHub pull requests,
+commits, runs of Actions, an issue and a file beside documents: a real tap on Links brings up PRs,
+Commits, Actions, Issues, Files and Other, all on, with how many links of each are in view — numbers
+that add up to every link the Links view shows — in a row below the bar and under the Links icon —
+centred on it, or right-aligned under the bar's end where centred would run past it — never wider
+than the bar and wholly inside the viewport, scrolling sideways where six are wider than that, with
+the page itself never wider than the screen; each a target at least 44px each way every point of
+which presses it once it is scrolled to, covering neither the field, the glass, the filters, the
+pill nor the first row, its words legible on and off and the two states drawn apart. A real tap on
+PRs takes the pull requests out of the rows that hold them, and a row left with nothing goes;
+Commits and Actions off as well leave the documents, the issue and the file; Issues and Files turned
+off from the keyboard — the browser scrolling each into view as it takes the focus — leave exactly
+the documents, which are Other. After a reload the five are still off; turned on again every link is
+back; the glass takes the row away; and over the call view, where Links stands beside the glass, the
+row is right-aligned under the bar's end and still inside the screen. With over a hundred links of
+each of the six kinds loaded, every button reading "99+", the row stays inside the screen at 313px,
+and at 360px under 130% and 150% type, a real swipe across it brings Other into view, and a real tap
+then turns it off.
 
 And where the filters empty the list (`EMPTY_SIZES`): a phone reader at the channel's newest line
-turns all three kinds off, types text that only a row without a link matches, types text nothing
+turns PRs, Commits and Actions off, types text that only a row without a link matches, types text nothing
 matches, or turns Links on over a channel with no link — at 412px under 150% type and on the two
 phones with the keyboard up, where the composer below the emptied list still overflows it. The
 sentence saying why is then wholly on the screen, below the bar and the kinds of link, with nothing
@@ -510,8 +516,9 @@ class KindsApi(FakeApi):
     """`#212 link-filter`: GitHub pull requests, commits and runs of Actions beside documents.
 
     200 holds a pull request and a document; 201 a run of Actions and a commit named in Markdown; 202 a
-    commit by its full id; 203 a document and a GitHub issue, which is no kind; 204 holds no link; 205
-    is a dozen pull requests' files and checks, so the PRs button carries a two-digit number.
+    commit by its full id; 203 a document, a GitHub issue and a file (`#266 link-filter-kinds`); 204
+    holds no link; 205 is a dozen pull requests' files and checks, so the PRs button carries a
+    two-digit number. Other is the two documents.
     """
 
     def __init__(self) -> None:
@@ -521,7 +528,8 @@ class KindsApi(FakeApi):
             said(0, f"Review please: {REPO}/pull/41 and the design note https://example.com/docs/design.html"),
             said(1, f"CI failed at {REPO}/actions/runs/123456/job/789 on [abc1234]({REPO}/commit/abc1234def)"),
             said(2, f"Landed in {REPO}/commit/0123456789abcdef0123456789abcdef01234567", "human"),
-            said(3, f"Spec: [the spec](https://example.org/spec) and the issue {REPO}/issues/7"),
+            said(3, f"Spec: [the spec](https://example.org/spec), the issue {REPO}/issues/7 and the file "
+                    f"{REPO}/blob/main/docs/spec.md"),
             said(4, "Nothing to open in this one.", "me"),
             said(5, f"The rest of the queue: {prs}"),
         ]
@@ -532,7 +540,8 @@ class CrowdedKindsApi(FakeApi):
     """`#212 link-filter`: over a hundred links of each kind, so every button under Links reads "99+".
 
     The widest the row of kinds ever gets, at the narrowest sizes a reader's own settings make: 200 a
-    hundred and twenty pull requests, 201 as many commits, 202 as many runs of Actions, 203 a document.
+    hundred and twenty pull requests, 201 as many commits, 202 as many runs of Actions, and since `#266
+    link-filter-kinds` 203 as many issues, 204 as many files and 205 as many documents, which are Other.
     """
 
     def __init__(self) -> None:
@@ -541,14 +550,16 @@ class CrowdedKindsApi(FakeApi):
             said(0, " ".join(f"{REPO}/pull/{n}" for n in range(120))),
             said(1, " ".join(f"{REPO}/commit/{n:07x}abc" for n in range(120))),
             said(2, " ".join(f"{REPO}/actions/runs/{n}" for n in range(120))),
-            said(3, "The one document: https://example.com/docs/guide.html"),
+            said(3, " ".join(f"{REPO}/issues/{n}" for n in range(120))),
+            said(4, " ".join(f"{REPO}/blob/main/docs/page-{n}.md" for n in range(120))),
+            said(5, " ".join(f"https://example.com/docs/guide-{n}.html" for n in range(120))),
         ]
         self.threads = []
 
 
 class EmptyKindsApi(FakeApi):
-    """`#212 link-filter`, from review: a channel whose only links are of the three kinds — 200 a pull
-    request, 201 a commit, 202 a run of Actions — and 203 none, so turning all three off empties the
+    """`#212 link-filter`, from review: a channel whose only links are of three kinds — 200 a pull
+    request, 201 a commit, 202 a run of Actions — and 203 none, so turning those three off empties the
     Links view, and text that matches only 203 empties it with every kind on."""
 
     def __init__(self) -> None:
@@ -1638,17 +1649,20 @@ LINK_VIEW_JS = """() => {""" + FLOAT_HELPERS_JS + """
     return {problems, rows: shownRows};
 }"""
 
-# `#212 link-filter`. The kinds of link under Links, as drawn: shown, PRs then Commits then Actions, in a
-# row below the bar and under the Links icon — centred on it, or right-aligned under the bar's end where
-# centred would run past that end, and only then — wholly inside the viewport; each a target at least 44px
-# each way every point of which presses it, meeting neither the field, the glass, the filters nor the bar;
-# the pill not drawn, and the first row of the list, scrolled to its top, clear below them. `pinned`
-# says whether Pinned is on the bar. Answers how the row was placed and, for each kind, [its name, its
-# aria-pressed, the number on it].
+# `#212 link-filter`. The kinds of link under Links, as drawn: shown, PRs, Commits, Actions, Issues, Files
+# then Other (`#266 link-filter-kinds`), in a row below the bar and under the Links icon — centred on it,
+# or right-aligned under the bar's end where centred would run past that end, and only then — wholly
+# inside the viewport and never wider than the bar, scrolling sideways where its buttons are wider than
+# that, and the page never wider than the screen; each, once scrolled to as a swipe or the focus would
+# scroll it, wholly inside the row and the screen, a target at least 44px each way every point of which
+# presses it, meeting neither the field, the glass, the filters nor the bar; the pill not drawn, and the
+# first row of the list, scrolled to its top, clear below them. `pinned` says whether Pinned is on the
+# bar. Answers how the row was placed, whether it scrolls, its buttons' whole width and, for each kind,
+# [its name, its aria-pressed, the number on it].
 KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     const problems = [];
     const row = document.getElementById('link-kinds');
-    if (!shown(row)) return {problems: ['no kinds of link are shown under Links'], placement: '', chips: []};
+    if (!shown(row)) return {problems: ['no kinds of link are shown under Links'], placement: '', scrolls: false, chips: []};
     if (shown(document.getElementById('pinned-filter')) !== pinned) problems.push(`Pinned is ${pinned ? 'not ' : ''}on the bar`);
     const b = box(document.getElementById('search-float')), l = box(document.getElementById('links-filter'));
     const r = box(row), width = document.documentElement.clientWidth;
@@ -1662,12 +1676,22 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     }
     if (!centred && mid + r.width / 2 < b.right - 2) problems.push('the kinds are right-aligned where centred under Links would fit');
     if (r.left < -0.5 || r.right > width + 0.5) problems.push(`the kinds run off the screen: ${r.left.toFixed(1)}..${r.right.toFixed(1)} of ${width}`);
+    if (r.width > b.width + 0.5) problems.push(`the kinds are ${r.width.toFixed(1)}px wide under a ${b.width.toFixed(1)}px bar`);
+    if (document.documentElement.scrollWidth > width + 0.5) problems.push(`the page is ${document.documentElement.scrollWidth}px wide on a ${width}px screen`);
+    const scrolls = row.scrollWidth > row.clientWidth + 1;
+    if (scrolls && !['auto', 'scroll'].includes(getComputedStyle(row).overflowX)) problems.push('the kinds overflow their row with no way to scroll to them');
     const others = ['search-field', 'search-toggle', 'links-filter', 'pinned-filter'].map((id) => document.getElementById(id)).filter(shown);
     const chips = [...row.querySelectorAll('button')];
     const said = chips.map((chip) => (chip.firstChild ? chip.firstChild.textContent.trim() : ''));
-    if (said.join(' ') !== 'PRs Commits Actions') problems.push(`the kinds read ${said.join(', ')}`);
+    if (said.join(' ') !== 'PRs Commits Actions Issues Files Other') problems.push(`the kinds read ${said.join(', ')}`);
+    const span = chips.reduce((sum, chip) => sum + box(chip).width, 0);
+    const kept = row.scrollLeft;
     chips.forEach((chip, i) => {
+        // Brought into view as a swipe, or the focus, brings it: the row scrolls, and nothing else does.
+        chip.scrollIntoView({block: 'nearest', inline: 'nearest'});
         const c = box(chip), label = said[i];
+        if (c.left < r.left - 0.5 || c.right > r.right + 0.5) problems.push(`${label} cannot be scrolled wholly into the row`);
+        if (c.left < -0.5 || c.right > width + 0.5) problems.push(`${label} is off the screen when scrolled to`);
         if (c.width < 43.5 || c.height < 43.5) problems.push(`${label}'s target is ${c.width.toFixed(1)}x${c.height.toFixed(1)}px`);
         if (meets(c, b)) problems.push(`${label} reaches into the bar`);
         for (const other of others) if (meets(c, box(other))) problems.push(`${label} covers ${name(other)}`);
@@ -1678,12 +1702,22 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
             }
         }
     });
+    row.scrollLeft = kept;
+    if (Math.abs(box(row).top - r.top) > 0.5 || Math.abs(box(row).left - r.left) > 0.5) problems.push('scrolling the kinds moved the row');
     if (shown(document.getElementById('channel-freshness'))) problems.push('the pill is drawn beside the kinds');
     document.getElementById('scroll-area').scrollTop = 0;
     const first = [...document.querySelectorAll('#discord-log > li[data-id], #transcript > li')].find(shown);
     if (first && box(first).top < r.bottom - 0.5) problems.push(`the kinds cover ${(r.bottom - box(first).top).toFixed(1)}px of the first row`);
-    return {problems, placement: centred ? 'centred' : 'right-aligned',
+    return {problems, placement: centred ? 'centred' : 'right-aligned', scrolls, span,
             chips: chips.map((chip, i) => [said[i], chip.getAttribute('aria-pressed'), chip.querySelector('.link-kind-count').textContent])};
+}"""
+
+# `#266 link-filter-kinds`. Where one kind's button is, against the row it scrolls in and the screen:
+# [its left, its right, the row's left, the row's right, the screen's width, how far the row is scrolled].
+KIND_PLACE_JS = """(id) => {
+    const c = document.getElementById(id).getBoundingClientRect();
+    const row = document.getElementById('link-kinds'), r = row.getBoundingClientRect();
+    return [c.left, c.right, r.left, r.right, document.documentElement.clientWidth, row.scrollLeft];
 }"""
 
 # `#212 link-filter`. How one kind's button is drawn: [its words' colour, their decoration, its pill's
@@ -1929,7 +1963,8 @@ BAR_SCALES = (("zoom-313", 313, 680, 100), ("font-115", 360, 800, 115), ("font-1
 KINDS_SIZES = (("phone", 412, 915, True, 100), ("phone-360", 360, 800, True, 100),
                ("font-150", 360, 800, True, 150), ("desktop", 1280, 800, False, 100))
 # ...and where the row is at its widest, every button reading "99+", against the narrowest lines: the
-# page zoomed to 313px, and 360px at 130% and 150% type, where it once ran off the left of the screen.
+# page zoomed to 313px, and 360px at 130% and 150% type, where three once ran off the left of the screen
+# and six now scroll.
 CROWDED_KINDS_SIZES = (("zoom-313", 313, 680, 100), ("font-130", 360, 800, 130), ("font-150", 360, 800, 150))
 # `#212 link-filter`, from review. Where a list the filters emptied is read: 412px at 150% type, 800px
 # tall as a phone's browser leaves it, where the composer still overflows the list by 102px with every
@@ -2275,19 +2310,21 @@ def main() -> int:
             print(f"{label} at {width}x{height}, root font {root_percent}%: the open bar with Links on and its"
                   f" count up — the glass at least {GLASS_MIN_PX}px, Links and Pinned 44px targets beside it,"
                   f" the field leaving {text:.0f}px for its text (at least {FIELD_TEXT_MIN_PX}) — every"
-                  " link on its own 44px line, clear of the bar, and PRs, Commits and Actions 44px targets"
+                  " link on its own 44px line, clear of the bar, and the six kinds of link 44px targets"
                   " under Links, inside the screen")
         for label, width, height, mobile, root_percent in KINDS_SIZES:
             placed = kinds_walk(playwright.chromium, args, label, width, height, mobile, root_percent)
-            print(f"{label} at {width}x{height}, root font {root_percent}%: PRs, Commits and Actions under Links,"
-                  f" {placed} under it over the channel and right-aligned under the bar's end over the call,"
-                  " inside the screen, each a 44px target clear of the bar, the pill and the first row,"
-                  " legible on and off; a real tap on each took its links out of their rows, and a row with"
-                  " nothing left went; the choice outlived a reload, and the glass took the row away")
+            print(f"{label} at {width}x{height}, root font {root_percent}%: PRs, Commits, Actions, Issues, Files"
+                  f" and Other under Links, numbers adding up to every link, {placed} under it over the channel"
+                  " and right-aligned under the bar's end over the call, inside the screen, each a 44px target"
+                  " clear of the bar, the pill and the first row, legible on and off; a real tap or Tab and Enter"
+                  " on each took its links out of their rows, and a row with nothing left went, Other keeping the"
+                  " documents; the choice outlived a reload, and the glass took the row away")
         for label, width, height, root_percent in CROWDED_KINDS_SIZES:
             span = crowded_kinds_walk(playwright.chromium, args, label, width, height, root_percent)
-            print(f"{label} at {width}x{height}, root font {root_percent}%: PRs, Commits and Actions each"
-                  f" reading 99+, {span:.0f}px wide, under Links and inside the screen, each a 44px target")
+            print(f"{label} at {width}x{height}, root font {root_percent}%: the six kinds each reading 99+,"
+                  f" {span:.0f}px of buttons scrolling inside the bar, under Links and inside the screen, each a"
+                  " 44px target; a real swipe brought Other into view and a real tap turned it off")
         for label, width, height, root_percent, mode in EMPTY_SIZES:
             top = empty_walk(playwright.chromium, args, label, width, height, root_percent, mode)
             print(f"{label} at {width}x{height}, root font {root_percent}%: a list emptied ({mode}) from its"
@@ -4155,15 +4192,16 @@ def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, 
             bar = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 0})
             view = page.evaluate(LINK_VIEW_JS)
             # `#212 link-filter`. The kinds of link under Links, with no GitHub link loaded and so no
-            # number on any of them: centred under Links where they fit, and inside the screen at
-            # every one of these sizes.
+            # number on any of them but Other, which is all four links (`#266 link-filter-kinds`):
+            # centred under Links where they fit, scrolling where they do not, and inside the screen
+            # at every one of these sizes.
             kinds = page.evaluate(KINDS_JS, {"pinned": True})
             if args.screenshots:
                 page.screenshot(path=str(args.screenshots / f"{label}-bar-links-on.png"))
             check(not bar["problems"], f"{shape}, with Links on: {bar['problems']}")
             check(not view["problems"], f"{shape}, the Links view under it: {view['problems']}")
             check(not kinds["problems"], f"{shape}, the kinds of link under Links: {kinds['problems']}")
-            check([chip[2] for chip in kinds["chips"]] == ["", "", ""], f"{shape}: the kinds read {kinds['chips']}")
+            check([chip[2] for chip in kinds["chips"]] == ["", "", "", "", "", "4"], f"{shape}: the kinds read {kinds['chips']}")
             shown = sorted(str(row[0]) for row in view["rows"])
             check(shown == ["200", "202", "203"], f"{shape}: the Links view shows rows {shown}")
             check(not errors, f"{shape}: the page threw: {errors}")
@@ -4180,12 +4218,14 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                mobile: bool, root_percent: int) -> str:
     """`#212 link-filter`: the kinds of link under Links, in the dark theme, against a fresh `KindsApi`.
 
-    A real tap on Links brings up PRs, Commits and Actions, all on and numbered, measured by
-    `KINDS_JS`; their words are legible on and off and the two states look different. Real taps then
-    turn the kinds off one by one and the Links view loses those links, row by row, a row with none
-    left going; a reload keeps the choice; turned back on, every link returns. The glass takes the row
-    away, and over the call view it is right-aligned under the bar's end. Answers how the row was
-    placed over the channel.
+    A real tap on Links brings up the six kinds, all on and numbered — the numbers adding up to every
+    link the Links view shows (`#266 link-filter-kinds`) — measured by `KINDS_JS`; their words are
+    legible on and off and the two states look different. Real taps then turn PRs, Commits and Actions
+    off one by one and the Links view loses those links, row by row, a row with none left going; Tab
+    and Enter turn Issues and Files off, each scrolled into view as it takes the focus, which leaves
+    Other's links and only them; a reload keeps the choice; turned back on, every link returns. The
+    glass takes the row away, and over the call view it is right-aligned under the bar's end. Answers
+    how the row was placed over the channel.
     """
     api = KindsApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
@@ -4243,6 +4283,23 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 until(f"() => document.getElementById('link-kind-{kind}').getAttribute('aria-pressed') === '{pressed}'",
                       f"a tap on {kind} did not turn it {'on' if pressed == 'true' else 'off'}")
 
+            def key_toggle(kind: str, pressed: str) -> None:
+                # `#266 link-filter-kinds`. Tab to the next kind and press Enter, as a keyboard does: the
+                # browser scrolls the row to bring the button into view as it takes the focus.
+                page.keyboard.press("Tab")
+                until(f"() => document.activeElement && document.activeElement.id === 'link-kind-{kind}'",
+                      f"Tab did not reach {kind}")
+                left, right, row_left, row_right, screen, _scrolled = page.evaluate(KIND_PLACE_JS, f"link-kind-{kind}")
+                check(left >= row_left - 0.5 and right <= row_right + 0.5 and left >= -0.5 and right <= screen + 0.5,
+                      f"{shape}: {kind}, focused, is not scrolled into view: {left:.1f}..{right:.1f} in a row of"
+                      f" {row_left:.1f}..{row_right:.1f} on a {screen}px screen")
+                page.keyboard.press("Enter")
+                until(f"() => document.getElementById('link-kind-{kind}').getAttribute('aria-pressed') === '{pressed}'",
+                      f"Enter on {kind} did not turn it {'on' if pressed == 'true' else 'off'}")
+
+            def counted(chips: list[list[str]]) -> int:
+                return sum(int(chip[2] or 0) for chip in chips)
+
             page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
@@ -4250,22 +4307,26 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 6", "the channel did not open")
 
-            # Links on: the three kinds under it, all on, numbered, every link in view.
+            # Links on: the six kinds under it, all on, numbered, every link in view — and the numbers
+            # add up to every link shown, because every link is of exactly one kind.
             links_on()
             kinds = page.evaluate(KINDS_JS, {"pinned": True})
             shot("1-kinds-on")
             check(not kinds["problems"], f"{shape}, over the channel: {kinds['problems']}")
-            check(kinds["chips"] == [["PRs", "true", "13"], ["Commits", "true", "2"], ["Actions", "true", "1"]],
+            check(kinds["chips"] == [["PRs", "true", "13"], ["Commits", "true", "2"], ["Actions", "true", "1"],
+                                     ["Issues", "true", "1"], ["Files", "true", "1"], ["Other", "true", "2"]],
                   f"{shape}: the kinds read {kinds['chips']}")
             everything = {
                 "200": [f"{REPO}/pull/41", "https://example.com/docs/design.html"],
                 "201": [f"{REPO}/actions/runs/123456/job/789", f"{REPO}/commit/abc1234def"],
                 "202": [f"{REPO}/commit/0123456789abcdef0123456789abcdef01234567"],
-                "203": ["https://example.org/spec", f"{REPO}/issues/7"],
+                "203": ["https://example.org/spec", f"{REPO}/issues/7", f"{REPO}/blob/main/docs/spec.md"],
             }
             shown = links_shown()
             check({k: v for k, v in shown.items() if k != "205"} == everything and len(shown.get("205", [])) == 12,
                   f"{shape}: with every kind on, the Links view shows {shown}")
+            check(counted(kinds["chips"]) == sum(len(links) for links in shown.values()),
+                  f"{shape}: the kinds count {counted(kinds['chips'])} links of the {sum(len(v) for v in shown.values())} shown")
 
             # PRs off: the pull requests leave their rows, and the row of nothing else goes.
             toggle("pr", "false")
@@ -4283,21 +4344,32 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             check(on["contrast"] >= 4.5 and off["contrast"] >= 4.5,
                   f"{shape}: the words on a kind read at {on['contrast']:.2f}:1 on and {off['contrast']:.2f}:1 off")
 
-            # Commits and Actions off too: the documents, and the issue, which is no kind.
+            # Commits and Actions off too: the documents, the issue and the file.
             toggle("commit", "false")
             toggle("action", "false")
             until("() => document.getElementById('search-count').textContent === '2 of 6 loaded'",
                   "the count does not say what the kinds left")
             shown = links_shown()
             check(shown == {"200": ["https://example.com/docs/design.html"], "203": everything["203"]},
-                  f"{shape}: with every kind off the Links view shows {shown}")
+                  f"{shape}: with PRs, Commits and Actions off the Links view shows {shown}")
+
+            # `#266 link-filter-kinds`. Issues and Files off from the keyboard: what is left is Other's,
+            # the documents, and nothing else.
+            page.focus("#link-kind-action")
+            key_toggle("issue", "false")
+            key_toggle("file", "false")
+            shown = links_shown()
+            check(shown == {"200": ["https://example.com/docs/design.html"], "203": ["https://example.org/spec"]},
+                  f"{shape}: with every kind but Other off the Links view shows {shown}")
+            page.evaluate("() => document.activeElement && document.activeElement.blur()")
             kinds = page.evaluate(KINDS_JS, {"pinned": True})
-            shot("3-every-kind-off")
-            check(not kinds["problems"], f"{shape}, every kind off: {kinds['problems']}")
-            check([chip[:2] for chip in kinds["chips"]] == [["PRs", "false"], ["Commits", "false"], ["Actions", "false"]],
+            shot("3-only-other")
+            check(not kinds["problems"], f"{shape}, every kind but Other off: {kinds['problems']}")
+            check([chip[:2] for chip in kinds["chips"]] == [["PRs", "false"], ["Commits", "false"], ["Actions", "false"],
+                                                           ["Issues", "false"], ["Files", "false"], ["Other", "true"]],
                   f"{shape}: the kinds read {kinds['chips']}")
             stored = page.evaluate("() => localStorage.getItem('vibe-talk.voice.hidden-link-kinds')")
-            check(stored == '["pr","commit","action"]', f"{shape}: the device kept {stored!r}")
+            check(stored == '["pr","commit","action","issue","file"]', f"{shape}: the device kept {stored!r}")
 
             # A reload keeps the choice; turned back on, every link is back.
             page.reload(wait_until="load")
@@ -4305,11 +4377,14 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                   " && !document.getElementById('pane-discord').hidden", "the reload did not reopen the channel")
             links_on()
             kinds = page.evaluate(KINDS_JS, {"pinned": True})
-            check([chip[1] for chip in kinds["chips"]] == ["false", "false", "false"],
+            check([chip[1] for chip in kinds["chips"]] == ["false", "false", "false", "false", "false", "true"],
                   f"{shape}: after a reload the kinds read {kinds['chips']}")
             check(set(links_shown()) == {"200", "203"}, f"{shape}: after a reload the hidden kinds came back")
             for kind in ("pr", "commit", "action"):
                 toggle(kind, "true")
+            page.focus("#link-kind-action")
+            for kind in ("issue", "file"):
+                key_toggle(kind, "true")
             until("() => document.getElementById('search-count').textContent === '5 of 6 loaded'",
                   "turning every kind back on did not bring every row back")
             shown = links_shown()
@@ -4347,8 +4422,11 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
     """`#212 link-filter`: the row of kinds at its widest — "99+" on every button — on a narrow line.
 
     A phone in the dark theme, against `CrowdedKindsApi`, at one of `CROWDED_KINDS_SIZES`: Links on by
-    real taps, then `KINDS_JS`. With the words free to grow with the type, this row was 355px wide at
-    150% on a 360px phone and ran off the left of the screen. Answers how wide it is.
+    real taps, then `KINDS_JS`. With the words free to grow with the type, three of these were 355px
+    wide at 150% on a 360px phone and ran off the left of the screen. Six (`#266 link-filter-kinds`)
+    are far wider than any phone: the row stays inside the bar and scrolls, a real swipe across it
+    brings Other — last, and furthest off — wholly into view, and a real tap then turns it off. Answers
+    how wide the six buttons are together.
     """
     api = CrowdedKindsApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
@@ -4379,12 +4457,29 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
                                       ".getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; }")
                 page.touchscreen.tap(float(found[0]), float(found[1]))
 
+            cdp = context.new_cdp_session(page)
+
+            def swipe_kinds_left() -> None:
+                """One finger, landed near the row's right end and drawn most of the way to its left, then lifted."""
+                found = page.evaluate("() => { const r = document.getElementById('link-kinds').getBoundingClientRect();"
+                                      " return [r.left, r.right, r.top + r.height / 2]; }")
+                start, end, y = float(found[1]) - 12, float(found[0]) + 12, float(found[2])
+                steps = 12
+                cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": start, "y": y}]})
+                for step in range(1, steps + 1):
+                    page.wait_for_timeout(16)
+                    cdp.send("Input.dispatchTouchEvent", {
+                        "type": "touchMove", "touchPoints": [{"x": start + (end - start) * step / steps, "y": y}]})
+                page.wait_for_timeout(16)
+                cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+                page.wait_for_timeout(300)
+
             page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
-            until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 4", "the channel did not open")
+            until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 6", "the channel did not open")
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
             tap("#links-filter")
@@ -4393,11 +4488,31 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
             if args.screenshots:
                 page.screenshot(path=str(args.screenshots / f"{label}-kinds-crowded.png"))
             check(not kinds["problems"], f"{shape}: {kinds['problems']}")
-            check([chip[2] for chip in kinds["chips"]] == ["99+", "99+", "99+"], f"{shape}: the kinds read {kinds['chips']}")
-            span = page.evaluate("() => document.getElementById('link-kinds').getBoundingClientRect().width")
+            check([chip[2] for chip in kinds["chips"]] == ["99+"] * 6, f"{shape}: the kinds read {kinds['chips']}")
+            check(bool(kinds["scrolls"]), f"{shape}: six buttons reading 99+ fit the bar, so nothing here scrolls")
+
+            # A swipe, or two, brings Other wholly into view; and a tap on it then turns it off.
+            def other_in_view() -> bool:
+                left, right, row_left, row_right, screen, _scrolled = page.evaluate(KIND_PLACE_JS, "link-kind-other")
+                return bool(left >= row_left - 0.5 and right <= row_right + 0.5 and left >= -0.5 and right <= screen + 0.5)
+
+            check(not other_in_view(), f"{shape}: Other is in view before any swipe")
+            for _swipe in range(4):
+                if other_in_view():
+                    break
+                swipe_kinds_left()
+            scrolled = page.evaluate(KIND_PLACE_JS, "link-kind-other")[5]
+            check(other_in_view(), f"{shape}: a swipe across the kinds did not bring Other into view (scrolled {scrolled}px)")
+            if args.screenshots:
+                page.screenshot(path=str(args.screenshots / f"{label}-kinds-crowded-swiped.png"))
+            tap("#link-kind-other")
+            until("() => document.getElementById('link-kind-other').getAttribute('aria-pressed') === 'false'",
+                  "a tap on Other, swiped into view, did not turn it off")
+            until("() => document.getElementById('search-count').textContent === '5 of 6 loaded'",
+                  "Other off did not take the row of documents away")
             check(not errors, f"{shape}: the page threw: {errors}")
             context.close()
-            return float(span)
+            return float(kinds["span"])
     finally:
         api.stopping.set()
         server.shutdown()

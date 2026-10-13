@@ -4145,10 +4145,12 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 # `#212 link-filter`. The owner: "3 buttons to pop up under the link icon I just
-                # clicked ... named PRs Commits Actions and be toggled on by default". The layout
-                # half only a browser has: below the bar, spanning the Links icon's middle, inside
-                # the screen, each a whole 44px target; and the pull request counted.
-                "PRs, Commits and Actions hang under Links, all on, inside the screen, 44px each",
+                # clicked ... named PRs Commits Actions and be toggled on by default" — and then
+                # `#266 link-filter-kinds`, "add Issues and Files and Other". The layout half only a
+                # browser has: below the bar, spanning the Links icon's middle, inside the screen and
+                # no wider than the bar, each a whole 44px target; the pull request counted, and the
+                # two documents beside it counted as Other.
+                "PRs, Commits, Actions, Issues, Files and Other hang under Links, all on, inside the screen, 44px each",
                 "(() => { const row = document.getElementById('link-kinds'); "
                 "const r = row.getBoundingClientRect(); "
                 "const l = document.getElementById('links-filter').getBoundingClientRect(); "
@@ -4156,11 +4158,13 @@ SCENES: tuple[Scene, ...] = (
                 "const mid = (l.left + l.right) / 2; "
                 "const chips = [...row.querySelectorAll('button')]; "
                 "return window.__visible('link-kinds') "
-                "&& chips.map((c) => c.firstChild.textContent).join(' ') === 'PRs Commits Actions' "
+                "&& chips.map((c) => c.firstChild.textContent).join(' ') === 'PRs Commits Actions Issues Files Other' "
                 "&& chips.every((c) => c.getAttribute('aria-pressed') === 'true' "
                 "&& c.getBoundingClientRect().width >= 44 && c.getBoundingClientRect().height >= 44) "
                 "&& window.__text('link-kind-pr-count') === '1' "
+                "&& window.__text('link-kind-other-count') === '2' "
                 "&& r.top >= bar.bottom - 1 && r.left <= mid && r.right >= mid "
+                "&& r.width <= bar.width + 1 "
                 "&& r.left >= 0 && r.right <= document.documentElement.clientWidth; })()",
             ),
         ),
@@ -4172,13 +4176,14 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
             (
-                # Off says so by more than colour: struck through, on the panel at rest, beside two
-                # that are still on.
-                "PRs reads as off and is struck through; Commits and Actions are still on",
+                # Off says so by more than colour: struck through, on the panel at rest, beside the
+                # five that are still on.
+                "PRs reads as off and is struck through; the other five kinds are still on",
                 "(() => { const pr = document.getElementById('link-kind-pr'); "
                 "return pr.getAttribute('aria-pressed') === 'false' "
                 "&& getComputedStyle(pr).textDecorationLine.includes('line-through') "
-                "&& ['link-kind-commit', 'link-kind-action'].every((id) => "
+                "&& ['link-kind-commit', 'link-kind-action', 'link-kind-issue', 'link-kind-file', "
+                "'link-kind-other'].every((id) => "
                 "document.getElementById(id).getAttribute('aria-pressed') === 'true'); })()",
             ),
             (

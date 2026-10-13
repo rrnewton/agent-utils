@@ -4086,8 +4086,9 @@ a.search-hit-link {
   padding-top: 0;
 }
 
-/* `#212 link-filter`. The kinds of link — PRs, Commits, Actions — hung UNDER Links while it is on:
-   a row of three toggles floating below the bar as the bar floats over the list. Centred under the
+/* `#212 link-filter`. The kinds of link — PRs, Commits, Actions, and since `#266 link-filter-kinds`
+   Issues, Files and Other — hung UNDER Links while it is on: a row of toggles floating below the bar
+   as the bar floats over the list. Centred under the
    Links button; and where centred would run past the bar's right-hand end — always over the call
    view, where Links stands beside the glass, and over the channel once the numbers on them are up on
    a narrow phone — right-aligned under the bar's end instead, so it never leaves the screen.
@@ -4098,14 +4099,31 @@ a.search-hit-link {
    gap after Links. `--links-mid` is the distance from that edge to the middle of Links. The row's
    right-hand end is put there, then moved right by half the row's own width, which centres the row
    on Links, or by `--links-mid` if that is less, which puts its end on the bar's. One rule for both
-   cases, and no script measuring anything: it holds at every width and every type size. */
+   cases, and no script measuring anything: it holds at every width and every type size.
+
+   `#266 link-filter-kinds`. Six with their numbers up are wider than a phone — a little over the
+   394px bar of a 412px phone at the ordinary type size, and 582px under 130% type or more with all
+   six reading 99+ — so the row is never wider than the bar, and scrolls sideways inside that width
+   instead: a swipe brings Other into view, and a button the focus reaches is scrolled wholly into
+   view (web/voice.js). Right-aligned under the bar's end, as the rule above already puts a row that
+   wide, it spans the bar exactly. No scrollbar is drawn, because one would add to its height and
+   cover the first row; the button cut off at its end says there is more. */
 #link-kinds {
   --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
   position: absolute;
   top: calc(100% + 1px + var(--kinds-gap));
   right: var(--links-mid);
   display: flex;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
   transform: translateX(min(50%, var(--links-mid)));
+}
+
+#link-kinds::-webkit-scrollbar {
+  display: none;
 }
 
 /* Over the call view there are no pins, and Links stands next to the glass. */
@@ -4119,10 +4137,13 @@ a.search-hit-link {
    the reader's font inside it — up to 16px, a quarter larger than at the default size. Past that,
    three of them with three-figure numbers ("99+") were wider than a 360px phone: at 150% type the
    row measured 355px in Chromium, and right-aligned under the bar it ran off the left of the screen
-   with half of PRs. Capped, it is about 305px there. */
+   with half of PRs. Capped, it is about 305px there. (Since `#266 link-filter-kinds` the six scroll
+   inside the bar's width instead, and the cap keeps each one short.) Never squeezed by the row: a
+   button narrower than its words would cut them, and the row scrolls instead. */
 .link-kind {
   position: relative;
   z-index: 0;
+  flex: 0 0 auto;
   min-width: var(--toggle-hit);
   height: var(--toggle-hit);
   padding: 0 9px;
@@ -4167,6 +4188,14 @@ a.search-hit-link {
 
 .link-kind[aria-pressed="false"] {
   text-decoration: line-through;
+}
+
+/* `#266 link-filter-kinds`. The row clips what spills past it, now that it scrolls, and a focus ring
+   drawn outside the button would be cut off top and bottom; so it is drawn inside, as the rows' own
+   buttons draw theirs. */
+.link-kind:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 /* How many links in view are of that kind, a size below the name it qualifies. Blank at none, and
