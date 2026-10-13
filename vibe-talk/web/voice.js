@@ -12820,12 +12820,13 @@ function replyRoute(message) {
   if (record && record.is_root !== true) {
     return { ...route, thread: String(record.id), note: "Posts in the thread this message belongs to." };
   }
-  // The count the thread tag goes by, a summary's before the record's: ticking the box on a thread
-  // that has replies after all would post into it while saying it starts one. And not where a reply
-  // IS a thread reply (Slack, `channelRepliesInThread`): there the reply starts the message's thread
-  // already, and a box whose two states post the same thing would say one of them goes to Main.
+  // Only a thread nobody has answered, by the rule the grey Thread tag goes by (`unansweredThread`):
+  // ticking the box on a thread that has replies after all would post into it while saying it starts
+  // one. And not where a reply IS a thread reply (Slack, `channelRepliesInThread`): there the reply
+  // starts the message's thread already, and a box whose two states post the same thing would say
+  // one of them goes to Main.
   if (record) {
-    const empty = threadReplyCount(record.id, { thread: record }) === 0;
+    const empty = unansweredThread(message, record);
     return { ...route, branch: empty && !channelRepliesInThread(el("discord-channel").value) ? String(record.id) : null };
   }
   if (!channelCanon.unplaced.has(String(message.id))) return route;
@@ -14375,6 +14376,25 @@ function startThread(id) {
     if (shownNode(box) && !box.disabled) box.focus();
   });
   return opened;
+}
+
+/**
+ * Whether `message`, whose thread record is `record`, heads a thread nobody has answered: the one
+ * decision the grey Thread tag paints (`drawThreadChips`) and Reply's "Start a new thread" box is
+ * offered by (`replyRoute`), so the two cannot disagree about the same message. Its count says zero —
+ * a summary's before the record's — the store holds no reply in it, and no exact count says more:
+ * a live reply the store holds makes it a thread at once, on the tag and on Reply alike.
+ * `#185 reply-new-thread`, `#252 thread-button-state`.
+ *
+ * @param {object} message
+ * @param {object} record its thread record, the store's copy's before the row's (`heldThreadRecord`)
+ */
+function unansweredThread(message, record) {
+  const id = String(record.id);
+  const tally = replyTally();
+  const entry = tally.threads.get(id);
+  return unansweredRoot({ thread: record }, threadReplyCount(id, { thread: record }), entry ? entry.held : 0,
+    exactReplyCount(id, message, tally));
 }
 
 /**
@@ -24907,6 +24927,15 @@ let replyChannelId = null;
  * placed a message the stream had left unplaced. See `followReplyStore`.
  */
 let replyRouting = { thread: null, branch: null, unknown: false, note: "" };
+/**
+ * The messages whose kept draft was left with "Start a new thread" ticked, by id as a string, so
+ * that the box comes back ticked with the words: a reader who put a reply down to look at something
+ * else and picked it up again should not find it bound for the main channel because the box forgot.
+ * Only with the draft — a reply sent or emptied takes its tick with it — and never for another
+ * message. For this session: the words outlive a reload, and the tick beside them does not.
+ * `#185 reply-new-thread`.
+ */
+const draftStartsThread = new Set();
 // Where the reader was in the channel when they opened this. Captured with the SAME mechanism the
 // fold control uses (`#47 scrollback-stability`), not a second one.
 let replyScrollMark = null;
@@ -24936,6 +24965,8 @@ function rememberDraft() {
   } else {
     drafts.delete(id);
   }
+  if (text.trim() && replyRouting.branch && el("reply-branch").checked) draftStartsThread.add(id);
+  else draftStartsThread.delete(id);
   // `#193 compose-draft-loss`. The row's Draft comes and goes with the draft.
   if (drafts.has(id) !== had) renderDraftMarkers();
   // ...and SAY SO when the browser refuses. The read-back was here from the start and its answer
@@ -25021,8 +25052,10 @@ function openReply(messages, from = null) {
   replyChannelId = el("discord-channel").value;
   replyRouting = replyRoute(message);
   // `#185 reply-new-thread`. Offered only where a new thread is possible, and never carried over
-  // from the last reply: the default is to answer where the message is.
-  el("reply-branch").checked = false;
+  // from the last reply: the default is to answer where the message is. Only this message's own kept
+  // draft brings its tick back (`draftStartsThread`).
+  el("reply-branch").checked = Boolean(replyRouting.branch) && drafts.has(String(message.id)) &&
+    draftStartsThread.has(String(message.id));
   el("reply-branch-row").hidden = !replyRouting.branch;
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it — and so does where the row stood.
@@ -25098,7 +25131,7 @@ function renderReplyDestination() {
   const note = el("reply-destination");
   note.textContent = replyRouting.branch
     ? el("reply-branch").checked
-      ? "Starts a new thread from this message, with your reply as its first answer."
+      ? "Posts in a new thread on this message, as its first reply."
       : "Posts in the main channel as a reply to this message."
     : replyRouting.note;
   note.hidden = note.textContent === "";
@@ -25163,6 +25196,7 @@ async function sendReply() {
     ...(route.unknown ? { placement: "unknown" } : {}),
   });
   drafts.delete(String(target.id));
+  draftStartsThread.delete(String(target.id));
   if (outgoingStorageOkay) persistDrafts();
   renderDraftMarkers();
   el("reply-text").value = "";
@@ -30033,7 +30067,14 @@ el("reply-send").addEventListener("click", guardQuietly(sendReply));
 // `#225 enter-to-send`. The box that had no Enter handler at all, so the one the owner had to reach
 // for the mouse in.
 el("reply-text").addEventListener("keydown", (event) => onComposerKey(event, guardQuietly(sendReply)));
-el("reply-branch").addEventListener("change", renderReplyDestination);
+// The note under the box and the title bar can change how many lines they take, which changes the
+// room the message being answered has: it is placed again, as a resize places it. Without this, a
+// message low on a 1280x800 screen ended 15px under the box once the box was ticked.
+// `#185 reply-new-thread`.
+el("reply-branch").addEventListener("change", () => {
+  renderReplyDestination();
+  refitReplyMessage();
+});
 el("reply-context-more").addEventListener("click", guardQuietly(loadEarlierReplyContext));
 // A draft survives leaving the screen without sending, so it is written as it is typed rather than
 // only on the way out — a way out that is not a control (the browser's own back, a reload) would

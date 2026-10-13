@@ -72,9 +72,16 @@ any view, including **All**. Replying to a main-channel message posts in the mai
 to it: a quote on Google Chat, a reply link on Discord. (Slack has neither, so its backend posts
 such a reply in the message's thread; see [Slack](#slack).) Where the chat service has already named
 an empty thread for the message, as Google Chat does, the reply screen also offers **Start a new
-thread from this message**, unticked each time it opens. Slack does not get that box: its reply
+thread from this message**, unticked each time it opens; ticked, the reply is posted into that
+message's thread as its first reply, the way the grey **Thread** starts one. It is offered exactly
+where that message's tag is the grey **Thread**: once the page holds a reply in the thread, from a
+read or the live stream, the tag is **Thread(1)** and Reply has no new thread to offer. A draft put
+down with the box ticked has it ticked again when you come back to the same message, until the page
+is reloaded. After **Send** you are back where you pressed Reply, and the message's tag is already
+its thread's **Thread(1)**. Slack does not get that box: its reply
 already starts the message's thread, which the server says with `replies_in_thread` in
-`/api/v1/client-config`. A message that arrived on the live stream
+`/api/v1/client-config`. Nor does a Discord message that heads no thread: Discord's threads are
+channels of their own, which vibe-talk does not create. A message that arrived on the live stream
 without saying which thread it is in, and that no read has placed since, is placed by one read of
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
 text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.

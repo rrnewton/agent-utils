@@ -45115,3 +45115,104 @@ test("`#249 search-highlight`: with rich headers off the words a header restates
   assert.equal(builtSince(page, made, "mark"), 0, "the switch marked the hits again");
   assert.match(cssBlock(':root[data-rich-headers="off"] .rh-head'), /display: none/);
 });
+
+// --- `#185 reply-new-thread`, beside the grey Thread ------------------------------------------------
+//
+// Reply's "Start a new thread from this message" and the grey Thread tag are the same decision about
+// the same message (`unansweredThread`), and a first reply sent from either goes into the message's
+// thread the same way: with `thread_id`, the thread the provider named.
+
+test("`#185 reply-new-thread`: a new thread started from Reply on Main goes into the message's thread, and the message shows its thread at once", async () => {
+  const { page, data } = await freshMessagePage();
+  await pickThread(page, "main");
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-branch-row").hidden, false, "no new-thread choice on a message nobody has answered");
+  await page.el("reply-text").setValue("the first answer, in a thread of its own");
+  await page.el("reply-branch").setChecked(true);
+  assert.equal(page.el("reply-destination").textContent, "Posts in a new thread on this message, as its first reply.");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+    [{ text: "the first answer, in a thread of its own", reply_to: "210", thread_id: data.lone.id }]);
+
+  // Back where Reply was pressed, as after every reply: Main, which shows no thread's replies, so the
+  // reply is its receipt there, with the tag of the thread it went into.
+  assert.equal(page.screen(), "main");
+  assert.equal(page.el("thread-select").value, "main", "sending took the reader out of Main");
+  const receipt = outgoingRows(page).find((row) => row.text().includes("the first answer, in a thread of its own"));
+  assert.ok(receipt && threadBadge(receipt), "the reply's receipt does not lead to the thread it went into");
+  // With no read: the message heads a thread now, coloured, with its reply counted...
+  const tag = tagOf(rowOf(page, "210"));
+  assert.deepStrictEqual({ ...tag, hue: undefined },
+    { state: "open", text: "Thread(1)", title: "Open this thread", label: "Open this thread, 1 reply", hue: undefined, hidden: false },
+    "the message did not show the thread its reply started");
+  // ...and Reply, by the same rule as the tag, has no new thread to offer on it.
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-branch-row").hidden, true, "Reply offered a new thread on a message that heads one");
+});
+
+test("`#185 reply-new-thread`: a live reply the page holds makes the message a thread for Reply as it does for its tag", async () => {
+  // The count the provider last gave the root is still nothing; the reply is in the store. The tag
+  // goes by what the store holds, and so does Reply: ticking the box would post into a thread that
+  // has a reply while saying it starts one.
+  const { page, data } = await freshMessagePage();
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  const live = message({ id: "211", content: "somebody answered it just now",
+    thread: { ...data.lone, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.messages = [...page.messages, live];
+  await deliver(page, page.stream(), sseMessage(live));
+  await page.settle();
+  assert.equal(tagOf(rowOf(page, "210")).state, "open", "the tag did not count the reply the page holds");
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-branch-row").hidden, true, "Reply offered a new thread the tag says exists");
+});
+
+test("`#185 reply-new-thread`: a draft put down with the new-thread box ticked comes back ticked, and only for its own message", async () => {
+  const { page } = await freshMessagePage((_page, data) => {
+    data.messages.push(message({ id: "212", content: "another message nobody has answered",
+      thread: { id: "spaces/A/threads/other", root_message_id: "212", is_root: true, reply_count: 0, reply_count_exact: true } }));
+  });
+  const box = () => page.el("reply-branch");
+  await replyButton(rowOf(page, "210")).click();
+  await page.el("reply-text").setValue("half an answer");
+  await box().setChecked(true);
+  await page.el("reply-cancel").click();
+
+  // Another message: its own empty box, and the choice did not follow the reader there.
+  await replyButton(rowOf(page, "212")).click();
+  assert.equal(page.el("reply-branch-row").hidden, false);
+  assert.equal(page.el("reply-text").value, "");
+  assert.equal(box().checked, false, "the tick followed the reader to another message");
+  await page.el("reply-cancel").click();
+
+  // Back to the draft: the words, and where they were going, title and note with them.
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-text").value, "half an answer");
+  assert.equal(box().checked, true, "the draft came back bound for the main channel");
+  assert.equal(page.el("topbar-title").text(), "Reply · New thread · a brand-new message nobody has answered");
+  assert.equal(page.el("reply-destination").textContent, "Posts in a new thread on this message, as its first reply.");
+
+  // A draft emptied takes its tick with it.
+  await page.el("reply-text").setValue("");
+  await page.el("reply-cancel").click();
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(box().checked, false, "an emptied draft kept its tick");
+
+  // And a reply sent: the next one on a message starts from nothing. (Sent unticked, so the message
+  // is still one nobody has answered in a thread, and the box is still offered.)
+  await page.el("reply-text").setValue("first a ticked draft");
+  await box().setChecked(true);
+  await page.el("reply-cancel").click();
+  await replyButton(rowOf(page, "212")).click();
+  await page.el("reply-text").setValue("an answer on the main channel");
+  await box().setChecked(true);
+  await box().setChecked(false);
+  await page.el("reply-send").click();
+  await page.settle();
+  await replyButton(rowOf(page, "212")).click();
+  assert.equal(page.el("reply-text").value, "");
+  assert.equal(box().checked, false, "a sent reply's tick carried over");
+  await page.el("reply-cancel").click();
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(box().checked, true, "sending another message's reply cleared this draft's tick");
+});
