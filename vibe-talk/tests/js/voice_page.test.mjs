@@ -31300,8 +31300,10 @@ test("`#264 voice-send-approval`: unticking the box saves it on the server and r
   assert.equal(page.el("voice-ask-before-send").checked, false);
   assert.equal(page.el("voice-ask-before-send").disabled, false, "the box stayed locked after the save");
   assert.equal(page.el("voice-ask-before-send-state").textContent, VOICE_SEND_OFF);
-  // The server changes at once, and the line says so; only the agent's instructions wait.
-  assert.match(page.el("status").textContent, /server now posts as soon as the voice agent sends; its instructions change from its next call/);
+  // The server changes at once, and the line says so. The fixture's agent is hosted and has not
+  // been called, so whether its instructions follow is conditional, and the line says that too.
+  assert.match(page.el("status").textContent,
+    /server now posts as soon as the voice agent sends; its instructions follow at its next call only if its provider lets this page replace its prompt; otherwise paste the new one into its console by hand\.$/);
 
   // The server's answer is the truth, not the click: one that kept asking redraws the box ticked.
   page.voiceSettings = { ask_before_send: true, changeable: true };
@@ -49102,7 +49104,7 @@ test("`#271 settings-groups`: the Voice agent section holds sending, the instruc
   assert.equal(voice[0], "Sending", `the section opens on "${voice[0]}", not on whether the agent asks first`);
   const sending = settingsGroup("Sending");
   assert.match(sending, /id="voice-ask-before-send"/);
-  assert.match(sending, /<p class="hint">Untick it to let the agent send as soon as you ask, with no read-back\.<\/p>/,
+  assert.match(sending, /<p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back\.<\/p>/,
     "nothing beside the switch says it is the way to let the agent send without asking");
   assert.equal(voice[1], "Instructions", "the instructions are not beside the switch about sending");
 });
@@ -49168,7 +49170,9 @@ test("`#272 voice-agent-instructions`: the Instructions group is a box, a Save, 
   const help = helpEntry("voice-instructions");
   assert.match(help, /Neither box can change what the agent is able to do/);
   assert.match(help, /only the additional instructions, as a\s+note at the start of the call/);
-  assert.match(help, /exactly as it did before/);
+  assert.match(help, /given this server's prompt on\s+every call, even with nothing of yours saved/);
+  assert.match(help, /give such an agent the write token/);
+  assert.match(help, /starts exactly as it did\s+before/);
   assert.equal(PAGE_ELEMENTS.get("voice-prompt-editor").hidden, true, "the editor is served before the server says it exists");
 });
 
@@ -49183,6 +49187,9 @@ test("`#272 voice-agent-instructions`: the boxes show what the server holds, wit
   assert.equal(page.el("save-voice-system-prompt").disabled, true);
   assert.equal(page.el("restore-voice-system-prompt").disabled, true, "Restore is live on the shipped prompt");
   assert.match(page.el("voice-prompt-state").textContent, /hands them to the agent as each call starts; the prompt only if its provider lets it be replaced/);
+  // `#272`: the replaced prompt is always the write token's, and Settings says what that asks of
+  // the agent's own credential.
+  assert.match(page.el("voice-prompt-state").textContent, /A replaced prompt tells the agent it may send, so that agent needs the write token\./);
 
   const bridge = await instructionsPage({ delivery: "profile" });
   assert.equal(bridge.el("voice-prompt-state").textContent, "Both reach the agent at its next call.");
@@ -49225,7 +49232,8 @@ test("`#272 voice-agent-instructions`: saving the system prompt keeps an unsaved
   assert.equal(page.el("voice-system-prompt-state").textContent, "Your copy, in place of the shipped prompt.");
   assert.match(page.el("status").textContent, /gets your prompt from its next call/);
 
-  // Restore saves an empty box, and the server's shipped prompt comes back.
+  // Restore, tapped twice, saves an empty box, and the server's shipped prompt comes back.
+  await page.el("restore-voice-system-prompt").click();
   await page.el("restore-voice-system-prompt").click();
   await page.settle();
   assert.deepStrictEqual(page.voicePromptCalls[1], { system_prompt: "" });
@@ -49237,6 +49245,8 @@ test("`#272 voice-agent-instructions`: saving the system prompt keeps an unsaved
 test("`#272 voice-agent-instructions`: Restore with nothing saved puts the box back and writes nothing", async () => {
   const page = await instructionsPage();
   await page.el("voice-system-prompt").setValue("half an edit");
+  await page.el("restore-voice-system-prompt").click();
+  assert.equal(page.el("voice-system-prompt").value, "half an edit", "one tap threw the edit away");
   await page.el("restore-voice-system-prompt").click();
   await page.settle();
   assert.deepStrictEqual(page.voicePromptCalls, [], "putting back an unsaved edit wrote to the server");
@@ -49422,4 +49432,184 @@ test("`#272 voice-agent-instructions`: with resuming on, the standing instructio
   assert.equal(updates.length, 2, "the instructions or the record did not go");
   assert.equal(updates[0].text, NOTE.text, "the record went before the standing instructions");
   assert.ok(String(updates[1].text).includes(REPLAY_PREAMBLE), "the record of the earlier call did not follow");
+});
+
+// --- `#272 voice-agent-instructions`: what the send switch reaches, and the review's other findings ---
+
+const HOSTED_UNKNOWN =
+  "The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.";
+const HOSTED_KEPT =
+  "The server changes at once, but the last call's agent does not let this page replace its prompt: paste the new prompt into its provider's console by hand, and change post_reply's approval there to match.";
+const HOSTED_REPLACED =
+  "The server changes at once, and the last call's agent was given this server's prompt, so its instructions follow from its next call. Change post_reply's approval in its provider's console to match.";
+
+test("`#272 voice-agent-instructions`: beside the send switch, a hosted agent's warning that a prompt pasted by hand must be pasted again", async () => {
+  // In the markup, inside the switch's editor, served with the wording for not knowing.
+  const sending = settingsGroup("Sending");
+  const opens = sending.indexOf('<div id="voice-send-editor"');
+  assert.ok(opens > 0, "the switch has no editor");
+  const editor = sending.slice(opens, sending.indexOf("</div>", opens));
+  assert.ok(editor.includes(`<p id="voice-send-hosted" class="hint" hidden>${HOSTED_UNKNOWN}</p>`),
+    "the warning is not beside the switch");
+
+  // A hosted agent nobody has called yet: shown, conditional.
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("voice-send-hosted").hidden, false, "a hosted agent's switch says nothing about its console prompt");
+  assert.equal(page.el("voice-send-hosted").textContent, HOSTED_UNKNOWN);
+
+  // An older server that does not say how its prompt is delivered: shown, as the page always did.
+  const older = newPage();
+  older.voicePrompt = undefined;
+  await signIn(older);
+  assert.equal(older.el("voice-send-hosted").hidden, false);
+  assert.equal(older.el("voice-send-hosted").textContent, HOSTED_UNKNOWN);
+
+  // A bridge fetches the prompt as each call opens: nothing to paste, and no warning.
+  const bridge = newPage();
+  bridge.voicePrompt = voicePromptView({ delivery: "profile" });
+  await signIn(bridge);
+  assert.equal(bridge.el("voice-send-hosted").hidden, true, "a bridge was told to paste a prompt");
+  await bridge.el("voice-ask-before-send").setChecked(false);
+  await bridge.settle();
+  assert.match(bridge.el("status").textContent, /server now posts as soon as the voice agent sends; its instructions change from its next call\.$/);
+});
+
+test("`#272 voice-agent-instructions`: after a call, the warning and the saved line say whether that agent's prompt follows the switch", async () => {
+  // An agent that does not let its prompt be replaced keeps the console's: the owner must paste.
+  const kept = newPage();
+  kept.voicePrompt = voicePromptView({ instructions: "Call me Sam." });
+  await talkWithPrompt(kept, NOTE);
+  assert.equal(kept.el("voice-send-hosted").textContent, HOSTED_KEPT);
+  await kept.el("hang-up").click();
+  await kept.settle();
+  await kept.el("voice-ask-before-send").setChecked(false);
+  await kept.settle();
+  assert.match(kept.el("status").textContent,
+    /server now posts as soon as the voice agent sends; this agent keeps the prompt pasted into its provider's console, so paste the new one there by hand\.$/,
+    "the save claimed the agent's instructions change when nothing hands them over");
+
+  // An agent that took this server's prompt follows the switch; only the vendor's approval does not.
+  const replaced = newPage();
+  await talkWithPrompt(replaced, { ...OVERRIDE, system_prompt_applied: false, instructions_applied: false });
+  assert.equal(replaced.el("voice-send-hosted").textContent, HOSTED_REPLACED);
+  await replaced.el("hang-up").click();
+  await replaced.settle();
+  await replaced.el("voice-ask-before-send").setChecked(false);
+  await replaced.settle();
+  assert.match(replaced.el("status").textContent,
+    /its instructions follow from its next call; change post_reply's approval in its provider's console to match\.$/);
+});
+
+test("`#272 voice-agent-instructions`: the hint about unticking shows only while the box is ticked", async () => {
+  const ticked = newPage();
+  await signIn(ticked);
+  assert.equal(ticked.el("voice-send-untick").hidden, false);
+  await ticked.el("voice-ask-before-send").setChecked(false);
+  await ticked.settle();
+  assert.equal(ticked.el("voice-send-untick").hidden, true, "an unticked box still says to untick it");
+
+  const unticked = newPage();
+  unticked.voiceSettings = { ask_before_send: false, changeable: true };
+  await signIn(unticked);
+  assert.equal(unticked.el("voice-send-untick").hidden, true);
+});
+
+test("`#272 voice-agent-instructions`: a call given the shipped prompt in place of the console's says so under Instructions", async () => {
+  // Only instructions saved, and an agent that allows the override: the shipped base replaced the
+  // prompt pasted into its console, which the owner did not write and may not expect.
+  const instructions = newPage();
+  instructions.voicePrompt = voicePromptView({ instructions: "Call me Sam." });
+  await talkWithPrompt(instructions, { ...OVERRIDE, system_prompt_applied: false, instructions_applied: true });
+  assert.match(instructions.el("voice-prompt-state").textContent,
+    /The last call was given the shipped prompt with your instructions, in place of the prompt in its provider's console\.$/);
+
+  // Nothing saved: the shipped prompt went all the same, carrying the send rules for the switch.
+  const nothing = newPage();
+  await talkWithPrompt(nothing, { ...OVERRIDE, system_prompt_applied: false, instructions_applied: false });
+  assert.match(nothing.el("voice-prompt-state").textContent,
+    /The last call was given the shipped prompt, in place of the prompt in its provider's console\.$/);
+});
+
+test("`#272 voice-agent-instructions`: Restore asks twice before it deletes the owner's copy, and a lapse disarms it", async () => {
+  const page = await instructionsPage({ system_prompt: "mine, and long", system_prompt_edited: true, edited_from_version: 9 });
+  const restore = page.el("restore-voice-system-prompt");
+  await restore.click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls, [], "one tap deleted the owner's prompt");
+  assert.equal(restore.textContent, "Delete your copy?");
+  assert.equal(restore.className, "secondary armed");
+  assert.match(page.el("status").textContent, /Tap again to delete your copy/);
+  assert.match(cssBlock("#restore-voice-system-prompt.armed"), /color:\s*var\(--warn\)/, "armed looks like disarmed");
+
+  // Left alone, it disarms, and the next tap only arms it again.
+  assert.equal(page.expireTimers(CLEAR_ARMED_MS), 1, "nothing was scheduled to disarm it");
+  assert.equal(restore.textContent, "Restore the shipped prompt");
+  assert.equal(restore.className, "secondary");
+  await restore.click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls, [], "a tap after the lapse acted at once");
+
+  await restore.click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePromptCalls, [{ system_prompt: "" }]);
+  assert.equal(page.el("voice-system-prompt").value, SHIPPED_SYSTEM_PROMPT);
+  assert.equal(restore.textContent, "Restore the shipped prompt");
+  assert.equal(page.expireTimers(CLEAR_ARMED_MS), 0, "the arming outlived the restore");
+});
+
+test("`#272 voice-agent-instructions`: Settings is drawn only after a call's opening frames are sent, and cannot stop the call", async () => {
+  const page = newPage();
+  page.voicePrompt = voicePromptView({ instructions: "Call me Sam." });
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  page.setFetch(mintWithPrompt(NOTE));
+  await page.el("talk").click();
+  assert.equal(page.sockets.length, 1, "start() opened no websocket");
+  const socket = page.sockets[0];
+  // Settings' line breaks the moment it is drawn, and records how much had been sent by then.
+  let sentWhenDrawn = null;
+  Object.defineProperty(page.el("voice-prompt-state"), "textContent", {
+    configurable: true,
+    get: () => "",
+    set: () => {
+      sentWhenDrawn = socket.sent.length;
+      throw new Error("a settings screen that cannot draw");
+    },
+  });
+  socket.onopen();
+  assert.equal(state(page), "live", "a Settings line that could not draw stopped the call");
+  assert.equal(page.processors.length, 1, "capture never started");
+  assert.deepStrictEqual(framesSent(socket).slice(0, 2).map((f) => f.type),
+    ["conversation_initiation_client_data", "contextual_update"]);
+  assert.equal(sentWhenDrawn, 2, "Settings was drawn before the opening frames were sent");
+});
+
+test("`#272 voice-agent-instructions`: a resumed call whose prompt is replaced still gets the record, when resuming rides on the initiation", async () => {
+  const page = newPage();
+  page.replayTransport = "client_data";
+  await withEarlierConversation(page, { resume: true });
+  page.setFetch(mintWithPrompt(OVERRIDE));
+  await page.el("talk").click();
+  assert.equal(page.sockets.length, 1, "the call did not open");
+  const socket = page.sockets[0];
+  socket.onopen();
+  const initiation = initiationFrame(socket);
+  assert.equal(initiation.conversation_config_override.agent.prompt.prompt, OVERRIDE.text);
+  // Kept on the initiation, so nothing configured at the vendor goes missing...
+  assert.ok(String(initiation.dynamic_variables.vibe_talk_resume).includes("the mac runner stalled"));
+  // ...but the console prompt that had the placeholder was replaced, so the record goes as a note.
+  const record = resumeFrame(socket);
+  assert.ok(record, "the record of the earlier call reached nothing: its placeholder went with the replaced prompt");
+  assert.match(record.text, /the mac runner stalled mid-deploy/);
+
+  // An agent that keeps its prompt keeps its placeholder: the record rides on the initiation alone.
+  const kept = newPage();
+  kept.replayTransport = "client_data";
+  await withEarlierConversation(kept, { resume: true });
+  kept.setFetch(mintWithPrompt(NOTE));
+  await kept.el("talk").click();
+  kept.sockets[0].onopen();
+  assert.equal(resumeFrame(kept.sockets[0]), undefined, "the record went twice to an agent that keeps its prompt");
 });

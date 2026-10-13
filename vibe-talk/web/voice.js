@@ -10935,16 +10935,20 @@ async function openConversation(options) {
       initiation.conversation_config_override = { conversation: { text_only: true } };
     }
     // `#272 voice-agent-instructions`. The owner's words, in the form the server chose.
-    const promptNote = handOverAgentPrompt(initiation, voicePromptForCall);
+    const handed = handOverAgentPrompt(initiation, voicePromptForCall);
     socket.send(JSON.stringify(initiation));
-    if (promptNote) {
-      socket.send(JSON.stringify(promptNote));
+    if (handed.note) {
+      socket.send(JSON.stringify(handed.note));
     }
-    if (resume && !carriedOnInitiation) {
+    // A replaced prompt took any `{{vibe_talk_resume}}` placeholder in the console's with it, so a
+    // record carried on `dynamic_variables` would reach nothing: it goes as a note as well.
+    if (resume && (!carriedOnInitiation || handed.replaced)) {
       // Immediately after, and before any audio: the vendor documents this as non-interrupting
       // background information, and the first agent turn is the one that has to know.
       socket.send(JSON.stringify({ type: "contextual_update", text: resume.text }));
     }
+    // Only once the frames are on their way, and unable to throw into the rest of the start.
+    renderAfterHandOver();
     session.connected = true;
     conversationOpen = true;
     startPostWatch();
@@ -26685,6 +26689,10 @@ function renderVoiceSendSetting() {
     return;
   }
   box.checked = voiceSendSetting.ask_before_send;
+  // The way to send without asking, said only while asking is on: unticked, it would describe the
+  // state the box is not in.
+  el("voice-send-untick").hidden = !voiceSendSetting.ask_before_send;
+  renderVoiceSendHosted();
   const line = voiceSendSetting.ask_before_send ? VOICE_SEND_STATE.on : VOICE_SEND_STATE.off;
   if (tokenScope !== "write") {
     box.disabled = true;
@@ -26718,12 +26726,67 @@ async function saveVoiceSendSetting() {
   }
   voiceSendSaving = false;
   applyVoiceSendSetting(stored);
-  // The server obeys the new setting at once; only the agent's instructions wait for its next call.
+  // The server obeys the new setting at once. The agent's instructions follow only where something
+  // hands them over, which the clause says.
   setStatus(
     stored.ask_before_send
-      ? "Saved. The server now holds what the voice agent sends for your yes; its instructions change from its next call."
-      : "Saved. The server now posts as soon as the voice agent sends; its instructions change from its next call."
+      ? `Saved. The server now holds what the voice agent sends for your yes; ${voiceSendSavedClause()}`
+      : `Saved. The server now posts as soon as the voice agent sends; ${voiceSendSavedClause()}`
   );
+}
+
+/**
+ * Whether the agent's own instructions follow the switch, as far as this page knows. `#272
+ * voice-agent-instructions`. "bridge": a bridge fetches its prompt as each call opens. "replaced":
+ * the last call's hosted agent was handed this server's prompt. "kept": the last call's hosted
+ * agent does not let its prompt be replaced, so it keeps the one pasted into its console.
+ * "unknown": a hosted agent, and no call yet that said which — or an older server that does not say
+ * how the prompt is delivered.
+ */
+function agentPromptFollowsSwitch() {
+  if (voicePromptSettings !== null && voicePromptSettings.delivery === "profile") return "bridge";
+  const last = voicePromptLastCall;
+  if (last !== null && last.transport === "prompt_override") return "replaced";
+  if (last !== null && last.override_allowed === false) return "kept";
+  return "unknown";
+}
+
+/**
+ * Beside the switch, what it does not reach on a hosted agent. The server obeys the switch at once,
+ * but the agent's send rules are in its prompt, and its approval for post_reply is in its
+ * provider's console: the prompt follows only when this page may replace it, and the approval
+ * never does. Without this, an owner who unticked the box would hear the agent go on reading back
+ * messages the server had already posted.
+ */
+const VOICE_SEND_HOSTED = {
+  unknown:
+    "The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.",
+  kept:
+    "The server changes at once, but the last call's agent does not let this page replace its prompt: paste the new prompt into its provider's console by hand, and change post_reply's approval there to match.",
+  replaced:
+    "The server changes at once, and the last call's agent was given this server's prompt, so its instructions follow from its next call. Change post_reply's approval in its provider's console to match.",
+};
+
+/** Show the hosted-agent line beside the switch, worded from what is known; hidden for a bridge. */
+function renderVoiceSendHosted() {
+  const follows = agentPromptFollowsSwitch();
+  const hosted = el("voice-send-hosted");
+  hosted.hidden = follows === "bridge";
+  if (follows !== "bridge") hosted.textContent = VOICE_SEND_HOSTED[follows];
+}
+
+/** The end of the sentence a saved switch reports: when, and whether, the agent's instructions follow. */
+function voiceSendSavedClause() {
+  switch (agentPromptFollowsSwitch()) {
+    case "bridge":
+      return "its instructions change from its next call.";
+    case "replaced":
+      return "its instructions follow from its next call; change post_reply's approval in its provider's console to match.";
+    case "kept":
+      return "this agent keeps the prompt pasted into its provider's console, so paste the new one there by hand.";
+    default:
+      return "its instructions follow at its next call only if its provider lets this page replace its prompt; otherwise paste the new one into its console by hand.";
+  }
 }
 
 /** The box as clicked, held still until the server answers. */
@@ -26757,6 +26820,15 @@ let voicePromptForCall = null;
 
 /** What the last call this page opened on a hosted agent was handed, or null before one. */
 let voicePromptLastCall = null;
+
+/**
+ * While Restore is armed, the timer that disarms it; null when a tap would only arm it.
+ *
+ * Restore deletes the owner's own copy of the prompt — perhaps hours of his wording — so it asks
+ * twice, in the armed idiom Clear and the backlog's Clear use, with their window: the first tap
+ * changes its word and colour, and only a second tap within that window acts.
+ */
+let restoreArmedTimer = null;
 
 /** The characters in a box, counted as the server counts them: by code point, after trimming. */
 const promptChars = (text) => [...String(text).trim()].length;
@@ -26826,7 +26898,12 @@ function voiceSystemPromptLine(dirty) {
 /** How the words reach this deployment's agent. */
 function voicePromptDeliveryLine() {
   if (voicePromptSettings.delivery === "profile") return "Both reach the agent at its next call.";
-  return "This page hands them to the agent as each call starts; the prompt only if its provider lets it be replaced.";
+  // `#272`: the replaced prompt is always the write token's, because this server cannot see the
+  // token the agent was given in its provider's console.
+  return (
+    "This page hands them to the agent as each call starts; the prompt only if its provider lets it be replaced. " +
+    "A replaced prompt tells the agent it may send, so that agent needs the write token."
+  );
 }
 
 /** What the last call was given, said plainly — above all an edited prompt that did not reach it. */
@@ -26838,12 +26915,16 @@ function voicePromptLastCallLine() {
       ? "The last call's agent does not let its prompt be replaced"
       : "Whether the last call's agent lets its prompt be replaced could not be checked";
   if (last.transport === "prompt_override") {
-    const what = last.system_prompt_applied
-      ? last.instructions_applied
-        ? "your prompt and instructions"
-        : "your prompt"
-      : "your instructions";
-    return `The last call was given ${what}.`;
+    if (last.system_prompt_applied) {
+      return last.instructions_applied
+        ? "The last call was given your prompt and instructions."
+        : "The last call was given your prompt.";
+    }
+    // The whole prompt was replaced all the same: with no copy of his, by the shipped one, and the
+    // prompt pasted into the provider's console did not reach the agent.
+    return last.instructions_applied
+      ? "The last call was given the shipped prompt with your instructions, in place of the prompt in its provider's console."
+      : "The last call was given the shipped prompt, in place of the prompt in its provider's console.";
   }
   if (last.transport === "contextual_update") {
     return `${refused}, so only your instructions went, as a note at the start.`;
@@ -26853,6 +26934,9 @@ function voicePromptLastCallLine() {
 
 /** Draw both boxes, their Saves and the lines under them from `voicePromptSettings`. */
 function renderVoicePrompt() {
+  // The line beside the send switch is worded from the same knowledge: how the prompt is delivered,
+  // and what the last call was given.
+  renderVoiceSendHosted();
   const state = el("voice-prompt-state");
   el("voice-prompt-editor").hidden = voicePromptSettings === null;
   if (voicePromptSettings === null) {
@@ -26870,8 +26954,19 @@ function renderVoicePrompt() {
   el("save-voice-system-prompt").disabled =
     held || !dirty.system_prompt ||
     promptChars(el("voice-system-prompt").value) > voicePromptSettings.max_system_prompt_chars;
-  el("restore-voice-system-prompt").disabled =
-    held || (!voicePromptSettings.system_prompt_edited && !dirty.system_prompt);
+  const restore = el("restore-voice-system-prompt");
+  restore.disabled = held || (!voicePromptSettings.system_prompt_edited && !dirty.system_prompt);
+  if (restore.disabled && restoreArmedTimer !== null) {
+    clearTimeout(restoreArmedTimer);
+    restoreArmedTimer = null;
+  }
+  const armed = restoreArmedTimer !== null;
+  restore.className = armed ? "secondary armed" : "secondary";
+  restore.textContent = !armed
+    ? "Restore the shipped prompt"
+    : voicePromptSettings.system_prompt_edited
+      ? "Delete your copy?"
+      : "Discard your edit?";
   el("voice-instructions-state").textContent = voiceInstructionsLine(dirty.instructions);
   el("voice-system-prompt-state").textContent = voiceSystemPromptLine(dirty.system_prompt);
   state.textContent = [lock, voicePromptDeliveryLine(), voicePromptLastCallLine()].filter(Boolean).join(" ");
@@ -26902,18 +26997,41 @@ async function saveVoicePrompt(field, text) {
         ? "Saved. The voice agent gets these instructions from its next call."
         : "Saved. The voice agent has no additional instructions from its next call."
     );
+  } else if (!stored.system_prompt_edited) {
+    setStatus("Saved. The voice agent gets the shipped prompt from its next call.");
   } else {
+    // His copy reaches a hosted agent only if the agent lets this page replace its prompt.
+    const follows = agentPromptFollowsSwitch();
     setStatus(
-      stored.system_prompt_edited
-        ? "Saved. The voice agent gets your prompt from its next call."
-        : "Saved. The voice agent gets the shipped prompt from its next call."
+      follows === "kept"
+        ? "Saved, but the last call's agent does not let this page replace its prompt, so your prompt will not reach it; your instructions still do."
+        : follows === "unknown"
+          ? "Saved. The voice agent gets your prompt from its next call if its provider lets this page replace its prompt."
+          : "Saved. The voice agent gets your prompt from its next call."
     );
   }
+}
+
+function disarmRestore() {
+  restoreArmedTimer = null;
+  renderVoicePrompt();
 }
 
 /** Back to the shipped prompt: a save of an empty box, or just the box put back when nothing was saved. */
 async function restoreVoiceSystemPrompt() {
   if (voicePromptSettings === null) return;
+  if (restoreArmedTimer === null) {
+    restoreArmedTimer = setTimeout(disarmRestore, CLEAR_ARMED_MS);
+    renderVoicePrompt();
+    setStatus(
+      voicePromptSettings.system_prompt_edited
+        ? "Tap again to delete your copy of the prompt and go back to the shipped one."
+        : "Tap again to throw away your edit and put the shipped prompt back."
+    );
+    return;
+  }
+  clearTimeout(restoreArmedTimer);
+  restoreArmedTimer = null;
   if (!voicePromptSettings.system_prompt_edited) {
     el("voice-system-prompt").value = voicePromptSettings.system_prompt;
     renderVoicePrompt();
@@ -26924,28 +27042,48 @@ async function restoreVoiceSystemPrompt() {
 
 /**
  * Put the owner's words on a hosted agent's opening frames, in the form the server chose, and
- * remember what this call was given. Answers the frame to send right after the initiation, or null.
+ * remember what this call was given. Answers `note`, the frame to send right after the initiation
+ * or null, and `replaced`, whether the initiation now replaces the agent's own prompt.
  *
  * `prompt_override` rides on the initiation itself, beside a typed call's text-only request; the
  * server names it only when the agent's own configuration allows it, because one it does not allow
  * is believed to end the conversation. `contextual_update` is a note sent straight after, as
  * resuming's record is. Anything else sends nothing, and an absent `handed` leaves the frame exactly
  * as it always was.
+ *
+ * It draws nothing. It runs inside the socket's open handler before the initiation is sent, and
+ * Settings is redrawn only after the frames are (`renderAfterHandOver`), so drawing Settings can
+ * never stand between the owner and his call.
  */
 function handOverAgentPrompt(initiation, handed) {
   voicePromptLastCall = handed && typeof handed.transport === "string" ? handed : null;
-  renderVoicePrompt();
-  if (voicePromptLastCall === null || typeof handed.text !== "string" || handed.text === "") return null;
+  const nothing = { note: null, replaced: false };
+  if (voicePromptLastCall === null || typeof handed.text !== "string" || handed.text === "") return nothing;
   if (handed.transport === "prompt_override") {
     const override = initiation.conversation_config_override || {};
     initiation.conversation_config_override = {
       ...override,
       agent: { ...(override.agent || {}), prompt: { prompt: handed.text } },
     };
-    return null;
+    return { note: null, replaced: true };
   }
-  if (handed.transport === "contextual_update") return { type: "contextual_update", text: handed.text };
-  return null;
+  if (handed.transport === "contextual_update") {
+    return { note: { type: "contextual_update", text: handed.text }, replaced: false };
+  }
+  return nothing;
+}
+
+/**
+ * Redraw Settings' lines about what the call was given, once its opening frames are sent. A
+ * failure here is caught and noted rather than allowed out: the rest of the open handler — the
+ * call going live, the microphone starting — must not depend on a settings screen drawing.
+ */
+function renderAfterHandOver() {
+  try {
+    renderVoicePrompt();
+  } catch (error) {
+    addDetail(`Settings could not show what this call was given: ${String((error && error.message) || error)}`);
+  }
 }
 
 // --- replying to a channel message -------------------------------------------------------------
