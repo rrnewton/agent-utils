@@ -1210,3 +1210,58 @@ def test_the_audit_publishes_each_slot_once_even_from_several_routes() -> None:
     # First-seen order, so the report is stable between runs.
     assert cli._first_seen_names(["b", "a", "b"]) == ["b", "a"]
     assert cli._first_seen_names([]) == []
+
+
+def exiting_init_proc(
+    proc_root: Path, pid: int = 2991802, *, wchan: str = "zap_pid_ns_processes",
+    nspid: str = "2991802\t1", cwd: str | None = None,
+) -> Path:
+    """The measured shape of a PID-namespace init being torn down.
+
+    Its wait channel is zap_pid_ns_processes and its cwd, root and ns/mnt
+    are gone (ENOENT): the kernel released them before it began to wait.
+    """
+    pid_dir = proc_root / str(pid)
+    (pid_dir / "ns").mkdir(parents=True)
+    (pid_dir / "stat").write_bytes(opaque_stat(pid, 1, flags=0, start_ticks=99))
+    uid = os.getuid()
+    (pid_dir / "status").write_text(
+        f"Name:\tpidns_recheck\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        f"NSpid:\t{nspid}\n", encoding="ascii")
+    (pid_dir / "cgroup").write_text("0::/fixture\n", encoding="ascii")
+    (pid_dir / "wchan").write_text(wchan, encoding="ascii")
+    if cwd is not None:
+        (pid_dir / "cwd").symlink_to(cwd)
+    return pid_dir
+
+
+def test_an_exiting_namespace_init_holds_no_checkout(tmp_path: Path, capsys) -> None:
+    # 2026-10-13: every `wrkslots remove <validate-fresh-...> --validate-complete`
+    # refused "mount namespace is indeterminate for live PID 2991802", a
+    # namespace init stuck in zap_pid_ns_processes, and 49 GB of finished
+    # validation checkouts could not be removed.
+    proc_root = tmp_path / "proc"
+    exiting_init_proc(proc_root)
+    assert cli._absent_validate_process_snapshot(proc_root) == ()
+    budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=30, stdout_limit=1 << 20,
+                                              stderr_limit=1 << 20)
+    assert cli._same_uid_process_observations(budget, proc_root) == ()
+    err = capsys.readouterr().err
+    assert "PID 2991802 (pidns_recheck) is a PID-namespace init being torn down" in err
+
+
+@pytest.mark.parametrize("near_miss", [
+    {"wchan": "do_wait"},                   # same name, not tearing down: still refused
+    {"nspid": "2991802\t7"},               # not the init of its namespace
+    {"cwd": "/home/somewhere/checkout"},   # still holds a working directory
+], ids=["other-wait-channel", "not-a-namespace-init", "cwd-still-held"])
+def test_a_near_miss_of_an_exiting_namespace_init_is_still_refused(
+        tmp_path: Path, near_miss: dict[str, str]) -> None:
+    proc_root = tmp_path / "proc"
+    exiting_init_proc(proc_root, **near_miss)
+    with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991802"):
+        cli._absent_validate_process_snapshot(proc_root)
+    budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=30, stdout_limit=1 << 20,
+                                              stderr_limit=1 << 20)
+    with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991802"):
+        cli._same_uid_process_observations(budget, proc_root)

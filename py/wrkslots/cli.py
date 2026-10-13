@@ -46441,6 +46441,49 @@ def _process_start_ticks(pid_dir: Path) -> int | None:
     return None if process_stat is None else process_stat.start_ticks
 
 
+def _process_is_exiting_namespace_init(pid_dir: Path) -> bool:
+    """Is this process a PID-namespace init being torn down, holding nothing?
+
+    The kernel's exit path (do_exit) releases a task's files, its
+    filesystem context and its namespaces (exit_files, exit_fs,
+    exit_task_namespaces) before exit_notify looks for a child reaper; an
+    exiting namespace init then waits in zap_pid_ns_processes until every
+    other process of its namespace is gone. Such a task can hold no
+    checkout: it has no open files, no working directory or root, and no
+    mount namespace, which is why its mount namespace reads as absent.
+    Required, each from /proc: the wait channel is zap_pid_ns_processes;
+    the innermost NSpid is 1; and cwd, root and ns/mnt each read as ENOENT
+    (released), not as a permission error. Anything else is not exempt.
+    """
+    try:
+        wchan = (pid_dir / "wchan").read_text(encoding="ascii", errors="replace").strip()
+        status = _read_process_status(pid_dir)
+    except (OSError, UnicodeError, Refusal):
+        return False
+    if wchan != "zap_pid_ns_processes":
+        return False
+    nspid = [line.split()[1:] for line in status.split("\n") if line.startswith("NSpid:")]
+    if not nspid or not nspid[0] or nspid[0][-1] != "1":
+        return False
+    for released in ("cwd", "root", "ns/mnt"):
+        try:
+            os.readlink(pid_dir / released)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        return False
+    names = [line.split(":", 1)[1].strip() for line in status.split("\n")
+             if line.startswith("Name:")]
+    print(
+        f"wrkslots: PID {pid_dir.name} ({names[0] if names else '?'}) is a PID-namespace "
+        "init being torn down (wchan zap_pid_ns_processes; cwd, root and mount namespace "
+        "already released), so it cannot hold a checkout; not counted as an occupant",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _process_is_zombie(
     pid_dir: Path, *, generation: _ProcessStat | None = None,
 ) -> bool:
@@ -46515,6 +46558,8 @@ def _absent_validate_process_snapshot(
             if _process_is_zombie(pid_dir):
                 continue
             if _process_start_ticks(pid_dir) is None:
+                continue
+            if _process_is_exiting_namespace_init(pid_dir):
                 continue
             raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
         current_generation = _read_process_stat(pid_dir)
@@ -47629,6 +47674,8 @@ def _same_uid_process_observations(
             raise
         if mount_namespace is None:
             if _process_is_zombie(pid_dir) or _process_start_ticks(pid_dir) is None:
+                continue
+            if _process_is_exiting_namespace_init(pid_dir):
                 continue
             raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
         current_generation = _read_process_stat(pid_dir)
