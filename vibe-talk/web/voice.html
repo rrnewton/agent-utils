@@ -1473,7 +1473,7 @@
                   <input id="voice-ask-before-send" type="checkbox" checked />
                   Ask me before the voice agent sends
                 </label>
-                <p class="hint">Takes effect from the agent's next call. An agent whose prompt was pasted into a provider console by hand needs the new prompt pasted again.</p>
+                <p class="hint">The server changes at once; the agent's instructions change from its next call, so change this between calls. An agent whose prompt was pasted into a provider console by hand needs the new prompt pasted again.</p>
               </div>
               <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
             </section>
@@ -2092,23 +2092,28 @@
               <summary><h2>Asking before the voice agent sends</h2></summary>
               <p class="hint">
                 On, which is how this server ships, the voice agent never posts by itself. When you
-                ask it to send something it drafts the message, reads it back word for word and
-                asks <em>Send it?</em>. A card shows the exact text. Tap <strong>Send</strong>, or
-                answer with a plain <em>yes</em>, <em>yeah</em>, <em>yep</em>, <em>send it</em>,
-                <em>do it</em>, <em>go ahead</em>, <em>sure</em> or <em>please do</em> — one word
-                of filler such as <em>yes please</em> is fine. This page, not the agent, decides
-                that you said yes: only right after a read-back that you heard to the end without
-                interrupting, only for the draft this call made, and only if the read-back said
-                every word of the card. <em>No</em>, <em>cancel</em>, <em>stop</em> or
-                <em>wait</em> withdraws the draft. Anything longer — "yes, and tell him I'm late" —
-                sends nothing. The page then tells the agent, and you, whether it was sent.
+                ask it to send something it drafts the message and reads it back in one fixed
+                form — <em>To lead team: on it, rebasing now. Send it?</em> — and a card shows the
+                exact text. Tap <strong>Send</strong>, or answer with a plain <em>yes</em>,
+                <em>yeah</em>, <em>yep</em>, <em>do it</em>, <em>go ahead</em>, <em>sure</em> or
+                <em>please do</em> — one word of filler such as <em>yes please</em> is fine.
+                <em>Send it</em> works too, but not straight after the question, where it could be
+                the agent's own voice. This page, not the agent, decides that you said yes: only as
+                your very next answer after a read-back that you heard to the end without
+                interrupting, only for the draft this call made, and only if the read-back was the
+                card's text word for word with nothing added. If anything else was said in between,
+                ask the agent to read it back again. <em>No</em>, <em>cancel</em>, <em>stop</em> or
+                <em>wait</em> withdraws the draft, and so does any answer that starts with one of
+                them. Anything longer — "yes, and tell him I'm late" — sends nothing. The page then
+                tells the agent, and you, whether it was sent; a typed yes never sends.
               </p>
               <p class="hint">
                 It cannot tell your voice from anyone else's: a passenger or the radio saying
                 <em>yeah</em> straight after a read-back counts as you. A short word is also the
-                easiest for speech recognition to mishear. Links, code and numbers are rarely read
-                out exactly, so those drafts need a tap. Spoken yes needs echo cancellation on, so
-                the agent's own <em>Send it?</em> is not heard as your answer.
+                easiest for speech recognition to mishear. Drafts with a mention, a link, code or
+                numbers are rarely read out exactly, so those need a tap. The read-back names the
+                channel, not the message a reply answers; the card shows that. Spoken yes needs echo
+                cancellation on, so the agent's own <em>Send it?</em> is not heard as your answer.
               </p>
               <p class="hint">
                 Off, the agent posts as soon as you ask, and tells you once the server says it was

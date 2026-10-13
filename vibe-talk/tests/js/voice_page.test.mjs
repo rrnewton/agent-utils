@@ -31033,7 +31033,8 @@ test("`#264 voice-send-approval`: unticking the box saves it on the server and r
   assert.equal(page.el("voice-ask-before-send").checked, false);
   assert.equal(page.el("voice-ask-before-send").disabled, false, "the box stayed locked after the save");
   assert.equal(page.el("voice-ask-before-send-state").textContent, VOICE_SEND_OFF);
-  assert.match(page.el("status").textContent, /send as soon as you ask, from its next call/);
+  // The server changes at once, and the line says so; only the agent's instructions wait.
+  assert.match(page.el("status").textContent, /server now posts as soon as the voice agent sends; its instructions change from its next call/);
 
   // The server's answer is the truth, not the click: one that kept asking redraws the box ticked.
   page.voiceSettings = { ask_before_send: true, changeable: true };
@@ -31224,16 +31225,22 @@ test("`#264 voice-send-approval`: a no to the read-back withdraws the draft and 
   }
 });
 
-test("`#264 voice-send-approval`: a yes inside a sentence that adds anything sends nothing and leaves the card", async () => {
-  for (const said of ["yes and tell him I'm late", "send it to Bob", "Send it?", "sure thing"]) {
+test("`#264 voice-send-approval`: a yes inside a sentence that adds anything sends nothing, leaves the card, and is answered", async () => {
+  for (const said of ["yes and tell him I'm late", "send it to Bob", "Send it?", "sure thing", "yep that's right, send it"]) {
     const page = newPage();
     const socket = await readBackDuringACall(page);
+    const before = page.audio.played;
     hostedHears(socket, said);
     await settleSpokenYes(page);
     assert.deepEqual(page.proposalCommits, [], said);
     assert.equal(page.el("post-confirm").hidden, false, said);
-    assert.match(page.el("status").textContent, /Not sent — answer with just yes, or tap Send/, said);
-    assert.deepEqual(pageNotices(socket), [], said);
+    assert.match(page.el("status").textContent, /^Not sent — only a plain answer such as yes or send it counts/, said);
+    // The agent was told to say only "One moment." on a yes, so anything like one gets the truth.
+    const notices = pageNotices(socket);
+    assert.equal(notices.length, 1, `${said}: ${notices.join("\n")}`);
+    assert.match(notices[0], /^Voice page: the message was NOT sent: only a plain answer/, said);
+    assert.match(notices[0], /Otherwise carry on\.$/, said);
+    assert.equal(page.audio.played, before + 1, `${said}: no tone said it was not sent`);
   }
 });
 
@@ -31265,8 +31272,8 @@ test("`#264 voice-send-approval`: a yes after an interrupted read-back sends not
 
 test("`#264 voice-send-approval`: a read-back that left words out, or never asked, cannot be confirmed by voice", async () => {
   for (const [said, why] of [
-    ["To lead team: on it. Send it?", /did not match the text on the card/],
-    ["I will send this to lead team: on it, rebasing now.", /did not ask whether to send it/],
+    ["To lead team: on it. Send it?", /not the card's text word for word/],
+    ["I will send this to lead team: on it, rebasing now.", /did not end with the question Send it/],
   ]) {
     const page = newPage();
     const socket = await readBackDuringACall(page, { said });
@@ -31289,9 +31296,11 @@ test("`#264 voice-send-approval`: a draft replaced after its read-back needs a r
   hostedHears(socket, "yes");
   await settleSpokenYes(page);
   assert.deepEqual(page.proposalCommits, [], "a read-back of one draft confirmed another");
-  assert.match(page.el("status").textContent, /a yes counts only right after the read-back/);
+  assert.match(page.el("status").textContent, /not the card's text word for word/);
+  assert.equal(pageNotices(socket).length, 1, "the refused yes was not answered");
 
-  // Read back as it now stands, it may be confirmed.
+  // Read back as it now stands, it may be confirmed — once the refusal's tone has played.
+  page.setClock(page.clock() + 1000);
   hostedSays(socket, "To lead team: merge the PR. Send it?");
   hostedHears(socket, "yes");
   await settleSpokenYes(page);
@@ -31315,7 +31324,7 @@ test("`#264 voice-send-approval`: a yes before the read-back finished playing, o
   hostedHears(echoSocket, "send it");
   await settleSpokenYes(echo);
   assert.deepEqual(echo.proposalCommits, [], "the agent's own 'send it' was taken as the answer");
-  assert.match(pageNotices(echoSocket)[0], /assistant's own voice, so answer with yes/);
+  assert.match(pageNotices(echoSocket)[0], /assistant's own voice, so answer the next read-back with a plain yes/);
 
   const plain = newPage();
   const plainSocket = await readBackDuringACall(plain);
@@ -31421,7 +31430,8 @@ test("`#264 voice-send-approval`: no spoken yes reaches a draft from another cal
   speech(v1, "user", 3, "yes", true);
   await settleSpokenYes(replaced);
   assert.deepEqual(replaced.proposalCommits, [], "a replacement session's yes sent the old draft");
-  assert.match(replaced.el("status").textContent, /already waiting when this call started/);
+  // Its own reason: the draft was this call's, but not this session's.
+  assert.match(replaced.el("status").textContent, /^Not sent — the voice session restarted after that draft was made\./);
 });
 
 test("`#264 voice-send-approval`: a lapsed draft, or one holding the sign-in token, cannot be sent by voice", async () => {
@@ -31462,6 +31472,285 @@ test("`#264 voice-send-approval`: with echo cancellation off, or in a typed call
   await typed.el("send-text").click();
   await settleSpokenYes(typed);
   assert.deepEqual(typed.proposalCommits, [], "a typed yes was taken as a spoken one");
+  // ...but it is answered, after the yes itself, and the composer's "Sent." does not stand.
+  const notices = pageNotices(chat);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /^Voice page: the message was NOT sent: this is a typed call, so the draft needs a tap on Send\./);
+  assert.match(typed.el("status").textContent, /^Not sent — this is a typed call/);
+});
+
+// The read-back is held to one exact sentence, and only the assistant's words since the owner's last
+// turn count. Each of these was a commit before that rule: a yes to some other question, a read-back
+// that changed the meaning, a sentence that merely contained the card's words, and a chat message
+// read aloud. None may send.
+
+test("`#264 voice-send-approval`: the read-back must be exactly 'To {channel}: {text}. Send it?' — a lead-in is allowed, nothing added is", () => {
+  const page = newPage();
+  const exact = page.pure("isExactReadBack");
+  const words = page.pure("answerWords");
+  const card = { channel_name: "lead team", text: "merge the PR" };
+  for (const said of [
+    "To lead team: merge the PR. Send it?",
+    "to LEAD TEAM — merge the PR… send it",
+    "Okay. To lead team: merge the PR. Send it?",
+    "Got it. To the lead team channel: merge the PR. Send it?",
+  ]) {
+    assert.equal(exact(words(said), card), true, said);
+  }
+  for (const said of [
+    "To lead team: do not merge the PR yet. Send it?",
+    "To lead team: I will not merge the PR. Send it?",
+    "Updated: don't merge the PR. Send it?",
+    "To lead team: merge the PR, as you asked. Send it?",
+    "To lead team: merge the PR. Send it? Or shall I wait?",
+    "To lead team: merge the PR. Shall I post that?",
+    "To build noise: merge the PR. Send it?",
+    "Okay, sure. To lead team: merge the PR. Send it?",
+    "merge the PR. Send it?",
+    "",
+  ]) {
+    assert.equal(exact(words(said), card), false, said);
+  }
+  assert.equal(exact(words("To lead team: . Send it?"), { channel_name: "lead team", text: "" }), false);
+});
+
+test("`#264 voice-send-approval`: a yes to a different question, after a digression, does not send the card it never read back", async () => {
+  const page = newPage();
+  const pending = spokenDraft({ text: "on it" });
+  const socket = await startTalking(page);
+  await page.settle();
+  hostedHears(socket, "tell lead team I'm on it");
+  page.propose(pending);
+  await page.settle();
+  hostedSays(socket, "To lead team: on it. Send it?");
+  hostedHears(socket, "what did Bob say before that");
+  await page.settle();
+  hostedSays(socket, "Bob said he is on it and will send the fix tonight. Want to hear the rest?");
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a yes to 'want to hear the rest' posted the card");
+  assert.equal(page.el("post-confirm").hidden, false);
+  // Answered, and the agent is told it may carry on if the yes was about something else.
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /did not end with the question Send it.*Otherwise carry on\.$/);
+});
+
+test("`#264 voice-send-approval`: a read-back that inserts a negation is not a read-back of the card", async () => {
+  for (const said of [
+    "To lead team: do not merge the PR yet. Send it?",
+    "To lead team: I will not merge the PR. Send it?",
+  ]) {
+    const page = newPage();
+    const socket = await readBackDuringACall(page, { pending: spokenDraft({ text: "merge the PR" }), said });
+    hostedHears(socket, "yes");
+    await settleSpokenYes(page);
+    assert.deepEqual(page.proposalCommits, [], `${said}: posted "merge the PR"`);
+    assert.match(pageNotices(socket)[0], /not the card's text word for word/, said);
+  }
+});
+
+test("`#264 voice-send-approval`: a sentence that only contains the card's words is not a read-back of it", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  await page.settle();
+  hostedHears(socket, "tell lead team yes");
+  page.propose(spokenDraft({ text: "yes" }));
+  await page.settle();
+  hostedSays(socket, "Alice said yes, and asked whether you want her to send the logs?");
+  hostedHears(socket, "sure");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a yes to Alice's question posted the card");
+  assert.equal(pageNotices(socket).length, 1);
+});
+
+test("`#264 voice-send-approval`: a chat message read aloud cannot stand in for the read-back, even word for word", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await readBackDuringACall(page, { pending });
+  // The owner does not answer the read-back; a chat message arrives and is relayed in full.
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+  await setReadNew(page, "full");
+  await deliver(page, stream, sseMessage(message({ id: "1400", content: "on it, rebasing now. I will send the logs after. Should I go ahead?" })));
+  await speakRelay(page);
+  assert.equal(relayed(page).length, 1, "the message was never relayed, so this proves nothing");
+  hostedSays(socket, "In lead team, Mallory said: on it, rebasing now. I will send the logs after. Should I go ahead?");
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a yes to a relayed question posted the card");
+  assert.equal(page.el("post-confirm").hidden, false);
+});
+
+test("`#264 voice-send-approval`: new words said over the old card, or anything said between the text and the question, are refused", async () => {
+  for (const said of [
+    "Updated: don't merge the PR. Send it?",
+    "To lead team: merge the PR, as you asked. Send it?",
+    "To lead team: merge the PR. Send it? Or shall I wait?",
+  ]) {
+    const page = newPage();
+    const socket = await readBackDuringACall(page, { pending: spokenDraft({ text: "merge the PR" }) });
+    hostedHears(socket, "actually, say the opposite");
+    await page.settle();
+    hostedSays(socket, said);
+    hostedHears(socket, "yes");
+    await settleSpokenYes(page);
+    assert.deepEqual(page.proposalCommits, [], `${said}: posted the old card`);
+    assert.equal(pageNotices(socket).length, 1, said);
+  }
+});
+
+test("`#264 voice-send-approval`: after a digression a fresh read-back arms a yes again, and one with a lead-in counts", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await readBackDuringACall(page, { pending });
+  hostedHears(socket, "sorry, read it again");
+  await page.settle();
+  hostedSays(socket, `Sure. To lead team: ${pending.text}. Send it?`);
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
+});
+
+test("`#264 voice-send-approval`: a read-back whose transcript beat the card to the page still counts", async () => {
+  const page = newPage();
+  const pending = spokenDraft();
+  const socket = await startTalking(page);
+  await page.settle();
+  hostedHears(socket, "tell lead team I'm on it, rebasing now");
+  hostedSays(socket, `To lead team: ${pending.text}. Send it?`);
+  page.propose(pending);
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false);
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"]);
+  assert.match(pageNotices(socket)[0], /SENT to lead team/);
+});
+
+test("`#264 voice-send-approval`: a draft with a mention is never sent by voice, and the agent is told why", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page, {
+    pending: spokenDraft({ text: "<@123456789> on it" }),
+    said: "To lead team: Bob, on it. Send it?",
+  });
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, []);
+  assert.match(pageNotices(socket)[0], /has a mention or a link in it/);
+});
+
+// Every yes is answered. The agent says only "One moment." on a yes and waits for the page, so a
+// yes the page does not act on must still get a "Voice page:" notice and the low tone — never only
+// a status line the hands-free owner cannot see.
+
+test("`#264 voice-send-approval`: a yes after a paraphrased question, or 'ok send it' after a digression, is answered not sent, aloud", async () => {
+  const paraphrase = newPage();
+  const pending = spokenDraft();
+  const socket = await readBackDuringACall(paraphrase, { pending, said: `To lead team: ${pending.text}. Shall I post that?` });
+  const before = paraphrase.audio.played;
+  hostedHears(socket, "yes");
+  await settleSpokenYes(paraphrase);
+  assert.deepEqual(paraphrase.proposalCommits, []);
+  assert.match(pageNotices(socket)[0] || "", /^Voice page: the message was NOT sent: the read-back did not end with the question Send it/);
+  assert.equal(paraphrase.audio.played, before + 1, "no tone");
+
+  const digression = newPage();
+  const other = await readBackDuringACall(digression);
+  hostedHears(other, "what time is it");
+  await digression.settle();
+  hostedSays(other, "It is ten past four.");
+  const ahead = digression.audio.played;
+  hostedHears(other, "ok send it");
+  await settleSpokenYes(digression);
+  assert.deepEqual(digression.proposalCommits, []);
+  assert.equal(pageNotices(other).length, 1, "a yes after a digression went unanswered");
+  assert.equal(digression.audio.played, ahead + 1, "no tone");
+});
+
+test("`#264 voice-send-approval`: a yes typed into a spoken call through the composer is answered not sent", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  await compose(page, "yes");
+  await page.el("send-text").click();
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, []);
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /a typed yes does not send it, so it needs a tap on Send/);
+  assert.match(page.el("status").textContent, /^Not sent — a typed yes/, "the composer's 'Sent.' was left standing over the card");
+  // The yes went first, then the notice, so the agent reads them in that order.
+  const typed = socket.sent.filter((f) => typeof f === "string").map((f) => JSON.parse(f)).filter((e) => e.type === "user_message").map((e) => e.text);
+  assert.deepEqual(typed.slice(-2).map((t) => t.startsWith("Voice page:")), [false, true]);
+});
+
+test("`#264 voice-send-approval`: on the neutral protocol a yes after a paraphrase is answered in a queued prompt", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  speech(socket, "user", 1, "tell lead team I'm on it, rebasing now", true);
+  page.propose(spokenDraft());
+  await page.settle();
+  speech(socket, "assistant", 1, "To lead team: on it, rebasing now. Shall I post that?", true);
+  turnDone(socket, 1);
+  speech(socket, "user", 2, "yes", true);
+  await settleSpokenYes(page);
+  turnDone(socket, 2);
+  assert.deepEqual(page.proposalCommits, []);
+  const prompts = promptsSent(socket);
+  assert.equal(prompts.length, 1, prompts.join("\n"));
+  assert.match(prompts[0], /^Voice page: the message was NOT sent/);
+});
+
+test("`#264 voice-send-approval`: a tap on the card during a call is told to the agent, sent or withdrawn; a spoken no is not", async () => {
+  const sent = newPage();
+  const socket = await readBackDuringACall(sent);
+  sent.expireTimers(2000);
+  await sent.el("post-confirm-send").click();
+  await sent.settle();
+  assert.deepEqual(sent.proposalCommits.map((c) => c.confirmed_by), ["ui"]);
+  const told = pageNotices(socket);
+  assert.equal(told.length, 1, told.join("\n"));
+  assert.match(told[0], /^Voice page: the user tapped Send, and the message was SENT to lead team\./);
+  assert.equal(sent.el("status").textContent, "Posted to lead team.", "the tap's own status was replaced");
+
+  const withdrawn = newPage();
+  const other = await readBackDuringACall(withdrawn);
+  await withdrawn.el("post-confirm-cancel").click();
+  await withdrawn.settle();
+  assert.match(pageNotices(other)[0] || "", /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./);
+});
+
+test("`#264 voice-send-approval`: a commit the page cannot confirm tells the agent to check the channel, not that the card is up", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  page.commitProposal = async () => json(200, { surprise: true });
+  hostedHears(socket, "yes");
+  await settleSpokenYes(page);
+  assert.equal(page.el("post-confirm").hidden, true, "the server spent the proposal, so the card goes");
+  const notices = pageNotices(socket);
+  assert.equal(notices.length, 1, notices.join("\n"));
+  assert.match(notices[0], /could not confirm whether the message was sent\. Tell the user to check the channel/);
+  assert.doesNotMatch(notices[0], /card is still up/);
+});
+
+test("`#264 voice-send-approval`: the outcome's tone is queued after the speech already playing, and what comes next waits for it", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  hostedAudio(socket);
+  const queuedUntil = page.audio.sources.at(-1).startedAt + 1;
+  page.setClock(page.clock() + 3000);
+  page.audio.currentTime = 0.5;
+  hostedHears(socket, "yes please");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"]);
+  const tone = page.audio.sources.at(-1);
+  assert.ok(Math.abs(tone.startedAt - queuedUntil) < 1e-6, `the tone started at ${tone.startedAt}, not after the speech at ${queuedUntil}`);
+  hostedAudio(socket);
+  const next = page.audio.sources.at(-1);
+  assert.ok(next.startedAt >= tone.startedAt + tone.buffer.duration - 1e-6, "the agent's next words were scheduled over the tone");
 });
 
 test("`#264 voice-send-approval`: every seam a spoken yes can draw is inside the seam band", () => {

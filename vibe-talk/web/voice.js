@@ -5367,6 +5367,9 @@ function sendUserMessage(text, options) {
     setStatus("Your message is still waiting for the conversation to open — send this after it.");
     return false;
   }
+  // A typed yes to the card never sends, but it is answered. Judged before it goes, because
+  // sending it forgets what the assistant said before it. `#264 voice-send-approval`.
+  const answerToCard = typedAnswerToCard(said);
   if (!canSendText() || !sendClientEvent({ type: "user_message", text: said })) {
     setStatus("Start a call first — typed messages reach the agent in a live conversation.");
     return false;
@@ -5381,6 +5384,7 @@ function sendUserMessage(text, options) {
     rememberComposeDraft();
   }
   setStatus("Sent.");
+  if (answerToCard) reportSpokenOutcome(answerToCard);
   return true;
 }
 
@@ -8317,6 +8321,9 @@ async function sendPostProposal() {
   const announce = spokenYesYieldsToTap(true);
   const outcome = await commitShownProposal(proposal, "ui");
   if (announce) reportSpokenOutcome(outcome);
+  // Any other tap during a call is told to the agent too: one that asked "Send it?" is waiting for
+  // the page's word, and a later "did it go?" must have a true answer.
+  else tellAgentAboutTap(outcome);
 }
 
 /**
@@ -8387,8 +8394,14 @@ async function commitShownProposal(proposal, confirmedBy) {
   return outcome;
 }
 
-/** The owner tapped Don't send. */
-async function cancelPostProposal() {
+/**
+ * The owner tapped Don't send, or (`spoken: true`) said no to the read-back.
+ *
+ * A tap during a call is told to the agent, which may be waiting on the page's word; a spoken no is
+ * not, because the agent heard it. The click passes its event here, which has no `spoken`.
+ */
+async function cancelPostProposal(options) {
+  const spoken = Boolean(options && options.spoken === true);
   const proposal = postWatch.shown;
   if (!proposal || postWatch.busy) return;
   spokenYesYieldsToTap(false);
@@ -8397,6 +8410,7 @@ async function cancelPostProposal() {
     await api("/api/v1/post-proposals/cancel", { method: "POST", body: { handle: proposal.handle } });
     settlePostCard(proposal);
     setStatus("Not sent.");
+    if (!spoken) tellAgentAboutTap({ kind: "withdrawn", proposal });
   } catch (error) {
     // Already settled is still "not sent from this card" — the watch shows whatever came next.
     if (!error.network) settlePostCard(proposal);
@@ -8425,18 +8439,25 @@ function settlePostCard(proposal) {
 //
 //   * THE CARD. The draft is the one this call's agent proposed — not one already waiting when the
 //     call opened, nor one from before a replacement session — it has not lapsed, and it holds no
-//     sign-in token.
+//     sign-in token and no mention or other `<…>` token (a model says a name there, so no read-back
+//     can be held to it exactly).
 //   * A REAL SPOKEN CALL with echo cancellation on. A typed call has no spoken answer, and without
 //     echo cancellation the agent's own "Send it?" can come back as the answer.
 //   * AN UNINTERRUPTED READ-BACK. Nothing cut the assistant off since the user last spoke, and on
 //     the neutral protocol its turn completed, not interrupted, before the answer.
-//   * THE READ-BACK SAID THE CARD. Every word of the card's text, in order, and after it the word
-//     "send", all said since this draft reached the card. So a model talked into a bad draft cannot
-//     read back something harmless and have the bad text sent on the strength of a yes to what it
-//     SAID. Mention tokens are left out, because the model says the person's name instead.
-//   * HEARD TO THE END. The answer began after the read-back's audio finished playing.
-//   * NOT AN ECHO. A bare "send it" straight after "...Send it?" may be the agent's own voice; a
-//     plain "yes" cannot be.
+//   * THE READ-BACK IS EXACTLY THE TEMPLATE. Everything the assistant said since the user's last
+//     turn — spoken, typed, relayed, or one of this page's own notices — or since this draft reached
+//     the card, is word for word "To {channel}: {text}. Send it?" (`isExactReadBack`): at most one
+//     lead-in word from a closed list, nothing inserted, nothing between the text and the question,
+//     nothing after it. So the owner heard exactly what would be posted and where, and nothing else
+//     since they last spoke: a read-back that adds a "not", a chat message read aloud, or an answer
+//     to some other question cannot stand in for it. Any turn of the user's ends it; only a fresh
+//     read-back, or a new draft read back, arms a yes again.
+//   * HEARD TO THE END. The answer arrived after the read-back's audio finished playing. On the
+//     neutral protocol that is when the answer began (it sends partials); on the hosted protocol it
+//     is when its transcript arrived, which is later.
+//   * NOT AN ECHO. An answer made only of the read-back's last words, within SPOKEN_YES_ECHO_GUARD_MS
+//     of its end — a bare "send it" straight after "...Send it?" — may be the agent's own voice.
 //   * THE VERY NEXT ANSWER, AND A YES. The read-back is what the assistant said since the user last
 //     spoke, so only the answer right after it can match it; and the answer is a yes from a closed
 //     list with at most one word of filler (`classifySpokenAnswer`).
@@ -8446,18 +8467,21 @@ function settlePostCard(proposal) {
 // — the tap's function and the tap's busy latch, so a tap and a yes racing commit once. A no withdraws
 // the draft. Anything else leaves the card for a tap.
 //
-// THE OUTCOME IS SAID THREE WAYS (`reportSpokenOutcome`). The agent is told through the call's own
-// text channel — the `user_message` the composer and the live relay already use, which the neutral
-// protocol carries as a queued `prompt` — so its next words are true and it is never the one that
-// claims a send. And the page says it itself, on the status line, as a transcript seam and as a short
-// tone, because a model's sentence needs a cooperative model and the owner must hear the truth anyway.
+// EVERY YES IS ANSWERED, and THE OUTCOME IS SAID THREE WAYS (`reportSpokenOutcome`). The agent is told
+// to say only "One moment." on a yes and wait for this page, so any yes — or anything like one,
+// spoken or typed — while this call's draft is up gets a word back, sent or not. The agent is told
+// through the call's own text channel — the `user_message` the composer and the live relay already
+// use, which the neutral protocol carries as a queued `prompt` — so its next words are true and it is
+// never the one that claims a send. And the page says it itself, on the status line, as a transcript
+// seam and as a short tone, because a model's sentence needs a cooperative model and the owner must
+// hear the truth anyway. A tap on the card during a call is told to the agent as well.
 //
 // WHAT IT CANNOT DO: tell the owner's voice from anyone else's, or know how sure the recogniser was.
 // A passenger or the radio saying "yeah" right after a read-back counts. The README says so.
 
 /** How long a heard yes waits for more speech before it commits. */
 const SPOKEN_YES_SETTLE_MS = 1200;
-/** How soon after the read-back's audio ends a bare "send it" is taken for its echo. */
+/** How soon after the read-back's audio ends an answer made of its last words is taken for its echo. */
 const SPOKEN_YES_ECHO_GUARD_MS = 1500;
 
 /** Answers that mean yes, as word lists; matched whole, longest first. */
@@ -8474,19 +8498,29 @@ const SPOKEN_NO_STARTS = [
   ["no"], ["nope"], ["nah"], ["cancel"], ["stop"], ["wait"], ["don't"], ["dont"],
   ["do", "not"], ["never", "mind"],
 ];
-/** Words that sound like a yes inside an answer that is not one, for the status line. */
-const SPOKEN_YES_HINTS = new Set(["yes", "yeah", "yep", "send", "sure", "ok", "okay"]);
+/** Words that sound like a yes inside an answer that is not one: answered, never acted on. */
+const SPOKEN_YES_HINTS = new Set([
+  "yes", "yeah", "yep", "yup", "send", "sure", "ok", "okay", "absolutely", "correct", "post",
+]);
+/** Words that make sending the subject, said by the assistant since the user last spoke or in the answer. */
+const SENDING_WORDS = new Set(["send", "sent", "sending", "post", "posted", "posting"]);
+/** What may open a read-back, once, without changing what it says. */
+const READ_BACK_LEAD_INS = [["okay"], ["ok"], ["alright"], ["all", "right"], ["sure"], ["got", "it"]];
 
 /** Why a spoken yes was not taken, in words the agent can repeat to the owner. */
 const SPOKEN_YES_REASONS = {
   interrupted: "the read-back was interrupted",
-  mismatch: "the read-back did not match the text on the card",
-  no_question: "the read-back did not ask whether to send it",
+  mismatch: "the read-back was not the card's text word for word, with nothing added",
+  no_question: "the read-back did not end with the question Send it",
+  mention: "the draft has a mention or a link in it, which a read-back cannot say exactly",
+  hint: "only a plain answer such as yes or send it counts, with nothing added",
   early: "the yes came before the read-back finished playing",
-  echo: "that may have been the assistant's own voice, so answer with yes",
+  echo: "that may have been the assistant's own voice, so answer the next read-back with a plain yes",
   echo_cancellation_off: "a spoken yes needs echo cancellation on in Settings",
   typed_call: "this is a typed call, so the draft needs a tap on Send",
+  typed_yes: "a typed yes does not send it, so it needs a tap on Send",
   earlier_draft: "that draft was already waiting when this call started",
+  replaced_session: "the voice session restarted after that draft was made",
   expired: "the draft lapsed",
   token: "the draft contains the sign-in token",
   busy: "another send or cancel was already under way",
@@ -8509,8 +8543,9 @@ const SPOKEN_COMMIT_REFUSALS = {
 const spokenYes = {
   // Bumped by every reset, so a timer or a commit from before it drops its result.
   epoch: 0,
-  // What the assistant has said since the user last spoke, per turn, in order: the read-back.
-  /** @type {Map<string, string>} */
+  // What the assistant has said since the user last spoke, per turn, in order, each with the handle
+  // that was on the card when the turn began: the read-back, held up against the card.
+  /** @type {Map<string, {text: string, card: string | null}>} */
   said: new Map(),
   // Something cut the assistant off since the user last spoke.
   cut: false,
@@ -8524,9 +8559,11 @@ const spokenYes = {
   // The handle a spoken yes may commit: the card's, when this session's agent proposed it.
   /** @type {string | null} */
   eligible: null,
-  // The handle on the card when this call or session opened, which no spoken yes may send.
+  // The handle on the card when this call or session opened, which no spoken yes may send, and why.
   /** @type {string | null} */
   ineligible: null,
+  /** @type {"earlier_draft" | "replaced_session"} */
+  ineligibleWhy: "earlier_draft",
   /** @type {{handle: string, words: string, timer: any, proposal: VibeTalk.PendingPost} | null} */
   settling: null,
   turns: 0,
@@ -8545,7 +8582,7 @@ function answerWords(text) {
  * filler, at most three pieces in all ("yes", "yes please", "ok send it", "yeah go ahead"); a
  * question is never a yes, because "Send it?" is what the agent just said. A yes inside a sentence
  * that adds anything ("yes and tell him I'm late", "send it to Bob") is a `hint`, which sends
- * nothing.
+ * nothing and is answered.
  *
  * @returns {"affirmative" | "negative" | "hint" | "other"}
  */
@@ -8584,19 +8621,64 @@ function isSpokenYes(words) {
   return phrases >= 1 && fillers <= 1 && pieces <= 3;
 }
 
-/** Where `card`'s words end as an in-order subsequence of `heard`, or -1 when they are not one. */
-function subsequenceEnd(heard, card) {
-  let at = 0;
-  for (const word of card) {
-    while (at < heard.length && heard[at] !== word) at += 1;
-    if (at >= heard.length) return -1;
-    at += 1;
+/**
+ * Is `said` (words) exactly the read-back of `shown`: "To {channel}: {text}. Send it?"
+ *
+ * Pure. Word for word after `answerWords`, so case and punctuation do not matter and nothing else
+ * may differ: at most one lead-in from READ_BACK_LEAD_INS, an optional "the" before the channel's
+ * name and "channel" after it, and then the card's text and "send it" with nothing inserted,
+ * nothing between them and nothing after. An inserted "not" fails, and so does any sentence of the
+ * model's own.
+ *
+ * @param {string[]} said
+ * @param {{channel_name: string, text: string}} shown
+ */
+function isExactReadBack(said, shown) {
+  const text = answerWords(shown.text);
+  if (text.length === 0) return false;
+  const channel = answerWords(shown.channel_name);
+  const lead = READ_BACK_LEAD_INS.find((words) => words.every((word, at) => said[at] === word));
+  const heard = lead ? [said, said.slice(lead.length)] : [said];
+  for (const before of [[], ["the"]]) {
+    for (const after of [[], ["channel"]]) {
+      const expected = ["to", ...before, ...channel, ...after, ...text, "send", "it"];
+      const same = (words) =>
+        words.length === expected.length && words.every((word, at) => word === expected[at]);
+      if (heard.some(same)) return true;
+    }
   }
-  return at;
+  return false;
+}
+
+/**
+ * Why what the assistant said is not a read-back of `shown`, as a key of SPOKEN_YES_REASONS, or
+ * null when it is one.
+ *
+ * Held to everything said since the user's last turn, or to the part of it said once this draft was
+ * on the card — the second so a replacement read back in full is not spoilt by the old one's words
+ * before it, the first so a read-back whose transcript beat the card to this page still counts.
+ *
+ * @param {VibeTalk.PendingPost} shown
+ * @param {{text: string, card: string | null}[]} turns
+ */
+function readBackRefusal(shown, turns) {
+  if (/<[^<>\s]+>/u.test(shown.text)) return "mention";
+  const all = answerWords(turns.map((turn) => turn.text).join(" "));
+  const since = answerWords(
+    turns.filter((turn) => turn.card === shown.handle).map((turn) => turn.text).join(" ")
+  );
+  if (isExactReadBack(all, shown) || isExactReadBack(since, shown)) return null;
+  return all.slice(-2).join(" ") === "send it" ? "mismatch" : "no_question";
+}
+
+/** Did the assistant since the user last spoke, or the answer itself, talk about sending? */
+function mentionsSending(turns, answer) {
+  const said = answerWords(turns.map((turn) => turn.text).join(" "));
+  return [...said, ...answerWords(answer)].some((word) => SENDING_WORDS.has(word));
 }
 
 /** Forget the conversation so far: a new call, a hang-up, or a replacement voice session. */
-function resetSpokenYes() {
+function resetSpokenYes(why = "earlier_draft") {
   const settling = spokenYes.settling;
   if (settling) clearTimeout(settling.timer);
   spokenYes.settling = null;
@@ -8610,6 +8692,7 @@ function resetSpokenYes() {
   // Whatever is on the card now was proposed to a conversation that is over, or to a session that
   // did not see it: a tap may still send it, a yes may not.
   spokenYes.ineligible = postWatch.shown ? postWatch.shown.handle : null;
+  spokenYes.ineligibleWhy = why;
 }
 
 /**
@@ -8618,37 +8701,37 @@ function resetSpokenYes() {
  */
 function noteSessionStartedForSpokenYes() {
   session.sessionStarts += 1;
-  if (session.sessionStarts > 1) resetSpokenYes();
+  if (session.sessionStarts > 1) resetSpokenYes("replaced_session");
 }
 
 /** The call's first look at the proposals: a draft already pending is not this call's to send. */
 function noteProposalsAtCallOpen(proposal) {
   spokenYes.ineligible = proposal ? proposal.handle : null;
+  spokenYes.ineligibleWhy = "earlier_draft";
 }
 
 /**
  * The card shows `proposal` where it showed `previous`.
  *
- * A NEW draft makes everything said before it a read-back of something else, so it is forgotten:
- * only what the assistant says once these words are on the card can be held up against them.
- * Without that, a draft replaced by a shorter one — "don't merge the PR" by "merge the PR" — would
- * pass on a read-back of the first, since every word of the second was in it, in order.
+ * Nothing said is forgotten here: each assistant turn carries the handle that was on the card when
+ * it began, and `readBackRefusal` holds the newest draft to what was said while it was up as well
+ * as to everything since the user last spoke. A draft replaced by a shorter one — "don't merge the
+ * PR" by "merge the PR" — is not confirmed by the first one's read-back, since neither is word for
+ * word the second's.
  */
 function noteCardForSpokenYes(proposal, previous) {
   const handle = proposal ? proposal.handle : null;
   if (handle === (previous ? previous.handle : null)) return;
   if (spokenYes.settling && spokenYes.settling.handle !== handle) abortSpokenYes("changed");
   spokenYes.eligible = handle !== null && handle !== spokenYes.ineligible ? handle : null;
-  if (handle !== null) {
-    spokenYes.said = new Map();
-    spokenYes.done = false;
-  }
 }
 
 /** The assistant said `text` in the turn named `key` (its whole text so far). */
 function hearAssistantForSpokenYes(key, text) {
   if (!String(text).trim()) return;
-  spokenYes.said.set(key, String(text));
+  const before = spokenYes.said.get(key);
+  const card = before ? before.card : postWatch.shown ? postWatch.shown.handle : null;
+  spokenYes.said.set(key, { text: String(text), card });
   spokenYes.done = false;
   spokenYes.answerAt = 0;
 }
@@ -8669,7 +8752,11 @@ function noteTurnCompleteForSpokenYes(interrupted) {
   }
 }
 
-/** A text turn went to the agent — typed, canned, relayed, or this page's own notice. */
+/**
+ * A text turn went to the agent — typed, canned, relayed, or this page's own notice. It is the
+ * user's next turn as far as a spoken yes is concerned: whatever the assistant said before it is no
+ * longer the last thing the owner heard, so it is forgotten, and only a fresh read-back arms a yes.
+ */
 function noteTypedForSpokenYes() {
   abortSpokenYes("typed");
   spokenYes.said = new Map();
@@ -8693,7 +8780,7 @@ function hearUserForSpokenYes(key, text, final) {
   // What this answer is judged against, taken before it is forgotten: the read-back belongs to the
   // answer right after it and to no later one.
   const heard = {
-    said: [...spokenYes.said.values()].join(" "),
+    turns: [...spokenYes.said.values()],
     cut: spokenYes.cut,
     done: spokenYes.done,
     answerAt: spokenYes.answerAt,
@@ -8709,29 +8796,36 @@ function hearUserForSpokenYes(key, text, final) {
 
 /**
  * Act on one final answer while a card is up: settle a yes that passes, withdraw on a no, and say
- * plainly why a yes that does not pass sent nothing.
+ * plainly why anything like a yes that does not pass sent nothing.
  *
  * @param {string} text
- * @param {{said: string, cut: boolean, done: boolean, answerAt: number}} heard
+ * @param {{turns: {text: string, card: string | null}[], cut: boolean, done: boolean, answerAt: number}} heard
  */
 function judgeSpokenAnswer(text, heard) {
   const shown = postWatch.shown;
   if (!shown || !session.connected) return;
   const kind = classifySpokenAnswer(text);
-  // Only an answer to a question about SENDING is about the card: with a card up, the assistant may
-  // still ask "shall I read the next one?", and a yes or a no to that is not a word about the draft.
-  const askedAboutSending = answerWords(heard.said).includes("send");
+  if (kind === "other") return;
+  const eligible = shown.handle === spokenYes.eligible;
+  const aboutSending = mentionsSending(heard.turns, text);
   if (kind === "negative") {
-    if (askedAboutSending && shown.handle === spokenYes.eligible) void cancelBySpokenNo();
+    if (eligible && aboutSending) void cancelBySpokenNo();
+    return;
+  }
+  // A yes, or anything like one, to THIS call's draft is always answered: the agent says only "One
+  // moment." and waits for this page, so silence would leave it waiting and the owner not knowing.
+  // A draft this call did not make is answered only when sending was the subject — the agent never
+  // proposed it, so a yes to something else while it lingers is not about it.
+  if (!eligible) {
+    if (aboutSending) {
+      reportSpokenOutcome({
+        kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS[spokenYes.ineligibleWhy],
+      });
+    }
     return;
   }
   if (kind === "hint") {
-    if (askedAboutSending) setStatus("Not sent — answer with just yes, or tap Send.");
-    return;
-  }
-  if (kind !== "affirmative") return;
-  if (!askedAboutSending) {
-    setStatus("Not sent — a yes counts only right after the read-back. Tap Send to post it.");
+    reportSpokenOutcome({ kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS.hint });
     return;
   }
   const refusal = spokenYesRefusal(shown, text, heard);
@@ -8756,33 +8850,46 @@ function judgeSpokenAnswer(text, heard) {
 }
 
 /**
+ * A message typed to the agent while the card is up, judged BEFORE it goes (sending it forgets what
+ * the assistant said before it). A typed yes never sends — the Send button is on the same screen —
+ * but the agent was told to say only "One moment." on a yes, so one like it is answered: not sent,
+ * and why. Returns that outcome, or null when there is nothing to say.
+ */
+function typedAnswerToCard(text) {
+  const shown = postWatch.shown;
+  if (!shown || !canSendText() || spokenYes.settling || postWatch.busy) return null;
+  const kind = classifySpokenAnswer(text);
+  if (kind !== "affirmative" && kind !== "hint") return null;
+  const eligible = shown.handle === spokenYes.eligible;
+  if (!eligible && !mentionsSending([...spokenYes.said.values()], text)) return null;
+  const why = !eligible ? spokenYes.ineligibleWhy : session.chat ? "typed_call" : "typed_yes";
+  return { kind: "not_armed", proposal: shown, reason: SPOKEN_YES_REASONS[why] };
+}
+
+/**
  * Why a yes to `shown` must not send it, as a key of SPOKEN_YES_REASONS, or null when it may.
  *
  * @param {VibeTalk.PendingPost} shown
  * @param {string} answer
- * @param {{said: string, cut: boolean, done: boolean, answerAt: number}} heard
+ * @param {{turns: {text: string, card: string | null}[], cut: boolean, done: boolean, answerAt: number}} heard
  */
 function spokenYesRefusal(shown, answer, heard) {
-  if (shown.handle !== spokenYes.eligible) return "earlier_draft";
+  if (shown.handle !== spokenYes.eligible) return spokenYes.ineligibleWhy;
   if (postWatch.deadline <= Date.now()) return "expired";
   if (redact(shown.text) !== shown.text) return "token";
   if (session.chat) return "typed_call";
   if (session.echoCancellation !== true) return "echo_cancellation_off";
   if (heard.cut || (session.protocol === "vibe-talk-v1" && !heard.done)) return "interrupted";
-  const readBack = answerWords(heard.said);
-  // A mention token is a provider's syntax the model is told to say as a name, so it is not
-  // something the read-back can be held to.
-  const card = answerWords(shown.text.replace(/<[^>]*>/gu, " "));
-  const end = card.length === 0 ? -1 : subsequenceEnd(readBack, card);
-  if (end < 0) return "mismatch";
-  if (!readBack.slice(end).includes("send")) return "no_question";
+  const readBack = readBackRefusal(shown, heard.turns);
+  if (readBack) return readBack;
   const answeredAt = heard.answerAt || Date.now();
   const playEnd = session.playEndMs || 0;
   if (answeredAt < playEnd) return "early";
+  // The read-back ends "...Send it?", so its last words are the card's last two and "send it": an
+  // answer made only of those, straight after, may be the agent's own voice coming back.
+  const tail = new Set(answerWords(heard.turns.map((turn) => turn.text).join(" ")).slice(-4));
   const words = answerWords(answer);
-  const plainYes = words.some((word) => word === "yes" || word === "yeah" || word === "yep");
-  const tail = new Set(readBack.slice(-4));
-  if (!plainYes && words.every((word) => tail.has(word)) && answeredAt - playEnd < SPOKEN_YES_ECHO_GUARD_MS) {
+  if (words.every((word) => tail.has(word)) && answeredAt - playEnd < SPOKEN_YES_ECHO_GUARD_MS) {
     return "echo";
   }
   return null;
@@ -8801,7 +8908,7 @@ function abortSpokenYes(reason) {
  * The owner tapped while a yes was settling. Send wins and its result is the one reported; Don't
  * send stops the yes and says so.
  *
- * @returns {boolean} whether the tap's own result should be reported to the agent
+ * @returns {boolean} whether the tap's own result should be reported in full, as the yes's would
  */
 function spokenYesYieldsToTap(sending) {
   const settling = spokenYes.settling;
@@ -8838,7 +8945,7 @@ async function commitBySpokenYes(proposal, epoch) {
 async function cancelBySpokenNo() {
   if (postWatch.busy) return;
   const proposal = postWatch.shown;
-  await cancelPostProposal();
+  await cancelPostProposal({ spoken: true });
   reportSpokenOutcome({ kind: "declined", proposal });
 }
 
@@ -8878,56 +8985,86 @@ const SPOKEN_YES_SEAM_LABELS = {
 };
 
 /**
- * Say what came of a spoken yes: to the agent, on the status line, in the transcript, and as a tone.
+ * The fixed sentence the agent is told about `outcome`, starting "Voice page:" — what its
+ * instructions tell it to wait for — or null when it needs none. It is never told SENT for anything
+ * this page did not see the server accept. `how` is "voice" for a spoken yes and "tap" for the card.
  *
- * The agent is told in a fixed sentence that starts "Voice page:", which is what its instructions
- * tell it to wait for, and is never told SENT for anything this page did not see the server accept.
+ * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string}} outcome
+ * @param {"voice" | "tap"} how
+ */
+function outcomeNotice(outcome, how) {
+  const channel = (outcome.proposal && outcome.proposal.channel_name) || "the channel";
+  switch (outcome.kind) {
+    case "sent":
+      return how === "tap"
+        ? `Voice page: the user tapped Send, and the message was SENT to ${channel}. ` +
+            "Tell the user in a few words that it was sent. Then stop."
+        : `Voice page: the message you read back was SENT to ${channel}. ` +
+            "Tell the user in a few words that it was sent. Then stop.";
+    case "partial":
+      return `Voice page: only part of the message reached ${channel}; the rest was NOT sent. ` +
+        "Tell the user that in one short sentence, and that the screen has the rest. Then stop.";
+    case "unknown":
+      return "Voice page: I could not confirm whether the message was sent. Tell the user to " +
+        "check the channel before sending it again. Then stop.";
+    case "refused":
+      return `Voice page: the message was NOT sent (${outcome.reason || "the server refused it"}). ` +
+        "Tell the user in one short sentence that it was not sent. Then stop.";
+    case "withdrawn":
+      return "Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent. " +
+        "Say so in a few words. Then stop.";
+    case "declined":
+      // The agent heard the no itself, and will offer new words or drop it; telling it again would
+      // only make it speak twice.
+      return null;
+    default:
+      return `Voice page: the message was NOT sent: ${outcome.reason || "it could not be confirmed by voice"}. ` +
+        "If the user meant to send it, tell them so in one short sentence, and that they can tap " +
+        "Send or ask you to read it back again. Otherwise carry on.";
+  }
+}
+
+/** Tell the agent `notice` on the call's text channel, if a call is open to hear it. */
+function tellAgent(notice) {
+  if (notice === null || !canSendText()) return;
+  // Remembered as typed, so a protocol that echoes it back as a user transcript does not show it
+  // as the owner's words or judge it as an answer.
+  noteTypedTurn(notice);
+  sendClientEvent({ type: "user_message", text: notice });
+}
+
+/**
+ * A tap on the card during a call: told to the agent, and only to it — the screen already said it.
+ * An agent that asked "Send it?" is waiting for the page's word, and a later "did it go?" must have
+ * a true answer.
+ */
+function tellAgentAboutTap(outcome) {
+  tellAgent(outcomeNotice(outcome, "tap"));
+}
+
+/**
+ * Say what came of a yes: to the agent, on the status line, in the transcript, and as a tone.
  *
  * @param {{kind: string, proposal?: VibeTalk.PendingPost | null, reason?: string}} outcome
  */
 function reportSpokenOutcome(outcome) {
   const channel = (outcome.proposal && outcome.proposal.channel_name) || "the channel";
   const kind = outcome.kind in SPOKEN_YES_SEAMS ? outcome.kind : "not_armed";
-  let notice = null;
   let status;
   if (kind === "sent") {
-    notice =
-      `Voice page: the message you read back was SENT to ${channel}. ` +
-      "Tell the user in a few words that it was sent. Then stop.";
     status = `Sent to ${channel}.`;
   } else if (kind === "partial") {
-    notice =
-      `Voice page: only part of the message reached ${channel}; the rest was NOT sent. ` +
-      "Tell the user that in one short sentence, and that the screen has the rest. Then stop.";
     status = `Only part reached ${channel} — the rest was not sent.`;
   } else if (kind === "unknown") {
-    notice =
-      "Voice page: I could not confirm whether the message was sent; the card is still up. " +
-      "Tell the user to check the screen. Then stop.";
-    status = "Could not confirm the send — check the screen.";
+    status = "Could not confirm the send — check the channel.";
   } else if (kind === "refused") {
-    const reason = outcome.reason || "the server refused it";
-    notice =
-      `Voice page: the message was NOT sent (${reason}). ` +
-      "Tell the user in one short sentence that it was not sent. Then stop.";
-    status = `Not sent — ${reason}.`;
+    status = `Not sent — ${outcome.reason || "the server refused it"}.`;
   } else if (kind === "declined") {
-    // The agent heard the no itself, and will offer new words or drop it; telling it again would
-    // only make it speak twice.
     status = "Not sent.";
   } else {
-    const reason = outcome.reason || "it could not be confirmed by voice";
-    notice =
-      `Voice page: the message was NOT sent: ${reason}. Tell the user in one short sentence that ` +
-      "it was not sent, and that they can tap Send or ask you to read it back again. Then stop.";
-    status = `Not sent — ${reason}.`;
+    status = `Not sent — ${outcome.reason || "it could not be confirmed by voice"}.`;
   }
-  if (notice !== null && canSendText()) {
-    // Remembered as typed, so a protocol that echoes it back as a user transcript does not show it
-    // as the owner's words or judge it as an answer.
-    noteTypedTurn(notice);
-    sendClientEvent({ type: "user_message", text: notice });
-  }
+  tellAgent(outcomeNotice({ ...outcome, kind }, "voice"));
   setStatus(status);
   transcriptSeam(SPOKEN_YES_SEAM_LABELS[kind], SPOKEN_YES_SEAMS[kind]);
   playSpokenYesTone(kind === "sent");
@@ -8936,9 +9073,11 @@ function reportSpokenOutcome(outcome) {
 /**
  * A short tone for the outcome: a rising pair for sent, one low note for not sent.
  *
- * Generated as an AudioBuffer on the call's own audio context, after whatever speech is queued, so
- * it is heard even when the model says nothing. Skipped when the agent's voice is silenced, in a
- * typed call, and after hang-up — there is nothing to play it with then, and the screen says it.
+ * Generated as an AudioBuffer on the call's own audio context and queued like speech — after
+ * whatever is already queued, and ahead of whatever comes next, so the agent's next words wait for
+ * it rather than talking over it — so it is heard even when the model says nothing. Skipped when the
+ * agent's voice is silenced, in a typed call, and after hang-up — there is nothing to play it with
+ * then, and the screen says it.
  */
 function playSpokenYesTone(sent) {
   const audio = session.audio;
@@ -8961,7 +9100,11 @@ function playSpokenYesTone(sent) {
   const node = audio.createBufferSource();
   node.buffer = buffer;
   node.connect(audio.destination);
-  node.start(Math.max(audio.currentTime, session.playAt || 0));
+  const now = audio.currentTime;
+  const at = Math.max(now, session.playAt || 0);
+  node.start(at);
+  session.playAt = at + buffer.duration;
+  session.playEndMs = Math.max(session.playEndMs || 0, Date.now() + (session.playAt - now) * 1000);
   session.playing.push(node);
   node.onended = () => {
     session.playing = session.playing.filter((n) => n !== node);
@@ -25757,10 +25900,11 @@ async function saveVoiceSendSetting() {
   }
   voiceSendSaving = false;
   applyVoiceSendSetting(stored);
+  // The server obeys the new setting at once; only the agent's instructions wait for its next call.
   setStatus(
     stored.ask_before_send
-      ? "The voice agent will ask before it sends, from its next call."
-      : "The voice agent will send as soon as you ask, from its next call."
+      ? "Saved. The server now holds what the voice agent sends for your yes; its instructions change from its next call."
+      : "Saved. The server now posts as soon as the voice agent sends; its instructions change from its next call."
   );
 }
 
