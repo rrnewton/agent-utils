@@ -246,19 +246,21 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
 /// never makes a summary be asked for again. A deploy that also changes the wording names a v1 no
 /// row is under, and its rows are swept, which is right.
 ///
+/// `current` is the version this server files under, computed once by the caller.
+///
 /// One line at INFO with the two counts and nothing else: no key, no id, no text.
 async fn keep_summaries_across_the_policy_change(
     store: &dyn StateStore,
     config: &vibe_talk::config::Config,
     summarizer: &dyn vibe_talk::summarize::Summarizer,
+    current: &str,
 ) {
-    let current = vibe_talk::summarize::policy_version_for(&config.summaries, summarizer);
     let previous = vibe_talk::summarize::policy_version_v1_for(&config.summaries, summarizer);
     let cap_then = u32::try_from(vibe_talk::summarize::hard_cap_chars(
         config.summaries.target_chars,
     ))
     .unwrap_or(u32::MAX);
-    let rekeyed = match store.rekey_summaries(&previous, &current, cap_then).await {
+    let rekeyed = match store.rekey_summaries(&previous, current, cap_then).await {
         Ok(moved) => moved,
         // Not configured is not a failure: there is no cache, so there is nothing to keep or
         // sweep.
@@ -276,7 +278,7 @@ async fn keep_summaries_across_the_policy_change(
     };
     // The sweep. Without it a changed policy leaves the old entries on disk forever: unreachable,
     // invisible, and still a copy of other people's text at rest.
-    match store.forget_summaries_except(&current).await {
+    match store.forget_summaries_except(current).await {
         // Every start, zeros included: "re-keyed=0 swept=0" is the evidence that a restart kept
         // every summary it had.
         Ok(swept) => tracing::info!(
@@ -575,7 +577,13 @@ async fn main() -> anyhow::Result<()> {
          the old ones unreachable at once. When the field above is false, NOTHING is summarised \
          and every long row shows as failed."
     );
-    keep_summaries_across_the_policy_change(store.as_ref(), &config, summarizer.as_ref()).await;
+    keep_summaries_across_the_policy_change(
+        store.as_ref(),
+        &config,
+        summarizer.as_ref(),
+        &summary_version,
+    )
+    .await;
     // `#208 persistent-cache`. Accepted so a rollback to this build starts with an overlay that
     // turns the cache on; nothing reads it here.
     if config.message_cache_ignored {

@@ -864,6 +864,13 @@ fn sqlite_store(
     (Arc::new(store), file)
 }
 
+fn summary_rows(file: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(file)
+        .expect("open")
+        .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))
+        .expect("count")
+}
+
 fn age_every_summary(file: &std::path::Path, made_at_ms: i64) {
     rusqlite::Connection::open(file)
         .expect("open")
@@ -885,8 +892,15 @@ async fn a_read_scope_hit_from_memory_writes_nothing() {
     let two_days_ago = vibe_talk::store::now_ms() - 2 * 86_400_000;
     age_every_summary(&file, two_days_ago);
 
+    let rows = summary_rows(&file);
+    let fetched = server.discord.fetch_count();
     let hit = summarise(&server, Scope::Read, &id).await;
     assert!(matches!(hit.outcome, SummaryOutcome::Cached(_)), "{hit:?}");
+    assert_eq!(
+        server.discord.fetch_count(),
+        fetched,
+        "the hit was not from memory"
+    );
     let held = store
         .cached_summary(&key)
         .await
@@ -896,6 +910,7 @@ async fn a_read_scope_hit_from_memory_writes_nothing() {
         held.made_at_ms, two_days_ago,
         "a read-scope hit kept an entry alive"
     );
+    assert_eq!(summary_rows(&file), rows, "a read-scope hit wrote a row");
 
     // THE CONTROL: a write-scope hit on the same old row keeps it alive, once.
     let hit = summarise(&server, Scope::Write, &id).await;
