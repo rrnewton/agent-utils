@@ -6213,7 +6213,11 @@ function recapSentence(recap) {
 function boundaryFor(recap, cause) {
   const sent = Boolean(recap && recap.state === "sent");
   const table = sent ? RESUME_SEAM_DETAILS : SEAM_DETAILS;
-  const detail = cause ? table[cause] || table.ended : sent ? RESUME_SEAM_DETAILS.ended : STORED_SEAM_DETAIL;
+  // A replacement session ended no call, so its marker names no cause; its recap says it was a
+  // replacement, and the restored line says what the live one did (`noteConversationNamed`).
+  const replaced = Boolean(recap && recap.state === "none" && recap.why === "replaced_session");
+  const why = cause || (replaced ? "replaced" : null);
+  const detail = why ? table[why] || table.ended : sent ? RESUME_SEAM_DETAILS.ended : STORED_SEAM_DETAIL;
   return { word: "new conversation", chip: recapChip(recap), detail, recapDetail: recapSentence(recap) };
 }
 
