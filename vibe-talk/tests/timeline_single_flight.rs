@@ -166,14 +166,13 @@ struct Harness {
     app: axum::Router,
     state: vibe_talk::state::AppState,
     chat: Arc<CountingChat>,
+    /// The provider behind the counter, for a change made upstream behind this server's back.
+    upstream: Arc<Threaded>,
     summarizer: Arc<vibe_talk::summarize::fake::FakeSummarizer>,
 }
 
 fn harness_with(toml: &str) -> Harness {
-    harness_over(
-        toml,
-        CountingChat::new(Arc::new(Threaded::new())).with_delay(READ),
-    )
+    harness_over(toml, Arc::new(Threaded::new()), READ)
 }
 
 /// Reads that take [`READ`] and describe the channel as it stood when they were asked, and posts
@@ -182,19 +181,22 @@ fn harness_with(toml: &str) -> Harness {
 fn scanning_harness() -> Harness {
     harness_over(
         &testing::config_toml(),
-        CountingChat::new(Arc::new(Threaded::scanning(READ))),
+        Arc::new(Threaded::scanning(READ)),
+        Duration::ZERO,
     )
 }
 
-fn harness_over(toml: &str, chat: CountingChat) -> Harness {
+/// `upstream` behind a counter that makes each call wait `delay`.
+fn harness_over(toml: &str, upstream: Arc<Threaded>, delay: Duration) -> Harness {
     let summarizer = Arc::new(vibe_talk::summarize::fake::FakeSummarizer::naming_threads());
     let (mut state, _discord, _store) = testing::state_with_backend(toml, summarizer.clone());
-    let chat = Arc::new(chat);
+    let chat = Arc::new(CountingChat::new(upstream.clone()).with_delay(delay));
     state.replace_chat(chat.clone());
     Harness {
         app: vibe_talk::http::router(state.clone()),
         state,
         chat,
+        upstream,
         summarizer,
     }
 }
@@ -621,4 +623,51 @@ async fn window_reads_with_no_post_between_them_still_share_one_fetch() {
         "{:?}",
         h.chat.calls()
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pull_or_an_enter_inside_the_memo_shows_an_unpushed_upstream_change() {
+    // Review of #278: the memo answered an explicit refresh with the read before it, so a message
+    // posted upstream and not yet pushed stayed hidden from pull to refresh. Pull and enter now
+    // read afresh; the poll still takes the kept answer.
+    let h = harness();
+    let poll = timeline("view=main&reason=poll");
+    assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
+    h.upstream
+        .messages
+        .lock()
+        .unwrap()
+        .push(message(30, "from another client, not pushed", false));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (status, body) = get(&h.app, &timeline("view=main&reason=pull"), READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        ids(&body).contains(&"30".to_owned()),
+        "pull to refresh 1 s after a poll did not show an upstream message: {:?}",
+        ids(&body)
+    );
+    assert_eq!(h.chat.count("fetch_timeline"), 2, "{:?}", h.chat.calls());
+
+    h.upstream
+        .messages
+        .lock()
+        .unwrap()
+        .push(message(31, "another, not pushed", false));
+    let (_, body) = get(&h.app, &timeline("view=main&reason=enter"), READ_TOKEN).await;
+    assert!(ids(&body).contains(&"31".to_owned()), "{:?}", ids(&body));
+    assert_eq!(h.chat.count("fetch_timeline"), 3, "{:?}", h.chat.calls());
+
+    // A poll right after is answered from the enter's read, which is kept as any other.
+    assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
+    assert_eq!(h.chat.count("fetch_timeline"), 3, "{:?}", h.chat.calls());
+
+    // Two columns entering the same channel together still make one read.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let enter = timeline("view=main&reason=enter");
+    let (a, b) = tokio::join!(get(&h.app, &enter, READ_TOKEN), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        get(&h.app, &enter, READ_TOKEN).await
+    });
+    assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(h.chat.count("fetch_timeline"), 4, "{:?}", h.chat.calls());
 }

@@ -29,7 +29,10 @@
 //! # What a reason is not
 //!
 //! Advice for the figures, never a permission. Nothing reads it to decide what a caller may see or
-//! do, so a client that lies about it can mislabel only its own reads. A word the page does not
+//! do, so a client that lies about it can mislabel only its own reads. The one thing it changes is
+//! how fresh a timeline answer must be: an explicit refresh ([`ReadReason::wants_fresh`]) is never
+//! answered from the few seconds' memory of a newest page, so a client that claims one costs at
+//! most one more read of the provider, and sees nothing it could not see otherwise. A word the page does not
 //! send — including every server-side reason — is [`ReadReason::Other`] when it arrives from
 //! outside, so a request cannot pass itself off as the server's own background work.
 
@@ -146,6 +149,15 @@ impl ReadReason {
             Self::Other => "other",
             Self::Untagged => "untagged",
         }
+    }
+
+    /// Whether the reader asked for the channel as it stands NOW: pull to refresh, or opening a
+    /// channel or a view. Such a timeline request is never answered from the memory of a newest
+    /// answer that has just landed, though it still joins a read already running. `#278
+    /// timeline-single-flight`; see [`crate::timeline_flight`].
+    #[must_use]
+    pub const fn wants_fresh(self) -> bool {
+        matches!(self, Self::Pull | Self::Enter)
     }
 
     /// Whether the page may send this word. The server's own reasons, and the two fallbacks, are

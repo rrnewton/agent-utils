@@ -1931,7 +1931,11 @@ identical request for `chat.timeline_memo_ms` more (three seconds by default; `0
 and requests in flight together still share). Any change this server hears of — a live message,
 edit or deletion, a post it sends to the channel, the storage purge — makes the next request read
 afresh, so the page's own re-read after one never gets an answer from before it. A change upstream
-that nobody pushes is invisible for at most those few seconds. Only the provider's answer is shared:
+that nobody pushes is invisible for at most those few seconds, and never to pull to refresh or to
+opening a channel (`reason=pull`, `reason=enter`), which are not answered from that memory though
+they still join a read already running. A kept answer is dropped when its time is up, and a shared
+read is given up after 150 seconds, longer than any provider's own bound, so a provider call that
+hangs cannot hold the requests waiting on it for longer. Only the provider's answer is shared:
 the channel allowlist is checked before a request joins anything, and each caller's spoken forms,
 noise marks, thread names, read state, pins and bookmark are its own, so a read token still queues
 no thread naming. Window reads of a channel's newest messages (`/messages`, the digest, a summary's

@@ -658,11 +658,13 @@ async fn shared_timeline(
     } else {
         std::time::Duration::ZERO
     };
+    // Pull to refresh and opening a channel ask for it as it stands now: never a kept answer.
+    let fresh = crate::read_reason::ReadReason::current().wants_fresh();
     let (state_for_read, channel_for_read) = (state.clone(), channel.clone());
     let (answer, shared) = state
         .read_ahead
         .timelines()
-        .read(key, changes, memo, move || async move {
+        .read(key, changes, memo, fresh, move || async move {
             let (state, channel) = (state_for_read, channel_for_read);
             match resumed {
                 Some(Forward::Native(own)) => {

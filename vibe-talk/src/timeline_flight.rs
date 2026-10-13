@@ -12,9 +12,16 @@
 //! reads abandoned that way.
 //!
 //! Now identical requests share one read ([`TimelineFlights::read`]). The read is a detached task,
-//! so it finishes whatever happens to the request that started it, and a re-send joins it. A newest
-//! page, or a delta, that has just landed is kept for a few seconds (`chat.timeline_memo_ms`, three
-//! by default, zero to turn the memory off), so a request arriving just after it is answered from it.
+//! so it finishes whatever happens to the request that started it, and a re-send joins it. It has a
+//! bound of its own, [`FLIGHT_BOUND`], above every provider's, so a provider call that hangs past
+//! its own timeout holds the requests waiting on it for that long at most. A newest page, or a
+//! delta, that has just landed is kept for a few seconds (`chat.timeline_memo_ms`, three by default,
+//! zero to turn the memory off), so a request arriving just after it is answered from it.
+//!
+//! An explicit refresh is never answered from that memory: pull to refresh, and opening a channel
+//! or a view ([`crate::read_reason::ReadReason::wants_fresh`]). The reader asked for the channel as
+//! it stands now, and a message posted upstream that nobody pushed would otherwise stay hidden for
+//! the memory's few seconds. Such a request still joins a read already running.
 //!
 //! # What is shared, and what is each caller's own
 //!
@@ -39,8 +46,8 @@
 //!
 //! # What is kept, and the purge
 //!
-//! Each kept answer is channel text, in memory only, for the memory's few seconds; nothing reaches
-//! the store. The storage purge calls [`TimelineFlights::clear`] (through
+//! Each kept answer is channel text, in memory only, for the memory's few seconds: a timer drops it
+//! when they are up, whether or not another request comes. Nothing reaches the store. The storage purge calls [`TimelineFlights::clear`] (through
 //! [`crate::read_ahead::ReadAhead::clear`]), which drops every kept answer and forgets every read
 //! running: a request after the purge reads afresh, and a read that began before it keeps nothing
 //! when it lands. A caller already waiting on such a read is still answered by it, as a page
@@ -71,6 +78,16 @@ pub const MAX_MEMO_MS: u64 = 60_000;
 /// The most kept answers held at once. Beyond it every kept answer is dropped: they are only a
 /// shortcut, and a read running is never dropped.
 pub const MAX_KEPT: usize = 256;
+
+/// The longest one shared read runs before every request waiting on it is answered with a failure:
+/// two and a half minutes.
+///
+/// Above every provider's own bound on a timeline read (one bridge request at most 120 s, the native
+/// Discord and Slack timelines 90 s), so it cuts short nothing that was going to finish. It exists so
+/// that the worst case is written down here rather than left to each provider: while a read runs,
+/// every identical request joins it instead of starting its own, so a call that hung past its own
+/// timeout would otherwise hold all of them with it.
+pub const FLIGHT_BOUND: Duration = Duration::from_secs(150);
 
 /// What one upstream timeline read brought.
 #[derive(Clone, Debug)]
@@ -153,6 +170,7 @@ enum Entry {
         answer: watch::Receiver<Option<Answer>>,
     },
     Kept {
+        number: u64,
         until: Instant,
         fetched: Arc<Fetched>,
     },
@@ -229,13 +247,16 @@ impl TimelineFlights {
     ///
     /// `changes` is what the channel had been through when the request was made
     /// ([`crate::read_ahead::ReadAhead::changes`]). `memo` is how long a read this call starts is
-    /// kept once it lands; zero keeps nothing. `start` makes the read; it runs in a task of its own, inside
-    /// the caller's [`ReadReason`], and is never cancelled by any caller going away.
+    /// kept once it lands; zero keeps nothing. `fresh` refuses a kept answer, for an explicit
+    /// refresh: a read already running is still joined. `start` makes the read; it runs in a task
+    /// of its own, inside the caller's [`ReadReason`], is never cancelled by any caller going away,
+    /// and is given up after [`FLIGHT_BOUND`].
     pub async fn read<F, Fut>(
         self: &Arc<Self>,
         mut key: Key,
         changes: Changes,
         memo: Duration,
+        fresh: bool,
         start: F,
     ) -> (Answer, Shared)
     where
@@ -252,11 +273,13 @@ impl TimelineFlights {
             };
             inner.prune(Instant::now());
             match inner.entries.get(&key) {
-                Some(Entry::Kept { fetched, .. }) => {
+                Some(Entry::Kept { fetched, .. }) if !fresh => {
                     return (Ok(Arc::clone(fetched)), Shared::Remembered);
                 }
                 Some(Entry::Running { answer, .. }) => (answer.clone(), None),
-                None => {
+                // Nothing for this request, or a kept answer an explicit refresh will not take:
+                // a read of its own, filed in the kept answer's place.
+                Some(Entry::Kept { .. }) | None => {
                     let number = inner.next;
                     inner.next += 1;
                     let (sender, receiver) = watch::channel(None);
@@ -284,13 +307,16 @@ impl TimelineFlights {
                 let reason = ReadReason::current();
                 tokio::spawn(reason.scope(async move {
                     let began = std::time::Instant::now();
-                    let answer = work.await.map(|(page, position)| {
-                        Arc::new(Fetched {
-                            page,
-                            position,
-                            began,
-                        })
-                    });
+                    let answer = match tokio::time::timeout(FLIGHT_BOUND, work).await {
+                        Ok(read) => read.map(|(page, position)| {
+                            Arc::new(Fetched {
+                                page,
+                                position,
+                                began,
+                            })
+                        }),
+                        Err(_) => Err(outlasted()),
+                    };
                     claim.finish(answer);
                 }));
                 Shared::Read
@@ -305,35 +331,58 @@ impl TimelineFlights {
     }
 
     /// Put a read's answer where later requests find it: kept for `memo`, or gone. Only the read
-    /// still filed under `key` — one a purge has not forgotten — is filed again.
-    fn settle(&self, key: &Key, number: u64, answer: &Answer, memo: Duration) {
+    /// still filed under `key` — one a purge has not forgotten — is filed again. Answers whether it
+    /// was kept.
+    fn settle(&self, key: &Key, number: u64, answer: &Answer, memo: Duration) -> bool {
         let mut inner = self.lock();
         let ours = matches!(
             inner.entries.get(key),
             Some(Entry::Running { number: running, .. }) if *running == number
         );
         if !ours {
-            return;
+            return false;
         }
         match answer {
             Ok(fetched) if !memo.is_zero() => {
                 inner.entries.insert(
                     key.clone(),
                     Entry::Kept {
+                        number,
                         until: Instant::now() + memo,
                         fetched: Arc::clone(fetched),
                     },
                 );
+                true
             }
             _ => {
                 inner.entries.remove(key);
+                false
             }
+        }
+    }
+
+    /// Drop the answer `number` kept under `key`, its time being up. Nothing else: a later read's
+    /// answer filed under the same key since keeps its own time.
+    fn expire(&self, key: &Key, number: u64) {
+        let mut inner = self.lock();
+        if matches!(
+            inner.entries.get(key),
+            Some(Entry::Kept { number: kept, .. }) if *kept == number
+        ) {
+            inner.entries.remove(key);
         }
     }
 }
 
 fn ended() -> ChatError {
     ChatError::Transport("the shared timeline read ended without an answer".to_owned())
+}
+
+fn outlasted() -> ChatError {
+    ChatError::Transport(format!(
+        "the shared timeline read took longer than {} s",
+        FLIGHT_BOUND.as_secs()
+    ))
 }
 
 /// The right, and the duty, to answer one read. Dropped unfinished — the task torn down with the
@@ -349,8 +398,22 @@ struct Claim {
 
 impl Claim {
     fn finish(mut self, answer: Answer) {
-        self.flights
+        let kept = self
+            .flights
             .settle(&self.key, self.number, &answer, self.memo);
+        if kept {
+            // Gone when its time is up, not when the next request happens to look.
+            let (flights, key, number, memo) = (
+                Arc::clone(&self.flights),
+                self.key.clone(),
+                self.number,
+                self.memo,
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(memo).await;
+                flights.expire(&key, number);
+            });
+        }
         if let Some(sender) = self.sender.take() {
             sender.send_replace(Some(answer));
         }
@@ -424,12 +487,14 @@ mod tests {
                 key(TimelineView::Main),
                 changes(0, 0),
                 memo,
+                false,
                 counting(&reads, refused())
             ),
             flights.read(
                 key(TimelineView::Main),
                 changes(0, 0),
                 memo,
+                false,
                 counting(&reads, refused())
             ),
         );
@@ -442,6 +507,7 @@ mod tests {
                 key(TimelineView::Main),
                 changes(0, 0),
                 memo,
+                false,
                 counting(&reads, Ok(())),
             )
             .await;
@@ -460,6 +526,7 @@ mod tests {
                 key(TimelineView::Flat),
                 changes,
                 memo,
+                false,
                 counting(&reads, Ok(())),
             )
         };
@@ -483,6 +550,7 @@ mod tests {
             key(TimelineView::Main),
             changes(0, 0),
             memo,
+            false,
             counting(&reads, Ok(())),
         );
         let purge = async {
@@ -513,11 +581,131 @@ mod tests {
                 key(TimelineView::Main),
                 changes(0, 0),
                 Duration::from_secs(3),
+                false,
                 start,
             )
             .await;
         assert_eq!(how, Shared::Read);
         assert!(matches!(answer, Err(ChatError::Transport(_))), "{answer:?}");
         assert!(flights.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_answer_is_dropped_when_its_time_is_up_with_no_request_after_it() {
+        // Review of #278: expiry was lazy, so an answer kept "for a few seconds" stayed in memory
+        // until the next timeline read of any channel.
+        let flights = Arc::new(TimelineFlights::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let memo = Duration::from_secs(3);
+        let (answer, _) = flights
+            .read(
+                key(TimelineView::Main),
+                changes(0, 0),
+                memo,
+                false,
+                counting(&reads, Ok(())),
+            )
+            .await;
+        assert!(answer.is_ok());
+        assert_eq!(flights.len(), 1, "the answer was not kept");
+        tokio::time::sleep(memo - Duration::from_millis(1)).await;
+        assert_eq!(flights.len(), 1, "the answer went before its time");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(flights.is_empty(), "the answer outlived its time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_kept_again_keeps_its_own_time() {
+        // A fresh read replaces a kept answer; the first one's timer must not take the second.
+        let flights = Arc::new(TimelineFlights::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let memo = Duration::from_secs(3);
+        let read = |fresh| {
+            flights.read(
+                key(TimelineView::Main),
+                changes(0, 0),
+                memo,
+                fresh,
+                counting(&reads, Ok(())),
+            )
+        };
+        assert_eq!(read(false).await.1, Shared::Read);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(read(true).await.1, Shared::Read, "an explicit refresh");
+        // The first answer's three seconds are up; the second has two and a half left.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(read(false).await.1, Shared::Remembered);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_refresh_takes_no_kept_answer_but_joins_a_read_running() {
+        let flights = Arc::new(TimelineFlights::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let memo = Duration::from_secs(3);
+        let read = |fresh| {
+            flights.read(
+                key(TimelineView::Main),
+                changes(0, 0),
+                memo,
+                fresh,
+                counting(&reads, Ok(())),
+            )
+        };
+        assert_eq!(read(false).await.1, Shared::Read);
+        assert_eq!(read(false).await.1, Shared::Remembered);
+        assert_eq!(read(true).await.1, Shared::Read);
+        let ((_, first), (_, second)) = tokio::join!(read(false), async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            read(true).await
+        });
+        assert_eq!(first, Shared::Remembered);
+        assert_eq!(second, Shared::Read);
+        let ((_, first), (_, second)) = tokio::join!(read(true), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            read(true).await
+        });
+        assert_eq!((first, second), (Shared::Read, Shared::Joined));
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_never_answers_is_given_up_at_the_bound_for_every_caller() {
+        // Review of #278: the detached read had no deadline of its own, so a provider call that
+        // hung past its timeout held every identical request with it.
+        let flights = Arc::new(TimelineFlights::new());
+        let hangs =
+            || std::future::pending::<Result<(TimelinePage, Option<GenericPosition>), ChatError>>();
+        let waiting = async {
+            tokio::join!(
+                flights.read(
+                    key(TimelineView::Main),
+                    changes(0, 0),
+                    Duration::from_secs(3),
+                    false,
+                    hangs
+                ),
+                flights.read(
+                    key(TimelineView::Main),
+                    changes(0, 0),
+                    Duration::from_secs(3),
+                    false,
+                    hangs
+                ),
+            )
+        };
+        let started = Instant::now();
+        let ((a, how_a), (b, how_b)) = tokio::time::timeout(2 * FLIGHT_BOUND, waiting)
+            .await
+            .expect("the shared read was never given up");
+        assert_eq!(started.elapsed(), FLIGHT_BOUND);
+        assert_eq!((how_a, how_b), (Shared::Read, Shared::Joined));
+        for answer in [a, b] {
+            assert!(
+                matches!(&answer, Err(ChatError::Transport(why)) if why.contains("longer than")),
+                "{answer:?}"
+            );
+        }
+        assert!(flights.is_empty(), "a read given up was kept");
     }
 }
