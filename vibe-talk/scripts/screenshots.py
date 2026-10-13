@@ -2024,6 +2024,16 @@ def _act_message_search(driver: Driver) -> None:
     driver.page.wait_for_function(
         "() => (window.__text('search-count') || '').length > 0", timeout=5_000
     )
+    # `#262 search-load-older`. The phrase is older than the newest page this run's small ceiling
+    # reads, and a search no longer reads older pages by itself -- the emptied list's own scroll
+    # position used to chain steps back through the whole channel. Enter in the field walks back a
+    # few pages for it, as the reader would.
+    driver.page.press("#search-field", "Enter")
+    driver.page.wait_for_function(
+        "() => document.querySelector('#discord-log > li[data-id]:not(.search-hidden)') !== null "
+        "&& document.getElementById('load-older').textContent.indexOf('Searching') !== 0",
+        timeout=20_000,
+    )
     driver.settle(300)
 
 
