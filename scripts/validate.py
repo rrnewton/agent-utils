@@ -220,6 +220,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # Their own group is always-on, so naming them here only stops them reading as unclassified.
     ("scripts/check_client_names.py", frozenset()),
     ("scripts/check_documented_defaults.py", frozenset()),
+    # The public website: static HTML and CSS that nothing builds, embeds, or packages.
+    ("site/", frozenset()),
     ("scripts/check_no_any.py", frozenset({PYTHON, CROSS, VIBE_TALK})),
     # Prose and agent-facing material. Not embedded anywhere, so nothing can go red for it.
     (".minibeads/", frozenset()),
@@ -979,6 +981,12 @@ def self_test() -> int:
         "a workflow edit runs the complete graph and every conditional compatibility lane",
         {"repository-infrastructure"},
     )
+    expect(
+        ["site/index.html", "site/style.css", "site/.nojekyll"],
+        set(),
+        "website files are static pages that nothing builds, embeds, or packages",
+    )
+    expect(["site.html"], set(ALL_GROUPS), "the site/ directory rule must stop at its boundary")
     expect(
         ["py/tests/js/browser/new-benchmark.test.cjs"],
         {TIMELINE_BROWSER, PYTHON},
