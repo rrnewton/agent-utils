@@ -152,11 +152,28 @@ async fn nothing_saved_is_the_shipped_prompt_everywhere() {
     assert_eq!(write["prompt"]["system_prompt_edited"], false);
     assert_eq!(write["prompt"]["additional_instructions"], false);
     // The test agent's configuration says nothing about replacing its prompt, so it keeps the one
-    // in its console and is handed nothing.
+    // in its console and is handed nothing, which the session says.
+    let handed = session(&harness).await["agent_prompt"].clone();
+    assert_eq!(handed["transport"], "not_sent", "{handed}");
     assert!(
-        session(&harness).await.get("agent_prompt").is_none(),
+        handed.get("text").is_none(),
         "a call with nothing of the owner's carried something to an agent that keeps its prompt"
     );
+}
+
+#[tokio::test]
+async fn an_agent_that_does_not_allow_it_with_nothing_saved_is_said_to_keep_its_prompt() {
+    // The vendor's default. The session used to carry no agent_prompt at all here, so the page
+    // never learned that this agent keeps its console prompt, and the warning beside the Sending
+    // switch said "only if its provider lets this page replace its prompt" for good.
+    let harness = harness();
+    harness.elevenlabs.allow_prompt_override(Some(false));
+    let handed = session(&harness).await["agent_prompt"].clone();
+    assert_eq!(handed["transport"], "not_sent", "{handed}");
+    assert_eq!(handed["override_allowed"], false, "{handed}");
+    assert!(handed.get("text").is_none(), "{handed}");
+    assert_eq!(handed["system_prompt_applied"], false);
+    assert_eq!(handed["instructions_applied"], false);
 }
 
 fn agent_reads(harness: &Harness) -> usize {

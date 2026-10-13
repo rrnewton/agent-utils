@@ -5012,9 +5012,12 @@ says which:
     `contextual_update`: the agent keeps its console prompt, and the page sends the heading and the
     additional instructions as a `contextual_update` straight after the initiation, before a resumed
     call's record. An edited base prompt cannot reach such an agent;
-  * not allowed and only the base was edited — `not_sent`: nothing is sent;
-  * not allowed and nothing saved — no `agent_prompt`: the initiation frame is exactly what it
-    always was.
+  * not allowed (or not said, or no answer), with nothing saved or only the base edited —
+    `not_sent`: nothing is sent, and the initiation frame is exactly what it always was. The
+    session says so all the same, with `override_allowed` as read, so that after the call Settings
+    can say the agent kept the prompt in its console, and the warning beside the Sending switch can
+    say plainly that the new prompt must be pasted there rather than "only if its provider lets
+    this page replace it".
 
   The vendor's answer is kept for two minutes per agent, so most call starts do not wait on it; a
   failure or a timeout is not kept, and is asked again at the next call. Two minutes is also how

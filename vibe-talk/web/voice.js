@@ -27521,7 +27521,11 @@ function voicePromptLastCallLine() {
   if (last.transport === "contextual_update") {
     return `${refused}, so only your instructions went, as a note at the start.`;
   }
-  return `${refused}, so your edited prompt did not reach it.`;
+  // Nothing went: an edited prompt the agent would not take, or nothing of the owner's at all.
+  // Either way the agent used the prompt in its provider's console.
+  return voicePromptSettings.system_prompt_edited
+    ? `${refused}, so your edited prompt did not reach it.`
+    : `${refused}, so it kept the prompt in its provider's console.`;
 }
 
 /** Draw both boxes, their Saves and the lines under them from `voicePromptSettings`. */

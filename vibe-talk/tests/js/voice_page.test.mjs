@@ -49439,6 +49439,7 @@ test("`#272 voice-agent-instructions`: an agent that does not is sent the instru
 
 test("`#272 voice-agent-instructions`: an edited prompt an agent cannot take sends nothing, and Settings says it did not reach it", async () => {
   const page = newPage();
+  page.voicePrompt = voicePromptView({ system_prompt: "mine", system_prompt_edited: true, edited_from_version: 9 });
   const socket = await talkWithPrompt(page, {
     transport: "not_sent", system_prompt_applied: false, instructions_applied: false, override_allowed: false,
   });
@@ -49448,7 +49449,24 @@ test("`#272 voice-agent-instructions`: an edited prompt an agent cannot take sen
   assert.match(page.el("voice-prompt-state").textContent, /so your edited prompt did not reach it\.$/);
 });
 
-test("`#272 voice-agent-instructions`: with nothing of the owner's the call opens exactly as before, and says nothing about it", async () => {
+test("`#272 voice-agent-instructions`: an agent that keeps its console prompt, with nothing saved, is said to keep it, beside the switch too", async () => {
+  // The vendor's default, and nothing of the owner's: the server now says `not_sent` rather than
+  // nothing, so the page knows this agent keeps its console prompt. Nothing more goes on the wire,
+  // and Settings says what happened without claiming an edited prompt that does not exist.
+  const page = newPage();
+  const socket = await talkWithPrompt(page, {
+    transport: "not_sent", system_prompt_applied: false, instructions_applied: false, override_allowed: false,
+  });
+  assert.deepStrictEqual(framesSent(socket).filter((f) => f.type).map((f) => f.type),
+    ["conversation_initiation_client_data"]);
+  assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" });
+  assert.match(page.el("voice-prompt-state").textContent,
+    /The last call's agent does not let its prompt be replaced, so it kept the prompt in its provider's console\.$/);
+  assert.doesNotMatch(page.el("voice-prompt-state").textContent, /edited prompt/, "an edit nobody made was reported");
+  assert.equal(page.el("voice-send-hosted").textContent, HOSTED_KEPT, "the warning beside the switch stayed conditional");
+});
+
+test("`#272 voice-agent-instructions`: a session with no agent_prompt, a bridge's or an older server's, opens exactly as before, and says nothing about it", async () => {
   const page = newPage();
   const socket = await talkWithPrompt(page, undefined);
   assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" });

@@ -54,7 +54,9 @@
 //! sent one still waiting for a yes. Handing an agent that allows it the assembled prompt on every
 //! call is what makes its rules follow the switch. The cost is that its console prompt is never
 //! used, which the QUICKSTART says before an operator allows it. An agent that does not allow it
-//! is handed nothing when nothing is saved, and its call opens exactly as it always did.
+//! is handed nothing when nothing is saved, and its call opens exactly as it always did; the
+//! session still says `not_sent`, so the page can tell the owner that agent keeps its console
+//! prompt.
 //!
 //! # The vendor is asked once in a while, not on every call
 //!
@@ -298,13 +300,15 @@ async fn override_allowed(state: &AppState) -> Option<bool> {
     }
 }
 
-/// What the page should hand a hosted agent as this call opens, or `None` when there is nothing:
-/// a provider that reads the profile instead, or an owner who has written nothing for an agent
-/// that keeps its console prompt.
+/// What the page should hand a hosted agent as this call opens, or `None` for a provider that
+/// reads the profile instead.
 ///
 /// An agent that allows its prompt to be replaced is handed the assembled prompt whether or not the
 /// owner has written anything, so its send rules follow the Sending switch (see the module
-/// documentation).
+/// documentation). One that does not, with nothing of his that can go, is handed nothing — but the
+/// session still says so (`not_sent`, with what the vendor said), because that is how the page
+/// learns the agent keeps its console prompt: without it, the warning beside the Sending switch
+/// could only ever say "if".
 ///
 /// The hosted agent is given the prompt for a credential that may post, under the send setting —
 /// the voice session that carries this needs the write token, and an agent that can propose is the
@@ -318,10 +322,6 @@ pub async fn for_session(state: &AppState) -> Option<SessionPrompt> {
     }
     let owner = current(state).await;
     let allowed = override_allowed(state).await;
-    if owner.is_shipped() && allowed != Some(true) {
-        // Nothing of his, and an agent that keeps its console prompt: nothing to hand over.
-        return None;
-    }
     let variant = Variant::for_caller(true, send_approval::current(state).await);
     Some(session_prompt(variant, &owner, allowed))
 }
@@ -622,11 +622,15 @@ mod tests {
         };
         elevenlabs.fail_next_agent_profile("the vendor is down");
         elevenlabs.allow_prompt_override(Some(true));
+        let failed = for_session(&state)
+            .await
+            .expect("a hosted agent's session says");
         assert_eq!(
-            for_session(&state).await,
-            None,
+            failed.transport,
+            PromptTransport::NotSent,
             "a vendor that did not answer was taken for an agent that allows an override"
         );
+        assert_eq!(failed.override_allowed, None);
         assert_eq!(agent_reads(), 1);
         let first = for_session(&state).await.expect("an agent that allows it");
         assert_eq!(first.transport, PromptTransport::PromptOverride);
@@ -646,9 +650,16 @@ mod tests {
     async fn a_call_carries_nothing_when_nothing_was_written_or_a_bridge_reads_the_profile() {
         let (state, _discord, _store) = testing::state_with_store();
         assert_eq!(delivery(&state), PromptDelivery::Page);
+        // The test agent's configuration does not say: nothing goes, and the session says so.
         assert_eq!(
             for_session(&state).await,
-            None,
+            Some(SessionPrompt {
+                transport: PromptTransport::NotSent,
+                text: String::new(),
+                system_prompt_applied: false,
+                instructions_applied: false,
+                override_allowed: None,
+            }),
             "the shipped prompt needs no handing over"
         );
 
@@ -666,6 +677,26 @@ mod tests {
             for_session(&bridge).await,
             None,
             "a bridge reads the profile; the page must not send the words twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusing_agent_with_nothing_saved_is_reported_not_sent_rather_than_left_unsaid() {
+        // The vendor's default: the override not allowed, and nothing saved. Nothing goes, but the
+        // session says not_sent, not nothing at all, so the page can say that agent keeps the
+        // prompt in its console rather than "if its provider lets this page replace it" for good.
+        let (state, _discord, _store, elevenlabs) = testing::state_with_store_and_voice();
+        elevenlabs.allow_prompt_override(Some(false));
+        assert_eq!(
+            for_session(&state).await,
+            Some(SessionPrompt {
+                transport: PromptTransport::NotSent,
+                text: String::new(),
+                system_prompt_applied: false,
+                instructions_applied: false,
+                override_allowed: Some(false),
+            }),
+            "the page was not told the agent keeps its console prompt"
         );
     }
 }
