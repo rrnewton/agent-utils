@@ -855,6 +855,11 @@ main {
   }
 }
 
+.arch-stack {
+  display: grid;
+  gap: 0.6rem;
+}
+
 .arch-frame {
   border: 1px dashed var(--border-strong);
   border-radius: 10px;

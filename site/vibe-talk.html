@@ -89,7 +89,7 @@
 <dt>Needs</dt>
 <dd>A host to run it, as a native build or a container. Something in front of it that terminates TLS if you expose it; the microphone needs HTTPS. A credential for your chat service. Optionally a model provider for summaries and a voice vendor for conversation. It holds the chat credential, needs no access to any development workspace, and is deliberately not run next to the coding agents.</dd>
 <dt>Where it fits</dt>
-<dd>It is an optional <a href="architecture.html#channel">owner channel</a>, beside the coordinator's Herdr tab and <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a>. It reads and posts in a chat service. It does not start, stop or type into agents.</dd>
+<dd>It is an optional phone front end for a chat service, beside the harness's <a href="architecture.html#channel">owner channel</a> rather than part of it. It reads and posts in the chat. It does not start, stop or type into agents, so it reaches a harness's coordinator only if <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a> bridges the same chat space. Today that needs a piece you supply: vibe-talk reaches Google Chat only through a Discord-compatible bridge, none of which ships with agent-utils, and agentctl chat has no Discord or Slack transport without an adapter you write. vibe-talk also posts as its own bot, so agentctl chat would have to accept that sender. This combination is not documented or tested.</dd>
 </dl>
 </div>
 </section>
@@ -99,7 +99,7 @@
 <div class="section-head">
 <p class="eyebrow">Clips</p>
 <h2 id="clips-title">Five short clips</h2>
-<p>Each clip is a GIF of 10 to 20 seconds. If your system asks for reduced motion, you see a still from each clip instead, and its link opens the animation. Four clips are a phone screen 412 pixels wide. The last is a desktop browser.</p>
+<p>Each clip is a GIF of 9.6 to 19.1 seconds. If your system asks for reduced motion, you see a still from each clip instead, and its link opens the animation. Four clips are a phone screen 412 pixels wide. The last is a desktop browser.</p>
 </div>
 
 <article class="clip" id="clip-summaries" aria-labelledby="clip-summaries-title">
@@ -180,7 +180,7 @@
 </figure>
 <div class="clip-text">
 <p>At desktop width the page can show two columns: Main on the left and, on the right, the threads as cards, each with a generated name, a one-sentence summary, its age and its unread count. Opening <code>csv-export-review</code> shows that thread. The owner replies from the box beside it, and worker-2's answer arrives in the same thread.</p>
-<p>A thread's name is chosen once and kept, so you can find it under the name you first learned. Its sentence is refreshed as the thread grows.</p>
+<p>A thread's name is chosen once and kept, so you can find it under the name you first learned, as long as vibe-talk has storage configured and the thread does not stay quiet or unread past the summary retention period. Without storage, names last only while the server runs. Its sentence is refreshed as the thread grows.</p>
 <p class="clip-meta">19.1 seconds, 1.0 MB · <a href="media/vibe-talk/desktop-threads.gif">Open the animation</a></p>
 <p class="small">In vibe-talk's README: <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#thread-names">thread names</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#the-page-has-two-compositions-and-a-capability-query-picks-between-them">the desktop layout</a></p>
 </div>
@@ -213,6 +213,7 @@
 <li>The chat service: a local mock bridge serving one fictional Google Chat space.</li>
 <li>The model: a local mock Messages API with hand-written summaries and thread names, answering after 0.8 seconds.</li>
 <li>The agents: scripted messages, including their answers to the owner's posts.</li>
+<li>The scenario. vibe-talk reads whatever agents post in a chat service, and here workers post in the owner's space and the owner answers a worker directly. That is not how an agent-utils harness routes the owner's channel: there only the coordinator speaks to you, and agentctl chat sends every message in its space to the coordinator.</li>
 <li>The tap ripple and the desktop pointer, drawn by the recorder.</li>
 </ul>
 </article>

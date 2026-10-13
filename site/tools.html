@@ -166,7 +166,7 @@
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/rs/agentctl/src/embedded_inbox_quickstart.md">Coordinator inbox (Rust)</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agentctl/RELATED_WORK.md">Related work</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agentctl/SKILL.md">Agent skill</a></li>
-<li><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/README.md#what-is-compared">Cross-edition tests</a></li>
+<li><a href="https://github.com/rrnewton/agent-utils/blob/main/cross/agentctl_differential.py">Cross-edition tests</a> (the shared interactive core only; <code>agentctl chat</code> is not compared)</li>
 <li>Source: <a href="https://github.com/rrnewton/agent-utils/tree/main/py/agentctl">Python</a>, <a href="https://github.com/rrnewton/agent-utils/tree/main/rs/agentctl">Rust</a></li>
 </ul>
 </div>
@@ -243,9 +243,9 @@
 <dt>Use it when</dt>
 <dd>You want to reach the coordinator from chat. Without it, you talk to the coordinator in its Herdr tab.</dd>
 <dt>Status</dt>
-<dd>Core, and setup may defer it. Google Chat works today through the polling transport, hourly by default unless an operator-supplied event command wakes the bridge sooner. The subscription-plugin protocol has no shipping provider yet. Prompts arrive as pasted terminal input, not through a native harness protocol, and reply capture depends on Herdr's bounded scrollback, so a clipped reply fails visibly rather than being guessed.</dd>
+<dd>Core, and setup lets you connect it later. Google Chat works today through the polling transport, once an hour by default; <code>--interval</code> sets a shorter cycle, down to a fraction of a second, and an operator-supplied event command delivers messages at once. The subscription-plugin protocol has no shipping provider yet. A coordinator started with <code>chat launch</code> belongs to the bridge's shell, not to agentctl's registry, so <code>agentctl send coordinator</code>, which tick-hub's delivery script uses, does not reach it. Prompts arrive as pasted terminal input, not through a native harness protocol, and reply capture depends on Herdr's bounded scrollback, so a clipped reply fails visibly rather than being guessed.</dd>
 <dt>Editions</dt>
-<dd>Two different bridges. Python: Google Chat polling, operator adapters, <code>chat launch</code> to supervise a coordinator, and <code>chat context</code>. Rust: an event-driven host for an installed subscription plugin, a separate one-shot outbound helper, and <code>sent</code> and <code>thread</code> for checking delivery. The agentctl-chat skill describes the Rust bridge.</dd>
+<dd>Two different bridges. Python: Google Chat polling, operator adapters, <code>chat launch</code> to start a coordinator and its bridge together in one Herdr pane, and <code>chat context</code>. Rust: an event-driven host for an installed subscription plugin, a separate one-shot outbound helper, and <code>sent</code> and <code>thread</code> for checking delivery. The agentctl-chat skill describes the Rust bridge.</dd>
 </dl>
 <div class="tool-cols">
 <div>
@@ -368,7 +368,7 @@
 <h3 id="tick-hub-title"><code>tick-hub</code></h3>
 <p class="badges"><span class="badge">optional</span><span class="badge badge-edition">Python + Rust</span></p>
 </div>
-<p class="tool-lede">One cron job, timer or heartbeat evaluates many recurring duties, each on its own cadence, and prints stable <code>HEALTH:</code>, <code>ACTION:</code>, <code>NOTE:</code> and <code>ERROR:</code> lines.</p>
+<p class="tool-lede">One cron job, timer or heartbeat evaluates many recurring duties, each on its own cadence, and prints stable lines such as <code>HEALTH:</code>, <code>ACTION:</code>, <code>NOTE:</code>, <code>ERROR:</code> and <code>NO_RESULT:</code>.</p>
 <dl class="tool-facts">
 <dt>Problem</dt>
 <dd>A coordinator has many recurring duties: status reports, freshness checks, conditions a shell command can test. Without tick-hub each needs its own timer, and each speaks its own format.</dd>
@@ -379,7 +379,7 @@
 <dt>Use it when</dt>
 <dd>The coordinator should be reminded of something on a schedule, or told when a file has gone stale.</dd>
 <dt>Status</dt>
-<dd>Optional, at version 0.2. It does not schedule itself or deliver what it prints; in a harness, a small <code>tick-deliver</code> script run by a 15-minute timer sends the action lines to the coordinator with <code>agentctl send</code>. Action handlers must be idempotent, because an interrupted run can emit an action before its state is written.</dd>
+<dd>Optional, at version 0.2. It does not schedule itself or deliver what it prints; in a harness, a small <code>tick-deliver</code> script run by a 15-minute timer sends the tick's output to the coordinator with <code>agentctl send</code> whenever it contains an <code>ACTION:</code> line. Action handlers must be idempotent, because an interrupted run can emit an action before its state is written. There is no related-work document yet.</dd>
 <dt>Editions</dt>
 <dd>Python and Rust, cross-checked by the differential harness.</dd>
 </dl>
@@ -486,7 +486,7 @@
 <dt>Needs</dt>
 <dd>Python 3.10 or newer, dagrun, and Linux cgroup v2. It refuses to run uncontained (exit 3) unless you pass <code>--allow-cgroup-failure</code>.</dd>
 <dt>Status</dt>
-<dd>Optional, at version 0.3, and not offered by setup. In its own words, "a resource box against a BUG in our own code, NOT a security sandbox": no seccomp and no user-namespace isolation.</dd>
+<dd>Optional, at version 0.3, and not offered by setup. In its own words, "a resource box against a BUG in our own code, NOT a security sandbox": no seccomp and no user-namespace isolation. There is no related-work document yet.</dd>
 <dt>Editions</dt>
 <dd>Python only, an explicit exception to the two-edition contract.</dd>
 </dl>
@@ -610,9 +610,9 @@
 <dt>Problem</dt>
 <dd>Agents post long messages, often many before you look. On a phone, and especially by ear, you need a short summary of each, a way to ask for one particular message in full, and a way to reply.</dd>
 <dt>What you get</dt>
-<dd>A phone web app with main, thread and all-message views, drafts, an outbox, reactions and search. Summaries and thread names. Read-aloud through ElevenLabs or the phone's own speech engine, and voice conversation. An MCP endpoint and a JSON API. Separate read and write tokens, configured channels as an allowlist, and posts that cannot ping anyone.</dd>
+<dd>A phone web app with main, thread and all-message views, drafts, an outbox, reactions and search. Summaries and thread names. Read-aloud through ElevenLabs or the phone's own speech engine, and voice conversation. An MCP endpoint and a JSON API. Separate read and write tokens, configured channels as an allowlist, and posts that cannot ping <code>@everyone</code>, <code>@here</code> or a role; a reply notifies only the users its text mentions.</dd>
 <dt>Needs</dt>
-<dd>A host to run it (a native build or a container), something in front of it that terminates TLS (HTTPS is required for the microphone), a chat-provider credential, and optionally a voice vendor and a model provider for summaries. It is a bridge, deliberately not run next to the coding agents.</dd>
+<dd>A host to run it (a native build or a container), something in front of it that terminates TLS if you expose it (the microphone needs HTTPS), a chat-provider credential, and optionally a voice vendor and a model provider for summaries. It is a bridge, deliberately not run next to the coding agents.</dd>
 <dt>Status</dt>
 <dd>Optional and early, at version 0.0.1. In its own status table, Discord reading and posting are written and unit-tested but have never run against live Discord. The voice-agent path has not been shown working end to end, model summaries have met only a local mock, and device speech is a prototype. Reading through a compatible Google Chat bridge has seen real read-only traffic. Slack support is tested against a local fake.</dd>
 <dt>Editions</dt>
@@ -649,7 +649,7 @@
 <dt>Needs</dt>
 <dd>Python 3.10 or newer, or a Rust build; <code>gh</code> and <code>git</code> for live mode. Fixture mode needs no network.</dd>
 <dt>Status</dt>
-<dd>Experimental, at version 0.1. It "never merges, rebases, labels, refires, or otherwise mutates a pull request"; live mode only updates private refs in the clone you give it and may write a local plan archive. A separate, authorised operator does any landing, guided by the pr-landing-operations skill, and only where the repository's own rules allow it.</dd>
+<dd>Experimental, at version 0.1. It "never merges, rebases, labels, refires, or otherwise mutates a pull request"; live mode only updates private refs in the clone you give it and may write a local plan archive. A separate, authorised operator does any landing, guided by the pr-landing-operations skill, and only where the repository's own rules allow it. There is no related-work document yet.</dd>
 <dt>Editions</dt>
 <dd>Python and Rust, cross-checked by the differential harness.</dd>
 </dl>
@@ -768,7 +768,7 @@
 <section class="section" aria-labelledby="install-title">
 <h2 id="install-title">Installing a tool on its own</h2>
 <div class="prose">
-<p>In a harness nothing needs installing: the setup agent links the source-checkout dispatchers as <code>agent-utils/bin</code>, and they run the Python engine without a build. To use one tool outside a harness, install it from a checkout of this repository:</p>
+<p>In a harness the core tools need no installing: the setup agent links the source-checkout dispatchers as <code>agent-utils/bin</code>, and they run the Python edition without a build. The exceptions are gh-paced and agent-usage, which are built with <code>cargo</code>, and vibe-talk, which is deployed separately. To use one tool outside a harness, install it from a checkout of this repository:</p>
 <pre tabindex="0"><code>python3 -m pip install ./py/wrkslots      # a Python distribution
 cargo install --path rs/agentctl          # a Rust crate</code></pre>
 <p>Every paired tool and every Python-only tool has its own installable distribution; gh-paced and agent-usage are built from <code>rs/</code>. This site does not claim that any of them is published to a package index. See the <a href="https://github.com/rrnewton/agent-utils/blob/main/py/README.md">Python distributions</a> and <a href="https://github.com/rrnewton/agent-utils/blob/main/rs/README.md">Rust crates</a> for the full lists.</p>
