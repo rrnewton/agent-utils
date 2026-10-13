@@ -51018,3 +51018,88 @@ test("a pull up from the newest line says pull as well, so the server reads the 
   const sent = page.timelineCalls.slice(reads).map(reasonOf);
   assert.equal(sent[0], "pull", `the pull up's read went as: ${sent.join(", ")}`);
 });
+
+// --- `#278 timeline-single-flight`: a pull reads what a delta cannot show ------------------------
+//
+// Round-2 review. Saying `pull` to the server for the pull up also handed that pull to the forward
+// cursor rules, which let a pull be a delta while nobody yet knew what the channel's deltas carry:
+// from opening a channel until its first delta lands, normally the first poll forty-five seconds
+// later. On a backend whose deltas carry additions only (every one without a change record), that
+// delta brings new messages and nothing else, so an edit or deletion made upstream and never pushed
+// stayed on screen after the pull — until the next full read. A pull is a delta now only where the
+// channel's deltas are KNOWN to be complete; anywhere else it reads the newest page in full, at the
+// top as at the foot.
+
+test("a pull up on a channel whose deltas are not yet known reads the newest page in full", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  const from = server.reads.length;
+  await pullUp(page, PULL_ARM_PX);
+  await page.settle();
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  const kinds = forwardReadKinds(server, from);
+  assert.ok(kinds.length > 0, "fixture: the pull up did not read");
+  assert.deepStrictEqual(kinds, [false], `the pull up read: ${JSON.stringify(server.reads.slice(from))}`);
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up did not show an edit made upstream");
+});
+
+test("after a pull up, an edit made upstream and never pushed is on screen", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  await pullUp(page, PULL_ARM_PX);
+  await page.settle();
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up did not show an edit made upstream");
+});
+
+test("after a pull up, a message deleted upstream and never pushed is gone", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const row = page.messages.find((m) => !m.thread);
+  assert.ok(shownIds(page).includes(String(row.id)), "fixture: the row is not on screen");
+  server.remove(String(row.id));
+  await pullUp(page, PULL_ARM_PX);
+  await page.settle();
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  assert.ok(!shownIds(page).includes(String(row.id)), "the pull up left a message deleted upstream on screen");
+});
+
+test("the pull from the top reads in full too while the channel's deltas are not yet known", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  const from = server.reads.length;
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  const kinds = forwardReadKinds(server, from);
+  assert.ok(kinds.length > 0, "fixture: the pull did not read");
+  assert.deepStrictEqual(kinds, [false], `the top pull read: ${JSON.stringify(server.reads.slice(from))}`);
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the top pull did not show an edit made upstream");
+});
+
+test("where the channel's deltas are known to be complete, a pull up is a delta and still shows an unpushed edit", async () => {
+  // The control: the saving is kept where it is provably fresh. A complete delta carries edits and
+  // deletions, so once one has landed a pull need not read the newest page.
+  const { page, server } = await forwardPage({ complete: true });
+  await pollOnce(page);
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  const from = server.reads.length;
+  await pullUp(page, PULL_ARM_PX);
+  await page.settle();
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  assert.deepStrictEqual(forwardReadKinds(server, from), [true], "a pull over complete deltas read in full");
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up did not show an edit made upstream");
+});
+
+test("before the channel's deltas are known, a pull up with complete deltas still shows an unpushed edit", async () => {
+  // The reviewer's control as written: no delta has landed yet, so the pull reads in full.
+  const { page, server } = await forwardPage({ complete: true });
+  const row = page.messages.find((m) => !m.thread || m.thread.is_root);
+  server.edit(String(row.id), { content: "edited upstream, never pushed" });
+  await pullUp(page, PULL_ARM_PX);
+  await page.settle();
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up did not show an edit made upstream");
+});

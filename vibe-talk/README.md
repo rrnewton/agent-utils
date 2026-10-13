@@ -3051,8 +3051,11 @@ view's coverage and walk-back cursor stay as they were. Where the channel's delt
 bridge with a change record), the poll, a live message, a live edit or deletion, pull-to-refresh,
 and coming back to a page hidden for fifteen seconds or more are all deltas. Where they carry
 additions only, the forty-five-second poll and pull-to-refresh stay full reads, so edits and
-deletions are no slower than before, and deltas serve live arrivals and the return to the page. A
-full read still happens on entering a view, changing channel, a stream reset, an expired or
+deletions are no slower than before, and deltas serve live arrivals and the return to the page.
+Pull-to-refresh, at the top or the foot, is a delta only once a delta has shown the channel's
+deltas to be complete: from opening the channel until its first delta lands, normally the first
+poll, it reads in full, so an edit or deletion made upstream and never pushed shows after it (`#278
+timeline-single-flight`). A full read still happens on entering a view, changing channel, a stream reset, an expired or
 mismatched cursor (`410 cursor_expired` or `400 cursor_mismatch`, answered at once with a full read
 rather than a failure), a delta still saying `more` after four pages, and every fifteen minutes per
 view. A cold start always reads in full: no cursor is saved to the device. An answer carrying `as_of`

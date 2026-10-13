@@ -17351,7 +17351,9 @@ function renderCachedTimeline() {
 // change record answers COMPLETE deltas, edits and deletions included, so every refresh there is
 // one. Any other backend answers additions only, so its channel keeps the full poll it always had
 // and its edits and deletions are no slower; deltas there serve a live arrival and a return to the
-// page, where speed is the point.
+// page, where speed is the point. Pull to refresh is a delta only once a delta has shown the
+// channel's deltas to be complete: until then it reads in full, wherever the channel's deltas come
+// from (`#278 timeline-single-flight`).
 
 /**
  * How old a view's last newest read may be before a refresh reads the newest page again: fifteen
@@ -17379,8 +17381,9 @@ const isMutationKey = (key) => key.startsWith("message_update:") || key.startsWi
 /**
  * The forward cursor this refresh may read from, or null for a full read. Only a view this page
  * has read live, recently enough, and only where the reason can be served by what this channel's
- * deltas carry: an edit or deletion needs a complete one. A queued read standing for several
- * triggers carries all their reasons, and is a delta only if every one of them could be.
+ * deltas carry: an edit or deletion needs a complete one, and so does a pull, which must show any.
+ * A queued read standing for several triggers carries all their reasons, and is a delta only if
+ * every one of them could be.
  *
  * @param {string | (string | undefined)[] | undefined} reason
  * @returns {string | null}
@@ -17397,6 +17400,12 @@ function forwardCursor(reason) {
   if (Date.now() - (cover.fullAt || 0) >= TIMELINE_RECONCILE_MS) return null;
   const complete = channelCanon.complete;
   if (reason === "mutation") return complete === true ? cover.newest : null;
+  // A pull asks for the channel as it stands now, edits and deletions made upstream and never pushed
+  // included, so it is a delta only where the channel's deltas are KNOWN to carry them. Until the
+  // first delta lands — from opening the channel until, normally, the first poll — nobody knows, and
+  // an additions-only delta would leave such an edit on screen until the next full read.
+  // `#278 timeline-single-flight`.
+  if (reason === "pull") return complete === true ? cover.newest : null;
   if (reason === "replay") return complete === true || !mutationAwaitsRead() ? cover.newest : null;
   if (complete === false && reason !== "live" && reason !== "visible") return null;
   return cover.newest;
@@ -25350,7 +25359,8 @@ async function refreshFromNewest() {
     } else {
       // A pull as much as the top's, and said so: the server never answers a pull from the few
       // seconds it keeps a newest answer. Unsaid, this read could be given the poll's of a moment
-      // ago. `#278 timeline-single-flight`.
+      // ago. And as a pull it reads in full wherever a delta might not carry an edit or deletion
+      // (`forwardCursor`). `#278 timeline-single-flight`.
       await loadDiscord({ keepPosition: true, reason: "pull" });
     }
   } catch (error) {
