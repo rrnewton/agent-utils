@@ -19,7 +19,11 @@
 //! calls paced by the summariser's rate limit, not fifty calls at once and not a slow page. A name
 //! produced after a page was read reaches that page on its next refresh, a forward delta included:
 //! a delta of the thread list carries every thread renamed in the last [`RECENT_WINDOW`], as the
-//! newest page this server served said it was, unless a delta has said it left the list.
+//! newest read of it said (two reads can land out of order, and a page the provider could not bring
+//! up to date never replaces one it could), unless a delta has said the thread left the list and no
+//! current thread list read after that delta has carried it again. That holds for a naming that
+//! was already under way when the delta came, and against a page whose read began before the delta
+//! and lands after it.
 //!
 //! # What it costs the chat provider
 //!
@@ -36,23 +40,40 @@
 //!   kept for good and a sentence until the next milestone. Nothing about the thread is copied when
 //!   it is queued. When its naming turn comes, its rows are looked up in read-ahead, the root
 //!   included, and checked against the newest summary any page has carried of it since: every
-//!   page refreshes a queued thread's reply count and last activity, whoever reads it. That count
-//!   must be EXACT, at most [`THREAD_FETCH_LIMIT`], read in the last 30 s from a page the provider
-//!   had brought up to date (no `as_of`), and read no earlier than any reply held. Exactly that
-//!   many replies must be held, the newest no older than the thread's last activity. So an edit or
-//!   delete pushed while the thread waits (which drops the row from read-ahead), a reply added, a
-//!   delta saying the thread left the list, or rows that expired while it waited all send the
-//!   thread to the provider. A thread of more than [`THREAD_FETCH_LIMIT`] replies is always read:
-//!   rows held cannot show they are its newest replies rather than an older page of them.
-//! * What that still accepts is a change nobody pushed, inside the 30 s a row is held. An edit, to
-//!   the root or a reply, changes neither the count nor the last activity, so the thread is named
-//!   from the text as the page read it. A delete can go unseen too: a deleted reply can still be
-//!   among the rows a thread is named from, and a deleted thread can still be named. The same 30 s
-//!   read-ahead allows speech; here the name it gives is kept. A provider that pushes edits and
-//!   deletes (a bridge with a tail) closes it.
+//!   page refreshes a queued thread's reply count and last activity, whoever reads it, unless that
+//!   page's read began before the one that last did, or the page was not current and that one
+//!   was. The count must be EXACT, at most [`THREAD_FETCH_LIMIT`], read in the last 30 s from a
+//!   page the provider had brought up to date (no `as_of`), and read no earlier than any reply
+//!   held. Nothing the server has been told of since that read may touch the thread
+//!   ([`crate::read_ahead::ThreadChanges`]: a message pushed into it, or pushed into its channel
+//!   with no thread label, or a reply this server posted to it, whether or not the post said it
+//!   arrived). If a delta has said the thread left the list, the count must have been read after
+//!   that delta. Every row, the root included, must come from a page the provider had brought
+//!   up to date: a page with `as_of` can hold a message as it was before an edit pushed earlier,
+//!   which the push's tombstone cannot keep out because the page's read began after it. Exactly
+//!   as many replies as the count must be held, the newest no older than the thread's last
+//!   activity. So an edit or delete pushed while the thread waits (which drops the row from
+//!   read-ahead), a reply pushed or posted here, a reply counted by a page read since, a delta
+//!   saying the thread left the list, or rows that expired while it waited all send the thread to
+//!   the provider. A thread of more than [`THREAD_FETCH_LIMIT`] replies is always read: rows held
+//!   cannot show they are its newest replies rather than an older page of them.
+//! * What that still accepts is a change the server is not told of, inside the 30 s a row is held.
+//!   An edit, to the root or a reply, changes neither the count nor the last activity, so the
+//!   thread is named from the text as the page read it. A delete can go unseen too: a deleted reply
+//!   can still be among the rows a thread is named from, and a deleted thread can still be named.
+//!   And a reply ADDED with nothing pushed is seen only if a page reads the thread's count again
+//!   before its turn: otherwise the thread is named without that reply, the name is kept, and the
+//!   sentence is filed at the old count, so it is not replaced before the next milestone. The same
+//!   30 s read-ahead allows speech; here the name it gives is kept. A provider that pushes every
+//!   change, each labelled with its thread, narrows all of this to the time a push takes to
+//!   arrive; this server's own posts need no push. And a thread naming does read is named from
+//!   that read even when the provider could not bring it up to date (`as_of`), as it always was:
+//!   there is nothing fresher to fall back to.
 //! * Being this strict costs reads. Rows read AFTER the thread's count (a Flat page read after the
-//!   thread list) are not used until a page reads the count again, and a list the provider could
-//!   not bring up to date names nothing without a read.
+//!   thread list) are not used until a page reads the count again; a reply pushed or posted into a
+//!   thread does the same to it, and a message pushed with no thread label to every thread of its
+//!   channel. A list the provider could not bring up to date names nothing without a read, and rows
+//!   from any page it could not bring up to date are never named from.
 //! * Any other thread costs one read, and naming reads at most one thread per channel per
 //!   [`READ_INTERVAL`]. A thread over the budget waits for its channel's next turn without holding
 //!   up the queue, and at most [`MAX_PENDING_PER_CHANNEL`] wait per channel, so another channel is
@@ -107,7 +128,7 @@ use tokio::time::Instant;
 use super::{Summarizer, SummaryError};
 use crate::chat::{ChatClient, ChatError};
 use crate::model::{ChannelId, Message, MessageId};
-use crate::read_ahead::ReadAhead;
+use crate::read_ahead::{ReadAhead, ThreadChanges};
 use crate::store::{StateStore, StoreError, SummaryKey};
 use crate::threads::{
     thread_summary_due, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
@@ -155,6 +176,8 @@ pub const PAUSE_AFTER_PROVIDER_FAILURE: Duration = Duration::from_secs(10 * 60);
 /// The most threads queued at once, across every channel. A thread past this is queued by a later
 /// read.
 const MAX_PENDING: usize = 1_024;
+/// The most delta removals remembered at once (see `NamesState::removed`).
+const MAX_REMOVED: usize = 1_024;
 /// The most threads of ONE channel queued at once: about half an hour of that channel's naming
 /// reads at [`READ_INTERVAL`]. A thread past this is queued by a later read of the list. Without
 /// it, one channel with hundreds of due threads would fill [`MAX_PENDING`] for hours and keep every
@@ -444,6 +467,9 @@ pub struct ThreadDeps {
     /// What this server has read in the last 30 s, looked at before the thread is read from
     /// `chat`. `#278 naming-throttle`.
     pub read_ahead: Arc<ReadAhead>,
+    /// Which threads the live feed, or this server's own posts, have said changed: a count read
+    /// before that names nothing from `read_ahead`. `#278 naming-throttle`.
+    pub changes: Arc<ThreadChanges>,
     /// Whether a channel is on this server's list NOW. A thread can wait minutes for its turn, and
     /// a channel taken off the list meanwhile is not read for it, nor is anything filed for it
     /// afterwards. `#278 naming-throttle`.
@@ -464,6 +490,7 @@ impl ThreadDeps {
             version: Arc::clone(&state.summary_version),
             sentence_chars: state.config.summaries.target_chars,
             read_ahead: Arc::clone(&state.read_ahead),
+            changes: Arc::clone(state.live.thread_changes()),
             listed: Arc::new(move |channel: &ChannelId| listed(&config, &added, &hidden, channel)),
         }
     }
@@ -524,6 +551,12 @@ struct NamesState {
     pending: HashMap<Key, Pending>,
     failed: HashMap<Key, Instant>,
     recent: VecDeque<Recent>,
+    /// Threads a delta said left the list, and when the read that said so began. Until a current
+    /// thread list read after that carries the thread again, it is never carried on a delta as
+    /// renamed, and it is named only from rows read after that. Kept while the thread is queued
+    /// and for [`RECENT_WINDOW`] besides, so a page that began before the removal and lands after
+    /// it, or a naming that was in flight, cannot undo it. `#278 naming-throttle`.
+    removed: HashMap<Key, std::time::Instant>,
     named: usize,
     /// Per channel: when naming last read a thread of it, and until when it reads none.
     /// `#278 naming-throttle`. One entry per channel ever named in, which the allowlist bounds.
@@ -556,20 +589,76 @@ impl NamesState {
             .filter(|(pending, _)| pending == channel)
             .count()
     }
+
+    /// When the read that brought the queued thread's summary began, if its rows may stand in for
+    /// a read: that page was current, and began after any delta that said the thread left the
+    /// list, so it shows the thread there since. `None` otherwise.
+    fn seen(&self, key: &Key) -> Option<std::time::Instant> {
+        let seen = self.pending.get(key)?.read.seen()?;
+        match self.removed.get(key) {
+            Some(removed) if seen <= *removed => None,
+            _ => Some(seen),
+        }
+    }
+
+    /// Forget removals no longer needed: older than [`RECENT_WINDOW`] with the thread not queued.
+    /// At most [`MAX_REMOVED`] are kept; past that, the oldest of those not queued go first.
+    fn prune_removed(&mut self) {
+        let pending = &self.pending;
+        self.removed
+            .retain(|key, at| pending.contains_key(key) || at.elapsed() < RECENT_WINDOW);
+        if self.removed.len() > MAX_REMOVED {
+            let mut ages: Vec<(std::time::Instant, Key)> = self
+                .removed
+                .iter()
+                .filter(|(key, _)| !pending.contains_key(*key))
+                .map(|(key, at)| (*at, key.clone()))
+                .collect();
+            ages.sort_by_key(|(at, _)| *at);
+            let excess = self.removed.len() - MAX_REMOVED;
+            for (_, key) in ages.into_iter().take(excess) {
+                self.removed.remove(&key);
+            }
+        }
+    }
+}
+
+/// When a read of a thread list began, and whether the provider had brought it up to date (it
+/// carried no `as_of`). What two summaries of one thread are ordered by. `#278 naming-throttle`.
+#[derive(Clone, Copy, Debug)]
+struct Read {
+    began: std::time::Instant,
+    current: bool,
+}
+
+impl Read {
+    /// When it began, if its counts can be taken as what the thread had then: it was current.
+    fn seen(self) -> Option<std::time::Instant> {
+        self.current.then_some(self.began)
+    }
+
+    /// Whether what this read said of a thread replaces what `held` said: a page that was not
+    /// current never replaces one that was, and otherwise the read that began later says more
+    /// (two reads can land out of order).
+    fn replaces(self, held: Read) -> bool {
+        (self.current, self.began) >= (held.current, held.began)
+    }
 }
 
 /// A queued thread, as the newest page that carried it said. `#278 naming-throttle`.
 ///
-/// Refreshed by every page that carries the thread, whoever reads it, until its naming completes:
-/// a thread can wait half an hour for its channel's reads, and what it is named from, and what a
-/// delta carries once it is named, is decided against what is true NOW, not when it was queued.
+/// Refreshed by every page that carries the thread, whoever reads it, until its naming completes,
+/// unless that page's read began before the one that last refreshed it or it was not current and
+/// that one was ([`Read::replaces`]): a thread can wait half an hour for its channel's reads, and
+/// what it is named from, and what a delta carries once it is named, is decided against the newest
+/// that is known NOW, not what was known when it was queued.
 #[derive(Clone, Debug)]
 struct Pending {
     /// The thread's summary: its reply count, last activity and root.
     latest: ThreadSummary,
-    /// When the read that brought `latest` began; `None` when that page was not current (it
-    /// carried `as_of`), so its count is not known to be what the thread had then.
-    seen: Option<std::time::Instant>,
+    /// The read that brought `latest`. A page that was not current (it carried `as_of`) does not
+    /// show what the thread had when it began.
+    read: Read,
 }
 
 /// What naming has asked of one channel's provider. `#278 naming-throttle`.
@@ -614,6 +703,8 @@ struct Recent {
     channel: ChannelId,
     at: Instant,
     thread: ThreadSummary,
+    /// The read that brought `thread`, so an older or stale one landing later cannot replace it.
+    read: Read,
 }
 
 impl ThreadNames {
@@ -682,8 +773,10 @@ impl ThreadNames {
     ///
     /// `read_began` is when the provider read that brought `page` began ([`crate::ops::timeline`]
     /// answers with it): what each thread's reply count on the page is compared with, against when
-    /// the rows already held of the thread were read ([`held_thread`]). A page that carries `as_of`
-    /// was not current, and its counts are never taken as what a thread had at `read_began`.
+    /// the rows already held of the thread were read ([`held_thread`]), and what orders two pages
+    /// that land out of order. A page that carries `as_of` was not current: its counts are never
+    /// taken as what a thread had at `read_began`, and it never replaces what a current page said.
+    /// A forward delta's `removed_threads` are noted as removed as of `read_began`.
     ///
     /// Does nothing at all when the summariser cannot name threads. Queues nothing for a caller
     /// without write scope (`may_write` false): a read token may be served what the cache holds and
@@ -702,15 +795,26 @@ impl ThreadNames {
         if !deps.summarizer.names_threads() {
             return;
         }
-        let seen = page.as_of.is_none().then_some(read_began);
+        let read = Read {
+            began: read_began,
+            current: page.as_of.is_none(),
+        };
         let removed: Vec<String> = page
             .delta
             .as_ref()
             .map(|delta| delta.removed_threads.clone())
             .unwrap_or_default();
-        self.forget_removed(channel, &removed);
+        self.forget_removed(channel, &removed, read_began);
         let mut answered = HashSet::new();
-        for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+        let listed = page.threads.len();
+        for (index, summary) in page
+            .threads
+            .iter_mut()
+            .chain(page.thread.iter_mut())
+            .enumerate()
+        {
+            // A thread page shows the thread is there to read, not that it is in the list.
+            let in_list = index < listed;
             answered.insert(summary.id.clone());
             match self.lookup(deps, channel, &summary.id).await {
                 Lookup::Known(record) => {
@@ -720,12 +824,12 @@ impl ThreadNames {
                             super::cut_for_serving(&sentence.summary, deps.sentence_chars)
                         });
                     }
-                    self.refresh(channel, summary, seen);
+                    self.refresh(channel, summary, read, in_list);
                     if !may_write {
                         continue;
                     }
                     if due(summary, record.as_ref()) {
-                        self.enqueue(deps, channel, summary.clone(), seen, record);
+                        self.enqueue(deps, channel, summary.clone(), read, record);
                     } else if let Some(record) = record {
                         if needs_touch(summary, &record, now_seconds()) {
                             self.touch(deps, channel, &summary.id, record);
@@ -734,7 +838,7 @@ impl ThreadNames {
                 }
                 Lookup::Unknown(name) => {
                     summary.display_name = name;
-                    self.refresh(channel, summary, seen);
+                    self.refresh(channel, summary, read, in_list);
                 }
             }
         }
@@ -811,39 +915,46 @@ impl ThreadNames {
 
     /// Keep what the server holds of a thread as current as the newest read of it: a renamed
     /// thread's record, which rides forward deltas, and a queued thread's summary, which its naming
-    /// is decided against. `#278 naming-throttle`.
-    fn refresh(
-        &self,
-        channel: &ChannelId,
-        summary: &ThreadSummary,
-        seen: Option<std::time::Instant>,
-    ) {
+    /// is decided against. Two reads can land out of order, and the one that began later says
+    /// more; a page that was not current never replaces one that was ([`Read::replaces`]). A
+    /// current thread LIST read that began after a delta said the thread left the list
+    /// (`in_list`) says it is back. `#278 naming-throttle`.
+    fn refresh(&self, channel: &ChannelId, summary: &ThreadSummary, read: Read, in_list: bool) {
         let mut state = self.lock();
+        let key = (channel.clone(), summary.id.clone());
+        if in_list
+            && read.current
+            && state
+                .removed
+                .get(&key)
+                .is_some_and(|removed| read.began > *removed)
+        {
+            state.removed.remove(&key);
+        }
         if let Some(recent) = state
             .recent
             .iter_mut()
             .find(|recent| recent.channel == *channel && recent.thread.id == summary.id)
         {
-            recent.thread = summary.clone();
+            if read.replaces(recent.read) {
+                recent.thread = summary.clone();
+                recent.read = read;
+            }
         }
-        if let Some(pending) = state
-            .pending
-            .get_mut(&(channel.clone(), summary.id.clone()))
-        {
-            // Two reads can land out of order; the one that began later says more. A page that
-            // was not current replaces it all the same, and leaves it with no time read.
-            let older = matches!((seen, pending.seen), (Some(new), Some(held)) if new < held);
-            if !older {
+        if let Some(pending) = state.pending.get_mut(&key) {
+            if read.replaces(pending.read) {
                 pending.latest = summary.clone();
-                pending.seen = seen;
+                pending.read = read;
             }
         }
     }
 
-    /// Threads a delta says left the list: never carried on a delta again as renamed, and a queued
-    /// one is no longer named from rows held, only from a read, which says whether it is still
-    /// there. `#278 naming-throttle`.
-    fn forget_removed(&self, channel: &ChannelId, removed: &[String]) {
+    /// Threads a delta whose read began at `at` says left the list: never carried on a delta again
+    /// as renamed, and named only from rows read after it, until a current list read after it
+    /// carries them again (`refresh`). Noted with that time, so a page that began earlier and
+    /// lands later cannot undo it, and kept while the thread is queued, so a naming in flight
+    /// cannot either. `#278 naming-throttle`.
+    fn forget_removed(&self, channel: &ChannelId, removed: &[String], at: std::time::Instant) {
         if removed.is_empty() {
             return;
         }
@@ -852,10 +963,13 @@ impl ThreadNames {
             .recent
             .retain(|recent| !(recent.channel == *channel && removed.contains(&recent.thread.id)));
         for thread in removed {
-            if let Some(pending) = state.pending.get_mut(&(channel.clone(), thread.clone())) {
-                pending.seen = None;
-            }
+            let noted = state
+                .removed
+                .entry((channel.clone(), thread.clone()))
+                .or_insert(at);
+            *noted = (*noted).max(at);
         }
+        state.prune_removed();
     }
 
     fn recently_renamed(
@@ -917,7 +1031,7 @@ impl ThreadNames {
         deps: &ThreadDeps,
         channel: &ChannelId,
         snapshot: ThreadSummary,
-        seen: Option<std::time::Instant>,
+        read: Read,
         prior: Option<ThreadRecord>,
     ) {
         let key = (channel.clone(), snapshot.id.clone());
@@ -925,7 +1039,11 @@ impl ThreadNames {
         // the rows, and the summary they are checked against, are looked up again when its turn
         // comes (see `work`), because a copy taken now would outlive an edit or delete pushed
         // while it waits, and a reply added. `#278 naming-throttle`.
-        let held = held_thread(&deps.read_ahead, channel, &snapshot, seen).is_some();
+        let seen = match self.lock().removed.get(&key) {
+            Some(removed) => read.seen().filter(|seen| seen > removed),
+            None => read.seen(),
+        };
+        let held = held_thread(&deps.read_ahead, &deps.changes, channel, &snapshot, seen).is_some();
         {
             let mut state = self.lock();
             if state.pending.contains_key(&key) {
@@ -954,7 +1072,7 @@ impl ThreadNames {
                 key.clone(),
                 Pending {
                     latest: snapshot,
-                    seen,
+                    read,
                 },
             );
         }
@@ -968,7 +1086,11 @@ impl ThreadNames {
             let outcome = this.work(&deps, &key, prior.as_ref()).await;
             let mut state = this.lock();
             // The thread as the newest page said, not as it was queued: what a delta carries.
-            let latest = state.pending.remove(&key).map(|pending| pending.latest);
+            let latest = state.pending.remove(&key);
+            // Unless a delta said it left the list, and no current list since has carried it:
+            // then a delta must not carry it as a live row, which the page would add back.
+            let removed = state.removed.contains_key(&key);
+            state.prune_removed();
             match outcome {
                 Work::Deferred => tracing::debug!(
                     "a thread was left unnamed: it needs a read, and its channel's naming reads are \
@@ -980,10 +1102,22 @@ impl ThreadNames {
                 Work::Named(record) => {
                     state.failed.remove(&key);
                     state.named += 1;
-                    state
+                    let earlier = state
                         .recent
-                        .retain(|recent| !(recent.channel == key.0 && recent.thread.id == key.1));
-                    if let Some(mut renamed) = latest {
+                        .iter()
+                        .position(|recent| recent.channel == key.0 && recent.thread.id == key.1)
+                        .and_then(|at| state.recent.remove(at));
+                    // The newest read of the thread, whichever holds it: a thread re-queued (for a
+                    // fresh sentence) from a page that began before the one its earlier renaming
+                    // rides with must not roll that back.
+                    let latest = latest.map(|pending| match earlier {
+                        Some(earlier) if earlier.read.replaces(pending.read) => {
+                            (earlier.thread, earlier.read)
+                        }
+                        _ => (pending.latest, pending.read),
+                    });
+                    if let (Some((latest, read)), false) = (latest, removed) {
+                        let mut renamed = latest;
                         renamed.display_name = Some(record.name.clone());
                         renamed.summary = record.sentence.as_ref().map(|sentence| {
                             super::cut_for_serving(&sentence.summary, deps.sentence_chars)
@@ -995,6 +1129,7 @@ impl ThreadNames {
                             channel: key.0.clone(),
                             at: Instant::now(),
                             thread: renamed,
+                            read,
                         });
                     }
                     state.known.insert(key, Some(record));
@@ -1033,12 +1168,16 @@ impl ThreadNames {
             if !(deps.listed)(channel) {
                 return Work::Unlisted;
             }
-            let Some(Pending { latest, seen }) = self.lock().pending.get(key).cloned() else {
-                // Never: the entry is removed only once this returns.
-                return Work::Deferred;
+            let (latest, seen) = {
+                let state = self.lock();
+                let Some(pending) = state.pending.get(key) else {
+                    // Never: the entry is removed only once this returns.
+                    return Work::Deferred;
+                };
+                (pending.latest.clone(), state.seen(key))
             };
             let snapshot = &latest;
-            let rows = match held_thread(&deps.read_ahead, channel, snapshot, seen) {
+            let rows = match held_thread(&deps.read_ahead, &deps.changes, channel, snapshot, seen) {
                 Some(rows) => Rows::Held(rows),
                 None => match self.take_read(channel) {
                     Gate::Open => Rows::Read,
@@ -1134,8 +1273,9 @@ impl From<SummaryError> for NameError {
 /// thread's naming turn comes, with the newest summary seen of it then (`snapshot`) and when the
 /// read that brought that summary began (`seen`), so what it answers is what read-ahead holds THEN,
 /// checked against what is known of the thread THEN: a row an edit or delete has since dropped is
-/// gone from it, and a reply added since shows in the count. `#278 naming-throttle`, remote-ops
-/// audit W5.
+/// gone from it, and a reply added since shows in the count if a page has read the count again,
+/// or in `changes` if the live feed or this server's own post said so. `#278 naming-throttle`,
+/// remote-ops audit W5.
 ///
 /// Every row comes from `read_ahead`, the root included: what it holds of the thread, read in it or
 /// labelled with it in the last [`crate::read_ahead::RECENT_TTL`] (the thread list's own roots; a
@@ -1143,8 +1283,14 @@ impl From<SummaryError> for NameError {
 /// `snapshot`, whose root is a copy that an edit or delete pushed since cannot reach. They stand in
 /// for a read only when all of these hold:
 ///
-/// * the count was read in the last [`crate::read_ahead::RECENT_TTL`], from a current page (`seen`
-///   is `None` for one that carried `as_of`). An older count says nothing about the thread now.
+/// * the count was read in the last [`crate::read_ahead::RECENT_TTL`], from a current page, and
+///   after any delta that said the thread left the list (`seen` is `None` otherwise). An older
+///   count says nothing about the thread now.
+/// * no change to the thread, or to its channel with no thread known, has been noted in `changes`
+///   since the count was read: a reply pushed, or posted by this server, after it.
+/// * every row, the root included, came from a page the provider had brought up to date. A page
+///   that carried `as_of` may hold a message as it was before an edit pushed earlier, which its
+///   tombstone cannot keep out because the page's read began after it.
 /// * the reply count is EXACT. An estimate, or no count at all, proves nothing.
 /// * it is at most [`THREAD_FETCH_LIMIT`]. Past that a read brings the newest replies, and rows
 ///   held cannot show they are those rather than an older page the reader scrolled to, or a newest
@@ -1161,15 +1307,20 @@ impl From<SummaryError> for NameError {
 ///
 /// Then every reply held was in the thread when its count was read, unless a delete nobody pushed
 /// took it out in between, and the thread had exactly those replies. What that cannot see is a
-/// change nobody pushed: an edit, or a delete, in the half minute a row is held.
+/// change nobody pushed or posted here: an edit, a delete, or a reply added, in the half minute a
+/// row is held.
 fn held_thread(
     read_ahead: &ReadAhead,
+    changes: &ThreadChanges,
     channel: &ChannelId,
     snapshot: &ThreadSummary,
     seen: Option<std::time::Instant>,
 ) -> Option<Vec<Message>> {
     let seen = seen?;
     if seen.elapsed() >= crate::read_ahead::RECENT_TTL {
+        return None;
+    }
+    if changes.changed_since(channel, &snapshot.id, seen) {
         return None;
     }
     if !snapshot.reply_count_exact {
@@ -1191,7 +1342,10 @@ fn held_thread(
                     .as_ref()
                     .is_some_and(|thread| thread.is_root)
         });
-    if replies.iter().any(|held| held.fetched > seen) {
+    if replies
+        .iter()
+        .any(|held| held.fetched > seen || !held.current)
+    {
         return None;
     }
     if replies.len() as u64 != counted {
@@ -1213,8 +1367,11 @@ fn held_thread(
     }
     // One root; were two rows to claim it, the copy read last.
     roots.sort_by_key(|held| held.fetched);
-    let root = roots.pop()?.message;
-    Some(std::iter::once(root).chain(replies).collect())
+    let root = roots.pop()?;
+    if !root.current {
+        return None;
+    }
+    Some(std::iter::once(root.message).chain(replies).collect())
 }
 
 /// Whether a thread needs a name, or a fresh sentence.
@@ -1712,6 +1869,8 @@ mod tests {
                     .collect()
             })
         };
+        // Nothing pushed, unless a case below says so.
+        let changes = ThreadChanges::new();
         // The thread list read the root, and its count, just now.
         let listed_at = std::time::Instant::now();
         let listed = ReadAhead::new();
@@ -1719,40 +1878,67 @@ mod tests {
         let counted = Some(std::time::Instant::now());
         let no_replies = as_listed(Some(0), true, &at(100));
         assert_eq!(
-            ids(held_thread(&listed, &channel, &no_replies, counted)),
+            ids(held_thread(
+                &listed,
+                &changes,
+                &channel,
+                &no_replies,
+                counted
+            )),
             Some(vec![100]),
             "no replies: the root the list read is the whole thread"
         );
         let empty = ReadAhead::new();
         assert!(
-            held_thread(&empty, &channel, &no_replies, counted).is_none(),
+            held_thread(&empty, &changes, &channel, &no_replies, counted).is_none(),
             "the root is not held (an edit or delete pushed since dropped it): the list's copy of \
              it is never used"
         );
         assert!(
-            held_thread(&listed, &channel, &no_replies, None).is_none(),
+            held_thread(&listed, &changes, &channel, &no_replies, None).is_none(),
             "a count from a page that was not current proves nothing"
         );
         let half_a_minute_ago = std::time::Instant::now()
             .checked_sub(crate::read_ahead::RECENT_TTL + Duration::from_secs(1))
             .expect("the clock has run for more than a minute");
         assert!(
-            held_thread(&listed, &channel, &no_replies, Some(half_a_minute_ago)).is_none(),
+            held_thread(
+                &listed,
+                &changes,
+                &channel,
+                &no_replies,
+                Some(half_a_minute_ago)
+            )
+            .is_none(),
             "a count read more than 30 s ago says nothing about the thread now"
         );
         assert_eq!(
-            held_thread(&listed, &channel, &snapshot(Some(0), false), counted).map(|m| m.len()),
+            held_thread(
+                &listed,
+                &changes,
+                &channel,
+                &snapshot(Some(0), false),
+                counted
+            )
+            .map(|m| m.len()),
             None,
             "an estimate proves nothing"
         );
-        assert!(held_thread(&listed, &channel, &snapshot(None, true), counted).is_none());
-        assert!(held_thread(&listed, &channel, &snapshot(Some(1), true), counted).is_none());
+        assert!(held_thread(&listed, &changes, &channel, &snapshot(None, true), counted).is_none());
+        assert!(held_thread(
+            &listed,
+            &changes,
+            &channel,
+            &snapshot(Some(1), true),
+            counted
+        )
+        .is_none());
         let rootless = ThreadSummary {
             root: None,
             ..no_replies.clone()
         };
         assert!(
-            held_thread(&empty, &channel, &rootless, counted).is_none(),
+            held_thread(&empty, &changes, &channel, &rootless, counted).is_none(),
             "no root anywhere: nothing to name it by but a read"
         );
 
@@ -1769,6 +1955,7 @@ mod tests {
         assert_eq!(
             ids(held_thread(
                 &read_ahead,
+                &changes,
                 &channel,
                 &snapshot(Some(2), true),
                 counted
@@ -1782,6 +1969,7 @@ mod tests {
         assert!(
             held_thread(
                 &read_ahead,
+                &changes,
                 &channel,
                 &snapshot(Some(2), true),
                 Some(before_the_rows)
@@ -1791,15 +1979,30 @@ mod tests {
              be its newest replies without its oldest"
         );
         assert!(
-            held_thread(&read_ahead, &channel, &snapshot(Some(3), true), counted).is_none(),
+            held_thread(
+                &read_ahead,
+                &changes,
+                &channel,
+                &snapshot(Some(3), true),
+                counted
+            )
+            .is_none(),
             "a reply the count says exists and nothing holds"
         );
         assert!(
-            held_thread(&read_ahead, &channel, &snapshot(Some(1), true), counted).is_none(),
+            held_thread(
+                &read_ahead,
+                &changes,
+                &channel,
+                &snapshot(Some(1), true),
+                counted
+            )
+            .is_none(),
             "a reply held that the count says is no longer there"
         );
         assert!(held_thread(
             &read_ahead,
+            &changes,
             &ChannelId("d".to_owned()),
             &snapshot(Some(2), true),
             counted
@@ -1808,6 +2011,7 @@ mod tests {
         assert!(
             held_thread(
                 &read_ahead,
+                &changes,
                 &channel,
                 &as_listed(Some(2), true, &at(104)),
                 counted
@@ -1818,6 +2022,7 @@ mod tests {
         assert!(
             held_thread(
                 &read_ahead,
+                &changes,
                 &channel,
                 &as_listed(Some(2), true, ""),
                 counted
@@ -1828,6 +2033,7 @@ mod tests {
         assert_eq!(
             ids(held_thread(
                 &read_ahead,
+                &changes,
                 &channel,
                 &as_listed(Some(2), true, &at(102)),
                 counted
@@ -1835,9 +2041,118 @@ mod tests {
             Some(vec![100, 101, 103]),
             "rows held that are newer than the list are not older than the thread"
         );
+
+        // A change noted after the count was read: a reply pushed, or posted by this server, that
+        // the count does not show.
+        let pushed = ThreadChanges::new();
+        pushed.note(&channel, Some("T"));
+        assert!(
+            held_thread(
+                &read_ahead,
+                &pushed,
+                &channel,
+                &snapshot(Some(2), true),
+                counted
+            )
+            .is_none(),
+            "a reply pushed after the count was read"
+        );
+        let unlabelled = ThreadChanges::new();
+        unlabelled.note(&channel, None);
+        assert!(
+            held_thread(
+                &read_ahead,
+                &unlabelled,
+                &channel,
+                &snapshot(Some(2), true),
+                counted
+            )
+            .is_none(),
+            "a message pushed with no thread label may be in this thread"
+        );
+        let elsewhere = ThreadChanges::new();
+        elsewhere.note(&channel, Some("U"));
+        elsewhere.note(&ChannelId("d".to_owned()), None);
+        assert!(
+            held_thread(
+                &read_ahead,
+                &elsewhere,
+                &channel,
+                &snapshot(Some(2), true),
+                counted
+            )
+            .is_some(),
+            "a change to another thread, or another channel, says nothing of this one"
+        );
+        let recounted = Some(std::time::Instant::now());
+        assert!(
+            held_thread(
+                &read_ahead,
+                &pushed,
+                &channel,
+                &snapshot(Some(2), true),
+                recounted
+            )
+            .is_some(),
+            "a count read after the change shows it"
+        );
+
+        // A copy from a page the provider could not bring up to date, of a reply or of the root:
+        // it may predate an edit pushed before that page's read began.
+        let stale_as_of = Some("2026-10-13T00:00:00Z");
+        let stale_reply = ReadAhead::new();
+        let stale_read = std::time::Instant::now();
+        stale_reply.remember(
+            &channel,
+            None,
+            &[message(100, true), message(101, false)],
+            stale_read,
+        );
+        stale_reply.remember_as_of(
+            &channel,
+            None,
+            &[message(103, false)],
+            stale_read,
+            stale_as_of,
+        );
+        let stale_root = ReadAhead::new();
+        stale_root.remember(
+            &channel,
+            None,
+            &[message(101, false), message(103, false)],
+            stale_read,
+        );
+        stale_root.remember_as_of(
+            &channel,
+            None,
+            &[message(100, true)],
+            stale_read,
+            stale_as_of,
+        );
+        let counted_after = Some(std::time::Instant::now());
+        for (held, what) in [(&stale_reply, "a reply"), (&stale_root, "the root")] {
+            assert!(
+                held_thread(
+                    held,
+                    &changes,
+                    &channel,
+                    &snapshot(Some(2), true),
+                    counted_after
+                )
+                .is_none(),
+                "{what} from a page that was not current"
+            );
+        }
         read_ahead.forget(&channel, &MessageId("101".to_owned()));
         assert!(
-            held_thread(&read_ahead, &channel, &snapshot(Some(2), true), counted).is_none(),
+            held_thread(
+                &read_ahead,
+                &changes,
+                &channel,
+                &snapshot(Some(2), true),
+                counted
+            )
+            .is_none(),
             "an edit or delete pushed since drops the reply, and the rows are not the thread"
         );
 
@@ -1850,6 +2165,7 @@ mod tests {
         let counted = Some(std::time::Instant::now());
         let held = ids(held_thread(
             &full,
+            &changes,
             &channel,
             &as_listed(Some(limit), true, &at(100 + limit)),
             counted,
@@ -1867,6 +2183,7 @@ mod tests {
             assert!(
                 held_thread(
                     &long,
+                    &changes,
                     &channel,
                     &as_listed(Some(replies), true, &at(100 + limit + 5)),
                     counted
@@ -1875,6 +2192,86 @@ mod tests {
                 "{replies} replies"
             );
         }
+    }
+
+    #[test]
+    fn a_removal_is_kept_while_its_thread_is_queued_and_for_the_delta_window_besides() {
+        // `#278 naming-throttle`. A thread can wait longer than fifteen minutes for its turn; the
+        // removal must outlast that wait, or the naming would put it back on every delta.
+        let channel = ChannelId("c".to_owned());
+        let key = |thread: &str| (channel.clone(), thread.to_owned());
+        let long_ago = std::time::Instant::now()
+            .checked_sub(RECENT_WINDOW + Duration::from_secs(1))
+            .expect("the clock has run for more than fifteen minutes");
+        let read = Read {
+            began: long_ago,
+            current: true,
+        };
+        let summary = ThreadSummary {
+            id: "queued".to_owned(),
+            root: None,
+            title: String::new(),
+            reply_count: Some(0),
+            reply_count_exact: true,
+            updated_at: String::new(),
+            display_name: None,
+            summary: None,
+        };
+        let mut state = NamesState::default();
+        state.pending.insert(
+            key("queued"),
+            Pending {
+                latest: summary,
+                read,
+            },
+        );
+        state.removed.insert(key("queued"), long_ago);
+        state.removed.insert(key("old"), long_ago);
+        state.removed.insert(key("new"), std::time::Instant::now());
+        state.prune_removed();
+        assert!(state.removed.contains_key(&key("queued")), "still queued");
+        assert!(!state.removed.contains_key(&key("old")), "past the window");
+        assert!(state.removed.contains_key(&key("new")));
+        assert_eq!(state.seen(&key("queued")), None, "read before the removal");
+
+        // Past the bound, the oldest of those not queued go first.
+        let start = std::time::Instant::now();
+        for n in 0..MAX_REMOVED {
+            state.removed.insert(
+                key(&format!("t{n}")),
+                start + Duration::from_millis(n as u64),
+            );
+        }
+        state.prune_removed();
+        assert_eq!(state.removed.len(), MAX_REMOVED);
+        assert!(state.removed.contains_key(&key("queued")));
+        assert!(
+            !state.removed.contains_key(&key("new")),
+            "the oldest not queued"
+        );
+        assert!(!state.removed.contains_key(&key("t0")));
+        assert!(state.removed.contains_key(&key("t1")));
+    }
+
+    #[test]
+    fn a_page_that_was_not_current_never_replaces_one_that_was_and_otherwise_the_later_read_does() {
+        let earlier = std::time::Instant::now();
+        let later = earlier + Duration::from_secs(1);
+        let read = |began, current| Read { began, current };
+        assert!(read(later, true).replaces(read(earlier, true)));
+        assert!(
+            !read(earlier, true).replaces(read(later, true)),
+            "landed late"
+        );
+        assert!(!read(later, false).replaces(read(earlier, true)), "stale");
+        assert!(read(earlier, true).replaces(read(later, false)));
+        assert!(read(later, false).replaces(read(earlier, false)));
+        assert!(
+            read(later, true).replaces(read(later, true)),
+            "the same read"
+        );
+        assert_eq!(read(later, false).seen(), None);
+        assert_eq!(read(later, true).seen(), Some(later));
     }
 
     #[test]

@@ -1510,8 +1510,10 @@ write-scope token queues the threads that are due, and they are named one at a t
 thread's root and newest messages, one call, file the result. A read token is shown names that
 exist but never causes a call. A name produced after a page was read reaches it on its next
 refresh, a forward delta included: for up to fifteen minutes, deltas of the thread list carry the
-thread with its new name, as the newest page this server served showed it, unless a delta has said
-it left the list. A thread whose naming failed is left alone for ten minutes. The
+thread with its new name, as the newest read of it showed it (reads that land out of order are
+ordered by when they began, and a page the provider could not bring up to date never replaces one
+it could), unless a delta has said it left the list and no up-to-date thread list read after that
+delta has shown it again. A thread whose naming failed is left alone for ten minutes. The
 model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
 characters); any other answer fails that naming by name rather than being cut into shape.
 
@@ -1527,21 +1529,35 @@ of the thread reads a deployment made. So:
   is kept for good. Nothing is copied when a thread is queued: when its turn comes, its messages,
   root included, are looked up in what was read in the last 30 seconds, and checked against the
   newest reply count any page has shown for it since (every page refreshes a queued thread's
-  count and last activity). That count must be exact, at most 50, read in the last 30 seconds from
-  a page the provider had brought up to date, and read no earlier than any of the replies held;
-  exactly that many replies must be held, and the newest of them must be no older than the
-  thread's last activity. So an edit or delete pushed while the thread waits, a reply added, a
-  delta saying it left the list, or messages that have expired all send it to the provider
-  instead. A thread of more than 50 replies is always read: the replies held might be an older
-  page you scrolled to rather than its newest.
-* What this cannot see is a change nobody pushed, within those 30 seconds. An edit, to the root
-  or a reply, changes neither the count nor the last activity, so the thread is named from the
-  text as the page read it; and a deleted reply can still be among the messages a thread is named
-  from, or a deleted thread still be named. A provider that pushes edits and deletes (a bridge
-  with a tail) closes it.
+  count and last activity, unless its read began before the one that last did, or it was not up
+  to date and that one was). That count must be exact, at most 50, read
+  in the last 30 seconds from a page the provider had brought up to date, and read no earlier
+  than any of the replies held, and nothing this server has been told of since may touch the
+  thread: a message pushed into it (or pushed into its channel with no thread label), or a reply
+  you posted to it from here, whether or not the post said it arrived. After a delta saying the
+  thread left the list, only a count read after that delta will do. Every message held must come
+  from a page the provider had brought up to date: one marked `as_of` can still hold a message as
+  it was before an edit that was pushed earlier. Exactly as many replies as the count must be
+  held, and the newest of them must be no older than the thread's last activity. So an edit or
+  delete pushed while the thread waits, a reply pushed or posted here, a reply a later page
+  counts, a delta saying it left the list, or messages that have expired all send it to the
+  provider instead. A thread of more than 50 replies is always read: the replies held might be an
+  older page you scrolled to rather than its newest.
+* What this cannot see is a change the server is not told of, within those 30 seconds. An edit,
+  to the root or a reply, changes neither the count nor the last activity, so the thread is named
+  from the text as the page read it; a deleted reply can still be among the messages a thread is
+  named from, or a deleted thread still be named; and a reply added with nothing pushed is missed
+  unless a page reads the thread's count again before its turn. When it is missed, the thread is
+  named without it, the name is kept, and the sentence is filed at the old count, so it is not
+  replaced before the next milestone. A provider that pushes every change, each labelled with its
+  thread, narrows this to the time a push takes to arrive. A thread that naming does read is named
+  from that read even if the provider could not bring it up to date (`as_of`), as before: there is
+  nothing fresher to fall back to.
 * Being strict costs reads: a Flat page read *after* the thread list is not used until a page
-  shows the thread's count again, and a thread list the provider could not bring up to date
-  (`as_of`) names nothing without a read.
+  shows the thread's count again; a reply pushed or posted into a thread does the same to it, and
+  a message pushed with no thread label to every thread of its channel; a thread list the
+  provider could not bring up to date (`as_of`) names nothing without a read; and messages from
+  any page marked `as_of` are never named from.
 * Any other thread costs one read, and naming reads **at most one thread per channel every 30
   seconds**. Twenty unnamed threads in one channel are named over ten minutes, not in one burst;
   at most 64 of one channel's threads wait at a time, so other channels are not held behind
@@ -2793,6 +2809,12 @@ screen distinguishes "configured and connected to this server" from adapter heal
 server cannot observe. Full pushed events are refused per channel when that channel's provider is
 polled: duplicate delivery must not depend on two unrelated cursors happening to agree. Hints are
 allowed beside polling precisely because they contain no message and create no second cursor.
+
+Label a reply with its thread (`message.thread.id`) when you push it. Every published message tells
+thread naming that its thread changed, so a reply count read before it is not trusted to name the
+thread from messages already held (see [Thread names](#thread-names)). A created message with no
+thread label could be in any thread, so it makes naming distrust every count of its channel read
+before it, which costs thread reads.
 
 ### Change-hint acceleration
 

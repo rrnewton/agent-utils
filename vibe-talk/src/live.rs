@@ -237,6 +237,10 @@ pub struct LiveHub {
     /// Here for the reason `upstream_clear` is: both producers reach the hub, and only the hub,
     /// so this is the one place a change cannot bypass. See [`crate::recent`].
     recent: std::sync::Arc<crate::recent::RecentWindows>,
+    /// Which threads have changed, noted on every publish so thread naming never takes a reply
+    /// count read before a change for what the thread has now. `#278 naming-throttle`. Here for
+    /// the reason `upstream_clear` is. See [`crate::read_ahead::ThreadChanges`].
+    thread_changes: std::sync::Arc<crate::read_ahead::ThreadChanges>,
 }
 
 impl Default for LiveHub {
@@ -264,6 +268,7 @@ impl LiveHub {
             hint_generation,
             upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
             recent,
+            thread_changes: std::sync::Arc::new(crate::read_ahead::ThreadChanges::new()),
         }
     }
 
@@ -277,6 +282,12 @@ impl LiveHub {
     #[must_use]
     pub fn upstream_clear(&self) -> &std::sync::Arc<crate::upstream_clear::Candidates> {
         &self.upstream_clear
+    }
+
+    /// Which threads the live feed has said changed. `#278 naming-throttle`.
+    #[must_use]
+    pub fn thread_changes(&self) -> &std::sync::Arc<crate::read_ahead::ThreadChanges> {
+        &self.thread_changes
     }
 
     /// Queue one content-free request to poll `channel` now.
@@ -376,6 +387,16 @@ impl LiveHub {
         // its provider: one map update and a wake-up, after the feed lock is released.
         let created = (live.kind == LiveKind::Create)
             .then(|| (live.message.id.clone(), live.message.timestamp.clone()));
+        // And where a change is noted against its thread, for thread naming
+        // (`#278 naming-throttle`): before the feed is told, so nothing that sees the change can
+        // run ahead of the note. A new message with no thread label may be in any thread of the
+        // channel. An edit or delete with none needs no note: it drops its row from read-ahead
+        // (`crate::http::api::ingest_event`), which is enough.
+        match (&live.message.thread, live.kind) {
+            (Some(thread), _) => self.thread_changes.note(channel, Some(&thread.id)),
+            (None, LiveKind::Create) => self.thread_changes.note(channel, None),
+            (None, _) => {}
+        }
         if !self.publish_to_feed(channel, live, deduplicate) {
             return false;
         }

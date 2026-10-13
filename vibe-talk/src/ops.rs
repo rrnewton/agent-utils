@@ -414,10 +414,15 @@ pub async fn messages(
         .await
         .mark(&mut messages);
     // `#191 read-aloud-first-lag`: a speech preparation in the next few seconds reads these
-    // rather than fetching the same window again.
-    state
-        .read_ahead
-        .remember(&channel.id, None, &messages, fetch_began);
+    // rather than fetching the same window again. Marked as not current when the provider could
+    // not bring the read up to date, for thread naming (`#278 naming-throttle`).
+    state.read_ahead.remember_as_of(
+        &channel.id,
+        None,
+        &messages,
+        fetch_began,
+        read.as_of.as_deref(),
+    );
     Ok(Window {
         channel,
         messages,
@@ -567,23 +572,31 @@ pub async fn timeline(
     let noise = crate::noise::filter_for(state, &channel.id).await;
     stamp(state, &mut page.messages);
     noise.mark(&mut page.messages);
+    // Each row says whether its page was current, so thread naming never takes a copy from a page
+    // the provider could not bring up to date for what a read would bring. `#278 naming-throttle`.
+    let as_of = page.as_of.clone();
     for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
         if let Some(root) = &mut summary.root {
             stamp(state, std::slice::from_mut(root));
             noise.mark(std::slice::from_mut(root));
-            state.read_ahead.remember(
+            state.read_ahead.remember_as_of(
                 &channel.id,
                 Some(&summary.id),
                 std::slice::from_ref(root),
                 fetch_began,
+                as_of.as_deref(),
             );
         }
     }
     // `#191 read-aloud-first-lag`: what the page is about to draw is what it will ask to hear.
     // A delta carries only what changed, which is exactly what has to replace an older copy.
-    state
-        .read_ahead
-        .remember(&channel.id, thread, &page.messages, fetch_began);
+    state.read_ahead.remember_as_of(
+        &channel.id,
+        thread,
+        &page.messages,
+        fetch_began,
+        as_of.as_deref(),
+    );
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
     }
@@ -1715,6 +1728,21 @@ pub async fn reply_scoped(
                     .await
             }
         };
+        // The thread this part went to has a reply its last-read count does not show, whether or
+        // not the answer says it arrived: thread naming must not take that count for what the
+        // thread has now (`#278 naming-throttle`). A part to the conversation itself starts its own
+        // thread, or none, and changes no other.
+        let changed = match &sent {
+            Ok(one) => one
+                .thread
+                .as_ref()
+                .map(|thread| thread.id.as_str())
+                .or(into),
+            Err(_) => into,
+        };
+        if let Some(thread) = changed {
+            state.live.thread_changes().note(&info.id, Some(thread));
+        }
         match sent {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));

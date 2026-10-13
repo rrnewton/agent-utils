@@ -16,11 +16,16 @@
 //! for a read only when they are what the read would bring. They are looked up at the thread's
 //! turn, the root included, never copied when it is queued, and checked against the newest summary
 //! any page has carried of the thread since: an exact count of at most 50, from a current page,
-//! read no earlier than any reply held, matched exactly, the newest reply no older than the
+//! read no earlier than any reply held and with nothing pushed or posted into the thread since,
+//! matched exactly by rows that all came from current pages, the newest reply no older than the
 //! thread's last activity. What changes while a thread waits (an edit or delete pushed, a reply
-//! added, a delta that removes it) is seen at its turn, and a renamed thread rides a delta as the
-//! newest page showed it. Plus two queue rules: a channel taken off the list is not read or filed
-//! for, and one channel's backlog does not keep another's threads out of the queue.
+//! pushed or posted here, a reply counted by a later page, a delta that removes it) is seen at its
+//! turn; a reply added with nothing pushed is not, unless a page counts it first, and no test here
+//! claims otherwise. Pages that land out of order are ordered by when their reads began, and a page
+//! the provider could not bring up to date never replaces one it could, so a renamed thread rides
+//! a delta as the newest current read showed it, and never once a delta has removed it. Plus two
+//! queue rules: a channel taken off the list is not read or filed for, and one channel's backlog
+//! does not keep another's threads out of the queue.
 //!
 //! Every test runs on tokio's paused clock, so minutes of budget cost no wall time. Read-ahead
 //! keeps its rows by the wall clock, which these tests barely move, so a row never expires in
@@ -71,6 +76,19 @@ struct Forum {
     /// When set, the thread list answers as a provider serving what it could not bring up to date
     /// does: complete only up to this instant (`as_of`).
     list_as_of: Mutex<Option<String>>,
+    /// When set, the thread list answers from THESE threads, complete only up to the instant given
+    /// (`as_of`): a provider that has fallen behind, serving the channel as it was.
+    stale_list: Mutex<Option<(String, Vec<ForumThread>)>>,
+    /// The same for the Flat view.
+    stale_flat: Mutex<Option<(String, Vec<ForumThread>)>>,
+    /// When set, the next thread-list read takes its answer as the threads are when it BEGINS, and
+    /// then waits for a permit from this before it answers: a read that began before another and
+    /// lands after it.
+    hold_next_list: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Threads the thread list leaves out, though they can still be read: moved out of the list.
+    unlisted: Mutex<Vec<String>>,
+    /// When set, a post to a thread arrives upstream and its answer is lost on the way back.
+    lose_post_answers: Mutex<bool>,
 }
 
 fn message(channel: &ChannelId, id: u64, content: &str, thread: &str, is_root: bool) -> Message {
@@ -227,12 +245,26 @@ impl ChatClient for Forum {
     ) -> Result<TimelinePage, ChatError> {
         let threads = self.threads(channel);
         let page = match request.view {
-            TimelineView::Threads => TimelinePage {
-                threads: threads.iter().map(Self::summary).collect(),
-                has_threads: true,
-                as_of: self.list_as_of.lock().unwrap().clone(),
-                ..TimelinePage::default()
-            },
+            TimelineView::Threads => {
+                let stale = self.stale_list.lock().unwrap().clone();
+                let (as_of, mut threads) = match stale {
+                    Some((as_of, threads)) => (Some(as_of), threads),
+                    None => (self.list_as_of.lock().unwrap().clone(), threads),
+                };
+                let unlisted = self.unlisted.lock().unwrap().clone();
+                threads.retain(|thread| !unlisted.contains(&thread.id));
+                let page = TimelinePage {
+                    threads: threads.iter().map(Self::summary).collect(),
+                    has_threads: true,
+                    as_of,
+                    ..TimelinePage::default()
+                };
+                let hold = self.hold_next_list.lock().unwrap().take();
+                if let Some(hold) = hold {
+                    hold.acquire().await.expect("never closed").forget();
+                }
+                page
+            }
             TimelineView::Thread => {
                 let id = request.thread_id.clone().unwrap_or_default();
                 self.thread_reads
@@ -257,6 +289,11 @@ impl ChatClient for Forum {
                 }
             }
             TimelineView::Flat => {
+                let stale = self.stale_flat.lock().unwrap().clone();
+                let (as_of, threads) = match stale {
+                    Some((as_of, threads)) => (Some(as_of), threads),
+                    None => (None, threads),
+                };
                 let mut messages: Vec<Message> = threads
                     .iter()
                     .flat_map(|thread| std::iter::once(&thread.root).chain(&thread.replies))
@@ -266,6 +303,7 @@ impl ChatClient for Forum {
                 TimelinePage {
                     messages: newest(messages, request.limit),
                     has_threads: true,
+                    as_of,
                     ..TimelinePage::default()
                 }
             }
@@ -284,6 +322,37 @@ impl ChatClient for Forum {
         _reply: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
         Err(ChatError::Refused("read only".to_owned()))
+    }
+    async fn post_in_thread(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        _reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        let mut posted = None;
+        self.change(channel, |threads| {
+            if let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) {
+                let id = thread
+                    .replies
+                    .last()
+                    .unwrap_or(&thread.root)
+                    .id
+                    .numeric()
+                    .unwrap()
+                    + 1;
+                let reply = message(channel, id, content, thread_id, false);
+                thread.replies.push(reply.clone());
+                posted = Some(reply);
+            }
+        });
+        let posted = posted.ok_or_else(|| ChatError::Refused("no such thread".to_owned()))?;
+        if *self.lose_post_answers.lock().unwrap() {
+            return Err(ChatError::Transport(
+                "the connection dropped before the answer".to_owned(),
+            ));
+        }
+        Ok(posted)
     }
 }
 
@@ -341,7 +410,10 @@ fn gated_harness(forum: Forum, permits: usize) -> Harness {
     let summarizer = Arc::new(FakeSummarizer::naming_threads());
     let gate = Arc::new(tokio::sync::Semaphore::new(permits));
     let (mut state, _discord, _store) = testing::state_with_backend(
-        &testing::config_toml(),
+        &format!(
+            "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n",
+            testing::config_toml()
+        ),
         Arc::new(Gated {
             inner: summarizer.clone(),
             gate: gate.clone(),
@@ -360,6 +432,9 @@ fn gated_harness(forum: Forum, permits: usize) -> Harness {
         state,
     }
 }
+
+/// What an adapter authenticates its pushes with (`POST /api/v1/live/events`).
+const INGEST_TOKEN: &str = "test-ingest-token-0000000000";
 
 fn write_channel() -> ChannelId {
     ChannelId(WRITE_CHANNEL.to_owned())
@@ -1311,6 +1386,569 @@ async fn one_channel_with_more_due_threads_than_the_whole_queue_holds_leaves_roo
         "the other channel's threads were queued and read on their own budget"
     );
     assert_eq!(thread_reads(&h, &write_channel()), 2);
+}
+
+// --- what the server learns after a count was read, and pages that land out of order ---------------
+//
+// A count read is only as good as what has happened since. A change the server is TOLD of after
+// the count was read (a pushed reply, the owner's own post), rows from a page the provider could not
+// bring up to date, a delta saying the thread left the list, and a page that began before another
+// but lands after it must each lose to what is newer.
+
+/// Send one request to `app` as `token`, with a JSON body if any.
+async fn call(
+    app: axum::Router,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"));
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    }
+    .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Add a reply to thread `n` of the write channel upstream, newer than everything in it.
+fn add_reply(h: &Harness, n: usize, content: &str) -> Message {
+    let channel = write_channel();
+    let mut added = None;
+    h.forum.change(&channel, |threads| {
+        let thread = &mut threads[n];
+        let id = thread
+            .replies
+            .last()
+            .unwrap_or(&thread.root)
+            .id
+            .numeric()
+            .unwrap()
+            + 1;
+        let thread_id = thread.id.clone();
+        let reply = message(&channel, id, content, &thread_id, false);
+        thread.replies.push(reply.clone());
+        added = Some(reply);
+    });
+    added.expect("a thread to reply in")
+}
+
+/// Push `message` as an adapter does: `kind` is `create` or `update`.
+async fn push(h: &Harness, event: &str, kind: &str, message: &Message) {
+    let (status, body) = call(
+        h.app.clone(),
+        INGEST_TOKEN,
+        "POST",
+        "/api/v1/live/events",
+        Some(serde_json::json!({
+            "event_id": event,
+            "historical": false,
+            "kind": kind,
+            "message": message,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// Hand `page` to naming as the write channel's thread list (a forward delta when `delta`), read
+/// by a read that began at `read_began`, as `ops::timeline` does.
+async fn annotate_list(
+    h: &Harness,
+    mut page: TimelinePage,
+    delta: bool,
+    read_began: std::time::Instant,
+) -> TimelinePage {
+    let request = TimelineRequest {
+        view: TimelineView::Threads,
+        thread_id: None,
+        before: None,
+        after: delta.then(|| "a cursor".to_owned()),
+        limit: 50,
+    };
+    h.names
+        .annotate(
+            &ThreadDeps::from_state(&h.state),
+            &write_channel(),
+            &request,
+            &mut page,
+            read_began,
+            true,
+        )
+        .await;
+    page
+}
+
+/// A delta of the write channel's thread list saying `thread` left it.
+fn removal(thread: String) -> TimelinePage {
+    TimelinePage {
+        has_threads: true,
+        delta: Some(TimelineDelta {
+            more: false,
+            complete: true,
+            deleted: Vec::new(),
+            removed_threads: vec![thread],
+        }),
+        ..TimelinePage::default()
+    }
+}
+
+/// Start a thread-list read of the write channel that takes its answer now and lands only when
+/// the returned semaphore is given a permit.
+async fn held_list_read(
+    h: &Harness,
+) -> (Arc<tokio::sync::Semaphore>, tokio::task::JoinHandle<Value>) {
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *h.forum.hold_next_list.lock().unwrap() = Some(Arc::clone(&hold));
+    let app = h.app.clone();
+    let read = tokio::spawn(async move {
+        let (status, body) = call(
+            app,
+            WRITE_TOKEN,
+            "GET",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?view=threads"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    });
+    run_for(1).await;
+    assert!(
+        h.forum.hold_next_list.lock().unwrap().is_none(),
+        "the held read has not begun"
+    );
+    (hold, read)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_pushed_after_the_count_was_read_is_in_the_name() {
+    // Two threads of one reply, both held from a Flat page and the list. The first holds the
+    // naming turn inside its model call; meanwhile the second gains a reply upstream, and the
+    // adapter pushes it. The count the list read no longer says what the thread has, and nothing
+    // has read it again: the thread is read at its turn, and the new reply is in its name.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 1), 0);
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    assert_eq!(thread_reads(&h, &write_channel()), 0, "both are held");
+
+    let added = add_reply(&h, 1, "reply 2 in thread 1");
+    push(&h, "reply-2", "create", &added).await;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_about(&h, "thread 1 starts here");
+    assert!(
+        prompt.contains("reply 2 in thread 1"),
+        "named without a reply pushed before its turn: {prompt}"
+    );
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "thread 1, read at its turn"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_pushed_with_no_thread_label_sends_every_waiting_thread_of_its_channel_to_a_read() {
+    // The same, but the adapter's message says nothing of its thread: it may be in any of them,
+    // so no count read before it is trusted.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 1), 0);
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+
+    let mut added = add_reply(&h, 1, "reply 2 in thread 1");
+    added.thread = None;
+    push(&h, "reply-2", "create", &added).await;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_about(&h, "thread 1 starts here");
+    assert!(prompt.contains("reply 2 in thread 1"), "{prompt}");
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_the_owner_posts_while_its_thread_waits_is_in_the_name() {
+    // This server posted it, so it knows: no push needed.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 1), 0);
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+
+    let (status, body) = call(
+        h.app.clone(),
+        WRITE_TOKEN,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        Some(serde_json::json!({
+            "text": "the owner's reply in thread 1",
+            "thread_id": write_thread(1),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_about(&h, "thread 1 starts here");
+    assert!(
+        prompt.contains("the owner's reply in thread 1"),
+        "named without the owner's own reply: {prompt}"
+    );
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_the_owner_posted_whose_answer_was_lost_is_in_the_name() {
+    // The post reached the thread, and the answer never came back: the reply may be there, so the
+    // count read before it is not trusted either.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 1), 0);
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+
+    *h.forum.lose_post_answers.lock().unwrap() = true;
+    let (status, body) = call(
+        h.app.clone(),
+        WRITE_TOKEN,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        Some(serde_json::json!({
+            "text": "the owner's reply in thread 1",
+            "thread_id": write_thread(1),
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_about(&h, "thread 1 starts here");
+    assert!(
+        prompt.contains("the owner's reply in thread 1"),
+        "named without a reply whose post may have arrived: {prompt}"
+    );
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rows_from_a_flat_page_the_provider_could_not_bring_up_to_date_do_not_undo_a_pushed_edit() {
+    // A reply is edited upstream and the edit pushed, which drops it from read-ahead. Then the
+    // provider, behind, serves a Flat page (with `as_of`) that still holds the reply as it was;
+    // its read began after the push, so the push's tombstone does not keep it out. A current
+    // thread list follows. The old text must not be what the thread is named from.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 1, 1));
+    let before_the_edit = h.forum.threads(&write_channel());
+    let mut edited = None;
+    h.forum.change(&write_channel(), |threads| {
+        let reply = &mut threads[0].replies[0];
+        reply.content = "EDITED REPLY in thread 0".to_owned();
+        edited = Some(reply.id.clone());
+    });
+    h.state
+        .read_ahead
+        .forget(&write_channel(), &edited.expect("a reply"));
+    *h.forum.stale_flat.lock().unwrap() =
+        Some(("2026-10-13T00:00:00Z".to_owned(), before_the_edit));
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    until_named(&h.names, 1).await;
+    let prompt = prompt_about(&h, "thread 0 starts here");
+    assert!(
+        prompt.contains("EDITED REPLY in thread 0"),
+        "named from a stale page's copy of a reply whose edit was pushed: {prompt}"
+    );
+    assert!(!prompt.contains("reply 1 in thread 0"), "{prompt}");
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_from_a_page_the_provider_could_not_bring_up_to_date_does_not_undo_a_pushed_edit() {
+    // The root of a waiting thread is edited and the edit pushed; a current list holds the edited
+    // root, and then a stale Flat page read after it puts the old copy back in read-ahead.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let before_the_edit = h.forum.threads(&write_channel());
+    let mut root = None;
+    h.forum.change(&write_channel(), |threads| {
+        threads[1].root.content = "EDITED ROOT of thread 1".to_owned();
+        root = Some(threads[1].root.id.clone());
+    });
+    h.state
+        .read_ahead
+        .forget(&write_channel(), &root.expect("a root"));
+    thread_list(&h, WRITE_CHANNEL).await;
+    *h.forum.stale_flat.lock().unwrap() =
+        Some(("2026-10-13T00:00:00Z".to_owned(), before_the_edit));
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_naming(&h, &["thread 1 starts here", "EDITED ROOT"]).expect("named");
+    assert!(
+        prompt.contains("EDITED ROOT of thread 1"),
+        "named from a stale page's copy of a root whose edit was pushed: {prompt}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_removed_while_its_naming_is_in_flight_is_not_put_back_by_a_delta() {
+    // Thread 1 is inside its model call, its rows chosen, when a delta says it left the list (and
+    // it has, upstream). Its naming completes; a later delta must not carry it as a live row,
+    // which the page would add back.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 1);
+    thread_list(&h, WRITE_CHANNEL).await;
+    until_named(&h.names, 1).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 1, "thread 1 is being named");
+    h.forum.change(&write_channel(), |threads| {
+        threads.remove(1);
+    });
+    annotate_list(
+        &h,
+        removal(write_thread(1)),
+        true,
+        std::time::Instant::now(),
+    )
+    .await;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    let delta = thread_delta(&h, &cursor).await;
+    assert!(
+        carried(&delta, &write_thread(1)).is_none(),
+        "a delta carried a thread a delta had removed: {delta}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_list_read_before_a_removal_and_landing_after_it_does_not_undo_it() {
+    // Thread 1 waits behind thread 0's model call. A delta says it left the list. Then a list
+    // whose read began BEFORE that delta lands, still carrying it: it says less than the delta,
+    // so thread 1 is still not named from rows held, nor carried on a later delta.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let read_before_the_removal = std::time::Instant::now();
+    let listed = TimelinePage {
+        threads: h
+            .forum
+            .threads(&write_channel())
+            .iter()
+            .map(Forum::summary)
+            .collect(),
+        has_threads: true,
+        ..TimelinePage::default()
+    };
+    h.forum.change(&write_channel(), |threads| {
+        threads.remove(1);
+    });
+    annotate_list(
+        &h,
+        removal(write_thread(1)),
+        true,
+        std::time::Instant::now(),
+    )
+    .await;
+    annotate_list(&h, listed, false, read_before_the_removal).await;
+    h.gate.add_permits(10);
+    run_for(5).await;
+    assert_eq!(h.names.pending(), 0);
+    assert!(
+        prompt_naming(&h, &["thread 1 starts here"]).is_none(),
+        "a thread a delta removed was named from rows held, on an older list's word"
+    );
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "thread 1 was read, and the provider said it is gone"
+    );
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    assert!(carried(&thread_delta(&h, &cursor).await, &write_thread(1)).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_opened_after_a_delta_removed_it_is_named_from_that_read_and_not_carried() {
+    // A delta says thread 1 left the list (it moved out; it can still be read). The reader then
+    // opens it: that read began after the removal, so its rows name the thread with no read of
+    // naming's own. But a thread page says the thread is there to read, not that it is back in
+    // the list, so a later delta still does not carry it.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    h.forum.unlisted.lock().unwrap().push(write_thread(1));
+    annotate_list(
+        &h,
+        removal(write_thread(1)),
+        true,
+        std::time::Instant::now(),
+    )
+    .await;
+    get(
+        &h,
+        &format!(
+            "/api/v1/channels/{WRITE_CHANNEL}/timeline?view=thread&thread_id={}",
+            urlencode(&write_thread(1))
+        ),
+    )
+    .await;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    assert_eq!(
+        thread_reads(&h, &write_channel()),
+        1,
+        "the reader's own read, and none of naming's"
+    );
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    assert!(carried(&list, &write_thread(1)).is_none());
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    assert!(
+        carried(&thread_delta(&h, &cursor).await, &write_thread(1)).is_none(),
+        "a thread page put a thread a delta had removed back on the list"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_list_landing_late_does_not_roll_back_a_renamed_thread_on_deltas() {
+    // Thread 0 is named at one reply. List read A begins and is held. The thread gains a second
+    // reply (not yet due for a new sentence), and list read B shows two. Then A lands, with one.
+    // A delta after B must carry the thread as B showed it: the page upserts what a delta carries,
+    // and a count that goes backwards moves the thread in the list.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 1, 1));
+    thread_list(&h, WRITE_CHANNEL).await;
+    until_named(&h.names, 1).await;
+    let (hold, late) = held_list_read(&h).await;
+    add_reply(&h, 0, "reply 2 in thread 0");
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let shown = carried(&list, &write_thread(0)).expect("listed");
+    assert_eq!(shown["reply_count"], 2, "{shown}");
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    hold.add_permits(1);
+    let landed = late.await.expect("the held read");
+    assert_eq!(
+        carried(&landed, &write_thread(0)).expect("listed")["reply_count"],
+        1,
+        "the held read answered as the thread was when it began"
+    );
+    let delta = thread_delta(&h, &cursor).await;
+    let renamed = carried(&delta, &write_thread(0)).expect("a renamed thread rides the delta");
+    assert_eq!(
+        renamed["reply_count"], 2,
+        "an older read landing late rolled the thread back: {renamed}"
+    );
+    assert_eq!(renamed["updated_at"], shown["updated_at"], "{renamed}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_queued_again_by_an_older_list_landing_late_does_not_roll_back_its_delta_row() {
+    // As above, but the older list also queues the thread again: its sentence was swept (here by
+    // `forget_channel_sentences`, as taking the channel off the list does) after the newer list
+    // landed. When it is named, the row deltas carry is still the newer list's.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 1, 1));
+    thread_list(&h, WRITE_CHANNEL).await;
+    until_named(&h.names, 1).await;
+    let (hold, late) = held_list_read(&h).await;
+    add_reply(&h, 0, "reply 2 in thread 0");
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let shown = carried(&list, &write_thread(0)).expect("listed");
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    h.names.forget_channel_sentences(&write_channel());
+    hold.add_permits(1);
+    late.await.expect("the held read");
+    run_for(31).await;
+    assert_eq!(h.names.named(), 2, "{} pending", h.names.pending());
+    let renamed = carried(&thread_delta(&h, &cursor).await, &write_thread(0)).expect("rides");
+    assert_eq!(
+        renamed["reply_count"], 2,
+        "renamed from an older list, and carried as it said: {renamed}"
+    );
+    assert_eq!(renamed["updated_at"], shown["updated_at"], "{renamed}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_list_landing_late_does_not_undo_what_a_newer_one_said_of_a_waiting_thread() {
+    // Thread 1 waits behind thread 0's model call. List read A begins, and is held, while it has
+    // no replies; it gains one; list read B shows it; then A lands. Thread 1 is decided at its
+    // turn against B: one reply nothing holds, so it is read, and the reply is in its name. Were A
+    // taken as the newest, the root alone would match A's count of none.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let (hold, late) = held_list_read(&h).await;
+    add_reply(&h, 1, "reply 1 in thread 1");
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    hold.add_permits(1);
+    late.await.expect("the held read");
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let prompt = prompt_about(&h, "thread 1 starts here");
+    assert!(
+        prompt.contains("reply 1 in thread 1"),
+        "named against an older list that landed late: {prompt}"
+    );
+    let renamed = carried(&thread_delta(&h, &cursor).await, &write_thread(1)).expect("rides");
+    assert_eq!(renamed["reply_count"], 1, "{renamed}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_list_the_provider_could_not_bring_up_to_date_does_not_replace_a_current_one() {
+    // Thread 1 waits; a current list shows its new reply; then the provider falls behind and serves
+    // the list as it was before the reply (`as_of`). Neither while it waits nor once it is named
+    // does that list replace what the current one said: a delta carries the thread with its reply.
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    let before_the_reply = h.forum.threads(&write_channel());
+    add_reply(&h, 1, "reply 1 in thread 1");
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    let shown = carried(&list, &write_thread(1)).expect("listed");
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    let stale = Some(("2026-10-13T00:00:00Z".to_owned(), before_the_reply));
+    *h.forum.stale_list.lock().unwrap() = stale.clone();
+    thread_list(&h, WRITE_CHANNEL).await;
+    *h.forum.stale_list.lock().unwrap() = None;
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    let renamed = carried(&thread_delta(&h, &cursor).await, &write_thread(1)).expect("rides");
+    assert_eq!(
+        renamed["reply_count"], 1,
+        "a stale list replaced a current one while the thread waited: {renamed}"
+    );
+    assert_eq!(renamed["updated_at"], shown["updated_at"], "{renamed}");
+
+    // And once it is named.
+    *h.forum.stale_list.lock().unwrap() = stale;
+    thread_list(&h, WRITE_CHANNEL).await;
+    *h.forum.stale_list.lock().unwrap() = None;
+    let renamed = carried(&thread_delta(&h, &cursor).await, &write_thread(1)).expect("rides");
+    assert_eq!(
+        renamed["reply_count"], 1,
+        "a stale list replaced a current one on a renamed thread: {renamed}"
+    );
 }
 
 fn urlencode(raw: &str) -> String {

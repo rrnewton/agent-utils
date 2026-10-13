@@ -44,6 +44,18 @@
 //! for [`RECENT_TTL`], `clear` raises a floor, and [`ReadAhead::remember`] takes the instant its
 //! fetch BEGAN and keeps nothing a tombstone or the floor is newer than. A tombstone older than
 //! [`RECENT_TTL`] is not needed: a fetch that began before it is too old to keep anything anyway.
+//!
+//! # What thread naming needs on top
+//!
+//! Thread naming (`#278 naming-throttle`) names a thread from rows held here only when they are
+//! what a read of it would bring now, so it needs two things speech does not:
+//!
+//! - whether each row came from a page the provider had brought up to date. A page that carries
+//!   `as_of` ([`ReadAhead::remember_as_of`]) may hold a message as it was before an edit pushed
+//!   earlier: its fetch began after the edit's tombstone, so the tombstone cannot keep it out.
+//!   Such a row is [`Recalled::current`] `false`, and naming does not use it.
+//! - which threads the live feed has said changed ([`ThreadChanges`]): a reply pushed into a thread
+//!   adds no row to forget, but it does make every count read before it out of date.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +122,8 @@ struct Recent {
     thread: Option<String>,
     /// When the fetch that read it began.
     fetched: Instant,
+    /// Whether the page it came from was current: carried no `as_of`.
+    current: bool,
 }
 
 /// One message [`ReadAhead::recall_thread`] found, and how old its copy is.
@@ -118,8 +132,12 @@ pub struct Recalled {
     /// The message as it was fetched.
     pub message: Message,
     /// When the fetch that read it began. The copy is what the provider answered then or a little
-    /// later.
+    /// later, if it was [`Recalled::current`].
     pub fetched: Instant,
+    /// Whether the page it came from was one the provider had brought up to date (it carried no
+    /// `as_of`). A copy from one that was not may be older than its fetch, older even than an edit
+    /// pushed before the fetch began. `#278 naming-throttle`.
+    pub current: bool,
 }
 
 /// Everything behind the one lock. See the module documentation.
@@ -220,12 +238,46 @@ impl ReadAhead {
         self.remember_at(channel, thread, messages, fetch_began, Instant::now());
     }
 
+    /// Keep `messages` as [`ReadAhead::remember`] does, from a page that answered with `as_of`:
+    /// `Some` when the provider could not bring it up to date, and it is complete only up to then.
+    /// Such rows are kept for speech as any other, and recalled as not
+    /// [`Recalled::current`]. `#278 naming-throttle`.
+    pub fn remember_as_of(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        messages: &[Message],
+        fetch_began: Instant,
+        as_of: Option<&str>,
+    ) {
+        self.keep(
+            channel,
+            thread,
+            messages,
+            fetch_began,
+            as_of.is_none(),
+            Instant::now(),
+        );
+    }
+
     fn remember_at(
         &self,
         channel: &ChannelId,
         thread: Option<&str>,
         messages: &[Message],
         fetch_began: Instant,
+        now: Instant,
+    ) {
+        self.keep(channel, thread, messages, fetch_began, true, now);
+    }
+
+    fn keep(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        messages: &[Message],
+        fetch_began: Instant,
+        current: bool,
         now: Instant,
     ) {
         if messages.is_empty() {
@@ -258,6 +310,7 @@ impl ReadAhead {
                     message: message.clone(),
                     thread: filed_under,
                     fetched: fetch_began,
+                    current,
                 },
             );
         }
@@ -318,9 +371,10 @@ impl ReadAhead {
 
     /// Every message of `thread` in `channel` fetched in the last [`RECENT_TTL`]: fetched in that
     /// thread, or labelled with it on a page of the channel (a Flat page labels each reply). Each
-    /// with when the fetch that read it began, in no particular order. `#278 naming-throttle`,
-    /// remote-ops audit W5: what thread naming reads before it asks the provider for the thread
-    /// again, and which it compares with when the thread's reply count was read.
+    /// with when the fetch that read it began and whether its page was current, in no particular
+    /// order. `#278 naming-throttle`, remote-ops audit W5: what thread naming reads before it asks
+    /// the provider for the thread again, and which it compares with when the thread's reply count
+    /// was read.
     #[must_use]
     pub fn recall_thread(&self, channel: &ChannelId, thread: &str) -> Vec<Recalled> {
         self.recall_thread_at(channel, thread, Instant::now())
@@ -340,6 +394,7 @@ impl ReadAhead {
             .map(|(_, entry)| Recalled {
                 message: entry.message.clone(),
                 fetched: entry.fetched,
+                current: entry.current,
             })
             .collect()
     }
@@ -486,6 +541,106 @@ impl ReadAhead {
     pub fn warming(&self) -> bool {
         self.warming.load(Ordering::Acquire)
     }
+}
+
+/// Which threads the live feed has said changed in the last [`RECENT_TTL`], and when.
+/// `#278 naming-throttle`, remote-ops audit W5.
+///
+/// An edit or a delete drops its row from [`ReadAhead`], which is enough to keep a thread from
+/// being named from the old copy. A reply ADDED to a thread drops nothing, yet every reply count
+/// read before it is now one short. So every change the live feed publishes is noted here by
+/// thread, and a count read before the newest note of its thread proves nothing
+/// ([`ThreadChanges::changed_since`]). A change whose thread is not known (an adapter that labels
+/// no thread) is noted against the whole channel.
+///
+/// Fed by [`crate::live::LiveHub`], which both live producers reach (a pushed event and a polled
+/// message), and by this server's own posts ([`crate::ops::reply_scoped`]). Ids only, never text.
+/// A note older than [`RECENT_TTL`] is not needed: a count read before it is too old to be used
+/// anyway. Bounded by [`MAX_RECENT`] notes of each kind; past that, the oldest go and a floor rises
+/// in their place, as [`ReadAhead::forget`]'s tombstones do, so the bound never makes a count read
+/// before a dropped note look newer than it.
+#[derive(Debug, Default)]
+pub struct ThreadChanges {
+    held: Mutex<Changes>,
+}
+
+#[derive(Debug, Default)]
+struct Changes {
+    threads: HashMap<(ChannelId, String), Instant>,
+    /// Changes whose thread was not known: they count against every thread of the channel.
+    channels: HashMap<ChannelId, Instant>,
+    /// Every count read at or before this proves nothing.
+    floor: Option<Instant>,
+}
+
+impl ThreadChanges {
+    /// Nothing noted.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that `thread` of `channel` changed just now: `None` when which thread is not known.
+    pub fn note(&self, channel: &ChannelId, thread: Option<&str>) {
+        self.note_at(channel, thread, Instant::now());
+    }
+
+    fn note_at(&self, channel: &ChannelId, thread: Option<&str>, now: Instant) {
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        let fresh = |at: &Instant| now.saturating_duration_since(*at) < RECENT_TTL;
+        held.threads.retain(|_, at| fresh(at));
+        held.channels.retain(|_, at| fresh(at));
+        match thread {
+            Some(thread) => {
+                held.threads
+                    .insert((channel.clone(), thread.to_owned()), now);
+            }
+            None => {
+                held.channels.insert(channel.clone(), now);
+            }
+        }
+        let mut dropped = None;
+        if held.threads.len() > MAX_RECENT {
+            dropped = oldest_out(&mut held.threads).max(dropped);
+        }
+        if held.channels.len() > MAX_RECENT {
+            dropped = oldest_out(&mut held.channels).max(dropped);
+        }
+        if let Some(at) = dropped {
+            held.floor = Some(held.floor.map_or(at, |floor| floor.max(at)));
+        }
+    }
+
+    /// Whether a change to `thread` of `channel`, or to the channel with no thread known, was
+    /// noted at or after `since`: then what a read that began at `since` said of the thread may
+    /// not show it. A poisoned lock says yes.
+    #[must_use]
+    pub fn changed_since(&self, channel: &ChannelId, thread: &str, since: Instant) -> bool {
+        let Ok(held) = self.held.lock() else {
+            return true;
+        };
+        held.floor.is_some_and(|floor| floor >= since)
+            || held.channels.get(channel).is_some_and(|at| *at >= since)
+            || held
+                .threads
+                .get(&(channel.clone(), thread.to_owned()))
+                .is_some_and(|at| *at >= since)
+    }
+}
+
+/// Drop the oldest entries of `notes` down to [`MAX_RECENT`], answering the newest time dropped.
+fn oldest_out<K: Clone + Eq + std::hash::Hash>(notes: &mut HashMap<K, Instant>) -> Option<Instant> {
+    let mut ages: Vec<(Instant, K)> = notes.iter().map(|(key, at)| (*at, key.clone())).collect();
+    ages.sort_by_key(|(at, _)| *at);
+    let excess = notes.len().saturating_sub(MAX_RECENT);
+    let mut newest = None;
+    for (at, key) in ages.into_iter().take(excess) {
+        notes.remove(&key);
+        newest = Some(at);
+    }
+    newest
 }
 
 /// Clears the warm-up flag when the warm-up task ends, however it ends.
@@ -947,5 +1102,118 @@ mod tests {
         let later = start + RECENT_TTL;
         read_ahead.remember_at(&channel, None, &[message("11", None)], later, later);
         assert_eq!(read_ahead.len(), 1);
+    }
+
+    #[test]
+    fn a_row_from_a_page_that_was_not_current_is_recalled_as_such() {
+        // `#278 naming-throttle`. A page the provider could not bring up to date may hold a
+        // message as it was before an edit pushed earlier. Speech still reads it; naming must be
+        // able to tell.
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let then = Instant::now();
+        read_ahead.remember_at(&channel, None, &[message("10", Some("T"))], then, then);
+        let current = read_ahead.recall_thread_at(&channel, "T", then);
+        assert!(current[0].current);
+        let edited = then + Duration::from_secs(1);
+        read_ahead.forget_at(&channel, &MessageId("10".to_owned()), edited);
+        let stale_read = edited + Duration::from_secs(1);
+        read_ahead.keep(
+            &channel,
+            None,
+            &[message("10", Some("T"))],
+            stale_read,
+            false,
+            stale_read,
+        );
+        let held = read_ahead.recall_thread_at(&channel, "T", stale_read);
+        assert_eq!(held.len(), 1, "a fetch after the tombstone keeps its copy");
+        assert!(!held[0].current, "and says its page was not current");
+        assert_eq!(
+            read_ahead
+                .recall_at(&channel, None, &ids(&["10"]), stale_read)
+                .len(),
+            1,
+            "speech still reads it"
+        );
+        read_ahead.remember_as_of(
+            &channel,
+            None,
+            &[message("11", Some("T"))],
+            Instant::now(),
+            None,
+        );
+        assert!(
+            read_ahead
+                .recall_thread(&channel, "T")
+                .iter()
+                .any(|held| held.message.id.0 == "11" && held.current),
+            "no `as_of` is current"
+        );
+        // A later page that was not current replaces a current copy, and says so.
+        read_ahead.remember_as_of(
+            &channel,
+            None,
+            &[message("11", Some("T"))],
+            Instant::now(),
+            Some("2026-10-13T00:00:00Z"),
+        );
+        assert!(read_ahead
+            .recall_thread(&channel, "T")
+            .iter()
+            .any(|held| held.message.id.0 == "11" && !held.current));
+    }
+
+    #[test]
+    fn a_change_counts_against_reads_that_began_before_it_in_its_thread_or_its_whole_channel() {
+        // `#278 naming-throttle`.
+        let changes = ThreadChanges::new();
+        let channel = ChannelId("1".to_owned());
+        let other = ChannelId("2".to_owned());
+        let read = Instant::now();
+        let changed = read + Duration::from_secs(1);
+        changes.note_at(&channel, Some("T"), changed);
+        assert!(changes.changed_since(&channel, "T", read));
+        assert!(
+            changes.changed_since(&channel, "T", changed),
+            "a read that began the instant the change was noted may not show it"
+        );
+        assert!(!changes.changed_since(&channel, "T", changed + Duration::from_millis(1)));
+        assert!(
+            !changes.changed_since(&channel, "U", read),
+            "another thread"
+        );
+        assert!(!changes.changed_since(&other, "T", read), "another channel");
+
+        // A change with no thread known counts against every thread of its channel.
+        let unlabelled = changed + Duration::from_secs(1);
+        changes.note_at(&channel, None, unlabelled);
+        assert!(changes.changed_since(&channel, "U", changed));
+        assert!(!changes.changed_since(&other, "U", changed));
+
+        // Past the bound the oldest notes go, and a floor rises so no read before them is trusted.
+        let crowded = ThreadChanges::new();
+        let start = Instant::now();
+        for n in 0..=MAX_RECENT {
+            crowded.note_at(
+                &channel,
+                Some(&format!("t{n}")),
+                start + Duration::from_millis(n as u64),
+            );
+        }
+        assert_eq!(crowded.held.lock().unwrap().threads.len(), MAX_RECENT);
+        assert!(
+            crowded.changed_since(&channel, "t0", start),
+            "the dropped note's thread is still not trusted"
+        );
+        assert!(crowded.changed_since(&channel, "anything", start));
+        assert!(!crowded.changed_since(&channel, "anything", start + Duration::from_millis(1)));
+
+        // A note older than read-ahead keeps a row is dropped when another arrives.
+        let much_later = unlabelled + RECENT_TTL;
+        changes.note_at(&other, Some("V"), much_later);
+        let held = changes.held.lock().unwrap();
+        assert_eq!(held.threads.len(), 1);
+        assert!(held.channels.is_empty());
     }
 }
