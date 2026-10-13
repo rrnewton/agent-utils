@@ -49647,6 +49647,45 @@ test("`#272 voice-agent-instructions`: after Restore, the status says whether th
     "Saved. The voice agent gets the shipped prompt from its next call.");
 });
 
+test("`#272 voice-agent-instructions`: a call that sent nothing is described from what was saved when it opened, not from a save after it", async () => {
+  // The line under Instructions says why the last call's agent got nothing: an edited prompt it
+  // would not take, or nothing of the owner's at all. It used to read that from the settings as
+  // they are now, so a save after the call rewrote what the call had been given.
+  const NOT_SENT = {
+    transport: "not_sent", system_prompt_applied: false, instructions_applied: false, override_allowed: false,
+  };
+  const afterCall = async (fields) => {
+    const page = newPage();
+    page.voicePrompt = voicePromptView(fields);
+    await talkWithPrompt(page, NOT_SENT);
+    await page.el("hang-up").click();
+    await page.settle();
+    await page.el("open-settings").click();
+    return page;
+  };
+
+  // His copy was saved when the call opened, and Restore came after: it was his edit that did not
+  // reach the agent.
+  const edited = await afterCall({ system_prompt: "mine", system_prompt_edited: true, edited_from_version: 9 });
+  await edited.el("restore-voice-system-prompt").click();
+  await edited.el("restore-voice-system-prompt").click();
+  await edited.settle();
+  assert.deepStrictEqual(edited.voicePromptCalls, [{ system_prompt: "" }]);
+  assert.match(edited.el("voice-prompt-state").textContent, /so your edited prompt did not reach it\.$/,
+    "a Restore after the call said the call had nothing of his");
+
+  // Nothing was saved when the call opened, and his copy came after: no edit was refused.
+  const shipped = await afterCall({});
+  await shipped.el("voice-system-prompt").setValue("You read me the chat while I drive.");
+  await shipped.el("save-voice-system-prompt").click();
+  await shipped.settle();
+  assert.deepStrictEqual(shipped.voicePromptCalls, [{ system_prompt: "You read me the chat while I drive." }]);
+  assert.match(shipped.el("voice-prompt-state").textContent,
+    /The last call's agent does not let its prompt be replaced, so it kept the prompt in its provider's console\.$/);
+  assert.doesNotMatch(shipped.el("voice-prompt-state").textContent, /edited prompt/,
+    "a copy saved after the call was said to have been refused by it");
+});
+
 test("`#272 voice-agent-instructions`: Restore asks twice before it deletes the owner's copy, and a lapse disarms it", async () => {
   const page = await instructionsPage({ system_prompt: "mine, and long", system_prompt_edited: true, edited_from_version: 9 });
   const restore = page.el("restore-voice-system-prompt");

@@ -27439,7 +27439,14 @@ let voicePromptSaving = false;
 /** What the voice session asked this page to hand the agent of the call being opened, or null. */
 let voicePromptForCall = null;
 
-/** What the last call this page opened on a hosted agent was handed, or null before one. */
+/**
+ * What the last call this page opened on a hosted agent was handed, or null before one, with
+ * whether the owner's own copy of the prompt was saved as it opened (`editedWhenOpened`; null when
+ * this server did not say). The line under Instructions says why such a call got nothing from
+ * that, so a save after the call cannot rewrite what the call was given.
+ *
+ * @type {(VibeTalk.SessionPrompt & {editedWhenOpened: boolean | null}) | null}
+ */
 let voicePromptLastCall = null;
 
 /**
@@ -27550,9 +27557,11 @@ function voicePromptLastCallLine() {
   if (last.transport === "contextual_update") {
     return `${refused}, so only your instructions went, as a note at the start.`;
   }
-  // Nothing went: an edited prompt the agent would not take, or nothing of the owner's at all.
-  // Either way the agent used the prompt in its provider's console.
-  return voicePromptSettings.system_prompt_edited
+  // Nothing went: an edited prompt the agent would not take, or nothing of the owner's at all —
+  // as saved when the call opened, not as saved since. Either way the agent used the prompt in its
+  // provider's console.
+  const edited = last.editedWhenOpened ?? voicePromptSettings.system_prompt_edited;
+  return edited
     ? `${refused}, so your edited prompt did not reach it.`
     : `${refused}, so it kept the prompt in its provider's console.`;
 }
@@ -27682,7 +27691,13 @@ async function restoreVoiceSystemPrompt() {
  * never stand between the owner and his call.
  */
 function handOverAgentPrompt(initiation, handed) {
-  voicePromptLastCall = handed && typeof handed.transport === "string" ? handed : null;
+  voicePromptLastCall =
+    handed && typeof handed.transport === "string"
+      ? {
+          ...handed,
+          editedWhenOpened: voicePromptSettings === null ? null : voicePromptSettings.system_prompt_edited === true,
+        }
+      : null;
   const nothing = { note: null, replaced: false };
   if (voicePromptLastCall === null || typeof handed.text !== "string" || handed.text === "") return nothing;
   if (handed.transport === "prompt_override") {

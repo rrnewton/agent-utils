@@ -5032,7 +5032,8 @@ says which:
   comes from the vendor's documentation and has not been observed from this repository; nor has
   whether a `contextual_update` carries instructions as strongly as a prompt does. After each call
   the line under Instructions says what that call was given — above all when an edited prompt did
-  not reach it.
+  not reach it — from what was saved when the call opened, so a save after the call does not
+  change what it says the call was given.
 
   **The override is always the write token's prompt.** This server cannot see which token the
   operator gave the agent's MCP connection at the vendor, so it hands over the prompt for a
