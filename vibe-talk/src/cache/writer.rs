@@ -1843,6 +1843,13 @@ impl Writer<'_> {
             self.work.rounds = 0;
             return;
         }
+        // Rounds of anything, eviction or tidying, are counted: a file that cannot get under
+        // its limit (a reader holding the log, a limit below the schema) must not keep the
+        // writer measuring and checkpointing for ever. They start again with the hourly pass.
+        if self.work.rounds >= EVICTION_ROUNDS {
+            return;
+        }
+        self.work.rounds += 1;
         let target = max / 10 * 9;
         let measured = self.page_counted_bytes().and_then(|(used, free)| {
             let rows: i64 = self
@@ -1852,10 +1859,6 @@ impl Writer<'_> {
         });
         match measured {
             Ok((used, _, rows)) if used >= target && rows > 0 => {
-                if self.work.rounds >= EVICTION_ROUNDS {
-                    return;
-                }
-                self.work.rounds += 1;
                 // The share of rows to go is the share of bytes over the target, plus one
                 // percent.
                 let share = (used - target).saturating_mul(rows) / used.max(1) + rows / 100 + 1;
@@ -1863,7 +1866,6 @@ impl Writer<'_> {
             }
             Ok((_, free, _)) => {
                 // The pages in use fit: what is over is free pages, or the write-ahead log.
-                self.work.rounds = 0;
                 if free > 0 {
                     self.work.vacuum = Some(None);
                 }

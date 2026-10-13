@@ -1707,6 +1707,8 @@ fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
+mod privacy_tests;
+#[cfg(test)]
 mod race_tests;
 #[cfg(test)]
 mod tests;
