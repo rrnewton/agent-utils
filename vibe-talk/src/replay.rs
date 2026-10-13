@@ -220,9 +220,69 @@ fn render(turn: &Turn) -> String {
     format!("{who}: {said}")
 }
 
+/// Whether a new call can actually be handed the earlier transcript: the operator allowed it AND
+/// the configured voice backend has a way to carry it.
+///
+/// Only the ElevenLabs path does (`contextual_update`, or the initiation frame's
+/// `dynamic_variables`). A deployment-managed `vibe-talk-v1` socket has no frame for it: the page
+/// opens the session and returns before the replay would be sent, so turning replay on there made
+/// the screen promise "this server will read the lines above back to it" while nothing was sent.
+/// That is exactly the false claim of continuity this module exists to prevent, so the page is
+/// told replay is off.
+#[must_use]
+pub fn offered(
+    replay: &crate::config::ReplayConfig,
+    conversation: &crate::config::ConversationConfig,
+) -> bool {
+    replay.enabled && conversation.backend == crate::config::ConversationBackend::ElevenLabs
+}
+
+/// The startup warning for replay switched on where it cannot work, or `None`.
+#[must_use]
+pub fn unusable_warning(
+    replay: &crate::config::ReplayConfig,
+    conversation: &crate::config::ConversationConfig,
+) -> Option<&'static str> {
+    (replay.enabled && !offered(replay, conversation)).then_some(
+        "replay.enabled is true, but conversation.backend = \"websocket\" has no way to hand a \
+         new call the earlier transcript. Replay is reported OFF to the page, which says the \
+         agent starts fresh. Set replay.enabled = false to silence this.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn voice_backend(
+        backend: crate::config::ConversationBackend,
+    ) -> crate::config::ConversationConfig {
+        crate::config::ConversationConfig {
+            backend,
+            ..crate::config::ConversationConfig::default()
+        }
+    }
+
+    fn replay_switch(enabled: bool) -> crate::config::ReplayConfig {
+        crate::config::ReplayConfig {
+            enabled,
+            ..crate::config::ReplayConfig::default()
+        }
+    }
+
+    /// A `vibe-talk-v1` socket cannot carry a replay, so the page must never be told one is
+    /// coming: it promised one and sent nothing.
+    #[test]
+    fn replay_is_offered_only_where_the_voice_backend_can_carry_it() {
+        use crate::config::ConversationBackend::{ElevenLabs, WebSocket};
+        assert!(offered(&replay_switch(true), &voice_backend(ElevenLabs)));
+        assert!(!offered(&replay_switch(true), &voice_backend(WebSocket)));
+        assert!(!offered(&replay_switch(false), &voice_backend(ElevenLabs)));
+        assert!(!offered(&replay_switch(false), &voice_backend(WebSocket)));
+        assert!(unusable_warning(&replay_switch(true), &voice_backend(WebSocket)).is_some());
+        assert!(unusable_warning(&replay_switch(true), &voice_backend(ElevenLabs)).is_none());
+        assert!(unusable_warning(&replay_switch(false), &voice_backend(WebSocket)).is_none());
+    }
 
     fn policy(max_chars: usize, max_turns: usize) -> ReplayPolicy {
         ReplayPolicy {

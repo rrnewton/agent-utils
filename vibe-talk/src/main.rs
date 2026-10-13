@@ -657,6 +657,11 @@ async fn main() -> anyhow::Result<()> {
     ) {
         tracing::warn!("{warning}");
     }
+    // A replay the voice backend cannot carry is reported off to the page; say why, once.
+    if let Some(warning) = vibe_talk::replay::unusable_warning(&config.replay, &config.conversation)
+    {
+        tracing::warn!("{warning}");
+    }
     let conversation = vibe_talk::conversation::provider(
         &config.conversation,
         Arc::clone(&elevenlabs),

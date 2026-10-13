@@ -780,7 +780,7 @@ pub async fn client_config(
         replies_in_thread: state.chat.replies_in_thread(),
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
-        replay_enabled: state.config.replay.enabled,
+        replay_enabled: crate::replay::offered(&state.config.replay, &state.config.conversation),
         self_author_id: state.chat.self_author_id(),
         owner_author_id: state.chat.owner_author_id(),
         providers,
