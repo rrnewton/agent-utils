@@ -673,3 +673,75 @@ async fn a_pull_or_an_enter_inside_the_memo_shows_an_unpushed_upstream_change() 
     assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
     assert_eq!(h.chat.count("fetch_timeline"), 4, "{:?}", h.chat.calls());
 }
+
+/// `path` asked `after` from now, and how long it took from when it was asked.
+async fn timed_get(app: &axum::Router, path: &str, after: Duration) -> (StatusCode, Duration) {
+    tokio::time::sleep(after).await;
+    let asked = tokio::time::Instant::now();
+    let (status, body) = get(app, path, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    (status, asked.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_window_read_that_a_running_fetch_cannot_answer_does_not_wait_for_it() {
+    // Review of #278: every window read of a channel took its turn for the whole fetch, so a read
+    // the running fetch could not answer — wider than it, or made after a change it began before —
+    // waited the whole fetch out and then fetched again: twice the wait, where every window read
+    // used to run beside the others. A voice tool, given fifteen seconds, behind a summary's fetch
+    // on a slow bridge, is the case that matters. Now such a read runs beside the fetch, and only a
+    // read that fetch can answer waits for it.
+    let h = harness();
+    let messages = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
+    let (narrow, wide) = (
+        format!("{messages}?limit=1"),
+        format!("{messages}?limit=20"),
+    );
+
+    // Wider than the fetch running: read beside it.
+    let (_, (_, waited)) = tokio::join!(
+        timed_get(&h.app, &narrow, Duration::ZERO),
+        timed_get(&h.app, &wide, Duration::from_millis(50)),
+    );
+    assert_eq!(waited, READ, "a wider read waited for a narrower fetch");
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        2,
+        "{:?}",
+        h.chat.calls()
+    );
+
+    // Made after a push the running fetch began before: read beside it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let (_, (_, waited)) = tokio::join!(timed_get(&h.app, &wide, Duration::ZERO), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.state.live.publish(&channel, message(12, "pushed", false));
+        timed_get(&h.app, &wide, Duration::from_millis(10)).await
+    });
+    assert_eq!(
+        waited, READ,
+        "a read after a push waited for a fetch from before it"
+    );
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        4,
+        "{:?}",
+        h.chat.calls()
+    );
+
+    // The control: as wide or narrower, with no change between, it still waits for that fetch and
+    // is answered by it, at no cost.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (_, (_, waited)) = tokio::join!(
+        timed_get(&h.app, &wide, Duration::ZERO),
+        timed_get(&h.app, &narrow, Duration::from_millis(50)),
+    );
+    assert_eq!(waited, READ - Duration::from_millis(50));
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        5,
+        "{:?}",
+        h.chat.calls()
+    );
+}

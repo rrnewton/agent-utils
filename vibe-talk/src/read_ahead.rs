@@ -18,7 +18,9 @@
 //!   (`#278 timeline-single-flight`), so speech preparation, the summary route (`#208
 //!   persistent-cache`), the digest, a lookup by id and the messages route share it: a page asking
 //!   for twenty summaries at once costs one fetch, and a summary asked for right after the page's
-//!   own read is answered from here with none.
+//!   own read is answered from here with none. A read the running fetch cannot answer — wider than
+//!   it, or made after a change it began before ([`WindowFetch`]) — does not wait for it, and reads
+//!   beside it instead.
 //! - [`ReadAhead::timelines`]: the same for `/timeline`, where identical requests share one read
 //!   that no caller going away can cancel, and a newest answer is kept for a few seconds. See
 //!   [`crate::timeline_flight`].
@@ -190,6 +192,43 @@ impl WindowRead {
     }
 }
 
+/// The window fetch running through a channel's [`ReadAhead::window_turn`]: what it began having
+/// seen, and how wide it is. A caller it cannot answer — wider, or having seen a change since — reads
+/// beside it rather than waiting for it. `#278 timeline-single-flight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowFetch {
+    /// What the channel had been through when the fetch began.
+    pub changes: Changes,
+    /// How many messages it asked for ([`ops::window_limit`]).
+    pub limit: u16,
+}
+
+impl WindowFetch {
+    /// Whether this fetch, when it lands, can be a window read's of `limit` messages made having
+    /// seen `changes`.
+    #[must_use]
+    pub fn can_answer(&self, changes: Changes, limit: u16) -> bool {
+        self.changes == changes && self.limit >= limit
+    }
+}
+
+/// Takes a channel's running [`WindowFetch`] off the list when the fetch ends, however it ends.
+#[must_use = "the fetch is listed only while this is held"]
+pub struct WindowFetching<'a> {
+    read_ahead: &'a ReadAhead,
+    channel: ChannelId,
+}
+
+impl Drop for WindowFetching<'_> {
+    fn drop(&mut self) {
+        self.read_ahead
+            .fetching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.channel);
+    }
+}
+
 /// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, one read per
 /// identical timeline request, a bound on thread lookups, and the provider warm-up. See the module
 /// documentation.
@@ -202,6 +241,8 @@ pub struct ReadAhead {
     windows: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Option<WindowRead>>>>>,
     /// Per channel: how many posts this server has sent to it ([`ReadAhead::posted`]).
     posts: Mutex<HashMap<ChannelId, u64>>,
+    /// Per channel: the window fetch running with the turn held ([`ReadAhead::window_fetching`]).
+    fetching: Mutex<HashMap<ChannelId, WindowFetch>>,
     /// [`THREAD_FETCHES_IN_FLIGHT`] permits, one per thread message lookup.
     lookups: tokio::sync::Semaphore,
     warming: Arc<AtomicBool>,
@@ -214,6 +255,7 @@ impl Default for ReadAhead {
             timelines: Arc::default(),
             windows: Mutex::default(),
             posts: Mutex::default(),
+            fetching: Mutex::default(),
             lookups: tokio::sync::Semaphore::new(THREAD_FETCHES_IN_FLIGHT),
             warming: Arc::default(),
         }
@@ -478,6 +520,32 @@ impl ReadAhead {
             Arc::clone(windows.entry(channel.clone()).or_default())
         };
         slot.lock_owned().await
+    }
+
+    /// The window fetch running through `channel`'s turn, if one is. A caller looks before it waits
+    /// for the turn: a fetch that cannot answer it ([`WindowFetch::can_answer`]) is not worth
+    /// waiting out, and it reads beside it instead, as every window read did before `#278
+    /// timeline-single-flight`.
+    #[must_use]
+    pub fn window_fetch(&self, channel: &ChannelId) -> Option<WindowFetch> {
+        self.fetching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(channel)
+            .copied()
+    }
+
+    /// List `fetch` as `channel`'s running window fetch until the guard is dropped. Called by the
+    /// caller holding the turn, just before it fetches.
+    pub fn window_fetching(&self, channel: &ChannelId, fetch: WindowFetch) -> WindowFetching<'_> {
+        self.fetching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(channel.clone(), fetch);
+        WindowFetching {
+            read_ahead: self,
+            channel: channel.clone(),
+        }
     }
 
     /// Start `speech`'s warm-up in the background, unless one is already running.

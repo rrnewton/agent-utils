@@ -409,6 +409,12 @@ pub async fn messages(
 /// If any message of it has been forgotten since (an edit or a delete was pushed), or the fetch
 /// failed, it reads the window itself.
 ///
+/// A caller does not wait for a fetch that cannot answer it: one narrower than its own, or begun
+/// before a change it has seen ([`crate::read_ahead::WindowFetch::can_answer`]). It reads beside
+/// that fetch, as every window read did before, rather than waiting it out and then reading in
+/// series — twice the wait, which a voice tool's fifteen seconds behind a summary's fetch on a slow
+/// bridge cannot afford. Such a read leaves the turn's record alone.
+///
 /// `began` is when the caller's own request started.
 pub(crate) async fn window_shared(
     state: &AppState,
@@ -419,15 +425,25 @@ pub(crate) async fn window_shared(
     // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
     // preparation compares a remembered window against (`crate::read_ahead`) are one number.
     let limit = window_limit(state, limit);
+    if let Some(running) = state.read_ahead.window_fetch(&channel.id) {
+        let mark = state.live.recent().mark(&channel.id);
+        if !running.can_answer(state.read_ahead.changes(&channel.id, mark), limit) {
+            return Ok((fetch_window(state, channel, limit, mark).await?, false));
+        }
+    }
     let mut turn = state.read_ahead.window_turn(&channel.id).await;
     // `#210 voice-catchup-speed`. Taken with the turn held and before the fetch, so it is both
     // what this caller has seen and where a fetch it makes begins. See `crate::recent`.
     let mark = state.live.recent().mark(&channel.id);
     let changes = state.read_ahead.changes(&channel.id, mark);
-    if let Some(read) = turn
-        .as_ref()
-        .filter(|read| read.finished >= began && read.limit >= limit && read.changes == changes)
-    {
+    if let Some(read) = turn.as_ref().filter(|read| {
+        read.finished >= began
+            && crate::read_ahead::WindowFetch {
+                changes: read.changes,
+                limit: read.limit,
+            }
+            .can_answer(changes, limit)
+    }) {
         if let Some(mut messages) = state.read_ahead.recall_window(&channel.id, read) {
             // The newest `limit`, as this caller's own read would have answered.
             let excess = messages.len().saturating_sub(usize::from(limit));
@@ -444,13 +460,20 @@ pub(crate) async fn window_shared(
             ));
         }
     }
-    let window = fetch_window(state, channel, limit, mark).await?;
+    let fetching = state.read_ahead.window_fetching(
+        &channel.id,
+        crate::read_ahead::WindowFetch { changes, limit },
+    );
+    let window = fetch_window(state, channel, limit, mark).await;
+    drop(fetching);
+    let window = window?;
     *turn = Some(crate::read_ahead::WindowRead::of(&window, changes));
     Ok((window, false))
 }
 
-/// One window fetch, with the channel's turn held: kept in `crate::recent` and read-ahead memory,
-/// stamped and noise-marked. `mark` was taken just before.
+/// One window fetch, with the channel's turn held or beside a fetch that could not answer it: kept
+/// in `crate::recent` and read-ahead memory, stamped and noise-marked. `mark` was taken just
+/// before.
 async fn fetch_window(
     state: &AppState,
     channel: ChannelInfo,
