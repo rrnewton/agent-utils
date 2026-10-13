@@ -1796,7 +1796,11 @@ one store, `src/store/`, and it holds these:
   chose it: one row, one boolean and an instant. No row means the configured default applies, and
   the purge deletes the row, restoring that default — which asks first unless the operator set
   `ask_before_send = false`, in which case a purge turns direct sends back on. See "Posting asks
-  first, unless you turn that off". `#264 voice-send-approval`.
+  first, unless you turn that off". `#264 voice-send-approval`; and
+* **the owner's instructions for the voice agent** — the additional instructions and his edited
+  copy of the system prompt, one row holding two texts he wrote, with the prompt version the copy
+  was made from. No row means the shipped prompt; the purge deletes the row. See "Instructions for
+  the voice agent". `#272 voice-agent-instructions`.
 
 The first three are your own record. The cached summaries are a derived cache, bounded by the
 same retention as the rest, erased by the same purge, and never filled by a read-scope token.
@@ -2187,8 +2191,10 @@ they were made.
 ### How an operator purges it
 
 Three ways, all of which erase everything — transcripts, read marks, "dealt with" marks,
-cached summaries, channel aliases, the noise rules (back to the default), and every channel's
-clear-unread setting (back to off, in the running server too) alike:
+cached summaries, channel aliases, the noise rules (back to the default), the voice send setting
+(back to the configured default), the owner's instructions for the voice agent (back to the
+shipped prompt), and every channel's clear-unread setting (back to off, in the running server too)
+alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
@@ -2473,6 +2479,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | PUT | `/api/v1/noise-rules` | **write** | `{rules:["…"]}` — replace the whole list of messages read automatically; answers what was stored. Read through client-config's `noise_rules`; see "Messages read automatically" |
 | GET | `/api/v1/voice-settings` | read | `{ask_before_send, changeable}` — whether the voice agent asks before it sends, and whether this server can keep a change; also client-config's `voice_settings`. See "Posting asks first, unless you turn that off" |
 | PUT | `/api/v1/voice-settings` | **write** | `{ask_before_send: bool}` and nothing else — the owner's choice, kept in the store; answers what was stored; 503 `storage_not_configured` with no store. No MCP tool reaches it |
+| GET | `/api/v1/voice-prompt` | read | `{instructions, system_prompt, system_prompt_edited, edited_from_version?, prompt_version, max_instructions_chars, max_system_prompt_chars, changeable, delivery}` — the owner's additional instructions and the base prompt in force (his copy or the shipped one); also client-config's `voice_prompt`. See "Instructions for the voice agent" |
+| PUT | `/api/v1/voice-prompt` | **write** | `{instructions?, system_prompt?}`, at least one — save either text; an absent field keeps its text, an empty `instructions` removes them, and an empty `system_prompt` (or the shipped one) restores the shipped prompt. Answers what was stored; 413 `too_large` over 4,000 / 20,000 characters; 503 `storage_not_configured` with no store. No MCP tool reaches it |
 | POST | `/api/v1/channels/{id}/not-noise` | **write** | `{messages:[…]}` — these are real messages; stop reading them automatically, leaving the rules alone |
 | GET | `/api/v1/channels/{id}/pins` | read | this app's pinned messages in the channel, oldest message first, each with the snapshot kept of it, and the list's `revision`; see "Pinned messages" |
 | PUT | `/api/v1/channels/{id}/pins/{message_id}` | **write** | `{author, author_id, author_is_bot?, content, timestamp, thread_id?, thread_root?}` — pin it, keeping that much of the row; idempotent. At 100 pins in the channel the oldest is unpinned and named in `unpinned` |
@@ -2480,7 +2488,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/bookmark` | read | the channel's reading bookmark, `{revision, anchor}`, `anchor` null when none is set; every channel read carries it too. See "The reading bookmark" |
 | PUT | `/api/v1/channels/{id}/bookmark` | **write** | `{message_id, timestamp, place?:"above"\|"below", thread_id?, if_revision?}` — put it next to that message; a stale `if_revision` is `409` with where it is now; idempotent |
 | DELETE | `/api/v1/channels/{id}/bookmark?if_revision=` | **write** | take it away; `if_revision` as for PUT; idempotent |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, bookmarks, and every channel's clear-unread setting (back to off) |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, bookmarks, the voice send setting and instructions, and every channel's clear-unread setting (back to off) |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -3196,11 +3204,18 @@ and every MCP tool with its `access` (`read`/`write`), whether it `requires_conf
 `post_reply`, exactly when the owner has the agent ask first), and whether it is `available` to the
 credential that asked. That answer is derived from the same manifest and the same scope filter as
 `tools/list`, so the two cannot disagree; a read credential is told that sending exists but is not
-its to use. A bridge that attaches this server's `/mcp` endpoint to its model should fetch the
+its to use. The text carries the owner's own words when he has saved any in Settings (`#272
+voice-agent-instructions`): his edited copy in place of `voice-agent-system.txt`, then his
+additional instructions under
+[`voice-agent-owner-instructions.txt`](prompts/voice-agent-owner-instructions.txt), and the
+capability section always last, chosen as above, so no edit decides what the agent may do. Two
+booleans beside the text, `system_prompt_edited` and `additional_instructions`, say which; with both
+false the text and its fingerprint are exactly the shipped ones. A bridge that attaches this server's `/mcp` endpoint to its model should fetch the
 profile with the same credential it gives the MCP client. It may also load the public file at
 deployment time; its endpoint, credentials, and provider-specific tool transport remain outside
-this repository. Changing any of the prompt files means bumping `PROMPT_VERSION` and all three
-pinned fingerprints in `src/voice_agent.rs`, which a unit test enforces. A bridge that fetches the
+this repository. Changing any of the prompt files means bumping `PROMPT_VERSION` and every pinned
+fingerprint in `src/voice_agent.rs` — one per section, and one for the heading of the owner's
+instructions — which a unit test enforces. A bridge that fetches the
 profile once per call picks up a change to the owner's setting at its next call, with no change of
 its own; **a hosted agent whose prompt and per-tool approval were pasted into its console by hand
 must be given the new prompt, and the new approval for `post_reply`, every time the setting
@@ -4716,6 +4731,23 @@ form; a form's comfortable width is a property of the form. The desktop block ha
 exempted these two screens ("they are forms rather than reading, and giving them a column is a
 separate judgement nobody has made yet"); this is that judgement.
 
+**Five sections, not twenty-two cards** (`#271 settings-groups`). With every group its own card, the
+screen read as two dozen separate decisions of equal weight, and the owner could not find the switch
+that lets the voice agent send without asking — it was a card called "Voice" near the bottom. So
+the groups sit as rows inside a handful of sections, and each section is the card:
+
+| Section | Holds |
+|---|---|
+| **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Live messages, Canned prompts, Microphone, and the provider's console link |
+| **Messages** | Your own messages, Read automatically, Combining messages, Rich headers, Recently dismissed, How messages are said, Message audio |
+| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream, who is who |
+| **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
+| **Storage and connection** | Stored conversations, Token, Connection status |
+
+A section's title is an `h2` a size up; a group inside it keeps its own small `h3` heading and its
+`?`, with a rule above it. No control, `?` or id changed; only where each one sits. The page suite
+holds the section list and which groups each section holds.
+
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the
 screen, in the position a reader arrives at, when what they arrive wanting is a switch. "Connection"
@@ -4859,6 +4891,64 @@ when anyone last spoke. Building the capability — an `owner_id` in config, `au
 into the digest, `before`/`after` on the Discord client — is a real feature and a separate one; the
 research is in `ai_docs/UNREAD_STATUS_20260819.md`. Blockers is unaffected, because it makes no
 claim about read state.
+
+### Instructions for the voice agent
+
+`#272 voice-agent-instructions`. Settings → **Voice agent** → **Instructions** holds two of the
+owner's own texts for the agent:
+
+* **Additional instructions** — a box of standing instructions added to every call: "call me Sam",
+  "keep answers under three sentences". Up to 4,000 characters.
+* **Edit the system prompt** — folded under it, because it is long and rarely changed: the base
+  prompt itself, `prompts/voice-agent-system.txt`, for him to change. Up to 20,000 characters.
+  **Restore the shipped prompt** goes back to the file. His copy does not follow a newer shipped
+  prompt; the line under the box names the prompt version it was saved against when that is older
+  than the one this server ships.
+
+Each box has its own **Save**, a write-scope `PUT /api/v1/voice-prompt`; nothing is kept until it
+is pressed, and saving one box leaves unsaved text in the other alone. Both texts are kept in the
+store, so every device and every later call has them, and no MCP tool reaches them: a model that
+could rewrite its own instructions could drop the rule about untrusted chat text. They are readable
+at read scope, because the assembled prompt is. A server with no store shows them and refuses a
+save; a store that cannot be read gives the agent the shipped prompt. The access log records a save
+as `voice_prompt event="changed"` with the instructions' length and whether the prompt is edited,
+and none of the words.
+
+**Neither text can change what the agent may do.** The section that says whether it can send, and
+whether it asks first, is still chosen by the server from the token and the Sending switch, and it
+goes after the owner's words — base, then his instructions under a short heading saying they grant
+nothing, then that section. The server enforces both whatever the prompt says: a read token cannot
+post, and with "Ask me before the voice agent sends" on, `post_reply` only proposes. Taking the
+untrusted-text rules out of the base prompt is his choice to make, and Help says what it costs.
+
+**How the words reach the agent** depends on the voice provider, and client-config's `delivery`
+says which:
+
+* `profile` — a deployment-managed bridge fetches `GET /api/v1/voice-agent` as each call opens, and
+  the prompt there is assembled with both texts, so both reach the next call with no change to the
+  bridge.
+* `page` — a hosted agent (ElevenLabs) is configured in its vendor's console, and this page opens
+  its socket. When the owner has saved something, `GET /api/v1/voice-session` asks the vendor, beside
+  the mint, whether the agent's security settings allow a client to override its system prompt
+  (`platform_settings.overrides.conversation_config_override.agent.prompt.prompt`), and adds
+  `agent_prompt` to the session:
+  * allowed — `prompt_override`: the page puts the whole assembled prompt, written for a credential
+    that may post and following the Sending switch, on the initiation frame as
+    `conversation_config_override.agent.prompt.prompt`. So an agent that allows it also stops
+    needing its prompt re-pasted when the switch changes;
+  * not allowed, not said, or the vendor did not answer within 2.5 seconds —
+    `contextual_update`: the agent keeps its console prompt, and the page sends the heading and the
+    additional instructions as a `contextual_update` straight after the initiation, before a resumed
+    call's record. An edited base prompt cannot reach such an agent;
+  * not allowed and only the base was edited — `not_sent`: nothing is sent.
+
+  The override is sent only when the agent's configuration says it is allowed, because an override
+  an agent does not allow is believed to end the conversation rather than be ignored. That belief
+  comes from the vendor's documentation and has not been observed from this repository; nor has
+  whether a `contextual_update` carries instructions as strongly as a prompt does. After each call
+  the line under Instructions says what that call was given — above all when an edited prompt did
+  not reach it. With nothing of the owner's saved, nothing is asked and the initiation frame is
+  exactly what it always was.
 
 ### Typing is the other way to say something, on the same conversation
 
@@ -5216,7 +5306,7 @@ promise the voice provider makes, and a bridge that has no such setting would le
 post entirely to the model — the same model that has just read other people's messages, any of
 which may be written to talk it into something. So whether `post_reply` sends is decided by this
 server, from one setting the owner owns: **"Ask me before the voice agent sends"**, a checkbox in
-the voice page's Settings, under **Voice**.
+the voice page's Settings, first in the **Voice agent** section, under **Sending**.
 
 **The setting.** On by default. The shipped default is `[conversation] ask_before_send` in the
 configuration file (`true` unless the operator says otherwise); the owner's own choice is one row
