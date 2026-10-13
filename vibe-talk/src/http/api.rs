@@ -4762,7 +4762,11 @@ pub async fn remove_channel(
 
 /// Delete a channel's cached summaries and thread sentences, keeping its thread names, and answer
 /// how many went: the count is all that is logged. `#208 persistent-cache`.
+///
+/// The sentences this server remembers go too, so a channel shown again in the same process is not
+/// shown from memory what was just deleted from the store.
 async fn forget_channel_summaries(state: &AppState, channel: &crate::model::ChannelId) -> u64 {
+    state.thread_names.forget_channel_sentences(channel);
     match state.store.forget_channel_summaries(channel).await {
         Ok(deleted) => deleted,
         Err(crate::store::StoreError::Unavailable(_)) => 0,

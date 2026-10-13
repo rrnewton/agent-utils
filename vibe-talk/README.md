@@ -2012,8 +2012,9 @@ long the chat provider itself keeps messages**: the age limit is what finally re
 whose message was deleted upstream.
 
 **Taking a channel off the list deletes its summaries.** Hiding a configured channel or removing
-an added one, in Settings, deletes that channel's cached summaries and thread sentences at once;
-its thread names are kept, so the channel comes back under the names you knew.
+an added one, in Settings, deletes that channel's cached summaries and thread sentences at once,
+from the store and from the running server's memory; its thread names are kept, so the channel
+comes back under the names you knew, and its sentences are asked for again.
 
 Two tables are deliberately outside all of it: the "dealt with" marks, which an age bound would
 put back into the to-do list purely because time passed, and the **channel aliases**, which an age
@@ -2025,9 +2026,11 @@ edited or deleted upstream is unreachable by key, is filed under the current pol
 nothing will ever announce that it went. The startup sweep cannot help — it deletes by policy
 version, and an orphan is under the live one.
 
-**Deleted means overwritten.** The store sets SQLite's `secure_delete`, so a purged or pruned row
-is zeroed in the file rather than left in a free page for anyone who reads it. That reaches only
-this file: **copies of the store that something else made — a backup, or a deploy script that
+**Deleted means overwritten.** The store sets SQLite's `secure_delete`, so from this version on a
+purged or pruned row is zeroed in the file rather than left in a free page for anyone who reads it.
+Free pages an older build left behind keep their old bytes until SQLite reuses them or the file is
+vacuumed (`sqlite3 FILE 'VACUUM'` with the server stopped). All of this reaches only this file:
+**copies of the store that something else made — a backup, or a deploy script that
 copies the file before an upgrade — are not reached by the purge**, and have to be pruned where
 they were made.
 

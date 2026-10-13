@@ -63,7 +63,12 @@ async fn model_mock() -> (ModelMock, String) {
 }
 
 async fn call(app: &axum::Router, path: &str, token: &str) -> (StatusCode, Value) {
+    send(app, "GET", path, token).await
+}
+
+async fn send(app: &axum::Router, method: &str, path: &str, token: &str) -> (StatusCode, Value) {
     let request = Request::builder()
+        .method(method)
         .uri(path)
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
@@ -1025,6 +1030,83 @@ async fn a_thread_sentence_cut_below_the_cap_is_shown_as_it_is_and_asked_again_o
         ],
         "{list}"
     );
+}
+
+#[tokio::test]
+async fn a_channel_hidden_and_shown_again_has_its_names_and_no_sentence_from_memory() {
+    // `#208 persistent-cache`. Hiding a channel deletes its thread sentences and keeps its names in
+    // the store. What this server remembers must follow: shown again in the same process, the
+    // channel's threads carry their names and no sentence until the owner's read asks for them
+    // again. Remembered, a deleted sentence would be shown from memory and never filed again.
+    let h = harness();
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 2).await;
+    let (_, before) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let before = names_of(&before);
+    assert!(before
+        .iter()
+        .all(|(_, name, sentence)| name.is_some() && sentence.is_some()));
+    let names = |threads: &[(String, Option<String>, Option<String>)]| -> Vec<_> {
+        threads
+            .iter()
+            .map(|(id, name, _)| (id.clone(), name.clone()))
+            .collect()
+    };
+
+    let channel_path = format!("/api/v1/channels/{}", channel().as_str());
+    let (status, body) = send(&h.app, "DELETE", &channel_path, WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for thread in THREADS {
+        let version = &h.state.summary_version;
+        assert!(h
+            .store
+            .cached_summary(&sentence_key(version, &channel(), thread))
+            .await
+            .expect("readable")
+            .is_none());
+        assert!(h
+            .store
+            .cached_summary(&name_key(&channel(), thread))
+            .await
+            .expect("readable")
+            .is_some());
+    }
+    let (status, body) = send(
+        &h.app,
+        "DELETE",
+        &format!("{channel_path}/hidden"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, shown) = call(&h.app, THREAD_LIST, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    let shown = names_of(&shown);
+    assert_eq!(names(&shown), names(&before), "a name was lost or changed");
+    assert!(
+        shown.iter().all(|(_, _, sentence)| sentence.is_none()),
+        "a sentence deleted with the channel was shown from memory: {shown:?}"
+    );
+
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 4).await;
+    let (_, after) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let after = names_of(&after);
+    assert_eq!(
+        names(&after),
+        names(&before),
+        "the sentences were asked for under new names"
+    );
+    assert!(after.iter().all(|(_, _, sentence)| sentence.is_some()));
+    for thread in THREADS {
+        assert!(h
+            .store
+            .cached_summary(&sentence_key(&h.state.summary_version, &channel(), thread))
+            .await
+            .expect("readable")
+            .is_some());
+    }
 }
 
 #[tokio::test]

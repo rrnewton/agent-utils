@@ -38,7 +38,8 @@
 //!   uncut and cut when it is attached to a page ([`super::cut_for_serving`]), like a summary;
 //!   one cut shorter than the cap in force is asked for again when a write-scope read next sees
 //!   the thread. Its row is kept alive alongside the name's, and taking the channel off the list
-//!   deletes it. `#208 persistent-cache`.
+//!   deletes it, from the store and from memory ([`ThreadNames::forget_channel_sentences`]).
+//!   `#208 persistent-cache`.
 //!
 //! A name is chosen once in a stronger sense too: a store that cannot be read is never taken to
 //! mean "no name". Nothing is queued for such a thread, and a naming re-reads the filed name
@@ -468,6 +469,31 @@ impl ThreadNames {
     #[must_use]
     pub fn named(&self) -> usize {
         self.lock().named
+    }
+
+    /// Forget the sentences remembered for `channel`'s threads and keep their names, as
+    /// [`crate::store::StateStore::forget_channel_summaries`] does in the store. Called when the
+    /// channel is taken off the list. `#208 persistent-cache`.
+    ///
+    /// Remembered, a sentence deleted with the channel would be shown again from memory if the
+    /// channel came back in the same process, and, being taken for current, never asked for or
+    /// filed again. The names stay: a name is chosen once, and a server with no store holds them
+    /// nowhere else. The next write-scope read of the channel asks for its sentences again.
+    pub fn forget_channel_sentences(&self, channel: &ChannelId) {
+        let mut state = self.lock();
+        for (key, record) in &mut state.known {
+            if key.0 == *channel {
+                if let Some(record) = record.as_mut() {
+                    record.sentence = None;
+                    record.sentence_below_cap = false;
+                }
+            }
+        }
+        for recent in &mut state.recent {
+            if recent.channel == *channel {
+                recent.thread.summary = None;
+            }
+        }
     }
 
     /// Attach known names and sentences to a timeline answer, and queue the threads that are due.
