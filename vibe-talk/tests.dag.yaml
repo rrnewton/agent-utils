@@ -478,10 +478,12 @@ steps:
   # reply-new-thread` added two short runs at both sizes on a channel whose messages each head an empty
   # thread: "Start a new thread" offered between the box and Send, ticking it keeping the message where
   # Reply put it (one low on the screen too), and Send posting into the message's thread. With them:
-  # about 27s wall.
+  # about 27s wall. And `#267 quote-reply`: words selected by a mouse drag or as a long press leaves
+  # them make Reply "Quote reply", and r or a tap opens the reply with them quoted and the caret under
+  # them. With it: about 34s wall.
   - group: check
     job: reply-continuity-browser
-    desc: the replied message kept at the list's size and place, the box under it, and the tint, in current Chromium at 1280x800 and 412x915
+    desc: the replied message kept at the list's size and place, the box under it, the tint, and Quote reply, in current Chromium at 1280x800 and 412x915
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
@@ -489,7 +491,7 @@ steps:
     cpu_timeout: 110
     hint:
       resources: {browser: 1}
-      est_duration_s: 27
+      est_duration_s: 34
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

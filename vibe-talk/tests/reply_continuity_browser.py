@@ -31,6 +31,14 @@ Reply and Send, and the reply leaves with its
 reference, the message it answers is marked Done (`#256 reply-marks-read`) and the list is at its
 newest, untinted.
 
+Then `#267 quote-reply`: words of a message selected as a reader selects them -- dragged over with
+the mouse at the desk, which neither folds the row nor takes the selection, and left as a long press
+leaves them on the phone -- make its Reply "Quote reply", in the accent and within its row; r (desk)
+and a tap (phone, once as Chromium taps and once as a phone that clears the selection when the finger
+lands) open the reply with the words quoted line by line, the box focused with the caret under the
+quote; a quote cancelled untouched leaves no draft, and Send posts the quote and what was typed under
+it to the message.
+
 Then once more in the light scheme, to measure the tint there and keep a picture of it. No
 horizontal overflow and no page error at any step.
 
@@ -74,6 +82,8 @@ COUNT = 40
 # The message taller than a phone's screen, and the reply (to message 3).
 TALL = 20
 REPLY = 26
+# `#267 quote-reply`: a message of two paragraphs, for a quote over the blank line between them.
+PARAGRAPHS = 32
 Json = dict[str, object]
 Scheme = Literal["dark", "light"]
 
@@ -93,6 +103,9 @@ def thread_of(message_id_text: str) -> str:
 def message(index: int) -> Json:
     if index == TALL:
         text = f"Message {index}, the long one. " + FILLER * 40
+    elif index == PARAGRAPHS:
+        text = (f"Message {index}, in two paragraphs: the shard was retried twice.\n\n"
+                "The second paragraph, after a blank line: the cache is warm now.")
     elif index % 3 == 0:
         text = f"Message {index}: checked."
     else:
@@ -590,6 +603,43 @@ BRANCH_JS = """() => {
 }"""
 
 
+# `#267 quote-reply`. Where in a row's words a selection from character `start` to `end` of its
+# longest text node is drawn, and what the page then says: the selection's text, the row's Reply,
+# and whether the row is folded and selected.
+SELECTION_JS = """([id, start, end, select]) => {
+  const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
+  const body = row.querySelector('.body');
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  let text = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!text || node.data.length > text.data.length) text = node;
+  }
+  const range = document.createRange();
+  range.setStart(text, start);
+  range.setEnd(text, end);
+  if (select) getSelection().removeAllRanges(), getSelection().addRange(range);
+  const rects = [...range.getClientRects()];
+  const first = rects[0];
+  return {left: first.left, right: first.right, top: first.top, bottom: first.bottom};
+}"""
+
+STATE_JS = """(id) => {
+  const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
+  const reply = row.querySelector('.reply-button');
+  const box = document.getElementById('reply-text');
+  const r = reply.getBoundingClientRect();
+  const li = row.getBoundingClientRect();
+  return {
+    selected: String(getSelection()), label: reply.textContent, quote: reply.getAttribute('data-quote'),
+    color: getComputedStyle(reply).color, collapsed: row.getAttribute('data-collapsed'),
+    lit: row.getAttribute('data-selected'), screen: document.getElementById('screen-reply').hidden ? 'main' : 'reply',
+    value: box.value, caret: box.selectionStart, focused: document.activeElement === box,
+    replyRight: r.right, rowRight: li.right, overflow: document.scrollingElement.scrollWidth - window.innerWidth,
+    draft: !row.querySelector('.draft-marker').hidden,
+  };
+}"""
+
+
 def branch_state(walk: Walk) -> Measured:
     found: object = walk.page.evaluate(BRANCH_JS)
     walk.check(isinstance(found, dict), f"the page measured nothing: {found!r}")
@@ -668,6 +718,140 @@ def new_thread_walk(walk: Walk) -> None:
                f"new-thread: what left the browser was {posted}")
     walk.notes.append(f"the new-thread box {row['width']:.0f}x{row['height']:.0f} between the reply box and Send; "
                       f"ticked, the title and note followed, the message stayed, and Send posted into its thread")
+
+
+def quote_text(selected: str) -> str:
+    """The quote the page should write for `selected`: the rule Help states, restated for the check."""
+    lines = [" ".join(line.split()) for line in selected.replace("\r\n", "\n").split("\n")]
+    said = "\n".join(lines)
+    while "\n\n\n" in said:
+        said = said.replace("\n\n\n", "\n\n")
+    said = said.strip()
+    return "\n".join(f"> {line}" if line else ">" for line in said.split("\n")) + "\n\n"
+
+
+def quote_case(walk: Walk) -> None:
+    """Words of a message selected as a reader selects them make its Reply Quote reply; pressing it
+    opens the reply with them quoted, the box focused with the caret under them, and Send posts it.
+
+    At a desk the words are selected by dragging the mouse over them, which neither folds the row nor
+    reads it, and selects it; r then quotes, and so does a click on Quote reply. On a phone, a
+    selection is made as a long press leaves one (by the engine's own Selection API, which Playwright's
+    touch cannot drag), and Quote reply is tapped: once as Chromium does it, keeping the selection
+    through the tap, and once as a phone that clears the selection when the finger lands, before the
+    click, which the page holds for the tap.
+    """
+    page = walk.page
+    # Not 31, which `send_case` has answered and which counts its reply.
+    index = 29
+    row_id = message_id(index)
+    list_box = walk.measure(index).box("list")
+    walk.place(index, list_box["top"] + list_box["height"] * 0.4)
+
+    def state() -> Json:
+        found: object = page.evaluate(STATE_JS, row_id)
+        assert isinstance(found, dict)
+        return {str(key): value for key, value in found.items()}
+
+    before = state()
+    walk.check(before["label"] == "Reply" and before["quote"] is None, f"quote: Reply was not Reply to begin with: {before}")
+    plain_color = before["color"]
+    if walk.touch:
+        page.evaluate(SELECTION_JS, [row_id, 12, 45, True])
+    else:
+        line: object = page.evaluate(SELECTION_JS, [row_id, 12, 45, False])
+        assert isinstance(line, dict)
+        y = (float(line["top"]) + float(line["bottom"])) / 2
+        page.mouse.move(float(line["left"]) + 2, y)
+        page.mouse.down()
+        page.mouse.move(float(line["right"]) - 2, y, steps=8)
+        page.mouse.up()
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{row_id}'] .reply-button\")"
+                  ".textContent === 'Quote reply'", "quote: the selection did not make Reply Quote reply")
+    walk.settled()
+    lit = state()
+    selected = str(lit["selected"])
+    walk.check(len(selected.strip()) > 10, f"quote: nothing was selected: {lit}")
+    walk.check(lit["collapsed"] == before["collapsed"], f"quote: selecting the words folded the row: {before} -> {lit}")
+    walk.check(lit["color"] != plain_color, f"quote: Quote reply is drawn as Reply is: {lit['color']}")
+    walk.check(float(str(lit["overflow"])) <= 0 and float(str(lit["replyRight"])) <= float(str(lit["rowRight"])) + 1,
+               f"quote: Quote reply does not fit its row: {lit}")
+    if not walk.touch:
+        walk.check(lit["lit"] == "true", f"quote: the drag's click did not select the row: {lit}")
+    walk.shot("quote-label")
+    expected = quote_text(selected)
+    if not walk.touch:
+        # r on the selected message, the selection inside it: the quote, the box focused.
+        page.keyboard.press("r")
+        walk.wait_for("() => !document.getElementById('screen-reply').hidden", "quote: r did not open the reply")
+        walk.settled()
+        keyed = state()
+        walk.check(keyed["value"] == expected and keyed["focused"] is True and keyed["caret"] == len(expected),
+                   f"quote: r did not quote {expected!r}: {keyed}")
+        walk.press("#reply-cancel")
+        walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Cancel did not go back")
+        walk.settled()
+        cancelled = state()
+        walk.check(cancelled["draft"] is False, f"quote: an untouched quote was kept as a draft: {cancelled}")
+        walk.check(cancelled["label"] == "Reply", f"quote: Reply stayed Quote reply after its quote was taken: {cancelled}")
+        # Selected again, and Quote reply clicked.
+        line = page.evaluate(SELECTION_JS, [row_id, 12, 45, False])
+        assert isinstance(line, dict)
+        y = (float(line["top"]) + float(line["bottom"])) / 2
+        page.mouse.move(float(line["left"]) + 2, y)
+        page.mouse.down()
+        page.mouse.move(float(line["right"]) - 2, y, steps=8)
+        page.mouse.up()
+        walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{row_id}'] .reply-button\")"
+                      ".textContent === 'Quote reply'", "quote: the second selection did not make Reply Quote reply")
+        expected = quote_text(str(state()["selected"]))
+    else:
+        # Tapped as Chromium does it, the selection kept through the tap.
+        walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
+        walk.wait_for("() => !document.getElementById('screen-reply').hidden", "quote: the tap did not open the reply")
+        walk.settled()
+        tapped = state()
+        walk.check(tapped["value"] == expected and tapped["focused"] is True and tapped["caret"] == len(expected),
+                   f"quote: the tap did not quote {expected!r}: {tapped}")
+        walk.press("#reply-cancel")
+        walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Cancel did not go back")
+        walk.settled()
+        # Over the blank line between two paragraphs, and a phone that clears it as the finger lands.
+        two = message_id(PARAGRAPHS)
+        walk.place(PARAGRAPHS, list_box["top"] + list_box["height"] * 0.4)
+        page.evaluate("""(id) => {
+          const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
+          const parts = [...row.querySelectorAll('.body p')];
+          const first = parts[0].firstChild, last = parts[parts.length - 1].firstChild;
+          getSelection().setBaseAndExtent(first, 9, last, 22);
+          document.addEventListener('pointerdown', () => getSelection().removeAllRanges(), {capture: true, once: true});
+        }""", two)
+        walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{two}'] .reply-button\")"
+                      ".textContent === 'Quote reply'", "quote: two paragraphs selected did not make Reply Quote reply")
+        across: object = page.evaluate("() => String(getSelection())")
+        walk.check("\n" in str(across), f"quote: the engine read two paragraphs as one line: {across!r}")
+        expected = quote_text(str(across))
+        walk.check("\n>\n" in expected, f"quote: the selection has no blank line to quote: {expected!r}")
+        row_id = two
+    walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
+    walk.wait_for("() => !document.getElementById('screen-reply').hidden", "quote: Quote reply did not open the reply")
+    walk.settled()
+    opened = state()
+    walk.check(opened["value"] == expected, f"quote: the box holds {opened['value']!r}, not {expected!r}")
+    walk.check(opened["focused"] is True and opened["caret"] == len(expected),
+               f"quote: the box is not focused with the caret under the quote: {opened}")
+    walk.shot("quote-reply")
+    page.keyboard.type("agreed")
+    sent = len(walk.api.replies)
+    walk.press("#reply-send")
+    walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Send did not go back to the list")
+    walk.settled()
+    page.wait_for_timeout(200)
+    with walk.api.lock:
+        posted = list(walk.api.replies[sent:])
+    walk.check(len(posted) == 1 and posted[0].get("text") == f"{expected}agreed" and posted[0].get("reply_to") == row_id,
+               f"quote: what left the browser was {posted}")
+    walk.notes.append(f"Quote reply quoted {len(expected.splitlines()) - 1} line(s) and posted them to their message")
 
 
 def light_walk(walk: Walk) -> None:
@@ -773,6 +957,7 @@ def main() -> int:
                                  ((width, height - 220), (width, height), (720, height), (width, height)))
                         resize_case(walk, turns)
                         send_case(walk)
+                        quote_case(walk)
                     else:
                         light_walk(walk)
                     check(not errors, f"{label}: the page threw: {errors}")
