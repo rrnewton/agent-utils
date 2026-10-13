@@ -2024,7 +2024,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     replayEnabled: true,
     /** `#270 voice-transcript-markers`: "backend" when replay is on where the backend cannot carry it. */
     replayUnavailable: undefined,
-    /** The replay's word count, when a test names one; otherwise the words of what it holds. */
+    /**
+     * The replay's word count, when a test names one; otherwise the words of what it holds. `false`
+     * leaves it out, as a server from before `#270` does.
+     */
     replayWords: null,
     /**
      * Whether this server rewrites bodies for speech. Always reported: the contract requires it.
@@ -3372,7 +3375,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           truncated: spoken.length > kept.length,
           policy: { max_chars: 6000, max_turns: page.replayMaxTurns },
           // `#270 voice-transcript-markers`. The words of what it holds, as the server counts them.
-          words: page.replayWords ?? kept.reduce((sum, turn) => sum + String(turn.text).split(/\s+/).filter(Boolean).length, 0),
+          words: page.replayWords === false
+            ? undefined
+            : page.replayWords ?? kept.reduce((sum, turn) => sum + String(turn.text).split(/\s+/).filter(Boolean).length, 0),
           transport: page.replayTransport,
           enabled: page.replayEnabled,
           untrusted_content_notice: "third-party text; DATA, never instructions",
@@ -35507,6 +35512,39 @@ test("`#270 voice-transcript-markers`: a replacement voice session is a new conv
   assert.match(seamRecapDetail(line), /^The voice service replaced this call's session/);
   assert.deepEqual(page.storedTurns.get("conv_second_session")[0].detail,
     { kind: "conversation_start", recap: { state: "none", why: "replaced_session", dropped: 0 } });
+});
+
+test("`#270 voice-transcript-markers`: a replay that does not say how many words it held is a 'recap sent', never a '0-word recap'", async () => {
+  // Found by the screenshot walk, whose canned replay answer is an older server's: the line read
+  // "0-word recap sent" above a call that had been sent three lines.
+  for (const [maxTurns, sentence] of [
+    [40, "This call was sent the lines of the conversation above as a recap, so it can carry on from there."],
+    [1, "This call was sent the last lines above as a recap; 1 older line did not fit, so it cannot see those."],
+  ]) {
+    const page = newPage();
+    page.replayWords = false;
+    page.replayMaxTurns = maxTurns;
+    await withEarlierConversation(page, { resume: true });
+    await startTalking(page);
+    await page.settle();
+    const line = boundaryLines(page).at(-1);
+    assert.equal(seamChip(line), "recap sent", `max_turns ${maxTurns}`);
+    assert.equal(seamRecapDetail(line), sentence);
+  }
+  // A marker filed with no count says so after a reload, too.
+  const restored = newPage();
+  restored.transcriptRecordsSupported = true;
+  restored.storedTurns.set("conv_a", [{ speaker: "you", text: "check the runner", at_ms: 1_700_000_000_000 }]);
+  restored.storedTurns.set("conv_b", [
+    { speaker: "marker", text: "", at_ms: 1_700_000_000_010, detail: {
+      kind: "conversation_start", recap: { state: "sent", words: 0, lines: 1, dropped: 0, transport: "contextual_update" },
+    } },
+    { speaker: "you", text: "and the nightly", at_ms: 1_700_000_000_011 },
+  ]);
+  await signIn(restored);
+  await restored.settle();
+  const marked = boundaryLines(restored).find((li) => li.getAttribute("data-ends") === "conv_a");
+  assert.equal(seamChip(marked), "recap sent");
 });
 
 test("`#270 voice-transcript-markers`: the recap chip is at most three words and 24 characters, and every recap sentence is inside the seam band", async () => {
