@@ -17,7 +17,10 @@ Playwright mock of the deployed `vibe-talk-v1` protocol:
   after the turn's completion has passed, and goes as a prompt at the segment's boundary -> the server
   closes the call: the page says so in red, that the reader did not hang up, and records
   `server_closed` with code 1000 -> a second call, hung up: one `audio_end` and one `quit`, recorded
-  as `hang_up`.
+  as `hang_up` -> a third call, whose card reaches the page after its read-back, as on a slow long
+  poll, and is answered "Yes." at once, inside the card's hold (`#269 approval-card-inline`): while
+  the yes settles the card says to tap Don't send to stop it, Don't send is live, and a real tap on
+  it withdraws the draft, so nothing posts.
 
 It serves the checked-out assets and a small fake API from one loopback origin. Pass --web-root DIR
 to run it against another copy of the page; against the page before `#268` it fails at the greeting
@@ -53,6 +56,11 @@ PROPOSAL = {"serial": 7, "handle": "hAnDlE-browser-call-drops-01", "channel_id":
             "channel_name": "lead team", "text": "on it, rebasing now", "reply_to": None,
             "expires_in_ms": 120_000}
 READ_BACK = "To lead team: on it, rebasing now. Send it?"
+# `#269 approval-card-inline`: the third call's draft, whose card reaches the page after its read-back.
+LATE_PROPOSAL = {"serial": 8, "handle": "hAnDlE-browser-call-drops-02", "channel_id": CHANNEL["id"],
+                 "channel_name": "lead team", "text": "the rebase is done", "reply_to": None,
+                 "expires_in_ms": 120_000}
+LATE_READ_BACK = "To lead team: the rebase is done. Send it?"
 OUTPUT_RATE = 24_000
 # The page's capture hand-off after a `turn_complete` is 750 ms; nothing may arrive well inside it.
 HAND_OFF_QUIET_MS = 400
@@ -71,6 +79,7 @@ class FakeApi:
     changed: threading.Condition = field(default_factory=threading.Condition)
     proposal: Json | None = None
     commits: list[Json] = field(default_factory=list)
+    cancels: list[Json] = field(default_factory=list)
     ends: list[Json] = field(default_factory=list)
 
     def client_config(self) -> Json:
@@ -129,6 +138,21 @@ class FakeApi:
                 "author_id": "1110000000000000098", "author_is_bot": True,
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "spoken_time": "", "reply_to": proposal["reply_to"], "content": proposal["text"]}
+
+    def cancel(self, body: Json) -> bool:
+        """Withdraw the pending proposal; whether there was one with that handle to withdraw."""
+        with self.changed:
+            self.cancels.append(body)
+            proposal = self.proposal
+            if proposal is None or body.get("handle") != proposal["handle"]:
+                return False
+            self.proposal = None
+            self.changed.notify_all()
+            return True
+
+    def recorded_cancels(self) -> list[Json]:
+        with self.changed:
+            return list(self.cancels)
 
     def recorded_ends(self) -> list[Json]:
         with self.changed:
@@ -222,6 +246,11 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                     self.json(409, {"error": "proposal_used", "detail": "already settled"})
                 else:
                     self.json(200, {"parts": [message], "posted": message, "serial": PROPOSAL["serial"]})
+            elif path == "/api/v1/post-proposals/cancel":
+                if api.cancel(body):
+                    self.json(204, {})
+                else:
+                    self.json(409, {"error": "proposal_used", "detail": "already settled"})
             elif path == "/api/v1/voice-end":
                 with api.changed:
                     api.ends.append(body)
@@ -303,6 +332,16 @@ YES_ROWS_SHOWN_JS = """() => [...document.querySelectorAll('#transcript li')].fi
   const body = li.querySelector('.body');
   return body !== null && /^yes\\.?$/i.test(body.textContent || '') && li.getClientRects().length > 0;
 }).length"""
+
+
+# The card at the moment of the tap: whether its hold after appearing is still running, whether a spoken
+# yes to it is settling, what its line says, and whether Don't send can be pressed.
+CARD_AT_TAP_JS = """() => ({
+  held: postWatch.hold !== null,
+  settling: spokenYes.settling !== null && postWatch.shown !== null && spokenYes.settling.handle === postWatch.shown.handle,
+  line: document.getElementById('post-confirm-expiry').textContent,
+  cancelDisabled: document.getElementById('post-confirm-cancel').disabled,
+})"""
 
 
 def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
@@ -401,12 +440,52 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
           f"hanging up sent {voice.kinds(1)}")
     check(api.recorded_ends()[1].get("ended_by") == "hang_up", f"the hang-up was recorded as {api.recorded_ends()[1]}")
     check(page.locator("#error").is_hidden(), "hanging up was reported as an error")
+
+    # 7. `#269 approval-card-inline`. A third call. The card reaches the page after its read-back, as
+    # on a slow or reconnecting long poll, and the owner says yes at once, inside the card's hold.
+    # The card says "tap Don't send to stop", and that tap is live: it withdraws the draft, and the
+    # settle window passes with nothing posted.
+    page.click("#talk")
+    until(page, lambda: len(voice.routes) == 3, "Talk to open a third call")
+    live(page)
+    voice.send(2, {"type": "session_started", "greeting": False})
+    until(page, lambda: "audio_start" in voice.kinds(2), "the third call to open its audio segment")
+    voice.say(2, "user", 1, "tell lead team the rebase is done")
+    voice.audio(2, 1.0)
+    voice.say(2, "assistant", 1, LATE_READ_BACK)
+    voice.send(2, {"type": "turn_complete", "turn": 1})
+    page.wait_for_timeout(2500)
+    api.propose(LATE_PROPOSAL)
+    page.locator("#post-confirm").wait_for(state="visible", timeout=10_000)
+    voice.say(2, "user", 2, "Yes.")
+    page.wait_for_function(
+        "() => document.getElementById('post-confirm-expiry').textContent.startsWith('Heard yes')", timeout=1_000)
+    at_tap = page.evaluate(CARD_AT_TAP_JS)
+    check(isinstance(at_tap, dict), "the card measured nothing")
+    assert isinstance(at_tap, dict)
+    check(at_tap["held"] is True and at_tap["settling"] is True,
+          f"the yes was not settling inside the card's hold, so this tests nothing: {at_tap}")
+    check(at_tap["cancelDisabled"] is False,
+          f"Don't send was held while the card said {at_tap['line']!r}: a tap to stop the send would be eaten")
+    page.tap("#post-confirm-cancel", timeout=500)
+    until(page, lambda: len(api.recorded_cancels()) == 1, "Don't send to withdraw the draft", 3_000)
+    page.wait_for_function("() => document.getElementById('post-confirm').hidden", timeout=5_000)
+    # Past the settle window: the yes the tap stopped sends nothing.
+    page.wait_for_timeout(1_500)
+    check(len(api.commits) == 1, f"the yes posted the draft Don't send withdrew: {api.commits[1:]}")
+    check(api.recorded_cancels() == [{"handle": LATE_PROPOSAL["handle"]}],
+          f"Don't send withdrew {api.recorded_cancels()}")
+    check(page.locator("#transcript > li[data-not-sent='withdrawn']").count() == 1,
+          "the withdrawn draft left no 'Not sent' line")
+    page.click("#hang-up")
+    until(page, lambda: len(api.recorded_ends()) == 3, "the third call's hang-up to be recorded")
     return (f"no microphone frame inside the greeting's hand-off (back after {resumed_ms:.0f} ms); a yes"
             " whose final transcript came after the reply's committed the card once, as the speaker's"
             f" turn; the notice waited for the owner's turn and its hand-off ({gap_ms:.0f} ms) and went"
             " at the segment's boundary; the"
             " service's close was said and recorded as server_closed 1000; a hang-up sent one goodbye"
-            " and was recorded as hang_up")
+            " and was recorded as hang_up; Don't send, tapped while a yes settled inside the hold of a"
+            " card that came after its read-back, withdrew the draft and nothing posted")
 
 
 def main() -> int:

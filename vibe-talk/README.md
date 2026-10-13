@@ -6765,7 +6765,9 @@ box. Under Reply, and while a reply is open in either column, the card's Send is
 filled **Send reply** is never taken for it. It names what it answers in words ("replying to Alex:
 …") and never by id. It is built so that a tap confirms only what the owner read. When a card appears, or a newer
 proposal replaces the text, both its buttons are held for two seconds and a replacement says the
-text changed, so a tap already on its way lands on neither the new words nor Don't send.
+text changed, so a tap already on its way lands on neither the new words nor Don't send. Don't send
+is never held while a spoken yes to the card is settling, though: then the card says "Heard yes —
+tap Don't send to stop", and that tap stops the send, however recently the card appeared.
 
 **What happens to a draft when the call ends depends on who ended it.** Hang up retires it: the
 card goes, and the next call on the same page does not offer it again; it lapses on the server. The
