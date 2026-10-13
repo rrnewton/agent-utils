@@ -12414,9 +12414,15 @@ function keepWindowItem(key, value) {
   }
 }
 
-/** Where a UI record is kept: the device's storage, which every window shares, or this window's own. */
-const deviceStore = () => localStorage;
-const windowStore = () => sessionStorage;
+/** Where a UI record is kept: the device's storage, which every window shares... */
+function deviceStore() {
+  return localStorage;
+}
+
+/** ...or this window's own. Asked for, not held: a browser refusing storage throws on the asking. */
+function windowStore() {
+  return sessionStorage;
+}
 
 const UI_STATE_KEY = "vibe-talk.voice.ui-state";
 const UI_STATE_VERSION = 2;
