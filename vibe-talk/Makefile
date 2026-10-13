@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -152,6 +152,16 @@ post-confirm-browser:
 # Pass WEB_ROOT=dir to run it against another copy of the page.
 voice-call-drops-browser:
 	python3 tests/voice_call_drops_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
+
+# `#277 send-order` in a real Chromium against the real server binary, which posts through its real
+# provider client to a mock Google Chat bridge on loopback that fails A at once: B waits behind A,
+# saying so, and the bridge never sees it; A goes again under the same nonce and lands, then B; and
+# across a real reload a message still waits behind the one before it, sending nothing, until Retry
+# lands both in order. Builds the release binary first, because web/ is compiled into it. Pass
+# SCREENSHOTS=dir to keep a PNG of each waiting state.
+send-order-browser:
+	cargo build --release --locked
+	python3 tests/send_order_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#241 voice-composer` in a real Chromium at 412x915 and 1280x800: the call's message box and the
 # view switch on screen and uncovered while the box has the focus -- at idle, in a typed
