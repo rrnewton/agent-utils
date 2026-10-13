@@ -1034,3 +1034,227 @@ async fn forgetting_the_stored_conversations_or_purging_empties_the_send_memory(
         assert_eq!(after["sends_through"], 1, "the counter never goes back");
     }
 }
+
+// --- #270 voice-transcript-markers: claims and markers through the append route ------------------
+
+fn store_harness() -> Harness {
+    let (state, discord, _store) = vibe_talk::testing::state_with_store();
+    Harness {
+        router: router(state),
+        discord,
+    }
+}
+
+async fn record(harness: &Harness, conversation: &str, body: Value) -> (StatusCode, Value) {
+    send(
+        harness,
+        "POST",
+        &format!("/api/v1/conversations/{conversation}/turns"),
+        WRITE_TOKEN,
+        Some(body),
+    )
+    .await
+}
+
+async fn stored(harness: &Harness, conversation: &str, records: bool) -> Vec<Value> {
+    let query = if records { "?records=1" } else { "" };
+    let (status, body) = send(
+        harness,
+        "GET",
+        &format!("/api/v1/conversations/{conversation}{query}"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["turns"].as_array().expect("turns").clone()
+}
+
+#[tokio::test]
+async fn a_claim_files_the_servers_own_copy_of_the_send_once() {
+    let harness = store_harness();
+    let proposal = propose(&harness, "on my way").await;
+    let mut confirmed = restated(&proposal);
+    confirmed["confirmed_by"] = json!("speaker_turn");
+    let (status, committed) = commit(&harness, confirmed).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let send_seq = committed["send_seq"].clone();
+
+    // The page's words are never the record of a send.
+    let (status, body) = record(
+        &harness,
+        "conv_s",
+        json!({ "speaker": "sent", "send": send_seq, "text": "something else entirely" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad_record");
+
+    let (status, body) = record(
+        &harness,
+        "conv_s",
+        json!({ "speaker": "sent", "send": send_seq, "text": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["turn"]["speaker"], "sent");
+    // The server's own copy: what went, the owner's tag included. `#303 voice-post-prefix`.
+    assert_eq!(body["turn"]["text"], tagged("on my way"));
+    assert_eq!(body["turn"]["detail"]["kind"], "sent");
+    assert_eq!(body["turn"]["detail"]["how"], "voice");
+    assert_eq!(body["turn"]["detail"]["serial"], proposal["serial"]);
+    assert_eq!(body["turn"]["detail"]["channel_name"], "lead team");
+
+    let (status, body) = record(
+        &harness,
+        "conv_s",
+        json!({ "speaker": "sent", "send": send_seq }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "send_recorded");
+    let (status, body) = record(&harness, "conv_s", json!({ "speaker": "sent", "send": 99 })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "send_unknown");
+    let (status, body) = record(&harness, "conv_s", json!({ "speaker": "sent" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A read that asked for records gets the row and its detail; one that did not, neither.
+    let with = stored(&harness, "conv_s", true).await;
+    assert_eq!(with.len(), 1);
+    assert_eq!(with[0]["detail"]["outcome"], "sent");
+    assert!(stored(&harness, "conv_s", false).await.is_empty());
+}
+
+#[tokio::test]
+async fn markers_and_answers_are_recorded_only_in_the_shapes_this_server_knows() {
+    let harness = store_harness();
+    let cases = [
+        (
+            json!({ "speaker": "agent", "text": "hi", "answer": 3 }),
+            "an answer on an agent row",
+        ),
+        (
+            json!({ "speaker": "you", "text": "yes", "send": 1 }),
+            "a send on a you row",
+        ),
+        (
+            json!({ "speaker": "you", "text": "yes", "answer": 1_000_001 }),
+            "an answer out of range",
+        ),
+        (
+            json!({ "speaker": "marker", "text": "" }),
+            "a marker row with no marker",
+        ),
+        (
+            json!({ "speaker": "marker", "text": "words", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 4 } }),
+            "text on a marker row",
+        ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "bored", "serial": 4 } }),
+            "an unknown reason",
+        ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 4, "extra": 1 } }),
+            "an unknown field",
+        ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "maybe" } } }),
+            "an unknown recap state",
+        ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "sent", "words": 5_000_000, "lines": 1, "dropped": 0, "transport": "contextual_update" } } }),
+            "a number out of range",
+        ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "none", "why": "off", "dropped": 0, "words": 3 } } }),
+            "a field from the other recap state",
+        ),
+        (
+            json!({ "speaker": "marker", "marker": { "kind": "applause" } }),
+            "an unknown kind",
+        ),
+    ];
+    for (body, case) in cases {
+        let (status, answer) = record(&harness, "conv_m", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+        assert_eq!(answer["error"], "bad_record", "{case}: {answer}");
+    }
+    assert_eq!(
+        send(
+            &harness,
+            "GET",
+            "/api/v1/conversations/conv_m",
+            WRITE_TOKEN,
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "a refused record created the conversation"
+    );
+
+    for body in [
+        json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "none", "why": "unsupported", "dropped": 0 } } }),
+        json!({ "speaker": "agent", "text": "To lead team: ship it. Send it?" }),
+        json!({ "speaker": "you", "text": "yes please", "answer": 7 }),
+        json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "sent", "words": 412, "lines": 9, "dropped": 0, "transport": "client_data" }, "previous_end": "closed" } }),
+        json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "withdrawn", "serial": 8 } }),
+    ] {
+        let (status, answer) = record(&harness, "conv_m", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+    }
+    let with = stored(&harness, "conv_m", true).await;
+    assert_eq!(with.len(), 5);
+    assert_eq!(with[0]["detail"]["recap"]["why"], "unsupported");
+    assert_eq!(with[2]["detail"], json!({ "kind": "answer", "serial": 7 }));
+    assert_eq!(with[3]["detail"]["previous_end"], "closed");
+    assert_eq!(with[3]["detail"]["recap"]["words"], 412);
+    assert_eq!(with[4]["detail"]["why"], "withdrawn");
+    let without = stored(&harness, "conv_m", false).await;
+    assert_eq!(without.len(), 2, "{without:?}");
+    assert!(without.iter().all(|turn| turn.get("detail").is_none()));
+    let (_, listed) = send(&harness, "GET", "/api/v1/conversations", WRITE_TOKEN, None).await;
+    assert_eq!(
+        listed["conversations"][0]["preview"], "To lead team: ship it. Send it?",
+        "a marker became the preview: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn forgetting_one_conversation_forgets_the_sends_filed_into_it() {
+    let harness = store_harness();
+    for (text, conversation) in [("first", "conv_a"), ("second", "conv_b")] {
+        let proposal = if text == "first" {
+            propose(&harness, text).await
+        } else {
+            propose_again(&harness, text).await
+        };
+        let (status, committed) = commit(&harness, restated(&proposal)).await;
+        assert_eq!(status, StatusCode::OK, "{committed}");
+        let (status, body) = record(
+            &harness,
+            conversation,
+            json!({ "speaker": "sent", "send": committed["send_seq"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, _) = send(
+        &harness,
+        "DELETE",
+        "/api/v1/conversations/conv_a",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let after = sends_after(&harness, 0).await;
+    let left: Vec<&str> = after["sends"]
+        .as_array()
+        .expect("sends")
+        .iter()
+        .filter_map(|send| send["text"].as_str())
+        .collect();
+    assert_eq!(left, [tagged("second")], "{after}");
+}

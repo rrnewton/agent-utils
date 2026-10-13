@@ -1753,3 +1753,83 @@ async fn the_hourly_message_cache_line_is_numbers_and_never_an_id_or_a_word() {
         "the hourly line names the channel: {line}"
     );
 }
+
+/// `#270 voice-transcript-markers`. Each record the voice page files leaves one line of names and
+/// numbers — the proposal, how it was approved, what recap a call was sent, why a draft was not
+/// sent — and not a word of what was said or posted.
+#[tokio::test]
+async fn transcript_records_log_names_and_numbers_and_never_a_word() {
+    const SECRET: &str = "the vault code is 4417 and nobody may read it";
+    let capture = LogCapture::info_only();
+    let (state, discord, _store) = vibe_talk::testing::state_with_store();
+    let harness = Harness {
+        router: router(state),
+        discord,
+    };
+    let status = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        tools_call(
+            "post_reply",
+            json!({ "channel_id": WRITE_CHANNEL, "text": SECRET }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, pending) = json_call(&harness, "GET", "/api/v1/post-proposals", None).await;
+    let proposal = pending["proposal"].clone();
+    let (status, committed) = json_call(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals/commit",
+        Some(json!({
+            "handle": proposal["handle"],
+            "channel_id": proposal["channel_id"],
+            // What was proposed, the owner's tag included. `#303 voice-post-prefix`.
+            "text": proposal["text"],
+            "reply_to": null,
+            "confirmed_by": "speaker_turn",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    for body in [
+        json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "none", "why": "unsupported", "dropped": 0 } } }),
+        json!({ "speaker": "you", "text": SECRET, "answer": proposal["serial"] }),
+        json!({ "speaker": "sent", "send": committed["send_seq"] }),
+        json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 9 } }),
+    ] {
+        let (status, answer) = json_call(
+            &harness,
+            "POST",
+            "/api/v1/conversations/conv_log/turns",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+    }
+    let lines = capture
+        .access_lines()
+        .into_iter()
+        .filter(|line| line.contains("transcript_record"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    let joined = lines.join("\n");
+    for expected in [
+        "event=\"conversation_start\"",
+        "recap=\"unsupported\"",
+        "event=\"answer\"",
+        "event=\"sent\"",
+        "how=\"voice\"",
+        "event=\"not_sent\"",
+        "why=\"lapsed\"",
+        "serial=9",
+    ] {
+        assert!(joined.contains(expected), "no {expected} in:\n{joined}");
+    }
+    let everything = capture.text();
+    assert!(
+        !everything.contains("vault code"),
+        "message text reached the INFO log:\n{everything}"
+    );
+}

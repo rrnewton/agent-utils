@@ -259,6 +259,29 @@ pub fn post_gate(
     );
 }
 
+/// One line for one record the voice page filed in its transcript: a send it drew, a draft not
+/// sent, a conversation's start, or the tag on a spoken yes. `#270 voice-transcript-markers`.
+///
+/// Content-free, like every line here: the proposal's number, how a send was approved, what recap
+/// a call was sent, why a draft was not sent — and never a word of what was said or posted.
+pub fn transcript_record(
+    event: &str,
+    serial: Option<u64>,
+    how: Option<&str>,
+    recap: Option<&str>,
+    why: Option<&str>,
+) {
+    tracing::info!(
+        target: "vibe_talk::access",
+        event,
+        serial = serial.map_or(-1_i64, |n| i64::try_from(n).unwrap_or(i64::MAX)),
+        how = how.unwrap_or("-"),
+        recap = recap.unwrap_or("-"),
+        why = why.unwrap_or("-"),
+        "transcript_record"
+    );
+}
+
 /// The arguments of a tool call, at DEBUG.
 ///
 /// This is the one line that can carry channel text — `post_reply` puts the message the owner is

@@ -181,6 +181,7 @@
       "speech_prep_enabled": true,
       "threading_supported": true,
       "token_scope": "write",
+      "transcript_records_supported": true,
       "upstream_clear_supported": true,
       "upstream_read_mark_supported": true,
       "version": "0.0.0",
@@ -278,6 +279,7 @@
         "playback": "browser"
       },
       "replay_enabled": false,
+      "replay_unavailable": "backend",
       "self_author_id": null,
       "speech_prep_enabled": false,
       "summaries_unavailable": "elevenlabs.api_key is not configured",
@@ -357,6 +359,7 @@
         "playback": "browser"
       },
       "replay_enabled": false,
+      "replay_unavailable": "backend",
       "self_author_id": null,
       "speech_prep_enabled": false,
       "summaries_unavailable": "elevenlabs.api_key is not configured",

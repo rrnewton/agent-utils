@@ -4039,10 +4039,10 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
 | GET | `/api/v1/conversations` | **write** | stored conversation transcripts, most recent first |
 | DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
-| GET | `/api/v1/conversations/{id}` | **write** | one stored transcript, oldest turn first |
+| GET | `/api/v1/conversations/{id}?records=` | **write** | one stored transcript, oldest turn first; `records=1` adds the record rows (`sent`, `marker`) and each row's `detail` (`#270 voice-transcript-markers`), which a read without it never sees |
 | DELETE | `/api/v1/conversations/{id}` | **write** | erase one stored transcript |
-| POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn |
-| GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
+| POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn, `{speaker, text}`; a `you` turn may carry `answer` (the proposal a spoken yes sent). Also the voice page's records: `{speaker: "sent", send}` files the send memory's own copy of send `send` (`404 send_unknown` once forgotten, `409 send_recorded` the second time), and `{speaker: "marker", marker}` a conversation's start or a draft not sent; both carry no text, and anything else is `400 bad_record` |
+| GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call, with `words`, how many words of what was said or sent it holds — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
 | POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
@@ -4293,6 +4293,16 @@ which is third-party Discord text. Every turn is neutralized and the whole recor
 `src/untrusted.rs`; the preamble sits OUTSIDE the fence, because it is this server speaking and
 the point of the fence is that nothing inside it is. A turn that forges the fence is defused and
 the tampering stays visible.
+
+A message the voice agent posted is in the record too (`#270 voice-transcript-markers`), as
+`sent to {channel}: {text}` — this server's own copy of what went, so a resumed agent asked "did
+that go?" has the truth. It is inside the fence and the budget like any other line, the channel's
+name is neutralized like the words, and the preamble says what such a line is. The page's markers
+— a conversation's start, a draft that was not sent — are never replayed.
+
+Where the voice backend cannot carry a recap at all — `conversation.backend = "websocket"` —
+client-config says `replay_unavailable: "backend"` as well as `replay_enabled: false`, so the page
+can say "recap unsupported" on the new conversation's seam rather than nothing.
 
 ### Privacy
 

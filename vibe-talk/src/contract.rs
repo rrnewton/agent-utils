@@ -69,6 +69,22 @@ pub struct ClientConfigResponse {
     /// what resuming will do, and the control's own note has to say what the next call will be —
     /// both of which are questions asked while there is no conversation to fetch.
     pub replay_enabled: bool,
+    /// Why replay is off although the operator turned it on, when that is the reason. `#270
+    /// voice-transcript-markers`.
+    ///
+    /// `backend`: the voice backend has no way to carry a recap (a `vibe-talk-v1` socket; see
+    /// `replay::offered`). The page then marks each new conversation "recap unsupported" rather than
+    /// saying nothing, which would read as "nothing to recap". Absent otherwise, and from an older
+    /// server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_unavailable: Option<ReplayUnavailable>,
+    /// Whether this server records the voice page's transcript records: a `sent` row for each
+    /// message the voice agent posted, markers for a conversation's start and a draft not sent,
+    /// and the tag on a spoken yes, read back with `records=1`, and the send memory read with
+    /// `sent_after`. `#270 voice-transcript-markers`. Absent, from an older server, means none of
+    /// those may be sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript_records_supported: bool,
     /// The Discord account this bridge posts as, when it can be known.
     ///
     /// NOT a secret: a bot's user id is visible on every message it has ever sent. It is here so
@@ -240,6 +256,14 @@ pub struct VoicePostPrefix {
     /// Whether this server can keep a change. False with no store configured, and when the store
     /// cannot be read — the server then tags with the default.
     pub changeable: bool,
+}
+
+/// Why replay is off although the operator turned it on. `#270 voice-transcript-markers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayUnavailable {
+    /// The configured voice backend has no way to hand a new call the earlier transcript.
+    Backend,
 }
 
 /// The owner's own words for the voice agent, as Settings shows them. `#272

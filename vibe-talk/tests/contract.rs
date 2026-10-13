@@ -17,10 +17,10 @@ use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
     LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheRequest, MessageCacheStatus,
     MessagesResponse, NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse,
-    PinsResponse, ProposalSettled, ProviderDescription, ReplyDismissals, TimelineResponse,
-    TokenScope, TranscriptRole, UpstreamClearAttemptView, UpstreamClearNowOutcome,
-    UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
-    VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
+    PinsResponse, ProposalSettled, ProviderDescription, ReplayUnavailable, ReplyDismissals,
+    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
+    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
+    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
@@ -201,6 +201,10 @@ fn client_config(
         },
         version: "0.0.0",
         replay_enabled: full,
+        // `#270 voice-transcript-markers`. The plain sample is a websocket deployment with replay
+        // turned on that cannot carry it.
+        replay_unavailable: (!full).then_some(ReplayUnavailable::Backend),
+        transcript_records_supported: full,
         self_author_id: full.then(|| "9".into()),
         owner_author_id: full.then(|| "7".into()),
         // `#323 slack-system-bots`: both present in the full sample, both absent in the other.
