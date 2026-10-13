@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-278-ca92fa746b9",
+    "issue_id": "agent-utils-278",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Review findings on 0aa2d025 fixed in f14eddf6: held rows are looked up at the thread's turn, not copied at enqueue; they count only against an exact count of at most 50, matched exactly, with the newest held reply no older than updated_at; a longer thread is read. Also: allowlist checked at the turn and before filing; at most 64 pending per channel (global cap 1,024); per-channel wake-up. Each counted in tests/thread_naming_reads.rs. Accepted and documented (module doc, README): an edit with nothing pushed inside read-ahead's 30 s still names a thread from the old text. Not done here: threads of more than 50 replies always cost a read even when the reader has their newest page open; the 10-min pause is triggered only by naming's own reads; batching a channel's due threads into one call is W14. Unverified: not measured against the live bridge.",
+    "created_at": "2026-10-13T20:46:52.393302142Z",
+    "updated_at": "2026-10-13T20:46:52.393302142Z"
+  }
+]
