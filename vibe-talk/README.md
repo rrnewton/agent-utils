@@ -5517,9 +5517,19 @@ page after the assistant's reply to it has begun: "One moment." arrived before t
 answered, and the page used to hold that reply up as part of the read-back, so an exact read-back
 and a plain yes sent nothing. The rules above are now asked of what was said BEFORE the answer:
 
-* An assistant turn numbered the same as the answer, or later, is its reply — the protocol numbers
-  the owner's words and the answer to them alike — and is no part of the read-back. Without turn
-  numbers nothing tells a reply from more of the read-back (the order of arrival is what cannot be
+* An assistant turn numbered the same as the answer, or later, whose words are exactly the
+  acknowledgement the agent is told to give a yes — "One moment.", case and punctuation aside, or
+  its first word "One" while that turn is still streaming — is taken for the answer's reply and is
+  no part of the read-back. Anything else such a turn says ("Or should I cancel it instead?", "One
+  moment, or should I cancel it?") stays part of the read-back, so the yes is refused; and if such
+  a turn completes interrupted, the read-back counts as interrupted. A turn taken for the reply
+  that goes on to say more stops a yes that is still settling.
+* That rests on an **assumption the protocol does not state**: that `vibe-talk-v1` numbers the
+  owner's words and the assistant's answer to them alike. The safety of the rule does not depend on
+  it. Only the acknowledgement is ever left out, whichever side of the answer it was really said
+  on, so if the assumption is wrong the most it lets through is a yes whose exact, completed,
+  heard-out read-back was followed by "One moment." before the owner answered. Without turn numbers
+  nothing tells a reply from more of the read-back (the order of arrival is what cannot be
   trusted), so a provider that sends none is judged as before, over everything said since the
   owner last spoke.
 * "Not interrupted" and "completed before the answer" are asked of the read-back's own numbered
@@ -5530,12 +5540,22 @@ and a plain yes sent nothing. The rules above are now asked of what was said BEF
   reply's first frame if that came sooner, which is never more lenient.
 * An answer the bridge streams only as hypotheses, never marking one final, is judged when its turn
   completes, with the words the page shows and stores for it then.
+* A final transcript of an older turn that arrives after the owner's next turn has begun ("Yes",
+  then "wait, no", and only then "Yes." marked final) is not the answer: it sends nothing, is
+  answered as more than a yes, and the newer turn is judged when it ends.
 * "Everything it said once this draft was on the card" is counted in words within a turn as well
-  as by turns: "Sure, let me draft that." before the tool call and the read-back after it can be
-  one numbered turn, which began before the card did.
+  as by turns, for a turn that began with no draft on the card: "Sure, let me draft that." before
+  the tool call and the read-back after it can be one numbered turn, which began before the card
+  did. A draft that replaced another in the middle of a turn gets no such allowance: a turn that
+  read the first draft back, saw it replaced and read the replacement does not confirm the
+  replacement, as before.
 
-None of this loosens a rule: the read-back must still be exact, plain words, uninterrupted and heard
-out, the answer the very next one and a plain yes, and the post goes at most once.
+The read-back must still be exact, plain words, uninterrupted and heard out, the answer the very
+next one and a plain yes, and the post goes at most once. Besides the bridge's order and an answer
+that never got a final transcript, two things are accepted that were not before, both stated above:
+a read-back after words the agent said in the same turn before the first draft appeared, which is
+what "once this draft was on the card" always said; and, if the stated assumption is wrong, "One
+moment." between the read-back and the yes.
 
 A yes that passes waits 1.2 s, so a "wait" transcribed within that time sends nothing, then
 commits exactly the card's server copy through the same function and busy latch as a tap: a tap and
