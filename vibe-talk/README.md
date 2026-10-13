@@ -4998,9 +4998,10 @@ hold, for both wire protocols:
 * **The read-back was not interrupted.** No `interruption` (hosted protocol), no
   `turn_complete{interrupted: true}`, and on `vibe-talk-v1` the read-back's own `turn_complete`
   arrived before the answer.
-* **The read-back was exactly the template.** Everything the assistant said since the owner's last
-  turn — spoken, typed, a relayed chat message, or one of the page's own notices — or everything it
-  said once this draft was on the card, is word for word `To {channel}: {text}. Send it?`, ignoring
+* **The read-back was exactly the template.** Everything the assistant said since the last turn of
+  anyone's — the owner's, spoken or typed, or a text turn of the page's own: a relayed chat message
+  or a notice — or everything it said once this draft was on the card, is word for word
+  `To {channel}: {text}. Send it?`, ignoring
   case and punctuation. At most one lead-in (*okay*, *ok*, *alright*, *all right*, *sure* or *got
   it*) and an optional "the" before the channel's name and "channel" after it are allowed; nothing
   else is — no inserted word, nothing between the text and the question, nothing after the
@@ -5031,24 +5032,27 @@ single-use handle is the backstop. An answer that starts *no, nope, cancel, stop
 not* or *never mind*, given while sending is the subject, withdraws this call's draft. Anything else
 leaves the card for a tap.
 
-**Every yes is answered, and every outcome is said, three ways.** On a yes the agent says only "One
-moment." and waits for the page; it is never told to say "Sending.", which would be a claim before
-the fact. So whenever the owner says or types anything like a yes while this call's draft is on the
-card — a plain yes, "yep that's right, send it", a yes after a paraphrased "Shall I post that?" or
-after a digression — the page answers it: SENT, or NOT sent and why. A draft the call did not make
-is answered only when sending was the subject. The agent is told through the call's existing text
+**Every yes to sending is answered, and every outcome is said, three ways.** On a yes the agent
+says only "One moment." and waits for the page; it is never told to say "Sending.", which would be a
+claim before the fact. So whenever the owner says or types anything like a yes while a draft is on
+the card, and sending is the subject — the assistant's last question since the owner's last turn
+was about sending ("Send it?", "Shall I post that?", even with a relayed message read out after
+it), or the answer itself says send ("yep that's right, send it", "ok send it" after a digression)
+— the page answers it: SENT, or NOT sent and why. A yes to some other question ("want to hear the
+rest?") is not waited on, so it changes only the status line; answering every "okay" would have the
+agent repeat itself to each acknowledgement. The agent is told through the call's existing text
 channel — the `user_message` the composer and the live relay already send, which `vibe-talk-v1`
 carries as a queued `prompt` once the spoken turn has closed (`#241 voice-composer`) — in one fixed
 sentence starting `Voice page:`: SENT, partly sent, NOT sent with the reason, or not confirmed. The
 notice for a yes the page did not take ends "Otherwise carry on", so a yes that was in fact about
 something else does not derail the conversation. The prompt tells the agent never to say "sent"
 before that notice, so it never claims a send that did not happen, and its context stays truthful
-for a later "did it go?".
-The page also says it itself, because a model's sentence needs a cooperative model: the status line
-("Sent to lead team." / "Not sent — the read-back was interrupted."), a transcript seam, and a short
-tone queued after the speech already playing — a rising pair for sent, one low note for not sent;
-none when Sound is off or in a typed call. A tap on **Send** or **Don't send** during a call is told
-to the agent too (the screen already says it), so an agent waiting on "Send it?" hears the result.
+for a later "did it go?". The page also says it itself, because a model's sentence needs a
+cooperative model: the status line ("Sent to lead team." / "Not sent — the read-back was
+interrupted."), a transcript seam, and a short tone queued after the speech already playing — a
+rising pair for sent, one low note for not sent; none when Sound is off or in a typed call. A tap on
+**Send** or **Don't send** during a call is told to the agent too (the screen already says it), so
+an agent waiting on "Send it?" hears the result.
 
 **What a spoken yes cannot know**, stated plainly:
 
@@ -5064,6 +5068,10 @@ to the agent too (the screen already says it), so an agent waiting on "Send it?"
   question.
 * **Which message a reply answers.** The read-back names the channel, not the message a reply is
   attached to; the card shows that.
+* **A yes to no question.** The page answers a yes only when sending was the subject of the
+  assistant's last question or of the answer itself. An agent that ignored its prompt — asked
+  nothing, then took a bare "okay" as agreement and said "One moment." — hears nothing back from
+  the page; the status line still says it was not sent.
 * **What a no meant.** Any answer that starts like a no withdraws the draft while sending is the
   subject — "no problem, send it" included, and a "stop" said only to stop the agent talking. That
   is the safe direction; ask for the draft again.
