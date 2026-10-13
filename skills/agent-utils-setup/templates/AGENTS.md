@@ -10,9 +10,11 @@ wins. `CLAUDE.md` is a symlink to this file.
 Inside `{{PRIMARY}}/`, that repository's own `AGENTS.md` (or contributing guide) also applies, and
 it governs how changes to it are made and landed.
 
-You are registered with agentctl as the session `coordinator` (launched from this directory with
-the `coordinator` profile), so timers, scripts, and other agents reach you with
+Setup starts you as the agentctl session `coordinator` (launched from this directory with the
+`coordinator` profile), so timers, scripts, and other agents reach you with
 `agentctl send coordinator`. Messages that arrive that way are requests like any other.
+(`agentctl status coordinator` confirms it; a coordinator started with `agentctl chat launch` is
+not registered, and "Suite configuration" below says so when that was the owner's choice.)
 
 ## Layout
 

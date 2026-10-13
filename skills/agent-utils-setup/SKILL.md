@@ -370,9 +370,14 @@ Then, with the owner's yes, **start the coordinator as a registered agentctl ses
 Run it from `$H` so agentctl uses the harness registry. Registration is what makes the coordinator
 addressable: tick-hub deliveries, other agents, and the owner's scripts reach it with
 `agentctl send coordinator`, and `agentctl status coordinator` finds it. A coordinator the owner
-starts by hand in some terminal is not registered, so nothing can deliver to it. (With chat
-configured, start it instead with `agentctl chat launch --config chat.json --harness <harness>`
-from a Herdr shell tab in `$H`, in the project's workspace; the bridge owns that pane.)
+starts by hand in some terminal is not registered, so nothing can deliver to it.
+
+With chat configured, keep the coordinator registered: start it as above, then point the bridge at
+it with `agentctl chat run`, using the pane and workspace identity `agentctl status coordinator`
+reports (the agentctl chat guide's Setup section). `agentctl chat launch --config chat.json
+--harness <harness>`, run from a Herdr shell tab in `$H`, is shorter, but the coordinator it starts
+in that pane is not an agentctl session, so `agentctl send coordinator` (and so tick-hub delivery)
+cannot reach it; if the owner prefers it anyway, say so and record it in the harness `AGENTS.md`.
 
 If the owner instead asks you to "attach yourself to Herdr", follow the agentctl skill's section
 of that name: a session that can be viewed remotely registers itself with `agentctl attach-self`
