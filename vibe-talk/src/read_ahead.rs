@@ -16,18 +16,28 @@
 //!   them fetches the window and the others wait for it, rather than queueing a second identical
 //!   fetch behind the first at the chat adapter.
 //! - [`ReadAhead::start_warm_up`]: the provider warm-up starts at the top of a preparation and is
-//!   never awaited by it. At most one runs at a time.
+//!   never awaited by it. At most one runs at a time, for at most [`WARM_UP_BOUND`].
 //!
 //! [`messages_for_speech`] puts the first two together for the prepare route.
 //!
 //! # What is kept, and for how long
 //!
-//! Message text from allowlisted channels, in memory only, for thirty seconds. That is the same
-//! text the page was handed in the same thirty seconds. Nothing here reaches the store, and a
-//! restart forgets it. A read still checks the channel allowlist first (the prepare route does
-//! that before it calls [`messages_for_speech`]), so a channel taken off the list cannot be read
-//! from here either. An update or delete pushed by an adapter, and a delta that reports a
-//! deletion, drop the message at once.
+//! Message text from allowlisted channels, in memory only, for thirty seconds from the moment the
+//! fetch that read it began. That is the same text the page was handed in the same thirty seconds.
+//! Nothing here reaches the store, and a restart forgets it. A read still checks the channel
+//! allowlist first (the prepare route does that before it calls [`messages_for_speech`]), so a
+//! channel taken off the list cannot be read from here either.
+//!
+//! # Edits, deletions and the purge
+//!
+//! An update or delete pushed by an adapter, and a delta that reports a deletion, drop the message
+//! at once ([`ReadAhead::forget`]); the storage purge drops everything ([`ReadAhead::clear`]).
+//!
+//! A fetch already in flight when that happens must not put the old copy back: it read the
+//! message before the change, and stores it a second or two after. So `forget` leaves a tombstone
+//! for [`RECENT_TTL`], `clear` raises a floor, and [`ReadAhead::remember`] takes the instant its
+//! fetch BEGAN and keeps nothing a tombstone or the floor is newer than. A tombstone older than
+//! [`RECENT_TTL`] is not needed: a fetch that began before it is too old to keep anything anyway.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,27 +51,50 @@ use crate::ops::{self, OpError};
 use crate::speech::SpeechProvider;
 use crate::state::AppState;
 
-/// How long a fetched message stays readable from here.
+/// How long a fetched message stays readable from here, counted from when its fetch began.
 ///
 /// Long enough to cover "the page drew the channel, the reader turned Read on and tapped a line".
 /// The measured case was 3 to 8 seconds. Short enough that an edit nobody pushed is stale for
 /// half a minute at most. A ticket already minted keeps its text for longer than this anyway.
 pub const RECENT_TTL: Duration = Duration::from_secs(30);
 
-/// The most messages kept at once, across every channel.
+/// The most messages kept at once, across every channel, and the most tombstones.
 ///
-/// Ten full windows of a hundred. Beyond it the oldest are dropped first.
+/// Ten full windows of a hundred. Beyond it the oldest are dropped first. A tombstone dropped
+/// early raises the floor in its place (see [`ReadAhead::forget`]), so the bound never lets an
+/// in-flight fetch restore a forgotten message.
 pub const MAX_RECENT: usize = 1_000;
 
-/// How many thread messages one preparation fetches at once when they missed.
+/// How many thread messages ONE preparation fetches at once when they missed.
 ///
-/// Measured against the deployed chat adapter's own log (completion times only). A lookup the
-/// adapter answers from its own cache took about 42 ms when the previous prepare route asked for
-/// them one after another. Lookups that were in flight together completed 0 to 9 ms apart. So the
-/// per-lookup cost is mostly round trip, and a few in flight together removes most of it. A lookup
-/// the adapter must send upstream still waits for its single upstream slot, and four in flight
-/// only queue there. They add no upstream load.
+/// Measured against the deployed chat adapter's own log (completion times only, so the overlap is
+/// inferred rather than observed). A lookup the adapter answers from its own cache took about
+/// 42 ms when the previous prepare route asked for them one after another. Lookups that were in
+/// flight together completed 0 to 9 ms apart. So the per-lookup cost is mostly round trip, and a
+/// few in flight together removes most of it. A lookup the adapter must send upstream still waits
+/// for its single upstream slot, and four in flight only queue there. They add no upstream load.
 pub const THREAD_FETCH_CONCURRENCY: usize = 4;
+
+/// How many thread message lookups ALL preparations together have in flight at once.
+///
+/// The page sends one preparation per thread on screen, all at once, so a per-request bound
+/// alone multiplies by the number of threads. This caps the total. It is twice the per-request
+/// bound on purpose: one large batch can hold at most half of it, so a tapped row's own
+/// preparation, sent while that batch is still fetching, still finds a free slot.
+pub const THREAD_FETCHES_IN_FLIGHT: usize = 2 * THREAD_FETCH_CONCURRENCY;
+
+/// The longest a warm-up started by [`ReadAhead::start_warm_up`] is waited for.
+///
+/// The providers bound their own steps (a conversation session waits at most 25 s for its lock,
+/// 10 s to connect and 10 s to start), and this sits above all of them together, so it never cuts
+/// a warm-up short that would have finished. It exists so that one that hangs anyway cannot keep
+/// every later preparation from starting one: only one runs at a time.
+pub const WARM_UP_BOUND: Duration = Duration::from_secs(60);
+
+/// The content-free code logged when a warm-up outlasts [`WARM_UP_BOUND`].
+pub const WARM_UP_TIMED_OUT: &str = "warm_up_timed_out";
+
+type Key = (ChannelId, MessageId);
 
 #[derive(Debug)]
 struct Recent {
@@ -69,17 +102,59 @@ struct Recent {
     /// The thread the backend fetched this under or labelled it with. `None` is the channel's
     /// ordinary window.
     thread: Option<String>,
+    /// When the fetch that read it began.
     fetched: Instant,
 }
 
-/// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, and the
-/// provider warm-up. See the module documentation.
+/// Everything behind the one lock. See the module documentation.
 #[derive(Debug, Default)]
+struct Held {
+    recent: HashMap<Key, Recent>,
+    /// Messages forgotten in the last [`RECENT_TTL`], and when.
+    forgotten: HashMap<Key, Instant>,
+    /// A fetch that began at or before this keeps nothing.
+    floor: Option<Instant>,
+}
+
+impl Held {
+    fn prune(&mut self, now: Instant) {
+        self.recent
+            .retain(|_, entry| now.saturating_duration_since(entry.fetched) < RECENT_TTL);
+        self.forgotten
+            .retain(|_, at| now.saturating_duration_since(*at) < RECENT_TTL);
+    }
+}
+
+/// What the last window fetch made through [`ReadAhead::window_turn`] read.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowRead {
+    /// When it finished.
+    pub finished: Instant,
+    /// How many messages it asked for ([`ops::window_limit`]).
+    pub limit: u16,
+}
+
+/// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, a bound on
+/// thread lookups, and the provider warm-up. See the module documentation.
+#[derive(Debug)]
 pub struct ReadAhead {
-    recent: Mutex<HashMap<(ChannelId, MessageId), Recent>>,
-    /// Per channel: when the last window fetch made through [`ReadAhead::window_turn`] finished.
-    windows: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Option<Instant>>>>>,
+    held: Mutex<Held>,
+    /// Per channel: the last window fetch made through [`ReadAhead::window_turn`].
+    windows: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Option<WindowRead>>>>>,
+    /// [`THREAD_FETCHES_IN_FLIGHT`] permits, one per thread message lookup.
+    lookups: tokio::sync::Semaphore,
     warming: Arc<AtomicBool>,
+}
+
+impl Default for ReadAhead {
+    fn default() -> Self {
+        Self {
+            held: Mutex::default(),
+            windows: Mutex::default(),
+            lookups: tokio::sync::Semaphore::new(THREAD_FETCHES_IN_FLIGHT),
+            warming: Arc::default(),
+        }
+    }
 }
 
 impl ReadAhead {
@@ -89,13 +164,24 @@ impl ReadAhead {
         Self::default()
     }
 
-    /// Keep `messages`, just fetched from `channel`.
+    /// Keep `messages`, fetched from `channel` by a fetch that began at `fetch_began`.
     ///
     /// `thread` is the thread the fetch was scoped to. Without one, each message is filed under
     /// the thread the backend labelled it with, if any. A thread lookup must match that label
     /// before it is answered from here.
-    pub fn remember(&self, channel: &ChannelId, thread: Option<&str>, messages: &[Message]) {
-        self.remember_at(channel, thread, messages, Instant::now());
+    ///
+    /// `fetch_began` must be taken BEFORE the fetch is sent. A message forgotten after that
+    /// instant, or everything if the memory was cleared after it, is not kept: the fetch may have
+    /// read it before the change that forgot it. And the message expires [`RECENT_TTL`] after it,
+    /// not after this call, because that is the oldest the text can be.
+    pub fn remember(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        messages: &[Message],
+        fetch_began: Instant,
+    ) {
+        self.remember_at(channel, thread, messages, fetch_began, Instant::now());
     }
 
     fn remember_at(
@@ -103,37 +189,52 @@ impl ReadAhead {
         channel: &ChannelId,
         thread: Option<&str>,
         messages: &[Message],
+        fetch_began: Instant,
         now: Instant,
     ) {
         if messages.is_empty() {
             return;
         }
-        let Ok(mut held) = self.recent.lock() else {
+        let Ok(mut held) = self.held.lock() else {
             return;
         };
-        held.retain(|_, entry| now.saturating_duration_since(entry.fetched) < RECENT_TTL);
+        held.prune(now);
+        if now.saturating_duration_since(fetch_began) >= RECENT_TTL
+            || held.floor.is_some_and(|floor| fetch_began <= floor)
+        {
+            return;
+        }
         for message in messages {
+            let key = (channel.clone(), message.id.clone());
+            if held
+                .forgotten
+                .get(&key)
+                .is_some_and(|forgotten| *forgotten >= fetch_began)
+            {
+                continue;
+            }
             let filed_under = thread
                 .map(str::to_owned)
                 .or_else(|| message.thread.as_ref().map(|t| t.id.clone()));
-            held.insert(
-                (channel.clone(), message.id.clone()),
+            held.recent.insert(
+                key,
                 Recent {
                     message: message.clone(),
                     thread: filed_under,
-                    fetched: now,
+                    fetched: fetch_began,
                 },
             );
         }
-        if held.len() > MAX_RECENT {
+        if held.recent.len() > MAX_RECENT {
             let mut ages: Vec<_> = held
+                .recent
                 .iter()
                 .map(|(key, entry)| (entry.fetched, key.clone()))
                 .collect();
             ages.sort_by_key(|(fetched, _)| *fetched);
-            let excess = held.len() - MAX_RECENT;
+            let excess = held.recent.len() - MAX_RECENT;
             for (_, key) in ages.into_iter().take(excess) {
-                held.remove(&key);
+                held.recent.remove(&key);
             }
         }
     }
@@ -160,12 +261,12 @@ impl ReadAhead {
         ids: &[String],
         now: Instant,
     ) -> HashMap<String, Message> {
-        let Ok(held) = self.recent.lock() else {
+        let Ok(held) = self.held.lock() else {
             return HashMap::new();
         };
         let mut found = HashMap::new();
         for id in ids {
-            let Some(entry) = held.get(&(channel.clone(), MessageId(id.clone()))) else {
+            let Some(entry) = held.recent.get(&(channel.clone(), MessageId(id.clone()))) else {
                 continue;
             };
             if now.saturating_duration_since(entry.fetched) >= RECENT_TTL {
@@ -180,27 +281,60 @@ impl ReadAhead {
     }
 
     /// Drop one message: it was edited or deleted, and the copy here no longer says what it says.
+    ///
+    /// Leaves a tombstone, so a fetch that began before now cannot put the old copy back.
     pub fn forget(&self, channel: &ChannelId, id: &MessageId) {
-        if let Ok(mut held) = self.recent.lock() {
-            held.remove(&(channel.clone(), id.clone()));
+        self.forget_at(channel, id, Instant::now());
+    }
+
+    fn forget_at(&self, channel: &ChannelId, id: &MessageId, now: Instant) {
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        held.prune(now);
+        let key = (channel.clone(), id.clone());
+        held.recent.remove(&key);
+        held.forgotten.insert(key, now);
+        if held.forgotten.len() > MAX_RECENT {
+            // Over the bound, the oldest tombstones go, and the floor rises to the newest of them:
+            // every fetch they were guarding against began before it, so it now keeps nothing.
+            let mut ages: Vec<_> = held
+                .forgotten
+                .iter()
+                .map(|(key, at)| (*at, key.clone()))
+                .collect();
+            ages.sort_by_key(|(at, _)| *at);
+            let excess = held.forgotten.len() - MAX_RECENT;
+            for (at, key) in ages.into_iter().take(excess) {
+                held.forgotten.remove(&key);
+                held.floor = Some(held.floor.map_or(at, |floor| floor.max(at)));
+            }
         }
     }
 
     /// Drop everything. For the storage purge, which promises that nothing derived from a
     /// channel is left behind.
+    ///
+    /// Raises the floor to now, so a fetch already in flight keeps nothing when it lands.
     pub fn clear(&self) {
-        if let Ok(mut held) = self.recent.lock() {
-            held.clear();
+        self.clear_at(Instant::now());
+    }
+
+    fn clear_at(&self, now: Instant) {
+        if let Ok(mut held) = self.held.lock() {
+            held.recent.clear();
+            held.forgotten.clear();
+            held.floor = Some(now);
         }
     }
 
-    /// How many messages are held, expired ones included until the next [`ReadAhead::remember`].
+    /// How many messages are held, expired ones included until the next change.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.recent.lock().map_or(0, |held| held.len())
+        self.held.lock().map_or(0, |held| held.recent.len())
     }
 
-    /// Whether nothing is held.
+    /// Whether no message is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -208,13 +342,14 @@ impl ReadAhead {
 
     /// Wait for this channel's window fetch slot.
     ///
-    /// The guard holds when the last window fetch through this slot finished. A caller that finds
-    /// a time later than its own start waited behind a fetch that has just read the window, and
-    /// should use that rather than read it again.
+    /// The guard holds what the last window fetch through this slot read, and when it finished. A
+    /// caller that finds one that finished after its own start, and was at least as wide as its
+    /// own would be, waited behind a fetch that has just read the window, and should use that
+    /// rather than read it again.
     pub async fn window_turn(
         &self,
         channel: &ChannelId,
-    ) -> tokio::sync::OwnedMutexGuard<Option<Instant>> {
+    ) -> tokio::sync::OwnedMutexGuard<Option<WindowRead>> {
         let slot = {
             let mut windows = self
                 .windows
@@ -230,7 +365,12 @@ impl ReadAhead {
     /// Answers whether this call started one. The caller does not wait for it. A tap that comes
     /// while the warm-up is still opening a session joins that opening (see
     /// `ConversationSpeech::session_for_read`), so there is nothing to gain by holding the prepare
-    /// response for it. A failure is logged, and the read itself reports it if it persists.
+    /// response for it.
+    ///
+    /// Given up after [`WARM_UP_BOUND`], so one that hangs holds off later warm-ups for that long
+    /// at most. Success is logged at INFO; a failure or a timeout at WARN, with the provider's
+    /// content-free error code (or [`WARM_UP_TIMED_OUT`]) and never its detail. The read itself
+    /// reports a failure if it persists.
     pub fn start_warm_up(&self, speech: Arc<dyn SpeechProvider>) -> bool {
         if self.warming.swap(true, Ordering::AcqRel) {
             return false;
@@ -240,12 +380,25 @@ impl ReadAhead {
             // Held across the await, so the flag clears even if the provider panics.
             let _running = running;
             let began = Instant::now();
-            let outcome = speech.warm_up().await;
-            tracing::info!(
-                warm_up_ms = millis(began.elapsed()),
-                ok = outcome.is_ok(),
-                "read-aloud warm-up finished"
-            );
+            let outcome = tokio::time::timeout(WARM_UP_BOUND, speech.warm_up()).await;
+            let warm_up_ms = millis(began.elapsed());
+            match outcome {
+                Ok(Ok(())) => {
+                    tracing::info!(warm_up_ms, ok = true, "read-aloud warm-up finished");
+                }
+                Ok(Err(error)) => tracing::warn!(
+                    warm_up_ms,
+                    ok = false,
+                    code = error.code(),
+                    "read-aloud warm-up finished"
+                ),
+                Err(_) => tracing::warn!(
+                    warm_up_ms,
+                    ok = false,
+                    code = WARM_UP_TIMED_OUT,
+                    "read-aloud warm-up finished"
+                ),
+            }
         });
         true
     }
@@ -291,10 +444,10 @@ pub struct Found {
 /// missing.
 ///
 /// Without a thread, the missing ids cost one window fetch, shared with any other preparation of
-/// the same channel already making one. An id that is not in the window is simply absent, as it
-/// always was. In a thread, each missing id is fetched on its own, up to
-/// [`THREAD_FETCH_CONCURRENCY`] at once, and the first failure fails the batch, as it did when
-/// they were fetched in series.
+/// the same channel that has just made one at least as wide. An id that is not in the window is
+/// simply absent, as it always was. In a thread, each missing id is fetched on its own, up to
+/// [`THREAD_FETCH_CONCURRENCY`] at once for this preparation and [`THREAD_FETCHES_IN_FLIGHT`] for
+/// all of them, and the first failure fails the batch, as it did when they were fetched in series.
 ///
 /// `began` is when the preparation started. A window fetch that finished after it is fresh
 /// enough to answer this one.
@@ -331,8 +484,12 @@ pub async fn messages_for_speech(
     let fetching = Instant::now();
     match thread {
         None => {
+            let width = ops::window_limit(state, limit);
             let mut turn = state.read_ahead.window_turn(&channel.id).await;
-            if turn.is_some_and(|finished| finished >= began) {
+            if turn
+                .as_ref()
+                .is_some_and(|read| read.finished >= began && read.limit >= width)
+            {
                 found.joined = true;
                 found
                     .messages
@@ -340,7 +497,10 @@ pub async fn messages_for_speech(
             } else {
                 // `ops::messages` remembers the window for everyone else as well.
                 let window = ops::messages(state, channel.id.as_str(), limit).await?;
-                *turn = Some(Instant::now());
+                *turn = Some(WindowRead {
+                    finished: Instant::now(),
+                    limit: window.limit,
+                });
                 found.fetches = 1;
                 let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
                 for message in window.messages {
@@ -351,8 +511,11 @@ pub async fn messages_for_speech(
             }
         }
         Some(thread) => {
+            let lookups = &state.read_ahead.lookups;
             let fetched: Vec<Message> = futures_util::stream::iter(missing)
                 .map(|id| async move {
+                    // Never closed, so this always holds a permit.
+                    let _slot = lookups.acquire().await;
                     ops::message_by_id_scoped(state, channel.id.as_str(), &id, limit, Some(thread))
                         .await
                         .map(|(_, message)| message)
@@ -363,7 +526,7 @@ pub async fn messages_for_speech(
             found.fetches = fetched.len();
             state
                 .read_ahead
-                .remember(&channel.id, Some(thread), &fetched);
+                .remember(&channel.id, Some(thread), &fetched, fetching);
             for message in fetched {
                 found.messages.insert(message.id.0.clone(), message);
             }
@@ -414,7 +577,7 @@ mod tests {
         let read_ahead = ReadAhead::new();
         let channel = ChannelId("1".to_owned());
         let then = Instant::now();
-        read_ahead.remember_at(&channel, None, &[message("10", None)], then);
+        read_ahead.remember_at(&channel, None, &[message("10", None)], then, then);
         let found = read_ahead.recall_at(&channel, None, &ids(&["10", "11"]), then);
         assert_eq!(found.len(), 1);
         assert_eq!(found["10"].content, "text of 10");
@@ -432,9 +595,35 @@ mod tests {
     }
 
     #[test]
+    fn a_message_expires_counting_from_when_its_fetch_began() {
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let began = Instant::now();
+        let landed = began + Duration::from_secs(2);
+        read_ahead.remember_at(&channel, None, &[message("10", None)], began, landed);
+        assert!(read_ahead
+            .recall_at(&channel, None, &ids(&["10"]), began + RECENT_TTL)
+            .is_empty());
+        // A fetch that took the whole of the memory's life keeps nothing at all.
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[message("11", None)],
+            began,
+            began + RECENT_TTL,
+        );
+        assert!(read_ahead.is_empty());
+    }
+
+    #[test]
     fn another_channel_never_answers() {
         let read_ahead = ReadAhead::new();
-        read_ahead.remember(&ChannelId("1".to_owned()), None, &[message("10", None)]);
+        read_ahead.remember(
+            &ChannelId("1".to_owned()),
+            None,
+            &[message("10", None)],
+            Instant::now(),
+        );
         assert!(read_ahead
             .recall(&ChannelId("2".to_owned()), None, &ids(&["10"]))
             .is_empty());
@@ -444,12 +633,13 @@ mod tests {
     fn a_thread_lookup_needs_the_thread_the_message_was_fetched_in() {
         let read_ahead = ReadAhead::new();
         let channel = ChannelId("1".to_owned());
+        let now = Instant::now();
         // Labelled by the backend in an unscoped (flat) read.
-        read_ahead.remember(&channel, None, &[message("10", Some("T"))]);
+        read_ahead.remember(&channel, None, &[message("10", Some("T"))], now);
         // Fetched in a thread-scoped read with no label of its own.
-        read_ahead.remember(&channel, Some("U"), &[message("20", None)]);
+        read_ahead.remember(&channel, Some("U"), &[message("20", None)], now);
         // Neither thread, nor labelled.
-        read_ahead.remember(&channel, None, &[message("30", None)]);
+        read_ahead.remember(&channel, None, &[message("30", None)], now);
         let wanted = ids(&["10", "20", "30"]);
         let in_t = read_ahead.recall(&channel, Some("T"), &wanted);
         assert_eq!(in_t.keys().collect::<Vec<_>>(), vec!["10"]);
@@ -465,12 +655,96 @@ mod tests {
     fn forgetting_an_edited_message_drops_only_that_one() {
         let read_ahead = ReadAhead::new();
         let channel = ChannelId("1".to_owned());
-        read_ahead.remember(&channel, None, &[message("10", None), message("11", None)]);
+        read_ahead.remember(
+            &channel,
+            None,
+            &[message("10", None), message("11", None)],
+            Instant::now(),
+        );
         read_ahead.forget(&channel, &MessageId("10".to_owned()));
         let found = read_ahead.recall(&channel, None, &ids(&["10", "11"]));
         assert_eq!(found.keys().collect::<Vec<_>>(), vec!["11"]);
         read_ahead.clear();
         assert!(read_ahead.is_empty());
+    }
+
+    #[test]
+    fn a_fetch_that_began_before_a_forget_cannot_put_the_old_copy_back() {
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let began = Instant::now();
+        let edited = began + Duration::from_millis(500);
+        let landed = began + Duration::from_secs(2);
+        // The edit arrives while the fetch is still out, and the fetch then lands its old copy.
+        read_ahead.forget_at(&channel, &MessageId("10".to_owned()), edited);
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[message("10", None), message("11", None)],
+            began,
+            landed,
+        );
+        let found = read_ahead.recall_at(&channel, None, &ids(&["10", "11"]), landed);
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            vec!["11"],
+            "the stale copy came back"
+        );
+        // A fetch that began after the edit read the new text, and is kept.
+        let again = edited + Duration::from_millis(1);
+        read_ahead.remember_at(&channel, None, &[message("10", None)], again, landed);
+        assert_eq!(
+            read_ahead
+                .recall_at(&channel, None, &ids(&["10"]), landed)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_began_before_a_clear_keeps_nothing() {
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let began = Instant::now();
+        let purged = began + Duration::from_millis(500);
+        read_ahead.clear_at(purged);
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[message("10", None)],
+            began,
+            purged + Duration::from_secs(1),
+        );
+        assert!(
+            read_ahead.is_empty(),
+            "the purge was undone by a late fetch"
+        );
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[message("10", None)],
+            purged + Duration::from_millis(1),
+            purged + Duration::from_secs(1),
+        );
+        assert_eq!(read_ahead.len(), 1);
+    }
+
+    #[test]
+    fn tombstones_beyond_the_bound_raise_the_floor_instead_of_vanishing() {
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let began = Instant::now();
+        // The first tombstone is the one dropped to keep within the bound.
+        for n in 0..=MAX_RECENT {
+            let at = began + Duration::from_millis(1 + u64::try_from(n).expect("small"));
+            read_ahead.forget_at(&channel, &MessageId(format!("f{n}")), at);
+        }
+        let landed = began + Duration::from_secs(5);
+        read_ahead.remember_at(&channel, None, &[message("f0", None)], began, landed);
+        assert!(
+            read_ahead.is_empty(),
+            "a dropped tombstone let the old copy back"
+        );
     }
 
     #[test]
@@ -481,12 +755,13 @@ mod tests {
         let first: Vec<Message> = (0..MAX_RECENT)
             .map(|n| message(&format!("a{n}"), None))
             .collect();
-        read_ahead.remember_at(&channel, None, &first, start);
+        read_ahead.remember_at(&channel, None, &first, start, start);
         let newer = start + Duration::from_millis(5);
         read_ahead.remember_at(
             &channel,
             None,
             &[message("b0", None), message("b1", None)],
+            newer,
             newer,
         );
         assert_eq!(read_ahead.len(), MAX_RECENT);
@@ -499,8 +774,9 @@ mod tests {
         let read_ahead = ReadAhead::new();
         let channel = ChannelId("1".to_owned());
         let start = Instant::now();
-        read_ahead.remember_at(&channel, None, &[message("10", None)], start);
-        read_ahead.remember_at(&channel, None, &[message("11", None)], start + RECENT_TTL);
+        read_ahead.remember_at(&channel, None, &[message("10", None)], start, start);
+        let later = start + RECENT_TTL;
+        read_ahead.remember_at(&channel, None, &[message("11", None)], later, later);
         assert_eq!(read_ahead.len(), 1);
     }
 }

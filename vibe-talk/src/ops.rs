@@ -364,13 +364,9 @@ pub async fn messages(
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
     let channel = allowed(state, channel_id).await?;
-    // Clamped to Discord's own ceiling, not merely to the configured one. Nothing in
-    // `Config::from_toml_and_env` stops an operator writing `max_fetch_limit = 200`, but both the
-    // real client and the fake clamp the request to 100 — so comparing against the unclamped
-    // number would report a FULL 100-message window as the whole channel.
-    let limit = state
-        .effective_limit(limit)
-        .min(crate::discord::http::DISCORD_MAX_LIMIT);
+    let limit = window_limit(state, limit);
+    // Before the fetch, not after: see `ReadAhead::remember`.
+    let fetch_began = std::time::Instant::now();
     let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. Decided HERE, on every read, from the text as it now stands — never
@@ -381,12 +377,30 @@ pub async fn messages(
         .mark(&mut messages);
     // `#191 read-aloud-first-lag`: a speech preparation in the next few seconds reads these
     // rather than fetching the same window again.
-    state.read_ahead.remember(&channel.id, None, &messages);
+    state
+        .read_ahead
+        .remember(&channel.id, None, &messages, fetch_began);
     Ok(Window {
         channel,
         messages,
         limit,
     })
+}
+
+/// How many messages [`messages`] asks the chat backend for, given what the caller asked for.
+///
+/// Clamped to Discord's own ceiling, not merely to the configured one. Nothing in
+/// `Config::from_toml_and_env` stops an operator writing `max_fetch_limit = 200`, but both the
+/// real client and the fake clamp the request to 100 — so comparing against the unclamped
+/// number would report a FULL 100-message window as the whole channel.
+///
+/// Public so speech preparation can tell whether another preparation's window was at least as
+/// wide as the one it would have fetched itself (`crate::read_ahead::messages_for_speech`).
+#[must_use]
+pub fn window_limit(state: &AppState, limit: Option<u16>) -> u16 {
+    state
+        .effective_limit(limit)
+        .min(crate::discord::http::DISCORD_MAX_LIMIT)
 }
 
 /// One message in full, by id, within the recent window. Read scope.
@@ -466,6 +480,8 @@ pub async fn timeline(
         .transpose()
         .map_err(|_| OpError::CursorMismatch)?;
     let mut backend = request.clone();
+    // Before the fetch, not after: see `ReadAhead::remember`.
+    let fetch_began = std::time::Instant::now();
     let (mut page, position) = match resumed {
         Some(Forward::Native(own)) => {
             backend.after = Some(own);
@@ -503,16 +519,19 @@ pub async fn timeline(
         if let Some(root) = &mut summary.root {
             stamp(state, std::slice::from_mut(root));
             noise.mark(std::slice::from_mut(root));
-            state
-                .read_ahead
-                .remember(&channel.id, Some(&summary.id), std::slice::from_ref(root));
+            state.read_ahead.remember(
+                &channel.id,
+                Some(&summary.id),
+                std::slice::from_ref(root),
+                fetch_began,
+            );
         }
     }
     // `#191 read-aloud-first-lag`: what the page is about to draw is what it will ask to hear.
     // A delta carries only what changed, which is exactly what has to replace an older copy.
     state
         .read_ahead
-        .remember(&channel.id, thread, &page.messages);
+        .remember(&channel.id, thread, &page.messages, fetch_began);
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
     }
@@ -952,6 +971,8 @@ pub async fn page(
     // second round trip or the guess that a full window means more exists.
     let probe = limit + 1;
 
+    // Before the fetch, not after: see `ReadAhead::remember`.
+    let fetch_began = std::time::Instant::now();
     let (mut messages, forward) = match since {
         Some(from) => {
             // Discord's `after` is EXCLUSIVE, and the `since` edge is inclusive, so the cursor
@@ -997,7 +1018,9 @@ pub async fn page(
         .await
         .mark(&mut messages);
     // `#191 read-aloud-first-lag`: the page draws the channel from this, and then asks to hear it.
-    state.read_ahead.remember(&channel.id, None, &messages);
+    state
+        .read_ahead
+        .remember(&channel.id, None, &messages, fetch_began);
 
     let (next_before, next_since) = if !has_more {
         (None, None)
