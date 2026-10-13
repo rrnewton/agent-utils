@@ -29,12 +29,23 @@
 //
 // No dependencies, no build step, no framework — same rule the page itself follows.
 
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+
+/**
+ * How many messages `message()` has built in the test now running, which is its clock: see
+ * MESSAGE_DAY. Every test starts it again at nought. Here, above the first test, because node:test
+ * may run a test the moment it is defined, and the hook that starts the count again has to be in
+ * place, and able to reach the count, before that.
+ */
+let messagesBuilt = 0;
+beforeEach(() => {
+  messagesBuilt = 0;
+});
 
 const WEB = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
 const SCRIPT = readFileSync(join(WEB, "voice.js"), "utf8");
@@ -8010,11 +8021,30 @@ test("with no header on screen, the body applies the top safe-area inset itself"
  */
 const MESSAGE_SPACING_MS = 60000;
 const MESSAGE_EPOCH = Date.parse("2026-08-19T04:31:00.000Z");
-let messagesBuilt = 0;
+
+/**
+ * The day `message()` stamps a test's messages on, unless the test gives a time: Aug 19, 2026, the
+ * date the page's clock reads, on the device's own calendar, from its first minute.
+ *
+ * `#250 date-separators` rules off each day and says the days a gap or a collapsed run covers, so
+ * two messages either side of a local midnight change what a test's rows say. This clock used to
+ * run through the whole suite, a minute for every message built so far, which put a test's
+ * messages wherever the tests above it had left the count: a test added early in the file, or the
+ * same suite run in another time zone, moved a later test's messages across a midnight and changed
+ * its words. Now every test starts again at this day's first minute (`messagesBuilt`, at the top
+ * of this file), and a test that would run its messages past the day's last minute is stopped and
+ * told, rather than handed a second day it did not ask for. A day holds 1,440 at a minute apart;
+ * the most any test builds is about 1,250.
+ */
+const MESSAGE_DAY = new Date(2026, 7, 19);
 
 function message(overrides) {
-  const at = new Date(MESSAGE_EPOCH + messagesBuilt * MESSAGE_SPACING_MS);
+  const at = new Date(MESSAGE_DAY.getTime() + messagesBuilt * MESSAGE_SPACING_MS);
   messagesBuilt += 1;
+  if ((!overrides || overrides.timestamp === undefined) && at.getDate() !== MESSAGE_DAY.getDate()) {
+    throw new Error(`message() ran past ${MESSAGE_DAY.toDateString()}, its one day, after ` +
+      `${messagesBuilt - 1} messages in this test: give the later ones a timestamp of their own`);
+  }
   return {
     id: "1122334455667788990",
     channel_id: CHANNEL.id,
@@ -38506,9 +38536,9 @@ test("Collapse read: a switch from All to Main keeps the reader's message by the
     // Every other message from 303 to 315 is a reply in the one thread, which Main does not show, and
     // unread. 304, 306 and 308, posted to the channel itself, are read: one at a time between unread
     // replies in All, and one run of three in Main, where the replies are not drawn.
-    // All 24 within one day, at times of their own: by `message`'s running clock they could straddle a
-    // midnight, depending on how many messages earlier tests built, and a run that begins a new day says
-    // that day on its line (`#250 date-separators`), which is not what this test is about.
+    // All 24 within one day, at times of their own, as written while `message`'s clock still ran through
+    // the whole suite and could put them across a midnight: a run that begins a new day says that day on
+    // its line (`#250 date-separators`), which is not what this test is about.
     const messages = Array.from({ length: 24 }, (_, i) => {
       const id = String(300 + i);
       const record = id === "302" ? thread : i > 2 && i < 17 && i % 2 === 1 ? { ...thread, is_root: false } : null;
