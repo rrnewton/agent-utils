@@ -167,9 +167,14 @@ pub struct Config {
     pub conversation: ConversationConfig,
     /// Durable state: where it lives, and how much of it is kept.
     pub storage: StorageConfig,
-    /// Summarisation policy. Every field is part of the cache key; see
-    /// [`crate::summarize::policy_version`].
+    /// Summarisation policy. Every field that changes what a summary says is part of the cache
+    /// key; see [`crate::summarize::policy_version`].
     pub summaries: SummariesConfig,
+    /// Whether the configuration has a `[message_cache]` table, which this build accepts and
+    /// IGNORES. `#208 persistent-cache`: a later build reads it, and a host overlay turns it on.
+    /// Accepting it here means a rollback to this build still starts with such an overlay in
+    /// place; startup says that it was ignored.
+    pub message_cache_ignored: bool,
 }
 
 /// How message read-aloud is synthesized; separate from conversational voice mode.
@@ -235,10 +240,11 @@ fn yes() -> bool {
 
 /// What a summary is, in numbers.
 ///
-/// **Every field here changes what a summary says**, so every field is folded into
-/// [`crate::summarize::policy_version`] and therefore into the cache key. A field added later
-/// without a line in that function is a field the cache cannot see, and the unit test over it is
-/// what catches that.
+/// Every field that changes what a summary SAYS is folded into
+/// [`crate::summarize::policy_version`] and therefore into the cache key; `threshold_chars` and
+/// `reply_timeout_seconds` change no word of one and are not (`#208 persistent-cache`). A field
+/// added later must be decided one way or the other there, and the unit test that enumerates every
+/// field fails until it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummariesConfig {
     /// Below this many characters a message is not summarised at all — it is already short
@@ -255,7 +261,7 @@ pub struct SummariesConfig {
     /// that agent runs is a property of the agent, set in the vendor's dashboard, not something
     /// this server can choose per request. Setting this therefore changes nothing about a summary
     /// except that every previously cached one becomes unreachable. It is folded into
-    /// [`crate::summarize::policy_version`] anyway, under the rule that every field here is, and
+    /// [`crate::summarize::policy_version`] anyway, as a model name would change the wording, and
     /// it should probably be deleted rather than documented as a selector.
     pub model: Option<String>,
     /// How many summaries share one conversation with the agent before it is recycled.
@@ -842,6 +848,9 @@ struct FileConfig {
     summaries: FileSummaries,
     #[serde(default)]
     replay: FileReplay,
+    /// `#208 persistent-cache`. Accepted and IGNORED by this build, whatever it holds: a later
+    /// build reads it, and accepting it here lets a host overlay carry it across a rollback.
+    message_cache: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -997,6 +1006,7 @@ struct FileStorage {
     max_summaries: Option<u32>,
     max_dismissals: Option<u32>,
     retain_days: Option<u16>,
+    summary_retain_days: Option<u16>,
 }
 
 /// Default bind address: every interface inside a container, port 8080.
@@ -1170,6 +1180,7 @@ impl Config {
         };
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
+        let message_cache_ignored = file.message_cache.is_some();
         let summaries = summaries_config(
             get(ENV_SUMMARY_MODEL),
             get(ENV_SUMMARY_BACKEND),
@@ -1238,6 +1249,7 @@ impl Config {
             storage,
             summaries,
             replay,
+            message_cache_ignored,
         })
     }
 }
@@ -1887,6 +1899,9 @@ fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageCo
         }
     }
 
+    let retain_days = file
+        .retain_days
+        .unwrap_or(crate::store::DEFAULT_RETAIN_DAYS);
     let retention = Retention {
         max_conversations: file
             .max_conversations
@@ -1900,9 +1915,11 @@ fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageCo
         max_dismissals: file
             .max_dismissals
             .unwrap_or(crate::store::DEFAULT_MAX_DISMISSALS),
-        retain_days: file
-            .retain_days
-            .unwrap_or(crate::store::DEFAULT_RETAIN_DAYS),
+        retain_days,
+        // `#208 persistent-cache`. Until it was its own setting, a cached summary lived for
+        // `retain_days` from when it was made; unset, it still lives that long, now counted from
+        // its last use, so a host that lowered `retain_days` for privacy keeps summaries no longer.
+        summary_retain_days: file.summary_retain_days.unwrap_or(retain_days),
     };
     if retention.max_conversations == 0 {
         return Err(ConfigError::Invalid {

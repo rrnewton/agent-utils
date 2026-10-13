@@ -1810,6 +1810,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
                 version: "current".to_owned(),
             },
             "somebody else's message, shortened",
+            None,
         )
         .await
         .expect("cache");

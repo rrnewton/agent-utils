@@ -4676,6 +4676,11 @@ async fn rollback_registration(
 /// hide is refused by name rather than held in memory until the next restart, which would be the
 /// same silent undo the old refusal existed to prevent.
 ///
+/// Either way its cached summaries and thread sentences are deleted too, and its thread names
+/// kept (`#208 persistent-cache`): a summary is a second at-rest copy of the channel's text, and
+/// the channel is no longer on the list it was read under. A failure there is logged, not
+/// returned: the channel is already off the list, and the age limit still collects them.
+///
 /// WRITE scope, and NO MCP TOOL, for the reason [`set_alias`] has none: the list is the owner's.
 pub async fn remove_channel(
     State(state): State<AppState>,
@@ -4694,7 +4699,8 @@ pub async fn remove_channel(
             hidden.insert(configured.id.clone());
         }
         state.refresh_routes();
-        tracing::info!(channel = %channel_id, "configured channel hidden in the app");
+        let summaries_deleted = forget_channel_summaries(&state, &configured.id).await;
+        tracing::info!(channel = %channel_id, summaries_deleted, "configured channel hidden in the app");
         return Ok(channel_list_answer(&state, configured).await);
     }
     let added_channel = state.added_channels.read().ok().and_then(|added| {
@@ -4734,7 +4740,8 @@ pub async fn remove_channel(
         added.retain(|channel| channel.channel != added_channel.channel);
     }
     state.refresh_routes();
-    tracing::info!(channel = %channel_id, "channel removed in the app");
+    let summaries_deleted = forget_channel_summaries(&state, &added_channel.channel).await;
+    tracing::info!(channel = %channel_id, summaries_deleted, "channel removed in the app");
     Ok(channel_list_answer(
         &state,
         ChannelInfo {
@@ -4747,6 +4754,19 @@ pub async fn remove_channel(
         },
     )
     .await)
+}
+
+/// Delete a channel's cached summaries and thread sentences, keeping its thread names, and answer
+/// how many went: the count is all that is logged. `#208 persistent-cache`.
+async fn forget_channel_summaries(state: &AppState, channel: &crate::model::ChannelId) -> u64 {
+    match state.store.forget_channel_summaries(channel).await {
+        Ok(deleted) => deleted,
+        Err(crate::store::StoreError::Unavailable(_)) => 0,
+        Err(error) => {
+            tracing::warn!(%error, "a channel taken off the list kept its cached summaries");
+            0
+        }
+    }
 }
 
 /// `DELETE /api/v1/channels/{channel_id}/hidden` — show a hidden configured channel again.

@@ -14,9 +14,10 @@
 use async_trait::async_trait;
 
 use super::{
-    Bookmark, BookmarkAnchor, BookmarkChange, ChannelAlias, ConversationId, ConversationSummary,
-    PinChange, PinSnapshot, Pins, ReadMark, StateStore, StoreError, SummaryKey, TranscriptCursor,
-    TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
+    Bookmark, BookmarkAnchor, BookmarkChange, CachedSummary, ChannelAlias, ConversationId,
+    ConversationSummary, PinChange, PinSnapshot, Pins, ReadMark, StateStore, StoreError,
+    SummaryKey, TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
+    UpstreamClearSetting,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -205,11 +206,28 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
-    async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<String>, StoreError> {
+    async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<CachedSummary>, StoreError> {
         refuse()
     }
 
-    async fn cache_summary(&self, _: &SummaryKey, _: &str) -> Result<(), StoreError> {
+    async fn cache_summary(
+        &self,
+        _: &SummaryKey,
+        _: &str,
+        _: Option<u32>,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn touch_summary(&self, _: &SummaryKey) -> Result<bool, StoreError> {
+        refuse()
+    }
+
+    async fn rekey_summaries(&self, _: &str, _: &str, _: u32) -> Result<u64, StoreError> {
+        refuse()
+    }
+
+    async fn forget_channel_summaries(&self, _: &ChannelId) -> Result<u64, StoreError> {
         refuse()
     }
 

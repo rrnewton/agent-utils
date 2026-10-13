@@ -185,11 +185,13 @@ fn message(content: &str) -> Message {
     }
 }
 
+/// What a reader is shown of the answer: the stored text, cut for serving at the cap in force.
 async fn summarise(under: &MessagesApiSummarizer, text: &str) -> Result<String, SummaryError> {
     let target = message(text);
     under
         .summarize(&SummaryRequest::new(&target, &[], 160))
         .await
+        .map(|summary| crate::summarize::cut_for_serving(&summary.text, 160))
 }
 
 #[tokio::test]

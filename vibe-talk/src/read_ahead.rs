@@ -14,7 +14,9 @@
 //!   preparation looks there first. Bounded by [`MAX_RECENT`].
 //! - [`ReadAhead::window_turn`]: when several preparations for one channel miss together, one of
 //!   them fetches the window and the others wait for it, rather than queueing a second identical
-//!   fetch behind the first at the chat adapter.
+//!   fetch behind the first at the chat adapter. The summary route shares the same turn
+//!   (`#208 persistent-cache`), so a page asking for twenty summaries at once costs one fetch, and
+//!   a summary asked for right after the page's own read is answered from here with none.
 //! - [`ReadAhead::start_warm_up`]: the provider warm-up starts at the top of a preparation and is
 //!   never awaited by it. At most one runs at a time, for at most [`WARM_UP_BOUND`].
 //!
@@ -128,12 +130,28 @@ impl Held {
 }
 
 /// What the last window fetch made through [`ReadAhead::window_turn`] read.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WindowRead {
     /// When it finished.
     pub finished: Instant,
     /// How many messages it asked for ([`ops::window_limit`]).
     pub limit: u16,
+    /// The ids it answered with, oldest first. Ids only, never text: the text is in the memory
+    /// above, under its own expiry and tombstones, and [`ReadAhead::recall_window`] puts the two
+    /// back together for a caller that needs the window in order (a summary's context).
+    pub ids: Arc<[MessageId]>,
+}
+
+impl WindowRead {
+    /// What `window` read, finishing now.
+    #[must_use]
+    pub fn of(window: &ops::Window) -> Self {
+        Self {
+            finished: Instant::now(),
+            limit: window.limit,
+            ids: window.messages.iter().map(|m| m.id.clone()).collect(),
+        }
+    }
 }
 
 /// Messages fetched in the last [`RECENT_TTL`], one window fetch per channel at a time, a bound on
@@ -280,6 +298,19 @@ impl ReadAhead {
             found.insert(id.clone(), entry.message.clone());
         }
         found
+    }
+
+    /// The window `read` fetched, oldest first, rebuilt from memory: `None` unless EVERY message it
+    /// answered with is still held for `channel`. `#208 persistent-cache`.
+    ///
+    /// All or nothing, because the caller wants the window in order — a summary takes the messages
+    /// just before its target as context — and a window with a hole where an edited or deleted
+    /// message was forgotten is not the window. Such a caller reads the window itself instead.
+    #[must_use]
+    pub fn recall_window(&self, channel: &ChannelId, read: &WindowRead) -> Option<Vec<Message>> {
+        let ids: Vec<String> = read.ids.iter().map(|id| id.0.clone()).collect();
+        let mut found = self.recall(channel, None, &ids);
+        ids.iter().map(|id| found.remove(id)).collect()
     }
 
     /// Drop one message: it was edited or deleted, and the copy here no longer says what it says.
@@ -500,10 +531,7 @@ pub async fn messages_for_speech(
             } else {
                 // `ops::messages` remembers the window for everyone else as well.
                 let window = ops::messages(state, channel.id.as_str(), limit).await?;
-                *turn = Some(WindowRead {
-                    finished: Instant::now(),
-                    limit: window.limit,
-                });
+                *turn = Some(WindowRead::of(&window));
                 found.fetches = 1;
                 let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
                 for message in window.messages {

@@ -52,6 +52,9 @@ pub struct AppState {
     /// [`crate::summarize::policy_version`], because recomputing it per request is how the two
     /// halves of a cache key drift apart.
     pub summary_version: Arc<str>,
+    /// How the summary route spent its requests, numbers only, for diagnostics.
+    /// `#208 persistent-cache`; see [`crate::summarize::counters`].
+    pub summary_counters: Arc<crate::summarize::counters::SummaryCounters>,
     /// Thread display names and sentences, and the background queue that produces them.
     /// `#182 thread-display-names`, `#233 llm-summarizer`. See [`crate::summarize::threads`].
     pub thread_names: Arc<crate::summarize::threads::ThreadNames>,

@@ -210,6 +210,14 @@ async fn editing_the_message_upstream_regenerates_only_that_summary() {
     server
         .discord
         .edit(&MessageId(edited.clone()), &long_text("rollback reverted"));
+    // ...and the server learns of it, as an adapter's pushed update tells it (the ingest route
+    // forgets the message). Until it learns, a summary asked for within thirty seconds of the page's
+    // read is answered from the text the page was shown, the window speech preparation accepts;
+    // see `ops::summarize_message`. `#208 persistent-cache`.
+    server
+        .state
+        .read_ahead
+        .forget(&server.channel, &MessageId(edited.clone()));
     let ops::Summarised { outcome, .. } = ops::summarize_message(
         &server.state,
         Scope::Write,
@@ -565,7 +573,7 @@ async fn the_cache_tests_exercise_the_key_a_real_deployment_writes() {
     // silent-stale-summary failure the version string exists to prevent, and nothing else in this
     // suite would notice. This is the one that does.
     let server = new_server(400, 160, 3);
-    let prefix = format!("v1-{}-", vibe_talk::summarize::agent::BACKEND);
+    let prefix = format!("v2-{}-", vibe_talk::summarize::agent::BACKEND);
     assert!(
         server.state.summary_version.starts_with(&prefix),
         "these tests file summaries under {:?}, which does not start with the prefix a real \

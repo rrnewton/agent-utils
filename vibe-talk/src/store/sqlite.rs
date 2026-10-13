@@ -34,9 +34,9 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
-    now_ms, Bookmark, BookmarkAnchor, BookmarkChange, BookmarkPlace, ChannelAlias, ConversationId,
-    ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn, Retention,
-    Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    now_ms, Bookmark, BookmarkAnchor, BookmarkChange, BookmarkPlace, CachedSummary, ChannelAlias,
+    ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn,
+    Retention, Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
     UpstreamClearAttempt, UpstreamClearMode, UpstreamClearResult, UpstreamClearSetting,
     MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
@@ -308,6 +308,20 @@ pub const MIGRATIONS: &[&str] = &[
         set_at_ms       INTEGER NOT NULL
     ) STRICT;
     ",
+    // v14 — the length a cached summary was cut at. `#208 persistent-cache`, milestone
+    // `summary-keep`.
+    //
+    // ONE nullable column and nothing else: every existing row reads NULL, "whole", until the
+    // first start re-keys the rows of the previous policy version and marks the ones it can see
+    // were cut (`StateStore::rekey_summaries`). A summary is now filed uncut up to a generous
+    // ceiling and cut when it is served, so a cap change re-derives nothing unless a stored answer
+    // was cut shorter than the new cap; this column is how a stored answer says so. No text.
+    //
+    // This step's place in the ladder is all that numbers it: a step landed meanwhile goes before
+    // it, and the tests find it by what it does rather than by its index.
+    "
+    ALTER TABLE summaries ADD COLUMN cut_at INTEGER;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -349,6 +363,12 @@ impl SqliteStore {
         restrict_file(path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
+            .map_err(backend)?;
+        // What is deleted is overwritten, not left in free pages for anyone who reads the file:
+        // the purge, a pruned summary, a hidden channel's summaries. Per connection, so on every
+        // open; the bundled SQLite is not built with it on. `#208 persistent-cache`.
+        connection
+            .pragma_update(None, "secure_delete", "ON")
             .map_err(backend)?;
         migrate(&connection)?;
         Ok(Self {
@@ -474,8 +494,10 @@ fn prune_summaries(
     transaction: &rusqlite::Transaction<'_>,
     retention: Retention,
 ) -> Result<(), StoreError> {
-    if retention.retain_days > 0 {
-        let cutoff = now_ms() - i64::from(retention.retain_days) * 86_400_000;
+    // Counted from `made_at_ms`, which a write-scope hit moves forward (`touch_summary`): from the
+    // last use, not from when the entry was made. `#208 persistent-cache`.
+    if retention.summary_retain_days > 0 {
+        let cutoff = now_ms() - i64::from(retention.summary_retain_days) * 86_400_000;
         transaction
             .execute("DELETE FROM summaries WHERE made_at_ms < ?1", [cutoff])
             .map_err(backend)?;
@@ -1764,12 +1786,12 @@ impl StateStore for SqliteStore {
         .await
     }
 
-    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
+    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<CachedSummary>, StoreError> {
         let key = key.clone();
         self.with_connection(move |connection| {
             connection
                 .query_row(
-                    "SELECT summary FROM summaries
+                    "SELECT summary, cut_at, made_at_ms FROM summaries
                      WHERE version = ?1 AND channel_id = ?2 AND message_id = ?3
                        AND content_hash = ?4",
                     rusqlite::params![
@@ -1778,7 +1800,17 @@ impl StateStore for SqliteStore {
                         key.message.as_str(),
                         hex(key.content_hash)
                     ],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        Ok(CachedSummary {
+                            text: row.get(0)?,
+                            // A length past `u32` cannot have been written by this server; read it
+                            // as "cut very long", which is never below any cap.
+                            cut_at: row
+                                .get::<_, Option<i64>>(1)?
+                                .map(|at| u32::try_from(at).unwrap_or(u32::MAX)),
+                            made_at_ms: row.get(2)?,
+                        })
+                    },
                 )
                 .optional()
                 .map_err(backend)
@@ -1786,7 +1818,12 @@ impl StateStore for SqliteStore {
         .await
     }
 
-    async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError> {
+    async fn cache_summary(
+        &self,
+        key: &SummaryKey,
+        summary: &str,
+        cut_at: Option<u32>,
+    ) -> Result<(), StoreError> {
         let key = key.clone();
         let summary = summary.to_owned();
         let retention = self.retention;
@@ -1795,17 +1832,20 @@ impl StateStore for SqliteStore {
             transaction
                 .execute(
                     "INSERT INTO summaries
-                        (version, channel_id, message_id, content_hash, summary, made_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        (version, channel_id, message_id, content_hash, summary, made_at_ms,
+                         cut_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(version, channel_id, message_id, content_hash) DO UPDATE SET
-                        summary = excluded.summary, made_at_ms = excluded.made_at_ms",
+                        summary = excluded.summary, made_at_ms = excluded.made_at_ms,
+                        cut_at = excluded.cut_at",
                     rusqlite::params![
                         &key.version,
                         key.channel.as_str(),
                         key.message.as_str(),
                         hex(key.content_hash),
                         &summary,
-                        now_ms()
+                        now_ms(),
+                        cut_at.map(i64::from),
                     ],
                 )
                 .map_err(backend)?;
@@ -1813,6 +1853,91 @@ impl StateStore for SqliteStore {
             // there: a bound applied "soon afterwards" is a bound a crash can skip.
             prune_summaries(&transaction, retention)?;
             transaction.commit().map_err(backend)
+        })
+        .await
+    }
+
+    async fn touch_summary(&self, key: &SummaryKey) -> Result<bool, StoreError> {
+        let key = key.clone();
+        self.with_connection(move |connection| {
+            let now = now_ms();
+            let touched = connection
+                .execute(
+                    "UPDATE summaries SET made_at_ms = ?5
+                     WHERE version = ?1 AND channel_id = ?2 AND message_id = ?3
+                       AND content_hash = ?4 AND made_at_ms < ?6",
+                    rusqlite::params![
+                        &key.version,
+                        key.channel.as_str(),
+                        key.message.as_str(),
+                        hex(key.content_hash),
+                        now,
+                        now - super::SUMMARY_TOUCH_AFTER_MS,
+                    ],
+                )
+                .map_err(backend)?;
+            Ok(touched > 0)
+        })
+        .await
+    }
+
+    async fn rekey_summaries(
+        &self,
+        from: &str,
+        to: &str,
+        cap_then: u32,
+    ) -> Result<u64, StoreError> {
+        let from = from.to_owned();
+        let to = to.to_owned();
+        self.with_connection(move |connection| {
+            if from == to {
+                return Ok(0);
+            }
+            let transaction = connection.transaction().map_err(backend)?;
+            // A thread sentence is a JSON record whose `summary` is the text that was cut; any
+            // other row's text is the summary itself. `json_valid` first, so one malformed row is
+            // read as plain text rather than failing the whole move.
+            let moved = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO summaries
+                        (version, channel_id, message_id, content_hash, summary, made_at_ms,
+                         cut_at)
+                     SELECT ?2, channel_id, message_id, content_hash, summary, made_at_ms,
+                            CASE WHEN substr(
+                                     CASE WHEN substr(message_id, 1, length(?4)) = ?4
+                                               AND json_valid(summary)
+                                          THEN json_extract(summary, '$.summary')
+                                          ELSE summary END,
+                                     -1) = '…'
+                                 THEN ?3 ELSE NULL END
+                     FROM summaries WHERE version = ?1",
+                    rusqlite::params![
+                        &from,
+                        &to,
+                        i64::from(cap_then),
+                        crate::summarize::threads::SENTENCE_PREFIX
+                    ],
+                )
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM summaries WHERE version = ?1", [&from])
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)?;
+            Ok(moved as u64)
+        })
+        .await
+    }
+
+    async fn forget_channel_summaries(&self, channel: &ChannelId) -> Result<u64, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let removed = connection
+                .execute(
+                    "DELETE FROM summaries WHERE channel_id = ?1 AND version <> ?2",
+                    [channel.as_str(), super::KEPT_VERSION],
+                )
+                .map_err(backend)?;
+            Ok(removed as u64)
         })
         .await
     }
@@ -2496,7 +2621,10 @@ mod tests {
             content_hash: 7,
             version: "current".to_owned(),
         };
-        store.cache_summary(&key, "old text").await.expect("cache");
+        store
+            .cache_summary(&key, "old text", None)
+            .await
+            .expect("cache");
         {
             let guard = store
                 .connection
@@ -2520,7 +2648,7 @@ mod tests {
             ..key.clone()
         };
         store
-            .cache_summary(&fresh, "new text")
+            .cache_summary(&fresh, "new text", None)
             .await
             .expect("cache");
 
@@ -2621,11 +2749,16 @@ mod tests {
         assert_eq!(store.cached_summary(&key).await.expect("miss"), None);
 
         store
-            .cache_summary(&key, "the runner stalled overnight")
+            .cache_summary(&key, "the runner stalled overnight", None)
             .await
             .expect("cache");
         assert_eq!(
-            store.cached_summary(&key).await.expect("hit").as_deref(),
+            store
+                .cached_summary(&key)
+                .await
+                .expect("hit")
+                .map(|hit| hit.text)
+                .as_deref(),
             Some("the runner stalled overnight")
         );
 
@@ -2674,6 +2807,7 @@ mod tests {
                         ..base.clone()
                     },
                     version,
+                    None,
                 )
                 .await
                 .expect("cache");
@@ -2695,6 +2829,7 @@ mod tests {
                 })
                 .await
                 .expect("hit")
+                .map(|hit| hit.text)
                 .as_deref(),
             Some("current"),
             "the sweep took the current policy's entries with it"
@@ -2743,6 +2878,7 @@ mod tests {
             Retention {
                 max_summaries: 3,
                 retain_days: 0,
+                summary_retain_days: 0,
                 ..Retention::default()
             },
         );
@@ -2751,6 +2887,7 @@ mod tests {
                 .cache_summary(
                     &summary_key(&format!("100000000000000000{n}"), n),
                     &format!("summary {n}"),
+                    None,
                 )
                 .await
                 .expect("cache");
@@ -2780,6 +2917,7 @@ mod tests {
                     .cached_summary(&summary_key(&format!("100000000000000000{n}"), n))
                     .await
                     .expect("read")
+                    .map(|hit| hit.text)
                     .as_deref(),
                 Some(format!("summary {n}").as_str()),
                 "the newest entries must be the ones kept"
@@ -2799,6 +2937,7 @@ mod tests {
             Retention {
                 max_summaries: 3,
                 retain_days: 0,
+                summary_retain_days: 0,
                 ..Retention::default()
             },
         );
@@ -2807,7 +2946,7 @@ mod tests {
             ..summary_key("thread-name:spaces/A/threads/runner", 0)
         };
         store
-            .cache_summary(&kept, "runner-wedged")
+            .cache_summary(&kept, "runner-wedged", None)
             .await
             .expect("cache");
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -2816,13 +2955,19 @@ mod tests {
                 .cache_summary(
                     &summary_key(&format!("100000000000000000{n}"), n),
                     &format!("summary {n}"),
+                    None,
                 )
                 .await
                 .expect("cache");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         assert_eq!(
-            store.cached_summary(&kept).await.expect("read").as_deref(),
+            store
+                .cached_summary(&kept)
+                .await
+                .expect("read")
+                .map(|hit| hit.text)
+                .as_deref(),
             Some("runner-wedged"),
             "ten newer summaries under a ceiling of three evicted the kept entry"
         );
@@ -2840,7 +2985,12 @@ mod tests {
             "the sweep collects the summaries of the old policy..."
         );
         assert_eq!(
-            store.cached_summary(&kept).await.expect("read").as_deref(),
+            store
+                .cached_summary(&kept)
+                .await
+                .expect("read")
+                .map(|hit| hit.text)
+                .as_deref(),
             Some("runner-wedged"),
             "...and never the entry that belongs to no policy"
         );
@@ -2853,6 +3003,7 @@ mod tests {
                         ..summary_key(&format!("thread-name:{n}"), 0)
                     },
                     &format!("name-{n}"),
+                    None,
                 )
                 .await
                 .expect("cache");
@@ -2877,12 +3028,13 @@ mod tests {
             &dir,
             Retention {
                 retain_days: 1,
+                summary_retain_days: 1,
                 ..Retention::default()
             },
         );
         let key = summary_key("1000000000000000200", 0xdead_beef);
         store
-            .cache_summary(&key, "the runner stalled overnight")
+            .cache_summary(&key, "the runner stalled overnight", None)
             .await
             .expect("cache");
         // Age it two days, which is what the passage of time would do.
@@ -2913,7 +3065,11 @@ mod tests {
         // The edited message's summary is written under a new content hash — and that write is
         // what collects the orphan.
         store
-            .cache_summary(&summary_key("1000000000000000200", 0x0bad_c0de), "reverted")
+            .cache_summary(
+                &summary_key("1000000000000000200", 0x0bad_c0de),
+                "reverted",
+                None,
+            )
             .await
             .expect("cache");
         assert_eq!(
@@ -2926,6 +3082,7 @@ mod tests {
                 .cached_summary(&summary_key("1000000000000000200", 0x0bad_c0de))
                 .await
                 .expect("read")
+                .map(|hit| hit.text)
                 .as_deref(),
             Some("reverted"),
             "the age limit took the live entry too"
@@ -2954,11 +3111,16 @@ mod tests {
             version: "current".to_owned(),
         };
         store
-            .cache_summary(&key, "it works")
+            .cache_summary(&key, "it works", None)
             .await
             .expect("the newer table has to exist after the upgrade");
         assert_eq!(
-            store.cached_summary(&key).await.expect("hit").as_deref(),
+            store
+                .cached_summary(&key)
+                .await
+                .expect("hit")
+                .map(|hit| hit.text)
+                .as_deref(),
             Some("it works")
         );
         // ...and so does the one after it, which is the whole point of a LADDER: a file at v1
@@ -3041,6 +3203,7 @@ mod tests {
             &dir,
             Retention {
                 retain_days: 1,
+                summary_retain_days: 1,
                 max_conversations: 1,
                 max_summaries: 1,
                 max_dismissals: 1,
@@ -3071,7 +3234,7 @@ mod tests {
             .await
             .expect("append");
         store
-            .cache_summary(&summary_key("1000000000000000200", 1), "a summary")
+            .cache_summary(&summary_key("1000000000000000200", 1), "a summary", None)
             .await
             .expect("cache");
         store
@@ -3611,6 +3774,7 @@ mod tests {
             &dir,
             Retention {
                 retain_days: 1,
+                summary_retain_days: 1,
                 max_summaries: 1,
                 ..Retention::default()
             },
@@ -3641,7 +3805,7 @@ mod tests {
             .await
             .expect("append");
         store
-            .cache_summary(&summary_key("1000000000000000300", 1), "a summary")
+            .cache_summary(&summary_key("1000000000000000300", 1), "a summary", None)
             .await
             .expect("cache");
         let before = store.pins(&channel).await.expect("read");

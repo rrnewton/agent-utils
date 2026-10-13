@@ -54,11 +54,14 @@
 //!
 //! * the database file is `0600` and its directory `0700`;
 //! * retention is bounded by [`Retention`] — a conversation count, a per-conversation turn count,
-//!   a cached-summary count, a dismissal count, and an age in days that applies to the first
-//!   three — enforced on every write, not by a sweeper that might not run; and pins are bounded
-//!   by [`MAX_PINS_PER_CHANNEL`] on every pin, for the reasons given there;
+//!   a cached-summary count, a dismissal count, an age in days for conversations, and one for
+//!   cached summaries counted from their last use — enforced on every write, not by a sweeper
+//!   that might not run; and pins are bounded by [`MAX_PINS_PER_CHANNEL`] on every pin, for the
+//!   reasons given there;
 //! * [`StateStore::purge_everything`] erases all of it, and an operator who does not trust that
-//!   can delete the single file the store lives in.
+//!   can delete the single file the store lives in. The SQLite store sets `secure_delete`, so
+//!   what is deleted is overwritten in the file rather than left in free pages. Copies of the
+//!   file taken by anything else (a backup, a deploy script) are beyond its reach.
 
 pub mod disabled;
 pub mod fake;
@@ -648,8 +651,10 @@ pub fn validate_alias(raw: &str) -> Result<String, StoreError> {
 /// An upstream EDIT or DELETE orphans the old entry: it is unreachable by key and nothing
 /// upstream will ever tell this server it went. The startup sweep cannot collect those — it
 /// deletes by *policy version*, and an orphan is under the current version — so what collects
-/// them is [`Retention`], enforced on every write of a summary: an age limit, and a ceiling on
-/// how many entries exist at all.
+/// them is [`Retention`], enforced on every write of a summary: an age limit counted from the
+/// entry's last use ([`Retention::summary_retain_days`]), and a ceiling on how many entries exist
+/// at all. Taking a channel off the list deletes its entries at once
+/// ([`StateStore::forget_channel_summaries`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SummaryKey {
     /// The channel the message is in.
@@ -662,6 +667,26 @@ pub struct SummaryKey {
     pub version: String,
 }
 
+/// One cached summary as it is read back. `#208 persistent-cache`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedSummary {
+    /// What was filed: for a summary, the answer UNCUT up to the stored ceiling, cut for serving
+    /// by [`crate::summarize::cut_for_serving`]; for a thread name or sentence, its JSON record.
+    pub text: String,
+    /// The length the answer was cut at before it was filed, or `None` when it is whole. A value
+    /// below the cap now in force means the stored text is shorter than a fresh answer would be
+    /// shown ([`crate::summarize::cut_below_cap`]).
+    pub cut_at: Option<u32>,
+    /// When the entry was written or last kept alive, in Unix milliseconds. The age limit counts
+    /// from this; see [`StateStore::touch_summary`].
+    pub made_at_ms: i64,
+}
+
+/// How old a cached summary must be before a write-scope hit rewrites its `made_at_ms`, so the age
+/// limit counts from its last use. Once a day per entry at most, so a busy page does not turn every
+/// hit into a write. `#208 persistent-cache`; the same interval thread names are kept alive by.
+pub const SUMMARY_TOUCH_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+
 /// The [`SummaryKey::version`] of a summary-cache entry that belongs to NO summary policy, and is
 /// therefore KEPT when the policy changes. `#233 llm-summarizer`.
 ///
@@ -672,10 +697,12 @@ pub struct SummaryKey {
 /// * left alone by [`StateStore::forget_summaries_except`], whatever version it is told to keep;
 /// * counted against [`Retention::max_summaries`] SEPARATELY from ordinary summaries, so a day of
 ///   summary traffic never evicts one, and they never crowd out a summary;
-/// * still collected by the age limit, `retain_days`, like every other cached entry — its writer
-///   refreshes it while it is in use — and by the purge.
+/// * still collected by the age limit, `summary_retain_days`, like every other cached entry — its
+///   writer refreshes it while it is in use — and by the purge;
+/// * left alone by [`StateStore::forget_channel_summaries`], which takes a channel's summaries and
+///   thread sentences and keeps its thread names.
 ///
-/// No policy version can be spelled this way: those all start `v1-`.
+/// No policy version can be spelled this way: those all start `v` and a digit.
 pub const KEPT_VERSION: &str = "kept";
 
 /// Bounds on how much the store keeps.
@@ -719,13 +746,21 @@ pub struct Retention {
     /// they are the same shape of row and an age limit would be wrong for them for the same
     /// reason — it would re-hide a message the owner rescued.
     pub max_dismissals: u32,
-    /// How many days a record survives: a conversation after its last turn, a cached summary
-    /// after it was made. `0` means no age limit.
-    ///
-    /// For summaries this is also the ONLY thing that collects an orphan — an entry whose
-    /// upstream message was deleted or edited away is unreachable by key and cannot be noticed
-    /// any other way, because nothing tells this server that a message went.
+    /// How many days a conversation survives after its last turn. `0` means no age limit.
     pub retain_days: u16,
+    /// How many days a cached summary, thread sentence or thread name survives after it was last
+    /// USED by a write-scope caller: written, or served to one more than a day after it was last
+    /// kept alive ([`StateStore::touch_summary`]). `0` means no age limit. `#208 persistent-cache`.
+    ///
+    /// Counted from use rather than from when it was made, so a summary that is still being read
+    /// is not thrown away and paid for again because a month went by. A read-scope hit keeps
+    /// nothing alive: that would be a durable write reachable from the read token.
+    ///
+    /// This is also the ONLY thing that collects an orphan — an entry whose upstream message was
+    /// deleted or edited away is unreachable by key and cannot be noticed any other way, because
+    /// nothing tells this server that a message went. It should therefore not exceed how long the
+    /// chat provider itself keeps messages.
+    pub summary_retain_days: u16,
 }
 
 impl Default for Retention {
@@ -736,6 +771,7 @@ impl Default for Retention {
             max_summaries: DEFAULT_MAX_SUMMARIES,
             max_dismissals: DEFAULT_MAX_DISMISSALS,
             retain_days: DEFAULT_RETAIN_DAYS,
+            summary_retain_days: DEFAULT_RETAIN_DAYS,
         }
     }
 }
@@ -1648,20 +1684,76 @@ pub trait StateStore: Send + Sync {
     ///
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
     /// failure.
-    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError>;
+    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<CachedSummary>, StoreError>;
 
     /// File a summary under its key, replacing any entry already there.
     ///
-    /// Bounded by [`Retention`] on the way in, exactly as [`StateStore::append_turn`] is: writing
-    /// one entry may evict the oldest, and evicts anything past the age limit. That is what keeps
-    /// an orphaned entry — one whose message was edited or deleted upstream — from living
-    /// forever. See [`SummaryKey`].
+    /// `cut_at` is the length `summary` was cut at before it was filed, or `None` when it is whole
+    /// (see [`CachedSummary::cut_at`]). Bounded by [`Retention`] on the way in, exactly as
+    /// [`StateStore::append_turn`] is: writing one entry may evict the oldest, and evicts anything
+    /// past the age limit. That is what keeps an orphaned entry — one whose message was edited or
+    /// deleted upstream — from living forever. See [`SummaryKey`].
     ///
     /// # Errors
     ///
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
     /// write failure.
-    async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError>;
+    async fn cache_summary(
+        &self,
+        key: &SummaryKey,
+        summary: &str,
+        cut_at: Option<u32>,
+    ) -> Result<(), StoreError>;
+
+    /// Keep one cached entry alive: set its `made_at_ms` to now, but only when it is older than
+    /// [`SUMMARY_TOUCH_AFTER_MS`]. Answers whether a row was rewritten. `#208 persistent-cache`.
+    ///
+    /// Called for a WRITE-scope hit only, so the age limit counts from the last use rather than
+    /// from when the entry was made; a read-scope hit writes nothing. Changes nothing else, and
+    /// nothing at all for a key with no entry.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn touch_summary(&self, key: &SummaryKey) -> Result<bool, StoreError>;
+
+    /// Move every entry filed under the old policy version `from` to `to`, in ONE transaction,
+    /// and answer how many moved. `#208 persistent-cache`, the first start after milestone
+    /// `summary-keep`.
+    ///
+    /// `from` is [`crate::summarize::policy_version_v1`] of the configuration in force, which
+    /// hashed the threshold, the reply deadline and the cap as well as the wording; `to` is
+    /// [`crate::summarize::policy_version_v2`] of the same configuration, which hashes the wording
+    /// alone. Every row under `from` was produced under exactly the wording `to` names, so it is
+    /// still valid. A row whose text (or, for a thread sentence, whose JSON `summary`) ends "…"
+    /// was cut at `cap_then`, the cap `from` folded in, and is moved with `cut_at = cap_then`; any
+    /// other row is moved whole. An entry already under `to` with the same key wins, and the old
+    /// one is dropped. Thread names ([`KEPT_VERSION`]) are untouched.
+    ///
+    /// A deploy that also changes the wording names a `from` no row is under, so nothing moves and
+    /// [`StateStore::forget_summaries_except`] then sweeps them, which is right.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure, in which case nothing moved.
+    async fn rekey_summaries(&self, from: &str, to: &str, cap_then: u32)
+        -> Result<u64, StoreError>;
+
+    /// Delete every cached summary and thread sentence of one channel, under any version, and
+    /// answer how many went. Thread NAMES ([`KEPT_VERSION`]) are kept, so a channel put back on
+    /// the list finds its threads under the names it knew. `#208 persistent-cache`.
+    ///
+    /// Called when a channel is hidden or removed, whether or not anything else is cached: a
+    /// summary is a second at-rest copy of that channel's text, and the channel is no longer on
+    /// the list it was read under.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn forget_channel_summaries(&self, channel: &ChannelId) -> Result<u64, StoreError>;
 
     /// Delete every cached summary produced under a policy other than `version`, returning how
     /// many went. Entries under [`KEPT_VERSION`] belong to no policy and are never deleted here.

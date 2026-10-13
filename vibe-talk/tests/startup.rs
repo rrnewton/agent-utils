@@ -312,11 +312,15 @@ async fn starting_the_server_sweeps_summaries_from_a_policy_that_no_longer_appli
         // test is an upgrade rehearsal: a real database carried across this change holds entries
         // under exactly this prefix, and what has to happen to them is that they go.
         store
-            .cache_summary(&key("v1-extractive-w3-c160-0000000000000000"), "stale")
+            .cache_summary(
+                &key("v1-extractive-w3-c160-0000000000000000"),
+                "stale",
+                None,
+            )
             .await
             .expect("cache");
         store
-            .cache_summary(&key(&current), "still valid")
+            .cache_summary(&key(&current), "still valid", None)
             .await
             .expect("cache");
     }
@@ -349,6 +353,7 @@ async fn starting_the_server_sweeps_summaries_from_a_policy_that_no_longer_appli
             .cached_summary(&key(&current))
             .await
             .expect("read")
+            .map(|hit| hit.text)
             .as_deref(),
         Some("still valid"),
         "the start swept away the entries it was supposed to keep:\n{output}"

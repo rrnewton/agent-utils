@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::threads::{ThreadNaming, ThreadRequest};
-use super::{Summarizer, SummaryError, SummaryRequest};
+use super::{Summarizer, Summary, SummaryError, SummaryRequest};
 
 /// What one call was asked to summarise.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +37,7 @@ pub struct FakeSummarizer {
 struct State {
     requests: Vec<RecordedRequest>,
     fail_next: Option<String>,
+    answer: Option<String>,
     names_threads: bool,
     threads: Vec<String>,
 }
@@ -76,6 +77,13 @@ impl FakeSummarizer {
     #[must_use]
     pub fn thread_prompts(&self) -> Vec<String> {
         self.lock().threads.clone()
+    }
+
+    /// Answer every summary with `reply`, run through what the shipped backends run a reply
+    /// through ([`super::agent::plain_uncut`]), instead of the numbered `summary #N`.
+    /// `#208 persistent-cache`: the tests of where an answer is cut need one longer than the cap.
+    pub fn answer_with(&self, reply: &str) {
+        self.lock().answer = Some(reply.to_owned());
     }
 
     /// Make the next call fail. One-shot, so recovery is testable too.
@@ -124,10 +132,11 @@ impl Summarizer for FakeSummarizer {
         Ok(ThreadNaming {
             slug: format!("thread-{n}"),
             sentence: format!("thread summary #{n}"),
+            cut_at: None,
         })
     }
 
-    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
         let mut state = self.lock();
         if let Some(why) = state.fail_next.take() {
             return Err(SummaryError::Transport(why));
@@ -138,8 +147,15 @@ impl Summarizer for FakeSummarizer {
             target_chars: request.target_chars,
             prompt: request.prompt().to_owned(),
         });
+        if let Some(reply) = &state.answer {
+            let (text, cut_at) = super::agent::plain_uncut(reply, request.target_chars);
+            return Ok(Summary { text, cut_at });
+        }
         // Deliberately NOT the message text: a fake that echoed its input would let a caller that
         // returned the raw message pass as one that summarised it.
-        Ok(format!("summary #{}", state.requests.len()))
+        Ok(Summary {
+            text: format!("summary #{}", state.requests.len()),
+            cut_at: None,
+        })
     }
 }

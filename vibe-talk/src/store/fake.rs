@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    now_ms, Bookmark, BookmarkAnchor, BookmarkChange, ChannelAlias, ConversationId,
+    now_ms, Bookmark, BookmarkAnchor, BookmarkChange, CachedSummary, ChannelAlias, ConversationId,
     ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn, Retention,
     StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
     UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting, MAX_PINS_PER_CHANNEL,
@@ -43,6 +43,7 @@ use crate::model::{ChannelId, MessageId};
 #[derive(Clone, Debug)]
 struct FakeSummary {
     text: String,
+    cut_at: Option<u32>,
     made_at_ms: i64,
     /// Insertion order, standing in for SQLite's `rowid`: it breaks a tie between two entries
     /// made in the same millisecond, and it survives an overwrite, as a rowid does.
@@ -879,16 +880,25 @@ impl StateStore for FakeStore {
         Ok(change)
     }
 
-    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
+    async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<CachedSummary>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
         Ok(state
             .summaries
             .get(&fake_key(key))
-            .map(|entry| entry.text.clone()))
+            .map(|entry| CachedSummary {
+                text: entry.text.clone(),
+                cut_at: entry.cut_at,
+                made_at_ms: entry.made_at_ms,
+            }))
     }
 
-    async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError> {
+    async fn cache_summary(
+        &self,
+        key: &SummaryKey,
+        summary: &str,
+        cut_at: Option<u32>,
+    ) -> Result<(), StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
         let slot = fake_key(key);
@@ -905,6 +915,7 @@ impl StateStore for FakeStore {
             slot,
             FakeSummary {
                 text: summary.to_owned(),
+                cut_at,
                 made_at_ms: now_ms(),
                 seq,
             },
@@ -913,8 +924,8 @@ impl StateStore for FakeStore {
         // The same two bounds the SQLite store applies, in the same order. See
         // `super::sqlite::prune_summaries` for why the age one is the only thing that ever
         // collects an orphan.
-        if self.retention.retain_days > 0 {
-            let cutoff = now_ms() - i64::from(self.retention.retain_days) * 86_400_000;
+        if self.retention.summary_retain_days > 0 {
+            let cutoff = now_ms() - i64::from(self.retention.summary_retain_days) * 86_400_000;
             state.summaries.retain(|_, held| held.made_at_ms >= cutoff);
         }
         // Counted per kind, as the real store counts them: ordinary summaries, and the entries kept
@@ -941,6 +952,75 @@ impl StateStore for FakeStore {
             }
         }
         Ok(())
+    }
+
+    async fn touch_summary(&self, key: &SummaryKey) -> Result<bool, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let now = now_ms();
+        match state.summaries.get_mut(&fake_key(key)) {
+            Some(held) if held.made_at_ms < now - super::SUMMARY_TOUCH_AFTER_MS => {
+                held.made_at_ms = now;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn rekey_summaries(
+        &self,
+        from: &str,
+        to: &str,
+        cap_then: u32,
+    ) -> Result<u64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        if from == to {
+            return Ok(0);
+        }
+        let old: Vec<_> = state
+            .summaries
+            .iter()
+            .filter(|((version, _, _, _), _)| version == from)
+            .map(|(slot, held)| (slot.clone(), held.clone()))
+            .collect();
+        let mut moved = 0;
+        for ((_, channel, message, hash), held) in old {
+            state.summaries.remove(&(
+                from.to_owned(),
+                channel.clone(),
+                message.clone(),
+                hash.clone(),
+            ));
+            let slot = (to.to_owned(), channel, message.clone(), hash);
+            if state.summaries.contains_key(&slot) {
+                continue;
+            }
+            // The SQLite store's rule: a thread sentence's JSON `summary`, else the text itself,
+            // ending "…" means it was cut at the cap the old version folded in.
+            let text = if message.starts_with(crate::summarize::threads::SENTENCE_PREFIX) {
+                serde_json::from_str::<serde_json::Value>(&held.text)
+                    .ok()
+                    .and_then(|record| record.get("summary")?.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| held.text.clone())
+            } else {
+                held.text.clone()
+            };
+            let cut_at = text.ends_with('…').then_some(cap_then);
+            state.summaries.insert(slot, FakeSummary { cut_at, ..held });
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    async fn forget_channel_summaries(&self, channel: &ChannelId) -> Result<u64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let before = state.summaries.len();
+        state.summaries.retain(|(version, held_channel, _, _), _| {
+            held_channel != channel.as_str() || version == super::KEPT_VERSION
+        });
+        Ok((before - state.summaries.len()) as u64)
     }
 
     async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError> {
@@ -1118,6 +1198,7 @@ mod tests {
         let store = FakeStore::with_retention(Retention {
             max_summaries: 2,
             retain_days: 0,
+            summary_retain_days: 0,
             ..Retention::default()
         });
         let key = |n: u64| SummaryKey {
@@ -1128,7 +1209,7 @@ mod tests {
         };
         for n in 0..3_u64 {
             store
-                .cache_summary(&key(n), &format!("summary {n}"))
+                .cache_summary(&key(n), &format!("summary {n}"), None)
                 .await
                 .expect("cache");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -1148,6 +1229,7 @@ mod tests {
                 .cached_summary(&key(2))
                 .await
                 .expect("read")
+                .map(|hit| hit.text)
                 .as_deref(),
             Some("summary 2")
         );
@@ -1160,6 +1242,7 @@ mod tests {
         let store = FakeStore::with_retention(Retention {
             max_summaries: 2,
             retain_days: 0,
+            summary_retain_days: 0,
             ..Retention::default()
         });
         let key = |message: &str, version: &str| SummaryKey {
@@ -1170,13 +1253,13 @@ mod tests {
         };
         let kept = key("thread-name:t", super::super::KEPT_VERSION);
         store
-            .cache_summary(&kept, "runner-wedged")
+            .cache_summary(&kept, "runner-wedged", None)
             .await
             .expect("cache");
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         for n in 0..5 {
             store
-                .cache_summary(&key(&format!("10000000000000000{n}"), "current"), "s")
+                .cache_summary(&key(&format!("10000000000000000{n}"), "current"), "s", None)
                 .await
                 .expect("cache");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -1191,7 +1274,12 @@ mod tests {
             2
         );
         assert_eq!(
-            store.cached_summary(&kept).await.expect("read").as_deref(),
+            store
+                .cached_summary(&kept)
+                .await
+                .expect("read")
+                .map(|hit| hit.text)
+                .as_deref(),
             Some("runner-wedged")
         );
         for n in 0..3 {
@@ -1199,6 +1287,7 @@ mod tests {
                 .cache_summary(
                     &key(&format!("thread-name:{n}"), super::super::KEPT_VERSION),
                     "name",
+                    None,
                 )
                 .await
                 .expect("cache");

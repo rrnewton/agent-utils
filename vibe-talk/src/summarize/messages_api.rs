@@ -48,10 +48,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use super::agent::{plain, PLAIN_TEXT_RULE};
+use super::agent::{plain_uncut, PLAIN_TEXT_RULE};
 use super::rate_limit::{Priority, RateLimiter};
 use super::threads::{parse_thread_answer, ThreadNaming, ThreadRequest, THREAD_RULE};
-use super::{Summarizer, SummaryError, SummaryRequest, PROMPT};
+use super::{Summarizer, Summary, SummaryError, SummaryRequest, PROMPT};
 use crate::config::{LlmConfig, LlmDialect, Secret};
 
 /// The slug this backend contributes to [`super::policy_version`].
@@ -872,7 +872,7 @@ impl Summarizer for MessagesApiSummarizer {
         true
     }
 
-    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
         let system = format!(
             "{PLAIN_TEXT_RULE}\nKeep the answer under {} characters.",
             request.target_chars
@@ -880,14 +880,20 @@ impl Summarizer for MessagesApiSummarizer {
         let reply = self
             .complete(Priority::Interactive, &system, request.prompt())
             .await?;
-        // Asked for `target_chars`, cut only well past it: see `plain`. `#257 summary-truncation`.
-        let summary = plain(&reply, request.target_chars);
+        // Asked for `target_chars`, stored uncut and cut only well past it when served: see
+        // `plain_uncut`. `#257 summary-truncation`, `#208 persistent-cache`. A `max_tokens` stop
+        // was already marked by `marked_as_cut`; it is the provider's cut, not ours, so it leaves
+        // `cut_at` unset.
+        let (summary, cut_at) = plain_uncut(&reply, request.target_chars);
         if summary.trim().is_empty() || summary == crate::summary::NO_TEXT {
             return Err(SummaryError::Shape(
                 "the model answered with no text at all".to_owned(),
             ));
         }
-        Ok(summary)
+        Ok(Summary {
+            text: summary,
+            cut_at,
+        })
     }
 
     async fn name_thread(&self, request: &ThreadRequest<'_>) -> Result<ThreadNaming, SummaryError> {

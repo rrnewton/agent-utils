@@ -28,12 +28,17 @@
 //! * the NAME, under [`crate::store::KEPT_VERSION`] rather than the summary policy version. No
 //!   change of policy (model, prompt, budget, any summary setting) removes it, and ordinary
 //!   summary traffic cannot evict it: kept rows are counted separately. The age limit,
-//!   `retain_days`, still applies, so the row is rewritten whenever the thread is named or
+//!   `summary_retain_days`, still applies, so the row is rewritten whenever the thread is named or
 //!   re-sentenced and, at most daily, when a write-scope read sees the thread active since it was
-//!   last written ([`TOUCH_AFTER`]). A thread quiet (or unread) for longer than `retain_days` loses
-//!   its name, and is named afresh when it is next listed.
+//!   last written ([`TOUCH_AFTER`]). A thread quiet (or unread) for longer than
+//!   `summary_retain_days` loses its name, and is named afresh when it is next listed. Taking the
+//!   channel off the list keeps it.
 //! * the SENTENCE, with the message count it was written at, under the summary policy version
-//!   like any summary: a changed policy re-derives the sentence, and keeps the name.
+//!   like any summary: a changed wording re-derives the sentence, and keeps the name. It is filed
+//!   uncut and cut when it is attached to a page ([`super::cut_for_serving`]), like a summary;
+//!   one cut shorter than the cap in force is asked for again when a write-scope read next sees
+//!   the thread. Its row is kept alive alongside the name's, and taking the channel off the list
+//!   deletes it. `#208 persistent-cache`.
 //!
 //! A name is chosen once in a stronger sense too: a store that cannot be read is never taken to
 //! mean "no name". Nothing is queued for such a thread, and a naming re-reads the filed name
@@ -186,8 +191,11 @@ fn build_prompt(messages: &[Message]) -> String {
 pub struct ThreadNaming {
     /// A name that passed [`valid_thread_slug`].
     pub slug: String,
-    /// One plain sentence.
+    /// One plain sentence, flattened and uncut up to the stored ceiling; see
+    /// [`super::agent::plain_uncut`].
     pub sentence: String,
+    /// Where the sentence was cut before it was filed, when it was. See [`super::Summary`].
+    pub cut_at: Option<u32>,
 }
 
 /// Whether `slug` is a usable thread name: two to four words of lowercase ASCII letters and
@@ -213,9 +221,10 @@ pub fn valid_thread_slug(slug: &str) -> bool {
 /// that fails is a FAILED naming, by name, never truncated or patched into shape — a name is the
 /// thing the reader finds the thread by, and a mangled one is worse than none.
 ///
-/// `sentence_chars` is the length the sentence was ASKED for, not where it is cut: it is kept whole
-/// up to [`super::hard_cap_chars`] of that, as a message summary is (see [`super::agent::plain`]).
-/// `#257 summary-truncation`.
+/// `sentence_chars` is the length the sentence was ASKED for, not where it is cut: it is shown whole
+/// up to [`super::hard_cap_chars`] of that, as a message summary is, and stored whole up to four
+/// times that (see [`super::agent::plain_uncut`]). `#257 summary-truncation`,
+/// `#208 persistent-cache`.
 ///
 /// # Errors
 ///
@@ -257,13 +266,17 @@ pub fn parse_thread_answer(
             slug.chars().count()
         )));
     }
-    let sentence = super::agent::plain(&sentence, sentence_chars);
+    let (sentence, cut_at) = super::agent::plain_uncut(&sentence, sentence_chars);
     if sentence.trim().is_empty() || sentence == crate::summary::NO_TEXT {
         return Err(SummaryError::Shape(
             "the model named the thread without saying what it is about".to_owned(),
         ));
     }
-    Ok(ThreadNaming { slug, sentence })
+    Ok(ThreadNaming {
+        slug,
+        sentence,
+        cut_at,
+    })
 }
 
 /// Drop a leading `name:` / `slug:` / `title:` / `summary:` / `sentence:` label, any case.
@@ -297,7 +310,8 @@ pub struct FiledName {
 }
 
 /// A thread's sentence as filed: under the summary policy version, like any summary, so a changed
-/// policy re-derives it (the name is kept regardless).
+/// policy re-derives it (the name is kept regardless). `summary` is the stored text, uncut up to
+/// the stored ceiling; it is cut for serving where it is attached to a page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FiledSentence {
     /// The sentence.
@@ -315,6 +329,9 @@ pub struct ThreadRecord {
     pub touched: i64,
     /// The sentence, when there is one under the current policy.
     pub sentence: Option<FiledSentence>,
+    /// Whether the filed sentence was cut shorter than the cap now in force, so a write-scope read
+    /// asks for it again. `#208 persistent-cache`.
+    pub sentence_below_cap: bool,
 }
 
 /// Where a thread's NAME is filed in the summary cache: under [`crate::store::KEPT_VERSION`], not
@@ -476,10 +493,9 @@ impl ThreadNames {
                 Lookup::Known(record) => {
                     if let Some(record) = &record {
                         summary.display_name = Some(record.name.clone());
-                        summary.summary = record
-                            .sentence
-                            .as_ref()
-                            .map(|sentence| sentence.summary.clone());
+                        summary.summary = record.sentence.as_ref().map(|sentence| {
+                            super::cut_for_serving(&sentence.summary, deps.sentence_chars)
+                        });
                     }
                     self.refresh_recent(channel, summary);
                     if !may_write {
@@ -531,13 +547,19 @@ impl ThreadNames {
         let record = match filed {
             None => None,
             Some(name) => {
-                let sentence = match deps
+                let (sentence, sentence_below_cap) = match deps
                     .store
                     .cached_summary(&sentence_key(&deps.version, channel, thread))
                     .await
                 {
-                    Ok(Some(text)) => serde_json::from_str::<FiledSentence>(&text).ok(),
-                    Ok(None) | Err(StoreError::Unavailable(_)) => None,
+                    Ok(Some(filed)) => match serde_json::from_str::<FiledSentence>(&filed.text) {
+                        Ok(sentence) => (
+                            Some(sentence),
+                            super::cut_below_cap(filed.cut_at, deps.sentence_chars),
+                        ),
+                        Err(_) => (None, false),
+                    },
+                    Ok(None) | Err(StoreError::Unavailable(_)) => (None, false),
                     Err(error) => {
                         tracing::warn!(%error, "a thread sentence could not be read from the store");
                         return Lookup::Unknown(Some(name.name));
@@ -547,6 +569,7 @@ impl ThreadNames {
                     name: name.name,
                     touched: name.touched,
                     sentence,
+                    sentence_below_cap,
                 })
             }
         };
@@ -616,6 +639,16 @@ impl ThreadNames {
         let thread = thread.to_owned();
         runtime.spawn(async move {
             file_name(&deps, &channel, &thread, &touched.name, touched.touched).await;
+            // The sentence's row too, so the age limit counts from the thread's last activity for
+            // both halves. `#208 persistent-cache`. A no-op when it is younger than a day.
+            match deps
+                .store
+                .touch_summary(&sentence_key(&deps.version, &channel, &thread))
+                .await
+            {
+                Ok(_) | Err(StoreError::Unavailable(_)) => {}
+                Err(error) => tracing::warn!(%error, "a thread sentence could not be kept alive"),
+            }
         });
     }
 
@@ -657,10 +690,9 @@ impl ThreadNames {
                     state.named += 1;
                     let mut renamed = snapshot;
                     renamed.display_name = Some(record.name.clone());
-                    renamed.summary = record
-                        .sentence
-                        .as_ref()
-                        .map(|sentence| sentence.summary.clone());
+                    renamed.summary = record.sentence.as_ref().map(|sentence| {
+                        super::cut_for_serving(&sentence.summary, deps.sentence_chars)
+                    });
                     state
                         .recent
                         .retain(|recent| !(recent.channel == key.0 && recent.thread.id == key.1));
@@ -697,6 +729,11 @@ fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
     let Some(record) = record else {
         return true;
     };
+    if record.sentence_below_cap {
+        // Filed cut shorter than the cap now in force: a fresh one would show more. Only ever
+        // consulted for a write-scope read. `#208 persistent-cache`.
+        return true;
+    }
     match (&record.sentence, messages) {
         // Named, but with no sentence under the current policy: a policy change swept it, or it
         // was evicted. The name is kept; only the sentence is asked for again.
@@ -729,7 +766,7 @@ async fn filed_name(
     thread: &str,
 ) -> Result<Option<FiledName>, SummaryError> {
     match deps.store.cached_summary(&name_key(channel, thread)).await {
-        Ok(Some(text)) => match serde_json::from_str::<FiledName>(&text) {
+        Ok(Some(filed)) => match serde_json::from_str::<FiledName>(&filed.text) {
             Ok(filed) if valid_thread_slug(&filed.name) => Ok(Some(filed)),
             _ => {
                 tracing::warn!("a filed thread name is unreadable; the thread will be renamed");
@@ -754,7 +791,7 @@ async fn file_name(deps: &ThreadDeps, channel: &ChannelId, thread: &str, name: &
     };
     match deps
         .store
-        .cache_summary(&name_key(channel, thread), &text)
+        .cache_summary(&name_key(channel, thread), &text, None)
         .await
     {
         Ok(()) | Err(StoreError::Unavailable(_)) => {}
@@ -821,6 +858,7 @@ async fn name_one(
     let began = std::time::Instant::now();
     let naming = deps.summarizer.name_thread(&request).await?;
     let renamed = kept.is_none();
+    let cut_at = naming.cut_at;
     let record = ThreadRecord {
         // A thread that already has a name keeps it, whatever the model offered this time.
         name: kept.unwrap_or(naming.slug),
@@ -831,6 +869,7 @@ async fn name_one(
                 .reply_count
                 .map_or(messages.len() as u64, |replies| replies.saturating_add(1)),
         }),
+        sentence_below_cap: super::cut_below_cap(cut_at, deps.sentence_chars),
     };
     tracing::info!(
         backend = deps.summarizer.backend(),
@@ -847,7 +886,11 @@ async fn name_one(
         })?;
         match deps
             .store
-            .cache_summary(&sentence_key(&deps.version, channel, &snapshot.id), &filed)
+            .cache_summary(
+                &sentence_key(&deps.version, channel, &snapshot.id),
+                &filed,
+                cut_at,
+            )
             .await
         {
             Ok(()) | Err(StoreError::Unavailable(_)) => {}
@@ -902,6 +945,7 @@ mod tests {
         let expected = ThreadNaming {
             slug: "runner-wedged".to_owned(),
             sentence: "The only mac runner is stuck and the arm64 job never started.".to_owned(),
+            cut_at: None,
         };
         for answer in [
             "runner-wedged\nThe only mac runner is stuck and the arm64 job never started.",
@@ -946,10 +990,14 @@ mod tests {
             long,
             "three times the requested length is still under the cap and kept whole"
         );
+        // Eight times is past the cap: SHOWN cut there. It is stored whole, since it is still under
+        // the stored ceiling (`#208 persistent-cache`), and cut when it is attached to a page.
         let wall = format!("{sentence} ").repeat(8);
-        let cut = parse_thread_answer(&format!("storage-audit-findings\n{wall}"), 160)
-            .expect("named")
-            .sentence;
+        let stored =
+            parse_thread_answer(&format!("storage-audit-findings\n{wall}"), 160).expect("named");
+        assert_eq!(stored.sentence, wall.trim_end());
+        assert_eq!(stored.cut_at, None);
+        let cut = super::super::cut_for_serving(&stored.sentence, 160);
         assert!(cut.chars().count() <= super::super::hard_cap_chars(160));
         let kept = cut
             .strip_suffix('…')
@@ -958,6 +1006,17 @@ mod tests {
             wall.starts_with(&format!("{kept} ")),
             "the cut split a word: {kept:?}"
         );
+    }
+
+    #[test]
+    fn a_sentence_past_the_stored_ceiling_is_cut_there_and_says_so() {
+        let wall = "alpha bravo charlie delta echo foxtrot ".repeat(120);
+        let naming =
+            parse_thread_answer(&format!("storage-audit-findings\n{wall}"), 160).expect("named");
+        let ceiling = super::super::stored_ceiling_chars(160);
+        assert_eq!(naming.cut_at, Some(u32::try_from(ceiling).expect("small")));
+        assert!(naming.sentence.chars().count() <= ceiling);
+        assert!(!super::super::cut_below_cap(naming.cut_at, 160));
     }
 
     #[test]
@@ -1047,6 +1106,7 @@ mod tests {
                 summary: "It is stuck.".to_owned(),
                 at,
             }),
+            sentence_below_cap: false,
         };
         assert!(due(&thread(Some(0)), None), "an unnamed thread is due");
         assert!(due(&thread(None), None), "even with no count");
@@ -1070,6 +1130,14 @@ mod tests {
             ..record(8)
         };
         assert!(due(&thread(Some(8)), Some(&nameless_sentence)));
+        // A sentence filed cut shorter than the cap now in force: due, though nothing says the
+        // thread grew. `#208 persistent-cache`.
+        let cut_short = ThreadRecord {
+            sentence_below_cap: true,
+            ..record(8)
+        };
+        assert!(due(&thread(Some(7)), Some(&cut_short)));
+        assert!(due(&thread(None), Some(&cut_short)));
     }
 
     #[test]
@@ -1080,6 +1148,7 @@ mod tests {
             name: "runner-wedged".to_owned(),
             touched: named_at,
             sentence: None,
+            sentence_below_cap: false,
         };
         let active_at = |seconds: i64| ThreadSummary {
             id: "t".to_owned(),

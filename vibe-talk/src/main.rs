@@ -235,6 +235,69 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
     Ok(Some(args))
 }
 
+/// Re-key the summaries the previous policy version filed, then sweep every other old version.
+/// `#208 persistent-cache`, milestone `summary-keep`.
+///
+/// Before it, the version hashed the threshold, the reply deadline and the cap as well as the
+/// wording, so the rows under `policy_version_v1` of THIS configuration were produced under
+/// exactly the wording `policy_version_v2` names: they are moved, not deleted, and the ones that
+/// end "…" are marked as cut at that version's cap. Every other old version is then swept as
+/// before. On every later start the re-key finds nothing and the sweep finds nothing, so a restart
+/// never makes a summary be asked for again. A deploy that also changes the wording names a v1 no
+/// row is under, and its rows are swept, which is right.
+///
+/// One line at INFO with the two counts and nothing else: no key, no id, no text.
+async fn keep_summaries_across_the_policy_change(
+    store: &dyn StateStore,
+    config: &vibe_talk::config::Config,
+    summarizer: &dyn vibe_talk::summarize::Summarizer,
+) {
+    let current = vibe_talk::summarize::policy_version_for(&config.summaries, summarizer);
+    let previous = vibe_talk::summarize::policy_version_v1_for(&config.summaries, summarizer);
+    let cap_then = u32::try_from(vibe_talk::summarize::hard_cap_chars(
+        config.summaries.target_chars,
+    ))
+    .unwrap_or(u32::MAX);
+    let rekeyed = match store.rekey_summaries(&previous, &current, cap_then).await {
+        Ok(moved) => moved,
+        // Not configured is not a failure: there is no cache, so there is nothing to keep or
+        // sweep.
+        Err(vibe_talk::store::StoreError::Unavailable(_)) => return,
+        Err(error) => {
+            // The sweep below would then delete what could not be moved; skipping it leaves the
+            // old rows unreachable until the next start retries, which costs nothing.
+            tracing::warn!(
+                %error,
+                "the cached summaries of the previous policy version could NOT be re-keyed; they \
+                 are left in place and the re-key is retried at the next start"
+            );
+            return;
+        }
+    };
+    // The sweep. Without it a changed policy leaves the old entries on disk forever: unreachable,
+    // invisible, and still a copy of other people's text at rest.
+    match store.forget_summaries_except(&current).await {
+        // Every start, zeros included: "re-keyed=0 swept=0" is the evidence that a restart kept
+        // every summary it had.
+        Ok(swept) => tracing::info!(
+            "re-keyed" = rekeyed,
+            swept,
+            "kept the cached summaries whose wording is unchanged and deleted those produced \
+             under an older wording"
+        ),
+        // A store that IS configured and could not be swept is a real fault and has to be
+        // visible at the default RUST_LOG=info, because what it leaves behind is other people's
+        // text at rest under a policy that no longer applies.
+        Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "re-keyed" = rekeyed,
+            "the summary cache could NOT be swept; entries produced under an older policy are \
+             still on disk"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -357,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
                 max_turns_per_conversation = retention.max_turns_per_conversation,
                 max_summaries = retention.max_summaries,
                 retain_days = retention.retain_days,
+                summary_retain_days = retention.summary_retain_days,
                 "durable state is ON. Conversation transcripts and read marks are written to \
                  this file at 0600 and survive a restart. Read marks are THIS SERVER'S OWN: \
                  nothing is read from or written back to the chat provider."
@@ -507,28 +571,15 @@ async fn main() -> anyhow::Result<()> {
         // passed while the field itself had been deleted — the assertion was reading the
         // sentence, not the value.
         "summaries are produced by this backend under this policy version; every cached summary \
-         is filed under the version, so changing any summary setting makes the old ones \
-         unreachable at once. When the field above is false, NOTHING is summarised and every long \
-         row shows as failed."
+         is filed under the version, so changing a setting that changes what a summary says makes \
+         the old ones unreachable at once. When the field above is false, NOTHING is summarised \
+         and every long row shows as failed."
     );
-    // The sweep. Without it a changed policy leaves the old entries on disk forever: unreachable,
-    // invisible, and still a copy of other people's text at rest.
-    match store.forget_summaries_except(&summary_version).await {
-        Ok(0) => {}
-        Ok(swept) => tracing::info!(
-            swept,
-            "deleted cached summaries produced under an older policy"
-        ),
-        // Not configured is not a failure: there is no cache, so there is nothing to sweep. A
-        // store that IS configured and could not be swept is a real fault and has to be visible
-        // at the default RUST_LOG=info, because what it leaves behind is other people's text at
-        // rest under a policy that no longer applies.
-        Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
-        Err(error) => tracing::warn!(
-            %error,
-            "the summary cache could NOT be swept; entries produced under an older policy are \
-             still on disk"
-        ),
+    keep_summaries_across_the_policy_change(store.as_ref(), &config, summarizer.as_ref()).await;
+    // `#208 persistent-cache`. Accepted so a rollback to this build starts with an overlay that
+    // turns the cache on; nothing reads it here.
+    if config.message_cache_ignored {
+        tracing::info!("[message_cache] is present; this build has no message cache");
     }
 
     // `#44 live-push`. Say the ingestion posture out loud in both directions, for the same reason
@@ -626,6 +677,7 @@ async fn main() -> anyhow::Result<()> {
         live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),
+        summary_counters: Arc::new(vibe_talk::summarize::counters::SummaryCounters::new()),
         thread_names: Arc::new(vibe_talk::summarize::threads::ThreadNames::new()),
     };
     // CHANNELS THE OWNER ADDED FROM INSIDE THE APP, brought back into the allowlist before the

@@ -24,15 +24,28 @@
 //!
 //! A cached summary is a derived value, and every derived value has the same failure: the inputs
 //! change and the cache does not notice. There are five inputs here — the prompt, the model, the
-//! target width (and the [`hard_cap_chars`] an answer is cut at, derived from it), how much
-//! surrounding context is included, and the message text itself — and four of them are
-//! configuration rather than data, so nothing about the message changes when they do.
+//! target width, how much surrounding context is included, and the message text itself — and four
+//! of them are configuration rather than data, so nothing about the message changes when they do.
 //!
 //! [`policy_version`] folds all four into one string, in ONE place, and that string is part of
 //! the cache key. Change any of them and every summary produced by the old policy becomes
 //! unreachable at once. The fifth input, the message text, is handled separately by
 //! [`crate::store::SummaryKey::content_hash`], because an upstream EDIT has to invalidate one
 //! entry rather than all of them.
+//!
+//! # Only what changes the wording
+//!
+//! `#208 persistent-cache`, milestone `summary-keep`. The version used to hash EVERY summary
+//! setting, including three that change no word of an answer: the threshold below which nothing
+//! is summarised, the reply deadline, and the [`hard_cap_chars`] an answer is cut at. Moving any
+//! of them made every stored summary unreachable and the startup sweep deleted them all, so the
+//! next view paid the model again for answers it already had; `#257 summary-truncation`'s deploy
+//! did exactly that to every summary on the host. [`policy_version_v2`] hashes only what changes
+//! the wording. The answer is stored UNCUT (up to [`stored_ceiling_chars`]) with the length it was
+//! cut at, if it was, and is cut to the cap in force when it is served ([`cut_for_serving`]), so a
+//! cap change needs no new answer unless a stored one was cut shorter than the new cap.
+//! [`policy_version_v1`] is the old function, kept so the first start can re-key the rows it
+//! filed rather than sweep them.
 //!
 //! # Untrusted input
 //!
@@ -46,6 +59,7 @@
 //! site can forget. A summary is still third-party text when it comes back.
 
 pub mod agent;
+pub mod counters;
 pub mod fake;
 pub mod messages_api;
 pub mod rate_limit;
@@ -121,11 +135,11 @@ pub const HARD_CAP_FLOOR_CHARS: usize = 600;
 /// The longest answer kept whole when `requested` characters were asked for: the larger of
 /// [`HARD_CAP_FACTOR`] times `requested` and [`HARD_CAP_FLOOR_CHARS`]. 640 for the default 160.
 ///
-/// An answer longer than this is cut at a word boundary and ends "…" (see
-/// [`agent::plain`], the one place every backend's answer passes through). Part of
-/// [`policy_version`], so a change to it re-derives every summary and thread sentence written under
-/// the old one — the first one being the cut at exactly `requested` that `#257 summary-truncation`
-/// replaced.
+/// An answer longer than this is SERVED cut at a word boundary, ending "…" ([`cut_for_serving`]).
+/// It is not part of [`policy_version`] any more (`#208 persistent-cache`): an answer is stored
+/// uncut up to [`stored_ceiling_chars`], so moving the cap moves where a stored answer is cut, not
+/// whether it is reachable. It was part of [`policy_version_v1`], which is why
+/// `#257 summary-truncation` re-derived every summary on its host.
 #[must_use]
 pub const fn hard_cap_chars(requested: usize) -> usize {
     let scaled = requested.saturating_mul(HARD_CAP_FACTOR);
@@ -134,6 +148,57 @@ pub const fn hard_cap_chars(requested: usize) -> usize {
     } else {
         HARD_CAP_FLOOR_CHARS
     }
+}
+
+/// How many times the hard cap a STORED answer may run before it is cut. `#208 persistent-cache`.
+///
+/// Only a safety ceiling: an answer that follows the instruction is nowhere near
+/// [`hard_cap_chars`], let alone four times it. What it bounds is a model that ignored the
+/// instruction, so one such answer cannot put an essay in a row of the store.
+pub const STORED_CAP_FACTOR: usize = 4;
+
+/// The longest answer stored whole when `requested` characters were asked for:
+/// [`STORED_CAP_FACTOR`] times [`hard_cap_chars`]. 2,560 for the default 160.
+#[must_use]
+pub const fn stored_ceiling_chars(requested: usize) -> usize {
+    hard_cap_chars(requested).saturating_mul(STORED_CAP_FACTOR)
+}
+
+/// A stored summary or thread sentence as it is handed out: cut at the cap in force now,
+/// [`hard_cap_chars`] of `requested`, at a word boundary and ending "…" if it runs past it.
+/// `#208 persistent-cache`.
+///
+/// Every place a stored or generated answer leaves this server goes through here. The stored text
+/// was already flattened ([`agent::plain_uncut`]), and cutting flattened text again lands exactly
+/// where one cut would have (a test in [`crate::summary`] holds that), so what a reader sees does
+/// not depend on whether it came from the model or from the store.
+#[must_use]
+pub fn cut_for_serving(stored: &str, requested: usize) -> String {
+    crate::summary::condense(stored, hard_cap_chars(requested))
+}
+
+/// Whether a stored answer was cut shorter than the cap now in force, so serving it would show
+/// less than a fresh answer would. `#208 persistent-cache`.
+///
+/// For a write-scope caller that is a miss: the answer is asked for again and filed. A read-scope
+/// caller, which may never file anything, is served the shorter text with no model call.
+#[must_use]
+pub fn cut_below_cap(cut_at: Option<u32>, requested: usize) -> bool {
+    cut_at.is_some_and(|at| usize::try_from(at).is_ok_and(|at| at < hard_cap_chars(requested)))
+}
+
+/// What a summariser answers. `#208 persistent-cache`.
+///
+/// `text` is flattened and NOT cut at the cap: it runs to [`stored_ceiling_chars`] at most, and is
+/// cut for serving by [`cut_for_serving`]. `cut_at` is that ceiling when the answer ran past it and
+/// was cut there, and `None` when the whole answer is here. A provider's own output cap (for
+/// example a Messages API `max_tokens` stop) is not a cut of ours and leaves it `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summary {
+    /// The answer, flattened, uncut up to the ceiling.
+    pub text: String,
+    /// Where it was cut, when it was.
+    pub cut_at: Option<u32>,
 }
 
 /// One thing to summarise, what it is allowed to cost, and the prompt that says so.
@@ -283,13 +348,14 @@ pub trait Summarizer: Send + Sync {
         Err(SummaryError::NotConfigured("summaries.llm"))
     }
 
-    /// Summarise one message.
+    /// Summarise one message: the answer flattened and uncut up to the stored ceiling. See
+    /// [`Summary`].
     ///
     /// # Errors
     ///
     /// [`SummaryError`] when a setting is absent, the backend cannot be reached, or the answer
     /// cannot be understood.
-    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError>;
+    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError>;
 }
 
 /// A change detector over everything that decides what a summary says.
@@ -301,7 +367,10 @@ pub trait Summarizer: Send + Sync {
 /// the fix is a real hash, not a longer FNV.
 ///
 /// Rendered readably on purpose: a stale entry on disk is diagnosed by looking at the path it is
-/// under, so `v1-elevenlabs-agent-w3-c160-8f1b...` has to be legible to a person with a shell.
+/// under, so `v2-elevenlabs-agent-w3-c160-8f1b...` has to be legible to a person with a shell.
+///
+/// This is [`policy_version_v2`], which hashes only what changes the wording; see the module
+/// documentation.
 #[must_use]
 pub fn policy_version(config: &SummariesConfig, backend: &str) -> String {
     policy_version_of(PROMPT, config, backend)
@@ -323,14 +392,83 @@ pub fn policy_version_for(config: &SummariesConfig, summarizer: &dyn Summarizer)
 /// change every version equally and be invisible.
 #[must_use]
 pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) -> String {
-    policy_version_capped(prompt, config, backend, hard_cap_chars(config.target_chars))
+    policy_version_v2(prompt, config, backend)
 }
 
-/// [`policy_version_of`] with the hard cap supplied.
+/// The version every summary is filed under from `#208 persistent-cache` on: a hash of exactly
+/// what changes what a summary SAYS, and nothing else.
 ///
-/// For the same reason that function exists: the cap is computed from constants and
-/// `target_chars`, so without this no test could move the cap alone and prove it is folded in.
-fn policy_version_capped(
+/// That is the prompt (with whatever the backend adds, [`Summarizer::policy_input`]), the backend,
+/// `model`, `target_chars`, `context_messages`, `max_per_socket`, `socket_idle_seconds`, and the
+/// `[summaries.llm]` dialect, model and output budget. Three settings are deliberately NOT here:
+///
+/// * `threshold_chars` decides WHICH messages are summarised, not what a summary says;
+/// * `reply_timeout_seconds` decides how long one is waited for;
+/// * the [`hard_cap_chars`] an answer is cut at decides how much of a stored answer is SHOWN, and
+///   the answer is stored uncut ([`Summary`]).
+///
+/// [`policy_version_v1`] folded all three in, under a rule of "every field", and paid for it with
+/// a full re-summarisation whenever one moved. A setting added to [`SummariesConfig`] later must be
+/// decided here one way or the other: the unit tests below enumerate every field and fail on one
+/// they do not name.
+#[must_use]
+pub fn policy_version_v2(prompt: &str, config: &SummariesConfig, backend: &str) -> String {
+    // `[summaries.llm]`: only what changes the WORDING — see `LlmConfig` for why endpoints,
+    // credentials, timeouts and the rate limit are deliberately not here. Hashed ONLY when the
+    // section is present.
+    let llm = config
+        .llm
+        .as_ref()
+        .map(|llm| format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens));
+    let mut hash = FNV_OFFSET;
+    for part in [
+        prompt,
+        backend,
+        config.model.as_deref().unwrap_or(""),
+        // The two numbers go through the hash as well as into the readable prefix, so a future
+        // field that is not given a prefix still changes the version.
+        &config.target_chars.to_string(),
+        &config.context_messages.to_string(),
+        // How many summaries share one conversation decides how much of the PREVIOUS summaries
+        // the agent still has in front of it when it writes this one, so it changes the wording
+        // — see `agent::DEFAULT_MAX_PER_SOCKET`. So does the idle timeout, which is the other way
+        // a socket is retired.
+        &config.max_per_socket.to_string(),
+        &config.socket_idle_seconds.to_string(),
+    ]
+    .into_iter()
+    .chain(llm.as_deref())
+    {
+        hash = fnv1a64(hash, part.as_bytes());
+        // A separator, so ("ab", "c") and ("a", "bc") do not hash the same.
+        hash = fnv1a64(hash, &[0x1f]);
+    }
+    format!(
+        "v2-{backend}-w{}-c{}-{hash:016x}",
+        config.context_messages, config.target_chars
+    )
+}
+
+/// [`policy_version_v1`] for the summariser that is actually running, under the cap that version
+/// folded in. For the first start after `#208 persistent-cache` only: it names the rows the
+/// previous build filed, so they can be re-keyed rather than swept.
+#[must_use]
+pub fn policy_version_v1_for(config: &SummariesConfig, summarizer: &dyn Summarizer) -> String {
+    policy_version_v1(
+        summarizer.policy_input(),
+        config,
+        summarizer.backend(),
+        hard_cap_chars(config.target_chars),
+    )
+}
+
+/// The version summaries were filed under BEFORE `#208 persistent-cache`, kept byte for byte so
+/// the migration can find them. Never used to file anything. A golden test pins its output.
+///
+/// It hashed every summary setting — the threshold, the reply deadline and the cap included — so
+/// any of them moving made every stored summary unreachable. See [`policy_version_v2`].
+#[must_use]
+pub fn policy_version_v1(
     prompt: &str,
     config: &SummariesConfig,
     backend: &str,
@@ -445,73 +583,101 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_input_that_changes_a_summary_changes_the_version() {
-        // The one test that stops the silent-stale-summary failure. Each case moves exactly one
-        // input and requires the version to move with it; the list is exhaustive over
-        // `SummariesConfig` on purpose, because a field added later without a line here is a
-        // field the cache cannot see. (`SummariesConfig` no longer has a backend field: there is
-        // one summariser, and the slug it contributes is the separate `backend` case below.)
-        let base = policy_version(&config(), agent::BACKEND);
-
-        let mut wider = config();
-        wider.target_chars += 1;
-        let mut more_context = config();
-        more_context.context_messages += 1;
-        let mut lower_threshold = config();
-        lower_threshold.threshold_chars += 1;
-        let mut with_model = config();
-        with_model.model = Some("some-model".to_owned());
-        let mut deeper_socket = config();
-        deeper_socket.max_per_socket += 1;
-        let mut longer_idle = config();
-        longer_idle.socket_idle_seconds += 1;
-        let mut longer_deadline = config();
-        longer_deadline.reply_timeout_seconds += 1;
-
-        for (what, changed) in [
-            ("target_chars", policy_version(&wider, agent::BACKEND)),
+    /// Every field of `SummariesConfig`, each moved by one, with whether it changes the WORDING.
+    ///
+    /// Exhaustive on purpose: a field added later without a line here is a field nobody decided
+    /// about, and `policy_version_v2` hashes only the ones marked `true`. (`SummariesConfig` has no
+    /// backend field: the slug the summariser contributes is the separate `backend` case.)
+    fn every_field_moved() -> Vec<(&'static str, bool, SummariesConfig)> {
+        let moved = |change: fn(&mut SummariesConfig)| {
+            let mut config = config();
+            change(&mut config);
+            config
+        };
+        // Destructured so a new field fails to compile here until it is given a line below.
+        let SummariesConfig {
+            threshold_chars: _,
+            target_chars: _,
+            context_messages: _,
+            model: _,
+            max_per_socket: _,
+            socket_idle_seconds: _,
+            reply_timeout_seconds: _,
+            llm: _,
+        } = config();
+        vec![
+            ("target_chars", true, moved(|c| c.target_chars += 1)),
+            ("context_messages", true, moved(|c| c.context_messages += 1)),
             (
-                "context_messages",
-                policy_version(&more_context, agent::BACKEND),
+                "model",
+                true,
+                moved(|c| c.model = Some("some-model".to_owned())),
             ),
-            (
-                "threshold_chars",
-                policy_version(&lower_threshold, agent::BACKEND),
-            ),
-            ("model", policy_version(&with_model, agent::BACKEND)),
-            (
-                "max_per_socket",
-                policy_version(&deeper_socket, agent::BACKEND),
-            ),
+            ("max_per_socket", true, moved(|c| c.max_per_socket += 1)),
             (
                 "socket_idle_seconds",
-                policy_version(&longer_idle, agent::BACKEND),
+                true,
+                moved(|c| c.socket_idle_seconds += 1),
             ),
+            ("llm", true, with_llm(|_| {})),
+            ("threshold_chars", false, moved(|c| c.threshold_chars += 1)),
             (
                 "reply_timeout_seconds",
-                policy_version(&longer_deadline, agent::BACKEND),
+                false,
+                moved(|c| c.reply_timeout_seconds += 1),
             ),
-            ("backend", policy_version(&config(), "http")),
-            ("llm", policy_version(&with_llm(|_| {}), agent::BACKEND)),
-        ] {
-            assert_ne!(
-                base, changed,
-                "changing {what} left the cache key unchanged, so every summary it produced would \
-                 keep being served"
-            );
+        ]
+    }
+
+    #[test]
+    fn every_input_that_changes_the_wording_changes_the_version() {
+        // The one test that stops the silent-stale-summary failure. Each case moves exactly one
+        // input and requires the version to move with it.
+        let base = policy_version(&config(), agent::BACKEND);
+        for (what, wording, changed) in every_field_moved() {
+            if wording {
+                assert_ne!(
+                    base,
+                    policy_version(&changed, agent::BACKEND),
+                    "changing {what} left the cache key unchanged, so every summary it produced \
+                     would keep being served"
+                );
+            }
+        }
+        assert_ne!(
+            base,
+            policy_version(&config(), "http"),
+            "changing the backend left the cache key unchanged"
+        );
+    }
+
+    #[test]
+    fn a_setting_that_changes_no_word_of_a_summary_keeps_every_summary() {
+        // `#208 persistent-cache`. The threshold decides WHICH messages are summarised and the
+        // deadline how long one is waited for; neither changes a word of an answer, and moving one
+        // used to make every stored summary unreachable and have the next start delete them all.
+        let base = policy_version(&config(), agent::BACKEND);
+        for (what, wording, changed) in every_field_moved() {
+            if !wording {
+                assert_eq!(
+                    base,
+                    policy_version(&changed, agent::BACKEND),
+                    "changing {what} moved the cache key, though it cannot change a summary: every \
+                     summary would be asked for again"
+                );
+            }
         }
     }
 
     /// The version as it is built from an exact list of parts, so a test can say which parts.
-    fn version_from_parts(config: &SummariesConfig, parts: &[&str]) -> String {
+    fn version_from_parts(prefix: &str, config: &SummariesConfig, parts: &[&str]) -> String {
         let mut hash = FNV_OFFSET;
         for part in parts {
             hash = fnv1a64(hash, part.as_bytes());
             hash = fnv1a64(hash, &[0x1f]);
         }
         format!(
-            "v1-{}-w{}-c{}-{hash:016x}",
+            "{prefix}-{}-w{}-c{}-{hash:016x}",
             agent::BACKEND,
             config.context_messages,
             config.target_chars
@@ -519,12 +685,11 @@ mod tests {
     }
 
     #[test]
-    fn without_an_llm_section_the_version_hashes_exactly_its_own_parts_and_nothing_appended() {
-        // A deployment without `[summaries.llm]` is keyed by precisely these parts, in this order,
-        // with nothing appended for the absent section — not even an empty part and its
-        // separator — so adding that section to the code (`#233 llm-summarizer`) did not empty an
-        // ElevenLabs-only deployment's cache. The last part is the hard cap, which
-        // `#257 summary-truncation` added ON PURPOSE: see the test after this one.
+    fn the_version_hashes_exactly_the_wording_and_nothing_appended() {
+        // Precisely these parts, in this order, with nothing appended for an absent
+        // `[summaries.llm]` — not even an empty part and its separator. In particular there is no
+        // cap: an answer is stored uncut and cut when served, so a cap change moves where a stored
+        // answer is cut and not whether it can be found (`#208 persistent-cache`).
         let config = SummariesConfig {
             model: Some("some-model".to_owned()),
             ..config()
@@ -532,11 +697,47 @@ mod tests {
         assert_eq!(
             policy_version_of(PROMPT, &config, agent::BACKEND),
             version_from_parts(
+                "v2",
                 &config,
                 &[
                     PROMPT,
                     agent::BACKEND,
                     "some-model",
+                    &config.target_chars.to_string(),
+                    &config.context_messages.to_string(),
+                    &config.max_per_socket.to_string(),
+                    &config.socket_idle_seconds.to_string(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn the_previous_version_is_kept_byte_for_byte_for_the_migration() {
+        // GOLDEN. `policy_version_v1` names the rows every build before `#208 persistent-cache`
+        // filed; the first start re-keys them from it. If this string moves, the re-key finds
+        // nothing and the sweep deletes every summary on the host — the failure the milestone
+        // exists to stop. It must never be edited to make this test pass.
+        assert_eq!(
+            policy_version_v1(PROMPT, &config(), agent::BACKEND, hard_cap_chars(160)),
+            "v1-elevenlabs-agent-w3-c160-75ba8b1506ab0af4"
+        );
+        // ...and it is still built from every part it was built from, the cap included.
+        let config = config();
+        assert_eq!(
+            policy_version_v1(
+                PROMPT,
+                &config,
+                agent::BACKEND,
+                hard_cap_chars(config.target_chars)
+            ),
+            version_from_parts(
+                "v1",
+                &config,
+                &[
+                    PROMPT,
+                    agent::BACKEND,
+                    "",
                     &config.target_chars.to_string(),
                     &config.context_messages.to_string(),
                     &config.threshold_chars.to_string(),
@@ -547,45 +748,15 @@ mod tests {
                 ],
             )
         );
-    }
-
-    #[test]
-    fn summaries_cut_at_the_requested_length_are_not_served_after_the_cap_moved() {
-        // `#257 summary-truncation`. Before it, every answer was cut at exactly `target_chars`
-        // and the version had no cap part. A version that still came out the same would keep
-        // serving those cut sentences forever — the very ones the owner reported.
-        let config = config();
-        let before = version_from_parts(
-            &config,
-            &[
-                PROMPT,
-                agent::BACKEND,
-                "",
-                &config.target_chars.to_string(),
-                &config.context_messages.to_string(),
-                &config.threshold_chars.to_string(),
-                &config.max_per_socket.to_string(),
-                &config.socket_idle_seconds.to_string(),
-                &config.reply_timeout_seconds.to_string(),
-            ],
-        );
-        assert_ne!(policy_version(&config, agent::BACKEND), before);
-    }
-
-    #[test]
-    fn the_hard_cap_is_part_of_the_version_and_the_version_moves_with_it() {
-        let config = config();
-        let cap = hard_cap_chars(config.target_chars);
-        assert_eq!(
-            policy_version_of(PROMPT, &config, agent::BACKEND),
-            policy_version_capped(PROMPT, &config, agent::BACKEND, cap),
-            "the shipped version must be built with the shipped cap"
-        );
         assert_ne!(
-            policy_version_capped(PROMPT, &config, agent::BACKEND, cap),
-            policy_version_capped(PROMPT, &config, agent::BACKEND, cap + 1),
-            "moving the cap left the cache key unchanged, so answers cut at the old cap would \
-             keep being served"
+            policy_version_v1(PROMPT, &config, agent::BACKEND, 640),
+            policy_version_v1(PROMPT, &config, agent::BACKEND, 641),
+            "the old version folded in the cap"
+        );
+        // The two can never be confused: no v2 version names a v1 row.
+        assert_ne!(
+            policy_version_v1(PROMPT, &config, agent::BACKEND, 640),
+            policy_version_of(PROMPT, &config, agent::BACKEND)
         );
     }
 
@@ -703,7 +874,7 @@ mod tests {
         // drifted apart, which is precisely the mismatch that makes a cache key unreadable.
         let rendered = policy_version(&config(), agent::BACKEND);
         assert!(
-            rendered.starts_with(&format!("v1-{}-w", agent::BACKEND)),
+            rendered.starts_with(&format!("v2-{}-w", agent::BACKEND)),
             "{rendered}"
         );
         assert!(
@@ -772,7 +943,7 @@ mod tests {
             fn policy_input(&self) -> &str {
                 "shout it"
             }
-            async fn summarize(&self, _: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+            async fn summarize(&self, _: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
                 unreachable!("this one never runs")
             }
         }
@@ -790,7 +961,7 @@ mod tests {
             fn policy_input(&self) -> &str {
                 "whisper it"
             }
-            async fn summarize(&self, _: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+            async fn summarize(&self, _: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
                 unreachable!("this one never runs either")
             }
         }

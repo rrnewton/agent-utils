@@ -284,6 +284,7 @@ fn state_pieces_with(
             summarizer.as_ref(),
         )
         .into(),
+        summary_counters: Arc::new(crate::summarize::counters::SummaryCounters::new()),
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
     };
     (state, fake, elevenlabs, store)

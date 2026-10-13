@@ -107,7 +107,7 @@ async fn a_configured_llm_section_is_the_summariser_the_summary_route_uses() {
     );
     let (state, discord, _store) = testing::state_with_backend(&text, summarizer);
     assert!(
-        state.summary_version.starts_with("v1-messages-api-"),
+        state.summary_version.starts_with("v2-messages-api-"),
         "{}",
         state.summary_version
     );
@@ -488,7 +488,7 @@ async fn a_thread_list_read_by_the_owner_names_its_threads_in_the_background() {
         .await
         .expect("readable")
         .expect("filed");
-    let name: FiledName = serde_json::from_str(&name).expect("a name row");
+    let name: FiledName = serde_json::from_str(&name.text).expect("a name row");
     assert!(name.name.starts_with("thread-"), "{name:?}");
     let sentence = h
         .state
@@ -501,7 +501,7 @@ async fn a_thread_list_read_by_the_owner_names_its_threads_in_the_background() {
         .await
         .expect("readable")
         .expect("filed");
-    let sentence: FiledSentence = serde_json::from_str(&sentence).expect("a sentence row");
+    let sentence: FiledSentence = serde_json::from_str(&sentence.text).expect("a sentence row");
     assert_eq!(sentence.at, 1, "named at one message: the root");
 
     // A read with nothing due asks nothing.
@@ -647,6 +647,7 @@ async fn a_name_survives_a_policy_change_and_a_flood_of_newer_summaries() {
                     version: version.to_string(),
                 },
                 "an ordinary summary",
+                None,
             )
             .await
             .expect("cache");
@@ -783,6 +784,7 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
                     touched: old,
                 })
                 .unwrap(),
+                None,
             )
             .await
             .unwrap();
@@ -794,6 +796,7 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
                     at: 1,
                 })
                 .unwrap(),
+                None,
             )
             .await
             .unwrap();
@@ -809,7 +812,7 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
             .await
             .unwrap()
             .unwrap();
-        serde_json::from_str::<FiledName>(&text).unwrap()
+        serde_json::from_str::<FiledName>(&text.text).unwrap()
     };
     for _ in 0..100 {
         if touched().await.touched > old {

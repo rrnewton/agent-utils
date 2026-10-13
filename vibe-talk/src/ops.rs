@@ -2541,16 +2541,35 @@ pub struct Summarised {
 /// One message, summarised — from the cache when the policy and the text are unchanged. Read
 /// scope to ASK; write scope to leave anything behind.
 ///
-/// The ORDER here is load-bearing and is the whole of the issue's first requirement: the
-/// threshold is checked BEFORE the cache and before the summariser, so a short message costs
-/// neither a lookup nor a call. Then the cache, then the summariser, then the write.
+/// The ORDER here is load-bearing. The allowlist first, then what the page itself read in the
+/// last thirty seconds, then the threshold, then the store, and only then the chat provider and
+/// the summariser:
 ///
-/// `caller` is the scope the credential actually carries, and it decides ONE thing: whether the
-/// generated summary is filed. A read-scope token may SPEND the cache and may never FILL it. The
-/// read token is the one pasted into a hosted voice agent, and a durable write reachable from the
-/// least-trusted credential is precisely what the two-token split exists to prevent — see
-/// [`crate::http`] for the rule stated once. A read-scope caller therefore gets the same answer,
-/// generated every time, exactly as it would with no store configured at all.
+/// * **The threshold is checked BEFORE the cache and before the summariser**, so a short message
+///   costs neither a lookup nor a call.
+/// * **A hit costs no chat call when the row was just read.** `#208 persistent-cache`, milestone
+///   `summary-keep`. The page asks for a summary of a row it has just drawn, so the text is in
+///   [`crate::read_ahead`] already; a stored summary of exactly that text is answered from there,
+///   with no upstream read. That memory is the thirty-second one speech preparation uses, cleared
+///   by pushed edits and deletes, delta deletions and the purge, so a summary is never made from
+///   text older than the page was shown and a pushed delete is honoured at once. On a provider
+///   whose feed carries no deletes, a message deleted upstream in those thirty seconds can still
+///   have its stored summary served, which is the window speech preparation already accepts.
+/// * **Requests that miss together share one fetch.** Otherwise the channel window is read through
+///   the same per-channel turn speech preparation takes ([`crate::read_ahead::ReadAhead::window_turn`]),
+///   so twenty rows asked for at once cost one window read, not twenty.
+///
+/// `caller` is the scope the credential actually carries, and it decides what is WRITTEN. A
+/// read-scope token may SPEND the cache and may never FILL it: it is never filed, never keeps an
+/// entry alive, and is served a stored answer cut shorter than the cap now in force rather than
+/// asking for a longer one it could not keep. The read token is the one pasted into a hosted voice
+/// agent, and a durable write reachable from the least-trusted credential is precisely what the
+/// two-token split exists to prevent — see [`crate::http`] for the rule stated once. A write-scope
+/// hit more than a day old is kept alive ([`crate::store::StateStore::touch_summary`]), so the age
+/// limit counts from the last use.
+///
+/// What is stored is the answer uncut up to a generous ceiling; what is handed out is cut at the
+/// cap in force ([`crate::summarize::cut_for_serving`]).
 ///
 /// The summariser is a model being fed channel text, so the request is built through
 /// [`crate::summarize::SummaryRequest::new`], which frames it with [`crate::untrusted`] — the
@@ -2575,6 +2594,8 @@ pub async fn summarize_message(
 }
 
 /// Summarize messages from a selected thread without mixing in other threads' context.
+///
+/// See [`summarize_message`] for the order of work and what each scope may write.
 pub async fn summarize_message_scoped(
     state: &AppState,
     caller: crate::auth::Scope,
@@ -2584,25 +2605,65 @@ pub async fn summarize_message_scoped(
     limit: Option<u16>,
     thread_id: Option<&str>,
 ) -> Result<Summarised, OpError> {
-    let window = if let Some(thread_id) = thread_id {
-        if also.len() >= usize::from(MAX_PAGE) {
-            return Err(ChatError::Refused("too many messages in one summary".to_owned()).into());
+    // Before anything is recalled or fetched: a shared window fetch that finished after this
+    // instant is fresh enough to answer this request.
+    let began = std::time::Instant::now();
+    state.summary_counters.request();
+    if thread_id.is_some() && also.len() >= usize::from(MAX_PAGE) {
+        return Err(ChatError::Refused("too many messages in one summary".to_owned()).into());
+    }
+    let channel = allowed(state, channel_id).await?;
+    if let Some(thread_id) = thread_id {
+        validate_thread_id(thread_id)?;
+    }
+
+    // FROM MEMORY. Every message the row is made of, as the page was just handed it.
+    let mut ids = Vec::with_capacity(1 + also.len());
+    ids.push(message_id.to_owned());
+    ids.extend(also.iter().cloned());
+    let mut recalled = state.read_ahead.recall(&channel.id, thread_id, &ids);
+    if let Some(target) = combined_row(message_id, also, |id| recalled.remove(id)) {
+        if below_threshold(state, &target) {
+            return Ok(below_threshold_answer(channel));
         }
-        let (channel, target) =
-            message_by_id_scoped(state, channel_id, message_id, limit, Some(thread_id)).await?;
-        let mut messages = vec![target];
-        for id in also {
+        let key = summary_key(state, &channel, &target);
+        match stored_summary(state, caller, &key).await {
+            Stored::Serve { text, below_cap } => {
+                state.summary_counters.hit(true, below_cap);
+                return Ok(cached_answer(channel, text));
+            }
+            Stored::Miss { below_cap } => {
+                // A thread summary takes no context, and neither does a deployment configured for
+                // none: the text in hand is everything the summariser would be shown.
+                if thread_id.is_some() || state.config.summaries.context_messages == 0 {
+                    return generate_summary(state, caller, channel, &target, &[], key, below_cap)
+                        .await;
+                }
+            }
+        }
+    }
+
+    // UPSTREAM: the existing path, with the channel window shared between requests.
+    let window = if let Some(thread_id) = thread_id {
+        let fetching = std::time::Instant::now();
+        let mut messages = Vec::with_capacity(ids.len());
+        for id in &ids {
             let (_, message) =
                 message_by_id_scoped(state, channel_id, id, limit, Some(thread_id)).await?;
             messages.push(message);
         }
+        state.summary_counters.fetched(messages.len());
+        // As speech preparation does: the next request for these rows recalls them.
+        state
+            .read_ahead
+            .remember(&channel.id, Some(thread_id), &messages, fetching);
         Window {
             channel,
             messages,
             limit: state.effective_limit(limit),
         }
     } else {
-        messages(state, channel_id, limit).await?
+        shared_window(state, channel, limit, began).await?
     };
     let position = window
         .messages
@@ -2623,54 +2684,189 @@ pub async fn summarize_message_scoped(
     // reply threads from, and what the cache is filed under. Only the CONTENT is combined — and
     // because the cache key hashes that content, a row that later groups differently is a
     // different key rather than a stale hit.
-    let mut combined = window.messages[position].clone();
-    if !also.is_empty() {
-        let mut parts = vec![combined.content.clone()];
-        for id in also {
-            let extra = window
-                .messages
-                .iter()
-                .find(|m| m.id.as_str() == id.as_str())
-                .ok_or(OpError::UnknownMessage)?;
-            parts.push(extra.content.clone());
-        }
-        combined.content = parts.join("\n");
-    }
-    let target = &combined;
+    let target = combined_row(message_id, also, |id| {
+        window
+            .messages
+            .iter()
+            .find(|m| m.id.as_str() == id)
+            .cloned()
+    })
+    .ok_or(OpError::UnknownMessage)?;
 
-    if target.content.chars().count() < state.config.summaries.threshold_chars {
-        return Ok(Summarised {
-            channel: window.channel.clone(),
-            outcome: SummaryOutcome::BelowThreshold,
-            generated_in_ms: None,
-        });
+    if below_threshold(state, &target) {
+        return Ok(below_threshold_answer(window.channel));
     }
 
-    let key = crate::store::SummaryKey {
-        channel: window.channel.id.clone(),
-        message: target.id.clone(),
-        content_hash: crate::summarize::content_hash(&target.content),
-        version: state.summary_version.to_string(),
-    };
+    let key = summary_key(state, &window.channel, &target);
     // A store that is absent or broken degrades to "generate every time", loudly in the log and
     // silently to the caller. The alternative — refusing to summarise because the CACHE is not
     // configured — would make an optional durability feature a hard dependency of a read.
-    match state.store.cached_summary(&key).await {
-        Ok(Some(hit)) => {
-            return Ok(Summarised {
-                channel: window.channel.clone(),
-                outcome: SummaryOutcome::Cached(hit),
-                generated_in_ms: None,
-            })
+    let below_cap = match stored_summary(state, caller, &key).await {
+        Stored::Serve { text, below_cap } => {
+            state.summary_counters.hit(false, below_cap);
+            return Ok(cached_answer(window.channel, text));
         }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(%error, "summary cache unreadable; generating uncached"),
-    }
+        Stored::Miss { below_cap } => below_cap,
+    };
 
     let start = position.saturating_sub(state.config.summaries.context_messages);
     let context = &window.messages[start..position];
-    let request =
-        crate::summarize::SummaryRequest::new(target, context, state.config.summaries.target_chars);
+    generate_summary(
+        state,
+        caller,
+        window.channel.clone(),
+        &target,
+        context,
+        key,
+        below_cap,
+    )
+    .await
+}
+
+/// The row a summary is about: the message `message_id`, with the `also` messages' text joined on
+/// after it, one per line, in the order given. `None` when any of them cannot be found.
+fn combined_row(
+    message_id: &str,
+    also: &[String],
+    mut find: impl FnMut(&str) -> Option<Message>,
+) -> Option<Message> {
+    let mut combined = find(message_id)?;
+    if !also.is_empty() {
+        let mut parts = vec![combined.content.clone()];
+        for id in also {
+            parts.push(find(id)?.content);
+        }
+        combined.content = parts.join("\n");
+    }
+    Some(combined)
+}
+
+fn below_threshold(state: &AppState, target: &Message) -> bool {
+    target.content.chars().count() < state.config.summaries.threshold_chars
+}
+
+fn below_threshold_answer(channel: ChannelInfo) -> Summarised {
+    Summarised {
+        channel,
+        outcome: SummaryOutcome::BelowThreshold,
+        generated_in_ms: None,
+    }
+}
+
+fn cached_answer(channel: ChannelInfo, text: String) -> Summarised {
+    Summarised {
+        channel,
+        outcome: SummaryOutcome::Cached(text),
+        generated_in_ms: None,
+    }
+}
+
+fn summary_key(
+    state: &AppState,
+    channel: &ChannelInfo,
+    target: &Message,
+) -> crate::store::SummaryKey {
+    crate::store::SummaryKey {
+        channel: channel.id.clone(),
+        message: target.id.clone(),
+        content_hash: crate::summarize::content_hash(&target.content),
+        version: state.summary_version.to_string(),
+    }
+}
+
+/// What the store has for one key, from this caller's point of view.
+enum Stored {
+    /// Serve this, already cut for serving. `below_cap` when the stored answer was cut shorter
+    /// than the cap now in force (only ever served to a read-scope caller).
+    Serve { text: String, below_cap: bool },
+    /// Ask the summariser. `below_cap` when there IS an entry, cut shorter than the cap now in
+    /// force, and this write-scope caller is to replace it.
+    Miss { below_cap: bool },
+}
+
+/// Look `key` up for `caller`. Keeps a write-scope hit alive; writes nothing for a read-scope one.
+async fn stored_summary(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    key: &crate::store::SummaryKey,
+) -> Stored {
+    let requested = state.config.summaries.target_chars;
+    let may_write = caller >= crate::auth::Scope::Write;
+    match state.store.cached_summary(key).await {
+        Ok(Some(hit)) => {
+            let below_cap = crate::summarize::cut_below_cap(hit.cut_at, requested);
+            if below_cap && may_write {
+                return Stored::Miss { below_cap: true };
+            }
+            if may_write
+                && hit.made_at_ms < crate::store::now_ms() - crate::store::SUMMARY_TOUCH_AFTER_MS
+            {
+                if let Err(error) = state.store.touch_summary(key).await {
+                    tracing::warn!(%error, "a cached summary could not be kept alive");
+                }
+            }
+            Stored::Serve {
+                text: crate::summarize::cut_for_serving(&hit.text, requested),
+                below_cap,
+            }
+        }
+        Ok(None) | Err(crate::store::StoreError::Unavailable(_)) => {
+            Stored::Miss { below_cap: false }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "summary cache unreadable; generating uncached");
+            Stored::Miss { below_cap: false }
+        }
+    }
+}
+
+/// The channel window for a summary, read once for every request of the channel that misses at
+/// the same time: through the same turn speech preparation takes. `#208 persistent-cache`.
+///
+/// A request that waited behind a fetch which finished after it began, and was at least as wide as
+/// its own, rebuilds that window from memory instead of reading it again. If any message of it has
+/// been forgotten since — an edit or a delete was pushed — it reads the window itself.
+async fn shared_window(
+    state: &AppState,
+    channel: ChannelInfo,
+    limit: Option<u16>,
+    began: std::time::Instant,
+) -> Result<Window, OpError> {
+    let width = window_limit(state, limit);
+    let mut turn = state.read_ahead.window_turn(&channel.id).await;
+    if let Some(read) = turn
+        .as_ref()
+        .filter(|read| read.finished >= began && read.limit >= width)
+    {
+        if let Some(messages) = state.read_ahead.recall_window(&channel.id, read) {
+            state.summary_counters.joined();
+            return Ok(Window {
+                channel,
+                messages,
+                limit: read.limit,
+            });
+        }
+    }
+    // `messages` remembers the window for everyone else as well.
+    let window = messages(state, channel.id.as_str(), limit).await?;
+    state.summary_counters.fetched(1);
+    *turn = Some(crate::read_ahead::WindowRead::of(&window));
+    Ok(window)
+}
+
+/// Ask the summariser, file the answer for a write-scope caller, and hand it out cut for serving.
+async fn generate_summary(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: ChannelInfo,
+    target: &Message,
+    context: &[Message],
+    key: crate::store::SummaryKey,
+    below_cap: bool,
+) -> Result<Summarised, OpError> {
+    state.summary_counters.miss();
+    let requested = state.config.summaries.target_chars;
+    let request = crate::summarize::SummaryRequest::new(target, context, requested);
     // Timed HERE rather than inside the summariser, so the number is the WHOLE cost of answering
     // — the vendor round trip plus everything this server does around it — rather than the part
     // the vendor happens to report. That is the number a reader waiting for a row is living
@@ -2687,8 +2883,13 @@ pub async fn summarize_message_scoped(
         "asked the summariser for one message"
     );
     let generated = generated?;
+    state.summary_counters.generated(below_cap);
     if caller >= crate::auth::Scope::Write {
-        if let Err(error) = state.store.cache_summary(&key, &generated).await {
+        if let Err(error) = state
+            .store
+            .cache_summary(&key, &generated.text, generated.cut_at)
+            .await
+        {
             tracing::warn!(%error, "summary could not be cached; it will be generated again");
         }
     } else {
@@ -2698,8 +2899,11 @@ pub async fn summarize_message_scoped(
         );
     }
     Ok(Summarised {
-        channel: window.channel,
-        outcome: SummaryOutcome::Generated(generated),
+        channel,
+        outcome: SummaryOutcome::Generated(crate::summarize::cut_for_serving(
+            &generated.text,
+            requested,
+        )),
         generated_in_ms: Some(generated_in_ms),
     })
 }

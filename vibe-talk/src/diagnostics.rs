@@ -34,6 +34,9 @@
 //!   lock and rolling back, precisely so that a READ-scope caller does not cause a durable write;
 //!   see [`crate::store::StateStore::check_writable`].
 //!
+//! Beside the checks, one section that is not a check: `summaries`, a copy of the summary route's
+//! counters, which are held in memory and are numbers only (`#208 persistent-cache`).
+//!
 //! # What has actually been exercised
 //!
 //! Every path below has been driven against this repository's in-memory Discord and in-memory
@@ -141,6 +144,9 @@ pub struct DiagnosticsReport {
     pub budget_seconds: u64,
     /// How long the run actually took.
     pub took_ms: u64,
+    /// How the summary route has spent its requests since this server started: numbers only, no
+    /// key, id or text. `#208 persistent-cache`; see [`crate::summarize::counters`].
+    pub summaries: crate::summarize::counters::SummaryCounts,
 }
 
 /// Redact every secret this deployment holds out of a string.
@@ -333,6 +339,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         checks,
         budget_seconds: TOTAL_BUDGET.as_secs(),
         took_ms: deadline.elapsed_ms(),
+        summaries: state.summary_counters.snapshot(),
     }
 }
 

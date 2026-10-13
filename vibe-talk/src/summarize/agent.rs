@@ -46,7 +46,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::Instant;
 
-use super::{Summarizer, SummaryError, SummaryRequest, PROMPT};
+use super::{Summarizer, Summary, SummaryError, SummaryRequest, PROMPT};
 use crate::config::{ElevenLabsConfig, SummariesConfig};
 use crate::elevenlabs::{ChatError, TextChat, TextChatProvider};
 
@@ -470,14 +470,32 @@ pub fn instruction(request: &SummaryRequest<'_>) -> String {
 /// `requested_chars` is the length the model was ASKED for, and the answer is NOT cut there. It is
 /// cut only past [`super::hard_cap_chars`] of it — 640 for the default 160 — at a word boundary,
 /// ending "…". `#257 summary-truncation`: cutting at the requested length turned every answer that
-/// ran one word long into a sentence that stopped mid-thought. Every backend's answer, and a thread
-/// sentence too ([`super::threads::parse_thread_answer`]), passes through here, so they all agree
-/// on where that is.
+/// ran one word long into a sentence that stopped mid-thought.
+///
+/// What is STORED is [`plain_uncut`]'s answer, and this is what serving it gives
+/// ([`super::cut_for_serving`]); the two agree by construction. `#208 persistent-cache`.
 #[must_use]
 pub fn plain(reply: &str, requested_chars: usize) -> String {
+    super::cut_for_serving(&plain_uncut(reply, requested_chars).0, requested_chars)
+}
+
+/// [`plain`]'s flattening, cut only at the stored ceiling ([`super::stored_ceiling_chars`], four
+/// times the hard cap), and the length it was cut at when it ran past that. `#208 persistent-cache`.
+///
+/// This is what is filed. The cap in force is applied when it is served, so a later cap change
+/// needs no new answer unless this one was cut shorter than the new cap. Every backend's answer,
+/// and a thread sentence too ([`super::threads::parse_thread_answer`]), passes through here, so
+/// they all agree on where that is.
+#[must_use]
+pub fn plain_uncut(reply: &str, requested_chars: usize) -> (String, Option<u32>) {
     let unmarked: Vec<String> = reply.lines().map(strip_line_markers).collect();
     let joined = unmarked.join(" ").replace("**", "").replace("__", "");
-    crate::summary::condense(&joined, super::hard_cap_chars(requested_chars))
+    let ceiling = super::stored_ceiling_chars(requested_chars);
+    let (text, cut) = crate::summary::condense_noting_cut(&joined, ceiling);
+    (
+        text,
+        cut.then(|| u32::try_from(ceiling).unwrap_or(u32::MAX)),
+    )
 }
 
 /// Drop a leading heading or list marker from one line.
@@ -541,10 +559,11 @@ impl Summarizer for AgentSummarizer {
         &self.inner.policy_input
     }
 
-    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
+    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
         let asked = instruction(request);
         let (reply, timing) = self.inner.turn(&asked).await.map_err(summary_from_chat)?;
-        let summary = plain(&reply, request.target_chars);
+        // Stored uncut, cut when served: see `plain_uncut`. `#208 persistent-cache`.
+        let (summary, cut_at) = plain_uncut(&reply, request.target_chars);
         // Not an empty success. A blank line on the page is indistinguishable from a summary that
         // has not loaded, and `condense`'s "(no text)" placeholder is worse — it is right for a
         // digest of a message with no words in it, and here it would be this server asserting that
@@ -568,7 +587,10 @@ impl Summarizer for AgentSummarizer {
             summary_chars = summary.chars().count(),
             "summarised one message with the ElevenLabs agent"
         );
-        Ok(summary)
+        Ok(Summary {
+            text: summary,
+            cut_at,
+        })
     }
 }
 
@@ -623,7 +645,7 @@ mod tests {
     async fn summarise(under: &AgentSummarizer, text: &str) -> Result<String, SummaryError> {
         let target = message(text);
         let request = SummaryRequest::new(&target, &[], 160);
-        under.summarize(&request).await
+        under.summarize(&request).await.map(|summary| summary.text)
     }
 
     #[tokio::test]
@@ -954,6 +976,50 @@ mod tests {
             wall.starts_with(&format!("{kept} ")),
             "the cut split a word: {kept:?}"
         );
+    }
+
+    #[test]
+    fn what_is_stored_is_cut_only_past_the_ceiling_and_says_where() {
+        // `#208 persistent-cache`. The stored answer runs to four times the hard cap, so a later
+        // cap change can be served from it; `cut_at` is set only when it really was cut.
+        let cap = super::super::hard_cap_chars(160);
+        let ceiling = super::super::stored_ceiling_chars(160);
+        assert_eq!(ceiling, 4 * cap);
+        let past_the_cap = sentence_of(cap + 200);
+        assert_eq!(
+            plain_uncut(&past_the_cap, 160),
+            (past_the_cap.clone(), None),
+            "an answer past the cap but within the ceiling is stored whole"
+        );
+        let at_the_ceiling = sentence_of(ceiling);
+        assert_eq!(plain_uncut(&at_the_ceiling, 160), (at_the_ceiling, None));
+        let wall = "alpha bravo charlie delta echo foxtrot ".repeat(120);
+        let (stored, cut_at) = plain_uncut(&wall, 160);
+        assert_eq!(cut_at, Some(u32::try_from(ceiling).expect("small")));
+        assert!(
+            stored.chars().count() <= ceiling,
+            "{}",
+            stored.chars().count()
+        );
+        assert!(stored.ends_with('…'), "{stored:?}");
+        // ...and serving what was stored is what the old single cut gave.
+        assert_eq!(
+            super::super::cut_for_serving(&stored, 160),
+            plain(&wall, 160)
+        );
+        assert_eq!(
+            super::super::cut_for_serving(&past_the_cap, 160),
+            plain(&past_the_cap, 160)
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_words_is_still_the_placeholder_and_never_counts_as_cut() {
+        assert_eq!(
+            plain_uncut("``\n  ``", 160),
+            (crate::summary::NO_TEXT.to_owned(), None)
+        );
+        assert_eq!(plain("   ", 160), crate::summary::NO_TEXT);
     }
 
     #[tokio::test]

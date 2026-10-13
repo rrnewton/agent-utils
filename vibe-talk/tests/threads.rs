@@ -390,7 +390,10 @@ async fn older_thread_messages_remain_addressable_for_summaries_and_speech() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["prepared"][0]["message_id"], "11");
-    assert_eq!(backend.lookups.lock().unwrap().len(), 3);
+    // Two lookups, not three: the summary route remembers the thread message it looked up, as
+    // speech preparation does, so the preparation right after it recalls the message rather than
+    // asking again. `#208 persistent-cache`.
+    assert_eq!(backend.lookups.lock().unwrap().len(), 2);
     let (_, config) = call(&app, "GET", "/api/v1/client-config", Some(READ_TOKEN), None).await;
     assert_eq!(config["threading_supported"], true);
     assert_eq!(config["chat_provider_name"], "Google Chat");

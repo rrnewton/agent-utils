@@ -58,11 +58,21 @@ pub struct DigestEntry {
 /// aloud is never what was wanted. The text that remains is the author's, unaltered.
 #[must_use]
 pub fn condense(content: &str, max_chars: usize) -> String {
+    condense_noting_cut(content, max_chars).0
+}
+
+/// [`condense`], and whether it had to cut to fit `max_chars`.
+///
+/// `#208 persistent-cache`: a stored summary records the length it was cut at, so a later, larger
+/// cap can tell an answer it holds whole from one it holds only the start of.
+#[must_use]
+pub fn condense_noting_cut(content: &str, max_chars: usize) -> (String, bool) {
     let flattened = flatten(content);
     if flattened.is_empty() {
-        return NO_TEXT.to_owned();
+        return (NO_TEXT.to_owned(), false);
     }
-    truncate_on_word_boundary(&flattened, max_chars)
+    let cut = flattened.chars().count() > max_chars;
+    (truncate_on_word_boundary(&flattened, max_chars), cut)
 }
 
 /// Build a digest entry for one message.
@@ -121,12 +131,16 @@ fn flatten(content: &str) -> String {
 
     let mut result = String::with_capacity(out.len());
     for word in out.split_whitespace() {
-        let cleaned = if word.starts_with("http://") || word.starts_with("https://") {
+        // Backticks off BEFORE the link test, so `https://...` in inline code is a link too. The
+        // other order kept that URL and let a second pass replace it, and `#208 persistent-cache`
+        // stores a flattened answer and cuts it again when serving: condensing twice must give
+        // what condensing once does.
+        let cleaned = word.trim_matches('`');
+        let cleaned = if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
             "[link]"
         } else {
-            word
+            cleaned
         };
-        let cleaned = cleaned.trim_matches('`');
         if cleaned.is_empty() {
             continue;
         }
@@ -285,6 +299,102 @@ mod tests {
             digest_entry(&unstamped, 40).spoken_time,
             "2026-08-18T12:00:00+00:00",
             "an unstamped message must degrade to the raw instant, never to a blank"
+        );
+    }
+
+    /// A deterministic corpus of awkward texts: words of every length, links bare and in inline
+    /// code, fences closed and not, runs of whitespace, markdown, and characters wider than a byte.
+    /// No dependency: a xorshift over a fixed vocabulary, so a failure names a reproducible case.
+    fn corpus() -> Vec<String> {
+        const VOCABULARY: &[&str] = &[
+            "a",
+            "deploy",
+            "the",
+            "runner",
+            "stalled",
+            "overnight",
+            "supercalifragilisticexpialidocious-and-then-some-more-letters",
+            "https://example.invalid/path?q=1",
+            "`https://example.invalid/inline`",
+            "`code`",
+            "``",
+            "`",
+            "```",
+            "```rust\nfn main() {}\n```",
+            "\n",
+            "  ",
+            "\t",
+            "**bold**",
+            "…",
+            "café",
+            "naïve",
+            "[link]",
+            "(no text)",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..2_000)
+            .map(|_| {
+                let words = usize::try_from(next() % 160).expect("small");
+                let mut text = String::new();
+                for _ in 0..words {
+                    let pick = usize::try_from(next()).unwrap_or(0) % VOCABULARY.len();
+                    text.push_str(VOCABULARY[pick]);
+                    if next() % 3 != 0 {
+                        text.push(' ');
+                    }
+                }
+                text
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cutting_a_stored_answer_again_gives_what_cutting_it_once_would_have() {
+        // `#208 persistent-cache` stores an answer cut at a generous ceiling and cuts it to the cap
+        // in force when it is SERVED. That is only sound if the second cut lands exactly where a
+        // single cut at the cap would have: otherwise what a reader sees would depend on whether
+        // the answer came from the model or from the store.
+        for text in corpus() {
+            for cap in [9_usize, 10, 17, 40, 160, 600, 640] {
+                for ceiling in [cap, cap * 2, cap * 4, cap * 16] {
+                    assert_eq!(
+                        condense(&condense(&text, ceiling), cap),
+                        condense(&text, cap),
+                        "cap {cap}, ceiling {ceiling}, text {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cut_is_noted_only_when_something_was_cut() {
+        assert_eq!(
+            condense_noting_cut("build is green", 14),
+            ("build is green".to_owned(), false)
+        );
+        let (cut, noted) = condense_noting_cut("build is green", 13);
+        assert!(noted, "{cut:?}");
+        assert!(cut.ends_with('…'), "{cut:?}");
+        // Flattening is not cutting: a link replaced by its placeholder is not a shortened answer.
+        assert_eq!(
+            condense_noting_cut("see https://example.invalid/a/very/long/path", 14),
+            ("see [link]".to_owned(), false)
+        );
+        assert_eq!(condense_noting_cut("  ", 1), (NO_TEXT.to_owned(), false));
+    }
+
+    #[test]
+    fn a_link_in_inline_code_is_a_link() {
+        assert_eq!(
+            condense("see `https://example.invalid/x` now", 160),
+            "see [link] now"
         );
     }
 
