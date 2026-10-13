@@ -2726,6 +2726,11 @@ no durable store.
 resumed there.** `replay.transport = "client_data"` exists so the other path can be measured too:
 it carries the text on the initiation message under `dynamic_variables`, which depends on the
 agent's dashboard security settings permitting overrides and fails SILENTLY when they do not.
+That variable only reaches the agent through a `{{vibe_talk_resume}}` placeholder in the prompt
+pasted into its console, so on a call where the page replaces that prompt (`#272
+voice-agent-instructions`, "Instructions for the voice agent") the placeholder is gone with it: the
+page then sends the record as a `contextual_update` as well, straight after the initiation, and
+keeps the variable on the initiation so nothing configured at the vendor goes missing.
 
 ## Live push
 
@@ -3219,7 +3224,9 @@ instructions — which a unit test enforces. A bridge that fetches the
 profile once per call picks up a change to the owner's setting at its next call, with no change of
 its own; **a hosted agent whose prompt and per-tool approval were pasted into its console by hand
 must be given the new prompt, and the new approval for `post_reply`, every time the setting
-changes.**
+changes** — unless its security settings let a client override its system prompt: the voice page
+then hands it the assembled prompt as every call opens (`#272 voice-agent-instructions`), so only
+the `post_reply` approval at the vendor is still changed by hand.
 
 **Startup timing.** "It takes a while to start talking" is not actionable; which phase takes the
 while is. For each `vibe-talk-v1` call the page records milliseconds since Start for
@@ -4901,9 +4908,10 @@ owner's own texts for the agent:
   "keep answers under three sentences". Up to 4,000 characters.
 * **Edit the system prompt** — folded under it, because it is long and rarely changed: the base
   prompt itself, `prompts/voice-agent-system.txt`, for him to change. Up to 20,000 characters.
-  **Restore the shipped prompt** goes back to the file. His copy does not follow a newer shipped
-  prompt; the line under the box names the prompt version it was saved against when that is older
-  than the one this server ships.
+  **Restore the shipped prompt** goes back to the file; it deletes his copy, so the first tap only
+  arms it (its word and colour change, as Clear's do) and a second within four seconds acts. His
+  copy does not follow a newer shipped prompt; the line under the box names the prompt version it
+  was saved against when that is older than the one this server ships.
 
 Each box has its own **Save**, a write-scope `PUT /api/v1/voice-prompt`; nothing is kept until it
 is pressed, and saving one box leaves unsaved text in the other alone. Both texts are kept in the
@@ -4928,27 +4936,43 @@ says which:
   the prompt there is assembled with both texts, so both reach the next call with no change to the
   bridge.
 * `page` — a hosted agent (ElevenLabs) is configured in its vendor's console, and this page opens
-  its socket. When the owner has saved something, `GET /api/v1/voice-session` asks the vendor, beside
-  the mint, whether the agent's security settings allow a client to override its system prompt
+  its socket. `GET /api/v1/voice-session` asks the vendor, beside the mint, whether the agent's
+  security settings allow a client to override its system prompt
   (`platform_settings.overrides.conversation_config_override.agent.prompt.prompt`), and adds
   `agent_prompt` to the session:
   * allowed — `prompt_override`: the page puts the whole assembled prompt, written for a credential
     that may post and following the Sending switch, on the initiation frame as
-    `conversation_config_override.agent.prompt.prompt`. So an agent that allows it also stops
-    needing its prompt re-pasted when the switch changes;
+    `conversation_config_override.agent.prompt.prompt`. **Whether or not the owner saved anything**:
+    with nothing saved it is the shipped prompt, so the agent's send rules follow the switch at its
+    next call instead of waiting for a prompt pasted by hand. The prompt in the vendor's console is
+    then never used. With only instructions saved, the shipped base replaces the console prompt,
+    and the line under Instructions says so;
   * not allowed, not said, or the vendor did not answer within 2.5 seconds —
     `contextual_update`: the agent keeps its console prompt, and the page sends the heading and the
     additional instructions as a `contextual_update` straight after the initiation, before a resumed
     call's record. An edited base prompt cannot reach such an agent;
-  * not allowed and only the base was edited — `not_sent`: nothing is sent.
+  * not allowed and only the base was edited — `not_sent`: nothing is sent;
+  * not allowed and nothing saved — no `agent_prompt`: the initiation frame is exactly what it
+    always was.
+
+  The vendor's answer is kept for two minutes per agent, so most call starts do not wait on it; a
+  failure or a timeout is not kept, and is asked again at the next call. Two minutes is also how
+  long an operator who withdraws the permission at the vendor must wait (or restart the server)
+  before the page stops sending an override the agent now refuses.
 
   The override is sent only when the agent's configuration says it is allowed, because an override
   an agent does not allow is believed to end the conversation rather than be ignored. That belief
   comes from the vendor's documentation and has not been observed from this repository; nor has
   whether a `contextual_update` carries instructions as strongly as a prompt does. After each call
   the line under Instructions says what that call was given — above all when an edited prompt did
-  not reach it. With nothing of the owner's saved, nothing is asked and the initiation frame is
-  exactly what it always was.
+  not reach it.
+
+  **The override is always the write token's prompt.** This server cannot see which token the
+  operator gave the agent's MCP connection at the vendor, so it hands over the prompt for a
+  credential that may post. An agent holding only the read token should not be allowed the
+  override: it would be told it may send, and the server would refuse every send it tried. Settings
+  says this under Instructions on a hosted deployment, and the QUICKSTART says it where the
+  override is allowed.
 
 ### Typing is the other way to say something, on the same conversation
 
@@ -5327,7 +5351,11 @@ changes at once; the agent's prompt changes at its next call. An agent still on 
 whose `post_reply` now posts at once is kept honest by the `SENT.` result, but **change it between
 calls**, and
 re-paste the prompt of a hosted agent configured by hand (see "Registering it with an ElevenLabs
-agent").
+agent") — unless it lets the voice page replace its prompt, in which case its next call has the new
+rules (see "Instructions for the voice agent"); its `post_reply` approval at the vendor is changed
+by hand either way. Settings says which, beside the switch: on a deployment whose agent is hosted
+it shows a line saying what the switch does and does not reach, worded from what the last call's
+agent was given.
 
 **Off: `post_reply` posts.** It goes through `ops::reply`, the same function a confirmed proposal is
 posted with — the allowlist, the write policy, the emptiness check, reply targets and the splitting
@@ -5621,7 +5649,9 @@ sends" on, paste the `write-confirm` prompt and keep `post_reply` on **REQUIRE A
 off, paste the `write-direct` prompt (from `GET /api/v1/voice-agent` with the write token) and set
 `post_reply` to **auto**: the owner turned confirmation off, and a vendor prompt in front of every
 send would be the friction he removed. **A hand-configured agent does not follow a change by
-itself — re-paste both whenever the setting changes.**
+itself — re-paste both whenever the setting changes** — unless its security settings let a client
+override its system prompt: the voice page then hands it the prompt for the setting as every call
+opens (see "Instructions for the voice agent"), and only the approval is still changed by hand.
 
 **Say this plainly: the per-tool approval setting is enforced on ElevenLabs' side, and this server
 cannot verify it.** Nothing here can tell whether you configured approval correctly, or
