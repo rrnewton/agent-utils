@@ -6831,7 +6831,7 @@ function focusMinimally(node) {
 /** `focusList`, unless the reader is typing in a field still on screen, which is never taken from them. */
 function settleFocus() {
   const held = document.activeElement;
-  if (held && isTextField(held) && shownNode(held) && !behindThreadList(held)) return;
+  if (held && isTextField(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return;
   focusList(currentScreen === "main" ? paneFor(held) : null);
 }
 
@@ -6841,6 +6841,15 @@ function settleFocus() {
  */
 function behindThreadList(node) {
   return threadListOnScreen() && nodeWithin(leftEl("scroll-area"), node);
+}
+
+/**
+ * Whether `node` is in the right column while it is not drawn — two columns or the thread list just
+ * left, by a view key pressed in its box (`#281 view-keys`). Its `hidden` says nothing of that: the
+ * stylesheet takes the column away, and the browser then drops the focus on the page's body.
+ */
+function inColumnGone(node) {
+  return !sideColumnUp() && nodeWithin(leftEl("side-column"), node);
 }
 
 // --- scrolling
@@ -8017,11 +8026,12 @@ function chordMatches(chord, event) {
 /**
  * Whether `event` is the digit chord `chord` by the place of its key, on a layout whose digit row types
  * something else without Shift: on AZERTY Ctrl+1 reports "&", on the key a browser's own Ctrl+1 is read
- * from. `#281 view-keys`. Never for a key that types a digit, which is read as that digit.
+ * from. `#281 view-keys`. Never for a key that types a digit, which is read as that digit; nor with
+ * Shift held, which on QWERTY makes Ctrl+2 Ctrl+@ — another key, and not the view key.
  */
 function digitByPlace(chord, event) {
-  return Boolean(chord.mod) && /^[0-9]$/.test(chord.key) && !/^[0-9]$/.test(String(event.key || "")) &&
-    event.code === `Digit${chord.key}`;
+  return Boolean(chord.mod) && /^[0-9]$/.test(chord.key) && !event.shiftKey &&
+    !/^[0-9]$/.test(String(event.key || "")) && event.code === `Digit${chord.key}`;
 }
 
 /** A chord of one key that types a character: what the Settings switch turns off, and what never fires in a field. */

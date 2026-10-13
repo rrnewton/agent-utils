@@ -42694,6 +42694,16 @@ test("`#281 view-keys`: the thread list is the right column on its own, across t
   await page.settle();
   assert.equal(azerty.defaulted, false);
   assert.equal(page.el("thread-select").value, "main", "Ctrl+1 on AZERTY did not choose Main");
+  // But Shift held is another key: Ctrl+Shift+2 on QWERTY is Ctrl+@, on the key Ctrl+2 is read from, and
+  // chooses nothing. On AZERTY, Shift types the digit itself, which is read as that digit.
+  const shifted = await press(page, page.el("scroll-area"), "@", { ctrlKey: true, shiftKey: true, code: "Digit2" });
+  await page.settle();
+  assert.equal(shifted.defaulted, true, "Ctrl+Shift+2 was taken");
+  assert.equal(page.el("thread-select").value, "main", "Ctrl+Shift+2, Ctrl+@, chose All");
+  const typed = await press(page, page.el("scroll-area"), "2", { ctrlKey: true, shiftKey: true, code: "Digit2" });
+  await page.settle();
+  assert.equal(typed.defaulted, false);
+  assert.equal(page.el("thread-select").value, "flat", "Ctrl+Shift+é on AZERTY, which types 2, did not choose All");
   // A channel that is itself one thread has no list to show.
   const { page: scoped } = await scopedPage();
   await press(scoped, scoped.el("scroll-area"), "3", { ctrlKey: true });
@@ -42858,6 +42868,27 @@ test("`#281 view-keys`: in two columns the view picker says so and chooses, and 
   assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "choosing Thread list did not show it");
   assert.equal(picker.value, "threads");
   assert.equal(page.el("column-toggle").getAttribute("aria-pressed"), "false", "the layout button still says two columns");
+  // From the box of a thread selected on the right: one column, and the keys on the list on screen — not
+  // left in a box the stylesheet has just taken away, where the browser drops the focus on the body.
+  await press(page, page.el("side-scroll"), "4", { ctrlKey: true });
+  await page.settle();
+  // Its replies button: a click on the card itself only highlights it (`#279 thread-card-focus`).
+  await openerOf(cardRow(page, threadData().threads[0].id)).click();
+  await page.settle();
+  assert.equal(page.el("side-pane").hidden, false, "a card's replies button did not select its thread on the right");
+  for (const [key, value] of [["1", "main"], ["2", "flat"]]) {
+    if (!inTwoColumns(page)) {
+      await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
+      await page.settle();
+    }
+    assert.equal(page.el("side-pane").hidden, false, "two columns came back without the thread on the right");
+    event = await press(page, page.el("side-compose-text"), key, { ctrlKey: true });
+    await page.settle();
+    assert.equal(event.defaulted, false);
+    assert.equal(picker.value, value);
+    assert.ok(focused(page) && nodeWithinFixture(page.el("scroll-area"), focused(page)),
+      `Ctrl+${key} in the right column's box left the focus on ${focusName(page)}`);
+  }
 });
 
 test("`#229 desktop-two-column`: with no thread selected, a card per thread, newest activity at the foot (`#261`), saying the summariser's name and summary or else its first message", async () => {
