@@ -821,6 +821,7 @@ class FakeElement {
         if (at >= 0) {
           held.splice(at, 1);
         }
+        FakeElement.leftDocument(kid);
       }
       kid.parentNode = this;
     }
@@ -831,16 +832,78 @@ class FakeElement {
    * Replace EVERY child, the element's own text with them. `textContent` here stands for the text
    * node a browser would hold as a child, and `replaceChildren` removes that too: a title bar set
    * to "Reply" and then given child lines reads as its lines, not "Reply" and its lines.
+   *
+   * Every old child leaves the document, one put straight back as well — which is what a browser
+   * does, and why the focus or a selection in any of them does not survive it (`leftDocument`).
    */
   replaceChildren(...kids) {
     this.textContent = "";
     for (const old of this.children) {
       old.parentNode = null;
+      FakeElement.leftDocument(old);
     }
     for (const kid of kids) {
       kid.parentNode = this;
     }
     this.children = [...kids];
+  }
+
+  /** The first child, text included, or null, as the DOM names it. */
+  get firstChild() {
+    return this.children[0] || null;
+  }
+
+  /** The child after this one in its parent, text included, or null, as the DOM names it. */
+  get nextSibling() {
+    if (!this.parentNode) return null;
+    const kids = this.parentNode.children;
+    return kids[kids.indexOf(this) + 1] || null;
+  }
+
+  /**
+   * Put `node` in before `ref`, a child of this element — at the end for null — and nothing else
+   * moves, as the DOM's own `insertBefore`: only `node` leaves wherever it was. `#249
+   * search-highlight` and `#250 date-separators` put a hit, a line between rows or the bookmark's
+   * line into a row this way, so that whatever else is in the row stays in the document.
+   */
+  insertBefore(node, ref) {
+    if (ref !== null && ref !== undefined && ref.parentNode !== this) {
+      throw new Error("insertBefore: the node to insert before is not a child of this element");
+    }
+    if (node.parentNode) node.parentNode.removeChild(node);
+    const at = ref === null || ref === undefined ? this.children.length : this.children.indexOf(ref);
+    this.children.splice(at, 0, node);
+    node.parentNode = this;
+    return node;
+  }
+
+  /** Put `node` where the child `old` is: only `old` leaves the document, as the DOM's `replaceChild`. */
+  replaceChild(node, old) {
+    if (old.parentNode !== this) throw new Error("replaceChild: the node to replace is not a child of this element");
+    if (node.parentNode) node.parentNode.removeChild(node);
+    this.children.splice(this.children.indexOf(old), 1, node);
+    node.parentNode = this;
+    old.parentNode = null;
+    FakeElement.leftDocument(old);
+    return old;
+  }
+
+  /**
+   * `node` has just left the document. A browser takes the focus off whatever had it inside `node`
+   * — even when `node` is put straight back, as `replaceChildren` with the same children does — and
+   * the document's `activeElement` falls back to nothing. Counted in `focusLost`, so a test can say
+   * that nothing lost it. Only where a test turns it on (`FakeElement.detachBlurs`), as the focus
+   * test of the lines between rows does; `newPage` turns it off.
+   */
+  static leftDocument(node) {
+    if (!FakeElement.detachBlurs || !FakeElement.focused) return;
+    for (let at = FakeElement.focused; at; at = at.parentNode) {
+      if (at === node) {
+        FakeElement.focused = null;
+        FakeElement.focusLost += 1;
+        return;
+      }
+    }
   }
 
   /** Swap this element for another in place. A live turn's row is rebuilt as its text improves. */
@@ -855,6 +918,7 @@ class FakeElement {
     parent.children.splice(parent.children.indexOf(this), 1, node);
     node.parentNode = parent;
     this.parentNode = null;
+    FakeElement.leftDocument(this);
   }
 
   /** Detach one child. The details sheet a press-and-hold opens is closed by removing it. */
@@ -863,6 +927,7 @@ class FakeElement {
     if (at >= 0) {
       this.children.splice(at, 1);
       kid.parentNode = null;
+      FakeElement.leftDocument(kid);
     }
     return kid;
   }
@@ -1900,6 +1965,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const documentListeners = new Map();
   FakeElement.focused = null;
   FakeElement.focusVisible = false;
+  FakeElement.detachBlurs = false;
+  FakeElement.focusLost = 0;
   const document = {
     documentElement: page.documentElement,
     get activeElement() {
@@ -3209,6 +3276,10 @@ const TUNING_BANDS = {
   EXCERPT_PLACES: [1, 6,
     "places under a folded message before it says how many more (#249 search-highlight): none says " +
     "nothing, and many grow the line into a second copy of the message"],
+  SEARCH_MARK_DELAY_MS: [60, 250,
+    "the pause after the last keystroke before a search's hits are marked (#249 search-highlight): " +
+    "shorter marks and unmarks every match letter by letter as a word is typed at speed, longer and " +
+    "the marks visibly trail the rows the search has already chosen"],
   CLEAR_ARMED_MS: [1000, 20000,
     "the second tap that really clears: under a second the confirmation cannot be reached, over " +
     "twenty and a stray later tap still destroys the view"],
@@ -35928,7 +35999,8 @@ const RUN_THREAD = "spaces/A/threads/canary";
 const runId = (n) => `77000000000000${String(n).padStart(5, "0")}`;
 const readRunLineOf = (li) => li.children.find((node) => node.className === "read-run");
 /** What a run's line says of its messages, the days it brings (`#250 date-separators`) left out. */
-const runCountWords = (line) => String(line.textContent).replace(/ · [^…]+ …$/, " …");
+const runCountWords = (line) =>
+  String(line.textContent).replace(/\u2060/g, "").replace(/\u00a0/g, " ").replace(/ · [^…]+ …$/, " …");
 const collapsedRows = (page) =>
   page.el("discord-log").children.filter((li) => li.hasAttribute("data-read-run"));
 /**
@@ -43806,12 +43878,22 @@ test("`#251 author-filter`: the author filter sits left of Links, only while the
   }
   assert.match(cssBlock("#author-filter + #links-filter"), /margin-left:\s*calc\(-1 \* var\(--bar-gap\)\)/);
   // ...except on a narrow phone, where a third square on the line would take the field's room: there it
-  // hangs under the bar's left end, and the list makes room for it at its head.
+  // hangs under the bar's left end, and the list STARTS below it — its top edge moved down to the
+  // disc's foot and the room at its head given back — so a scrolled list runs under nothing.
   const narrow = mediaBody("(max-width: 400px)");
   assert.match(narrow, /#screen-main\[data-searching\] #author-filter\s*\{[^}]*position:\s*absolute[^}]*top:\s*calc\(100% \+ 1px \+ var\(--kinds-gap\)\)/,
     "on a narrow phone the author filter does not hang under the bar");
-  assert.match(narrow, /#screen-main\[data-searching\] #scroll-area\s*\{[^}]*var\(--toggle-hit\)/,
-    "on a narrow phone the list makes no room for the author filter under the bar");
+  const inset = /#screen-main\[data-searching\] #scroll-area\s*\{([^}]*)\}/.exec(narrow);
+  assert.ok(inset, "on a narrow phone the list is not placed under the author filter");
+  assert.match(inset[1], /--hang-foot:\s*calc\(var\(--float-line\) \+ var\(--search-bar\) \/ 2 \+ var\(--kinds-gap\) \+ var\(--toggle-hit\)\)/,
+    "the list's top is not the author filter's foot");
+  assert.match(inset[1], /margin-top:\s*var\(--hang-foot\)/, "the list does not start below the author filter");
+  assert.match(inset[1], /padding-top:\s*0\.35rem/, "the room at the list's head is not given back, so every row moves");
+  assert.match(inset[1], /mask-image:\s*linear-gradient\(to bottom, transparent 0, #000 0\.35rem\)/,
+    "the fade under the header reaches into the first row");
+  const kindsInset = /#screen-main\[data-searching\]\[data-link-kinds\] #scroll-area\s*\{([^}]*)\}/.exec(narrow);
+  assert.ok(kindsInset && /2 \* \(var\(--kinds-gap\) \+ var\(--toggle-hit\)\)/.test(kindsInset[1]) &&
+    /padding-top:\s*0\.35rem/.test(kindsInset[1]), "with the kinds of link up the list does not start under the disc below them");
   assert.match(cssBlock("#author-filter[aria-pressed=\"true\"]"), /color: var\(--accent\)/, "a filtering state does not say so");
 
   const page = newPage();
@@ -44082,6 +44164,24 @@ const excerptOf = (li) => li.children.find((kid) => kid.hasClass("search-excerpt
 /** What a row says, the lines drawn between rows (`#249`, `#250`) left out. */
 const rowWords = (li) => li.children.filter((kid) => !kid.hasClass("row-seam")).map((kid) => kid.text()).join("");
 
+/** How long after the last keystroke the hits are marked. */
+const SEARCH_MARK_DELAY_MS = sourceConstant("SEARCH_MARK_DELAY_MS");
+
+/** The marking a keystroke put off, as the page's timers hold it: how many are pending. */
+const marksPending = (page) => [...page.timers.values()].filter((timer) => timer.ms === SEARCH_MARK_DELAY_MS).length;
+
+/** Let the typing pause: the hits of what is typed are marked, as `SEARCH_MARK_DELAY_MS` after the last key. */
+async function typingPaused(page) {
+  page.expireTimers(SEARCH_MARK_DELAY_MS);
+  await page.settle();
+}
+
+/** Type `query` into the open bar and let the typing pause, so its hits are marked. */
+async function typeAndPause(page, query) {
+  await search(page, query);
+  await typingPaused(page);
+}
+
 test("`#249 search-highlight`: every hit of every term is marked where it is, whatever its case, and the row says what it said", async () => {
   const page = newPage();
   await signIn(page);
@@ -44092,8 +44192,7 @@ test("`#249 search-highlight`: every hit of every term is marked where it is, wh
     message({ id: "3", content: "**en**gine notes", content_html: "<p><strong>en</strong>gine notes</p>\n" }),
   ]);
   const before = rows.map(rowWords);
-  await search(page, "engine");
-  await page.settle();
+  await typeAndPause(page, "engine");
   assert.deepStrictEqual(hitsIn(rows[0]), ["Engine", "ENGINE", "engine"], "a hit is unmarked, or marked in the wrong case");
   assert.deepStrictEqual(hitsIn(rows[1]), [], "a row the search hides was marked");
   assert.equal(drawnMarkup(boxesOf(rows[2])[0]),
@@ -44101,19 +44200,19 @@ test("`#249 search-highlight`: every hit of every term is marked where it is, wh
     `a word half in bold is not marked whole, in its two pieces: ${drawnMarkup(boxesOf(rows[2])[0])}`);
   assert.deepStrictEqual(rows.map(rowWords), before, "marking the hits changed what a row says");
   // Two terms, and a quoted phrase: each term's hits; a phrase's only where it is whole.
-  await page.el("search-field").setValue("restart engine");
+  await typeAndPause(page, "restart engine");
   assert.deepStrictEqual(hitsIn(rows[0]), ["Engine", "restart", "ENGINE", "engine"]);
-  await page.el("search-field").setValue("\"engine room\"");
+  await typeAndPause(page, "\"engine room\"");
   assert.deepStrictEqual(hitsIn(rows[0]), ["engine room"], "a phrase was marked word by word");
   // Overlapping hits of two terms are one mark.
-  await page.el("search-field").setValue("engi gine");
+  await typeAndPause(page, "engi gine");
   assert.deepStrictEqual(hitsIn(rows[0]), ["Engine", "ENGINE", "engine"], "overlapping hits were marked twice");
   // Cleared, every mark goes and the text is whole again, a text node as it was.
   await page.el("search-field").setValue("");
   assert.deepStrictEqual(rows.flatMap(hitsIn), [], "a mark outlived the search");
   assert.equal(drawnMarkup(boxesOf(rows[2])[0]), '<div class="md"><p><strong>en</strong>gine notes</p>\n</div>');
   assert.deepStrictEqual(rows.map(rowWords), before);
-  await search(page, "engine");
+  await typeAndPause(page, "engine");
   await page.el("search-toggle").click();
   await page.settle();
   assert.deepStrictEqual(rows.flatMap(hitsIn), [], "closing the search left its marks");
@@ -44132,8 +44231,7 @@ test("`#249 search-highlight`: hits in code, in a link's words, a link's address
     message({ id: "4", content: "[engine-bot] Engine check, 9:05 AM ET. All green.",
       heading: { tag: "engine-bot", time: "9:05 AM ET", title: "Engine check", cut: 39 } }),
   ]);
-  await search(page, "engine");
-  await page.settle();
+  await typeAndPause(page, "engine");
   assert.deepStrictEqual(hitsIn(rows[0]), ["engine"], "a hit in code is not marked");
   assert.deepStrictEqual(hitsIn(rows[1]), ["engine"], "a hit in a link's words is not marked");
   const anchors = rows[1].descendants().filter((node) => node.tagName === "a");
@@ -44166,8 +44264,7 @@ test("`#249 search-highlight`: markup in a message stays text, and a mark is bui
     message({ id: "1", content: "<b>engine</b> & <script>engine()</script>" }),
   ]);
   const templates = page.templatesParsed;
-  await search(page, "engine");
-  await page.settle();
+  await typeAndPause(page, "engine");
   assert.deepStrictEqual(hitsIn(rows[0]), ["engine", "engine"]);
   assert.equal(rows[0].text().includes("<b>engine</b> & <script>engine()</script>"), true, "the text is not what was written");
   for (const tag of ["b", "script"]) assert.ok(!page.createdTags.includes(tag), `the text became a <${tag}>`);
@@ -44184,16 +44281,14 @@ test("`#249 search-highlight`: a combined row is marked in each of its messages,
     timestamp: new Date(Date.parse(first.timestamp) + 1500).toISOString() });
   const rows = await showDiscord(page, [first, second]);
   assert.equal(rows.length, 1, "the fixture made no combined row");
-  await search(page, "engine");
-  await page.settle();
+  await typeAndPause(page, "engine");
   assert.deepStrictEqual(boxesOf(rows[0]).map((box) => box.descendants().filter((n) => n.tagName === "mark").length), [1, 1]);
   // The call's transcript.
   await page.el("search-toggle").click();
   await startTalking(page);
   assistantSays(page, "the engine is warm");
   await page.settle();
-  await search(page, "warm");
-  await page.settle();
+  await typeAndPause(page, "warm");
   const turn = unfiltered(page, "transcript").find((li) => li.text().includes("engine is warm"));
   assert.deepStrictEqual(hitsIn(turn), ["warm"], "a turn of the call was not marked");
   assert.equal(said(turn), "the engine is warm");
@@ -44213,8 +44308,7 @@ test("`#249 search-highlight`: a folded message whose hit is past its fold says 
     message({ id: "4", content: "a short engine note" }),
   ]);
   assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the fixture's long message is not folded");
-  await search(page, "engine");
-  await page.settle();
+  await typeAndPause(page, "engine");
   const line = excerptOf(rows[0]);
   assert.ok(line, "a folded message with a hit past its fold says nothing about it");
   assert.equal(line.hidden, false);
@@ -44241,7 +44335,7 @@ test("`#249 search-highlight`: a folded message whose hit is past its fold says 
   await page.el("search-field").setValue("");
   assert.equal(excerptOf(rows[0]), undefined, "the line outlived the search");
   // A tap on it is a tap on the row, which opens the message.
-  await page.el("search-field").setValue("engine");
+  await typeAndPause(page, "engine");
   await tapRowAt(page, excerptOf(rows[0]));
   assert.equal(rows[0].getAttribute("data-collapsed"), "false", "a tap on the line did not open the message");
 });
@@ -44259,8 +44353,7 @@ test("`#249 search-highlight`: a redraw with the same search writes nothing, and
   await signIn(page);
   await showDiscord(page, Array.from({ length: 12 }, (_unused, i) =>
     message({ id: String(i + 1), content: i % 2 ? `engine report ${i}` : `${"long words. ".repeat(30)}engine at the end ${i}` })));
-  await search(page, "engine");
-  await page.settle();
+  await typeAndPause(page, "engine");
   const marks = page.el("discord-log").descendants().filter((n) => n.tagName === "mark").length;
   assert.ok(marks >= 12, `the fixture marked ${marks} hits`);
   const made = page.createdTags.length;
@@ -44281,6 +44374,7 @@ test("`#249 search-highlight`: a redraw with the same search writes nothing, and
     // The same query again — a redraw, as a poll's or a keystroke's — and the same rows.
     await page.el("search-field").setValue("engine");
     await page.settle();
+    assert.equal(marksPending(page), 0, "the same search put off a marking it has already made");
   } finally {
     FakeElement.prototype.replaceChildren = replace;
     FakeElement.prototype.getBoundingClientRect = rect;
@@ -44301,11 +44395,17 @@ function nodeWithinFixture(root, node) {
 // messages"." A line in each gap a filter choosing rows leaves, counting messages as a run does.
 
 /**
+ * The words a line between rows or a collapsed run's line says, as a reader reads them: the no-break
+ * spaces and word joiners that hold each side of its `·` together (`lineWords`) read as nothing more.
+ */
+const lineText = (line) => String(line.textContent).replace(/\u2060/g, "").replace(/\u00a0/g, " ");
+
+/**
  * Each row's gap lines as `[id, above, below]`, the words of each or null, for the rows drawing any:
  * the days a line says (`#250 date-separators`) and a day rule of its own left out.
  */
 function seamsOf(page, list = "discord-log") {
-  const words = (line) => (line ? String(line.textContent).replace(/ · [^…]+ …$/, " …") : null);
+  const words = (line) => (line ? lineText(line).replace(/ · [^…]+ …$/, " …") : null);
   return page.el(list).children.map((li) => {
     const line = (below) => li.children.find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below") === below);
     const above = li.getAttribute("data-seam") === "gap" ? line(false) : null;
@@ -44437,8 +44537,7 @@ test("`#249 search-highlight`: a redraw that changes nothing writes no line, and
 test("`#249 search-highlight`: the cards of the right column are marked where the search finds them", async () => {
   const page = await threadPage();
   await twoColumns(page);
-  await search(page, "root");
-  await page.settle();
+  await typeAndPause(page, "root");
   const cards = page.el("side-cards").children.filter((li) => !li.hasClass("search-hidden"));
   assert.ok(cards.length > 0, "no card matched the fixture's search");
   for (const card of cards) {
@@ -44472,7 +44571,7 @@ function linesOf(page, list = "discord-log") {
     const line = (below) => li.children.find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below") === below);
     const above = line(false);
     const under = line(true);
-    return [li.getAttribute("data-id"), li.getAttribute("data-seam"), above ? above.textContent : null, under ? under.textContent : null];
+    return [li.getAttribute("data-id"), li.getAttribute("data-seam"), above ? lineText(above) : null, under ? lineText(under) : null];
   }).filter(([, , above, below]) => above !== null || below !== null);
 }
 
@@ -44489,7 +44588,7 @@ function dayChannel() {
   ];
 }
 
-test("`#250 date-separators`: a rule above the first message of each day, at the device's midnight, with Yesterday and Today by name", async () => {
+test("`#250 date-separators`: a rule above the first message of each day, at the device's midnight, with Yesterday and Today by name and date", async () => {
   const page = newPage();
   clockAt(page, 10, 12);
   await signIn(page);
@@ -44498,8 +44597,8 @@ test("`#250 date-separators`: a rule above the first message of each day, at the
     ["1", "day", "Oct 3, Sat", null],
     ["2", "day", "Oct 4, Sun", null],
     ["4", "day", "Oct 6, Tue", null],
-    ["5", "day", "Yesterday", null],
-    ["6", "day", "Today", null],
+    ["5", "day", "Yesterday, Oct 11, Sun", null],
+    ["6", "day", "Today, Oct 12, Mon", null],
   ], "the days are not ruled off where they begin, or not said as the owner asked");
   const line = page.el("discord-log").children[0].children[0];
   assert.equal(line.className, "row-seam", "the rule is not the row's first child, ahead of its message");
@@ -44531,13 +44630,18 @@ test("`#250 date-separators`: filtered to sparse hits, the days in each gap are 
     ["4", "gap", "… 2 unmatched messages · Oct 4 – 6 …", null],
     ["6", "gap", "… 1 unmatched message · Yesterday – Today …", "… 1 unmatched message …"],
   ], "the days a filter skips are not one range on the gap's line");
+  // Each side of the `·` is held together, so a narrow line breaks between the count and the days.
+  assert.equal(rowWithId(page, "4").children[0].textContent, "…\u00a02\u00a0unmatched\u00a0messages\u00a0· Oct\u00a04\u00a0–\u2060\u00a06\u00a0…",
+    "a gap's line can break inside its count or its days");
+  assert.equal(rowWithId(page, "4").children[0].getAttribute("aria-label"), "2 unmatched messages · Oct 4 – 6",
+    "a screen reader is read the no-break spaces");
   // A gap that crosses no day says none; one across a month says both months; one before the first
   // match says the days it reaches, as does one after the last.
   await page.el("search-field").setValue("plain");
   assert.deepStrictEqual(linesOf(page), [
     ["2", "gap", "… 1 unmatched message · Oct 3 – 4 …", null],
     ["5", "gap", "… 1 unmatched message · Oct 6 – Yesterday …", null],
-    ["7", "gap", "… 1 unmatched message · Today …", null],
+    ["7", "gap", "… 1 unmatched message · Today, Oct 12, Mon …", null],
   ]);
   page.messages = [
     message({ id: "21", content: "engine late september", timestamp: localStamp(9, 29, 10) }),
@@ -44566,16 +44670,16 @@ test("`#250 date-separators`: a collapsed run's line says the days it brings, an
   await showDiscord(page, dayChannel());
   await chooseReadMode(page, "Collapse read");
   assert.equal(rowWithId(page, "2").getAttribute("data-read-run"), "head", "the fixture collapsed no run");
-  assert.equal(readRunLineOf(rowWithId(page, "2")).textContent, "… 3 read messages · Oct 4 – 6 …",
+  assert.equal(lineText(readRunLineOf(rowWithId(page, "2"))), "… 3 read messages · Oct 4 – 6 …",
     "the run's line does not say the days it covers");
   assert.deepStrictEqual(linesOf(page), [
-    ["1", "day", "Oct 3, Sat", null], ["5", "day", "Yesterday", null], ["6", "day", "Today", null],
+    ["1", "day", "Oct 3, Sat", null], ["5", "day", "Yesterday, Oct 11, Sun", null], ["6", "day", "Today, Oct 12, Mon", null],
   ], "a day inside the run has a rule of its own, or the next day has none");
   // A run within one day already said says no day.
   page.dealtWith.delete("4");
   await reReadChannel(page);
   await page.settle();
-  assert.equal(readRunLineOf(rowWithId(page, "2")).textContent, "… 2 read messages · Oct 4 …".replace("Oct 4", "Oct 4, Sun"));
+  assert.equal(lineText(readRunLineOf(rowWithId(page, "2"))), "… 2 read messages · Oct 4, Sun …");
   assert.deepStrictEqual(linesOf(page).map(([id]) => id), ["1", "4", "5", "6"]);
 });
 
@@ -44603,10 +44707,10 @@ test("`#250 date-separators`: the first redraw after midnight says Yesterday whe
   clockAt(page, 10, 12, 23);
   await signIn(page);
   await showDiscord(page, dayChannel());
-  assert.deepStrictEqual(linesOf(page).slice(-2).map(([, , words]) => words), ["Yesterday", "Today"]);
+  assert.deepStrictEqual(linesOf(page).slice(-2).map(([, , words]) => words), ["Yesterday, Oct 11, Sun", "Today, Oct 12, Mon"]);
   clockAt(page, 10, 13, 0);
   await reReadChannel(page);
-  assert.deepStrictEqual(linesOf(page).slice(-2).map(([, , words]) => words), ["Oct 11, Sun", "Yesterday"],
+  assert.deepStrictEqual(linesOf(page).slice(-2).map(([, , words]) => words), ["Oct 11, Sun", "Yesterday, Oct 12, Mon"],
     "the days were not said again once the device's day had turned");
 });
 
@@ -44666,13 +44770,13 @@ test("`#250 date-separators`: each column and the Pinned list say their own days
   await page.settle();
   // Main on the left: 200, 201, 203. The first thread on the right: 201, 202.
   assert.deepStrictEqual(linesOf(page, "discord-log").map(([id, , words]) => [id, words]),
-    [["200", "Oct 3, Sat"], ["201", "Oct 4, Sun"], ["203", "Today"]]);
+    [["200", "Oct 3, Sat"], ["201", "Oct 4, Sun"], ["203", "Today, Oct 12, Mon"]]);
   assert.deepStrictEqual(linesOf(page, "side-log").map(([id, , words]) => [id, words]),
-    [["201", "Oct 4, Sun"], ["202", "Yesterday"]], "the right column does not say its own days");
+    [["201", "Oct 4, Sun"], ["202", "Yesterday, Oct 11, Sun"]], "the right column does not say its own days");
   await page.setDesk(false);
   await showPinned(page);
   assert.deepStrictEqual(linesOf(page, "pinned-log").map(([id, , words]) => [id, words]),
-    [["200", "Oct 3, Sat"], ["203", "Today"]], "the Pinned list does not say its days");
+    [["200", "Oct 3, Sat"], ["203", "Today, Oct 12, Mon"]], "the Pinned list does not say its days");
 });
 
 test("`#250 date-separators`: replies gathered under their message, out of time order, say no day and move none", async () => {
@@ -44695,4 +44799,317 @@ test("`#250 date-separators`: replies gathered under their message, out of time 
   assert.deepStrictEqual(linesOf(page).map(([id, , words]) => [id, words]), [
     ["597", "Oct 3, Sat"], ["601", "Oct 4, Sun"], ["605", "Oct 7, Wed"], ["608", "Oct 10, Sat"],
   ], "a gathered reply was ruled off as though it were in time order");
+});
+
+// --- one day in the owner's words, and the polish before landing -----------------------------------
+//
+// The owner's wording for a single day: "Today, Oct 12, Mon" and "Yesterday, Oct 11, Sun" with the
+// date, "Oct 9, Fri" otherwise, and "Oct 9, 2025, Thu" when the year is not now's — Today and
+// Yesterday across New Year too: "Yesterday, Dec 31, 2025, Wed". One function, `dayLabel(when, now)`,
+// says it; a range stays compact. `dayLabel` is the time's tooltip's formatter (`#260 timestamp-hover`),
+// whose table above pins its words — today, yesterday, this year, another year, across New Year and
+// both clock changes — so a day rule is checked here to BE that function, not a copy of it.
+
+test("`#250 date-separators`: one day is said in the owner's words by `dayLabel`, the page's one wording of a day", async () => {
+  const dayLabel = newPage().pure("dayLabel");
+  await inZone("America/New_York", () => {
+    const at = (year, month, day, hour = 12, minute = 0) => new Date(year, month - 1, day, hour, minute);
+    assert.equal(dayLabel(at(2026, 10, 11, 17, 25), at(2026, 10, 12, 15, 56)), "Yesterday, Oct 11, Sun");
+    assert.equal(dayLabel(at(2025, 12, 31, 23, 50), at(2026, 1, 1, 0, 30)), "Yesterday, Dec 31, 2025, Wed");
+  });
+  // A day rule says exactly what `dayLabel` says of the day: the rule IS the function, not a copy.
+  assert.match(SCRIPT_CODE, /return dayLabel\(new Date\(year, month, day, 12\), clock\.now\);/,
+    "a day's rule words its day without `dayLabel`");
+  assert.equal((SCRIPT_CODE.match(/^function dayLabel\(/gm) || []).length, 1, "there is more than one wording of a day");
+  assert.equal((SCRIPT_CODE.match(/^const DAY_MONTHS = /gm) || []).length, 1, "the names of the months are kept twice");
+});
+
+test("`#250 date-separators`: a range stays compact — across a year, within a month of a past year, and ending Today or Yesterday", async () => {
+  const page = newPage();
+  const range = page.pure("dayRangeWords");
+  const clockNow = page.pure("dayClock");
+  clockAt(page, 10, 12);
+  const now = clockNow();
+  const cases = [
+    [20261007, 20261009, "Oct 7 – 9"],
+    [20260929, 20261002, "Sep 29 – Oct 2"],
+    [20251230, 20260102, "Dec 30, 2025 – Jan 2"],
+    [20241230, 20250102, "Dec 30, 2024 – Jan 2, 2025"],
+    [20251003, 20251005, "Oct 3 – 5, 2025"],
+    [20250929, 20251002, "Sep 29 – Oct 2, 2025"],
+    [20261009, 20261012, "Oct 9 – Today"],
+    [20261008, 20261011, "Oct 8 – Yesterday"],
+    [20261011, 20261012, "Yesterday – Today"],
+    [20251230, 20261012, "Dec 30, 2025 – Today"],
+    // One day is not a range: it is said as `dayLabel` says it.
+    [20261012, 20261012, "Today, Oct 12, Mon"],
+    [20251005, 20251005, "Oct 5, 2025, Sun"],
+  ];
+  for (const [from, to, want] of cases) assert.equal(range(from, to, now), want, `${from} to ${to}`);
+  // New Year's Day: the days before it are another year's, and the last of them is Yesterday.
+  page.setClock(new Date(2026, 0, 1, 9, 0).getTime());
+  const newYear = clockNow();
+  assert.equal(range(20251229, 20251231, newYear), "Dec 29, 2025 – Yesterday");
+  assert.equal(range(20251231, 20251231, newYear), "Yesterday, Dec 31, 2025, Wed");
+  assert.equal(range(20251231, 20260101, newYear), "Yesterday – Today");
+});
+
+test("`#250 date-separators`: a search's gaps across a year say both years where they differ from now's, and a past year's month once", async () => {
+  const page = newPage();
+  clockAt(page, 10, 12);
+  await signIn(page);
+  const at = (year, month, day) => new Date(year, month - 1, day, 10, 0).toISOString();
+  await showDiscord(page, [
+    message({ id: "1", content: "engine one", timestamp: at(2025, 10, 2) }),
+    message({ id: "2", content: "plain", timestamp: at(2025, 10, 3) }),
+    message({ id: "3", content: "plain", timestamp: at(2025, 10, 4) }),
+    message({ id: "4", content: "engine two", timestamp: at(2025, 10, 5) }),
+    message({ id: "5", content: "plain", timestamp: at(2025, 10, 30) }),
+    message({ id: "6", content: "plain", timestamp: at(2025, 11, 2) }),
+    message({ id: "7", content: "engine three", timestamp: at(2025, 11, 3) }),
+    message({ id: "8", content: "plain", timestamp: at(2025, 12, 30) }),
+    message({ id: "9", content: "plain", timestamp: at(2025, 12, 31) }),
+    message({ id: "10", content: "engine four", timestamp: at(2026, 1, 2) }),
+    message({ id: "11", content: "plain", timestamp: at(2026, 10, 11) }),
+  ]);
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(linesOf(page), [
+    ["1", "day", "Oct 2, 2025, Thu", null],
+    ["4", "gap", "… 2 unmatched messages · Oct 3 – 5, 2025 …", null],
+    ["7", "gap", "… 2 unmatched messages · Oct 30 – Nov 3, 2025 …", null],
+    ["10", "gap", "… 2 unmatched messages · Dec 30, 2025 – Jan 2 …", "… 1 unmatched message · Yesterday, Oct 11, Sun …"],
+  ], "a gap across a year, or within a past year's month, is not said compactly");
+});
+
+test("`#250 date-separators`: past midnight a channel nobody writes in says Yesterday where it said Today, though the refresh that finds nothing draws nothing", async () => {
+  /**
+   * A channel read at 23:55 through a server with a change record, and polled at 00:05 with nothing
+   * new: within `TIMELINE_RECONCILE_MS` of the read, so each poll is a delta that brings nothing.
+   */
+  const quietMidnight = async (script, typed = null) => {
+    const page = newPage(new Map(), script);
+    page.setClock(new Date(2026, 9, 12, 23, 55).getTime());
+    // A provider with threads, whose reads go through the timeline and can be deltas; none in it.
+    page.threadingSupported = true;
+    page.threads = [];
+    page.messages = dayChannel();
+    const server = forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    if (typed !== null) {
+      await search(page, typed);
+      await page.settle();
+    }
+    // The first poll reads the view as a delta from then on, and brings nothing.
+    await pollOnce(page);
+    const before = linesOf(page);
+    const rows = [...page.el("discord-log").children];
+    const made = page.createdTags.length;
+    const reads = server.reads.length;
+    page.setClock(new Date(2026, 9, 13, 0, 5).getTime());
+    await pollOnce(page);
+    assert.ok(server.reads.length > reads && server.reads.slice(reads).every((read) => read.after !== null),
+      "the poll past midnight was not a delta");
+    assert.ok(page.el("discord-log").children.every((li, at) => li === rows[at]), "the quiet refresh rebuilt the rows");
+    assert.equal(builtSince(page, made, "li"), 0, "the quiet refresh built rows");
+    return { page, before, after: linesOf(page) };
+  };
+  const words = (lines) => lines.slice(-2).map(([, , said]) => said);
+  const plain = await quietMidnight(SCRIPT);
+  assert.deepStrictEqual(words(plain.before), ["Yesterday, Oct 11, Sun", "Today, Oct 12, Mon"]);
+  assert.deepStrictEqual(words(plain.after), ["Oct 11, Sun", "Yesterday, Oct 12, Mon"], "midnight on a quiet channel left Today on yesterday");
+  // Under a search, the gaps' days turn too; and a quiet refresh later the same night writes nothing.
+  const searched = await quietMidnight(SCRIPT, "engine");
+  assert.deepStrictEqual(searched.before.at(-1), ["6", "gap", "… 1 unmatched message · Yesterday – Today …", "… 1 unmatched message …"]);
+  assert.deepStrictEqual(searched.after.at(-1), ["6", "gap", "… 1 unmatched message · Oct 11 – Yesterday …", "… 1 unmatched message …"],
+    "midnight under a search left a gap's days as they were");
+  const set = FakeElement.prototype.setAttribute;
+  let written = 0;
+  FakeElement.prototype.setAttribute = function counted(name, value) {
+    if (name === "data-seam" || name === "data-seam-below" || (this.isRowSeam() && name === "aria-label")) written += 1;
+    return set.call(this, name, value);
+  };
+  try {
+    searched.page.setClock(new Date(2026, 9, 13, 0, 8).getTime());
+    await pollOnce(searched.page);
+  } finally {
+    FakeElement.prototype.setAttribute = set;
+  }
+  assert.equal(written, 0, "a quiet refresh on the same day drew the lines again");
+  // The control: without the turn of the day noticed there, the quiet refresh leaves Today standing,
+  // so the refresh above really was the one that draws nothing.
+  const control = await quietMidnight(brokenScript("      seamsAfterMidnight();\n", ""));
+  assert.deepStrictEqual(words(control.after), ["Yesterday, Oct 11, Sun", "Today, Oct 12, Mon"],
+    "the control relabelled the days anyway, so the quiet refresh was not the one under test");
+});
+
+test("`#249 search-highlight` x `#250 date-separators`: a line drawn above a row, the bookmark put on it and a hit marked beside a link leave the focus where it was", async () => {
+  /** Focus a control in a row, then draw a gap above it, mark the hits by it, and bookmark another row. */
+  const focusAcross = async (script) => {
+    const page = newPage(new Map(), script);
+    clockAt(page, 10, 12);
+    page.serveBookmark = true;
+    await signIn(page);
+    const messages = dayChannel();
+    messages[6] = { ...messages[6], content: "plain this morning, see [the notes](https://example.com/n) for more plain words",
+      content_html: `<p>plain this morning, see <a href="https://example.com/n" ${LINK_ATTRS}>the notes</a> for more plain words</p>\n` };
+    await showDiscord(page, messages);
+    FakeElement.detachBlurs = true;
+    const kept = {};
+    const row = rowWithId(page, "7");
+    const link = row.descendants().find((node) => node.tagName === "a");
+    // The bar open first, which takes the focus to its field; then a link in the row holds it.
+    await page.el("search-toggle").click();
+    await page.settle();
+    link.focus();
+    // The search leaves 6 out before 7, so a gap's line goes in at the head of 7's row.
+    await page.el("search-field").setValue("plain");
+    await page.settle();
+    assert.equal(row.getAttribute("data-seam"), "gap", "the fixture drew no line above the row");
+    kept.seam = focused(page) === link;
+    // The hits are marked in the paragraph the link stands in, either side of it.
+    link.focus();
+    await page.el("search-field").dispatch("keydown", { key: "Enter" });
+    await page.settle();
+    assert.deepStrictEqual(hitsIn(row), ["plain", "plain"], "the fixture marked nothing beside the link");
+    kept.marks = focused(page) === link;
+    link.focus();
+    await page.el("search-field").setValue("");
+    assert.deepStrictEqual(hitsIn(row), []);
+    kept.unmarked = focused(page) === link;
+    // The bookmark's line goes in at the head of 4's row, after its day's rule; its ⋯ item has the focus.
+    await page.el("search-toggle").click();
+    await page.settle();
+    const item = rowWithId(page, "4").descendants().find((node) => node.className === "row-bookmark-button");
+    item.focus();
+    await item.click();
+    await page.settle();
+    assert.deepStrictEqual(rowWithId(page, "4").children.slice(0, 2).map((kid) => kid.className), ["row-seam", "bookmark-line"]);
+    kept.bookmark = focused(page) === item;
+    return { kept, lost: FakeElement.focusLost };
+  };
+  const { kept, lost } = await focusAcross(SCRIPT);
+  assert.deepStrictEqual(kept, { seam: true, marks: true, unmarked: true, bookmark: true }, "a pass over the rows took the focus off a control in one");
+  assert.equal(lost, 0, "a pass over the rows took something with the focus out of the document");
+  // The controls: each line put in by writing the row's children again, as before. The fixture loses
+  // the focus as a browser does, so the checks above can fail.
+  const seam = await focusAcross(brokenScript("    else row.insertBefore(line, row.firstChild);", "    else row.replaceChildren(line, ...row.children);"));
+  assert.equal(seam.kept.seam, false, "the control drew the line above the row and kept the focus, so the check proves nothing");
+  const marks = await focusAcross(brokenScript(
+    "      for (const made of pieces) parent.insertBefore(made, piece.node);\n      parent.removeChild(piece.node);",
+    "      parent.replaceChildren(...[...parent.childNodes].flatMap((kid) => (kid === piece.node ? pieces : [kid])));"));
+  assert.equal(marks.kept.marks, false, "the control marked the hits and kept the focus, so the check proves nothing");
+  const bookmark = await focusAcross(brokenScript(
+    "      row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);",
+    "      row.replaceChildren(...(first === row.seamLine ? [first] : []), line, ...row.children.filter((kid) => kid !== row.seamLine));"));
+  assert.equal(bookmark.kept.bookmark, false, "the control drew the bookmark and kept the focus, so the check proves nothing");
+});
+
+test("`#249 search-highlight`: the rows follow every keystroke, and the hits are marked once the typing pauses — at once on Enter, and on clearing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "1", content: "the engine stalled at noon" }),
+    message({ id: "2", content: "nothing about it here" }),
+  ]);
+  await search(page, "e");
+  for (const typed of ["en", "eng", "engine"]) await page.el("search-field").setValue(typed);
+  assert.deepStrictEqual(passing(page), ["1"], "the rows did not follow the keystroke");
+  assert.deepStrictEqual(hitsIn(rows[0]), [], "a keystroke marked the hits before the typing paused");
+  assert.equal(marksPending(page), 1, "each keystroke left a marking of its own pending");
+  await typingPaused(page);
+  assert.deepStrictEqual(hitsIn(rows[0]), ["engine"], "the pause did not mark the hits");
+  assert.equal(marksPending(page), 0);
+  // Enter is the reader saying the words are typed.
+  await page.el("search-field").setValue("engine noon");
+  assert.deepStrictEqual(hitsIn(rows[0]), ["engine"], "the marks followed the keystroke");
+  await page.el("search-field").dispatch("keydown", { key: "Enter" });
+  await page.settle();
+  assert.deepStrictEqual(hitsIn(rows[0]), ["engine", "noon"], "Enter did not mark the hits at once");
+  assert.equal(marksPending(page), 0, "Enter left a marking pending");
+  // Cleared, no mark outlives its words, and nothing waits to put one back.
+  await page.el("search-field").setValue("");
+  assert.deepStrictEqual(rows.flatMap(hitsIn), [], "a mark outlived the cleared field");
+  assert.equal(marksPending(page), 0, "clearing left a marking pending");
+  // Closing the bar with a marking pending: nothing is marked after it shuts.
+  await page.el("search-field").setValue("stalled");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.equal(marksPending(page), 0, "closing the bar left a marking pending");
+  assert.deepStrictEqual(rows.flatMap(hitsIn), []);
+});
+
+test("`#249 search-highlight`: marking a paragraph drawn in many pieces writes only the text nodes it splits", async () => {
+  const page = newPage();
+  await signIn(page);
+  const pieces = Array.from({ length: 60 }, (_unused, i) => `<strong>w${i}</strong> engine `).join("");
+  const rows = await showDiscord(page, [message({ id: "1", content: "many pieces", content_html: `<p>${pieces}</p>\n` })]);
+  const paragraph = bodyOf(rows[0]).descendants().find((node) => node.tagName === "p");
+  const kids = [...paragraph.children];
+  const replace = FakeElement.prototype.replaceChildren;
+  const insert = FakeElement.prototype.insertBefore;
+  let replaced = 0;
+  let inserted = 0;
+  FakeElement.prototype.replaceChildren = function counted(...made) {
+    if (this === paragraph) replaced += 1;
+    return replace.apply(this, made);
+  };
+  FakeElement.prototype.insertBefore = function counted(node, ref) {
+    if (this === paragraph) inserted += 1;
+    return insert.call(this, node, ref);
+  };
+  try {
+    await typeAndPause(page, "engine");
+  } finally {
+    FakeElement.prototype.replaceChildren = replace;
+    FakeElement.prototype.insertBefore = insert;
+  }
+  assert.equal(hitsIn(rows[0]).length, 60);
+  assert.equal(replaced, 0, "the paragraph's children were written again to mark one piece");
+  // Each " engine " is three pieces where it was one: a space, the mark, a space.
+  assert.equal(inserted, 60 * 3, `marking 60 hits put ${inserted} nodes into the paragraph`);
+  assert.ok(kids.filter((kid) => kid.tagName === "strong").every((kid) => kid.parentNode === paragraph),
+    "an element beside a hit left the paragraph");
+});
+
+test("`#249 search-highlight`: in summary mode a folded match's hits past its fold are said under its summary, the one place they show", async () => {
+  const page = newPage();
+  await signIn(page);
+  const content = `${longMessage("rollout")} Then the engine stalled at the end.`;
+  const rows = await showDiscord(page, [message({ id: "7000000000000000031", content })]);
+  await turnSummariesOn(page);
+  assert.equal(rows[0].getAttribute("data-summarised"), "true", "the fixture never summarised");
+  assert.equal(bodyOf(rows[0]).hidden, true, "the summary did not take the message's place");
+  await typeAndPause(page, "engine");
+  const line = excerptOf(rows[0]);
+  assert.ok(line, "a summarised match says nothing of its hits");
+  assert.equal(line.hidden, false, "the line under a summarised match is hidden");
+  assert.match(line.text(), /engine stalled at the end/);
+  assert.deepStrictEqual(line.descendants().filter((n) => n.tagName === "mark").map((n) => n.text()), ["engine"]);
+  // Nothing in the stylesheet hides it under a summary: only the Links view does.
+  const hiding = [...CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter((rule) => /search-excerpt/.test(rule[1]) && /display:\s*none/.test(rule[2]))
+    .map((rule) => rule[1].trim());
+  assert.ok(hiding.every((selector) => selector.includes('data-links-view="true"')), `a rule hides the line: ${hiding}`);
+});
+
+test("`#249 search-highlight`: with rich headers off the words a header restates are marked where they show, and the switch needs no marking again", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("rich-headers").setChecked(false);
+  await page.settle();
+  const rows = await showDiscord(page, [message({ id: "100", content: HEALTH, heading: HEALTH_HEADING })]);
+  await typeAndPause(page, "backup");
+  const source = rows[0].descendants().find((node) => node.hasClass("rh-src"));
+  assert.ok(source, "the fixture's body does not carry the words its header restates");
+  assert.deepStrictEqual(source.descendants().filter((n) => n.tagName === "mark").map((n) => n.text()), ["Backup"],
+    "with the header off, the hit in the words it restates is not marked");
+  // ...and in the header too, hidden while it is off, so turning it on shows its hit with no new pass.
+  assert.deepStrictEqual(hitsIn({ children: [headOf(rows[0])] }), ["Backup"]);
+  const made = page.createdTags.length;
+  await page.el("rich-headers").setChecked(true);
+  await page.settle();
+  assert.equal(builtSince(page, made, "mark"), 0, "the switch marked the hits again");
+  assert.match(cssBlock(':root[data-rich-headers="off"] .rh-head'), /display: none/);
 });

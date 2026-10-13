@@ -1102,8 +1102,8 @@ function stamp(atMs) {
 // Oct 11, Sun, 5:25 PM".
 //
 // `dayLabel` is THE ONE DAY FORMATTER on this page. The tooltip over every message's time and the
-// details sheet ask it, and `#250 date-separators` — the lines between days in a list, in flight
-// separately — must ask it too rather than make a second wording that drifts from this one:
+// details sheet ask it, and so do `#250 date-separators`' lines between days in a list, rather than
+// make a second wording that drifts from this one:
 //
 //   the day the reader is in     Today, Oct 12, Mon
 //   the day before it            Yesterday, Oct 11, Sun
@@ -2506,6 +2506,47 @@ let searchOpen = false;
 let searchQuery = "";
 
 /**
+ * The text whose hits are drawn (`#249 search-highlight`): `searchQuery` once the typing pauses.
+ *
+ * The rows follow the field at every keystroke, as they always have; marking where each hit is
+ * splits text in every row shown, and done at every keystroke a word typed at speed is marked and
+ * unmarked letter by letter in every match. So the marks follow `SEARCH_MARK_DELAY_MS` after the last
+ * key — at once on Enter, and at once when the field is cleared, so no mark outlives its words.
+ */
+let markedQuery = "";
+
+/** How long after the last keystroke the hits are marked. */
+const SEARCH_MARK_DELAY_MS = 120;
+
+/** The marking a keystroke put off, or null. */
+let searchMarkTimer = null;
+
+/** Mark the hits of what is typed once the typing pauses: each key puts it off again. */
+function markSearchSoon() {
+  if (searchMarkTimer !== null) clearTimeout(searchMarkTimer);
+  searchMarkTimer = markedQuery === searchQuery ? null : setTimeout(markSearchNow, SEARCH_MARK_DELAY_MS);
+}
+
+/**
+ * Mark the hits of what is typed now: a redraw of both columns' lists that chooses the same rows, so
+ * not a filter change. The reader stays on what they were reading — the message the keystroke's own
+ * change held, while it holds (`captureScroll`) — because the line a folded match grows under it
+ * (`searchExcerpt`) is height.
+ */
+function markSearchNow() {
+  if (searchMarkTimer !== null) clearTimeout(searchMarkTimer);
+  searchMarkTimer = null;
+  if (markedQuery === searchQuery) return;
+  const mark = () => {
+    markedQuery = searchQuery;
+    eachColumn(renderScrollTools);
+    if (columnsShown) filterSideCards();
+  };
+  if (currentScreen === "main") preservingScroll(mark);
+  else mark();
+}
+
+/**
  * The lists a filter may touch, in document order.
  *
  * Every list of MESSAGES, including the ones that are not on screen at the moment. Filtering all
@@ -2621,6 +2662,8 @@ function applySearch() {
   // hidden behind a line, and closing it collapses them again.
   applyReadRuns();
   const terms = searchOpen ? searchTerms(searchQuery) : [];
+  // `#249 search-highlight`. Where the hits are drawn: what was typed when the typing paused.
+  const marking = searchOpen ? searchTerms(markedQuery) : [];
   const links = searchOpen && linksOnly;
   // `#251 author-filter`. Whose messages, ANDed with the rest.
   const author = authorChoosing();
@@ -2660,7 +2703,7 @@ function applySearch() {
       const hit = said && (!links || shown > 0) && authorPasses(row, author);
       setClassWord(row, "search-hidden", !hit);
       // `#249 search-highlight`. Where each term is, in the rows it lets through.
-      markSearchHits(row, hit && text !== null ? terms : []);
+      markSearchHits(row, hit && text !== null ? marking : []);
       if (counts && text !== null) {
         loaded += 1;
         const held = links ? heldLinks(row) : [];
@@ -2969,6 +3012,14 @@ function textRunsOf(part) {
 /**
  * Mark every hit of `terms` in `part`, and answer the marks made. Each run of text is matched as one,
  * and each piece of a hit is marked in the text node it is in.
+ *
+ * ONE WALK over a run's pieces and its hits together, both in order: a hit is visited once for each
+ * piece it reaches into, so a paragraph drawn in many pieces costs its pieces plus its hits, never
+ * the one times the other. And each text node is split IN PLACE — the pieces put in before it, then
+ * it taken out — so nothing else in the paragraph is moved: a link beside it that holds the focus,
+ * or the reader's selection, is where it was. (`replaceChildren` with the same children back takes
+ * every one of them out of the document first, and the browser drops the focus and the selection
+ * of whatever it takes out.)
  */
 function markHitsIn(part, terms) {
   const marks = [];
@@ -2977,15 +3028,17 @@ function markHitsIn(part, terms) {
     const ranges = textHits(texts.join(""), terms);
     if (ranges.length === 0) continue;
     let from = 0;
+    // The first hit that does not end before the piece being split.
+    let next = 0;
     run.forEach((piece, index) => {
       const text = texts[index];
       const to = from + text.length;
+      while (next < ranges.length && ranges[next][1] <= from) next += 1;
       const pieces = [];
       let cursor = 0;
-      for (const [start, end] of ranges) {
-        if (end <= from || start >= to) continue;
-        const a = Math.max(start, from) - from;
-        const b = Math.min(end, to) - from;
+      for (let at = next; at < ranges.length && ranges[at][0] < to; at += 1) {
+        const a = Math.max(ranges[at][0], from) - from;
+        const b = Math.min(ranges[at][1], to) - from;
         if (a > cursor) pieces.push(document.createTextNode(text.slice(cursor, a)));
         const mark = hitMark(text.slice(a, b));
         pieces.push(mark);
@@ -3000,7 +3053,8 @@ function markHitsIn(part, terms) {
         return;
       }
       const parent = piece.node.parentNode;
-      parent.replaceChildren(...[...parent.childNodes].flatMap((kid) => (kid === piece.node ? pieces : [kid])));
+      for (const made of pieces) parent.insertBefore(made, piece.node);
+      parent.removeChild(piece.node);
     });
   }
   return marks;
@@ -3009,7 +3063,7 @@ function markHitsIn(part, terms) {
 /**
  * Put back the text the marks in `marks` split: each mark becomes its text again, and the text nodes
  * either side of it are one again — or, where that leaves an element holding nothing but text, the
- * element holds it as its text, as it did.
+ * element holds it as its text, as it did. In place, node by node, for the reason `markHitsIn` is.
  */
 function unmarkHits(marks) {
   const parents = new Set();
@@ -3017,27 +3071,29 @@ function unmarkHits(marks) {
     const parent = mark.parentNode;
     if (!parent) continue;
     parents.add(parent);
-    const text = document.createTextNode(String(mark.textContent));
-    parent.replaceChildren(...[...parent.childNodes].map((kid) => (kid === mark ? text : kid)));
+    parent.replaceChild(document.createTextNode(String(mark.textContent)), mark);
   }
   for (const parent of parents) {
     const kids = [...parent.childNodes];
     if (kids.every((kid) => kid.nodeType === 3)) {
+      // Text and nothing else: no element in it to keep in place.
       const text = kids.map((kid) => kid.textContent).join("");
       parent.replaceChildren();
       parent.textContent = text;
       continue;
     }
-    const merged = [];
+    // Each text node after another joins it, and goes.
+    let joined = null;
     for (const kid of kids) {
-      const last = merged[merged.length - 1];
-      if (kid.nodeType === 3 && last && last.nodeType === 3) {
-        merged[merged.length - 1] = document.createTextNode(`${last.textContent}${kid.textContent}`);
+      if (kid.nodeType !== 3) {
+        joined = null;
+      } else if (joined === null) {
+        joined = kid;
       } else {
-        merged.push(kid);
+        joined.textContent = `${joined.textContent}${kid.textContent}`;
+        parent.removeChild(kid);
       }
     }
-    if (merged.length !== kids.length) parent.replaceChildren(...merged);
   }
 }
 
@@ -3177,9 +3233,8 @@ function markSearchHits(row, terms) {
   const excerpt = entry ? searchExcerpt(excerptSource(row), terms) : null;
   if (excerpt) {
     excerpt.hidden = !isFolded(entry);
-    const kids = [...row.children];
-    const after = kids.find((kid) => classWords(kid).includes("elided")) || entry.body;
-    row.replaceChildren(...kids.flatMap((kid) => (kid === after ? [kid, excerpt] : [kid])));
+    const after = [...row.children].find((kid) => classWords(kid).includes("elided")) || entry.body;
+    row.insertBefore(excerpt, after.nextSibling);
   }
   row.searchMarks = { key, links, marks, outlined, author: named, excerpt };
 }
@@ -3213,8 +3268,26 @@ function markSearchHits(row, terms) {
 /** Whether a filter is choosing rows: the search text, Links, or whose messages. */
 const rowsChosen = () => readRunsSuspended();
 
+/**
+ * A line's words: how many messages it stands for, and the days they reach when they reach any
+ * (`#250 date-separators`) — "… 12 unmatched messages · Oct 3 – 5 …". With days, each side of the `·`
+ * is held together, so a line too narrow for both — a phone 360px wide, the day said in full — wraps
+ * between the count and the days and nowhere else: "… 2 unmatched messages ·" over "Today, Oct 12,
+ * Mon …", never a lone "…" left on a line of its own. Held by no-break spaces, and a word joiner after
+ * a range's dash, which the line breaking rules otherwise let a line end on even before a no-break
+ * space: "Oct 9 –" over "Yesterday …".
+ */
+function lineWords(count, days) {
+  if (!days) return `${count} …`;
+  const held = (words) => words.replace(/ /g, "\u00a0").replace(/–/g, "–\u2060");
+  return `${held(count)}\u00a0· ${held(days)}\u00a0…`;
+}
+
+/** What a screen reader is given of a line's words: no ellipses, and spaces where they are held together. */
+const lineLabel = (words) => words.replace(/…/g, "").replace(/\u2060/g, "").replace(/\u00a0/g, " ").trim();
+
 /** What a gap's line says, and the days it reaches when it reaches any (`#250 date-separators`). */
-const gapWords = (count, days = "") => `… ${count} unmatched message${count === 1 ? "" : "s"}${days ? ` · ${days}` : ""} …`;
+const gapWords = (count, days = "") => lineWords(`… ${count} unmatched message${count === 1 ? "" : "s"}`, days);
 
 /** The line on `row` above it (`below` false) or below it, made once and kept on it. */
 function seamLineOf(row, below) {
@@ -3249,13 +3322,16 @@ function placeSeam(row, seam, below) {
   const line = seamLineOf(row, below);
   if (line.textContent !== seam.words) {
     line.textContent = seam.words;
-    line.setAttribute("aria-label", seam.words.replace(/…/g, "").trim());
+    line.setAttribute("aria-label", lineLabel(seam.words));
   }
   row.setAttribute(attribute, seam.kind);
   if (line.parentNode !== row) {
-    // Above: first, ahead of the bookmark's line, which sits nearer the row. Below: last.
+    // Above: first, ahead of the bookmark's line, which sits nearer the row. Below: last. Put in, not
+    // the row's children written again: that would take every one of them out of the document and
+    // back, and the browser drops the focus and the selection of whatever it takes out — a reader
+    // tabbed onto a row's Reply when midnight draws its day's rule would be left on nothing.
     if (below) row.append(line);
-    else row.replaceChildren(line, ...row.children);
+    else row.insertBefore(line, row.firstChild);
   }
 }
 
@@ -3279,14 +3355,20 @@ function placeSeam(row, seam, below) {
 // shown says the days it reaches. Gathered replies (`#215 reply-coalesce`), drawn out of time order,
 // and a row whose time cannot be read say no day and move none.
 //
-// Today and Yesterday by name; another year's date with its year; a weekday on a single day only. The
-// device's own zone, by the local calendar getters — never arithmetic on milliseconds, which a change
-// of clocks or a flight would break — and "today" read once a pass, so the first redraw after midnight
-// says Yesterday where it said Today.
+// ONE DAY IS SAID IN THE OWNER'S WORDS, `dayLabel`'s: "Today, Oct 12, Mon", "Yesterday, Oct 11, Sun",
+// "Oct 9, Fri", and "Oct 9, 2025, Thu" for another year's. A RANGE stays compact, with no weekdays —
+// "Oct 9 – 11", "Sep 29 – Oct 2", "Dec 30, 2025 – Jan 2" — and names its last day Today or Yesterday,
+// "Oct 9 – Today", so a gap's line still fits a phone. The device's own zone, by the local calendar
+// getters — never arithmetic on milliseconds, which a change of clocks or a flight would break — and
+// "today" read once a pass. A refresh that brings nothing draws nothing (`#226`), so when the day has
+// turned since the lines were drawn it draws them again (`seamsAfterMidnight`): a channel nobody
+// writes in past midnight says Yesterday where it said Today.
 
-/** The months and weekdays, as every other word on this page is: English, and short. */
-const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+// --- which day ------------------------------------------------------------------------------------
+//
+// `dayLabel` is the page's one wording of a single day, in the owner's words, and a day rule says
+// exactly what it does. It is defined once, with `DAY_MONTHS`, `DAY_WEEKDAYS` and `sameLocalDay`,
+// beside the time's tooltip (`#260 timestamp-hover`), which says a day in the same words.
 
 /** A local calendar day as a number that sorts as the days do: yyyymmdd. */
 const dayKeyOf = (date) => date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
@@ -3300,16 +3382,17 @@ function rowDay(row) {
 }
 
 /**
- * Today, yesterday and this year on this device's calendar, read once for a pass.
+ * Now, and today, yesterday and this year on this device's calendar, read once for a pass.
  *
- * @typedef {{today: number, yesterday: number, year: number}} DayClock
+ * @typedef {{now: Date, today: number, yesterday: number, year: number}} DayClock
  * @returns {DayClock}
  */
 function dayClock() {
   const now = new Date();
   return {
+    now,
     today: dayKeyOf(now),
-    yesterday: dayKeyOf(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)),
+    yesterday: dayKeyOf(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12)),
     year: now.getFullYear(),
   };
 }
@@ -3317,25 +3400,23 @@ function dayClock() {
 /** A day key's year, month (from 0) and day of the month. */
 const dayParts = (key) => ({ year: Math.floor(key / 10000), month: Math.floor(key / 100) % 100 - 1, day: key % 100 });
 
-/** One day, as a rule says it: "Today", "Yesterday", "Oct 3, Mon", or "Oct 3, 2025, Fri". */
+/** One day, as a rule says it: `dayLabel`'s words for the day's noon, which every zone's calendar has. */
 function dayWords(key, clock) {
-  if (key === clock.today) return "Today";
-  if (key === clock.yesterday) return "Yesterday";
   const { year, month, day } = dayParts(key);
-  const weekday = WEEKDAY_NAMES[new Date(year, month, day).getDay()];
-  return `${MONTH_NAMES[month]} ${day},${year === clock.year ? "" : ` ${year},`} ${weekday}`;
+  return dayLabel(new Date(year, month, day, 12), clock.now);
 }
 
 /**
- * The days from `from` to `to`, as a line says them: one day as `dayWords`; a range with no weekdays,
- * "Oct 3 – 5", "Sep 29 – Oct 2", "Dec 30, 2025 – Jan 2", ending "– Today" or "– Yesterday".
+ * The days from `from` to `to`, as a line says them: one day as `dayLabel` does; a range with no
+ * weekdays, "Oct 3 – 5", "Sep 29 – Oct 2", "Dec 30, 2025 – Jan 2", "Oct 3 – 5, 2025", ending
+ * "– Today" or "– Yesterday" — "Oct 9 – Today", "Yesterday – Today", "Dec 30, 2025 – Yesterday".
  */
 function dayRangeWords(from, to, clock) {
   if (from >= to) return dayWords(to, clock);
   const named = (key) => (key === clock.today ? "Today" : key === clock.yesterday ? "Yesterday" : null);
   const start = dayParts(from);
   const end = dayParts(to);
-  const date = (parts, withYear) => `${MONTH_NAMES[parts.month]} ${parts.day}${withYear ? `, ${parts.year}` : ""}`;
+  const date = (parts, withYear) => `${DAY_MONTHS[parts.month]} ${parts.day}${withYear ? `, ${parts.year}` : ""}`;
   if (named(to)) return `${named(from) || date(start, start.year !== clock.year)} – ${named(to)}`;
   const tail = start.year === end.year && start.year !== clock.year ? `, ${start.year}` : "";
   if (start.year === end.year && start.month === end.month) return `${date(start, false)} – ${end.day}${tail}`;
@@ -3407,8 +3488,11 @@ function seamsFor(list) {
     const span = fresh(hiddenDays);
     wanted.get(last).below = { kind: "gap", words: gapWords(hidden, span ? dayRangeWords(span.from, span.to, clock) : "") };
   }
-  return { rows, wanted, runDays };
+  return { rows, wanted, runDays, today: clock.today };
 }
+
+/** The day each list's lines were last drawn on, as `dayKeyOf` says it (`seamsAfterMidnight`). */
+const seamsDrawnOn = new WeakMap();
 
 /**
  * Draw the lines between the rows of `list`, and take away every one no longer wanted. Under
@@ -3416,7 +3500,8 @@ function seamsFor(list) {
  * places the reader itself once the list is drawn (`keepingFilterPlace`).
  */
 function drawSeams(list) {
-  const { rows, wanted, runDays } = seamsFor(list);
+  const { rows, wanted, runDays, today } = seamsFor(list);
+  seamsDrawnOn.set(list, today);
   const none = { above: null, below: null };
   // `#250 date-separators`. A collapsed run's line says the days it brings, as its words go.
   const changed = rows.some((row) => {
@@ -3451,6 +3536,21 @@ function drawSeams(list) {
     }
   } else {
     apply();
+  }
+}
+
+/**
+ * Draw the lines between rows again in the column being worked on, if the device's day has turned
+ * since they were last drawn — and nothing otherwise. For the refresh that brings nothing and so
+ * draws nothing (`#226 page-energy-profile`): without it a channel nobody writes in past midnight
+ * goes on saying "Today" of yesterday until something else redraws it, which on a quiet evening is
+ * the next poll that brings a message, or never.
+ */
+function seamsAfterMidnight() {
+  const today = dayClock().today;
+  for (const list of [el("discord-log"), el("pinned-log")]) {
+    const drawn = seamsDrawnOn.get(list);
+    if (drawn !== undefined && drawn !== today) drawSeams(list);
   }
 }
 
@@ -4010,6 +4110,9 @@ function showSearchOpen(open) {
   searchOpen = open;
   if (!open) {
     searchQuery = "";
+    // `#249 search-highlight`. And its marks, at once.
+    markedQuery = "";
+    markSearchSoon();
     el("search-field").value = "";
     // `#206 pin-message`. The Pinned filter lives in this bar, and goes with it for the reason the
     // query does: a filter left on behind a control that is no longer on screen is the state this
@@ -15412,8 +15515,10 @@ async function loadTimeline(options) {
       observeOutgoingMessages(deltas.flatMap((page) => page.messages || []));
       noteFreshRead(deltas[deltas.length - 1]);
       saveChannelScope();
-      // The thread picker's ages ("13h · 16") are the one thing on screen a clock moves.
+      // The thread picker's ages ("13h · 16") are one thing on screen a clock moves; the days
+      // between the rows, past midnight, are the other (`#250 date-separators`).
       renderChannelNavigation();
+      seamsAfterMidnight();
       return;
     }
     // One pass over the scroll tools, at the end, however often settling asks. `#226`.
@@ -18131,9 +18236,11 @@ function placeBookmarkLine() {
     const line = bookmarkLineOf(target.row);
     if (line.parentNode !== target.row) {
       // After a line between rows drawn above it (`#250 date-separators`): the bookmark is the nearer.
-      const kids = [...target.row.children];
-      const lead = kids.length && kids[0] === /** @type {any} */ (target.row).seamLine ? 1 : 0;
-      target.row.replaceChildren(...kids.slice(0, lead), line, ...kids.slice(lead));
+      // Put in, not the row's children written again, which would take them all out of the document
+      // and back and lose the focus or the selection in any of them (see `placeSeam`).
+      const row = /** @type {any} */ (target.row);
+      const first = row.firstChild;
+      row.insertBefore(line, first !== null && first === row.seamLine ? first.nextSibling : first);
     }
   };
   // The reader does not move: a line drawn or taken away above them changes the height above them.
@@ -23186,9 +23293,11 @@ function readRunWords(row) {
 /** The days a collapsed run's line says, kept on its first row by `drawSeams` (`#250 date-separators`). */
 const runDaysOf = (row) => String(row.runDays || "");
 
-/** What a collapsed run's line says: how many, and the days it brings (`#250 date-separators`). */
-const readRunText = (count, days = "") =>
-  `… ${count} read message${count === 1 ? "" : "s"}${days ? ` · ${days}` : ""} …`;
+/**
+ * What a collapsed run's line says: how many, and the days it brings (`#250 date-separators`), held
+ * together as a gap's line is (`lineWords`) so a narrow line breaks only between the two.
+ */
+const readRunText = (count, days = "") => lineWords(`… ${count} read message${count === 1 ? "" : "s"}`, days);
 
 /** How many messages the collapsed run `row` heads stands for. */
 const readRunCount = (row) => readRunRows(row).reduce((sum, one) => sum + idsOf(one).length, 0);
@@ -26207,6 +26316,7 @@ function placeOpenedCards() {
  */
 function filterSideCards() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
+  const marking = searchOpen ? searchTerms(markedQuery) : [];
   const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
   const replies = terms.length > 0 ? heldReplyText() : null;
   let unread = 0;
@@ -26222,8 +26332,9 @@ function filterSideCards() {
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
     markReplyMatch(row, inReplies);
-    // `#249 search-highlight`. And where: the card's own words, whatever its replies matched.
-    markSearchHits(row, said ? terms : []);
+    // `#249 search-highlight`. And where, once the typing pauses (`markedQuery`): the card's own
+    // words, whatever its replies matched.
+    markSearchHits(row, said ? marking : []);
     if (fresh) unread += 1;
     if (kept && said) shown += 1;
   }
@@ -30132,9 +30243,13 @@ for (const { kind, chip } of LINK_KINDS) {
 el("search-field").addEventListener("input", () => {
   keepingFilterPlace(() => {
     searchQuery = el("search-field").value;
+    // `#249 search-highlight`. Cleared — no word left to find — the marks go with the words, in this
+    // one redraw; otherwise they follow once the typing pauses (`markedQuery`).
+    if (searchTerms(searchQuery).length === 0) markedQuery = searchQuery;
     eachColumn(renderScrollTools);
     if (columnsShown) refilterSideCards();
   });
+  markSearchSoon();
 });
 // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
 // desktop reader reaches for without being told, and the only one a keyboard has. `#224
@@ -30142,6 +30257,9 @@ el("search-field").addEventListener("input", () => {
 // gone; handled here, so the page's own listener (`onPageKey`) leaves it alone. Not while an input
 // method composes, whose Escape is its own.
 el("search-field").addEventListener("keydown", (event) => {
+  // `#249 search-highlight`. Enter — a phone keyboard's Search — is the reader saying the words are
+  // typed: the hits are marked now rather than when the pause would have.
+  if (event.key === "Enter" && !event.isComposing) markSearchNow();
   if (event.key === "Escape" && !event.isComposing) {
     setSearchOpen(false);
     settleFocus();

@@ -444,14 +444,16 @@ steps:
       rss_baseline_bytes: 1073741824
 
   # `#249 search-highlight`, `#250 date-separators` and `#251 author-filter` in the browser engine, at
-  # 1280x800 with a mouse and 412x915 with a finger, over a week of a channel read at a fixed noon in New
-  # York's zone: eight day rules, Today and Yesterday by name, each between its row and the one above,
-  # the bookmark's line nearer its message than its day's rule; "engine" leaves four messages, each hit
-  # lit in the highlighter's colour, the link found by its address outlined, a folded answer's hit said
-  # under it, and each gap's line saying the days it reaches; every line as wide as the list, whatever
-  # side its row is drawn on; then the author filter shows only the owner's fourteen prompts, "14 of 30
-  # loaded", the prompt chosen staying within a pixel, and back again. Measured on 2026-10-12: about 6s
-  # wall.
+  # 1280x800 with a mouse and 412x915 and 360x800 with a finger, over a week of a channel read at a fixed
+  # noon in New York's zone: eight day rules in the owner's words ("Today, Oct 12, Mon"), each between
+  # its row and the one above, the bookmark's line nearer its message than its day's rule; "engine"
+  # leaves four messages, each hit lit in the highlighter's colour once the typing pauses, the link found
+  # by its address outlined, a folded answer's hit said under it, and each gap's line saying the days it
+  # reaches, on one line or two broken only between its count and its days; every line as wide as the
+  # list, whatever side its row is drawn on; on the narrow phone the list starts below the hanging author
+  # filter, so scrolled no row passes under it; then the author filter shows only the owner's fourteen
+  # prompts, "14 of 30 loaded", the prompt chosen staying within a pixel, and back again. Measured on
+  # 2026-10-12: about 6s wall.
   - group: check
     job: search-dates-browser
     desc: a search's hits and gaps, the days ruled off and ranged, and the author filter keeping the chosen prompt in place, in current Chromium at 1280x800 and 412x915

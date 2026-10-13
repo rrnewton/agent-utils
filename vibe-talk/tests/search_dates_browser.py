@@ -15,14 +15,18 @@ October 2026 at noon there (the browser's clock is fixed), with the owner's prom
 answers, the bookmark on the first message of one day, one long answer with the word past its fold, and
 one link to it by its address alone. At each size — a mouse on the desk, a finger on the phone:
 
-  sign in and open the channel -> a rule above the first message of each day, eight of them, Today and
-  Yesterday by name, each between the row above and its own, touching neither; the bookmark's day: its
-  rule above the bookmark's line, the line above the message -> the search glass, "engine": four
-  messages, each hit lit where it is, the link found by its address outlined, the long answer's hit
-  said under its fold; a line in each gap, between the rows and touching neither, the days it reaches
-  on it ("· Oct 6 – 8"), and one under the last match -> the text cleared, an owner's prompt mid-screen
-  chosen, the author filter pressed: only the owner's prompts, "N of 30 loaded", the prompt where it
-  stood within a pixel; pressed twice more, back to everyone's, the prompt where it stood again.
+  sign in and open the channel -> a rule above the first message of each day, eight of them, in the
+  owner's words ("Oct 9, Fri", "Yesterday, Oct 11, Sun", "Today, Oct 12, Mon"), each between the row
+  above and its own, touching neither; the bookmark's day: its rule above the bookmark's line, the line
+  above the message -> the search glass, "engine": four messages, each hit lit where it is once the
+  typing pauses, the link found by its address outlined, the long answer's hit said under its fold; a
+  line in each gap, between the rows and touching neither, the days it reaches on it ("· Oct 7 – 8"),
+  on one line or two broken between its count and its days and nowhere else, inside its room; and one
+  under the last match -> the text cleared, the author filter a whole target; on the narrow phone,
+  where it hangs under the bar, the list starting below it, so that scrolled no row passes under it
+  -> an owner's prompt mid-screen chosen, the author filter pressed: only the owner's prompts, "N of
+  30 loaded", the prompt where it stood within a pixel; pressed twice more, back to everyone's, the
+  prompt where it stood again.
 
 Pass --web-root DIR to run it against another copy of the page, and --screenshots DIR to keep a PNG of
 each stage.
@@ -140,6 +144,26 @@ ROWS_JS = """() => {
     return {top: r.top, bottom: r.bottom, left: r.left, right: r.right};
   };
   const list = box(document.getElementById('discord-log'));
+  // A line's words as the reader reads them, the no-break spaces and word joiners holding each side of
+  // its "·" together read as nothing more; and how they are laid out: the distinct lines its text is
+  // on, and whether the count and the days are each on one line.
+  const words = (seam) => seam.textContent.replace(/\u2060/g, '').replace(/\u00a0/g, ' ');
+  const layout = (seam) => {
+    const text = seam.firstChild;
+    if (!text || text.nodeType !== 3) return null;
+    const lines = (from, to) => {
+      const range = document.createRange();
+      range.setStart(text, from);
+      range.setEnd(text, to);
+      const rects = [...range.getClientRects()].filter((r) => r.width > 0);
+      return {count: new Set(rects.map((r) => Math.round(r.top))).size,
+        top: Math.min(...rects.map((r) => r.top)), bottom: Math.max(...rects.map((r) => r.bottom))};
+    };
+    const all = lines(0, text.length);
+    const dot = text.data.indexOf('·');
+    return {lines: all.count, top: all.top, bottom: all.bottom,
+      count: dot < 0 ? null : lines(0, dot + 1).count, days: dot < 0 ? null : lines(dot + 2, text.length).count};
+  };
   return [...document.querySelectorAll('#discord-log > li[data-id]')]
     .filter((li) => li.getClientRects().length)
     .map((li) => {
@@ -149,9 +173,9 @@ ROWS_JS = """() => {
       const excerpt = li.querySelector(':scope > .search-excerpt');
       return {
         id: li.dataset.id, who: li.dataset.who, box: box(li), seam: li.getAttribute('data-seam'), list,
-        above: above ? {text: above.textContent, box: box(above),
+        above: above ? {text: words(above), box: box(above), layout: layout(above),
           style: getComputedStyle(above, '::before').borderTopStyle} : null,
-        below: under ? {text: under.textContent, box: box(under)} : null,
+        below: under ? {text: words(under), box: box(under), layout: layout(under)} : null,
         bookmark: box(li.querySelector(':scope > .bookmark-line')),
         marks: [...li.querySelectorAll('mark.search-hit')].filter((m) => !excerpt || !excerpt.contains(m))
           .map((m) => ({text: m.textContent, box: box(m), background: getComputedStyle(m).backgroundColor})),
@@ -175,6 +199,22 @@ PRESS_AT_JS = """(id) => {
     const r = document.querySelector(`#discord-log > li[data-id='${id}']`).getBoundingClientRect();
     return [r.left + Math.min(40, r.width / 4), r.top + Math.min(18, r.height / 2)];
 }"""
+# Scroll the list half way down, and measure what of each row is drawn — its box within the list's —
+# against the author filter's: on a narrow phone the filter hangs under the bar, over the list.
+SCROLLED_JS = """() => {
+    const area = document.getElementById('scroll-area');
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 2);
+    const clip = area.getBoundingClientRect();
+    const at = document.getElementById('author-filter').getBoundingClientRect();
+    const drawn = [...document.querySelectorAll('#discord-log > li[data-id]')].map((li) => {
+        const r = li.getBoundingClientRect();
+        const top = Math.max(r.top, clip.top), bottom = Math.min(r.bottom, clip.bottom);
+        return bottom > top ? {id: li.dataset.id, top, bottom, left: r.left, right: r.right} : null;
+    }).filter(Boolean);
+    return {list: {top: clip.top, bottom: clip.bottom}, scrolled: area.scrollTop,
+        author: {top: at.top, bottom: at.bottom, left: at.left, right: at.right}, drawn};
+}"""
+
 # The open bar, its field, the author filter and the first row shown, as boxes.
 BAR_JS = """() => {
     const box = (node) => { const r = node.getBoundingClientRect();
@@ -338,10 +378,38 @@ def lines_between(walk: Walk, rows: list[Json], why: str) -> int:
     return count
 
 
+def gap_lines_fit(walk: Walk, rows: list[Json]) -> int:
+    """Every gap's line that says its days is on one line, or on two broken between its count and its
+    days — "… 5 unmatched messages ·" over "Today, Oct 12, Mon …" — and never inside either, nor with
+    a lone "…" on a line of its own; and its words stay inside the room the row keeps for it. Answers
+    how many were on two."""
+    wrapped = 0
+    for row in rows:
+        for kind in ("above", "below"):
+            drawn = part(row, kind)
+            if drawn is None or " · " not in str(drawn.get("text", "")):
+                continue
+            layout = drawn.get("layout")
+            walk.check(isinstance(layout, dict), f"the line {kind} {row['id']} is not one run of text")
+            if not isinstance(layout, dict):
+                continue
+            lines = number(layout, "lines")
+            walk.check(lines in (1, 2), f"the line {kind} {row['id']} ({drawn.get('text')!r}) is on {lines:.0f} lines")
+            walk.check(number(layout, "count") == 1 and number(layout, "days") == 1,
+                       f"the line {kind} {row['id']} ({drawn.get('text')!r}) breaks inside its count or its days")
+            box = drawn.get("box")
+            walk.check(number(layout, "top") >= number(box, "top") - 0.5 and number(layout, "bottom") <= number(box, "bottom") + 0.5,
+                       f"the words of the line {kind} {row['id']} run out of its room: {number(layout, 'top'):.1f}-"
+                       f"{number(layout, 'bottom'):.1f}px in {number(box, 'top'):.1f}-{number(box, 'bottom'):.1f}px")
+            wrapped += 1 if lines == 2 else 0
+    return wrapped
+
+
 def bar_geometry(walk: Walk) -> None:
     """The author filter is a whole 44px target a tap reaches, on the screen: on the bar's line left of
-    Links where the bar has the room, and hanging under the bar's left end on a narrow phone, over none
-    of the first row, so the field keeps 140px either way."""
+    Links where the bar has the room, and hanging under the bar's left end on a narrow phone, so the
+    field keeps 140px either way. Hanging, it covers no row: not the first at the list's head, and not
+    any row of a list scrolled half way down, which passes under the bar but never under the filter."""
     found = walk.page.evaluate(BAR_JS)
     measured: Json = {str(name): value for name, value in found.items()} if isinstance(found, dict) else {}
     author, bar, field = measured.get("author"), measured.get("bar"), measured.get("field")
@@ -356,6 +424,21 @@ def bar_geometry(walk: Walk) -> None:
         first = measured.get("first")
         walk.check(first is None or number(first, "top") >= number(author, "bottom") - 0.5,
                    "the author filter hangs over the first row")
+        found = walk.page.evaluate(SCROLLED_JS)
+        walk.settled()
+        scrolled: Json = {str(name): value for name, value in found.items()} if isinstance(found, dict) else {}
+        hanging = scrolled.get("author")
+        walk.check(number(scrolled, "scrolled") > 0, "the list did not scroll, so the scrolled case was not looked at")
+        walk.check(number(scrolled.get("list"), "top") >= number(hanging, "bottom") - 0.5,
+                   f"scrolled, the list is drawn from {number(scrolled.get('list'), 'top'):.1f}px, above the author "
+                   f"filter's foot at {number(hanging, 'bottom'):.1f}px")
+        drawn = scrolled.get("drawn")
+        covered = [row.get("id") for row in (drawn if isinstance(drawn, list) else []) if isinstance(row, dict) and
+                   number(row, "top") < number(hanging, "bottom") - 0.5 and number(row, "bottom") > number(hanging, "top") + 0.5 and
+                   number(row, "left") < number(hanging, "right") - 0.5 and number(row, "right") > number(hanging, "left") + 0.5]
+        walk.check(not covered, f"scrolled, the author filter covers part of {covered}")
+        walk.page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+        walk.settled()
     else:
         walk.check(abs(number(author, "right") - number(measured.get("links"), "left")) <= 0.5 and
                    number(author, "top") >= number(bar, "top") - 0.5 and number(author, "bottom") <= number(bar, "bottom") + 0.5,
@@ -375,8 +458,8 @@ def walk_through(walk: Walk) -> None:
     # 1. The days, each ruled off above its first message, and the bookmark's day.
     rows = walk.rows()
     days = [(str(row["id"]), said(row, "above")) for row in rows if row.get("seam") == "day"]
-    walk.check([words for _, words in days] == ["Oct 5, Mon", "Oct 6, Tue", "Oct 7, Wed", "Oct 8, Thu",
-                                                 "Oct 9, Fri", "Oct 10, Sat", "Yesterday", "Today"],
+    walk.check([words for _, words in days] == ["Oct 5, Mon", "Oct 6, Tue", "Oct 7, Wed", "Oct 8, Thu", "Oct 9, Fri",
+                                                 "Oct 10, Sat", "Yesterday, Oct 11, Sun", "Today, Oct 12, Mon"],
                f"the days are not ruled off as the owner asked: {days}")
     walk.check(all((part(row, "above") or {}).get("style") == "solid" for row in rows if row.get("seam") == "day"),
                "a day's rule is not drawn solid")
@@ -395,6 +478,9 @@ def walk_through(walk: Walk) -> None:
     page.fill("#search-field", "engine")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === 4",
                "the search did not leave the four messages holding the word")
+    # The hits are marked once the typing pauses.
+    walk.until("() => document.querySelectorAll('#discord-log mark.search-hit').length >= 3",
+               "the hits were not marked once the typing paused")
     walk.settled()
     page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
     walk.settled()
@@ -411,10 +497,11 @@ def walk_through(walk: Walk) -> None:
                "the long answer's hit past its fold is not said under it")
     gaps = [said(row, "above") for row in rows if row.get("seam") == "gap"]
     walk.check(any(" · " in gap for gap in gaps), f"no gap's line says the days it reaches: {gaps}")
+    wrapped = gap_lines_fit(walk, rows)
     walk.check(part(rows[-1], "below") is not None, "the messages after the last match are not said under it")
     count = lines_between(walk, rows, "the search")
     walk.shot("2-search-gaps-days")
-    walk.notes.append(f"{len(hits)} hits, {count} lines: " + " / ".join(gaps))
+    walk.notes.append(f"{len(hits)} hits, {count} lines, {wrapped} on two: " + " / ".join(gaps))
 
     # 3. Only the owner's prompts, with nothing typed, the prompt chosen kept where it stood.
     page.fill("#search-field", "")
