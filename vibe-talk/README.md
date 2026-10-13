@@ -1267,7 +1267,8 @@ the one thing this route exists to do is tell those apart.
     { "channel_id": "123456789012345678", "reads": 40, "skipped": 2, "failed": 0,
       "compared": 40, "stale": 1, "raced": 1, "mismatched": 1, "id_mismatches": 1,
       "hash_mismatches": 0 }
-  ]
+  ],
+  "upstream": { … }   // how long each provider has taken; see "How long upstream takes" below
 }
 ```
 
@@ -1307,6 +1308,69 @@ Four properties are the point of it:
 **Honesty note.** The ElevenLabs and Discord halves of this have been exercised **only against
 in-memory fakes, never against live Discord or live ElevenLabs.** The classification is the same
 code path the startup probe uses, which is itself in the same position — see **Known gaps**.
+
+### How long upstream takes
+
+The report also carries an `upstream` section: how long each chat provider has taken to answer
+since this process started, and how big the messages it sent back were. It is not a check and never
+fails. It is there so a slow page can be traced to the provider or ruled out, and so the size of a
+message cache can be worked out from real messages rather than guessed (`#208 persistent-cache`).
+
+```jsonc
+"upstream": {
+  "since": "2026-10-13T07:00:00Z",   // when this process started counting
+  "seconds": 5400,
+  "providers": [
+    {
+      "provider": "slack", "name": "Slack",   // the key from the configuration, and its name
+      "operations": [                         // one row per operation and outcome
+        { "name": "fetch_recent", "outcome": "ok", "count": 41, "rows": 2050,
+          "mean_ms": 910.4, "p50_ms": 812.5, "p90_ms": 1937.5, "p99_ms": 3875, "max_ms": 4102,
+          "octaves_ms": [[256, 3], [512, 22], [1024, 14], [2048, 2]] }
+      ],
+      "shim_calls": [                         // one row per Web API method and outcome
+        { "name": "conversations.history", "outcome": "rate_limited", "count": 2, "…": "…" }
+      ],
+      "content_bytes": { "messages": 2050, "total": 553500, "mean": 270, "p50": 140,
+                         "p90": 610, "p99": 2900, "max": 11800, "octaves": [[0, 12], [1, 3]] }
+    }
+  ]
+}
+```
+
+* **Operations** are the provider-neutral reads and posts the rest of the server asks for
+  (`fetch_timeline`, `fetch_recent`, `post_message`, …). They are timed around each provider's own
+  client, so the live poller and this report's own token check count as well as the page and the
+  voice agent. Questions a provider answers from memory, such as whether it supports threads, are
+  not counted. `rows` is what the operations returned, in total.
+* **Shim calls** are the HTTP requests the Slack client sends, by Web API method. One operation can
+  be several: a flat read is about eleven, and each author lookup is one more. A request answered
+  with a 429 and then sent again counts twice, as the far end's own log counts it (a compatible
+  bridge's, for example), so the two can be compared hour by hour. The time here runs from sending
+  the request to reading the whole answer, so it includes the network both ways. Other providers
+  leave this list empty.
+* **Outcomes** are `ok`, `transport`, `rate_limited`, `unauthorized` (401), `forbidden` (403),
+  `not_found` (404), `client_error` (another 4xx), `server_error` (5xx), `unexpected_status`,
+  `shape` (an answer this server could not read), `refused` (this server said no before asking),
+  `cursor_expired`, and `abandoned`: the caller stopped waiting, so the time is how long it waited.
+* **Percentiles are read off a histogram** of powers of two from 1 ms to 128 s, each split into
+  eight steps, so a percentile is within about 6 % of the true value. `octaves_ms` counts per power
+  of two: `[512, 22]` is 22 that took at least 512 ms and under 1024 ms, and `0` means under 1 ms.
+* **`content_bytes`** counts the UTF-8 bytes of each message's text, for every message a read
+  returned, in powers of two from 1 byte to 1 MiB (`0` is an empty message). A message read twice
+  counts twice.
+* **Memory only.** A restart starts from zero.
+
+**No channel text.** The section names a provider by its key and display name, which the checks
+above already show, and an operation or method by its name in this server's code. Everything else
+is a number: no channel, no message id, no author, no text.
+
+**Every hour, one `info` line per provider** gives the same figures for that hour alone, starting an
+hour after the server starts. Its target is `vibe_talk::upstream_profile`:
+
+```text
+INFO vibe_talk::upstream_profile: upstream timings for the last hour provider="slack" seconds=3600 operations=88 operations_failed=1 operation_timings="fetch_recent ok n=60 p50_ms=812.5 p90_ms=1937.5 max_ms=4102; fetch_recent transport n=1 p50_ms=10000 p90_ms=10000 max_ms=10000; …" shim_calls=402 shim_calls_failed=2 shim_call_timings="conversations.history ok n=300 p50_ms=687.5 p90_ms=1437.5 max_ms=3010; …" content_messages=1900 content_bytes_p50=140 content_bytes_p90=610 content_bytes_max=11800
+```
 
 ## Summaries
 
@@ -5865,6 +5929,8 @@ src/live.rs           bounded polling and adapter push, per-channel fan-out, rep
 src/replay.rs         rebuilding continuity across a hang-up: the preamble, the budget, the fence
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/diagnostics.rs    those same checks on demand, structured, redacted, and time-bounded
+src/upstream_profile.rs  how long each provider operation and Slack Web API call takes, and how
+                      big messages are: numbers only, for diagnostics and one line an hour
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
 src/bin/mock_elevenlabs.rs     that mock as a process, for a browser or the smoke script
