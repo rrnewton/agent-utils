@@ -594,3 +594,192 @@ async fn a_thread_view_that_shows_an_edit_brings_it_into_flat() {
     assert!(!shown.iter().any(|text| text == "edited far back"));
     assert!(flat(&fake, &client).await.replies.is_empty());
 }
+
+/// Set the `reply_count` on `root`'s history row to `count`, leaving its `latest_reply` alone, as
+/// a root that has caught up with a deletion its replies feed has not.
+fn set_reply_count(fake: &Fake, root: &str, count: i64) {
+    fake.with(|state| {
+        let message = state
+            .history
+            .get_mut(CH)
+            .expect("history")
+            .iter_mut()
+            .find(|message| message["ts"] == json!(root))
+            .expect("root");
+        message["reply_count"] = json!(count);
+    });
+}
+
+/// Delete the reply `at` from `root`'s replies feed, leaving the root as it was.
+fn delete_from_feed(fake: &Fake, root: &str, at: &str) {
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), root.to_owned()))
+            .expect("thread")
+            .retain(|reply| reply["ts"] != json!(at));
+    });
+}
+
+/// One reply deleted and two posted raise the count by one, but the forward read brings two: that
+/// does not add up, so the thread is read in full and the deleted reply goes. Merging the two
+/// regardless would keep it until the reconcile. Remote-ops audit W8 review.
+#[tokio::test]
+async fn an_incremental_read_that_does_not_add_up_reads_the_thread_in_full() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    assert_eq!(flat(&fake, &client).await.calls(), 23);
+
+    let (churned, index) = roots[6].clone();
+    let gone = reply_ts(index, 7);
+    delete_from_feed(&fake, &churned, &gone);
+    add_reply(&fake, &churned, &ts(9700, 0));
+    add_reply(&fake, &churned, &ts(9701, 0));
+    let read = flat(&fake, &client).await;
+    assert_eq!(
+        read.threads(),
+        [churned.clone(), churned.clone(), churned.clone()],
+        "one forward read that did not add up, then the root and 31 replies, 20 a call"
+    );
+    assert_eq!(
+        read.replies[0].get("oldest"),
+        Some(&reply_ts(index, REPLIES - 1))
+    );
+    assert!(read.replies[1..]
+        .iter()
+        .all(|params| !params.contains_key("oldest")));
+    assert!(!read.messages.contains(&gone), "the deleted reply is gone");
+    assert!(read.messages.contains(&ts(9700, 0)));
+    assert!(read.messages.contains(&ts(9701, 0)));
+
+    let settled = flat(&fake, &client).await;
+    assert!(settled.replies.is_empty(), "{:?}", settled.threads());
+    assert_eq!(settled.messages, read.messages);
+}
+
+/// A thread that gets a reply more often than the reconcile period is read forward each time,
+/// and those forward reads do not restart its reconcile clock: it is still read in full once its
+/// last FULL read is a period old, so an edit to an older reply reaches Flat. Here the period is
+/// two seconds, and the reads are 1.1 seconds apart. Remote-ops audit W8 review.
+#[tokio::test]
+async fn a_forward_read_does_not_restart_the_reconcile_clock() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client().with_flat_reconcile(Duration::from_secs(2));
+    assert_eq!(flat(&fake, &client).await.replies.len(), 20);
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (busy, index) = roots[0].clone();
+    add_reply(&fake, &busy, &ts(9900, 0));
+    let step = flat(&fake, &client).await;
+    assert_eq!(
+        step.threads(),
+        std::slice::from_ref(&busy),
+        "one forward read"
+    );
+    assert!(step.replies[0].contains_key("oldest"));
+
+    let target = reply_ts(index, 3);
+    fake.with(|state| {
+        let reply = state
+            .replies
+            .get_mut(&(CH.to_owned(), busy.clone()))
+            .expect("thread")
+            .iter_mut()
+            .find(|reply| reply["ts"] == json!(target))
+            .expect("reply");
+        reply["text"] = json!("edited before the reconcile");
+    });
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let late = flat(&fake, &client).await;
+    assert!(
+        reads_of(&late, &busy)
+            .iter()
+            .all(|params| !params.contains_key("oldest")),
+        "read in full: {:?}",
+        reads_of(&late, &busy)
+    );
+    assert!(
+        late.texts
+            .iter()
+            .any(|text| text == "edited before the reconcile"),
+        "the forward read restarted the reconcile clock"
+    );
+}
+
+/// A feed that lags the root's newest reply, read just as another reply is posted, holds as many
+/// replies as the root counts, but ends past the latest reply the root names. That is not held:
+/// once the feed catches up and the newer reply is deleted, the root reads exactly as before, and
+/// the next Flat read must show the reply the root names and not the deleted one. Remote-ops
+/// audit W8 review.
+#[tokio::test]
+async fn a_full_read_past_its_roots_latest_is_read_again_even_when_the_count_matches() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (lagging, index) = roots[2].clone();
+    let newest = reply_ts(index, REPLIES - 1);
+    let racer = ts(9600, 0);
+    let hidden = fake.with(|state| {
+        let replies = state
+            .replies
+            .get_mut(&(CH.to_owned(), lagging.clone()))
+            .expect("thread");
+        let hidden = replies.pop().expect("a reply");
+        replies.push(
+            json!({"type": "message", "ts": racer, "thread_ts": lagging, "user": "UREPLIER1",
+            "text": "racer", "user_profile": {"display_name": "Replier"}}),
+        );
+        hidden
+    });
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+    assert!(!first.messages.contains(&newest), "the feed lags");
+    assert!(first.messages.contains(&racer));
+
+    fake.with(|state| {
+        let replies = state
+            .replies
+            .get_mut(&(CH.to_owned(), lagging.clone()))
+            .expect("thread");
+        replies.retain(|reply| reply["ts"] != json!(racer));
+        replies.push(hidden);
+    });
+    let second = flat(&fake, &client).await;
+    assert_eq!(second.threads(), [lagging.clone(), lagging.clone()]);
+    assert!(
+        second.messages.contains(&newest),
+        "the reply the root names is shown"
+    );
+    assert!(!second.messages.contains(&racer), "a deleted reply lingers");
+}
+
+/// A thread of fewer replies than Flat shows, whose root already counts one reply fewer than its
+/// replies feed still lists, ends at the latest reply the root names; only the count shows the
+/// read is behind. It is not held, so once the feed catches up the deleted reply goes. Remote-ops
+/// audit W8 review.
+#[tokio::test]
+async fn a_full_read_with_a_reply_its_root_no_longer_counts_is_read_again() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let (pruned, index) = roots[8].clone();
+    let gone = reply_ts(index, 5);
+    set_reply_count(&fake, &pruned, REPLIES - 1);
+    let first = flat(&fake, &client).await;
+    assert_eq!(first.calls(), 23);
+    assert!(first.messages.contains(&gone), "the feed lags the deletion");
+
+    delete_from_feed(&fake, &pruned, &gone);
+    let second = flat(&fake, &client).await;
+    assert_eq!(second.threads(), [pruned.clone(), pruned.clone()]);
+    assert!(
+        !second.messages.contains(&gone),
+        "a reply deleted in Slack is still shown"
+    );
+
+    let third = flat(&fake, &client).await;
+    assert!(third.replies.is_empty(), "{:?}", third.threads());
+    assert_eq!(third.messages, second.messages);
+}
