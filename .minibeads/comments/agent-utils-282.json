@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-282-c02b8fa437e",
+    "issue_id": "agent-utils-282",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Review fixes, remote-ops audit W8. (1) A full thread read is held for the next Flat read only when it agrees with the root the same read fetched: it ends at the root's latest_reply, that is not the root itself, and holds reply_count replies (or Flat's 50). A lagging replies feed, a reply posted mid-read and then deleted, and a root without latest_reply (count-only, where a delete plus an add is invisible) are now read in full on the next Flat read instead of reused for up to 15 minutes; a root without latest_reply gets no saving at all, and the README says the saving depends on the server reporting it. (2) A thread view read that shows the held replies otherwise (an edit) drops them, so the next Flat read rereads that thread (3 + 2 calls) and shows the edit; a matching thread view costs nothing extra. Tests in vibe-talk/tests/slack_flat_calls.rs count conversations.replies per Flat read and fail before each fix. Still unverified against the bridge: whether its history rows carry latest_reply, and whether its message JSON is identical across reads (if not, every thread view drops that thread's held replies: one extra full thread read on the next Flat read, never staleness).",
+    "created_at": "2026-10-13T20:36:10.496403269Z",
+    "updated_at": "2026-10-13T20:36:10.496403269Z"
+  }
+]
