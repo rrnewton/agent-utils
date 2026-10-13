@@ -254,20 +254,20 @@
 <p>vibe-talk is early, at version 0.0.1. Its README keeps a status table of what works and what is stubbed, and this is that table's view of each provider, shortened. <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#status-what-works-what-is-stubbed">The full table</a> is the authority.</p>
 </div>
 <div class="table-wrap" role="region" aria-labelledby="status-caption" tabindex="0">
-<table>
+<table class="table-stack" role="table">
 <caption id="status-caption">What vibe-talk supports, and how far each part has been tested</caption>
-<thead>
-<tr><th scope="col">Piece</th><th scope="col">Supported</th><th scope="col">State, from vibe-talk's README</th></tr>
+<thead role="rowgroup">
+<tr role="row"><th scope="col" role="columnheader">Piece</th><th scope="col" role="columnheader">Supported</th><th scope="col" role="columnheader">State, from vibe-talk's README</th></tr>
 </thead>
-<tbody>
-<tr><th scope="row">Discord</th><td>Directly, through Discord's HTTP API with a dedicated bot.</td><td>Written and unit-tested; never run against live Discord.</td></tr>
-<tr><th scope="row">Google Chat</th><td>Through a compatible HTTP bridge that speaks Discord's API. You supply the bridge; none ships with agent-utils.</td><td>Reading has been exercised with real read-only traffic. Posting tests use local fakes.</td></tr>
-<tr><th scope="row">Slack</th><td>Built in, through a small fixed part of the Slack Web API.</td><td>The status table has no row for Slack. Its tests run against a local fake Slack server.</td></tr>
-<tr><th scope="row">Summaries and thread names</th><td>One plain Messages API call each: the Anthropic API, Google Vertex, or a gateway that speaks the Vertex path.</td><td>Tested against a local mock Messages API only; never run against a live model provider.</td></tr>
-<tr><th scope="row">Summaries from ElevenLabs instead</th><td>With no model provider configured, the ElevenLabs conversational agent writes them.</td><td>Never run against live ElevenLabs. With neither configured, long messages show as failed summaries; nothing falls back to truncation.</td></tr>
-<tr><th scope="row">Read-aloud</th><td>The phone's own speech engine, or ElevenLabs.</td><td>Device speech is a prototype.</td></tr>
-<tr><th scope="row">Voice conversation</th><td>ElevenLabs by default, or a WebSocket provider that your deployment runs.</td><td>A real ElevenLabs agent has been reached; in the README's last test it answered but called none of vibe-talk's tools.</td></tr>
-<tr><th scope="row">TLS</th><td>Not included. Terminate it in front of the server, or do not expose the server at all.</td><td>—</td></tr>
+<tbody role="rowgroup">
+<tr role="row"><th scope="row" role="rowheader">Discord</th><td role="cell" data-label="Supported">Directly, through Discord's HTTP API with a dedicated bot.</td><td role="cell" data-label="State, from vibe-talk's README">Written and unit-tested; never run against live Discord.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Google Chat</th><td role="cell" data-label="Supported">Through a compatible HTTP bridge that speaks Discord's API. You supply the bridge; none ships with agent-utils.</td><td role="cell" data-label="State, from vibe-talk's README">Reading has been exercised with real read-only traffic. Posting tests use local fakes.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Slack</th><td role="cell" data-label="Supported">Built in, through a small fixed part of the Slack Web API.</td><td role="cell" data-label="State, from vibe-talk's README">The status table has no row for Slack. Its tests run against a local fake Slack server.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Summaries and thread names</th><td role="cell" data-label="Supported">One plain Messages API call each: the Anthropic API, Google Vertex, or a gateway that speaks the Vertex path.</td><td role="cell" data-label="State, from vibe-talk's README">Tested against a local mock Messages API only; never run against a live model provider.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Summaries from ElevenLabs instead</th><td role="cell" data-label="Supported">With no model provider configured, the ElevenLabs conversational agent writes them.</td><td role="cell" data-label="State, from vibe-talk's README">Never run against live ElevenLabs. With neither configured, long messages show as failed summaries; nothing falls back to truncation.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Read-aloud</th><td role="cell" data-label="Supported">The phone's own speech engine, or ElevenLabs.</td><td role="cell" data-label="State, from vibe-talk's README">Device speech is a prototype.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Voice conversation</th><td role="cell" data-label="Supported">ElevenLabs by default, or a WebSocket provider that your deployment runs.</td><td role="cell" data-label="State, from vibe-talk's README">A real ElevenLabs agent has been reached; in the README's last test it answered but called none of vibe-talk's tools.</td></tr>
+<tr role="row"><th scope="row" role="rowheader">TLS</th><td role="cell" data-label="Supported">Not included. Terminate it in front of the server, or do not expose the server at all.</td><td role="cell" data-label="State, from vibe-talk's README">—</td></tr>
 </tbody>
 </table>
 </div>
@@ -310,7 +310,7 @@
 <h2 id="rerecord-title">Recording the clips again</h2>
 <p>The recorder, the mock bridge, the mock Messages API and the configuration template are in <a href="https://github.com/rrnewton/agent-utils/tree/main/site/demos/vibe-talk"><code>site/demos/vibe-talk/</code></a>, which is not published with this site. They need a vibe-talk release build, Python with Playwright and its Chromium, and ffmpeg. They need no network and no credentials, and a full run takes about two minutes. From the repository root:</p>
 </div>
-<pre tabindex="0"><code>cargo build --release --manifest-path vibe-talk/Cargo.toml
+<pre tabindex="0" role="region" aria-label="Commands that record the clips again"><code>cargo build --release --manifest-path vibe-talk/Cargo.toml
 python3 site/demos/vibe-talk/record_demo.py --publish
 python3 scripts/check_site.py</code></pre>
 <p><a href="https://github.com/rrnewton/agent-utils/blob/main/site/demos/vibe-talk/README.md">The recorder's README</a> lists the ports, the scripted conversation, the encoding, and what is fragile, such as the page selectors the clip scripts depend on.</p>

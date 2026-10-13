@@ -74,22 +74,22 @@
 <div class="wrap">
 <div class="section-head">
 <h2 id="layers-title">Layers and responsibilities</h2>
-<p>Each layer has one job and a narrow interface to the next. The coordinator talks to subagents only through agentctl and wrkslots, never by typing into terminals directly, and only the coordinator talks to the owner.</p>
+<p>Each layer has one job and a narrow interface to the next. The coordinator talks to subagents only through agentctl and wrkslots, never by typing into terminals directly, and only the coordinator talks to the owner. The colored bar beside each layer's section below is that layer's color in <a href="index.html#architecture">the overview figure</a>.</p>
 </div>
 <div class="table-wrap" role="region" aria-labelledby="layers-caption" tabindex="0">
-<table>
+<table class="table-stack" role="table">
 <caption id="layers-caption">The layers, top to bottom</caption>
-<thead>
-<tr><th scope="col">Layer</th><th scope="col">Piece</th><th scope="col">Responsible for</th><th scope="col">Status</th></tr>
+<thead role="rowgroup">
+<tr role="row"><th scope="col" role="columnheader">Layer</th><th scope="col" role="columnheader">Piece</th><th scope="col" role="columnheader">Responsible for</th><th scope="col" role="columnheader">Status</th></tr>
 </thead>
-<tbody>
-<tr><th scope="row">Owner</th><td>You, optionally reading a chat space on a phone with <a href="tools.html#vibe-talk"><code>vibe-talk</code></a></td><td>Goals, priorities, and policy: launch profiles, the herdr-run allowlist, the harness <code>AGENTS.md</code>, the project's landing rules.</td><td>vibe-talk optional</td></tr>
-<tr><th scope="row">Owner channel</th><td>Herdr tab, <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a></td><td>Getting your requests to the coordinator and its replies back to you.</td><td>chat bridge core, can be connected later</td></tr>
-<tr><th scope="row">Coordinator</th><td>One agent and the <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">coordinator skill</a></td><td>Turning goals into tasks, delegating, checking claims, landing, reporting.</td><td>core</td></tr>
-<tr><th scope="row">Sessions</th><td><a href="tools.html#agentctl"><code>agentctl</code></a> on <a href="tools.html#herdr">Herdr</a></td><td>Named agents that outlive their launcher, durable prompt delivery, human takeover.</td><td>core (beta); Herdr external</td></tr>
-<tr><th scope="row">Workspaces</th><td><a href="tools.html#wrkslots"><code>wrkslots</code></a></td><td>One isolated worktree per task, ownership and handoff records, safe removal, salvage.</td><td>core</td></tr>
-<tr><th scope="row">Recurring work</th><td><a href="tools.html#tick-hub"><code>tick-hub</code></a></td><td>Reminders and health checks delivered to the coordinator on a timer.</td><td>optional</td></tr>
-<tr><th scope="row">Validation and landing</th><td>The project's own checks, <a href="tools.html#dagrun"><code>dagrun</code></a>, <a href="tools.html#herdr-run"><code>herdr-run</code></a>, <a href="tools.html#gh-paced"><code>gh-paced</code></a></td><td>Proving work before it lands, reaching the network when a sandbox blocks it, pacing GitHub.</td><td>optional</td></tr>
+<tbody role="rowgroup">
+<tr role="row"><th scope="row" role="rowheader">Owner</th><td role="cell" data-label="Piece">You, optionally reading a chat space on a phone with <a href="tools.html#vibe-talk"><code>vibe-talk</code></a></td><td role="cell" data-label="Responsible for">Goals, priorities, and policy: launch profiles, the herdr-run allowlist, the harness <code>AGENTS.md</code>, the project's landing rules.</td><td role="cell" data-label="Status">vibe-talk optional</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Owner channel</th><td role="cell" data-label="Piece">Herdr tab, <a href="tools.html#agentctl-chat"><code>agentctl chat</code></a></td><td role="cell" data-label="Responsible for">Getting your requests to the coordinator and its replies back to you.</td><td role="cell" data-label="Status">chat bridge core, can be connected later</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Coordinator</th><td role="cell" data-label="Piece">One agent and the <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agent-utils-coordinator/SKILL.md">coordinator skill</a></td><td role="cell" data-label="Responsible for">Turning goals into tasks, delegating, checking claims, landing, reporting.</td><td role="cell" data-label="Status">core</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Sessions</th><td role="cell" data-label="Piece"><a href="tools.html#agentctl"><code>agentctl</code></a> on <a href="tools.html#herdr">Herdr</a></td><td role="cell" data-label="Responsible for">Named agents that outlive their launcher, durable prompt delivery, human takeover.</td><td role="cell" data-label="Status">core (beta); Herdr external</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Workspaces</th><td role="cell" data-label="Piece"><a href="tools.html#wrkslots"><code>wrkslots</code></a></td><td role="cell" data-label="Responsible for">One isolated worktree per task, ownership and handoff records, safe removal, salvage.</td><td role="cell" data-label="Status">core</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Recurring work</th><td role="cell" data-label="Piece"><a href="tools.html#tick-hub"><code>tick-hub</code></a></td><td role="cell" data-label="Responsible for">Reminders and health checks delivered to the coordinator on a timer.</td><td role="cell" data-label="Status">optional</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Validation and landing</th><td role="cell" data-label="Piece">The project's own checks, <a href="tools.html#dagrun"><code>dagrun</code></a>, <a href="tools.html#herdr-run"><code>herdr-run</code></a>, <a href="tools.html#gh-paced"><code>gh-paced</code></a></td><td role="cell" data-label="Responsible for">Proving work before it lands, reaching the network when a sandbox blocks it, pacing GitHub.</td><td role="cell" data-label="Status">optional</td></tr>
 </tbody>
 </table>
 </div>
@@ -158,7 +158,7 @@
 <li>
 <h3>A fresh slot <span class="who">coordinator · wrkslots</span></h3>
 <p>The coordinator fetches the primary checkout's remote, because a slot starts from the remote-tracking branch, then creates the slot:</p>
-<pre tabindex="0"><code>git -C &lt;primary&gt; fetch origin
+<pre tabindex="0" role="region" aria-label="Commands that create a slot"><code>git -C &lt;primary&gt; fetch origin
 $WS create &lt;slot&gt; --slot-type agent --coordinator-authorized \
   --agent &lt;name&gt; --task &lt;slug&gt; --purpose "&lt;one line&gt;" \
   --coordinator-pid &lt;pid&gt; --repo &lt;primary&gt;=&lt;primary&gt; \
@@ -167,7 +167,7 @@ $WS create &lt;slot&gt; --slot-type agent --coordinator-authorized \
 <li>
 <h3>A subagent with a full brief <span class="who">coordinator · agentctl</span></h3>
 <p>It starts a subagent in the slot with one of your launch profiles and a brief that states the goal and why, the slot and branch, how to validate, how to report back, and the slot protocol:</p>
-<pre tabindex="0"><code>AGENTCTL_WRKSLOTS_BIN=$WS $AU/agentctl start &lt;name&gt; --cwd &lt;harness&gt; \
+<pre tabindex="0" role="region" aria-label="Command that starts a subagent in the slot"><code>AGENTCTL_WRKSLOTS_BIN=$WS $AU/agentctl start &lt;name&gt; --cwd &lt;harness&gt; \
   --profile &lt;profile&gt; --slot &lt;slot&gt; --file &lt;brief&gt;</code></pre>
 <p>The subagent appears as a new tab in the project's Herdr workspace. Every task gets a fresh agent name.</p>
 </li>
@@ -185,7 +185,7 @@ $WS create &lt;slot&gt; --slot-type agent --coordinator-authorized \
 </li>
 <li>
 <h3>Stop and remove <span class="who">coordinator · wrkslots</span></h3>
-<pre tabindex="0"><code>$AU/agentctl stop &lt;name&gt;
+<pre tabindex="0" role="region" aria-label="Commands that stop the subagent and remove its slot"><code>$AU/agentctl stop &lt;name&gt;
 $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;n&gt;</code></pre>
 <p>wrkslots refuses unless it can prove nothing uses the slot, and it salvages any unpublished commits first. A refusal names its reason. Nobody deletes a slot by hand.</p>
 </li>
@@ -212,7 +212,7 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 <h2 id="harness-title">The harness directory</h2>
 <p>Setup turns the checkout you started in into the harness root and moves the checkout inside it, unchanged. For a repository <code>foobar</code>:</p>
 </div>
-<pre class="tree" tabindex="0"><code>~/work/foobar/                  <span class="c">harness root; the coordinator runs here</span>
+<pre class="tree" tabindex="0" role="region" aria-label="The harness directory"><code>~/work/foobar/                  <span class="c">harness root; the coordinator runs here</span>
 ├── AGENTS.md                   <span class="c">you are the coordinator; layout, tools, delegation,</span>
 │                               <span class="c">suite configuration, and your project rules</span>
 ├── CLAUDE.md -&gt; AGENTS.md
@@ -243,25 +243,25 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 <p>Everything the suite keeps is a file you can read on the machine; there is no hosted service and no database server.</p>
 </div>
 <div class="table-wrap" role="region" aria-labelledby="state-caption" tabindex="0">
-<table>
+<table class="table-stack" role="table">
 <caption id="state-caption">State, its location, and who owns it</caption>
-<thead>
-<tr><th scope="col">State</th><th scope="col">Where</th><th scope="col">Owned by</th><th scope="col">In the harness repository?</th></tr>
+<thead role="rowgroup">
+<tr role="row"><th scope="col" role="columnheader">State</th><th scope="col" role="columnheader">Where</th><th scope="col" role="columnheader">Owned by</th><th scope="col" role="columnheader">In the harness repository?</th></tr>
 </thead>
-<tbody>
-<tr><th scope="row">The project's code and history</th><td>The primary checkout and its remote</td><td>The project</td><td>No: an independent repository</td></tr>
-<tr><th scope="row">Rules and suite configuration</th><td><code>AGENTS.md</code></td><td>You; the coordinator edits it only on request</td><td>Yes</td></tr>
-<tr><th scope="row">Slot policy</th><td><code>.wrkslots.yml</code></td><td>You</td><td>Yes</td></tr>
-<tr><th scope="row">Skill links</th><td><code>.agents/skills/</code></td><td>Setup</td><td>Yes</td></tr>
-<tr><th scope="row">Launch profiles</th><td><code>.agentctl/profiles.json</code>, owner-only permissions</td><td>You</td><td>No: private and ignored</td></tr>
-<tr><th scope="row">Session registry and prompt queue</th><td><code>.agentctl/</code> (inbox, in-flight, failed, processed)</td><td>agentctl</td><td>No</td></tr>
-<tr><th scope="row">Slot checkouts</th><td><code>worktrees/slots/&lt;slot&gt;/</code>, or one sparse image per slot</td><td>wrkslots</td><td>No</td></tr>
-<tr><th scope="row">Ownership history and handoffs</th><td>The wrkslots control directory under <code>worktrees/</code>, outside the slot checkouts</td><td>wrkslots</td><td>No</td></tr>
-<tr><th scope="row">Salvaged commits</th><td>A configured salvage remote, otherwise a verified bundle under <code>worktrees/wrkslots-salvage/</code></td><td>wrkslots</td><td>No</td></tr>
-<tr><th scope="row">Chat bridge intake and replies</th><td>The bridge's own state directory, usually under <code>.agentctl/</code>; configuration in <code>chat.json</code></td><td>agentctl chat</td><td>No</td></tr>
-<tr><th scope="row">Run records and audit log</th><td><code>.herdr-run/</code>; run spools pruned after four days by default</td><td>herdr-run</td><td>No</td></tr>
-<tr><th scope="row">Reminder cadence</th><td><code>.tick-hub/</code>, written only on <code>--flush</code></td><td>tick-hub</td><td>No</td></tr>
-<tr><th scope="row">Terminal scrollback</th><td>Herdr, with bounded history</td><td>Herdr</td><td>No</td></tr>
+<tbody role="rowgroup">
+<tr role="row"><th scope="row" role="rowheader">The project's code and history</th><td role="cell" data-label="Where">The primary checkout and its remote</td><td role="cell" data-label="Owned by">The project</td><td role="cell" data-label="In the harness repository?">No: an independent repository</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Rules and suite configuration</th><td role="cell" data-label="Where"><code>AGENTS.md</code></td><td role="cell" data-label="Owned by">You; the coordinator edits it only on request</td><td role="cell" data-label="In the harness repository?">Yes</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Slot policy</th><td role="cell" data-label="Where"><code>.wrkslots.yml</code></td><td role="cell" data-label="Owned by">You</td><td role="cell" data-label="In the harness repository?">Yes</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Skill links</th><td role="cell" data-label="Where"><code>.agents/skills/</code></td><td role="cell" data-label="Owned by">Setup</td><td role="cell" data-label="In the harness repository?">Yes</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Launch profiles</th><td role="cell" data-label="Where"><code>.agentctl/profiles.json</code>, owner-only permissions</td><td role="cell" data-label="Owned by">You</td><td role="cell" data-label="In the harness repository?">No: private and ignored</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Session registry and prompt queue</th><td role="cell" data-label="Where"><code>.agentctl/</code> (inbox, in-flight, failed, processed)</td><td role="cell" data-label="Owned by">agentctl</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Slot checkouts</th><td role="cell" data-label="Where"><code>worktrees/slots/&lt;slot&gt;/</code>, or one sparse image per slot</td><td role="cell" data-label="Owned by">wrkslots</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Ownership history and handoffs</th><td role="cell" data-label="Where">The wrkslots control directory under <code>worktrees/</code>, outside the slot checkouts</td><td role="cell" data-label="Owned by">wrkslots</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Salvaged commits</th><td role="cell" data-label="Where">A configured salvage remote, otherwise a verified bundle under <code>worktrees/wrkslots-salvage/</code></td><td role="cell" data-label="Owned by">wrkslots</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Chat bridge intake and replies</th><td role="cell" data-label="Where">The bridge's own state directory, usually under <code>.agentctl/</code>; configuration in <code>chat.json</code></td><td role="cell" data-label="Owned by">agentctl chat</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Run records and audit log</th><td role="cell" data-label="Where"><code>.herdr-run/</code>; run spools pruned after four days by default</td><td role="cell" data-label="Owned by">herdr-run</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Reminder cadence</th><td role="cell" data-label="Where"><code>.tick-hub/</code>, written only on <code>--flush</code></td><td role="cell" data-label="Owned by">tick-hub</td><td role="cell" data-label="In the harness repository?">No</td></tr>
+<tr role="row"><th scope="row" role="rowheader">Terminal scrollback</th><td role="cell" data-label="Where">Herdr, with bounded history</td><td role="cell" data-label="Owned by">Herdr</td><td role="cell" data-label="In the harness repository?">No</td></tr>
 </tbody>
 </table>
 </div>

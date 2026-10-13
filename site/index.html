@@ -165,7 +165,7 @@
 <ul class="arch-row">
 <li class="arch-node"><b>You, at the machine</b><span>attach to any tab and type</span></li>
 <li class="arch-node"><b>You, in a chat space</b><span>away from the terminal</span></li>
-<li class="arch-node is-optional"><b><code>vibe-talk</code></b><span>phone reader and voice for a chat space; does not reach the coordinator by itself</span></li>
+<li class="arch-node is-optional"><b><code>vibe-talk</code><span class="vh"> (optional)</span></b><span>phone reader and voice for a chat space; does not reach the coordinator by itself</span></li>
 </ul>
 </div>
 <p class="arch-edge both"><span class="arrow-up"></span>requests down, replies up</p>
@@ -173,7 +173,7 @@
 <p class="arch-label">Owner channel<span>reaches the coordinator only</span></p>
 <ul class="arch-row">
 <li class="arch-node"><b>Herdr tab</b><span>the coordinator's own terminal</span></li>
-<li class="arch-node is-core"><b><code>agentctl chat</code></b><span>carries a chat space's messages to the coordinator; Google Chat today; can be connected later</span></li>
+<li class="arch-node is-core"><b><code>agentctl chat</code><span class="vh"> (core, can be connected later)</span></b><span>carries a chat space's messages to the coordinator; Google Chat today; can be connected later</span></li>
 </ul>
 </div>
 <p class="arch-edge">typed into the coordinator's pane</p>
@@ -181,7 +181,7 @@
 <p class="arch-label">Coordinator<span>one agent, harness root</span></p>
 <ul class="arch-row">
 <li class="arch-node is-wide"><b>Coordinator agent</b><span>reads <code>AGENTS.md</code> and the coordinator skill; plans, delegates, verifies, lands, reports</span></li>
-<li class="arch-node is-optional"><b><code>tick-hub</code> timer</b><span>recurring duties, delivered with <code>agentctl send</code></span></li>
+<li class="arch-node is-optional"><b><code>tick-hub</code> timer<span class="vh"> (optional)</span></b><span>recurring duties, delivered with <code>agentctl send</code></span></li>
 </ul>
 </div>
 <p class="arch-edge"><code>agentctl start --slot</code> · <code>send</code> · <code>read</code> · <code>stop</code></p>
@@ -189,7 +189,7 @@
 <p class="arch-label">Sessions<span>named, durable, attachable</span></p>
 <div class="arch-stack">
 <ul class="arch-row">
-<li class="arch-node is-core"><b><code>agentctl</code></b><span>a registry of named sessions and a durable prompt queue</span></li>
+<li class="arch-node is-core"><b><code>agentctl</code><span class="vh"> (core)</span></b><span>a registry of named sessions and a durable prompt queue</span></li>
 </ul>
 <div class="arch-frame">
 <p class="arch-frame-label">Herdr terminal server (external)</p>
@@ -205,7 +205,7 @@
 <div class="arch-layer arch-workspaces">
 <p class="arch-label">Workspaces<span>one slot per task</span></p>
 <ul class="arch-row">
-<li class="arch-node is-core"><b><code>wrkslots</code></b><span>owner records, handoffs, salvage, proof before removal</span></li>
+<li class="arch-node is-core"><b><code>wrkslots</code><span class="vh"> (core)</span></b><span>owner records, handoffs, salvage, proof before removal</span></li>
 <li class="arch-node"><b><code>slots/s1</code></b><span>branch <code>a/task-1</code></span></li>
 <li class="arch-node"><b><code>slots/s2</code></b><span>branch <code>b/task-2</code></span></li>
 <li class="arch-node"><b><code>slots/s3</code></b><span>branch <code>c/task-3</code></span></li>
@@ -216,9 +216,9 @@
 <div class="arch-layer arch-landing">
 <p class="arch-label">Validation and landing<span>the project's rules win</span></p>
 <ul class="arch-row">
-<li class="arch-node is-optional"><b><code>dagrun</code></b><span>local CI graph under limits</span></li>
-<li class="arch-node is-optional"><b><code>herdr-run</code></b><span>allowlisted push from a visible pane</span></li>
-<li class="arch-node is-optional"><b><code>gh-paced</code></b><span>paced GitHub calls</span></li>
+<li class="arch-node is-optional"><b><code>dagrun</code><span class="vh"> (optional)</span></b><span>local CI graph under limits</span></li>
+<li class="arch-node is-optional"><b><code>herdr-run</code><span class="vh"> (optional)</span></b><span>allowlisted push from a visible pane</span></li>
+<li class="arch-node is-optional"><b><code>gh-paced</code><span class="vh"> (optional)</span></b><span>paced GitHub calls</span></li>
 <li class="arch-node"><b>The project's remote</b><span>read back by content after landing</span></li>
 </ul>
 </div>
@@ -247,22 +247,22 @@
 <article class="card card-core">
 <h4 class="card-title"><a href="tools.html#agentctl"><code>agentctl</code></a> <span class="badges"><span class="badge badge-core">core</span><span class="badge badge-warn">beta</span></span></h4>
 <p>Named, durable agent sessions. Start, message, read and stop coding agents by name, with launch profiles you write and prompt delivery that never repeats an uncertain submission.</p>
-<p class="card-links"><a href="tools.html#agentctl">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">User guide</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/USER_GUIDE.md">User guide<span class="vh"> for agentctl</span></a></p>
 </article>
 <article class="card card-core">
 <h4 class="card-title"><a href="tools.html#wrkslots"><code>wrkslots</code></a> <span class="badges"><span class="badge badge-core">core</span></span></h4>
 <p>One isolated Git worktree slot per agent, with ownership records, handoffs, salvage of unpushed work, and removal only after proof that nothing still uses the slot.</p>
-<p class="card-links"><a href="tools.html#wrkslots">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">README</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkslots/README.md">README<span class="vh"> for wrkslots</span></a></p>
 </article>
 <article class="card card-core">
 <h4 class="card-title"><a href="tools.html#agentctl-chat"><code>agentctl chat</code></a> <span class="badges"><span class="badge badge-core">core</span><span class="badge">connect later</span></span></h4>
 <p>Connects a chat space to the coordinator: your messages are typed into its pane and its marked replies go back to the thread. Google Chat works today; the bridge polls the space, once an hour by default.</p>
-<p class="card-links"><a href="tools.html#agentctl-chat">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md">Chat guide</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md">Chat guide<span class="vh"> for agentctl chat</span></a></p>
 </article>
 <article class="card card-external">
 <h4 class="card-title"><a href="tools.html#herdr">Herdr</a> <span class="badges"><span class="badge badge-external">external</span></span></h4>
 <p>A separately installed, persistent terminal server. Every agent runs as its own terminal interface in a Herdr tab. The suite was last tested with Herdr 0.8.</p>
-<p class="card-links"><a href="tools.html#herdr">Details</a> <a href="https://github.com/herdrdev/herdr">Upstream project</a></p>
+<p class="card-links"><a href="https://github.com/herdrdev/herdr">Upstream project<span class="vh">: Herdr</span></a></p>
 </article>
 </div>
 
@@ -271,42 +271,42 @@
 <article class="card">
 <h4 class="card-title"><a href="tools.html#herdr-run"><code>herdr-run</code></a> <span class="badges"><span class="badge">optional</span></span></h4>
 <p>Runs an allowlisted command, such as <code>git push</code>, in a visible Herdr pane outside whatever confines the agent, and records every run. A cooperative safety rail, not a security boundary.</p>
-<p class="card-links"><a href="tools.html#herdr-run">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/QUICKSTART.md">Quickstart</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/herdr-run/QUICKSTART.md">Quickstart<span class="vh"> for herdr-run</span></a></p>
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#tick-hub"><code>tick-hub</code></a> <span class="badges"><span class="badge">optional</span></span></h4>
 <p>One scheduled tick checks many recurring duties, each on its own cadence. When a tick's output contains an <code>ACTION:</code> line, a small timer script sends that output to the coordinator.</p>
-<p class="card-links"><a href="tools.html#tick-hub">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/python/README.md">README</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/tick-hub/rendered/python/README.md">README<span class="vh"> for tick-hub</span></a></p>
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#dagrun"><code>dagrun</code></a> <span class="badges"><span class="badge">optional</span></span></h4>
 <p>Runs validation as a dependency graph under CPU, memory and named-resource limits, with cgroup containment. This repository validates itself with it.</p>
-<p class="card-links"><a href="tools.html#dagrun">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/README.md">README</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/dagrun/rendered/python/README.md">README<span class="vh"> for dagrun</span></a></p>
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#wrkviz"><code>wrkviz</code></a> <span class="badges"><span class="badge">optional</span></span></h4>
 <p>A zoomable local timeline of what the coordinator and its subagents did, built from their transcripts. Only its summary stage makes model calls.</p>
-<p class="card-links"><a href="tools.html#wrkviz">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/README.md">README</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/wrkviz/README.md">README<span class="vh"> for wrkviz</span></a></p>
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#gh-paced"><code>gh-paced</code></a> <span class="badges"><span class="badge">optional</span><span class="badge">build from source</span></span></h4>
 <p>Paces <code>gh</code> calls against per-host budgets, so agents sharing one GitHub account are less likely to trip GitHub's rate limits.</p>
-<p class="card-links"><a href="tools.html#gh-paced">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/QUICKSTART.md">Quickstart</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/gh-paced/QUICKSTART.md">Quickstart<span class="vh"> for gh-paced</span></a></p>
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#agent-usage"><code>agent-usage</code></a> <span class="badges"><span class="badge">optional</span><span class="badge">build from source</span></span></h4>
 <p>Reads Claude Code and Codex plan usage, reset times and burn rates without making a model call, so agents can see their own budgets.</p>
-<p class="card-links"><a href="tools.html#agent-usage">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/QUICKSTART.md">Quickstart</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/agent-usage/QUICKSTART.md">Quickstart<span class="vh"> for agent-usage</span></a></p>
 </article>
 <article class="card" id="vibe-talk-card">
 <h4 class="card-title"><a href="vibe-talk.html"><code>vibe-talk</code></a> <span class="badges"><span class="badge">optional</span><span class="badge badge-warn">early</span></span></h4>
 <p>A separately deployed web service: a phone reader for agent chat, with summaries, read-aloud and voice conversation. Its own status table says the live Discord and voice-vendor paths are not yet verified.</p>
-<p class="card-links"><a href="vibe-talk.html">Clips</a> <a href="tools.html#vibe-talk">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#status-what-works-what-is-stubbed">Status table</a></p>
+<p class="card-links"><a href="tools.html#vibe-talk">On the tools page<span class="vh">: vibe-talk</span></a> <a href="https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md#status-what-works-what-is-stubbed">Status table<span class="vh"> of vibe-talk</span></a></p>
 </article>
 <article class="card">
 <h4 class="card-title"><a href="tools.html#pr-landing-planner"><code>pr-landing-planner</code></a> <span class="badges"><span class="badge badge-warn">experimental</span></span></h4>
 <p>An advisory plan for landing a queue of pull requests from real merge conflicts, ordering, CI state and evidence tied to each exact head. It never changes a pull request.</p>
-<p class="card-links"><a href="tools.html#pr-landing-planner">Details</a> <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/python/README.md">README</a></p>
+<p class="card-links"><a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/pr-landing-planner/rendered/python/README.md">README<span class="vh"> for pr-landing-planner</span></a></p>
 </article>
 </div>
 <p class="small muted"><code>cpuset-alloc</code> and <code>parallel-experiment-runner</code> build on dagrun; the <a href="tools.html">tools page</a> covers them, the agent skills, and the compatibility commands.</p>
@@ -349,7 +349,7 @@
 </div>
 <div class="adopt-aside">
 <h3>What you end up with</h3>
-<pre class="tree" tabindex="0"><code>~/work/foobar/             <span class="c">the harness; the coordinator runs here</span>
+<pre class="tree" tabindex="0" role="region" aria-label="The harness directory setup produces"><code>~/work/foobar/             <span class="c">the harness; the coordinator runs here</span>
   AGENTS.md                <span class="c">makes the agent here the coordinator</span>
   CLAUDE.md -&gt; AGENTS.md
   foobar/                  <span class="c">your checkout, moved in unchanged</span>

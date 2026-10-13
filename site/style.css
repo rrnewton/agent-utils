@@ -26,7 +26,9 @@
   --text: #17202a;
   --muted: #4a5561;
   --border: #d5dbe0;
-  --border-strong: #b7c1ca;
+  /* At least 3:1 against --surface and --bg (WCAG 1.4.11): it outlines figure nodes and the
+   * dashed borders that mark optional and external pieces. #7a8794 is 3.67:1 on #fff. */
+  --border-strong: #7a8794;
   --accent: #0b6b69;
   --accent-strong: #08514f;
   --accent-soft: #e0efed;
@@ -35,8 +37,9 @@
   --ext-text: #3b4757;
   --ext-bg: #e8ecf1;
   --code-bg: #eef1f0;
-  --line: #8a98a5;
+  --line: #7a8794;
   --grid: rgba(23, 32, 42, 0.07);
+  --scroll-shade: rgba(23, 32, 42, 0.22);
   --shadow: 0 1px 2px rgba(23, 32, 42, 0.06), 0 4px 16px rgba(23, 32, 42, 0.05);
   --layer-owner: #6b4fa0;
   --layer-channel: #0b6b69;
@@ -54,7 +57,7 @@
     --text: #e5e9ec;
     --muted: #a3afba;
     --border: #2b353e;
-    --border-strong: #3d4a56;
+    --border-strong: #6c7a87;
     --accent: #5cc9bf;
     --accent-strong: #8fe0d8;
     --accent-soft: #123b38;
@@ -65,6 +68,7 @@
     --code-bg: #1b232a;
     --line: #6c7a87;
     --grid: rgba(229, 233, 236, 0.06);
+    --scroll-shade: rgba(0, 0, 0, 0.6);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.25);
     --layer-owner: #b9a2e8;
     --layer-channel: #5cc9bf;
@@ -83,7 +87,7 @@
   --text: #e5e9ec;
   --muted: #a3afba;
   --border: #2b353e;
-  --border-strong: #3d4a56;
+  --border-strong: #6c7a87;
   --accent: #5cc9bf;
   --accent-strong: #8fe0d8;
   --accent-soft: #123b38;
@@ -94,6 +98,7 @@
   --code-bg: #1b232a;
   --line: #6c7a87;
   --grid: rgba(229, 233, 236, 0.06);
+  --scroll-shade: rgba(0, 0, 0, 0.6);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.25);
   --layer-owner: #b9a2e8;
   --layer-channel: #5cc9bf;
@@ -210,12 +215,19 @@ code {
 }
 
 pre {
-  background: var(--code-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 0.9rem 1rem;
   overflow-x: auto;
   line-height: 1.5;
+  /* A shadow at an edge with more to scroll to. The two `local` covers move with the content
+   * and hide each `scroll` shadow once that edge is reached, so a block that fits shows none. */
+  background:
+    linear-gradient(to right, var(--code-bg) 40%, transparent) left center / 2.5rem 100% no-repeat local,
+    linear-gradient(to left, var(--code-bg) 40%, transparent) right center / 2.5rem 100% no-repeat local,
+    linear-gradient(to right, var(--scroll-shade), transparent) left center / 1rem 100% no-repeat scroll,
+    linear-gradient(to left, var(--scroll-shade), transparent) right center / 1rem 100% no-repeat scroll,
+    var(--code-bg);
 }
 
 pre code {
@@ -421,8 +433,8 @@ strong {
 
 @media (max-width: 47.99rem) {
   .theme-switch button {
-    padding: 0.4rem 0.42rem;
-    font-size: 0.76rem;
+    padding: 0.55rem 0.6rem;
+    font-size: 0.8rem;
   }
 }
 
@@ -440,6 +452,11 @@ main {
 .section:first-child,
 .hero + .section {
   border-top: 0;
+}
+
+/* The tools page's last section follows the column of tool cards, not another section. */
+.wrap + .section {
+  margin-top: 3rem;
 }
 
 .section-head {
@@ -613,11 +630,11 @@ main {
 .grid {
   display: grid;
   gap: 1rem;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
 }
 
 .grid-2 {
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));
 }
 
 .card {
@@ -657,7 +674,8 @@ main {
 
 .card-title a {
   color: var(--text);
-  text-decoration: none;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
 }
 
 .card-title code {
@@ -685,6 +703,7 @@ main {
 
 .card-external {
   border-style: dashed;
+  border-color: var(--border-strong);
   box-shadow: none;
 }
 
@@ -851,6 +870,7 @@ main {
 
 .arch-node b code {
   font-weight: 700;
+  font-size: 1em;
 }
 
 .arch-node.is-core {
@@ -1172,6 +1192,64 @@ tbody th {
   font-weight: 600;
 }
 
+/* Below 40rem a .table-stack table shows each row as a labeled block: the row header as its
+ * title, then each cell under its column's name (the cell's data-label). The column headers stay
+ * in the accessibility tree, and the markup carries explicit table roles because some browsers
+ * drop table semantics once a table's display changes. */
+@media (max-width: 40rem) {
+  .table-stack,
+  .table-stack tbody,
+  .table-stack tr,
+  .table-stack th[scope="row"],
+  .table-stack td {
+    display: block;
+  }
+
+  .table-stack caption {
+    display: block;
+    padding-bottom: 0.5rem;
+  }
+
+  .table-stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .table-stack tbody tr {
+    padding: 0.7rem 0.8rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .table-stack th[scope="row"],
+  .table-stack td {
+    padding: 0;
+    border: 0;
+  }
+
+  .table-stack th[scope="row"] {
+    font-size: 1rem;
+    margin-bottom: 0.35rem;
+  }
+
+  .table-stack td + td {
+    margin-top: 0.45rem;
+  }
+
+  .table-stack td::before {
+    content: attr(data-label);
+    display: block;
+    font: 650 0.72rem/1.4 var(--mono);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+}
+
 caption {
   caption-side: top;
   text-align: left;
@@ -1267,6 +1345,7 @@ caption {
 
 .tool-external {
   border-style: dashed;
+  border-color: var(--border-strong);
   box-shadow: none;
 }
 
