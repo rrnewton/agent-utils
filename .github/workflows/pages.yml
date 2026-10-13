@@ -63,9 +63,9 @@ jobs:
       - name: check and stage the site
         run: python3 scripts/check_site.py --stage "$RUNNER_TEMP/pages"
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: ${{ runner.temp }}/pages
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
