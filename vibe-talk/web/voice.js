@@ -8449,12 +8449,11 @@ function settlePostCard(proposal) {
 //   * THE READ-BACK IS EXACTLY THE TEMPLATE. Everything the assistant said since the last turn of
 //     anyone's — the user's, spoken or typed, or a text turn of this page's: a relayed message, a
 //     notice — or since this draft reached the card, is word for word "To {channel}: {text}. Send
-//     it?" (`isExactReadBack`): at most one
-//     lead-in word from a closed list, nothing inserted, nothing between the text and the question,
-//     nothing after it. So the owner heard exactly what would be posted and where, and nothing else
-//     since they last spoke: a read-back that adds a "not", a chat message read aloud, or an answer
-//     to some other question cannot stand in for it. Any turn of the user's ends it; only a fresh
-//     read-back, or a new draft read back, arms a yes again.
+//     it?" (`isExactReadBack`): at most one lead-in from a closed list, nothing inserted, nothing
+//     between the text and the question, nothing after it. So the owner heard exactly what would be
+//     posted and where, and nothing else since: a read-back that adds a "not", a chat message read
+//     aloud, or an answer to some other question cannot stand in for it. Any turn ends it; only a
+//     fresh read-back, or a new draft read back, arms a yes again.
 //   * HEARD TO THE END. The answer arrived after the read-back's audio finished playing. On the
 //     neutral protocol that is when the answer began (it sends partials); on the hosted protocol it
 //     is when its transcript arrived, which is later.
@@ -8474,12 +8473,12 @@ function settlePostCard(proposal) {
 // like one, spoken or typed — to a question about sending, or that says "send" itself, while this
 // call's draft is up gets a word back, sent or not (`askedAboutSending`). A yes to some other
 // question is not waited on, so it is not answered: answering every "okay" would make the agent
-// repeat itself to each acknowledgement of what it just said. The agent is told
-// through the call's own text channel — the `user_message` the composer and the live relay already
-// use, which the neutral protocol carries as a queued `prompt` — so its next words are true and it is
-// never the one that claims a send. And the page says it itself, on the status line, as a transcript
-// seam and as a short tone, because a model's sentence needs a cooperative model and the owner must
-// hear the truth anyway. A tap on the card during a call is told to the agent as well.
+// repeat itself to each acknowledgement of what it just said. The agent is told through the call's
+// own text channel — the `user_message` the composer and the live relay already use, which the
+// neutral protocol carries as a queued `prompt` — so its next words are true and it is never the one
+// that claims a send. And the page says it itself, on the status line, as a transcript seam and as a
+// short tone, because a model's sentence needs a cooperative model and the owner must hear the truth
+// anyway. A tap on the card during a call is told to the agent as well.
 //
 // WHAT IT CANNOT DO: tell the owner's voice from anyone else's, or know how sure the recogniser was.
 // A passenger or the radio saying "yeah" right after a read-back counts. The README says so.
@@ -8670,9 +8669,10 @@ function isExactReadBack(said, shown) {
  * Why what the assistant said is not a read-back of `shown`, as a key of SPOKEN_YES_REASONS, or
  * null when it is one.
  *
- * Held to everything said since the user's last turn, or to the part of it said once this draft was
- * on the card — the second so a replacement read back in full is not spoilt by the old one's words
- * before it, the first so a read-back whose transcript beat the card to this page still counts.
+ * Held to everything said since the last turn of anyone's, or to the part of it said once this
+ * draft was on the card — the second so a replacement read back in full is not spoilt by the old
+ * one's words before it, the first so a read-back whose transcript beat the card to this page still
+ * counts.
  *
  * @param {VibeTalk.PendingPost} shown
  * @param {{text: string, card: string | null}[]} turns
@@ -8691,8 +8691,8 @@ function readBackRefusal(shown, turns) {
  * Is sending the subject of this answer? Yes when the answer itself says send or post ("ok send
  * it"), or when the assistant, since the user last spoke, ended on a question about sending —
  * "Send it?", "Shall I post that?" — judged by the last sentence with a question mark, or by the
- * closing words of a transcript that has none. "Want to hear the rest?" is not about sending, nor is
- * "It was not sent; tap Send or ask me to read it back."
+ * closing words of a transcript with no punctuation at all. "Want to hear the rest?" is not about
+ * sending, nor is "It was not sent. Tap Send or ask me to read it back."
  *
  * @param {{text: string}[]} turns
  * @param {string} answer
