@@ -13,34 +13,72 @@
 //!
 //! # The shadow
 //!
-//! With `recent_view_shadow = true` (and `recent_view = "messages"`), every recent read through
-//! [`read`] is followed by a read of the newest Flat page of the same size, in a detached task so
-//! the caller never waits for it, at most one per channel at a time. The two answers are compared
-//! over the stretch both cover — from the newer of their oldest messages (or the channel's start,
-//! for a read that came back short) up to the newest message `/messages` returned — and two things
-//! are counted per channel:
+//! With `recent_view_shadow = true` (and `recent_view = "messages"`), each recent read through
+//! [`read`] is checked against a read of the newest Flat page of the same size, made later in a
+//! detached task so the caller never waits for it. The two answers are compared over the stretch
+//! both cover — from the newer of their oldest messages (or the channel's start, for a read that
+//! came back short) up to the newest message `/messages` returned — and two things are counted per
+//! channel:
 //!
 //! * **id mismatches**: messages inside that stretch that only one of the two listed;
 //! * **content-hash mismatches**: messages both listed whose text differs, compared by the same
 //!   [`crate::summarize::content_hash`] the summary cache keys on.
 //!
 //! A Flat message newer than everything `/messages` returned is not a mismatch: it arrived after
-//! that read. Counts only, in memory, in the diagnostics report. One `info` line per comparison
+//! that read. An empty `/messages` read bounds no stretch, so nothing is compared beside one.
+//! Counts only, in memory, in the diagnostics report, with two that explain a mismatch rather than
+//! hide it: `stale`, a Flat page the bridge labelled with `as_of`, and `raced`, a comparison across
+//! which the live feed reported an edit or a delete in the channel. One `info` line per comparison
 //! that found a difference carries the counts, and a `debug` line the message ids — never text.
+//!
+//! # What a check costs the reads it checks
+//!
+//! A Flat read is not free for the bridge, and it need not wait its turn there. The bridge this
+//! was built against runs every provider command through one slot and serves a timeline read as
+//! one a reader is waiting for, ahead of `/messages`. When its copy of the channel is a few minutes
+//! old it first brings it forward — one provider command, about two seconds — and when it holds no
+//! copy at all, as for the first read of a channel after a quiet spell or a restart of the bridge,
+//! it scans the channel, for up to 50 seconds. Either way it stops the `/messages` read holding the
+//! slot, runs it again afterwards, and goes ahead of every one waiting. A check started the moment
+//! its read returned would therefore hold up the next read of a catch-up, which reads channel
+//! after channel, or an agent's `digest_channel`: exactly the reads the shadow is meant to measure
+//! and leave alone.
+//!
+//! So checks wait, in one queue across every channel, and run ONE AT A TIME, each only once no
+//! recent read has been running for [`QUIET`]. A channel has at most one read waiting: a newer
+//! read of it takes the older one's place, and a read that has waited longer than [`MAX_WAIT`] is
+//! dropped, since a Flat read that much later would count every edit and delete in between. Both
+//! count as `skipped`. That makes a collision unlikely, not impossible: a read that starts while a
+//! check is making the bridge bring its copy forward still waits for it. And the bridge keeps a
+//! copy it was asked for recently current in the background, through the same slot at the
+//! priority of `/messages` itself: nothing is stopped for that, but a read can queue behind it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::chat::{ChatError, RecentRead};
 use crate::config::{ProviderKind, RecentView};
 use crate::model::{ChannelId, Message, MessageId};
+use crate::recent::ReadMark;
 use crate::state::AppState;
 use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 
-/// Read `channel`'s most recent `limit` messages through its provider, and shadow the read when
-/// that provider asks for it.
+/// How long no recent read may have run before a check starts. Long enough to fall between the
+/// back-to-back reads of a catch-up rather than inside them, short enough that a quiet minute
+/// checks every channel read in it.
+pub const QUIET: Duration = Duration::from_secs(3);
+
+/// How long a read may wait for its check before it is dropped, unchecked. A Flat read made much
+/// later than the `/messages` read it checks counts every edit and delete in between.
+pub const MAX_WAIT: Duration = Duration::from_secs(120);
+
+/// Read `channel`'s most recent `limit` messages through its provider, and queue the read for a
+/// check when that provider asks for one.
 ///
 /// # Errors
 ///
@@ -50,9 +88,24 @@ pub async fn read(
     channel: &ChannelId,
     limit: u16,
 ) -> Result<RecentRead, ChatError> {
-    let read = state.chat.fetch_recent_dated(channel, limit).await?;
-    if shadowed(state, channel) {
-        shadow(state, channel, limit, &read.messages);
+    // Taken before the read, like every mark: a change pushed while it runs may be in either
+    // answer, so it explains a difference between them. See `crate::recent::ReadMark`.
+    let mark = shadowed(state, channel).then(|| state.live.recent().mark(channel));
+    let reading = state.recent_view_shadow.reading();
+    let read = state.chat.fetch_recent_dated(channel, limit).await;
+    drop(reading);
+    let read = read?;
+    if let Some(mark) = mark {
+        let waiting = Waiting {
+            channel: channel.clone(),
+            limit,
+            messages: read.messages.clone(),
+            mark,
+            queued: Instant::now(),
+        };
+        if state.recent_view_shadow.enqueue(waiting) {
+            tokio::spawn(check(state.clone()));
+        }
     }
     Ok(read)
 }
@@ -72,27 +125,40 @@ pub fn shadowed(state: &AppState, channel: &ChannelId) -> bool {
         })
 }
 
-/// Start the Flat read that checks one `/messages` read, unless one for `channel` is running.
-fn shadow(state: &AppState, channel: &ChannelId, limit: u16, messages: &[Message]) {
-    let Some(running) = Running::claim(&state.recent_view_shadow, channel) else {
-        return;
+/// The one task that checks waiting reads, one at a time, each after a quiet spell. It ends when
+/// nothing is waiting; the next read queued starts another.
+async fn check(state: AppState) {
+    let shadow = Arc::clone(&state.recent_view_shadow);
+    let mut checking = Checking {
+        shadow: &shadow,
+        ended: false,
     };
-    let state = state.clone();
-    let messages = messages.to_vec();
-    tokio::spawn(async move {
+    loop {
+        shadow.quiet().await;
+        let Some(waiting) = shadow.next() else {
+            // `next` let the queue go, under its lock, so a read queued from now on starts a task.
+            checking.ended = true;
+            return;
+        };
+        shadow.count(&waiting.channel, |tally| tally.reads += 1);
         let request = TimelineRequest {
             view: TimelineView::Flat,
-            limit,
+            limit: waiting.limit,
             ..TimelineRequest::default()
         };
-        let channel = running.channel.clone();
-        let flat = state.chat.fetch_timeline(&channel, &request).await;
-        // Released before counting, so a reader of the counts can start the next one at once.
-        drop(running);
-        state
-            .recent_view_shadow
-            .finish(&channel, &messages, limit, flat);
-    });
+        let flat = state.chat.fetch_timeline(&waiting.channel, &request).await;
+        let raced = state
+            .live
+            .recent()
+            .changed_since(&waiting.channel, waiting.mark);
+        shadow.finish(
+            &waiting.channel,
+            &waiting.messages,
+            waiting.limit,
+            flat,
+            raced,
+        );
+    }
 }
 
 /// What one channel's shadow has counted since this process started.
@@ -100,7 +166,8 @@ fn shadow(state: &AppState, channel: &ChannelId, limit: u16, messages: &[Message
 pub struct Tally {
     /// Flat reads started to check a `/messages` read.
     pub reads: u64,
-    /// `/messages` reads left unchecked because a Flat read of the channel was still running.
+    /// `/messages` reads never checked: a newer read of the channel took their place in the queue,
+    /// or they waited longer than [`MAX_WAIT`] for their turn.
     pub skipped: u64,
     /// Flat reads that failed, so nothing was compared.
     pub failed: u64,
@@ -109,6 +176,10 @@ pub struct Tally {
     /// Of those, how many carried `as_of`: the bridge served a copy it could not bring up to date,
     /// and a mismatch beside one is explained by that.
     pub stale: u64,
+    /// Of those, how many the live feed reported an edit or a delete in the channel for between
+    /// the start of the `/messages` read and the end of the Flat read: a mismatch beside one may be
+    /// that change rather than a disagreement. Always zero where nothing feeds this server live.
+    pub raced: u64,
     /// Comparisons that found at least one mismatch of either kind.
     pub mismatched: u64,
     /// Messages, summed over every comparison, inside the stretch both reads cover that only one
@@ -128,18 +199,62 @@ pub struct ChannelTally {
     pub tally: Tally,
 }
 
-/// Every channel's shadow counts, and which channels have a Flat read running.
+/// A `/messages` read waiting for its check.
+#[derive(Clone, Debug)]
+struct Waiting {
+    channel: ChannelId,
+    limit: u16,
+    messages: Vec<Message>,
+    /// Taken before the read: see [`Tally::raced`].
+    mark: ReadMark,
+    queued: Instant,
+}
+
+/// The reads waiting for a check, and what decides when the next may start.
 #[derive(Debug, Default)]
+struct Queue {
+    /// Oldest first, at most one per channel.
+    waiting: VecDeque<Waiting>,
+    /// Recent reads running now.
+    reading: usize,
+    /// When the last of them ended.
+    last_read: Option<Instant>,
+    /// Whether the checking task is running.
+    checking: bool,
+}
+
+/// Every channel's shadow counts, and the reads waiting to be checked.
+#[derive(Debug)]
 pub struct Shadow {
     tallies: Mutex<BTreeMap<ChannelId, Tally>>,
-    running: Mutex<BTreeSet<ChannelId>>,
+    queue: Mutex<Queue>,
+    /// Woken when the last running recent read ends.
+    idle: Notify,
+    quiet: Duration,
+}
+
+impl Default for Shadow {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Shadow {
-    /// Nothing counted yet.
+    /// Nothing counted yet, checks waiting [`QUIET`].
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_quiet(QUIET)
+    }
+
+    /// Nothing counted yet, checks waiting `quiet` instead. For tests.
+    #[must_use]
+    pub fn with_quiet(quiet: Duration) -> Self {
+        Self {
+            tallies: Mutex::new(BTreeMap::new()),
+            queue: Mutex::new(Queue::default()),
+            idle: Notify::new(),
+            quiet,
+        }
     }
 
     /// What `channel`'s shadow has counted, zero when it has counted nothing.
@@ -155,6 +270,86 @@ impl Shadow {
         change(lock(&self.tallies).entry(channel.clone()).or_default());
     }
 
+    /// A recent read is running until the guard drops. Every read through [`read`] holds one,
+    /// shadowed or not: a check waits for all of them.
+    fn reading(&self) -> Reading<'_> {
+        lock(&self.queue).reading += 1;
+        Reading { shadow: self }
+    }
+
+    /// Put a read in the queue, in the place of one of the same channel already waiting. Whether
+    /// the caller must start the checking task.
+    fn enqueue(&self, waiting: Waiting) -> bool {
+        let channel = waiting.channel.clone();
+        let (replaced, start) = {
+            let mut queue = lock(&self.queue);
+            let replaced = match queue.waiting.iter_mut().find(|w| w.channel == channel) {
+                Some(older) => {
+                    *older = waiting;
+                    true
+                }
+                None => {
+                    queue.waiting.push_back(waiting);
+                    false
+                }
+            };
+            (replaced, !std::mem::replace(&mut queue.checking, true))
+        };
+        if replaced {
+            self.count(&channel, |tally| tally.skipped += 1);
+        }
+        start
+    }
+
+    /// Return once no recent read is running and none has for the quiet spell.
+    async fn quiet(&self) {
+        loop {
+            let wait = {
+                let queue = lock(&self.queue);
+                if queue.reading > 0 {
+                    None
+                } else {
+                    let since = queue.last_read.map_or(self.quiet, |at| at.elapsed());
+                    if since >= self.quiet {
+                        return;
+                    }
+                    Some(self.quiet - since)
+                }
+            };
+            match wait {
+                // `notify_one` keeps its wake-up for a waiter that has not started waiting yet, so
+                // a read that ends between the check above and this line is not missed.
+                None => self.idle.notified().await,
+                Some(wait) => tokio::time::sleep(wait).await,
+            }
+        }
+    }
+
+    /// The next read to check, dropping as skipped any that waited too long; `None`, and the
+    /// queue let go, when nothing is waiting.
+    fn next(&self) -> Option<Waiting> {
+        let mut dropped = Vec::new();
+        let next = {
+            let mut queue = lock(&self.queue);
+            loop {
+                match queue.waiting.pop_front() {
+                    Some(waiting) if waiting.queued.elapsed() > MAX_WAIT => {
+                        dropped.push(waiting.channel);
+                    }
+                    Some(waiting) => break Some(waiting),
+                    None => {
+                        queue.checking = false;
+                        break None;
+                    }
+                }
+            }
+        };
+        for channel in dropped {
+            self.count(&channel, |tally| tally.skipped += 1);
+        }
+        next
+    }
+
     /// Fold one finished Flat read into `channel`'s counts.
     fn finish(
         &self,
@@ -162,6 +357,7 @@ impl Shadow {
         messages: &[Message],
         limit: u16,
         flat: Result<TimelinePage, ChatError>,
+        raced: bool,
     ) {
         let page = match flat {
             Ok(page) => page.into_recent(limit),
@@ -176,6 +372,7 @@ impl Shadow {
         self.count(channel, |tally| {
             tally.compared += 1;
             tally.stale += u64::from(stale);
+            tally.raced += u64::from(raced);
             if !difference.is_empty() {
                 tally.mismatched += 1;
                 tally.id_mismatches += count(difference.ids.len());
@@ -188,6 +385,7 @@ impl Shadow {
                 id_mismatches = difference.ids.len(),
                 hash_mismatches = difference.contents.len(),
                 stale,
+                raced,
                 "recent view shadow: the Flat view disagreed with /messages"
             );
             tracing::debug!(
@@ -209,33 +407,35 @@ fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A running Flat read of one channel. Dropping it — the read finished, or its task was torn
-/// down — lets the next `/messages` read of the channel start another.
-struct Running {
-    shadow: Arc<Shadow>,
-    channel: ChannelId,
+/// A recent read running. Dropping it — the read finished, or its caller gave up — starts the
+/// quiet spell when it was the last.
+struct Reading<'a> {
+    shadow: &'a Shadow,
 }
 
-impl Running {
-    fn claim(shadow: &Arc<Shadow>, channel: &ChannelId) -> Option<Self> {
-        let claimed = lock(&shadow.running).insert(channel.clone());
-        shadow.count(channel, |tally| {
-            if claimed {
-                tally.reads += 1;
-            } else {
-                tally.skipped += 1;
-            }
-        });
-        claimed.then(|| Self {
-            shadow: Arc::clone(shadow),
-            channel: channel.clone(),
-        })
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        let mut queue = lock(&self.shadow.queue);
+        queue.reading = queue.reading.saturating_sub(1);
+        queue.last_read = Some(Instant::now());
+        if queue.reading == 0 {
+            self.shadow.idle.notify_one();
+        }
     }
 }
 
-impl Drop for Running {
+/// The checking task, running. Torn down before it let the queue go — a panic, or the runtime
+/// ending — it lets it go here, so a later read can start another.
+struct Checking<'a> {
+    shadow: &'a Shadow,
+    ended: bool,
+}
+
+impl Drop for Checking<'_> {
     fn drop(&mut self) {
-        lock(&self.shadow.running).remove(&self.channel);
+        if !self.ended {
+            lock(&self.shadow.queue).checking = false;
+        }
     }
 }
 
@@ -261,9 +461,14 @@ impl Difference {
 /// The stretch compared starts at the newer of the two reads' oldest messages — or at the
 /// channel's start for a read that came back short, which claims the whole channel — and ends at
 /// the newest message `messages` holds: a Flat message after that arrived after the `/messages`
-/// read and is not a mismatch. An id that is not a number is always inside the stretch.
+/// read and is not a mismatch. An empty `messages` holds no newest message, so nothing is
+/// compared: every Flat message may have arrived after it. An id that is not a number is always
+/// inside the stretch.
 #[must_use]
 pub fn compare(messages: &[Message], flat: &[Message], limit: u16) -> Difference {
+    if messages.is_empty() {
+        return Difference::default();
+    }
     let floor = |read: &[Message]| {
         if read.len() < usize::from(limit) {
             0
@@ -389,6 +594,14 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_messages_read_compares_nothing() {
+        // Nothing says how new the read was, so every Flat message may have arrived after it.
+        let flat = [message(10, "a"), message(11, "b")];
+        assert!(compare(&[], &flat, 50).is_empty());
+        assert!(compare(&[], &flat, 2).is_empty());
+    }
+
+    #[test]
     fn the_counts_follow_each_comparison_and_failure() {
         let shadow = Shadow::new();
         let channel = ChannelId("1".to_owned());
@@ -398,7 +611,13 @@ mod tests {
             as_of: as_of.map(str::to_owned),
             ..TimelinePage::default()
         };
-        shadow.finish(&channel, &messages, 50, Ok(page(messages.to_vec(), None)));
+        shadow.finish(
+            &channel,
+            &messages,
+            50,
+            Ok(page(messages.to_vec(), None)),
+            false,
+        );
         shadow.finish(
             &channel,
             &messages,
@@ -407,12 +626,14 @@ mod tests {
                 vec![message(11, "b, edited")],
                 Some("2026-10-12T10:00:00Z"),
             )),
+            true,
         );
         shadow.finish(
             &channel,
             &messages,
             50,
             Err(ChatError::Transport("down".to_owned())),
+            true,
         );
         assert_eq!(
             shadow.tally(&channel),
@@ -422,6 +643,7 @@ mod tests {
                 failed: 1,
                 compared: 2,
                 stale: 1,
+                raced: 1,
                 mismatched: 1,
                 id_mismatches: 1,
                 hash_mismatches: 1,
@@ -429,16 +651,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_flat_read_runs_per_channel_and_the_next_waits_for_it_to_end() {
+    fn waiting(channel: &str, text: &str) -> Waiting {
+        let channel = ChannelId(channel.to_owned());
+        Waiting {
+            mark: crate::recent::RecentWindows::new().mark(&channel),
+            channel,
+            limit: 50,
+            messages: vec![message(10, text)],
+            queued: Instant::now(),
+        }
+    }
+
+    /// One queue for every channel, one read waiting per channel: a newer read of a channel takes
+    /// the older one's place, keeps its turn, and the older one counts as skipped. Only the first
+    /// read queued while no check is running starts one.
+    #[tokio::test(start_paused = true)]
+    async fn one_read_waits_per_channel_and_a_newer_one_takes_its_place() {
+        let shadow = Shadow::new();
+        assert!(shadow.enqueue(waiting("1", "first")));
+        assert!(!shadow.enqueue(waiting("2", "other")));
+        assert!(!shadow.enqueue(waiting("1", "newer")));
+        assert_eq!(shadow.tally(&ChannelId("1".to_owned())).skipped, 1);
+
+        let next = shadow.next().expect("waiting");
+        assert_eq!(next.channel, ChannelId("1".to_owned()));
+        assert_eq!(next.messages[0].content, "newer");
+        assert_eq!(
+            shadow.next().expect("waiting").channel,
+            ChannelId("2".to_owned())
+        );
+        // Empty: the queue is let go, so the next read queued starts a check again.
+        assert!(shadow.next().is_none());
+        assert!(shadow.enqueue(waiting("2", "again")));
+    }
+
+    /// A read left waiting too long is dropped as skipped: a Flat read that late would count every
+    /// change in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_waited_too_long_is_skipped() {
+        let shadow = Shadow::new();
+        assert!(shadow.enqueue(waiting("1", "old")));
+        tokio::time::advance(MAX_WAIT / 2).await;
+        assert!(!shadow.enqueue(waiting("2", "younger")));
+        tokio::time::advance(MAX_WAIT / 2 + Duration::from_secs(1)).await;
+        let next = shadow.next().expect("the younger read is still in time");
+        assert_eq!(next.channel, ChannelId("2".to_owned()));
+        assert_eq!(shadow.tally(&ChannelId("1".to_owned())).skipped, 1);
+        assert_eq!(shadow.tally(&ChannelId("2".to_owned())).skipped, 0);
+    }
+
+    /// A check waits while any recent read runs, and then for the quiet spell after the last.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_waits_for_recent_reads_to_stop_and_then_for_quiet() {
         let shadow = Arc::new(Shadow::new());
-        let channel = ChannelId("1".to_owned());
-        let first = Running::claim(&shadow, &channel).expect("the first read starts");
-        assert!(Running::claim(&shadow, &channel).is_none());
-        assert!(Running::claim(&shadow, &ChannelId("2".to_owned())).is_some());
+        // Nothing has been read: no reason to wait.
+        tokio::time::timeout(Duration::from_millis(1), shadow.quiet())
+            .await
+            .expect("quiet at once");
+
+        let first = shadow.reading();
+        let second = shadow.reading();
+        let waiter = {
+            let shadow = Arc::clone(&shadow);
+            tokio::spawn(async move { shadow.quiet().await })
+        };
+        tokio::time::sleep(QUIET * 4).await;
+        assert!(!waiter.is_finished(), "a read is running");
         drop(first);
-        assert!(Running::claim(&shadow, &channel).is_some());
-        let tally = shadow.tally(&channel);
-        assert_eq!((tally.reads, tally.skipped), (2, 1));
+        tokio::time::sleep(QUIET * 4).await;
+        assert!(!waiter.is_finished(), "a read is still running");
+        drop(second);
+        tokio::time::sleep(QUIET - Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "inside the quiet spell");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(waiter.is_finished(), "the quiet spell is over");
     }
 }

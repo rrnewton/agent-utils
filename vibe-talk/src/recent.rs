@@ -153,6 +153,9 @@ pub struct Held {
     /// Earlier than the read when the provider said its answer was complete only up to an earlier
     /// instant: then that instant. `#208 persistent-cache`; see [`RecentWindows::record_as_of`].
     pub read_started: Instant,
+    /// When this server's read began, never moved back: what "this server read it N ago" counts
+    /// from. The same as `read_started` unless the provider's `as_of` moved that back.
+    pub read_began: Instant,
     /// When that read finished.
     pub read_finished: Instant,
     /// The provider's own `as_of`, RFC 3339, when it moved `read_started` back: what to say when
@@ -161,8 +164,10 @@ pub struct Held {
 }
 
 impl Held {
-    /// How long ago the read that produced this window began: the age to SAY, since the window
-    /// may know nothing of the channel after that moment.
+    /// How old this window's picture of the channel is: since the read that produced it began, or
+    /// since the provider's `as_of` when that is earlier. The window may know nothing of the
+    /// channel after that moment. How long ago THIS SERVER read it counts from
+    /// [`Held::read_began`].
     #[must_use]
     pub fn age(&self) -> Duration {
         self.read_started.elapsed()
@@ -366,6 +371,7 @@ impl RecentWindows {
             limit,
             whole: messages.len() < usize::from(limit),
             read_started: started,
+            read_began: mark.started,
             read_finished: Instant::now(),
             as_of: as_of.filter(|_| started < mark.started).map(str::to_owned),
         };
@@ -455,6 +461,18 @@ impl RecentWindows {
             .slots
             .get(channel)
             .is_some_and(|slot| slot.held.is_some())
+    }
+
+    /// Whether the live feed has reported an edit or a delete in `channel` since `mark` was taken,
+    /// or more pushes than are journalled, so that it cannot be told. `#208 persistent-cache`:
+    /// what may explain two reads of the channel either side of it disagreeing; see
+    /// [`crate::recent_view`].
+    #[must_use]
+    pub fn changed_since(&self, channel: &ChannelId, mark: ReadMark) -> bool {
+        self.windows().slots.get(channel).is_some_and(|slot| {
+            slot.pushes_since(mark)
+                .is_none_or(|pushes| pushes.iter().any(|live| live.kind != LiveKind::Create))
+        })
     }
 
     /// Whether `channel`'s window can answer a read of `scan` messages without asking the chat
@@ -966,6 +984,8 @@ mod tests {
         let held = windows.snapshot(&channel).held.expect("held");
         assert!(held.age() >= Duration::from_secs(590), "{:?}", held.age());
         assert!(held.since_finished() < Duration::from_secs(1));
+        // This server read it just now, whatever the copy's age.
+        assert!(held.read_began.elapsed() < Duration::from_secs(1));
         assert_eq!(held.as_of.as_deref(), Some(ten_minutes_ago.as_str()));
 
         // A current read replaces it and says nothing about a copy.
@@ -1004,6 +1024,63 @@ mod tests {
             assert_eq!(held.as_of, None, "{as_of}");
             assert!(held.age() < Duration::from_secs(1), "{as_of}");
         }
+    }
+
+    /// `#208 persistent-cache`. A read that succeeded after a failure clears it, however old the
+    /// copy it brought: the read began after the failure even when its `as_of` is earlier.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_from_an_older_copy_still_clears_a_failure_before_it() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let failed = windows.mark(&channel);
+        windows.note_failure(&channel, ChatError::Transport("down".to_owned()), failed);
+        assert!(windows.snapshot(&channel).failure.is_some());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let ten_minutes_ago =
+            crate::clock::iso_from_ms(jiff::Timestamp::now().as_millisecond() - 600_000);
+        windows.record_as_of(
+            &channel,
+            &[message(id(1), "copy")],
+            50,
+            windows.mark(&channel),
+            Some(&ten_minutes_ago),
+        );
+        let known = windows.snapshot(&channel);
+        let held = known.held.expect("held");
+        assert!(
+            held.read_started < failed.started(),
+            "the copy is older than the failure"
+        );
+        assert!(known.failure.is_none(), "{:?}", known.failure);
+    }
+
+    /// `#208 persistent-cache`. What the recent-view shadow asks of the journal: whether an edit
+    /// or a delete came after a mark. A creation does not count; pushes the journal no longer holds
+    /// might have been either, so they do.
+    #[tokio::test]
+    async fn an_edit_or_delete_after_a_mark_is_told_and_a_creation_is_not() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let mark = windows.mark(&channel);
+        assert!(!windows.changed_since(&channel, mark));
+        windows.merge(&channel, &live(LiveKind::Create, message(id(1), "new")));
+        assert!(!windows.changed_since(&channel, mark));
+        windows.merge(&channel, &live(LiveKind::Update, message(id(1), "edited")));
+        assert!(windows.changed_since(&channel, mark));
+        let later = windows.mark(&channel);
+        assert!(!windows.changed_since(&channel, later));
+        windows.merge(&channel, &live(LiveKind::Delete, message(id(1), "")));
+        assert!(windows.changed_since(&channel, later));
+
+        let other = ChannelId("2".to_owned());
+        let mark = windows.mark(&other);
+        for n in 0..=u64::try_from(JOURNAL).expect("small") {
+            windows.merge(&other, &live(LiveKind::Create, message(id(n), "new")));
+        }
+        assert!(
+            windows.changed_since(&other, mark),
+            "fell out of the journal"
+        );
     }
 
     #[tokio::test(start_paused = true)]

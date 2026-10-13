@@ -701,7 +701,8 @@ pub enum Currency {
     Current,
     /// This server's earlier copy, because the channel was not read again in time.
     Held {
-        /// How long ago the read that produced the copy began.
+        /// How long ago this server's read of the copy began. A copy the provider dated with
+        /// `as_of` is older than that: [`ChannelActivity::as_of`] says how much.
         age: std::time::Duration,
         /// Why it was not read again: the code of the newest read's failure, or `None` when that
         /// read is still running.
@@ -910,7 +911,7 @@ async fn channel_activity(
         Currency::Current
     } else {
         Currency::Held {
-            age: held.age(),
+            age: held.read_began.elapsed(),
             // Said even while another read is running: "the last read failed" is the more useful
             // of the two things that are true.
             failed: known.failure.map(|error| OpError::Chat(error).code()),

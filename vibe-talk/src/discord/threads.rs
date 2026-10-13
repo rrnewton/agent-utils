@@ -1952,6 +1952,19 @@ mod tests {
         let read = page.into_recent(2);
         assert_eq!(ids_of(&read.messages), ["11", "12"]);
         assert_eq!(read.as_of.as_deref(), Some("2026-10-12T09:00:00Z"));
+
+        // Newest first, with a repeat: sorted before the repeat is dropped and the oldest cut, or
+        // the newest messages would be the ones lost.
+        let page = TimelinePage {
+            messages: ["13", "12", "12", "11", "10"]
+                .into_iter()
+                .map(parsed)
+                .collect(),
+            ..TimelinePage::default()
+        };
+        let read = page.into_recent(3);
+        assert_eq!(ids_of(&read.messages), ["11", "12", "13"]);
+        assert_eq!(read.as_of, None);
     }
 
     fn bridge_page(messages: Value) -> Value {

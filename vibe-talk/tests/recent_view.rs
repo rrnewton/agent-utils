@@ -4,12 +4,16 @@
 //! diagnostics. Off by default.
 //!
 //! The provider here wraps [`FakeDiscord`]: its recent read carries whatever `as_of` the test sets,
-//! and its Flat view answers from the same messages with whatever the test changes.
+//! and its Flat view answers from the same messages with whatever the test changes. It also keeps
+//! a log of when each read ran, so a test can show that a check never ran beside a recent read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -23,7 +27,7 @@ use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::mcp::protocol::{dispatch, Outcome};
 use vibe_talk::model::{ChannelId, Message, MessageId};
 use vibe_talk::ops;
-use vibe_talk::recent_view::{self, Tally};
+use vibe_talk::recent_view::{self, Shadow, Tally, QUIET};
 use vibe_talk::state::AppState;
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
 use vibe_talk::threads::{TimelinePage, TimelineRequest, TimelineView};
@@ -36,6 +40,21 @@ struct Bridge {
     flat_missing: Mutex<BTreeSet<MessageId>>,
     recent_missing: Mutex<BTreeSet<MessageId>>,
     flat_reads: AtomicUsize,
+    /// When set, a recent read waits for a permit here before it answers.
+    hold: Mutex<Option<Arc<Semaphore>>>,
+    /// How long a Flat read takes: a bridge bringing its copy forward first.
+    flat_takes: Mutex<Duration>,
+    /// Every read, in the order it started and ended.
+    log: Mutex<Vec<(Instant, Event)>>,
+}
+
+/// One entry of [`Bridge::log`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Event {
+    RecentStarted,
+    RecentEnded,
+    FlatStarted,
+    FlatEnded,
 }
 
 impl Bridge {
@@ -47,7 +66,14 @@ impl Bridge {
             flat_missing: Mutex::new(BTreeSet::new()),
             recent_missing: Mutex::new(BTreeSet::new()),
             flat_reads: AtomicUsize::new(0),
+            hold: Mutex::new(None),
+            flat_takes: Mutex::new(Duration::ZERO),
+            log: Mutex::new(Vec::new()),
         }
+    }
+
+    fn note(&self, event: Event) {
+        self.log.lock().expect("log").push((Instant::now(), event));
     }
 }
 
@@ -76,9 +102,15 @@ impl ChatClient for Bridge {
         channel: &ChannelId,
         limit: u16,
     ) -> Result<RecentRead, ChatError> {
+        self.note(Event::RecentStarted);
+        let hold = self.hold.lock().expect("hold").clone();
+        if let Some(hold) = hold {
+            hold.acquire().await.expect("open").forget();
+        }
         let missing = self.recent_missing.lock().expect("missing").clone();
         let mut messages = self.inner.fetch_recent(channel, limit).await?;
         messages.retain(|m| !missing.contains(&m.id));
+        self.note(Event::RecentEnded);
         Ok(RecentRead {
             messages,
             as_of: self.as_of.lock().expect("as_of").clone(),
@@ -94,6 +126,10 @@ impl ChatClient for Bridge {
         assert_eq!(request.view, TimelineView::Flat, "only Flat is read here");
         assert!(request.before.is_none() && request.after.is_none());
         self.flat_reads.fetch_add(1, Ordering::SeqCst);
+        self.note(Event::FlatStarted);
+        let takes = *self.flat_takes.lock().expect("takes");
+        tokio::time::sleep(takes).await;
+        self.note(Event::FlatEnded);
         let text = self.flat_text.lock().expect("text").clone();
         let missing = self.flat_missing.lock().expect("missing").clone();
         let messages = self
@@ -141,6 +177,10 @@ fn harness(extra: &str) -> Harness {
     for text in ["build is green", "deploy started", "deploy finished"] {
         fake.seed(&channel(READ_CHANNEL), "agent", text);
     }
+    fake.seed(&channel(WRITE_CHANNEL), "agent", "posted here");
+    // Checks wait a moment rather than three seconds, so a test on the real clock is quick. The
+    // test of that wait itself puts the real one back and stops the clock.
+    state.recent_view_shadow = Arc::new(Shadow::with_quiet(Duration::from_millis(5)));
     let bridge = Arc::new(Bridge::new(Arc::clone(&fake)));
     let client: Arc<dyn ChatClient> = bridge.clone();
     state.replace_chat(client);
@@ -288,7 +328,7 @@ async fn the_shadow_is_off_unless_a_bridge_turns_it_on() {
 
 /// Wait, briefly, for the detached Flat read to be folded into the counts.
 async fn compared(state: &AppState, id: &str, times: u64) -> Tally {
-    for _ in 0..200 {
+    for _ in 0..2_000 {
         let tally = state.recent_view_shadow.tally(&channel(id));
         if tally.compared + tally.failed >= times {
             return tally;
@@ -298,8 +338,8 @@ async fn compared(state: &AppState, id: &str, times: u64) -> Tally {
     panic!("the shadow read never finished");
 }
 
-/// Shadowed, every `/messages` read is followed by a Flat read of the same size, and where the
-/// two disagree is counted per channel: a message only one listed, and a message whose text
+/// Shadowed, every `/messages` read is checked by a later Flat read of the same size, and where
+/// the two disagree is counted per channel: a message only one listed, and a message whose text
 /// differs. The caller's answer is the `/messages` read, untouched.
 #[tokio::test]
 async fn a_shadowed_read_counts_where_the_flat_view_disagrees() {
@@ -379,9 +419,87 @@ async fn a_shadowed_read_counts_where_the_flat_view_disagrees() {
     assert_eq!(row(READ_CHANNEL)["id_mismatches"], json!(1));
     assert_eq!(row(READ_CHANNEL)["hash_mismatches"], json!(1));
     assert_eq!(row(WRITE_CHANNEL)["reads"], json!(0));
+    assert_eq!(row(READ_CHANNEL)["raced"], json!(0));
     let text = report["recent_view_shadow"].to_string();
     assert!(
         !text.contains("deploy"),
         "message text in diagnostics: {text}"
     );
+}
+
+/// A bridge may serve a Flat read ahead of `/messages`, stopping the one it is running, so a check
+/// must not run beside the reads it measures: it waits while any recent read runs and for
+/// [`QUIET`] after the last, and checks run one at a time across every channel.
+#[tokio::test(start_paused = true)]
+async fn a_check_waits_until_recent_reads_have_stopped_and_runs_one_at_a_time() {
+    let mut h = harness("recent_view_shadow = true");
+    h.state.recent_view_shadow = Arc::new(Shadow::new());
+    *h.bridge.flat_takes.lock().expect("takes") = Duration::from_secs(2);
+
+    ops::messages(&h.state, READ_CHANNEL, None)
+        .await
+        .expect("read");
+    // A second channel's read starts at once and is slow.
+    let hold = Arc::new(Semaphore::new(0));
+    *h.bridge.hold.lock().expect("hold") = Some(Arc::clone(&hold));
+    let slow = {
+        let state = h.state.clone();
+        tokio::spawn(async move { ops::messages(&state, WRITE_CHANNEL, None).await })
+    };
+    tokio::time::sleep(QUIET * 4).await;
+    assert_eq!(
+        h.bridge.flat_reads.load(Ordering::SeqCst),
+        0,
+        "a read is running"
+    );
+    *h.bridge.hold.lock().expect("hold") = None;
+    hold.add_permits(1);
+    slow.await.expect("joined").expect("read");
+    tokio::time::sleep(QUIET / 2).await;
+    assert_eq!(
+        h.bridge.flat_reads.load(Ordering::SeqCst),
+        0,
+        "inside the quiet spell"
+    );
+
+    // While the first check runs, another read: the second check waits out a quiet spell after it.
+    while h.bridge.flat_reads.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ops::messages(&h.state, READ_CHANNEL, None)
+        .await
+        .expect("read");
+    // The first read of READ_CHANNEL was checked first, as the oldest waiting; the newer one
+    // queued behind WRITE_CHANNEL's.
+    compared(&h.state, WRITE_CHANNEL, 1).await;
+    compared(&h.state, READ_CHANNEL, 2).await;
+    assert_eq!(h.bridge.flat_reads.load(Ordering::SeqCst), 3);
+
+    let log = h.bridge.log.lock().expect("log").clone();
+    let (mut recent, mut flat) = (0_i32, 0_i32);
+    let mut last_recent_end: Option<Instant> = None;
+    for (at, event) in log {
+        match event {
+            Event::RecentStarted => {
+                recent += 1;
+            }
+            Event::RecentEnded => {
+                recent -= 1;
+                last_recent_end = Some(at);
+            }
+            Event::FlatStarted => {
+                assert_eq!(recent, 0, "a check started beside a recent read");
+                assert_eq!(flat, 0, "two checks at once");
+                if let Some(end) = last_recent_end {
+                    assert!(
+                        at - end >= QUIET,
+                        "a check started {:?} after a read",
+                        at - end
+                    );
+                }
+                flat += 1;
+            }
+            Event::FlatEnded => flat -= 1,
+        }
+    }
 }
