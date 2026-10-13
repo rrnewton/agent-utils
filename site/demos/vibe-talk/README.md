@@ -45,7 +45,8 @@ python3 -m playwright install chromium
 #    About two minutes.
 python3 site/demos/vibe-talk/record_demo.py --publish
 
-# 4. Check the website, then look at every clip before committing it.
+# 4. Check the website, then look at every clip before committing it. A clip with a new name
+#    must be `git add`-ed first: the checker refuses a website file that git does not track.
 python3 scripts/check_site.py
 ```
 

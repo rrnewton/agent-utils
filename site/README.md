@@ -15,6 +15,7 @@ repository's own documents, which stay the authority.
 | `favicon.svg` | The site icon. |
 | `.nojekyll` | Tells a branch-based Pages build not to run Jekyll. The Actions deployment ignores it. |
 | `demos/` | **Not published.** The tools that record the demo clips; see `demos/vibe-talk/README.md`. |
+| `README.md` | **Not published.** These maintainer notes, which GitHub shows when you browse `site/`. |
 
 ## Rules
 
@@ -41,9 +42,12 @@ repository's own documents, which stay the authority.
   `<img>` has its own `width` and `height` so the page does not shift when it loads, and
   `loading="lazy"`; a plain link beside the clip opens the animation. Say what the clip was
   recorded against. The vibe-talk clips ran against local mocks, and the page says so.
-- `demos/` is repository source, never website. The checker does not treat its files as website
-  files, refuses a page link into it, and leaves it out of what it stages for Pages. Link its
-  files by their GitHub URL.
+- `demos/` and this `README.md` are repository source, never website. The checker does not treat
+  them as website files, refuses a page link to them, and leaves them out of what it stages for
+  Pages. Link them by their GitHub URL.
+- Every published file must be tracked: `git add` a new page, GIF or poster before you run the
+  checker. CI and the Pages deploy check out a clean tree, so an untracked file that previews
+  fine locally would be missing there, and the checker refuses it.
 
 ## Check and preview
 

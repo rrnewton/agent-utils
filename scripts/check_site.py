@@ -7,7 +7,9 @@ nothing else would notice a page that no longer parses, a link to a document tha
 `#fragment` whose heading was reworded, or a stylesheet quietly fetched from another origin. This
 script is that notice. It needs only the Python standard library and `git`.
 
-What it checks, each proven able to fail by `--self-test`:
+What it checks. `--self-test` builds a small fixture site and, for each rule below, a variant
+that breaks exactly that rule, and requires the rule's own message; it also requires the valid
+fixture to pass:
 
 * **Structure.** Every page starts with `<!DOCTYPE html>`, parses, closes every non-void element
   explicitly and in order, has unique ids, one `<main>` with an id that a skip link (the first link
@@ -31,11 +33,13 @@ What it checks, each proven able to fail by `--self-test`:
 * **Accessibility basics.** Every `<img>` has `alt`; an inline `<svg>` is either `aria-hidden` or
   has `role="img"` and an accessible name.
 * **Assets.** Only known file types live in `site/`, `index.html` and `.nojekyll` exist, GIFs are
-  at most 3 MB each, other images at most 1.5 MB, text assets at most 256 KB.
-* **What is published.** `site/demos/` holds the tools that record the site's media. It is
-  repository source, not website: its files are not checked as website files, `--stage` leaves it
-  out of what the Pages workflow uploads, and a page link into it is refused, because the target
-  would not exist once published.
+  at most 3 MB each, other images at most 1.5 MB, text assets at most 256 KB. Every published
+  file is tracked by git (the index counts), because CI and the Pages deploy check out a clean
+  tree: a GIF that was never `git add`-ed would pass here and be missing there.
+* **What is published.** `site/demos/` holds the tools that record the site's media, and
+  `site/README.md` holds the maintainer notes. Both are repository source, not website: they are
+  not checked as website files, `--stage` leaves them out of what the Pages workflow uploads, and
+  a page link to them is refused, because the target would not exist once published.
 
 The pages' own content, wording and visual quality are a human's job; see `site/README.md`.
 
@@ -94,11 +98,12 @@ IMAGE_LIMIT = 1_500_000
 TEXT_LIMIT = 256_000
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".avif", ".ico"})
 TEXT_SUFFIXES = frozenset({".html", ".css", ".svg", ".js", ".txt", ".md"})
-#: `.nojekyll` and `README.md` are named; anything else needs a known suffix.
+#: Files allowed without a known suffix.
 NAMED_FILES = frozenset({".nojekyll"})
-#: Top-level directories of `site/` that are repository source, never published: `demos/` holds
-#: the tools that record the site's media (a Python recorder, a mock server, a config template).
-UNPUBLISHED = frozenset({"demos"})
+#: Top-level entries of `site/` that are repository source, never published: `demos/` holds the
+#: tools that record the site's media (a Python recorder, a mock server, a config template), and
+#: `README.md` is the maintainer notes, which GitHub shows when browsing `site/`.
+UNPUBLISHED = frozenset({"demos", "README.md"})
 
 #: CSP source expressions that keep every load on this origin.
 CSP_ALLOWED_SOURCE = re.compile(r"^(?:'self'|'none'|'sha256-[A-Za-z0-9+/]+={0,2}')$")
@@ -383,6 +388,19 @@ _HTML_ANCHOR = re.compile(r"""<[A-Za-z][^>]*?\s(?:id|name)\s*=\s*["']([^"']+)["'
 _ATX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+#: One block-quote marker or list-item marker at the start of a line. GitHub gives a heading inside
+#: a block quote (`> ### Note`) or a list item (`- ## Step`) an anchor like any other heading.
+_CONTAINER = re.compile(r"^ {0,3}(?:>[ \t]?|(?:[-+*]|\d{1,9}[.)])[ \t]+)")
+
+
+def _strip_containers(line: str) -> str:
+    """`line` without its leading block-quote and list-item markers."""
+
+    while True:
+        match = _CONTAINER.match(line)
+        if not match or not match.end():
+            return line
+        line = line[match.end():]
 
 
 def heading_text(markdown: str) -> str:
@@ -439,11 +457,14 @@ def markdown_anchors(text: str) -> set[str]:
         anchors.add(f"{slug}-{number}")
 
     for line in lines[start:]:
-        fence_match = _FENCE.match(line)
+        # Fences and ATX headings are recognized inside block quotes and list items too; setext
+        # headings only at the top level, which is where this repository's documents use them.
+        body = _strip_containers(line)
+        fence_match = _FENCE.match(body)
         if fence is not None:
             if fence_match and fence_match.group(1)[0] == fence[0] and len(
                 fence_match.group(1)
-            ) >= len(fence) and not line.strip().strip(fence[0]):
+            ) >= len(fence) and not body.strip().strip(fence[0]):
                 fence = None
             previous = None
             continue
@@ -452,7 +473,7 @@ def markdown_anchors(text: str) -> set[str]:
             previous = None
             continue
         anchors.update(_HTML_ANCHOR.findall(line))
-        atx = _ATX.match(line)
+        atx = _ATX.match(body)
         if atx:
             content = atx.group(2) or ""
             content = re.sub(r"(?:^|[ \t]+)#+$", "", content)
@@ -538,7 +559,7 @@ def _resolve_local(
     hidden = _unpublished(resolved, site.resolve())
     if hidden is not None:
         return None, (
-            f"{target!r} is in {SITE}/{hidden}/, which is repository source and is not "
+            f"{target!r} is under {SITE}/{hidden}, which is repository source and is not "
             "published; link it by its GitHub URL"
         )
     if resolved.is_dir():
@@ -798,6 +819,20 @@ def _check_assets(site: Path, files: Sequence[Path]) -> list[str]:
     return problems
 
 
+def _check_tracked(files: Sequence[Path], repo: Repo) -> list[str]:
+    """Every published file must be in the git index: CI and Pages build from a clean checkout."""
+
+    problems: list[str] = []
+    for path in files:
+        name = _rel(path, repo.root)
+        if name not in repo.tracked:
+            problems.append(
+                f"{name}: not tracked by git, so a clean checkout (CI, the Pages deploy) would "
+                "not have it; `git add` it or remove it"
+            )
+    return problems
+
+
 def check_site(site: Path, repo: Repo) -> Report:
     """Run every check over `site`; problems are reported relative to the repository root."""
 
@@ -813,6 +848,7 @@ def check_site(site: Path, repo: Repo) -> Report:
             report.problems.append(f"{_rel(path, root)}: symlinks do not survive the Pages upload")
     files = [path for path in files if not path.is_symlink()]
     report.problems.extend(_check_assets(site, files))
+    report.problems.extend(_check_tracked(files, repo))
 
     pages: dict[Path, Page] = {}
     for path in files:
@@ -845,8 +881,9 @@ def check_site(site: Path, repo: Repo) -> Report:
 def stage(site: Path, destination: Path) -> int:
     """Copy exactly the published files of `site` into `destination`; return how many.
 
-    Run only after `check_site` passed, so there is no symlink to copy. The destination must be
-    absent or empty: files left over from something else would be published too.
+    Run only after `check_site` passed, so there is no symlink to copy and every file is tracked.
+    The destination must be absent or empty: files left over from something else would be
+    published too.
     """
 
     if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
@@ -941,6 +978,14 @@ Setext heading
 ```text
 ## Inside a fence
 ```
+
+> ### Quoted heading
+
+- ## Listed heading
+
+> ```text
+> ## Inside a quoted fence
+> ```
 """
 
 
@@ -976,13 +1021,28 @@ def _fixture(root: Path) -> Repo:
         encoding="utf-8",
     )
     (site / ".nojekyll").write_text("", encoding="utf-8")
+    (site / "README.md").write_text("# Maintainer notes\n", encoding="utf-8")
     (root / "docs").mkdir()
     (root / "docs" / "GUIDE.md").write_text(_FIXTURE_MARKDOWN, encoding="utf-8")
-    return Repo(
+    return _tracking_site(
         root,
-        frozenset({"docs/GUIDE.md", "docs/LINK.md", "docs/tool.py", "README.md"}),
-        frozenset({"docs/LINK.md"}),
+        Repo(
+            root,
+            frozenset({"docs/GUIDE.md", "docs/LINK.md", "docs/tool.py", "README.md"}),
+            frozenset({"docs/LINK.md"}),
+        ),
     )
+
+
+def _tracking_site(root: Path, repo: Repo) -> Repo:
+    """`repo` with every file now under `root/site` tracked, as `git add` would leave it."""
+
+    names = {
+        path.relative_to(root).as_posix()
+        for path in (root / SITE).rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    return Repo(repo.root, repo.tracked | names, repo.symlinks)
 
 
 def self_test() -> int:
@@ -1014,15 +1074,21 @@ def self_test() -> int:
     expect("setext-heading" in anchors, "a setext heading is a heading")
     expect("explicit-anchor" in anchors, "an HTML id in Markdown is an anchor")
     expect("inside-a-fence" not in anchors, "a heading inside a code fence is not a heading")
+    expect("quoted-heading" in anchors, "a heading inside a block quote is a heading")
+    expect("listed-heading" in anchors, "a heading inside a list item is a heading")
+    expect("inside-a-quoted-fence" not in anchors,
+           "a heading inside a code fence inside a block quote is not a heading")
     expect("name-fixture" not in anchors and "description-front-matter-is-a-table-not-a-heading"
            not in anchors, "YAML front matter produces no heading")
 
     def run(mutate: Callable[[Path, Repo], Repo | None]) -> list[str]:
+        """Check the fixture after `mutate`. Files it adds count as tracked, as though the
+        author ran `git add`, unless it returns the `Repo` to check against instead."""
         with tempfile.TemporaryDirectory(prefix="check-site-self-test-") as raw:
             root = Path(raw)
             repo = _fixture(root)
             changed = mutate(root / SITE, repo)
-            return check_site(root / SITE, changed or repo).problems
+            return check_site(root / SITE, changed or _tracking_site(root, repo)).problems
 
     clean = run(lambda site, repo: None)
     expect(clean == [], f"the valid fixture must pass, got {clean}")
@@ -1043,6 +1109,28 @@ def self_test() -> int:
         text = _page()
         (site / "index.html").write_text(text[: text.index("</body>")], encoding="utf-8")
         return None
+
+    def edited(change: Callable[[str], str]) -> Callable[[Path, Repo], Repo | None]:
+        """The valid index page with `change` applied to its text."""
+        def mutate(site: Path, repo: Repo) -> Repo | None:
+            text = _page(body='<h2 id="part">Part</h2>')
+            changed = change(text)
+            assert changed != text, "the edit must change the page"
+            (site / "index.html").write_text(changed, encoding="utf-8")
+            return None
+        return mutate
+
+    def csp_line(text: str) -> str:
+        return next(line for line in text.splitlines(keepends=True)
+                    if "Content-Security-Policy" in line)
+
+    def symlink(site: Path, repo: Repo) -> Repo | None:
+        (site / "alias.css").symlink_to("style.css")
+        return None
+
+    def untracked(site: Path, repo: Repo) -> Repo | None:
+        (site / "clip.gif").write_bytes(b"GIF89a")
+        return repo  # the fixture's own index, which does not have clip.gif
 
     cases: list[tuple[str, Callable[[Path, Repo], Repo | None], str]] = [
         ("an element closed out of order", body("<div><p>x</div>"), "is not closed before"),
@@ -1118,6 +1206,64 @@ def self_test() -> int:
          link(REPO_URL + "/blob/main/docs/GUIDE.md#inside-a-fence"), "no heading or anchor"),
         ("a non-line fragment on a source file",
          link(REPO_URL + "/blob/main/docs/tool.py#main"), "line anchor"),
+        # Page shape and landmarks.
+        ("a first link that is not the skip link",
+         edited(lambda t: t.replace('<a class="skip" href="#main">Skip to content</a>\n', "")
+                .replace("<header>", '<header><a href="other.html">Other</a>')),
+         "first link on the page must be the skip link"),
+        ("a page without <header>",
+         edited(lambda t: t.replace("<header>", "<div>").replace("</header>", "</div>")),
+         "no <header> landmark"),
+        ("a page without <nav>",
+         edited(lambda t: t.replace("<nav>", "<div>").replace("</nav>", "</div>")),
+         "no <nav> landmark"),
+        ("a page without <footer>",
+         edited(lambda t: t.replace("<footer>", "<div>").replace("</footer>", "</div>")),
+         "no <footer> landmark"),
+        ("a second <main>", body('<main id="again"><p>x</p></main>'), "exactly one <main>"),
+        ("a <main> without an id",
+         edited(lambda t: t.replace('<main id="main">', "<main>")), "<main> has no id"),
+        ("a missing viewport",
+         edited(lambda t: t.replace('<meta name="viewport" content="width=device-width, '
+                                    'initial-scale=1">\n', "")), "viewport"),
+        ("an <h2> before the <h1>",
+         edited(lambda t: t.replace("<h1>Fixture</h1>", "<h2>First</h2>\n<h1>Fixture</h1>")),
+         "the first heading must be the <h1>"),
+        ("an empty id", body('<p id="">x</p>'), "empty id"),
+        ("a <base> element", page_with(head_extra='<base href="https://example.org/">\n'),
+         "<base>"),
+        # The page policy.
+        ("a page with no policy <meta> at all",
+         edited(lambda t: t.replace(csp_line(t), "")), "no Content-Security-Policy <meta>"),
+        ("a policy <meta> after the stylesheet",
+         edited(lambda t: t.replace(csp_line(t), "").replace(
+             '<link rel="stylesheet" href="style.css">\n',
+             '<link rel="stylesheet" href="style.css">\n' + csp_line(t))),
+         "must come before the first script or stylesheet"),
+        ("a policy <meta> after an inline script",
+         edited(lambda t: t.replace(csp_line(t), "").replace(
+             "</script>\n", "</script>\n" + csp_line(t))),
+         "must come before the first script or stylesheet"),
+        ("two policy <meta> elements",
+         edited(lambda t: t.replace(csp_line(t), csp_line(t) * 2)),
+         "more than one Content-Security-Policy"),
+        # Links.
+        ("a fragment on a file that is not a page", link("style.css#x"), "not a page"),
+        ("a page link to the unpublished site README", link("README.md"), "is not published"),
+        ("a repository link with a query string",
+         link(REPO_URL + "/blob/main/README.md?plain=1"), "drop the query string"),
+        ("a repository directory link with a fragment",
+         link(REPO_URL + "/tree/main/docs#x"), "has no #x"),
+        ("a blob link that names a directory with a slash",
+         link(REPO_URL + "/blob/main/docs/"), "must name a file"),
+        ("a fragment on a tracked Markdown file that is not in the checkout",
+         link(REPO_URL + "/blob/main/README.md#x"), "cannot read"),
+        ("a fragment naming a heading inside a quoted fence",
+         link(REPO_URL + "/blob/main/docs/GUIDE.md#inside-a-quoted-fence"),
+         "no heading or anchor"),
+        # Files.
+        ("a symlink under site/", symlink, "symlinks do not survive"),
+        ("a published file that git does not track", untracked, "not tracked by git"),
     ]
 
     def css(text: str) -> Callable[[Path, Repo], Repo | None]:
@@ -1168,6 +1314,7 @@ def self_test() -> int:
          svg('<svg><image href="https://img.example/a.png"/></svg>'), "everything loads from"),
         ("a GIF over 3 MB", add_file("demo.gif", GIF_LIMIT + 1), "exceeds"),
         ("an image over its cap", add_file("shot.png", IMAGE_LIMIT + 1), "exceeds"),
+        ("a text asset over its cap", add_file("big.css", TEXT_LIMIT + 1), "exceeds"),
         ("an unknown file type", add_file("tool.php", 10), "not a known website file type"),
         ("a missing .nojekyll", remove(".nojekyll"), ".nojekyll is missing"),
         ("a missing index.html", remove("index.html"), "index.html is missing"),
@@ -1190,6 +1337,11 @@ def self_test() -> int:
     at_cap = run(add_file("demo.gif", GIF_LIMIT))
     expect(at_cap == [], f"a GIF of exactly {GIF_LIMIT:,} bytes must pass, got {at_cap}")
 
+    # Headings GitHub anchors inside a block quote or a list item are valid link targets.
+    quoted = run(body(f'<p><a href="{REPO_URL}/blob/main/docs/GUIDE.md#quoted-heading">x</a></p>'
+                      '<h2 id="part">Part</h2>'))
+    expect(quoted == [], f"a link to a quoted heading must pass, got {quoted}")
+
     # The recorder's own files are not website files: no type or size rule applies to them.
     demo_source = run(with_demo("<p>x</p>"))
     expect(demo_source == [], f"files under demos/ are not website files, got {demo_source}")
@@ -1204,7 +1356,7 @@ def self_test() -> int:
         count = stage(site, staged_dir)
         staged = sorted(path.relative_to(staged_dir).as_posix()
                         for path in staged_dir.rglob("*") if path.is_file())
-        want = [".nojekyll", "index.html", "mark.svg", "other.html", "style.css"]
+        want = [".nojekyll", "index.html", "mark.svg", "other.html", "style.css"]  # no README.md
         expect(staged == want and count == len(want),
                f"--stage must copy exactly {want}, copied {staged} ({count})")
         refused = False
@@ -1227,14 +1379,18 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--self-test", action="store_true", help="prove each check can fail, then exit")
+    parser.add_argument(
+        "--self-test", action="store_true",
+        help="check the checker: a valid fixture site must pass and a variant breaking each "
+        "rule must fail with that rule's message; then exit",
+    )
     parser.add_argument(
         "--stage",
         type=Path,
         metavar="DIR",
         help="after a passing check, copy exactly the published files (everything under site/ "
-        "except site/demos/) into DIR, which must be absent or empty; the Pages workflow "
-        "uploads DIR. Nothing is copied when the check fails",
+        "except site/demos/ and site/README.md) into DIR, which must be absent or empty; the "
+        "Pages workflow uploads DIR. Nothing is copied when the check fails",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.self_test:
