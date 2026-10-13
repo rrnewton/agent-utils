@@ -1,12 +1,13 @@
 ---
 title: 'thread-card-focus: thread cards stay contracted; a click highlights and expands one and greys the rest; the replies button or Right arrow enters'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-13T20:15:23.236492453+00:00
-updated_at: 2026-10-13T20:15:23.236492453+00:00
+updated_at: 2026-10-13T20:17:05.549090226+00:00
+closed_at: 2026-10-13T20:17:05.549090097+00:00
 ---
 
 # Description

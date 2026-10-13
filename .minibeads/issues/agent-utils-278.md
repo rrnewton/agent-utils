@@ -1,12 +1,13 @@
 ---
 title: 'send-order: messages to one destination leave in the order written, through retries and reloads'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-13T20:15:23.231346664+00:00
-updated_at: 2026-10-13T20:15:23.231346664+00:00
+updated_at: 2026-10-13T20:17:05.545156312+00:00
+closed_at: 2026-10-13T20:17:05.545156151+00:00
 ---
 
 # Description
