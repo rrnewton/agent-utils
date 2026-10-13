@@ -3575,7 +3575,9 @@ function applySearch() {
       setClassWord(row, "search-hidden", !hit);
       // `#249 search-highlight`. Where each term is, in the rows it lets through.
       markSearchHits(row, hit && text !== null ? marking : []);
-      if (counts && text !== null) {
+      // A spoken yes drawn into the card it sent (`#269 approval-card-inline`) is not on screen, and
+      // the card speaks for it.
+      if (counts && text !== null && !row.hasAttribute("data-absorbed")) {
         // `#262 search-load-older`. In messages, as the lines between the rows count them (`seamsFor`):
         // a combined row is every message it holds, all of them on screen when it is, and a row with
         // no message of the channel's own — a turn of the call, one still being sent — is one. So what
@@ -10030,6 +10032,8 @@ function drawSentFromMemory(send, instance) {
   const turn = { speaker: "sent", text: send.text, at_ms: detail.sent_at_ms, detail: { kind: "sent", ...detail } };
   const li = placeSentCard(turn, conversationId || null);
   postWatch.sentDrawn.set(key, { li, sendSeq: detail.send_seq, handle: null });
+  // `#269 approval-card-inline`. A yes whose commit's answer was lost was shown again; it sent.
+  if (detail.how === "voice") absorbAnswerRow(conversationId || null, detail.serial);
   // A card still up for this send — its commit's answer is on its way, or was lost: the memory says
   // it went, so the card freezes into this one, the focus with it.
   if (postWatch.shown && postKey(postWatch.shown.instance, postWatch.shown.serial) === key) {
@@ -11247,8 +11251,9 @@ const spokenYes = {
   /** @type {"earlier_draft" | "replaced_session"} */
   ineligibleWhy: "earlier_draft",
   // The yes waiting out SPOKEN_YES_SETTLE_MS: the card it would send, its words, the answer's turn
-  // number, and the assistant turns it was judged without because they were its reply (`isReplyTo`).
-  /** @type {{handle: string, words: string, timer: any, proposal: VibeTalk.PendingPost, turn: number | null, replies: Set<string>} | null} */
+  // number, the assistant turns it was judged without because they were its reply (`isReplyTo`),
+  // and the hold keeping its row out of sight (`#269 approval-card-inline`).
+  /** @type {{handle: string, words: string, timer: any, proposal: VibeTalk.PendingPost, turn: number | null, replies: Set<string>, hold?: YesHold | null} | null} */
   settling: null,
   // The last draft the card showed during this call, kept after the card goes, so a yes to its
   // read-back that arrives once it has lapsed or been settled is still answered.
@@ -11258,6 +11263,10 @@ const spokenYes = {
   // began: an agent that posts at once asks nothing, so there is no yes to judge.
   askFirst: true,
   turns: 0,
+  // `#269 approval-card-inline`. The user turns drawn hidden while they may be a yes to the card,
+  // by turn key — kept across resets, because a yes that sent stays drawn into its card.
+  /** @type {Map<string, YesHold>} */
+  holds: new Map(),
 };
 
 /** Words of an answer or a read-back: `spokenWords`, with curly apostrophes made straight first. */
@@ -11474,6 +11483,8 @@ function mayBeYes(kind, text) {
  * @param {"earlier_draft" | "replaced_session"} [why] why a draft on the card now may not be sent by voice
  */
 function resetSpokenYes(why = "earlier_draft") {
+  // A row held for a yes that is not on its way is shown again: nothing will send it now.
+  releaseYesHolds();
   const settling = spokenYes.settling;
   if (settling) clearTimeout(settling.timer);
   spokenYes.settling = null;
@@ -11938,13 +11949,17 @@ function judgeSpokenAnswer(text, heard, refused = null) {
     proposal: shown,
     turn: heard.turn,
     replies: heard.replies,
+    hold: /** @type {YesHold | null} */ (null),
   };
   settling.timer = setTimeout(() => {
     if (spokenYes.settling !== settling || spokenYes.epoch !== epoch) return;
     spokenYes.settling = null;
-    void commitBySpokenYes(settling.proposal, epoch);
+    void commitBySpokenYes(settling.proposal, epoch, settling.hold);
   }, SPOKEN_YES_SETTLE_MS);
   spokenYes.settling = settling;
+  // `#269 approval-card-inline`. The answer's row, drawn hidden while it might be this yes, stays
+  // hidden while it settles and sends.
+  settling.hold = acceptYesHold(spokenYes.answered, shown.serial);
   setStatus("Heard yes — sending…");
   // `#269 approval-card-inline`. The card's own line says so too, with how to stop it.
   renderPostExpiry();
@@ -12016,6 +12031,7 @@ function abortSpokenYes(reason) {
   if (!settling) return;
   clearTimeout(settling.timer);
   spokenYes.settling = null;
+  releaseYesHold(settling.hold || null);
   renderPostExpiry();
   reportSpokenOutcome({ kind: "not_armed", proposal: settling.proposal, reason: SPOKEN_YES_REASONS[reason] });
 }
@@ -12032,12 +12048,20 @@ function spokenYesYieldsToTap() {
   if (!settling || !postWatch.shown || settling.handle !== postWatch.shown.handle) return false;
   clearTimeout(settling.timer);
   spokenYes.settling = null;
+  // The tap is what approves it, and its card says so: the yes is a turn of its own again.
+  releaseYesHold(settling.hold || null);
   renderPostExpiry();
   return true;
 }
 
-/** The settle window passed: check once more, then commit what the card shows. */
-async function commitBySpokenYes(proposal, epoch) {
+/**
+ * The settle window passed: check once more, then commit what the card shows.
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ * @param {number} epoch
+ * @param {YesHold | null} [hold] the yes's row, kept out of sight until this says whether it sent
+ */
+async function commitBySpokenYes(proposal, epoch, hold = null) {
   const shown = postWatch.shown;
   let refusal = null;
   if (!shown || shown.handle !== proposal.handle) refusal = "changed";
@@ -12046,10 +12070,16 @@ async function commitBySpokenYes(proposal, epoch) {
   else if (redact(shown.text) !== shown.text) refusal = "token";
   else if (!session.connected) refusal = "ended";
   if (refusal || !shown) {
+    releaseYesHold(hold);
     reportSpokenOutcome({ kind: "not_armed", proposal, reason: SPOKEN_YES_REASONS[refusal || "changed"] });
     return;
   }
+  commitYesHold(hold);
   const outcome = await commitShownProposal(shown, "speaker_turn");
+  // `#269 approval-card-inline`. A yes that sent is drawn into the frozen card for good; any other
+  // outcome shows it again. One whose answer was lost may yet be in the send memory.
+  if (outcome.kind === "sent" || outcome.kind === "partial" || outcome.kind === "unconfirmed") sentYesHold(hold);
+  else releaseYesHold(hold, outcome.kind === "unknown");
   // A call that ended, or a session that was replaced, while the commit was on the wire hears
   // nothing about it; the screen still says what happened.
   if (spokenYes.epoch === epoch) reportSpokenOutcome(outcome);
@@ -12061,6 +12091,219 @@ async function cancelBySpokenNo() {
   const proposal = postWatch.shown;
   const withdrawn = await cancelPostProposal({ spoken: true });
   reportSpokenOutcome({ kind: "declined", proposal, withdrawn: withdrawn === true });
+}
+
+// --- a spoken yes the page acts on shows no turn ----------------------------------------------------
+//
+// `#269 approval-card-inline`. A yes that sends the message is drawn INTO the frozen card it sent —
+// "approved by voice" — rather than standing as a turn of its own above it: the owner said "yes" to
+// the card, and the card is what answers. So the row of a user turn that could still become a yes to
+// the card is drawn hidden from its first frame (`data-absorbed`), and stays hidden only if that yes
+// sends. Anything else shows it again, in its own place. The asymmetry is deliberate: a turn that
+// starts like a yes and becomes something else appears a frame late; a yes never appears and then
+// vanishes.
+//
+// The RECORD always keeps the yes, as an ordinary `you` turn, tagged `answer: <serial>` when the page
+// had acted on it by the time it was filed. A reload hides it only when a `sent` row approved by voice
+// for that serial follows it, so the record never loses words, and a tag on a yes that sent nothing
+// hides nothing.
+
+/** How long a hold waits, after its turn's last frame, for that turn to be judged. Longer than `#268`'s quiet-turn bound. */
+const YES_HOLD_JUDGE_MS = 10000;
+/** How long a yes the page took stays hidden while it settles and commits, at most. */
+const YES_HOLD_MAX_MS = 20000;
+
+/**
+ * One user turn drawn hidden while it may be a yes to the card.
+ *
+ * @typedef {{key: string, li: HTMLElement | null, state: "tentative" | "accepted" | "committing" | "sent" | "released",
+ *   serial: number | null, conversationId: string | null, timer: any, kept: boolean}} YesHold
+ */
+
+/**
+ * Could `words` still become a yes from the closed list (`isSpokenYes`)? A yes already, or the start
+ * of one whose last word may be unfinished: "ye", "yes", "ok se", "go a". Never one that begins with
+ * a word a no begins with, which `classifySpokenAnswer` makes a no whatever follows.
+ *
+ * @param {string[]} words
+ */
+function couldBeSpokenYes(words) {
+  if (words.length === 0) return false;
+  if (SPOKEN_NO_STARTS.some((start) => start.length === 1 && start[0] === words[0])) return false;
+  return isSpokenYes(words) || yesPrefix(words, 0, 0, 0);
+}
+
+/**
+ * Can `words` from `at` on be the start of the rest of a yes, given the pieces and filler words
+ * before it? Only the last word may be unfinished.
+ *
+ * @param {string[]} words
+ * @param {number} at
+ * @param {number} pieces
+ * @param {number} fillers
+ * @returns {boolean}
+ */
+function yesPrefix(words, at, pieces, fillers) {
+  if (at === words.length) return pieces < 3;
+  if (pieces >= 3) return false;
+  const unfinished = (offset, whole) => at + offset === words.length - 1 && whole.startsWith(words[at + offset]);
+  for (const phrase of SPOKEN_YES_PHRASES) {
+    let used = 0;
+    while (used < phrase.length && at + used < words.length && words[at + used] === phrase[used]) used += 1;
+    if (at + used === words.length) return true;
+    if (used < phrase.length) {
+      if (unfinished(used, phrase[used])) return true;
+      continue;
+    }
+    if (yesPrefix(words, at + used, pieces + 1, fillers)) return true;
+  }
+  if (fillers >= 1) return false;
+  if (SPOKEN_YES_FILLER.has(words[at]) && yesPrefix(words, at + 1, pieces + 1, fillers + 1)) return true;
+  return [...SPOKEN_YES_FILLER].some((filler) => unfinished(0, filler));
+}
+
+/**
+ * Might the user turn saying `text` be a yes to the card, one the page would act on? Only while a
+ * draft of this call's agent is on the card and nothing is settling or sending it, only as an answer
+ * while sending is the subject, and only for words that could still become a yes.
+ *
+ * @param {string} text
+ */
+function mightBeCardYes(text) {
+  if (!spokenYes.askFirst || session.chat) return false;
+  const shown = postWatch.shown;
+  if (!shown || shown.handle !== spokenYes.eligible || postWatch.busy || spokenYes.settling) return false;
+  if (/[?¿]/u.test(String(text))) return false;
+  if (!askedAboutSending([...spokenYes.sinceUser.values()], text)) return false;
+  return couldBeSpokenYes(answerWords(text));
+}
+
+/**
+ * The user turn `key` was drawn as `li` (or redrawn: a hypothesis grew) saying `text`. Hide it while
+ * it may be a yes to the card; show it, for good, once it cannot be.
+ *
+ * @param {string} key
+ * @param {string} text
+ * @param {HTMLElement | null} li
+ */
+function noteYesCandidate(key, text, li) {
+  const held = spokenYes.holds.get(key);
+  if (held) {
+    if (li) held.li = li;
+    if (held.state !== "tentative") return;
+    if (!mightBeCardYes(text)) {
+      releaseYesHold(held);
+      return;
+    }
+    armYesHold(held, YES_HOLD_JUDGE_MS);
+    return;
+  }
+  if (!li || !mightBeCardYes(text)) return;
+  /** @type {YesHold} */
+  const hold = { key, li, state: "tentative", serial: null, conversationId: null, timer: null, kept: false };
+  li.setAttribute("data-absorbed", "");
+  spokenYes.holds.set(key, hold);
+  if (spokenYes.holds.size > 32) spokenYes.holds.delete(spokenYes.holds.keys().next().value);
+  armYesHold(hold, YES_HOLD_JUDGE_MS);
+}
+
+/** Bound how long `hold` keeps its row hidden. */
+function armYesHold(hold, ms) {
+  if (hold.timer !== null) clearTimeout(hold.timer);
+  hold.timer = setTimeout(() => {
+    hold.timer = null;
+    releaseYesHold(hold);
+  }, ms);
+}
+
+/**
+ * The yes the page has just begun to settle is the turn `key`: its row stays hidden while it settles
+ * and sends, and is marked as the answer to proposal `serial`.
+ *
+ * @param {string | null} key
+ * @param {number} serial
+ * @returns {YesHold | null}
+ */
+function acceptYesHold(key, serial) {
+  const hold = key === null ? undefined : spokenYes.holds.get(key);
+  if (!hold || hold.state !== "tentative") return null;
+  hold.state = "accepted";
+  hold.serial = serial;
+  hold.conversationId = session.conversationId;
+  if (hold.li) hold.li.setAttribute("data-answer", String(serial));
+  armYesHold(hold, YES_HOLD_MAX_MS);
+  return hold;
+}
+
+/** The yes `hold` is being committed. */
+function commitYesHold(hold) {
+  if (hold && hold.state === "accepted") hold.state = "committing";
+}
+
+/** The yes `hold` sent the message: its row stays hidden for good, drawn into the frozen card. */
+function sentYesHold(hold) {
+  if (!hold || (hold.state !== "accepted" && hold.state !== "committing")) return;
+  hold.state = "sent";
+  if (hold.timer !== null) clearTimeout(hold.timer);
+  hold.timer = null;
+}
+
+/**
+ * Show `hold`'s row again, in its own place, for good. `kept`: its commit's answer was lost, so the
+ * send memory may yet say it went (`absorbAnswerRow`).
+ *
+ * @param {YesHold | null} hold
+ * @param {boolean} [kept]
+ */
+function releaseYesHold(hold, kept = false) {
+  if (!hold || hold.state === "released" || hold.state === "sent") return;
+  hold.state = "released";
+  hold.kept = kept;
+  if (hold.timer !== null) clearTimeout(hold.timer);
+  hold.timer = null;
+  const li = hold.li;
+  if (!li || !li.hasAttribute("data-absorbed")) return;
+  const pinned = atBottom(el("scroll-area"));
+  li.removeAttribute("data-absorbed");
+  applySearch();
+  followIfPinned(pinned);
+}
+
+/** The turn `key` has been judged: unless the page took it as a yes, its row is shown. */
+function settleYesCandidate(key) {
+  const hold = spokenYes.holds.get(key);
+  if (hold && hold.state === "tentative" && spokenYes.answered === key) releaseYesHold(hold);
+}
+
+/** A turn completed and whatever answer it held was judged: every judged turn not taken is shown. */
+function settleYesCandidates() {
+  for (const key of spokenYes.holds.keys()) settleYesCandidate(key);
+}
+
+/** Show every row still held for a yes that is not on its way: the conversation so far is forgotten. */
+function releaseYesHolds() {
+  for (const hold of spokenYes.holds.values()) {
+    if (hold.state === "tentative" || hold.state === "accepted") releaseYesHold(hold);
+  }
+}
+
+/**
+ * The send memory says proposal `serial` went, approved by voice, in `conversationId`: a yes whose
+ * commit's answer was lost was shown again, and is drawn into the card now after all.
+ *
+ * @param {string | null} conversationId
+ * @param {number} serial
+ */
+function absorbAnswerRow(conversationId, serial) {
+  const holds = [...spokenYes.holds.values()].filter((hold) =>
+    hold.serial === serial && hold.conversationId === conversationId);
+  if (holds.some((hold) => hold.state === "sent")) return;
+  const hold = holds.reverse().find((one) => one.state === "released" && one.kept);
+  if (!hold || !hold.li || !hold.li.parentNode) return;
+  hold.state = "sent";
+  const li = hold.li;
+  preservingScroll(() => li.setAttribute("data-absorbed", ""));
+  applySearch();
 }
 
 /**
@@ -12307,7 +12550,13 @@ function setStorageState(text) {
  */
 let recordQueue = Promise.resolve();
 
-function recordTurn(who, text) {
+/**
+ * @param {string} who
+ * @param {string} text
+ * @param {{answerOf?: YesHold | null}} [options] `answerOf`: the hold on a user turn that may be a
+ *   spoken yes to the card (`#269 approval-card-inline`)
+ */
+function recordTurn(who, text, options = {}) {
   if (recordingBroken || !session.conversationId || !text) {
     return;
   }
@@ -12315,15 +12564,27 @@ function recordTurn(who, text) {
   // Captured now: by the time this turn reaches the front of the queue the session may have moved
   // on, and a turn belongs to the conversation it was spoken in.
   const conversationId = session.conversationId;
+  const hold = options.answerOf || null;
   recordQueue = recordQueue.then(() => {
     // Checked here rather than only at call time: a turn queued before the store failed must not
     // be posted after it, or one dead store costs one request per turn for the rest of the call.
     if (recordingBroken) {
       return undefined;
     }
+    /** @type {{speaker: string, text: string, answer?: number}} */
+    const body = { speaker, text };
+    // `#270 voice-transcript-markers`. A spoken yes the page acted on is filed as the answer to the
+    // proposal it sent: read HERE, when the request goes, which is never before the handler that
+    // stored the turn has judged it — a `vibe-talk-v1` turn with no final is stored at its
+    // `turn_complete` a moment before the judgement in the same handler. The tag only lets a reload
+    // draw the yes into the card that follows it; on one that sent nothing it hides nothing.
+    if (hold && transcriptRecordsSupported && hold.serial !== null &&
+      (hold.state === "accepted" || hold.state === "committing" || hold.state === "sent")) {
+      body.answer = hold.serial;
+    }
     return api(`/api/v1/conversations/${conversationId}/turns`, {
       method: "POST",
-      body: { speaker, text },
+      body,
     }).catch((error) => {
       recordingBroken = true;
       setStorageState(
@@ -12414,6 +12675,7 @@ const restoredSpeaker = (speaker) =>
  */
 function restoredRun(turns, trailingSeam) {
   const rows = [];
+  const absorbed = absorbedAnswers(turns);
   // Drawn from one place on purpose. A boundary between two stored calls and a boundary between
   // the record and the live one are the same boundary, and a second call site here is how the
   // two wordings would come to differ. Each says which conversation it ends, as a live one does
@@ -12435,7 +12697,14 @@ function restoredRun(turns, trailingSeam) {
       const detail = turn.detail;
       if (detail && detail.kind === "not_sent") notSentSeam(String(detail.why), rows);
     } else {
-      rows.push(turnNode(restoredSpeaker(turn.speaker), turn.text, turn.at_ms));
+      const li = turnNode(restoredSpeaker(turn.speaker), turn.text, turn.at_ms);
+      // `#269 approval-card-inline`. A spoken yes that sent the card after it is drawn into that
+      // card, as it was live: there, out of sight, and still in the record.
+      if (absorbed.has(turn)) {
+        li.setAttribute("data-absorbed", "");
+        li.setAttribute("data-answer", String(turn.detail.serial));
+      }
+      rows.push(li);
     }
     previous = turn.conversation_id;
   }
@@ -12443,6 +12712,39 @@ function restoredRun(turns, trailingSeam) {
     rule(previous);
   }
   return rows;
+}
+
+/**
+ * The sends approved by voice, as `conversation:serial`, whose yes a step back may still bring: a
+ * page of the record can end between a yes and the card it sent. `#269 approval-card-inline`.
+ */
+let restoredWantAnswer = new Set();
+
+/**
+ * Which `you` rows of a run of stored turns are a spoken yes drawn into the card it sent: walking
+ * from the newest, each `sent` row approved by voice claims the newest `answer`-tagged `you` row
+ * before it, in its conversation, that names its serial. Only that one: an earlier yes to the same
+ * draft, tagged and then stopped, sent nothing and is drawn as a turn.
+ *
+ * @param {any[]} turns oldest first
+ * @returns {Set<any>}
+ */
+function absorbedAnswers(turns) {
+  const absorbed = new Set();
+  const want = restoredWantAnswer;
+  for (let at = turns.length - 1; at >= 0; at -= 1) {
+    const turn = turns[at];
+    const detail = turn.detail;
+    if (!detail || typeof detail !== "object") continue;
+    const key = `${turn.conversation_id}:${detail.serial}`;
+    if (turn.speaker === "sent" && detail.how === "voice") {
+      want.add(key);
+    } else if (turn.speaker === "you" && detail.kind === "answer" && want.has(key)) {
+      want.delete(key);
+      absorbed.add(turn);
+    }
+  }
+  return absorbed;
 }
 
 /** The query that asks a transcript read for record rows, when this server keeps them. `#270`. */
@@ -12463,6 +12765,7 @@ function forgetTranscriptWalk() {
   transcriptMoreAbove = false;
   transcriptOlderCursor = null;
   oldestRestoredConversation = null;
+  restoredWantAnswer = new Set();
   renderOlderTurnsControl();
 }
 
@@ -14113,11 +14416,17 @@ function handle(socket, message) {
         if (isEchoOfTyped(said)) {
           break;
         }
-        line("you", said);
-        recordTurn("you", said);
+        const li = line("you", said);
         // This protocol sends no partials: every user transcript is a final turn of its own.
         spokenYes.turns += 1;
-        hearUserForSpokenYes(`you:${spokenYes.turns}`, said, true);
+        const key = `you:${spokenYes.turns}`;
+        // `#269 approval-card-inline`. Out of sight from the moment it is drawn while it may be a yes
+        // to the card, and judged BEFORE it is recorded, so the record knows whether the page acted
+        // on it.
+        noteYesCandidate(key, said, li);
+        hearUserForSpokenYes(key, said, true);
+        settleYesCandidate(key);
+        recordTurn("you", said, { answerOf: spokenYes.holds.get(key) || null });
       }
       break;
     case "interruption":
@@ -14236,7 +14545,7 @@ function upsertSpoken(who, turn, said, final) {
   }
   let entry = session.liveTurns.get(key);
   if (!entry) {
-    entry = { who, settled: "", pending: "", li: null, atMs: Date.now(), stored: false, echo: false };
+    entry = { key, who, settled: "", pending: "", li: null, atMs: Date.now(), stored: false, echo: false };
     // A typed prompt reflected back is already on screen; see `isEchoOfTyped`.
     entry.echo = who === "you" && final && isEchoOfTyped(said);
     session.liveTurns.set(key, entry);
@@ -14252,6 +14561,11 @@ function upsertSpoken(who, turn, said, final) {
     const pinned = atBottom(el("scroll-area"));
     if (entry.li) {
       const li = turnNode(who, text, entry.atMs);
+      // `#269 approval-card-inline`. A row held for a yes is redrawn held: never a frame on screen.
+      for (const name of ["data-absorbed", "data-answer"]) {
+        const value = entry.li.getAttribute(name);
+        if (value !== null) li.setAttribute(name, value);
+      }
       entry.li.replaceWith(li);
       entry.li = li;
       applySearch();
@@ -14259,6 +14573,7 @@ function upsertSpoken(who, turn, said, final) {
     } else {
       entry.li = line(who, text, entry.atMs);
     }
+    if (who === "you") noteYesCandidate(key, text, entry.li);
   }
   if (anonymous && final) {
     storeSpoken(entry);
@@ -14278,7 +14593,10 @@ function storeSpoken(entry) {
   }
   entry.stored = true;
   if (!entry.echo) {
-    recordTurn(entry.who, spokenText(entry));
+    // A user turn held for a yes is filed with its hold, which says by the time the request goes —
+    // after the handler storing it has judged it — whether the page acted on it. `#269`.
+    const hold = entry.who === "you" ? spokenYes.holds.get(entry.key) || null : null;
+    recordTurn(entry.who, spokenText(entry), { answerOf: hold });
   }
   // `#270 voice-transcript-markers`. A record drawn below this turn waited for it to be stored.
   flushRecordsAfterLive();
@@ -14662,6 +14980,7 @@ function handleVibeTalk(message) {
         hearAssistantForSpokenYes(spoken.key, spokenText(spoken.entry), turnNumber);
       } else if (!spoken.entry.echo) {
         hearUserForSpokenYes(spoken.key, spokenText(spoken.entry), final, turnNumber);
+        settleYesCandidate(spoken.key);
       }
       break;
     }
@@ -14701,6 +15020,9 @@ function handleVibeTalk(message) {
       vibeTalkTurnComplete();
       judgeTurn(message, closingSegment);
       judgeAnswerAtTurnEnd(number);
+      // `#269 approval-card-inline`. An answer judged at its turn's end and not taken is shown. The
+      // row `vibeTalkTurnComplete` stored a moment ago is filed after this, so with its tag.
+      settleYesCandidates();
       break;
     }
     default:
