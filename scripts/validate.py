@@ -225,6 +225,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # The public website is static HTML and CSS that nothing builds or embeds. Its checker runs in
     # the always-on hygiene group because the site links into the whole tree: a renamed document
     # or a reworded heading ANYWHERE can break it, so a site-only rule here could not be complete.
+    # site/demos/ holds the Python that records the site's media clips; a Python file there owes
+    # repository-wide strict typing, which the root-mypy rule in selection_for adds.
     ("site/", frozenset()),
     ("scripts/check_no_any.py", frozenset({PYTHON, CROSS, VIBE_TALK})),
     # Prose and agent-facing material. Not embedded anywhere, so nothing can go red for it.
@@ -287,11 +289,12 @@ def selection_for(
                     best, best_len = groups, len(prefix)
         # Root `make mypy` scans the whole checkout, not only `py/`. A Python helper stored in an
         # otherwise prose-only directory is executable validation input and must not inherit the
-        # directory's exemption. Vibe-talk's operator scripts are the one explicit exception:
-        # its own selected gate runs the same strict mypy contract over that directory.
+        # directory's exemption. That includes the website's demo recorders under site/demos/.
+        # Vibe-talk's operator scripts are the one explicit exception: its own selected gate runs
+        # the same strict mypy contract over that directory.
         root_mypy_observes = (
             Path(path).suffix in {".py", ".pyi"}
-            and path.startswith(("ai_docs/", "reviews/", "skills/", "common/docs/"))
+            and path.startswith(("ai_docs/", "reviews/", "skills/", "common/docs/", "site/"))
             and (best is None or WORKSPACE not in best)
         )
         if root_mypy_observes:
@@ -1007,6 +1010,21 @@ def self_test() -> int:
         "website files are checked by the always-on hygiene group and owe nothing else",
     )
     expect(["site.html"], set(ALL_GROUPS), "the site/ directory rule must stop at its boundary")
+    expect(
+        ["site/demos/vibe-talk/record_demo.py", "site/demos/vibe-talk/gchat_bridge_mock.py"],
+        {PYTHON},
+        "the website's demo recorders are inputs to repository-wide strict typing",
+    )
+    expect(
+        [
+            "site/demos/vibe-talk/README.md",
+            "site/demos/vibe-talk/vibe-talk.toml.template",
+            "site/demos/vibe-talk/fonts.conf",
+            "site/media/vibe-talk/live-message.gif",
+        ],
+        set(),
+        "demo prose, configuration and published clips are checked by the always-on hygiene group",
+    )
     expect(
         ["py/tests/js/browser/new-benchmark.test.cjs"],
         {TIMELINE_BROWSER, PYTHON},
