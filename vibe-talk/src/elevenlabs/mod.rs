@@ -384,6 +384,12 @@ pub struct AgentProfile {
     /// The voice this agent speaks in, which read-aloud borrows when `elevenlabs.voice_id` is
     /// unset. `None` when the agent genuinely has none — see [`crate::probe::Diagnosis::NoVoice`].
     pub voice_id: Option<String>,
+    /// Whether the agent's security settings let a client replace its system prompt when a
+    /// conversation starts. `None` when its configuration does not say. `#272
+    /// voice-agent-instructions`: the owner's edited prompt is sent as such an override only when
+    /// this is `Some(true)`, because an override the agent does not allow is believed to end the
+    /// conversation rather than be ignored.
+    pub prompt_override: Option<bool>,
 }
 
 /// Something that can mint a signed conversation URL.

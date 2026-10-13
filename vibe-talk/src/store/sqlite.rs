@@ -41,6 +41,7 @@ use super::{
     MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId, UserId};
+use crate::voice_agent::{EditedPrompt, OwnerPrompt};
 
 /// The schema, one step per released shape. **Append only** — editing a landed entry would leave
 /// every existing file believing it has a schema it does not have.
@@ -321,6 +322,23 @@ pub const MIGRATIONS: &[&str] = &[
     // it, and the tests find it by what it does rather than by its index.
     "
     ALTER TABLE summaries ADD COLUMN cut_at INTEGER;
+    ",
+    // v15 — the owner's own words for the voice agent. `#272 voice-agent-instructions`.
+    //
+    // ONE row or none, for the reason `voice_settings` gives: no row means he has never saved
+    // anything, so the agent gets the shipped prompt. `instructions` is '' for none.
+    // `system_prompt` is his edited copy of the base prompt, NULL for the shipped one, and
+    // `edited_from` the prompt version that copy was made from, present exactly when the copy is.
+    // His own text, which he wrote and nobody else's; no channel text is ever kept here.
+    "
+    CREATE TABLE voice_prompt (
+        id            INTEGER PRIMARY KEY CHECK (id = 1),
+        instructions  TEXT    NOT NULL,
+        system_prompt TEXT,
+        edited_from   INTEGER,
+        set_at_ms     INTEGER NOT NULL,
+        CHECK ((system_prompt IS NULL) = (edited_from IS NULL))
+    ) STRICT;
     ",
 ];
 
@@ -1491,6 +1509,68 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn owner_prompt(&self) -> Result<Option<OwnerPrompt>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT instructions, system_prompt, edited_from FROM voice_prompt WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(backend)?
+                .map(|(instructions, text, from)| {
+                    let system_prompt = match (text, from) {
+                        (Some(text), Some(from)) => Some(EditedPrompt {
+                            text,
+                            from_version: u32::try_from(from).map_err(|_| {
+                                StoreError::Backend(format!(
+                                    "the edited prompt's version {from} is not a version"
+                                ))
+                            })?,
+                        }),
+                        _ => None,
+                    };
+                    Ok(OwnerPrompt {
+                        instructions,
+                        system_prompt,
+                    })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn set_owner_prompt(&self, prompt: &OwnerPrompt) -> Result<OwnerPrompt, StoreError> {
+        let prompt = prompt.clone();
+        self.with_connection(move |connection| {
+            let (text, from) = match &prompt.system_prompt {
+                Some(edited) => (Some(edited.text.clone()), Some(i64::from(edited.from_version))),
+                None => (None, None),
+            };
+            connection
+                .execute(
+                    "INSERT INTO voice_prompt (id, instructions, system_prompt, edited_from, set_at_ms)
+                     VALUES (1, ?1, ?2, ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET
+                        instructions  = excluded.instructions,
+                        system_prompt = excluded.system_prompt,
+                        edited_from   = excluded.edited_from,
+                        set_at_ms     = excluded.set_at_ms",
+                    rusqlite::params![prompt.instructions, text, from, now_ms()],
+                )
+                .map_err(backend)?;
+            Ok(prompt)
+        })
+        .await
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
@@ -2059,6 +2139,11 @@ impl StateStore for SqliteStore {
             // operator chose, not necessarily the safer setting. `#264 voice-send-approval`.
             transaction
                 .execute("DELETE FROM voice_settings", [])
+                .map_err(backend)?;
+            // Back to the shipped prompt, with no instructions of his. `#272
+            // voice-agent-instructions`.
+            transaction
+                .execute("DELETE FROM voice_prompt", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -4569,6 +4654,119 @@ mod tests {
             "an upgraded file arrived with a choice nobody made"
         );
         assert!(!store.set_ask_before_send(false).await.expect("save"));
+    }
+
+    fn edited(text: &str, from_version: u32) -> OwnerPrompt {
+        OwnerPrompt {
+            instructions: "Call me Sam.\nBe brief.".to_owned(),
+            system_prompt: Some(EditedPrompt {
+                text: text.to_owned(),
+                from_version,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_owners_prompt_starts_unsaved_survives_a_restart_and_the_purge_forgets_it() {
+        // `#272 voice-agent-instructions`. Never saved (the shipped prompt) and saved are two
+        // states; so are an edited base and none, and the version an edit was made from is kept
+        // with it.
+        let dir = TempDir::new("sqlite-voice-prompt");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            assert_eq!(store.owner_prompt().await.expect("read"), None);
+            let saved = store
+                .set_owner_prompt(&edited("You read me the chat.", 8))
+                .await
+                .expect("save");
+            assert_eq!(saved, edited("You read me the chat.", 8));
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(
+            reopened.owner_prompt().await.expect("read back"),
+            Some(edited("You read me the chat.", 8)),
+            "the owner's words did not survive a restart"
+        );
+        // Back to the shipped base, keeping his instructions: the edit and its version both go.
+        let shipped_base = OwnerPrompt {
+            instructions: "Be brief.".to_owned(),
+            system_prompt: None,
+        };
+        reopened
+            .set_owner_prompt(&shipped_base)
+            .await
+            .expect("save");
+        assert_eq!(
+            reopened.owner_prompt().await.expect("read"),
+            Some(shipped_base)
+        );
+        reopened.purge_everything().await.expect("purge");
+        assert_eq!(
+            reopened.owner_prompt().await.expect("read"),
+            None,
+            "the purge left the owner's words behind instead of the shipped prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_voice_prompt_table_arrives_on_a_file_at_the_previous_schema_unsaved() {
+        // Found by what it does rather than by its index, so a step landed meanwhile can go before
+        // it without this test numbering the ladder.
+        let at = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("CREATE TABLE voice_prompt"))
+            .expect("the voice_prompt step");
+        let dir = TempDir::new("sqlite-voice-prompt-migrate");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..at] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch("INSERT INTO voice_settings VALUES (1, 0, 5);")
+                .expect("an owner's choice");
+            connection
+                .pragma_update(None, "user_version", i64::try_from(at).expect("small"))
+                .expect("stamp old schema");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        assert_eq!(
+            store.ask_before_send().await.expect("read"),
+            Some(false),
+            "the upgrade lost the send choice"
+        );
+        assert_eq!(
+            store.owner_prompt().await.expect("read"),
+            None,
+            "an upgraded file arrived with instructions nobody wrote"
+        );
+        store
+            .set_owner_prompt(&edited("Be brief.", PROMPT_VERSION_FOR_TEST))
+            .await
+            .expect("save");
+    }
+
+    /// Any version will do for a stored edit; this one reads as the build's own.
+    const PROMPT_VERSION_FOR_TEST: u32 = crate::voice_agent::PROMPT_VERSION;
+
+    #[test]
+    fn the_voice_prompt_table_refuses_an_edit_without_its_version() {
+        let connection = Connection::open_in_memory().expect("open");
+        migrate(&connection).expect("schema");
+        for (text, from) in [("'mine'", "NULL"), ("NULL", "8")] {
+            assert!(
+                connection
+                    .execute_batch(&format!(
+                        "INSERT INTO voice_prompt VALUES (1, '', {text}, {from}, 5);"
+                    ))
+                    .is_err(),
+                "an edit and its version must be present together ({text}, {from})"
+            );
+        }
     }
 
     // --- #208 persistent-cache, milestone summary-keep ---------------------------------------

@@ -330,6 +330,16 @@ declare namespace VibeTalk {
      */
     version: string;
     /**
+     * The owner's own words for the voice agent, as Settings shows them. `#272
+     * voice-agent-instructions`.
+     *
+     * Here so the Instructions editor is drawn at sign-in, as the send setting is. Readable at
+     * read scope — the assembled prompt is served there too, to a bridge holding the read token —
+     * and changed only by a write-scope `PUT /api/v1/voice-prompt`. Absent from an older server;
+     * the page then hides the editor.
+     */
+    voice_prompt?: VoicePromptSettings | null;
+    /**
      * "Ask me before the voice agent sends", as Settings shows it. `#264 voice-send-approval`.
      *
      * Here so the checkbox is drawn at sign-in, as the noise rules are. Readable at read scope —
@@ -933,6 +943,16 @@ declare namespace VibeTalk {
   type Playback = "browser" | "audio";
 
   /**
+   * How the owner's words reach the voice agent. `#272 voice-agent-instructions`.
+   */
+  type PromptDelivery = "profile" | "page";
+
+  /**
+   * How the page hands the owner's words to a hosted agent. `#272 voice-agent-instructions`.
+   */
+  type PromptTransport = "prompt_override" | "contextual_update" | "not_sent";
+
+  /**
    * One configured chat provider, as the page needs to know it.
    */
   interface ProviderDescription {
@@ -1046,6 +1066,38 @@ declare namespace VibeTalk {
      * Every message at or after `from` that is marked Done, newest first.
      */
     messages: MessageId[];
+  }
+
+  /**
+   * What the page hands a hosted agent as a call opens, so the call carries the owner's words.
+   * `#272 voice-agent-instructions`.
+   *
+   * On a voice session only when the provider is one the page configures and the owner has written
+   * something; absent, the page sends exactly what it always sent.
+   */
+  interface SessionPrompt {
+    /**
+     * Whether the owner's additional instructions are in what is sent.
+     */
+    instructions_applied: boolean;
+    /**
+     * What the agent's configuration said about replacing its prompt; absent when it could not
+     * be read or did not say, which is treated as not allowed.
+     */
+    override_allowed?: boolean | null;
+    /**
+     * Whether the owner's edited base prompt is in what is sent.
+     */
+    system_prompt_applied: boolean;
+    /**
+     * What to send: the whole assembled prompt for `prompt_override`, the heading and the
+     * instructions for `contextual_update`; absent for `not_sent`.
+     */
+    text?: string;
+    /**
+     * How to hand `text` over.
+     */
+    transport: PromptTransport;
   }
 
   /**
@@ -1491,9 +1543,68 @@ declare namespace VibeTalk {
   }
 
   /**
+   * The owner's own words for the voice agent, as Settings shows them. `#272
+   * voice-agent-instructions`.
+   *
+   * The body of `GET` and `PUT /api/v1/voice-prompt`, and `voice_prompt` in client-config. Both
+   * texts join only the scope-neutral part of the prompt: what the agent can do — read, send, or
+   * ask first — is added by the server from the caller's token and the send setting, after them.
+   */
+  interface VoicePromptSettings {
+    /**
+     * Whether this server can keep a change. False with no store configured, and when the store
+     * cannot be read — the agent then gets the shipped prompt.
+     */
+    changeable: boolean;
+    /**
+     * How these words reach this deployment's voice agent.
+     */
+    delivery: PromptDelivery;
+    /**
+     * The prompt version shipped when he last saved his copy; present exactly when he has one.
+     * Behind `prompt_version` means the shipped prompt has changed since.
+     */
+    edited_from_version?: number | null;
+    /**
+     * Additional instructions, added to every call. Empty for none.
+     */
+    instructions: string;
+    /**
+     * The longest `instructions` a save may carry, in characters.
+     */
+    max_instructions_chars: number;
+    /**
+     * The longest `system_prompt` a save may carry, in characters.
+     */
+    max_system_prompt_chars: number;
+    /**
+     * The version of the prompt this server ships.
+     */
+    prompt_version: number;
+    /**
+     * The base prompt in force: the owner's edited copy when `system_prompt_edited`, otherwise
+     * the shipped one, so the editor always opens on what the agent is actually given.
+     */
+    system_prompt: string;
+    /**
+     * Whether `system_prompt` is the owner's edited copy.
+     */
+    system_prompt_edited: boolean;
+  }
+
+  /**
    * A browser-ready conversational voice session.
    */
   interface VoiceSession {
+    /**
+     * The owner's words for the agent, for the page to hand over as the socket opens. `#272
+     * voice-agent-instructions`.
+     *
+     * Filled in by `GET /api/v1/voice-session` for a hosted agent the page configures, and only
+     * when the owner has written something; a provider never sets it. A deployment-managed
+     * bridge reads the same words from `GET /api/v1/voice-agent` instead.
+     */
+    agent_prompt?: SessionPrompt | null;
     /**
      * Microphone PCM sample rate expected by the provider.
      */
@@ -1561,6 +1672,7 @@ declare namespace VibeTalk {
     UpstreamClearNowResponse: UpstreamClearNowResponse;
     VoiceSettings: VoiceSettings;
     MessagesResponse: MessagesResponse;
+    VoicePromptSettings: VoicePromptSettings;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

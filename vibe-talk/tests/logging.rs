@@ -1153,6 +1153,40 @@ async fn a_direct_send_and_the_setting_that_allowed_it_are_logged_without_a_word
 }
 
 #[tokio::test]
+async fn saving_the_owners_words_for_the_voice_agent_logs_sizes_and_never_the_words() {
+    // `#272 voice-agent-instructions`. The instructions and the edited prompt are the owner's own
+    // text; the access log records that he changed them, how long the instructions are, and
+    // whether the prompt is edited, and nothing he wrote.
+    const SECRET: &str = "my sister's name is Priya and the vault code is 4417";
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let (status, body) = json_call(
+        &harness,
+        "PUT",
+        "/api/v1/voice-prompt",
+        Some(json!({ "instructions": SECRET, "system_prompt": format!("{SECRET}, edited") })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lines = capture.access_lines();
+    let changed = lines
+        .iter()
+        .find(|line| line.contains("voice_prompt"))
+        .unwrap_or_else(|| panic!("no voice_prompt line in:\n{}", lines.join("\n")));
+    assert!(changed.contains("event=\"changed\""), "{changed}");
+    assert!(
+        changed.contains(&format!("instructions_chars={}", SECRET.chars().count())),
+        "{changed}"
+    );
+    assert!(changed.contains("system_prompt_edited=true"), "{changed}");
+    let everything = capture.text();
+    assert!(
+        !everything.contains("vault code") && !everything.contains("Priya"),
+        "the owner's words reached the INFO log:\n{everything}"
+    );
+}
+
+#[tokio::test]
 async fn the_summary_route_and_taking_a_channel_off_the_list_log_numbers_and_never_a_key() {
     // `#208 persistent-cache`. A hit from memory, a shared fetch, a generated summary, a stored one
     // kept alive, and a channel whose summaries are deleted with it: none of them may put a message

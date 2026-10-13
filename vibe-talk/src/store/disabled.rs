@@ -20,6 +20,7 @@ use super::{
     UpstreamClearSetting,
 };
 use crate::model::{ChannelId, MessageId};
+use crate::voice_agent::OwnerPrompt;
 
 /// The setting whose absence installs [`DisabledStore`].
 pub const SETTING: &str = "storage.path";
@@ -162,6 +163,16 @@ impl StateStore for DisabledStore {
     }
 
     async fn set_ask_before_send(&self, _: bool) -> Result<bool, StoreError> {
+        refuse()
+    }
+
+    async fn owner_prompt(&self) -> Result<Option<OwnerPrompt>, StoreError> {
+        // A refusal, not `Ok(None)`, for the noise rules' reason: Settings must not believe it
+        // could save. `voice_prompt::current` applies the shipped prompt by name.
+        refuse()
+    }
+
+    async fn set_owner_prompt(&self, _: &OwnerPrompt) -> Result<OwnerPrompt, StoreError> {
         refuse()
     }
 

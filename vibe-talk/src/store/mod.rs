@@ -1550,6 +1550,33 @@ pub trait StateStore: Send + Sync {
     /// write failure.
     async fn set_ask_before_send(&self, ask: bool) -> Result<bool, StoreError>;
 
+    /// The owner's own words for the voice agent — additional instructions and an edited base
+    /// prompt — or `None` when he has never saved any. `#272 voice-agent-instructions`.
+    ///
+    /// `None` means the shipped prompt, which [`crate::voice_prompt::current`] applies at read
+    /// time; nothing ever writes it here on his behalf. Not covered by [`Retention`], for the
+    /// reason [`StateStore::ask_before_send`] is not: an age limit would silently put back
+    /// instructions he replaced.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn owner_prompt(&self) -> Result<Option<crate::voice_agent::OwnerPrompt>, StoreError>;
+
+    /// Replace the owner's words for the voice agent with `prompt`, whole, returning it as stored.
+    /// The caller has cleaned it ([`crate::voice_agent::clean_instructions`],
+    /// [`crate::voice_agent::clean_system_prompt`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_owner_prompt(
+        &self,
+        prompt: &crate::voice_agent::OwnerPrompt,
+    ) -> Result<crate::voice_agent::OwnerPrompt, StoreError>;
+
     /// The messages in this channel the owner has said are NOT noise, whatever the rules say.
     ///
     /// The ids alone, for the same reason [`StateStore::dismissals`] returns ids alone.

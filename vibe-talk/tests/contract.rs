@@ -19,8 +19,9 @@ use vibe_talk::contract::{
     PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals,
     TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoiceSettings,
+    VibeTalkV1ServerFrame, VoicePromptSettings, VoiceSettings,
 };
+use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
 use vibe_talk::speech::{Description, Playback};
@@ -245,6 +246,28 @@ fn client_config(
             ask_before_send: true,
             changeable: true,
         }),
+        voice_prompt: full.then(|| voice_prompt(true, PromptDelivery::Page)),
+    }
+}
+
+/// The owner's words for the voice agent, with an edited base or the shipped one.
+/// `#272 voice-agent-instructions`.
+fn voice_prompt(edited: bool, delivery: PromptDelivery) -> VoicePromptSettings {
+    VoicePromptSettings {
+        instructions: if edited { "Call me Sam." } else { "" }.into(),
+        system_prompt: if edited {
+            "You read me the chat."
+        } else {
+            "You are a voice assistant."
+        }
+        .into(),
+        system_prompt_edited: edited,
+        edited_from_version: edited.then_some(8),
+        prompt_version: 9,
+        max_instructions_chars: 4_000,
+        max_system_prompt_chars: 20_000,
+        changeable: edited,
+        delivery,
     }
 }
 
@@ -333,6 +356,7 @@ fn samples() -> Value {
                 valid_for_seconds: Some(60),
                 input_sample_rate: 16_000,
                 output_sample_rate: 24_000,
+                agent_prompt: None,
             }),
             to(&VoiceSession {
                 websocket_url: "wss://voice.example/session".into(),
@@ -341,6 +365,54 @@ fn samples() -> Value {
                 valid_for_seconds: None,
                 input_sample_rate: 16_000,
                 output_sample_rate: 24_000,
+                agent_prompt: None,
+            }),
+            // `#272 voice-agent-instructions`: a hosted agent handed the owner's words each of the
+            // three ways, with what its configuration said present and absent.
+            to(&VoiceSession {
+                websocket_url: "wss://voice.example/session".into(),
+                protocol: "elevenlabs",
+                provider: "ElevenLabs".into(),
+                valid_for_seconds: Some(900),
+                input_sample_rate: 16_000,
+                output_sample_rate: 16_000,
+                agent_prompt: Some(SessionPrompt {
+                    transport: PromptTransport::PromptOverride,
+                    text: "You read me the chat.".into(),
+                    system_prompt_applied: true,
+                    instructions_applied: true,
+                    override_allowed: Some(true),
+                }),
+            }),
+            to(&VoiceSession {
+                websocket_url: "wss://voice.example/session".into(),
+                protocol: "elevenlabs",
+                provider: "ElevenLabs".into(),
+                valid_for_seconds: Some(900),
+                input_sample_rate: 16_000,
+                output_sample_rate: 16_000,
+                agent_prompt: Some(SessionPrompt {
+                    transport: PromptTransport::ContextualUpdate,
+                    text: "Call me Sam.".into(),
+                    system_prompt_applied: false,
+                    instructions_applied: true,
+                    override_allowed: None,
+                }),
+            }),
+            to(&VoiceSession {
+                websocket_url: "wss://voice.example/session".into(),
+                protocol: "elevenlabs",
+                provider: "ElevenLabs".into(),
+                valid_for_seconds: Some(900),
+                input_sample_rate: 16_000,
+                output_sample_rate: 16_000,
+                agent_prompt: Some(SessionPrompt {
+                    transport: PromptTransport::NotSent,
+                    text: String::new(),
+                    system_prompt_applied: false,
+                    instructions_applied: false,
+                    override_allowed: Some(false),
+                }),
             }),
         ],
         "PendingPostResponse": [
@@ -743,6 +815,12 @@ fn samples() -> Value {
             to(&VoiceSettings { ask_before_send: true, changeable: true }),
             to(&VoiceSettings { ask_before_send: false, changeable: true }),
             to(&VoiceSettings { ask_before_send: true, changeable: false }),
+        ],
+        // `#272 voice-agent-instructions`: an owner's edited copy for a hosted agent, and the
+        // shipped prompt on a bridge with no store.
+        "VoicePromptSettings": [
+            to(&voice_prompt(true, PromptDelivery::Page)),
+            to(&voice_prompt(false, PromptDelivery::Profile)),
         ],
         // `#208 persistent-cache`: a current window, and one a provider served from a copy it
         // could not bring up to date, so `as_of` is seen omitted and present.

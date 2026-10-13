@@ -186,7 +186,19 @@ pub fn parse_agent_profile(value: &serde_json::Value, agent_id: &str) -> AgentPr
             .filter(|name| !name.is_empty())
             .map(str::to_owned),
         voice_id: parse_agent_voice(value).ok(),
+        prompt_override: parse_prompt_override(value),
     }
+}
+
+/// Whether the agent lets a client override its system prompt, read from
+/// `platform_settings.overrides.conversation_config_override.agent.prompt.prompt` on
+/// `GET /v1/convai/agents/{agent_id}`. `None` when the answer does not carry a boolean there.
+/// `#272 voice-agent-instructions`.
+#[must_use]
+pub fn parse_prompt_override(value: &serde_json::Value) -> Option<bool> {
+    value
+        .pointer("/platform_settings/overrides/conversation_config_override/agent/prompt/prompt")
+        .and_then(serde_json::Value::as_bool)
 }
 
 /// Pull the agent's configured voice out of its configuration.
@@ -655,6 +667,38 @@ mod tests {
             "conversation_config": { "tts": { "voice_id": "voice_abc", "model_id": "x" } }
         });
         assert_eq!(parse_agent_voice(&value).expect("a voice"), "voice_abc");
+    }
+
+    #[test]
+    fn whether_the_agent_lets_a_client_replace_its_prompt_is_read_and_never_guessed() {
+        // `#272 voice-agent-instructions`.
+        let allowing = |prompt: serde_json::Value| {
+            serde_json::json!({
+                "agent_id": "agent_1",
+                "platform_settings": { "overrides": { "conversation_config_override": {
+                    "agent": { "prompt": { "prompt": prompt }, "first_message": true },
+                    "conversation": { "text_only": true }
+                } } }
+            })
+        };
+        assert_eq!(
+            parse_prompt_override(&allowing(serde_json::json!(true))),
+            Some(true)
+        );
+        assert_eq!(
+            parse_prompt_override(&allowing(serde_json::json!(false))),
+            Some(false)
+        );
+        let profile = parse_agent_profile(&allowing(serde_json::json!(true)), "agent_1");
+        assert_eq!(profile.prompt_override, Some(true));
+        // Absent, or not a boolean: unknown, which the caller treats as not allowed.
+        for unknown in [
+            serde_json::json!({ "agent_id": "agent_1" }),
+            serde_json::json!({ "platform_settings": { "overrides": {} } }),
+            allowing(serde_json::json!("yes")),
+        ] {
+            assert_eq!(parse_prompt_override(&unknown), None, "{unknown}");
+        }
     }
 
     #[test]
