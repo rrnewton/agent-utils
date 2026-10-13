@@ -392,6 +392,34 @@
         "spoken_time": "",
         "timestamp": "2026-09-25T12:00:00+00:00"
       },
+      "send_seq": 3,
+      "serial": 3
+    },
+    {
+      "parts": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "posted": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
       "serial": 3
     }
   ],
@@ -671,6 +699,7 @@
   ],
   "PendingPostResponse": [
     {
+      "now_ms": 1700000000000,
       "proposal": {
         "channel_id": "111",
         "channel_name": "lead team",
@@ -678,11 +707,16 @@
         "handle": "AAAAAAAAAAAAAAAAAAAAAA",
         "prefix": "(Voice-agent relayed, from user) ",
         "reply_to": "300",
+        "reply_to_author": "Alex",
+        "reply_to_excerpt": "is the build green yet…",
         "serial": 3,
-        "text": "(Voice-agent relayed, from user) on my way"
-      }
+        "text": "(Voice-agent relayed, from user) on my way",
+        "thread_name": "release"
+      },
+      "sends_through": 0
     },
     {
+      "now_ms": 1700000000000,
       "proposal": {
         "channel_id": "111",
         "channel_name": "lead team",
@@ -691,10 +725,108 @@
         "reply_to": null,
         "serial": 4,
         "text": "on my way"
-      }
+      },
+      "sends_through": 2,
+      "settled": [
+        {
+          "fate": "superseded",
+          "serial": 3
+        }
+      ]
     },
     {
-      "proposal": null
+      "now_ms": 1700000000000,
+      "proposal": null,
+      "sends": [
+        {
+          "detail": {
+            "begun_at_ms": 1699999999000,
+            "channel_id": "111",
+            "channel_name": "lead team",
+            "how": "tap",
+            "message_id": "900",
+            "origin": "commit",
+            "outcome": "sent",
+            "parts_posted": 1,
+            "parts_total": 1,
+            "send_seq": 3,
+            "sent_at_ms": 1699999999400,
+            "serial": 5,
+            "text_chars": 9,
+            "text_truncated": false,
+            "unsent_chars": 0
+          },
+          "text": "on my way"
+        },
+        {
+          "detail": {
+            "begun_at_ms": 1699999999000,
+            "channel_id": "111",
+            "channel_name": "lead team",
+            "how": "voice",
+            "message_id": "900",
+            "origin": "commit",
+            "outcome": "partial",
+            "parts_posted": 1,
+            "parts_total": 3,
+            "reply_to": "300",
+            "reply_to_author": "Alex",
+            "reply_to_excerpt": "is the build green yet…",
+            "send_seq": 4,
+            "sent_at_ms": 1699999999400,
+            "serial": 6,
+            "text_chars": 9,
+            "text_truncated": true,
+            "thread_id": "t1",
+            "thread_name": "release",
+            "uncertain_part": 2,
+            "unsent_chars": 1900
+          },
+          "text": "the first part"
+        },
+        {
+          "detail": {
+            "begun_at_ms": 1699999999000,
+            "channel_id": "111",
+            "channel_name": "lead team",
+            "how": "direct",
+            "origin": "rest",
+            "outcome": "unconfirmed",
+            "parts_posted": 0,
+            "parts_total": 1,
+            "send_seq": 5,
+            "sent_at_ms": 1699999999400,
+            "serial": 7,
+            "text_chars": 9,
+            "text_truncated": false,
+            "unsent_chars": 0
+          },
+          "text": "rebase onto main"
+        }
+      ],
+      "sends_through": 5,
+      "settled": [
+        {
+          "fate": "committed",
+          "serial": 1
+        },
+        {
+          "fate": "cancelled",
+          "serial": 2
+        },
+        {
+          "fate": "expired",
+          "serial": 3
+        },
+        {
+          "fate": "superseded",
+          "serial": 4
+        },
+        {
+          "fate": "refused",
+          "serial": 5
+        }
+      ]
     }
   ],
   "PinChangeResponse": [

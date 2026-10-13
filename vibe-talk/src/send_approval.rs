@@ -54,11 +54,11 @@
 //! `ops::reply_scoped`, and keeping this out of that function means there is still exactly one
 //! place that decides how a long message goes out.
 
-use crate::model::{ChannelInfo, Message};
+use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
 use crate::ops::{self, OpError};
-use crate::post_gate::{Binding, DirectOutcome, Repeat};
+use crate::post_gate::{Binding, DirectOutcome, Repeat, SendReport};
 use crate::state::AppState;
-use crate::store::StoreError;
+use crate::store::{SendOrigin, SendOutcome, StoreError};
 
 /// What `post_reply` does with a message right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +197,9 @@ pub enum VoicePost {
 /// words that are posted. A commit posts the proposal's text as it stands, and is never tagged
 /// again.
 ///
+/// `origin` says which of the two called, and is kept with a direct send in the post gate's send
+/// memory for audit (`#270 voice-transcript-markers`); nothing behaves differently for it.
+///
 /// # Errors
 ///
 /// Whatever [`ops::propose_reply`] or [`ops::reply`] refuses with — the allowlist, the write
@@ -207,6 +210,7 @@ pub async fn voice_post(
     channel_id: &str,
     text: &str,
     reply_to: Option<&str>,
+    origin: SendOrigin,
 ) -> Result<VoicePost, OpError> {
     let tagged = crate::post_prefix::apply(&crate::post_prefix::current(state).await, text);
     let text = tagged.text.as_str();
@@ -222,36 +226,41 @@ pub async fn voice_post(
                 text: text.to_owned(),
                 reply_to: reply_to.map(str::to_owned),
             };
-            let ticket = match state.post_gate.begin_direct(binding) {
-                Ok(ticket) => ticket,
-                Err(earlier) => {
-                    crate::access::post_gate(
-                        "direct_repeat",
-                        Some(earlier.serial),
-                        Some(channel_id),
-                        Some(text.chars().count()),
-                        Some(earlier.outcome.as_str()),
-                        None,
-                    );
-                    let channel = ops::channels(state)
-                        .await
-                        .into_iter()
-                        .find(|channel| channel.id.as_str() == channel_id)
-                        .map_or_else(
-                            || channel_id.to_owned(),
-                            |channel| channel.display_name().to_owned(),
+            let channel = channel_name(state, channel_id).await;
+            let ticket =
+                match state
+                    .post_gate
+                    .begin_direct(binding.clone(), origin, channel.clone())
+                {
+                    Ok(ticket) => ticket,
+                    Err(earlier) => {
+                        crate::access::post_gate(
+                            "direct_repeat",
+                            Some(earlier.serial),
+                            Some(channel_id),
+                            Some(text.chars().count()),
+                            Some(earlier.outcome.as_str()),
+                            None,
                         );
-                    return Ok(VoicePost::Repeat {
-                        channel,
-                        earlier,
-                        text: text.to_owned(),
-                    });
-                }
-            };
+                        return Ok(VoicePost::Repeat {
+                            channel,
+                            earlier,
+                            text: text.to_owned(),
+                        });
+                    }
+                };
             let serial = ticket.serial();
-            match ops::reply(state, channel_id, text, reply_to).await {
+            let result = ops::reply(state, channel_id, text, reply_to).await;
+            // Remembered when anything may have reached the channel, so the same words are not
+            // posted over it, and filed in the send memory for the page to draw; forgotten when
+            // certainly nothing did.
+            ticket.finish(send_report(
+                state,
+                &binding,
+                result.as_ref().map(|(_, _, parts)| parts.as_slice()),
+            ));
+            match result {
                 Ok((channel, _first, parts)) => {
-                    ticket.finish(Some(DirectOutcome::Sent));
                     crate::access::post_gate(
                         "sent_direct",
                         Some(serial),
@@ -274,21 +283,6 @@ pub async fn voice_post(
                     })
                 }
                 Err(error) => {
-                    // Remembered when anything may have reached the channel, so the same words
-                    // are not posted over it; forgotten when certainly nothing did.
-                    ticket.finish(match &error {
-                        OpError::PartiallyPosted {
-                            posted, uncertain, ..
-                        } if *posted > 0 => Some(if *uncertain {
-                            DirectOutcome::PartlyUnconfirmed
-                        } else {
-                            DirectOutcome::Partly
-                        }),
-                        OpError::PartiallyPosted {
-                            uncertain: true, ..
-                        } => Some(DirectOutcome::Unconfirmed),
-                        _ => None,
-                    });
                     crate::access::post_gate(
                         "direct_failed",
                         Some(serial),
@@ -301,6 +295,223 @@ pub async fn voice_post(
                 }
             }
         }
+    }
+}
+
+/// A channel's name as the owner knows it — alias included — or its id when this server does not
+/// list it.
+pub async fn channel_name(state: &AppState, channel_id: &str) -> String {
+    ops::channels(state)
+        .await
+        .into_iter()
+        .find(|channel| channel.id.as_str() == channel_id)
+        .map_or_else(
+            || channel_id.to_owned(),
+            |channel| channel.display_name().to_owned(),
+        )
+}
+
+/// What a card can say about the message a post answers, and the thread it is in, from what this
+/// server already holds. `#269 approval-card-inline`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplyContext {
+    /// Who wrote it, at most [`REPLY_CONTEXT_CHARS`] characters.
+    pub author: Option<String>,
+    /// Its first few words, flattened, at most [`REPLY_CONTEXT_CHARS`] characters.
+    pub excerpt: Option<String>,
+    /// The thread it is in, when it is inside one.
+    pub thread_id: Option<String>,
+    /// That thread's name, when this server knows one.
+    pub thread_name: Option<String>,
+}
+
+/// The longest author or excerpt a card is given.
+pub const REPLY_CONTEXT_CHARS: usize = 80;
+
+/// How many words of a replied-to message a card quotes.
+const EXCERPT_WORDS: usize = 8;
+
+/// What this server holds about `reply_to` in `channel_id`: the messages it fetched in the last
+/// half minute, then the voice catch-up's window of the channel. Never a read of the chat service:
+/// a card is drawn now, and the fallback wording — "an earlier message" — covers a miss.
+#[must_use]
+pub fn reply_context(state: &AppState, channel_id: &str, reply_to: Option<&str>) -> ReplyContext {
+    let Some(reply_to) = reply_to else {
+        return ReplyContext::default();
+    };
+    let channel = ChannelId(channel_id.to_owned());
+    let message = state
+        .read_ahead
+        .recall(&channel, None, &[reply_to.to_owned()])
+        .remove(reply_to)
+        .or_else(|| {
+            state
+                .live
+                .recent()
+                .snapshot(&channel)
+                .held
+                .and_then(|held| {
+                    held.messages
+                        .into_iter()
+                        .find(|message| message.id == MessageId(reply_to.to_owned()))
+                })
+        });
+    let Some(message) = message else {
+        return ReplyContext::default();
+    };
+    let thread_id = message
+        .thread
+        .as_ref()
+        .filter(|thread| !thread.is_root)
+        .map(|thread| thread.id.clone());
+    let thread_name = thread_id
+        .as_deref()
+        .and_then(|thread| state.thread_names.known_name(&channel, thread));
+    let author = cap(message
+        .author
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" "));
+    ReplyContext {
+        author: (!author.is_empty()).then_some(author),
+        excerpt: excerpt(&message.content),
+        thread_id,
+        thread_name,
+    }
+}
+
+/// The first [`EXCERPT_WORDS`] words of `content`, flattened onto one line, with any word that
+/// carries a long run of digits — a mention, a raw id, a link to one — left out: a card never
+/// shows an id. `None` when nothing is left.
+#[must_use]
+pub fn excerpt(content: &str) -> Option<String> {
+    let words: Vec<&str> = content
+        .split_whitespace()
+        .filter(|word| !has_long_digit_run(word))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let mut said = words
+        .iter()
+        .take(EXCERPT_WORDS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.len() > EXCERPT_WORDS {
+        said.push('…');
+    }
+    Some(cap(said))
+}
+
+fn has_long_digit_run(word: &str) -> bool {
+    let mut run = 0;
+    for c in word.chars() {
+        run = if c.is_ascii_digit() { run + 1 } else { 0 };
+        if run >= 10 {
+            return true;
+        }
+    }
+    false
+}
+
+/// At most [`REPLY_CONTEXT_CHARS`] characters, with an ellipsis when cut, and no control
+/// characters.
+fn cap(text: String) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= REPLY_CONTEXT_CHARS {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(REPLY_CONTEXT_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// What a finished send posted, for the post gate's send memory, or `None` when it certainly
+/// posted nothing. `#270 voice-transcript-markers`.
+///
+/// `result` is the posted parts, or the failure. The text filed is the text that went: all of it
+/// for a whole post and for one whose answer was lost — the channel may have it — and for a
+/// partial post the parts known to have been posted, cut by the same deterministic split the post
+/// was cut by.
+#[must_use]
+pub fn send_report(
+    state: &AppState,
+    binding: &Binding,
+    result: Result<&[Message], &OpError>,
+) -> Option<SendReport> {
+    let context = reply_context(state, &binding.channel_id, binding.reply_to.as_deref());
+    let place = |first: Option<&Message>| {
+        let thread_id = first
+            .and_then(|first| first.thread.as_ref())
+            .filter(|thread| !thread.is_root)
+            .map(|thread| thread.id.clone());
+        let thread_name = thread_id.as_deref().and_then(|thread| {
+            state
+                .thread_names
+                .known_name(&ChannelId(binding.channel_id.clone()), thread)
+        });
+        (
+            first.map(|first| first.id.0.clone()),
+            thread_id,
+            thread_name,
+        )
+    };
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    match result {
+        Ok(parts) => {
+            let (message_id, thread_id, thread_name) = place(parts.first());
+            Some(SendReport {
+                outcome: SendOutcome::Sent,
+                text: binding.text.clone(),
+                message_id,
+                thread_id,
+                thread_name,
+                reply_to_author: context.author,
+                reply_to_excerpt: context.excerpt,
+                parts_posted: count(parts.len()),
+                parts_total: count(parts.len()),
+                uncertain_part: None,
+                unsent_chars: 0,
+            })
+        }
+        Err(OpError::PartiallyPosted {
+            posted,
+            uncertain,
+            first,
+            ..
+        }) if *posted > 0 || *uncertain => {
+            let limit = state
+                .chat
+                .post_limit(&ChannelId(binding.channel_id.clone()));
+            let split = crate::discord::split::split_within(&binding.text, &limit);
+            let posted = (*posted).min(split.len());
+            let unsent_from = (posted + usize::from(*uncertain)).min(split.len());
+            let unsent_chars: usize = split[unsent_from..]
+                .iter()
+                .map(|part| part.chars().count())
+                .sum();
+            let (message_id, thread_id, thread_name) = place(first.as_deref());
+            let (outcome, text) = if posted == 0 {
+                (SendOutcome::Unconfirmed, binding.text.clone())
+            } else {
+                (SendOutcome::Partial, split[..posted].concat())
+            };
+            Some(SendReport {
+                outcome,
+                text,
+                message_id,
+                thread_id,
+                thread_name,
+                reply_to_author: context.author,
+                reply_to_excerpt: context.excerpt,
+                parts_posted: count(posted),
+                parts_total: count(split.len()),
+                uncertain_part: uncertain.then(|| count(posted + 1)),
+                unsent_chars: count(unsent_chars),
+            })
+        }
+        Err(_) => None,
     }
 }
 
@@ -498,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn asking_proposes_and_posts_nothing() {
         let (state, discord, _store) = testing::state_with_store();
-        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", None)
+        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", None, SendOrigin::Mcp)
             .await
             .expect("proposed");
         assert!(matches!(outcome, VoicePost::Proposed { .. }), "{outcome:?}");
@@ -509,9 +720,15 @@ mod tests {
     #[tokio::test]
     async fn direct_posts_once_through_the_shared_send_and_leaves_nothing_pending() {
         let (state, discord, _store) = testing::state_with_store_from_toml(&direct_toml());
-        let outcome = voice_post(&state, WRITE_CHANNEL, "rebase onto main", Some("42"))
-            .await
-            .expect("sent");
+        let outcome = voice_post(
+            &state,
+            WRITE_CHANNEL,
+            "rebase onto main",
+            Some("42"),
+            SendOrigin::Mcp,
+        )
+        .await
+        .expect("sent");
         let VoicePost::Sent {
             channel,
             parts,
@@ -547,7 +764,7 @@ mod tests {
     #[tokio::test]
     async fn a_proposal_holds_the_tagged_text_and_says_which_part_is_the_tag() {
         let (state, discord, _store) = testing::state_with_store();
-        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", Some("42"))
+        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", Some("42"), SendOrigin::Mcp)
             .await
             .expect("proposed");
         let VoicePost::Proposed { channel, proposal } = outcome else {
@@ -577,24 +794,34 @@ mod tests {
     #[tokio::test]
     async fn text_handed_back_with_the_tag_is_tagged_once_in_both_modes() {
         let (state, discord, store) = testing::state_with_store();
-        let VoicePost::Proposed { proposal, .. } =
-            voice_post(&state, WRITE_CHANNEL, &format!("{TAG}on it"), None)
-                .await
-                .expect("proposed")
-        else {
+        let VoicePost::Proposed { proposal, .. } = voice_post(
+            &state,
+            WRITE_CHANNEL,
+            &format!("{TAG}on it"),
+            None,
+            SendOrigin::Mcp,
+        )
+        .await
+        .expect("proposed") else {
             panic!("asking did not propose");
         };
         assert_eq!(proposal.binding.text, format!("{TAG}on it"));
         assert_eq!(proposal.prefix, TAG);
 
         store.set_ask_before_send(false).await.expect("direct");
-        voice_post(&state, WRITE_CHANNEL, "rebase", None)
+        voice_post(&state, WRITE_CHANNEL, "rebase", None, SendOrigin::Mcp)
             .await
             .expect("sent");
         // A retry with the text the model was shown is the same send, not a second post.
-        let again = voice_post(&state, WRITE_CHANNEL, &format!("{TAG}rebase"), None)
-            .await
-            .expect("answered");
+        let again = voice_post(
+            &state,
+            WRITE_CHANNEL,
+            &format!("{TAG}rebase"),
+            None,
+            SendOrigin::Mcp,
+        )
+        .await
+        .expect("answered");
         assert!(matches!(again, VoicePost::Repeat { .. }), "{again:?}");
         assert_eq!(discord.posted().len(), 1);
         assert_eq!(discord.posted()[0].content, format!("{TAG}rebase"));
@@ -607,13 +834,13 @@ mod tests {
         crate::post_prefix::set(&state, Some(""))
             .await
             .expect("saved");
-        voice_post(&state, WRITE_CHANNEL, "plain", None)
+        voice_post(&state, WRITE_CHANNEL, "plain", None, SendOrigin::Mcp)
             .await
             .expect("sent");
         crate::post_prefix::set(&state, Some("[voice] "))
             .await
             .expect("saved");
-        voice_post(&state, WRITE_CHANNEL, "tagged", None)
+        voice_post(&state, WRITE_CHANNEL, "tagged", None, SendOrigin::Mcp)
             .await
             .expect("sent");
         let posted: Vec<String> = discord.posted().into_iter().map(|p| p.content).collect();
@@ -626,7 +853,7 @@ mod tests {
         for direct in [false, true] {
             store.set_ask_before_send(!direct).await.expect("setting");
             for text in ["", "   ", TAG] {
-                let error = voice_post(&state, WRITE_CHANNEL, text, None)
+                let error = voice_post(&state, WRITE_CHANNEL, text, None, SendOrigin::Mcp)
                     .await
                     .expect_err("nothing to post");
                 assert!(error.to_string().contains("empty"), "{text:?}: {error}");
@@ -717,7 +944,34 @@ mod tests {
             resumable: true,
             thread_id: None,
             uncertain,
+            first: None,
         }
+    }
+
+    #[test]
+    fn an_excerpt_is_the_first_eight_words_on_one_line_and_never_carries_an_id() {
+        assert_eq!(
+            excerpt("is the build\n green yet?").as_deref(),
+            Some("is the build green yet?")
+        );
+        assert_eq!(
+            excerpt("one two three four five six seven eight nine").as_deref(),
+            Some("one two three four five six seven eight…")
+        );
+        assert_eq!(
+            excerpt("ping <@1234567890123> about https://x.example/9876543210/run").as_deref(),
+            Some("ping about"),
+            "a mention or a link holding an id was quoted"
+        );
+        assert_eq!(excerpt("<@1234567890123>"), None);
+        assert_eq!(excerpt("   "), None);
+        let long = excerpt(&"w".repeat(200)).expect("a word");
+        assert_eq!(long.chars().count(), REPLY_CONTEXT_CHARS);
+        assert!(long.ends_with('…'));
+        assert_eq!(
+            excerpt("build 123456789 failed").as_deref(),
+            Some("build 123456789 failed")
+        );
     }
 
     #[test]

@@ -91,7 +91,7 @@ class FakeApi:
             if wait > 0:
                 self.changed.wait_for(lambda: self.serial() != seen or self.stopping.is_set(),
                                       timeout=min(wait, 1.0))
-            return {"proposal": self.proposal}
+            return {"proposal": self.proposal, "sends_through": 0, "now_ms": int(time.time() * 1000)}
 
     def propose(self, proposal: Json) -> None:
         with self.changed:
