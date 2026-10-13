@@ -104,6 +104,30 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  - group: hygiene
+    job: site-self-test
+    desc: prove the website checker can fail
+    cmd: python3 scripts/check_site.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
+    job: site
+    desc: website pages parse, links resolve, and nothing loads from another origin
+    cmd: python3 scripts/check_site.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 120
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
   - group: docs
     job: embedded-userguides
     desc: generated package guides match their source templates

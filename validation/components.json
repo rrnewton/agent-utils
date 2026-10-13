@@ -222,6 +222,7 @@
         "scripts/check_no_any.py",
         "scripts/check_python_packages.py",
         "scripts/check_rust_packages.py",
+        "scripts/check_site.py",
         "scripts/embed_userguides.py",
         "scripts/pid_namespace_init.py",
         "scripts/rebase-delta-guard",

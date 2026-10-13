@@ -137,8 +137,9 @@ WHY: dict[str, str] = {
         " Chromium and are the only checks that can see a rendering or interaction regression"
     ),
     HYGIENE: (
-        "always: a consuming project's name can be typed into any file, and a documented default"
-        " can be broken from either the prose or the code side"
+        "always: a consuming project's name can be typed into any file, a documented default"
+        " can be broken from either the prose or the code side, and renaming any file or"
+        " rewording any heading can break a website link"
     ),
 }
 
@@ -220,7 +221,10 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # Their own group is always-on, so naming them here only stops them reading as unclassified.
     ("scripts/check_client_names.py", frozenset()),
     ("scripts/check_documented_defaults.py", frozenset()),
-    # The public website: static HTML and CSS that nothing builds, embeds, or packages.
+    ("scripts/check_site.py", frozenset()),
+    # The public website is static HTML and CSS that nothing builds or embeds. Its checker runs in
+    # the always-on hygiene group because the site links into the whole tree: a renamed document
+    # or a reworded heading ANYWHERE can break it, so a site-only rule here could not be complete.
     ("site/", frozenset()),
     ("scripts/check_no_any.py", frozenset({PYTHON, CROSS, VIBE_TALK})),
     # Prose and agent-facing material. Not embedded anywhere, so nothing can go red for it.
@@ -984,7 +988,7 @@ def self_test() -> int:
     expect(
         ["site/index.html", "site/style.css", "site/.nojekyll"],
         set(),
-        "website files are static pages that nothing builds, embeds, or packages",
+        "website files are checked by the always-on hygiene group and owe nothing else",
     )
     expect(["site.html"], set(ALL_GROUPS), "the site/ directory rule must stop at its boundary")
     expect(
@@ -1015,6 +1019,12 @@ def self_test() -> int:
         ["scripts/check_documented_defaults.py"],
         {PYTHON},
         "a documented-default implementation change also runs its owned tests",
+        {"repository-infrastructure"},
+    )
+    expect(
+        ["scripts/check_site.py"],
+        {PYTHON},
+        "a website-checker change runs strict typing and the infrastructure tests",
         {"repository-infrastructure"},
     )
     expect(

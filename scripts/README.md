@@ -14,6 +14,7 @@ through the top-level `bin/` command surface while that family is still evolving
 | `check_no_any.py` | Reject explicit `typing.Any` use at typed boundaries. |
 | `check_python_packages.py` | Build each wheel and sdist, rebuild from the sdist, then inspect, install, and smoke every Python distribution in isolation. |
 | `check_rust_packages.py` | Package and inspect each Rust crate in isolation. |
+| `check_site.py` | Check the public website under `site/`: pages parse, every relative and repository link resolves (including `#fragments` into Markdown headings), nothing loads from another origin, and asset sizes stay within their caps. |
 | `dagrun_profile_chart.py` | Render deterministic, dependency-free SVG speedup and within-step parallelism charts from dagrun model/trace data. |
 | `agent-log-archive/fetch_agent_logs.py` | Strict-typed, non-deleting local/SSH archive fetcher with manifests, metrics, and immutable receipts (`.sh` is its compatibility launcher). |
 | `irq_survey.py` | Re-derive the per-CPU interrupt numbers the core allocator's ranking rests on: is there a signal, does it change placement, and how far does an independent window drift. |
@@ -25,6 +26,7 @@ Run the focused checks directly:
 python3 scripts/embed_userguides.py --check
 python3 scripts/check_deps.py
 python3 scripts/check_no_any.py .
+python3 scripts/check_site.py --self-test && python3 scripts/check_site.py
 python3 scripts/irq_survey.py distribution
 make check-packages
 ```
