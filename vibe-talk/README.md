@@ -3075,8 +3075,8 @@ sends `audio_end`, waits for `turn_complete`, and then sends the prompt; after t
 `turn_complete`, it sends a fresh `audio_start` before resuming microphone frames. Server output is
 `transcript`, `turn_complete`, `error`, or binary PCM. `quit` ends the session. The page closes the
 segment only once any spoken turn already under way — the owner's words or the assistant's answer
-— has completed, and resumes microphone frames a moment after every `turn_complete`, the greeting's
-included; see "How a call ended".
+— has completed, and both sends that `audio_end` and resumes microphone frames only a moment after
+every `turn_complete`, the greeting's included; see "How a call ended".
 
 A client may send `{"type":"interrupt"}` at any time after `session_started`. During a turn, the
 server stops the response, drops that turn's remaining PCM and transcripts (including any already
@@ -3315,9 +3315,11 @@ it used to tear down whatever call the reader had started since. Now it only add
 the connection details; nothing else it delivers is judged or acted on.
 
 A healthy call does not end itself. Nothing the page times — the 9-second open deadline (which only
-applies to a socket that has not opened), the spoken yes's settle window, the hold below, the
-microphone's hand-off, the card's countdown, the no-reply bound — closes a call or sends `quit`;
-the page suite fires every one of them on a working call to hold it to that.
+applies to a socket that has not opened), the spoken yes's settle window, the hold below and its
+cap, the microphone's hand-off, the card's countdown, the no-reply bound — closes a call or sends
+`quit`; the page suite fires every one of them on a working call to hold it to that. None did before
+this change either: that test is a guard, and its control makes one timer hang up to show it would
+see it.
 
 The page also stopped two things it did to the bridge mid-call. **The microphone waits across the
 greeting's end** as it does across every other turn's (`VOICE_CAPTURE_RESUME_MS`): PCM a few
@@ -3328,9 +3330,13 @@ while the owner was speaking or the assistant answering. That left two `turn_com
 the page took the turn's for the segment's, sent its prompt into a turn still running, then took
 the segment's for the prompt's and opened the microphone over the answer. Now the text waits until
 anything of a spoken turn that has arrived — the owner's words, the assistant's, its audio — is
-closed by that turn's `turn_complete`, and only then sends `audio_end`. A turn that sends nothing
-for 8 seconds without completing (`SPOKEN_TURN_HOLD_MS`) is let go, as before, and the connection
-details say so.
+closed by that turn's `turn_complete`, and then for the hand-off after it (`VOICE_CAPTURE_RESUME_MS`,
+the wait the microphone keeps), and only then sends `audio_end`; a message typed inside a hand-off
+waits out the rest of it too. A turn that sends nothing for 8 seconds without completing
+(`SPOKEN_TURN_HOLD_MS`) is let go, as before, and so is a turn that keeps sending without ever
+completing — a trickle of hypotheses of background speech, a bridge that never sends the turn's
+`turn_complete` — 30 seconds after the hold began however often its frames came
+(`SPOKEN_TURN_HOLD_CAP_MS`). The connection details say which let it go.
 
 ## Signed conversation URLs
 

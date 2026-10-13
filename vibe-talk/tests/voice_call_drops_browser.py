@@ -11,10 +11,11 @@ Playwright mock of the deployed `vibe-talk-v1` protocol:
   resume after the hand-off -> the owner asks, the agent proposes and reads the draft back word for
   word -> the owner's "Yes" arrives as a hypothesis, then the agent's reply "One moment." with its
   audio, then the final "Yes." -> the card is committed once, as the speaker's turn -> the page's
-  notice does not close the microphone's segment while that turn is open, closes it when the turn
-  completes, and goes as a prompt at the segment's boundary -> the server closes the call: the page
-  says so in red, that the reader did not hang up, and records `server_closed` with code 1000 ->
-  a second call, hung up: one `audio_end` and one `quit`, recorded as `hang_up`.
+  notice does not close the microphone's segment while that turn is open, closes it once the hand-off
+  after the turn's completion has passed, and goes as a prompt at the segment's boundary -> the server
+  closes the call: the page says so in red, that the reader did not hang up, and records
+  `server_closed` with code 1000 -> a second call, hung up: one `audio_end` and one `quit`, recorded
+  as `hang_up`.
 
 It serves the checked-out assets and a small fake API from one loopback origin. Pass --web-root DIR
 to run it against another copy of the page; against the page before `#268` it fails at the greeting
@@ -139,12 +140,14 @@ class FakeVoice:
 
     routes: list[WebSocketRoute] = field(default_factory=list)
     frames: list[list[Json]] = field(default_factory=list)
+    frames_at: list[list[float]] = field(default_factory=list)
     audio_at: list[list[float]] = field(default_factory=list)
 
     def accept(self, route: WebSocketRoute) -> None:
         index = len(self.routes)
         self.routes.append(route)
         self.frames.append([])
+        self.frames_at.append([])
         self.audio_at.append([])
 
         def heard(message: str | bytes) -> None:
@@ -154,11 +157,17 @@ class FakeVoice:
             parsed: object = json.loads(message)
             if isinstance(parsed, dict):
                 self.frames[index].append({str(key): value for key, value in parsed.items()})
+                self.frames_at[index].append(time.monotonic())
 
         route.on_message(heard)
 
     def kinds(self, index: int) -> list[object]:
         return [frame.get("type") for frame in self.frames[index]]
+
+    def first_at(self, index: int, kind: str) -> float:
+        """When the first JSON frame of `kind` arrived on socket `index`, by the monotonic clock."""
+        return next(at for frame, at in zip(self.frames[index], self.frames_at[index], strict=True)
+                    if frame.get("type") == kind)
 
     def prompts(self, index: int) -> list[str]:
         return [str(frame.get("text")) for frame in self.frames[index] if frame.get("type") == "prompt"]
@@ -336,11 +345,16 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
           f"the yes did not commit the card once, as the speaker's turn: {api.commits}")
     page.wait_for_function("() => document.getElementById('post-confirm').hidden", timeout=5_000)
 
-    # 4. The page's notice waits for the owner's turn to complete before it closes the segment.
+    # 4. The page's notice waits for the owner's turn to complete before it closes the segment, and
+    # then for the hand-off after that turn_complete, as the microphone does.
     page.wait_for_timeout(300)
     check("audio_end" not in voice.kinds(0), "the notice closed the segment inside the owner's open turn")
     voice.send(0, {"type": "turn_complete", "turn": 2})
+    released = time.monotonic()
     until(page, lambda: "audio_end" in voice.kinds(0), "the turn's end to close the segment for the notice")
+    gap_ms = (voice.first_at(0, "audio_end") - released) * 1000
+    check(gap_ms >= HAND_OFF_QUIET_MS, f"the notice closed the segment {gap_ms:.0f} ms after the turn_complete that"
+          " let it go, inside the backend's hand-off")
     check(voice.prompts(0) == [], f"the notice went before the segment's boundary: {voice.prompts(0)}")
     voice.send(0, {"type": "turn_complete", "turn": 3})
     until(page, lambda: bool(voice.prompts(0)), "the notice to go as a prompt")
@@ -376,7 +390,8 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     check(page.locator("#error").is_hidden(), "hanging up was reported as an error")
     return (f"no microphone frame inside the greeting's hand-off (back after {resumed_ms:.0f} ms); a yes"
             " whose final transcript came after the reply's committed the card once, as the speaker's"
-            " turn; the notice waited for the owner's turn and went at the segment's boundary; the"
+            f" turn; the notice waited for the owner's turn and its hand-off ({gap_ms:.0f} ms) and went"
+            " at the segment's boundary; the"
             " service's close was said and recorded as server_closed 1000; a hang-up sent one goodbye"
             " and was recorded as hang_up")
 

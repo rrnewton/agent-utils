@@ -456,6 +456,9 @@ const session = {
   spokenTurnOpen: false,
   // Bounds that hold: a turn that stops sending anything without completing is let go.
   spokenTurnTimer: null,
+  // ...and one that keeps sending without completing is let go SPOKEN_TURN_HOLD_CAP_MS after the
+  // hold began, however often its frames restarted the bound above.
+  spokenTurnCapTimer: null,
   // The highest turn number a `turn_complete` has named, so a late frame of it opens no new turn.
   /** @type {number | null} */
   lastCompletedTurn: null,
@@ -5393,8 +5396,17 @@ function advanceVibeTalkInput() {
       // late `turn_complete` for the prompt's and opened the microphone over the answer. The
       // backend is built for one turn at a time. So the text waits for this turn to end; that
       // `turn_complete` sends it (`vibeTalkTurnComplete`), and a turn that goes quiet without one
-      // is let go after SPOKEN_TURN_HOLD_MS (`holdBehindSpokenTurn`).
+      // is let go after SPOKEN_TURN_HOLD_MS, or one that never ends after SPOKEN_TURN_HOLD_CAP_MS
+      // (`holdBehindSpokenTurn`).
       holdBehindSpokenTurn();
+      return;
+    }
+    if (session.captureResumeTimer !== null) {
+      // `#268 voice-call-drops`. A `turn_complete` has just arrived, and the bridge's next handler
+      // is not ready across that hand-off (VOICE_CAPTURE_RESUME_MS): the microphone's frames wait it
+      // out, and so does the segment's end. The hand-off's own timer sends it
+      // (`deferVoiceCaptureAcrossTurn`). Without this, a message held behind a spoken turn went out
+      // as `audio_end` in the same event-loop turn as the `turn_complete` that let it go.
       return;
     }
     session.capturePaused = true;
@@ -5414,13 +5426,31 @@ function advanceVibeTalkInput() {
 /**
  * How long a spoken turn that has stopped sending anything, without completing, may hold the page's
  * next text turn. `#268 voice-call-drops`. Restarted by every piece of the turn that arrives, so an
- * answer that is still talking is never cut off; this only bounds one that went quiet.
+ * answer that is still talking is not cut off by it; this bounds one that went quiet.
  */
 const SPOKEN_TURN_HOLD_MS = 8000;
+
+/**
+ * The longest a spoken turn may hold the page's next text turn at all, measured from when the hold
+ * began and never restarted. `#268 voice-call-drops`. Without it a turn that keeps sending and never
+ * completes — a steady trickle of hypotheses of background speech, a bridge that stops sending
+ * `turn_complete` — held a typed message, or the page's word on a yes, for as long as it went on.
+ */
+const SPOKEN_TURN_HOLD_CAP_MS = 30000;
 
 /** Wait for the open spoken turn to end before closing the segment; see `advanceVibeTalkInput`. */
 function holdBehindSpokenTurn() {
   if (session.spokenTurnTimer === null) armSpokenTurnHold();
+  if (session.spokenTurnCapTimer !== null) return;
+  const socket = session.socket;
+  session.spokenTurnCapTimer = setTimeout(() => {
+    session.spokenTurnCapTimer = null;
+    releaseSpokenTurnHold(
+      socket,
+      `a spoken turn held the page's next message for ${Math.round(SPOKEN_TURN_HOLD_CAP_MS / 1000)} s ` +
+        "without completing; the message went anyway"
+    );
+  }, SPOKEN_TURN_HOLD_CAP_MS);
 }
 
 function armSpokenTurnHold() {
@@ -5428,16 +5458,39 @@ function armSpokenTurnHold() {
   const socket = session.socket;
   session.spokenTurnTimer = setTimeout(() => {
     session.spokenTurnTimer = null;
-    if (session.socket !== socket || !session.spokenTurnOpen) return;
-    // Nothing more of it, and no end: let the text go as it went before the page waited, and say
-    // so where the call's other mechanics are recorded.
-    session.spokenTurnOpen = false;
-    addDetail(
+    releaseSpokenTurnHold(
+      socket,
       `a spoken turn went quiet for ${Math.round(SPOKEN_TURN_HOLD_MS / 1000)} s without completing; ` +
         "the page's next message went anyway"
     );
-    advanceVibeTalkInput();
   }, SPOKEN_TURN_HOLD_MS);
+}
+
+/**
+ * Let the held text go without the turn's end — it went quiet, or held it too long — as it went
+ * before the page waited, and say so, with `why`, where the call's other mechanics are recorded.
+ *
+ * @param {WebSocket | null} socket the call the hold was for
+ * @param {string} why
+ */
+function releaseSpokenTurnHold(socket, why) {
+  if (session.socket !== socket || !session.spokenTurnOpen) return;
+  clearSpokenTurnHold();
+  session.spokenTurnOpen = false;
+  addDetail(why);
+  advanceVibeTalkInput();
+}
+
+/** Nothing is waiting on a spoken turn any more: both of the hold's bounds go. */
+function clearSpokenTurnHold() {
+  if (session.spokenTurnTimer !== null) {
+    clearTimeout(session.spokenTurnTimer);
+    session.spokenTurnTimer = null;
+  }
+  if (session.spokenTurnCapTimer !== null) {
+    clearTimeout(session.spokenTurnCapTimer);
+    session.spokenTurnCapTimer = null;
+  }
 }
 
 /**
@@ -5461,10 +5514,7 @@ function closeSpokenTurn(turn = null) {
   if (turn !== null) {
     session.lastCompletedTurn = Math.max(session.lastCompletedTurn ?? turn, turn);
   }
-  if (session.spokenTurnTimer !== null) {
-    clearTimeout(session.spokenTurnTimer);
-    session.spokenTurnTimer = null;
-  }
+  clearSpokenTurnHold();
 }
 
 /**
@@ -12268,6 +12318,10 @@ function vibeTalkTurnComplete() {
 // then closed the whole session. Keep the microphone graph and audio segment alive, but withhold
 // its frames across that backend hand-off. 750 ms was the shortest controlled live gap that
 // survived both the hand-off and continued silence afterwards.
+//
+// `#268 voice-call-drops`. The segment's `audio_end` waits out the same gap: a text turn that the
+// `turn_complete` let go, or that arrived inside the gap, closes the segment when it ends
+// (`advanceVibeTalkInput`), with the microphone still paused.
 const VOICE_CAPTURE_RESUME_MS = 750;
 
 function deferVoiceCaptureAcrossTurn() {
@@ -12279,14 +12333,11 @@ function deferVoiceCaptureAcrossTurn() {
   const socket = session.socket;
   session.captureResumeTimer = setTimeout(() => {
     session.captureResumeTimer = null;
-    if (
-      session.socket === socket &&
-      session.connected &&
-      !session.chat &&
-      !session.waitingForGreeting &&
-      !session.waitingForAudioEnd &&
-      !session.typedTurnInFlight
-    ) {
+    if (session.socket !== socket || !session.connected || session.chat) return;
+    // A text turn waiting out the hand-off goes first: it closes the segment, and the microphone
+    // stays paused for its turn rather than streaming for a moment before it.
+    advanceVibeTalkInput();
+    if (!session.waitingForGreeting && !session.waitingForAudioEnd && !session.typedTurnInFlight) {
       session.capturePaused = false;
     }
   }, VOICE_CAPTURE_RESUME_MS);

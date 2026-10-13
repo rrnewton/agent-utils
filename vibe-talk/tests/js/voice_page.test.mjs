@@ -2324,7 +2324,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     setTimeout: (fn, ms) => {
       const id = nextTimer;
       nextTimer += 1;
-      page.timers.set(id, { fn, ms });
+      // `at`, the test clock when it was armed, is for `passTime`, which fires a timer once the
+      // clock has passed its delay; `expireTimers` goes by the delay alone.
+      page.timers.set(id, { fn, ms, at: clockMs });
       return id;
     },
     clearTimeout: (id) => {
@@ -3846,6 +3848,12 @@ const TUNING_BANDS = {
     "Under four seconds a tool call in the middle of an answer is cut off by the page's notice, " +
     "which is the double turn this hold exists to prevent; past fifteen the agent that said 'One " +
     "moment.' waits that long for the page's word on a yes"],
+  SPOKEN_TURN_HOLD_CAP_MS: [20000, 60000,
+    "the longest a spoken turn that keeps sending without completing holds the page's next text " +
+    "turn, from when the hold began. Under twenty seconds a long spoken answer still talking is cut " +
+    "off by the page's notice, the double turn the hold exists to prevent; past a minute a trickle " +
+    "of hypotheses of background speech keeps a typed message, or the page's word on a yes, from " +
+    "the agent for longer than anyone waits for a reply"],
   // `#267 quote-reply`.
   QUOTE_MAX_CHARS: [300, 1500,
     "the longest quote Quote reply puts in the box. Under three hundred, two sentences of a long " +
@@ -31425,6 +31433,10 @@ test("`#264 voice-send-approval`: on the neutral protocol a yes counts after a c
   const stringFrames = () => socket.sent.filter((f) => typeof f === "string").map((f) => JSON.parse(f).type);
   assert.ok(!stringFrames().includes("audio_end"), "the segment was closed inside the owner's open turn");
   turnDone(socket, 2);
+  // ...nor inside the backend's hand-off after that turn's turn_complete, which the microphone waits
+  // out as well. `#268 voice-call-drops`.
+  assert.ok(!stringFrames().includes("audio_end"), "the segment was closed inside the hand-off");
+  page.expireTimers(sourceConstant("VOICE_CAPTURE_RESUME_MS"));
   assert.deepEqual(JSON.parse(socket.sent.at(-1)), { type: "audio_end" });
   assert.deepEqual(promptsSent(socket), [], "the notice went before the segment's own boundary");
   turnDone(socket, 3);
@@ -32149,8 +32161,9 @@ test("`#264 voice-send-approval`: on the neutral protocol a yes after a paraphra
   speech(socket, "user", 2, "yes", true);
   await settleSpokenYes(page);
   turnDone(socket, 2);
-  // The owner's turn has completed, so the page closes its segment; the server's boundary for that
-  // lets the notice go (`#268 voice-call-drops`).
+  // The owner's turn has completed, so the page closes its segment once the hand-off after it is
+  // over; the server's boundary for that lets the notice go (`#268 voice-call-drops`).
+  page.expireTimers(sourceConstant("VOICE_CAPTURE_RESUME_MS"));
   turnDone(socket, 3);
   assert.deepEqual(page.proposalCommits, []);
   const prompts = promptsSent(socket);
@@ -49170,7 +49183,9 @@ test("`#268 voice-call-drops`: an answer the bridge streams only as hypotheses i
   assert.match(page.el("status").textContent, /Heard yes/);
   await settleSpokenYes(page);
   assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.confirmed_by]), [[pending.handle, "speaker_turn"]]);
-  // The turn is over, so the notice closes the segment at once and goes at its boundary.
+  // The turn is over, so the notice closes the segment once the hand-off after it has passed, and
+  // goes at the segment's boundary.
+  page.expireTimers(CAPTURE_RESUME_MS);
   assert.equal(controlFrames(socket).at(-1), "audio_end");
   turnDone(socket, 3);
   assert.match(promptsSent(socket).at(-1), /^Voice page: the message you read back was SENT to lead team\./);
@@ -49364,6 +49379,7 @@ test("`#268 voice-call-drops`: a page message waits for an open spoken turn inst
   speech(socket, "assistant", 1, "Let me look. Two merges and a revert.", false);
   socket.onmessage({ data: page.pcmFrame(24000, SPEECH) });
   turnDone(socket, 1);
+  page.expireTimers(CAPTURE_RESUME_MS);
   assert.equal(controlFrames(socket).at(-1), "audio_end", "the turn's end did not close the segment");
   assert.deepEqual(promptsSent(socket), []);
   turnDone(socket, 2);
@@ -49379,6 +49395,8 @@ test("`#268 voice-call-drops`: a page message waits for an open spoken turn inst
   speech(lateSocket, "user", 1, "hello there", true);
   await compose(late, "anything new?");
   await late.el("send-text").click();
+  // The hand-off after turn 1's turn_complete, which every segment's end waits out; not the hold.
+  late.expireTimers(CAPTURE_RESUME_MS);
   assert.equal(controlFrames(lateSocket).at(-1), "audio_end", "a completed turn held the message");
 });
 
@@ -49404,6 +49422,144 @@ test("`#268 voice-call-drops`: a spoken turn that goes quiet without completing 
   await hung.el("send-text").click();
   await hung.el("hang-up").click();
   assert.equal(hung.expireTimers(SPOKEN_TURN_HOLD_MS), 0, "a dead call's hold outlived it");
+});
+
+/**
+ * Walk the test clock forward `ms`, firing each timer whose delay runs out on the way, in the order
+ * they fall due, and letting what each one starts finish. For behaviour that depends on how often
+ * something happens and how long since a timer was armed, which `expireTimers` cannot express.
+ */
+async function passTime(page, ms) {
+  const end = page.clock() + ms;
+  for (let fired = 0; fired < 10_000; fired += 1) {
+    let next = null;
+    for (const [id, timer] of page.timers) {
+      const due = (timer.at ?? page.clock()) + timer.ms;
+      if (due <= end && (next === null || due < next.due)) next = { id, timer, due };
+    }
+    if (next === null) break;
+    page.timers.delete(next.id);
+    page.setClock(Math.max(page.clock(), next.due));
+    next.timer.fn();
+    await page.settle();
+  }
+  page.setClock(end);
+}
+
+test("`#268 voice-call-drops`: a spoken turn that keeps sending and never completes holds a page message no longer than the cap", async () => {
+  // The hold's quiet bound starts again with every frame of the turn, so a turn that never stops —
+  // a trickle of hypotheses of background speech, a bridge that never completes the turn — held a
+  // typed message, or the page's word on a yes, for as long as it went on. The cap runs from when
+  // the hold began and is never restarted. Read defensively: a page without one is held to the
+  // longest cap the tuning band allows, and fails by holding the message past it.
+  const cap = optionalSourceConstant("SPOKEN_TURN_HOLD_CAP_MS") ?? TUNING_BANDS.SPOKEN_TURN_HOLD_CAP_MS[1];
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  let heard = "um";
+  speech(socket, "user", 1, heard, false);
+  await compose(page, "are you there?");
+  await page.el("send-text").click();
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the message did not wait for the open turn");
+  let held = 0;
+  while (!controlFrames(socket).includes("audio_end") && held <= cap) {
+    await passTime(page, 5000);
+    held += 5000;
+    heard += " um";
+    speech(socket, "user", 1, heard, false);
+  }
+  assert.ok(controlFrames(socket).includes("audio_end"), `a hypothesis every 5 s held the message past ${cap / 1000} s`);
+  assert.ok(held <= cap, `a hypothesis every 5 s held the message for ${held / 1000} s, past the ${cap / 1000} s cap`);
+  assert.match(page.el("settings-detail").textContent, /held the page's next message for \d+ s without completing/);
+  // A turn that completes inside the cap still sends the message at its end, as before.
+  const prompt = newPage();
+  const promptSocket = await startNeutralCall(prompt);
+  speech(promptSocket, "user", 1, "um", false);
+  await compose(prompt, "are you there?");
+  await prompt.el("send-text").click();
+  await passTime(prompt, 5000);
+  speech(promptSocket, "user", 1, "um what", false);
+  turnDone(promptSocket, 1);
+  await passTime(prompt, CAPTURE_RESUME_MS);
+  assert.equal(controlFrames(promptSocket).at(-1), "audio_end");
+  assert.doesNotMatch(prompt.el("settings-detail").textContent, /without completing/);
+});
+
+test("`#268 voice-call-drops`: a held message's audio_end waits out the hand-off after the turn_complete that lets it go", async () => {
+  // The bridge's next handler is not ready in the moments after a `turn_complete`
+  // (VOICE_CAPTURE_RESUME_MS): the microphone's frames wait that long, and the segment's end now
+  // waits too. It used to go out in the same event-loop turn as the `turn_complete` that released
+  // it.
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  const audio = () => socket.sent.filter((frame) => typeof frame !== "string").length;
+  speech(socket, "user", 1, "what's new in the channel", true);
+  speech(socket, "assistant", 1, "Let me look.", false);
+  await compose(page, "and the build?");
+  await page.el("send-text").click();
+  turnDone(socket, 1);
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the segment's end went with the turn_complete that let it go");
+  await passTime(page, CAPTURE_RESUME_MS - 1);
+  const before = audio();
+  speakInto(page);
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the segment's end went inside the hand-off");
+  assert.equal(audio(), before, "the microphone streamed inside the hand-off");
+  await passTime(page, 1);
+  assert.equal(controlFrames(socket).at(-1), "audio_end", "the segment's end never went");
+  speakInto(page);
+  assert.equal(audio(), before, "the microphone streamed between the hand-off and the message's turn");
+  turnDone(socket, 2);
+  assert.deepEqual(promptsSent(socket), ["and the build?"]);
+
+  // A message typed inside a hand-off, with no turn open, waits out the rest of it as well.
+  const typed = newPage();
+  const typedSocket = await startNeutralCall(typed);
+  turnDone(typedSocket, 1);
+  await passTime(typed, CAPTURE_RESUME_MS - 100);
+  await compose(typed, "anything new?");
+  await typed.el("send-text").click();
+  assert.ok(!controlFrames(typedSocket).includes("audio_end"), "a message typed inside the hand-off closed the segment in it");
+  await passTime(typed, 100);
+  assert.equal(controlFrames(typedSocket).at(-1), "audio_end");
+});
+
+test("`#268 voice-call-drops`: a socket's own close handler acts only for the call it belongs to", async () => {
+  // Hang up swaps the socket's close handler for one that only records the code, before it
+  // closes, so in a browser a late close reaches that. This is the other half: the handler the call
+  // opened with, run for a socket that is no longer the call's, changes nothing but the connection
+  // details — so neither alone is all that stands between a late close and the call that replaced
+  // it.
+  const page = newPage();
+  const first = await startNeutralCall(page);
+  const openedWith = first.onclose;
+  await page.el("hang-up").click();
+  await page.el("talk").click();
+  await page.settle();
+  const second = page.sockets[1];
+  second.onopen();
+  second.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  const ends = page.endPosts.length;
+  openedWith.call(first, { code: 1006, reason: "" });
+  await page.settle();
+  assert.equal(state(page), "live", "the old call's close handler ended the new call");
+  assert.equal(page.el("error").hidden, true, "the old call's close was reported against the new call");
+  assert.equal(page.endPosts.length, ends, "the old call's close was recorded as the new call's end");
+  assert.match(page.el("settings-detail").textContent, /closed with code 1006/);
+
+  // THE CONTROL: without the check, the same close tears the new call down.
+  const control = newPage(new Map(), brokenScript(
+    "    if (session.socket !== socket) {\n      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : \"\"}`);\n      return;\n    }\n",
+    ""
+  ));
+  const old = await startNeutralCall(control);
+  const oldHandler = old.onclose;
+  await control.el("hang-up").click();
+  await control.el("talk").click();
+  await control.settle();
+  control.sockets[1].onopen();
+  control.sockets[1].onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  oldHandler.call(old, { code: 1006, reason: "" });
+  await control.settle();
+  assert.notEqual(state(control), "live", "the control kept the new call: this test sees nothing");
 });
 
 test("`#268 voice-call-drops`: the microphone waits across the greeting's hand-off as it does after every other turn", async () => {
@@ -49540,38 +49696,54 @@ test("`#268 voice-call-drops`: a finished call's socket cannot end the call that
   assert.ok(controlFrames(control.sockets[1]).includes("quit"), "the control did not hang up: this test sees nothing");
 });
 
-test("`#268 voice-call-drops`: every timer a healthy call arms, fired, never ends it", async () => {
+test("`#268 voice-call-drops`: every timer a healthy call arms, fired, never ends it — a guard, with a control that does", async () => {
   // A greeting, a spoken request, a draft read back, a yes, the page's notices, a typed message —
-  // then every pending timer, round after round: the open deadline, the settle window, the hold,
-  // the capture hand-off, the card's countdown, the no-reply bound. None of them may say goodbye.
-  const page = newPage();
-  const pending = spokenDraft();
-  const socket = await startNeutralCall(page, { greeting: true });
-  agentTurn(page, socket, 0, { text: "Hi." });
-  speech(socket, "user", 1, "tell lead team I'm on it, rebasing now", true);
-  page.propose(pending);
-  await page.settle();
-  socket.onmessage({ data: page.pcmFrame(24000, SPEECH) });
-  speech(socket, "assistant", 1, `To lead team: ${pending.text}. Send it?`, true);
-  turnDone(socket, 1);
-  page.setClock(page.clock() + 3000);
-  speech(socket, "assistant", 2, "One moment.", true);
-  speech(socket, "user", 2, "Yes.", true);
-  await settleSpokenYes(page);
-  turnDone(socket, 2);
-  await compose(page, "and the build?");
-  await page.el("send-text").click();
-  for (let round = 0; round < 6; round += 1) {
-    for (const [id, timer] of [...page.timers]) {
-      page.timers.delete(id);
-      timer.fn();
-    }
+  // then every pending timer, round after round: the open deadline, the settle window, the hold and
+  // its cap, the capture hand-off, the card's countdown, the no-reply bound. None of them may say
+  // goodbye. No timer ended a call on the page before `#268` either, so this is a guard on what
+  // holds, not a demonstration of a fix, and it passes there; its control makes one timer hang up,
+  // to show the walk would catch one that does.
+  /** The call above, every timer fired six rounds over. Returns the socket. */
+  const walk = async (page) => {
+    const pending = spokenDraft();
+    const socket = await startNeutralCall(page, { greeting: true });
+    agentTurn(page, socket, 0, { text: "Hi." });
+    speech(socket, "user", 1, "tell lead team I'm on it, rebasing now", true);
+    page.propose(pending);
     await page.settle();
-    page.setClock(page.clock() + 20_000);
-  }
+    socket.onmessage({ data: page.pcmFrame(24000, SPEECH) });
+    speech(socket, "assistant", 1, `To lead team: ${pending.text}. Send it?`, true);
+    turnDone(socket, 1);
+    page.setClock(page.clock() + 3000);
+    speech(socket, "user", 2, "Yes.", true);
+    speech(socket, "assistant", 2, "One moment.", true);
+    await settleSpokenYes(page);
+    turnDone(socket, 2);
+    await compose(page, "and the build?");
+    await page.el("send-text").click();
+    for (let round = 0; round < 6; round += 1) {
+      for (const [id, timer] of [...page.timers]) {
+        page.timers.delete(id);
+        timer.fn();
+      }
+      await page.settle();
+      page.setClock(page.clock() + 20_000);
+    }
+    return socket;
+  };
+  const page = newPage();
+  const socket = await walk(page);
+  assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"], "the walk never reached the yes's timers");
   assert.ok(!controlFrames(socket).includes("quit"), "a timer said goodbye on a healthy call");
   assert.equal(socket.readyState, 1, "a timer closed a healthy call's socket");
   assert.equal(page.el("hang-up").hidden, false, "the call is no longer live");
   assert.deepEqual(page.endPosts, []);
-  assert.deepEqual(page.proposalCommits.map((c) => c.confirmed_by), ["speaker_turn"]);
+
+  // THE CONTROL: the capture hand-off's timer hangs up. The same walk sees it.
+  const control = newPage(new Map(), brokenScript(
+    "  session.captureResumeTimer = setTimeout(() => {\n    session.captureResumeTimer = null;\n",
+    "  session.captureResumeTimer = setTimeout(() => {\n    session.captureResumeTimer = null;\n    stop();\n"
+  ));
+  const controlSocket = await walk(control);
+  assert.ok(controlFrames(controlSocket).includes("quit"), "the control's timer hung up unseen: this walk sees nothing");
 });
