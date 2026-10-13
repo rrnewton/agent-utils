@@ -57550,18 +57550,21 @@ test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column
  * Two columns as `replyColumnsPage` has them, each tall enough to stand part way up: Main with earlier
  * messages over the announcement, and the first thread with more answers under its root.
  */
+/** Both columns taller than they are drawn: six long messages before Main's and six more in the thread. */
+function tallColumns(_page, given) {
+  const root = given.messages.find((one) => one.id === "201");
+  const answer = given.messages.find((one) => one.id === "202");
+  const earlier = Array.from({ length: 6 }, (_unused, at) =>
+    message({ id: `19${at}`, content: longMessage(`earlier ${at}`) }));
+  const more = Array.from({ length: 6 }, (_unused, at) =>
+    message({ id: `21${at}`, content: longMessage(`more ${at}`), thread: { ...answer.thread } }));
+  given.messages.unshift(...earlier);
+  given.messages.push(...more);
+  root.thread.reply_count = 1 + more.length;
+}
+
 async function tallReplyColumnsPage(script = SCRIPT) {
-  const { page, data } = await twoColumnServer((_page, given) => {
-    const root = given.messages.find((one) => one.id === "201");
-    const answer = given.messages.find((one) => one.id === "202");
-    const earlier = Array.from({ length: 6 }, (_unused, at) =>
-      message({ id: `19${at}`, content: longMessage(`earlier ${at}`) }));
-    const more = Array.from({ length: 6 }, (_unused, at) =>
-      message({ id: `21${at}`, content: longMessage(`more ${at}`), thread: { ...answer.thread } }));
-    given.messages.unshift(...earlier);
-    given.messages.push(...more);
-    root.thread.reply_count = 1 + more.length;
-  }, script);
+  const { page, data } = await twoColumnServer(tallColumns, script);
   await threadBadge(rowWithId(page, "201")).click();
   await page.settle();
   return { page, data };
@@ -63051,4 +63054,91 @@ test("`#316 late-counts-resurrect`: a placing read that is not folded does not p
     "    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, \"main\", number));\n"));
   assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
   assert.ok(control.polls.every((state) => state.shown && state.saved));
+});
+
+/**
+ * A draft from the voice agent on the card, then the channel in two columns with the first thread on
+ * the right: the card at the foot of the left column's list, under Main's 200.
+ */
+async function draftInTwoColumns(script = SCRIPT, arrange = null) {
+  const page = newPage(new Map(), script);
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  if (arrange) arrange(page, data);
+  forwardTimeline(page);
+  await proposedDuringACall(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  return page;
+}
+
+test("`#277 reply-in-column` with `#269 approval-card-inline`: a reply open at the foot of either column outlines the card's Send, as the reply screen does, and the card stays where it was", async () => {
+  const page = await draftInTwoColumns();
+  const card = page.el("post-confirm");
+  assert.ok(inTwoColumns(page), "the premise is two columns");
+  assert.equal(card.parentNode, page.el("pane-discord"), "the premise is the card under the left column's list");
+  assert.equal(card.hasAttribute("data-beside-reply"), false, "no reply is open, yet the card's Send is outlined");
+  assert.match(cssBlock('#post-confirm[data-beside-reply] #post-confirm-send'), /background:\s*transparent/,
+    "beside a reply's box the card's Send is as filled as the reply's own");
+  for (const [column, row] of [["left", () => rowWithId(page, "200")], ["right", () => sideRow(page, "202")]]) {
+    await replyButton(row()).click();
+    await page.settle();
+    assert.equal(replyBoxAt(page), column, `${column}: the premise is a reply open at the foot of that column`);
+    assert.equal(card.hasAttribute("data-beside-reply"), true,
+      `${column}: a reply's filled Send is at a column's foot and the card's is filled as well`);
+    // The card is where it was, a message of the left column's list, and still the draft's.
+    assert.equal(card.parentNode, page.el("pane-discord"), `${column}: the reply moved the card`);
+    assert.equal(card.nextSibling, page.el("channel-composer"), `${column}: the card left its place above the channel's box`);
+    assert.equal(card.hidden, false, `${column}: the reply hid the draft`);
+    await page.el("reply-cancel").click();
+    await page.settle();
+    assert.equal(card.hasAttribute("data-beside-reply"), false, `${column}: the card's Send stayed outlined after the reply went`);
+  }
+  // Sent from the card with a reply open beside it, the draft goes once, and the reply's words stay.
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("still writing");
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.proposalCommits.length, 1, "Send on the card beside a reply did not commit the draft once");
+  assert.equal(page.repliesPosted.length, 0, "the card's Send posted the reply");
+  assert.equal(replyBoxAt(page), "left", "sending the draft closed the reply");
+  assert.equal(page.el("reply-text").value, "still writing");
+
+  // THE CONTROL: the card not told when a reply opens in a column. The walk above sees it.
+  const control = await draftInTwoColumns(brokenScript(
+    "  renderReplyingMarks();\n  markCardBesideReply();\n  placeToolsOverReply();\n  if (!from",
+    "  renderReplyingMarks();\n  placeToolsOverReply();\n  if (!from"));
+  await replyButton(rowWithId(control, "200")).click();
+  await control.settle();
+  assert.equal(control.el("post-confirm").hasAttribute("data-beside-reply"), false,
+    "the control marked the card all the same, so this test cannot see the mark go missing");
+});
+
+test("`#277 reply-in-column` with `#269 approval-card-inline`: the left column's jump names a reply of its own that did not go before the draft below it, and the draft once that reply has been seen", async () => {
+  const page = await draftInTwoColumns(SCRIPT, tallColumns);
+  const area = page.el("scroll-area");
+  const label = page.el("jump-newest-label");
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  assert.equal(page.el("jump-newest").hidden, false, "the premise is the jump up over a long column");
+  assert.equal(label.textContent, "Draft to send", "the premise is the draft below naming the jump");
+  page.replyResponse = errorResponse(422, "chat_error", "Google Chat returned HTTP 400");
+  await replyButton(rowWithId(page, "200")).click();
+  await page.el("reply-text").setValue("this will not go");
+  await page.el("reply-send").click();
+  await page.settle();
+  // Both wait at the foot. The draft was said when it appeared and counts down on its own card; the
+  // reply's Retry is said nowhere else, so the jump names it first.
+  assert.equal(label.textContent, "Reply not sent", "a draft below hid the reply that did not go");
+  assert.match(page.el("jump-newest").getAttribute("aria-label"), /^Jump to your reply, which was not sent/);
+  await page.el("jump-newest").click();
+  await page.settle();
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  assert.equal(label.textContent, "Draft to send", "once the reply was seen, the jump forgot the draft still below");
+  assert.equal(page.el("jump-newest").getAttribute("aria-label"), "Jump to the draft waiting to be sent");
 });
