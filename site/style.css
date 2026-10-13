@@ -1,7 +1,7 @@
 /* agent-utils website: the one stylesheet.
  *
- * No external resources of any kind: system fonts, no images except the local favicon, and a
- * page Content-Security-Policy that would refuse anything else. Colours follow the visitor's
+ * No external resources of any kind: system fonts, no images except the local favicon and the
+ * demo clips under media/, and a page Content-Security-Policy that would refuse anything else. Colours follow the visitor's
  * system preference; the header's System/Light/Dark buttons (shown only when JavaScript runs)
  * store an override that sets <html data-theme>. Every text colour pair below meets WCAG AA in
  * both themes; scripts/check_site.py checks structure, links and origins, not colours, so keep
@@ -1337,6 +1337,115 @@ caption {
 .back-to-top {
   font-size: 0.85rem;
   margin: 0 0 0.8rem;
+}
+
+/* ---------------------------------------------------------------- demo clips (vibe-talk.html) */
+
+/* One clip: its heading, the GIF in a <picture> whose reduced-motion source is a still poster,
+ * and the text. The <img> carries the GIF's own width and height, so the browser reserves the
+ * right box before a lazily loaded GIF arrives; the CSS only lets it shrink to fit. The widths
+ * below are the GIF's own plus its 1px borders, so a clip is never scaled where it fits. */
+
+.page-head .badges {
+  display: flex;
+  margin: 0 0 0.9rem;
+}
+
+.page-head .callout {
+  margin-top: 1.4rem;
+}
+
+.clip {
+  display: grid;
+  gap: 0.6rem 2.2rem;
+  padding: 2.2rem 0 1.2rem;
+  border-top: 1px solid var(--border);
+}
+
+.clip:first-of-type {
+  border-top: 0;
+  padding-top: 0.4rem;
+}
+
+.clip-title {
+  margin: 0;
+}
+
+.clip-figure {
+  margin: 0 0 0.4rem;
+}
+
+.clip-figure img {
+  display: block;
+  width: 100%;
+  max-width: 414px;
+  height: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: #0e1215;
+  box-shadow: var(--shadow);
+}
+
+.clip-wide .clip-figure img {
+  max-width: 802px;
+  border-radius: 10px;
+}
+
+.clip-figure figcaption {
+  margin-top: 0.7rem;
+  max-width: 414px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.clip-wide .clip-figure figcaption {
+  max-width: var(--prose);
+}
+
+.clip-text {
+  max-width: var(--prose);
+}
+
+.clip-text > :last-child {
+  margin-bottom: 0;
+}
+
+.clip-meta {
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+@media (min-width: 52rem) {
+  .clip {
+    grid-template-columns: 414px minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+      "figure title"
+      "figure text";
+    align-items: start;
+  }
+
+  .clip-title {
+    grid-area: title;
+    padding-top: 0.3rem;
+  }
+
+  .clip-figure {
+    grid-area: figure;
+  }
+
+  .clip-text {
+    grid-area: text;
+  }
+
+  .clip-wide {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-template-areas:
+      "title"
+      "figure"
+      "text";
+  }
 }
 
 /* ---------------------------------------------------------------- footer */

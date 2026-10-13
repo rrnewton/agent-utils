@@ -48,6 +48,7 @@
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html" aria-current="page">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
+<li><a href="vibe-talk.html">vibe-talk</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/blob/main/QUICKSTART.md">Quickstart</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils">Source</a></li>
 </ul>
@@ -104,6 +105,7 @@
 <p>The simplest channel is the coordinator's own Herdr tab: attach to it and type. Pause automation with <code>agentctl pause</code> before you type into a terminal a script also writes to.</p>
 <p>The chat bridge, <code>agentctl chat</code>, connects one chat space to the coordinator. It accepts messages only from allow-listed senders, stores each one durably, and marks it with a reaction that means "received", not "done". Herdr then pastes the message into the coordinator's pane. The agent replies between two marker lines, so the bridge can post each reply to the original thread exactly once.</p>
 <p>The two editions differ. The Python bridge polls Google Chat's public API, hourly by default unless you configure an event command that wakes it sooner. The Rust bridge is an event-driven host for subscription plugins, and no plugin ships yet. Without chat, you use the Herdr tab.</p>
+<p>vibe-talk, optional and early, is a separately deployed phone reader for a chat service: one-sentence summaries of long messages, named threads, replies from the phone, and voice. It reads and posts in the chat; it does not start or type into agents. <a href="vibe-talk.html">Its page</a> shows it in five short clips.</p>
 <p class="small"><a href="https://github.com/rrnewton/agent-utils/blob/main/py/agentctl/CHAT_USER_GUIDE.md#how-the-connection-works">How the connection works</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/skills/agentctl-chat/SKILL.md">How an agent answers bridged chat</a> · <a href="https://github.com/rrnewton/agent-utils/blob/main/common/docs/chat-subscription-plugin/README.md">Plugin protocol</a></p>
 </div>
 
@@ -337,6 +339,7 @@ $WS remove &lt;slot&gt; --coordinator-pid &lt;pid&gt; --expected-generation &lt;
 <li><a href="index.html">Overview</a></li>
 <li><a href="architecture.html">Architecture</a></li>
 <li><a href="tools.html">Tools</a></li>
+<li><a href="vibe-talk.html">vibe-talk</a></li>
 <li><a href="https://github.com/rrnewton/agent-utils/tree/main/site">Page source (site/)</a></li>
 </ul>
 </div>
