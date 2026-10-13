@@ -780,6 +780,11 @@ pub async fn client_config(
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
         replay_enabled: crate::replay::offered(&state.config.replay, &state.config.conversation),
+        replay_unavailable: crate::replay::unavailable(
+            &state.config.replay,
+            &state.config.conversation,
+        ),
+        transcript_records_supported: true,
         self_author_id: state.chat.self_author_id(),
         owner_author_id: state.chat.owner_author_id(),
         providers,
@@ -2780,22 +2785,39 @@ pub struct ConversationResponse {
     pub untrusted_content_notice: &'static str,
 }
 
+/// Whether a transcript read includes record rows. `#270 voice-transcript-markers`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RecordsQuery {
+    /// `1` for record rows — sends, markers — and every row's detail. Absent is a read exactly as
+    /// a page from before them made it.
+    pub records: Option<u8>,
+}
+
+impl RecordsQuery {
+    fn wanted(&self) -> bool {
+        self.records == Some(1)
+    }
+}
+
 /// `GET /api/v1/conversations/{conversation_id}`
 pub async fn conversation(
     State(state): State<AppState>,
     _scope: WriteScope,
     Path(conversation_id): Path<String>,
+    Query(query): Query<RecordsQuery>,
 ) -> Result<Response, ApiError> {
     let id = ConversationId::parse(&conversation_id)?;
     // Record rows and details stay out of what a page did not ask for. `#270
     // voice-transcript-markers`: the store hands back everything, because the replay reads it.
-    let turns = state
-        .store
-        .turns(&id)
-        .await?
-        .into_iter()
-        .filter_map(Turn::without_records)
-        .collect();
+    let turns = state.store.turns(&id).await?;
+    let turns = if query.wanted() {
+        turns
+    } else {
+        turns
+            .into_iter()
+            .filter_map(Turn::without_records)
+            .collect()
+    };
     Ok(no_store(Json(ConversationResponse {
         id,
         turns,
@@ -2812,6 +2834,8 @@ pub struct TranscriptQuery {
     pub limit: Option<u16>,
     /// The `next` token from the previous step. Absent means "start at the newest".
     pub before: Option<String>,
+    /// `1` for record rows and details. `#270 voice-transcript-markers`; see [`RecordsQuery`].
+    pub records: Option<u8>,
 }
 
 /// One turn of the record, with what a page needs to place it.
@@ -2827,6 +2851,10 @@ pub struct TranscriptTurn {
     pub text: String,
     /// When the server recorded it.
     pub at_ms: i64,
+    /// What the row records beyond words, on a read that asked for records. `#270
+    /// voice-transcript-markers`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<crate::store::TurnDetail>,
 }
 
 /// One step backwards through everything that has been said.
@@ -2876,7 +2904,7 @@ pub async fn transcript(
         .clamp(1, crate::store::MAX_TRANSCRIPT_PAGE);
     let page = state
         .store
-        .transcript(limit, before.as_ref(), false)
+        .transcript(limit, before.as_ref(), query.records == Some(1))
         .await?;
     Ok(no_store(Json(TranscriptResponse {
         has_more: page.has_more,
@@ -2894,6 +2922,7 @@ pub async fn transcript(
                 speaker: entry.turn.speaker,
                 text: entry.turn.text,
                 at_ms: entry.turn.at_ms,
+                detail: entry.turn.detail,
             })
             .collect(),
         untrusted_content_notice: untrusted::NOTICE,
@@ -2911,6 +2940,10 @@ pub struct ReplayResponse {
     pub dropped: usize,
     /// Whether the budget, rather than the transcript running out, is what stopped it.
     pub truncated: bool,
+    /// How many words the included lines hold, counting only what was said or sent, split on
+    /// whitespace. `#270 voice-transcript-markers`: what the new conversation's seam says it was
+    /// sent.
+    pub words: usize,
     /// The budget that produced it.
     pub policy: crate::replay::ReplayPolicy,
     /// How the page should hand `text` to the vendor.
@@ -2959,6 +2992,7 @@ pub async fn replay(
         included: built.included,
         dropped: built.dropped,
         truncated: built.truncated,
+        words: built.words,
         policy: built.policy,
         transport: settings.transport,
         enabled: settings.enabled,
@@ -2967,12 +3001,26 @@ pub async fn replay(
 }
 
 /// One turn to record.
+///
+/// `#270 voice-transcript-markers` adds the record rows, each checked by
+/// [`ops::record_turn`]: a `sent` row names a settled send by `send` and carries no text, a
+/// `marker` row carries `marker` and no text, and a `you` row may carry `answer`.
 #[derive(Debug, Deserialize)]
 pub struct AppendTurnRequest {
     /// Who said it.
     pub speaker: Speaker,
-    /// What was said.
+    /// What was said. Empty, or absent, on a record row.
+    #[serde(default)]
     pub text: String,
+    /// For a `sent` row: the send memory's number for the send it records.
+    #[serde(default)]
+    pub send: Option<u64>,
+    /// For a `you` row: the proposal this spoken answer sent.
+    #[serde(default)]
+    pub answer: Option<u64>,
+    /// For a `marker` row: the marker.
+    #[serde(default)]
+    pub marker: Option<serde_json::Value>,
 }
 
 /// What the store did with it.
@@ -2993,16 +3041,35 @@ pub async fn append_turn(
     Json(request): Json<AppendTurnRequest>,
 ) -> Result<Response, ApiError> {
     let id = ConversationId::parse(&conversation_id)?;
-    // A record row is this server's to write, from its own copy, never a page's words.
-    if request.speaker.is_record() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "bad_record",
-            "this server does not take sent or marker rows on this route",
-        ));
-    }
-    let turn = Turn::now(request.speaker, request.text);
-    state.store.append_turn(&id, &turn).await?;
+    let turn = ops::record_turn(
+        &state,
+        &id,
+        request.speaker,
+        request.text,
+        ops::RecordAsk {
+            send: request.send,
+            answer: request.answer,
+            marker: request.marker,
+        },
+    )
+    .await
+    .map_err(|error| match error {
+        ops::RecordError::Store(store) => ApiError::from(store),
+        ops::RecordError::Bad(detail) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "bad_record", detail)
+        }
+        ops::RecordError::SendUnknown => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "send_unknown",
+            "this server no longer remembers that send: it restarted, or the send is older than \
+             its memory",
+        ),
+        ops::RecordError::SendRecorded => ApiError::new(
+            StatusCode::CONFLICT,
+            "send_recorded",
+            "that send is already in a transcript",
+        ),
+    })?;
     Ok(no_store(Json(AppendTurnResponse { id, turn })))
 }
 
@@ -3014,6 +3081,9 @@ pub async fn forget_conversation(
 ) -> Result<Response, ApiError> {
     let id = ConversationId::parse(&conversation_id)?;
     state.store.forget_conversation(&id).await?;
+    // Its sends, still in the post gate's memory, are part of what was forgotten. `#270
+    // voice-transcript-markers`.
+    state.post_gate.forget_sends_claimed_into(id.as_str());
     Ok(no_store(Json(serde_json::json!({ "forgotten": 1 }))))
 }
 

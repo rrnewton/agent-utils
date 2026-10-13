@@ -211,7 +211,8 @@ fn inventory() -> Vec<Route> {
             "GET",
             "/api/v1/conversations/{conversation_id}",
             Write,
-            Nothing,
+            // `#270 voice-transcript-markers`: whether record rows come back.
+            Query("?records=1", "?records=soon"),
         ),
         route(
             "DELETE",
@@ -231,7 +232,12 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
-        route("GET", "/api/v1/transcript", Write, limit),
+        route(
+            "GET",
+            "/api/v1/transcript",
+            Write,
+            Query("?limit=5&records=1", "?limit=5&records=soon"),
+        ),
         route("DELETE", "/api/v1/storage", Write, Nothing),
         route("GET", "/api/v1/inbox", Read, Nothing),
         route(

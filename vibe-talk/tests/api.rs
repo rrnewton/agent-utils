@@ -2180,6 +2180,144 @@ async fn record(harness: &Harness, id: &str, speaker: &str, text: &str) {
     assert_eq!(status, StatusCode::OK, "{payload}");
 }
 
+/// `#270 voice-transcript-markers`. The page must know a new call cannot be sent a recap on a
+/// websocket backend, so its seam says "recap unsupported" rather than nothing; and it must know
+/// this server takes transcript records before it sends one.
+#[tokio::test]
+async fn client_config_says_why_replay_is_off_and_that_transcript_records_are_taken() {
+    for (extra, unavailable) in [
+        ("", None),
+        (
+            "[conversation]\nbackend = \"websocket\"\nwebsocket_url = \"/ws\"\n",
+            Some("backend"),
+        ),
+    ] {
+        let (harness, _store) = replay_harness(extra);
+        let (status, config) = call(
+            &harness,
+            "GET",
+            "/api/v1/client-config",
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{config}");
+        assert_eq!(config["transcript_records_supported"], true, "{config}");
+        assert_eq!(config["replay_enabled"], unavailable.is_none(), "{config}");
+        assert_eq!(
+            config.get("replay_unavailable").and_then(Value::as_str),
+            unavailable,
+            "{config}"
+        );
+    }
+    // Off on purpose is not "unavailable": nothing is promised, so nothing is withheld.
+    let off = harness();
+    let (_, config) = call(&off, "GET", "/api/v1/client-config", Some(READ_TOKEN), None).await;
+    assert_eq!(config["replay_enabled"], false);
+    assert!(config.get("replay_unavailable").is_none(), "{config}");
+}
+
+/// `#270 voice-transcript-markers`. The replay counts the words it sends, for the page's seam, and
+/// replays a sent message as what was posted where.
+#[tokio::test]
+async fn a_replay_says_how_many_words_it_holds_and_skips_markers() {
+    let (harness, _store) = replay_harness("");
+    record(&harness, "conv_w", "you", "what happened overnight").await;
+    record(&harness, "conv_w", "agent", "the runner stalled").await;
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        "/api/v1/conversations/conv_w/turns",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "speaker": "marker",
+            "marker": { "kind": "not_sent", "why": "lapsed", "serial": 2 },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_w/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["included"], 2, "{payload}");
+    assert_eq!(payload["words"], 6, "{payload}");
+}
+
+/// `#270 voice-transcript-markers`. Both transcript reads give record rows and details only to a
+/// page that asks with `records=1`; the walk's pages stay full either way.
+#[tokio::test]
+async fn both_transcript_reads_give_records_only_on_records_1() {
+    use vibe_talk::store::{NotSentWhy, Speaker, Turn, TurnDetail};
+    let (harness, store) = store_harness();
+    let id = vibe_talk::store::ConversationId::parse("conv_r1").expect("id");
+    for turn in [
+        Turn::now(Speaker::You, "first"),
+        Turn::record(
+            Speaker::Marker,
+            "",
+            Some(TurnDetail::NotSent {
+                why: NotSentWhy::Declined,
+                serial: 2,
+            }),
+        ),
+        Turn::record(Speaker::You, "yes", Some(TurnDetail::Answer { serial: 3 })),
+    ] {
+        store.append_turn(&id, &turn).await.expect("append");
+    }
+    let (_, walk) = call(
+        &harness,
+        "GET",
+        "/api/v1/transcript?limit=2&records=1",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    let turns = walk["turns"].as_array().expect("turns");
+    assert_eq!(turns.len(), 2, "{walk}");
+    assert_eq!(turns[0]["detail"]["kind"], "answer");
+    assert_eq!(turns[1]["speaker"], "marker");
+    assert_eq!(turns[1]["detail"]["why"], "declined");
+    let (_, walk) = call(
+        &harness,
+        "GET",
+        "/api/v1/transcript?limit=2",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    let texts: Vec<&str> = walk["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .filter_map(|turn| turn["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["yes", "first"], "{walk}");
+    assert!(walk["turns"][0].get("detail").is_none());
+
+    let (_, whole) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_r1?records=1",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(whole["turns"].as_array().map(Vec::len), Some(3), "{whole}");
+    for path in [
+        "/api/v1/transcript?records=1",
+        "/api/v1/conversations/conv_r1?records=1",
+    ] {
+        let (status, _) = call(&harness, "GET", path, Some(READ_TOKEN), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
 #[tokio::test]
 async fn a_replay_is_refused_to_a_read_token_because_it_is_the_transcript() {
     // The whole route is the transcript, rendered. If a read token could fetch this it could
