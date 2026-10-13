@@ -10230,10 +10230,24 @@ function placePostCard() {
   // Which screen it is docked under, so the stylesheet can tell Reply's own Send from the card's.
   if (place === "dock") card.setAttribute("data-screen", currentScreen);
   else card.removeAttribute("data-screen");
+  markCardBesideReply();
   card.hidden = !shown || place === "none";
   holdDraftRoom(shown);
   // What the chips and the status pill stand on has just changed.
   placeChipsOverComposer();
+}
+
+/**
+ * `#277 reply-in-column`. In two columns Reply is no screen: its box, with its own filled "Send reply",
+ * opens at the foot of a column — under the very list the card ends, in the left one, or level with
+ * it in the right. Marked while one is open there, so the stylesheet outlines the card's Send as it
+ * does under the reply screen, and the filled Send nearest the thumb is never taken for the other.
+ * Read from the boxes themselves, so it holds however a reply was opened or put away.
+ */
+function markCardBesideReply() {
+  const card = leftEl("post-confirm");
+  const beside = currentScreen === "main" && (!leftEl("column-reply").hidden || !leftEl("side-reply").hidden);
+  if (card.hasAttribute("data-beside-reply") !== beside) card.toggleAttribute("data-beside-reply", beside);
 }
 
 /**
@@ -32893,6 +32907,7 @@ function dockReply(from) {
   mount.hidden = false;
   replyDocked = true;
   renderReplyingMarks();
+  markCardBesideReply();
   placeToolsOverReply();
   // `#304 back-gesture-in-app`. A reply open in a column is a level, as the reply screen is.
   scheduleBackSync();
@@ -32918,6 +32933,7 @@ function undockReply() {
   el("screen-reply").append(el("reply-compose"));
   for (const id of ["column-reply", "side-reply"]) leftEl(id).hidden = true;
   renderReplyingMarks();
+  markCardBesideReply();
   placeToolsOverReply();
   scheduleBackSync();
 }
