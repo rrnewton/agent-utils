@@ -161,7 +161,7 @@ let sideActive = false;
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -276,22 +276,32 @@ const CHIPS_PILL_REM = 2.4;
 
 function placeChipsOverComposer() {
   let top = 0;
+  // `#269 approval-card-inline`. A draft waiting above the channel's box is part of what they stand
+  // on: they float over the messages above it, never over its Send. Docked under another screen, the
+  // pill stands on the card in the same way.
+  const card = leftEl("post-confirm");
+  const carded = !card.hidden && card.parentNode === leftEl("pane-discord");
   if (currentScreen === "main" && currentView === "discord") {
     const area = leftEl("scroll-area");
     const box = leftEl("channel-composer");
     const below = area.scrollHeight - area.scrollTop - (area.clientHeight || 0);
-    if (below < (area.clientHeight || 0) + (box.offsetHeight || 0)) {
+    const lowest = (box.offsetHeight || 0) + (carded ? card.offsetHeight || 0 : 0);
+    if (below < (area.clientHeight || 0) + lowest) {
       const foot = leftEl("screen-main").getBoundingClientRect().bottom;
       const edge = box.getBoundingClientRect();
+      const cardEdge = carded ? card.getBoundingClientRect() : null;
       // The strip they float in at the foot: half a rem off it, the chips, and the pill over them.
       const strip = rootFontPx() * (0.5 + CHIPS_PILL_REM) + leftEl("scroll-tools").getBoundingClientRect().height;
-      if (edge.bottom > foot - strip) top = Math.max(0, Math.round(foot - edge.top));
+      const reaches = edge.bottom > foot - strip || (cardEdge !== null && cardEdge.bottom > foot - strip);
+      if (reaches) top = Math.max(0, Math.round(foot - (cardEdge ? cardEdge.top : edge.top)));
     }
     // `#277 reply-in-column`. A reply open at the foot of the left column: they stand on its box.
     const reply = leftEl("column-reply");
     if (!reply.hidden) {
       top = Math.max(top, Math.round(leftEl("screen-main").getBoundingClientRect().bottom - reply.getBoundingClientRect().top));
     }
+  } else if (currentScreen !== "main" && !card.hidden && card.getAttribute("data-place") === "dock") {
+    top = Math.max(0, Math.round(leftEl("frame-body").getBoundingClientRect().bottom - card.getBoundingClientRect().top));
   }
   if (top === composerTop) return;
   composerTop = top;
@@ -1115,6 +1125,8 @@ function showScreen(name) {
   // `#229 desktop-two-column`. Back on the main screen, two columns are decided again: the window may
   // have been resized behind Settings.
   if (main) renderColumns();
+  // `#269 approval-card-inline`. A waiting draft follows the owner to the screen now up.
+  placePostCard();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") refreshUpstreamClear();
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
@@ -1385,6 +1397,9 @@ function showView(name) {
   currentView = name;
   el("pane-voice").hidden = name !== "voice";
   el("pane-discord").hidden = name !== "discord";
+  // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
+  // there BEFORE the place in that list is restored, which counts it.
+  placePostCard();
   const discord = name === "discord";
   el("view-switch").setAttribute("aria-checked", discord ? "true" : "false");
   el("view-switch-label").textContent = discord ? "Channel" : "Voice";
@@ -1663,16 +1678,18 @@ function restoreScroll(mark) {
  * read a backlog, so that is the ordinary case, not a corner — and its cost was silence. The turn
  * belongs to a list nobody is looking at, so the only right act is to raise that list's chip.
  */
-function followIfPinned(pinned, turns = 0) {
-  if (pinned && currentView === "voice") {
+function followIfPinned(pinned, turns = 0, view = "voice") {
+  if (pinned && currentView === view) {
     scrollToNewest();
     return;
   }
-  // Named explicitly: this is only ever reached from `line()` and `seam()`, which append to the
-  // transcript. Letting it default to `currentView` would raise a chip over the channel list.
-  // `turns` is how many new turns this was, for the count the jump shows: a turn growing as it is
-  // spoken, or a seam, is a change below and not another message. `#207 scrollback-jump`.
-  setJumpNewest(true, "voice", turns);
+  // Named explicitly: `line()` and `seam()` append to the transcript, so they leave `view` as the
+  // transcript's. Letting it default to `currentView` would raise a chip over the channel list. The
+  // send card (`#269 approval-card-inline`) is the one caller that names a view: it is the next
+  // message of whichever list is on screen. `turns` is how many new turns this was, for the count
+  // the jump shows: a turn growing as it is spoken, a seam or the card is a change below and not
+  // another message. `#207 scrollback-jump`.
+  setJumpNewest(true, view, turns);
 }
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
@@ -2977,13 +2994,17 @@ function renderJumpNewest() {
   // `#277 reply-in-column`. So does a reply sent from this column that did not go, before anything
   // else: the way down is the way to its Retry. In the orange of the outbox row it leads to.
   const failed = unsent !== null && unsent.state === "failed";
+  // `#269 approval-card-inline`. A draft waiting below is what the jump goes to, so it says so.
+  const draft = unsent === null && shown && draftBelowView();
   const label = unsent !== null ? (failed ? "Reply not sent" : "Reply unconfirmed")
-    : arrived === false ? "Newest" : count ? `${many} new` : "New";
+    : draft ? "Draft to send" : arrived === false ? "Newest" : count ? `${many} new` : "New";
   const name = unsent !== null
     ? `Jump to your reply, which ${failed ? "was not sent" : "may not have been posted"}, at the foot of the list`
-    : arrived === false
-      ? "Jump to the newest message"
-      : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
+    : draft
+      ? "Jump to the draft waiting to be sent"
+      : arrived === false
+        ? "Jump to the newest message"
+        : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
   if (button.hidden === shown) button.hidden = !shown;
   if (el("jump-newest-label").textContent !== label) el("jump-newest-label").textContent = label;
   if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
@@ -9711,8 +9732,10 @@ function readableChannelFailure(error) {
 const POST_WATCH_WAIT_SECONDS = 25;
 const POST_WATCH_RETRY_MS = 3000;
 const POST_EXPIRY_TICK_MS = 1000;
-// How long Send stays disabled after a card appears or its text is replaced by a newer proposal, so
-// that a tap already on its way lands on nothing rather than on words the owner has not read.
+// How long Send and Don't send stay disabled after a card appears or its text is replaced by a newer
+// proposal, so that a tap already on its way lands on nothing rather than on words the owner has not
+// read. Both: the card appears as the next message in the list, where a tap aimed at the last row may
+// land on either button. `#269 approval-card-inline`.
 const POST_CHANGE_HOLD_MS = 2000;
 
 const postWatch = {
@@ -9733,10 +9756,13 @@ const postWatch = {
   // When the shown proposal lapses, fixed once when it first appears so a re-render cannot extend it.
   deadline: 0,
   tick: null,
-  // Set while Send is held after a card appears; `changed` marks a replacement until it is settled.
+  // Set while both buttons are held after a card appears; `changed` marks a replacement until it is
+  // settled.
   hold: null,
   changed: false,
   busy: false,
+  // Whether the owner opened a long draft with More. A new draft starts folded again.
+  unfolded: false,
 };
 
 // What a refused confirmation means, per code. Every one of them says that THIS tap posted nothing,
@@ -9821,57 +9847,185 @@ function showPostProposal(proposal) {
     postWatch.tick = null;
   }
   const previous = postWatch.shown;
+  // Measured BEFORE the card is put up or its text changes, because putting it up is what changes
+  // the answer: a reader at the newest line follows the card down, one scrolled up is not moved.
+  // `#269 approval-card-inline`.
+  const pinned = atBottom(leftEl("scroll-area"));
+  const card = leftEl("post-confirm");
+  const hadFocus = nodeWithin(card, document.activeElement);
   postWatch.shown = proposal;
   noteCardForSpokenYes(proposal, previous);
   if (!proposal) {
     if (postWatch.hold !== null) clearTimeout(postWatch.hold);
     postWatch.hold = null;
     postWatch.changed = false;
-    el("post-confirm").hidden = true;
+    postWatch.unfolded = false;
+    placePostCard();
+    if (hadFocus) parkFocusOffCard();
+    renderJumpNewest();
     return;
   }
-  if (!previous || previous.handle !== proposal.handle) {
+  const fresh = !previous || previous.handle !== proposal.handle;
+  if (fresh) {
     postWatch.deadline = Date.now() + proposal.expires_in_ms;
     // Words the owner may be about to confirm appeared under a tap aimed at whatever was there
-    // before, a row or the old text: hold Send long enough for it to miss, and say if it changed.
+    // before — a row, the old text, or, now that the card is the next message in the list, the
+    // spot the last row was in. BOTH buttons are held long enough for that tap to miss: a tap that
+    // landed on Don't send would withdraw a draft the owner had not read either. It says when the
+    // text changed.
     if (postWatch.hold !== null) clearTimeout(postWatch.hold);
     postWatch.changed = Boolean(previous);
+    postWatch.unfolded = false;
     postWatch.hold = setTimeout(() => {
       postWatch.hold = null;
       if (postWatch.shown) showPostProposal(postWatch.shown);
     }, POST_CHANGE_HOLD_MS);
+    // Said once, politely: the countdown is not a live region, so this is how a reader who is not
+    // looking at the card hears that a draft is waiting, or that its words changed.
+    setStatus(previous
+      ? `The assistant changed the draft to ${proposal.channel_name} — read it again.`
+      : `Draft to ${proposal.channel_name} is waiting: Send or Don't send.`);
   }
-  el("post-confirm-where").textContent = proposal.reply_to
-    ? `To ${proposal.channel_name}, as a reply to message ${proposal.reply_to}`
-    : `To ${proposal.channel_name}`;
+  el("post-confirm-where").textContent = postCardWhere(proposal);
   // Verbatim, as text. It is the one thing on the card the owner is confirming, so nothing is
   // shortened or reformatted — except a sign-in token, which is never put on screen and never sent.
   const shown = redact(proposal.text);
   el("post-confirm-text").textContent = shown;
+  // A long draft is folded, with More to read the rest in place: never a scroll box inside the
+  // scrolling list. Folded by the length that folds a message, so the card agrees with the rows.
+  const long = shown.length > COLLAPSE_OVER_CHARS;
+  const more = el("post-confirm-more");
+  more.hidden = !long;
+  const folded = long && !postWatch.unfolded;
+  card.toggleAttribute("data-folded", folded);
+  more.textContent = folded ? FOLD_MORE : FOLD_LESS;
+  more.setAttribute("aria-expanded", folded ? "false" : "true");
+  // "Send to lead team": still beginning with Send, as the agent's instructions and the help say.
+  // A long name is cut on screen; the accessible name stays whole.
+  const sendLabel = `Send to ${proposal.channel_name}`;
+  el("post-confirm-send-label").textContent = sendLabel;
+  el("post-confirm-send").setAttribute("aria-label", sendLabel);
   el("post-confirm-send").disabled =
     postWatch.busy || postWatch.hold !== null || shown !== proposal.text;
-  el("post-confirm-cancel").disabled = postWatch.busy;
+  el("post-confirm-cancel").disabled = postWatch.busy || postWatch.hold !== null;
   renderPostExpiry();
-  el("post-confirm").hidden = false;
+  placePostCard();
+  // Only over the list on screen: a draft that arrives while the owner is in Settings waits docked
+  // there, and must not move the list he left.
+  if (fresh && currentScreen === "main") followIfPinned(pinned, 0, currentView);
+  renderJumpNewest();
+}
+
+/**
+ * Where the draft goes, in words: "To lead team · replying to Alex: “is the build green yet…” · in
+ * thread “release”". `#269 approval-card-inline`. Never an id: who wrote the message it answers and
+ * its first words come from the server, which says nothing when it does not hold that message, and
+ * then this says "as a reply to an earlier message".
+ *
+ * @param {VibeTalk.PendingPost} proposal
+ */
+function postCardWhere(proposal) {
+  const parts = [`To ${proposal.channel_name}`];
+  if (proposal.reply_to) {
+    const author = proposal.reply_to_author;
+    const excerpt = proposal.reply_to_excerpt;
+    if (author && excerpt) parts.push(`replying to ${author}: “${excerpt}”`);
+    else if (author) parts.push(`replying to ${author}`);
+    else parts.push("as a reply to an earlier message");
+  }
+  if (proposal.thread_name) parts.push(`in thread “${proposal.thread_name}”`);
+  return parts.join(" · ");
+}
+
+/**
+ * Put the card where the owner is looking. `#269 approval-card-inline`.
+ *
+ * The card is the tentative next message: on the main screen it is the last thing in the list on
+ * screen, just above that list's message box — under the call's transcript, or under the channel's
+ * messages — and on Reply, Threads, Settings and Help it is docked at the foot of the screen, so a
+ * draft never waits somewhere the owner is not. ONE element moved between those places, so every
+ * id, every listener and the hold stay with it. Nothing on the sign-in screen: no call can be open.
+ * `data-draft` on the main screen is what lets the stylesheet make room for it there: the message
+ * box shrinks to one line under it.
+ */
+function placePostCard() {
+  const card = leftEl("post-confirm");
+  const shown = postWatch.shown !== null;
+  let parent = null;
+  let before = null;
+  let place = "none";
+  if (currentScreen === "main") {
+    const channel = currentView === "discord";
+    parent = leftEl(channel ? "pane-discord" : "pane-voice");
+    before = leftEl(channel ? "channel-composer" : "voice-composer");
+    place = channel ? "channel" : "voice";
+  } else if (currentScreen !== "signin") {
+    parent = leftEl("frame-body");
+    place = "dock";
+  }
+  if (parent && (card.parentNode !== parent || card.nextSibling !== before)) {
+    parent.insertBefore(card, before);
+  }
+  if (card.getAttribute("data-place") !== place) card.setAttribute("data-place", place);
+  card.hidden = !shown || place === "none";
+  leftEl("screen-main").toggleAttribute("data-draft", shown);
+  // What the chips and the status pill stand on has just changed.
+  placeChipsOverComposer();
+}
+
+/**
+ * The card went with the focus inside it. A reader on a touch screen gets it on the list, never on
+ * the message box: focusing a text field from a tap opens the phone's keyboard over half the screen.
+ * One using the keys or a mouse gets the box of the list on screen, where typing goes on.
+ */
+function parkFocusOffCard() {
+  if (currentScreen !== "main") {
+    focusList(null);
+    return;
+  }
+  const target = drawnBy()
+    ? leftEl(currentView === "discord" ? "channel-compose-text" : "compose-text")
+    : leftEl("scroll-area");
+  target.focus({ preventScroll: true });
+}
+
+/** Whether the card is up in the list on screen and below what it shows. */
+function draftBelowView() {
+  if (currentScreen !== "main" || postWatch.shown === null) return false;
+  const card = leftEl("post-confirm");
+  if (card.hidden) return false;
+  const area = leftEl("scroll-area");
+  return card.getBoundingClientRect().top >= area.getBoundingClientRect().top + (area.clientHeight || 0);
 }
 
 function renderPostExpiry() {
+  if (postWatch.tick !== null) {
+    clearTimeout(postWatch.tick);
+    postWatch.tick = null;
+  }
   const proposal = postWatch.shown;
   if (!proposal) return;
+  const status = el("post-confirm-expiry");
   if (redact(proposal.text) !== proposal.text) {
-    el("post-confirm-expiry").textContent =
+    status.textContent =
       "This text contains your sign-in token, so this page will not send it. Tap Don't send.";
     return;
   }
   const seconds = Math.max(0, Math.ceil((postWatch.deadline - Date.now()) / 1000));
   if (seconds === 0) {
     el("post-confirm-send").disabled = true;
-    el("post-confirm-expiry").textContent = "This proposal has lapsed. Nothing was posted.";
+    status.textContent = "This draft has lapsed. Nothing was posted.";
     return;
   }
-  const changed = postWatch.changed ? "The assistant changed the text — read it again. " : "";
-  el("post-confirm-expiry").textContent =
-    `${changed}Nothing is posted until you confirm. Lapses in ${seconds} s.`;
+  // A spoken yes is settling: what the next second does is send, and the one control that stops
+  // it is on this card. The countdown does not write over that.
+  const settling = spokenYes.settling;
+  if (settling && settling.handle === proposal.handle) {
+    status.textContent = "Heard yes — sending… Tap Don't send to stop.";
+  } else {
+    const changed = postWatch.changed ? "The assistant changed the text — read it again" : "Waiting for you";
+    status.textContent = `${changed} · lapses in ${seconds} s`;
+  }
   postWatch.tick = setTimeout(() => {
     postWatch.tick = null;
     renderPostExpiry();
@@ -9971,6 +10125,9 @@ async function cancelPostProposal(options) {
   const spoken = Boolean(options && options.spoken === true);
   const proposal = postWatch.shown;
   if (!proposal || postWatch.busy) return;
+  // A tap during the hold is one aimed at what was under that spot before the card was. A spoken
+  // no is not a tap and is never held. `#269 approval-card-inline`.
+  if (!spoken && postWatch.hold !== null) return;
   const stoppedYes = spokenYesYieldsToTap();
   postWatch.busy = true;
   try {
@@ -10906,6 +11063,8 @@ function judgeSpokenAnswer(text, heard, refused = null) {
   }, SPOKEN_YES_SETTLE_MS);
   spokenYes.settling = settling;
   setStatus("Heard yes — sending…");
+  // `#269 approval-card-inline`. The card's own line says so too, with how to stop it.
+  renderPostExpiry();
 }
 
 /**
@@ -10974,6 +11133,7 @@ function abortSpokenYes(reason) {
   if (!settling) return;
   clearTimeout(settling.timer);
   spokenYes.settling = null;
+  renderPostExpiry();
   reportSpokenOutcome({ kind: "not_armed", proposal: settling.proposal, reason: SPOKEN_YES_REASONS[reason] });
 }
 
@@ -10989,6 +11149,7 @@ function spokenYesYieldsToTap() {
   if (!settling || !postWatch.shown || settling.handle !== postWatch.shown.handle) return false;
   clearTimeout(settling.timer);
   spokenYes.settling = null;
+  renderPostExpiry();
   return true;
 }
 
@@ -37563,6 +37724,15 @@ el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("post-confirm-send").addEventListener("click", sendPostProposal);
 el("post-confirm-cancel").addEventListener("click", cancelPostProposal);
+// `#269 approval-card-inline`. More opens a long draft in place, and Less folds it again. Measured
+// before, so a reader at the newest line still sees the buttons after the card grows upward.
+el("post-confirm-more").addEventListener("click", () => {
+  if (!postWatch.shown) return;
+  const pinned = atBottom(leftEl("scroll-area"));
+  postWatch.unfolded = !postWatch.unfolded;
+  showPostProposal(postWatch.shown);
+  if (currentScreen === "main") followIfPinned(pinned, 0, currentView);
+});
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
 el("retry-start").addEventListener("click", retryStart);

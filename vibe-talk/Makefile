@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -167,6 +167,15 @@ voice-call-drops-browser:
 send-order-browser:
 	cargo build --release --locked
 	python3 tests/send_order_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#269 approval-card-inline` in a real Chromium at 393x852, 360x780 and 375x667: the send card laid
+# out as the next message -- in the list on the call's view and the channel, docked on Settings --
+# with Send's centre at least 0.62 of the way down the screen, uncovered, wholly on screen with where
+# the draft goes, the box's own Send out of the way, the card at the owner's own inset, and both
+# buttons held when it appears. Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to
+# keep a PNG of each placement.
+approval-card-browser:
+	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#241 voice-composer` in a real Chromium at 412x915 and 1280x800: the call's message box and the
 # view switch on screen and uncovered while the box has the focus -- at idle, in a typed

@@ -596,7 +596,9 @@ a.search-hit-link {
      exact behaviour this whole file removes. */
   min-height: 0;
   display: grid;
-  grid-template-rows: auto 1fr;
+  /* The third row is the send card's when it is docked under a screen other than the main one
+     (`#269 approval-card-inline`); empty, it takes no room. */
+  grid-template-rows: auto 1fr auto;
   padding: 0;
 }
 
@@ -5507,43 +5509,193 @@ a.search-hit-link {
 
 /* ---------------------------------------------------------------- the post confirmation --- */
 /*
- * `#34 voice-chat-write-confirm`. An overlay at the TOP of the body area, for the reason
- * #status-line is one: a card that appeared as a grid row would push the transcript down under the
- * reader's thumb at the moment they are listening to the read-back. Unlike the status pill it is
- * a real target — Send and Don't send are the whole point — so it takes its own taps.
+ * `#34 voice-chat-write-confirm`, and since `#269 approval-card-inline` THE TENTATIVE NEXT MESSAGE.
+ *
+ * It used to be an overlay at the top of the body area, over the transcript, far from the thumb and
+ * on top of the very lines being read back. Now it is the owner's own outgoing tile — the channel's
+ * `.outgoing-message`, at `li.mine`'s inset — as the last thing in the list on screen, just above that
+ * list's message box (`placePostCard` in web/voice.js moves it). Tentative and frozen cards differ in
+ * their words and buttons, never in geometry, so nothing moves sideways when a draft is sent.
+ *
+ * From top to bottom: a small heading, the words, More for a long draft, where it goes, the status
+ * line, and the buttons — Send last, under everything it confirms.
  */
 #post-confirm {
-  position: absolute;
-  z-index: 6;
-  inset-inline: 0;
-  top: 0.5rem;
-  max-width: calc(100% - 1.5rem);
-  margin: 0 auto;
-  padding: 0.75rem calc(0.75rem + env(safe-area-inset-right)) 0.75rem
-    calc(0.75rem + env(safe-area-inset-left));
-  border-color: var(--accent);
-  box-shadow: 0 2px 12px rgb(0 0 0 / 45%);
+  background: var(--mine);
+  border: 1px solid var(--mine-edge);
+  border-radius: 0.5rem;
+  border-bottom-right-radius: 0.15rem;
+  padding: 0.6rem 0.7rem;
+  margin: 0.5rem 0;
+  overflow-wrap: anywhere;
 }
 
-#post-confirm h2 {
-  margin: 0 0 0.35rem;
-  font-size: 1rem;
+/* In the call's pane, exactly where a turn of the owner's sits: `.messages li.mine`. */
+#pane-voice > #post-confirm {
+  margin-left: 15%;
+}
+
+/* In the channel, where its own outgoing messages sit. */
+#pane-discord > #post-confirm {
+  margin-left: var(--speaker-inset);
+}
+
+#post-confirm-title {
+  margin: 0 0 0.3rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
 }
 
 #post-confirm p {
-  margin: 0.35rem 0;
+  margin: 0.3rem 0;
 }
 
 /* The words that will be posted, verbatim. Kept as the owner's line breaks and wrapped anywhere,
-   because a long URL that ran off the card would be text the owner confirmed without seeing. */
+   because a long URL that ran off the card would be text the owner confirmed without seeing.
+   Folded, a long draft is held to the room the screen actually has — never less than three lines,
+   never more than about ten — with More to open it in place: never a scroll box inside the list. */
 #post-confirm-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 40vh;
+  font-size: calc(0.88rem * var(--msg-scale, 1));
+}
+
+#post-confirm[data-folded] #post-confirm-text {
+  max-height: clamp(4.5rem, 100dvh - 38rem, 14rem);
+  overflow: hidden;
+}
+
+/* Docked at the foot of another screen, the words are three lines and More. */
+#post-confirm[data-place="dock"][data-folded] #post-confirm-text {
+  max-height: 4.5rem;
+}
+
+#post-confirm-more {
+  margin: 0.1rem 0 0.2rem;
+}
+
+#post-confirm-where {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+/* ONE LINE, ALWAYS, so the countdown changing its words never moves the buttons under a thumb. */
+#post-confirm-expiry {
+  min-height: 1.45em;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+/* Send is the filled primary button and takes the room; Don't send is the outlined one beside it.
+   Both at least 44px tall. When "Send to {channel}" does not fit beside Don't send, Send wraps onto
+   a row of its own under it, the whole width of the card — still last, still nearest the thumb — and
+   only a name too long even for that is cut on screen; the accessible name is always whole. */
+.post-confirm-actions {
+  flex-wrap: wrap;
+  margin: 0.45rem 0 0;
+}
+
+#post-confirm-send,
+#post-confirm-cancel {
+  min-height: 2.75rem;
+  padding-inline: 0.7rem;
+}
+
+#post-confirm-send {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+#post-confirm-cancel {
+  flex: 0 0 auto;
+}
+
+#post-confirm-send-label {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/*
+ * THUMB REACH, while a draft is up. `#269 approval-card-inline`. The card takes the space above the
+ * message box and the box gives up its height: one line, with its own Send beside it on the same row
+ * — hidden while the box is empty, so "Send" at the right-hand edge always means the card — and an
+ * outlined Send once something is typed, so it is never mistaken for the card's. Focusing the box
+ * opens it again for typing. `margin-top: auto` moves from the box to the card: a short transcript
+ * leaves the gap ABOVE the card, not between it and the box.
+ */
+#screen-main[data-draft] #pane-voice > #post-confirm {
+  margin-top: auto;
+}
+
+/* Measured, not guessed: on a 375x667 phone Send's centre only reaches the thumb's line with the
+   card sitting close on the box — a quarter rem between them, the box's own top padding cut to
+   0.3rem, and half a rem rather than a whole one between the box and the status pill's room under
+   it. The card's height never matters here: it grows upward from the box. */
+#screen-main[data-draft] #pane-voice > #post-confirm,
+#screen-main[data-draft] #pane-discord > #post-confirm {
+  margin-bottom: 0.25rem;
+  padding-bottom: 0.45rem;
+}
+
+#screen-main[data-draft] #voice-composer {
+  margin-top: 0;
+  padding-bottom: calc(max(0.5rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + 2.4rem);
+}
+
+#screen-main[data-draft] #voice-composer,
+#screen-main[data-draft] #channel-composer {
+  padding-top: 0.3rem;
+}
+
+#screen-main[data-draft] #voice-composer,
+#screen-main[data-draft] #channel-composer {
+  grid-template-columns: 1fr auto;
+  align-items: end;
+}
+
+#screen-main[data-draft] #channel-compose-state {
+  grid-column: 1 / -1;
+}
+
+#screen-main[data-draft] #compose-text,
+#screen-main[data-draft] #channel-compose-text {
+  height: 2.75rem;
+  min-height: 2.75rem;
+  resize: none;
+}
+
+#screen-main[data-draft] #compose-text:focus,
+#screen-main[data-draft] #channel-compose-text:focus {
+  height: auto;
+  min-height: 5rem;
+}
+
+#screen-main[data-draft] #compose-text:placeholder-shown ~ #send-text,
+#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ #channel-send {
+  display: none;
+}
+
+#screen-main[data-draft] #send-text,
+#screen-main[data-draft] #channel-send {
+  min-width: 0;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+/* Docked at the foot of Reply, Threads, Settings or Help: its own row of the body, under the screen,
+   so the screen above it still scrolls and nothing is covered. */
+#frame-body > #post-confirm {
+  grid-row: 3;
+  margin: 0;
+  max-height: 60dvh;
   overflow-y: auto;
-  padding: 0.5rem;
-  border-left: 3px solid var(--accent);
-  background: var(--bg);
+  border-radius: 0.5rem 0.5rem 0 0;
+  padding: 0.6rem calc(0.75rem + env(safe-area-inset-right)) 0.6rem
+    calc(0.75rem + env(safe-area-inset-left));
 }
 
 /* ----------------------------------------------------------------------- the control bar --- */
@@ -6519,7 +6671,8 @@ textarea {
   /* A percentage inset is proportionate inside a capped column and absurd across a full-width
      one. Capping the pane above is what actually fixes the 600px gutter; this only stops a reader
      who has dragged the column out to 120ch from getting it back. */
-  .messages li.mine {
+  .messages li.mine,
+  #pane-voice > #post-confirm {
     margin-left: min(15%, 6rem);
   }
 

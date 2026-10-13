@@ -350,8 +350,21 @@ const FIXTURE_TREE = {
   // `#241 voice-composer`. The call's message box is the last thing in its pane, inside the
   // scrolling element, as the channel's box is in its own; its height is part of what "the reader is
   // at the bottom" means on the call's view, exactly as the channel's is there.
-  "pane-voice": ["empty-state", "transcript", "voice-composer"],
+  "pane-voice": ["empty-state", "transcript", "post-confirm", "voice-composer"],
   "voice-composer": ["compose-text", "send-text"],
+  // `#269 approval-card-inline`. The send card, which the markup puts between the transcript and the
+  // call's box and the page moves to whichever list is on screen. Its height is part of what "the
+  // reader is at the bottom" means while a draft is up, which is what following it down asks.
+  "post-confirm": [
+    "post-confirm-title",
+    "post-confirm-text",
+    "post-confirm-more",
+    "post-confirm-where",
+    "post-confirm-expiry",
+    "post-confirm-cancel",
+    "post-confirm-send",
+  ],
+  "post-confirm-send": ["post-confirm-send-label"],
   // In markup order: the walk-back control sits ABOVE the log and inside the scrolling element, so
   // it scrolls away with the top of the history rather than standing on the screen. Its height is
   // part of what the anchoring model measures against. `#65 scrollback-paging`.
@@ -7652,8 +7665,8 @@ test("YOUR OWN TURN DOES NOT YANK YOU TO THE BOTTOM once you have scrolled up", 
   // The control: the OLD rule, an unconditional scroll on every arrival. It has to fail.
   const control = await parked(
     brokenScript(
-      'function followIfPinned(pinned, turns = 0) {\n  if (pinned && currentView === "voice") {',
-      "function followIfPinned(pinned, turns = 0) {\n  if (true) {"
+      'function followIfPinned(pinned, turns = 0, view = "voice") {\n  if (pinned && currentView === view) {',
+      'function followIfPinned(pinned, turns = 0, view = "voice") {\n  if (true) {'
     )
   );
   assert.notEqual(
@@ -33679,8 +33692,9 @@ test("a proposed post is shown verbatim, and Send commits exactly that proposal,
   const pending = await proposedDuringACall(page);
 
   assert.equal(page.el("post-confirm-text").textContent, pending.text);
-  assert.match(page.el("post-confirm-where").textContent, /lead team.*reply to message 1122334455667788990/);
-  assert.match(page.el("post-confirm-expiry").textContent, /Nothing is posted until you confirm\. Lapses in 120 s/);
+  // `#269 approval-card-inline`: what it answers in words, and never the id.
+  assert.equal(page.el("post-confirm-where").textContent, "To lead team · as a reply to an earlier message");
+  assert.match(page.el("post-confirm-expiry").textContent, /^Waiting for you · lapses in 120 s$/);
   assert.ok(!page.createdTags.includes("b"), "the proposed text became markup");
   assert.ok(!page.renderedText().includes(pending.handle), "the handle was put on screen");
   assert.deepEqual(page.proposalCommits, [], "something was committed before Send");
@@ -33776,7 +33790,7 @@ test("redrawing the card never extends the lapse the server set", async () => {
   await page.el("post-confirm-send").click();
   await page.settle();
   assert.equal(page.el("post-confirm").hidden, false);
-  assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 2 s/);
+  assert.match(page.el("post-confirm-expiry").textContent, /lapses in 2 s/);
 });
 
 test("a card that appears where none was shown holds Send too, without saying the text changed", async () => {
@@ -33790,15 +33804,20 @@ test("a card that appears where none was shown holds Send too, without saying th
   await page.settle();
   assert.equal(page.el("post-confirm").hidden, false, "the proposal never reached the card");
   assert.equal(page.el("post-confirm-send").disabled, true, "Send was live on the card's first frame");
-  assert.equal(page.el("post-confirm-cancel").disabled, false, "Don't send was held with it");
+  // `#269 approval-card-inline`: the card is the next message in the list now, where a tap aimed at
+  // the last row may land on either button, so Don't send is held with Send.
+  assert.equal(page.el("post-confirm-cancel").disabled, true, "Don't send was live on the card's first frame");
   assert.doesNotMatch(page.el("post-confirm-expiry").textContent, /changed the text/, "a first card said it changed");
 
   await page.el("post-confirm-send").click();
+  await page.el("post-confirm-cancel").click();
   await page.settle();
   assert.deepEqual(page.proposalCommits, [], "a tap during the hold committed the card");
+  assert.deepEqual(page.proposalCancels, [], "a tap during the hold withdrew the card");
 
   assert.equal(page.expireTimers(2000), 1, "no hold was armed");
   assert.equal(page.el("post-confirm-send").disabled, false, "Send stayed held");
+  assert.equal(page.el("post-confirm-cancel").disabled, false, "Don't send stayed held");
   await page.el("post-confirm-send").click();
   await page.settle();
   assert.deepEqual(page.proposalCommits.map((c) => c.handle), [pending.handle]);
@@ -33841,15 +33860,210 @@ test("a proposal carrying the sign-in token is neither shown nor sendable", asyn
 test("the card counts down to the lapse, and a lapsed card cannot send", async () => {
   const page = newPage();
   await proposedDuringACall(page, proposal({ expires_in_ms: 2000 }));
-  assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 2 s/);
+  assert.match(page.el("post-confirm-expiry").textContent, /lapses in 2 s/);
   page.setClock(page.clock() + 1000);
   assert.equal(page.expireTimers(1000), 1, "no countdown tick was armed");
-  assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 1 s/);
+  assert.match(page.el("post-confirm-expiry").textContent, /lapses in 1 s/);
   page.setClock(page.clock() + 1000);
   page.expireTimers(1000);
   assert.match(page.el("post-confirm-expiry").textContent, /lapsed\. Nothing was posted/);
   assert.equal(page.el("post-confirm-send").disabled, true);
   assert.equal(page.expireTimers(1000), 0, "the countdown kept ticking past the lapse");
+});
+
+// --- `#269 approval-card-inline`: the card as the tentative next message ----------------------------
+
+test("`#269 approval-card-inline`: the card is the next message under the transcript, under the channel, and docked on other screens", async () => {
+  const page = newPage();
+  await proposedDuringACall(page);
+  const card = page.el("post-confirm");
+  assert.equal(card.parentNode, page.el("pane-voice"), "the card is not in the call's pane");
+  assert.equal(card.nextSibling, page.el("voice-composer"), "the card is not just above the call's box");
+  assert.equal(card.getAttribute("data-place"), "voice");
+  assert.ok(page.el("screen-main").hasAttribute("data-draft"), "the stylesheet cannot make room for the card");
+  // Not modal and takes no focus: a group named by its heading and described by what it sends.
+  assert.match(HTML, /<section id="post-confirm" role="group" aria-labelledby="post-confirm-title"/);
+  assert.doesNotMatch(HTML_CODE, /alertdialog/, "the card still calls itself a modal dialog");
+  // A turn spoken while the draft waits lands in the transcript's own list, above the card: the card
+  // is never a row of the list, so nothing that walks the turns meets it.
+  assistantSays(page, "anything else for the channel?");
+  await page.settle();
+  const transcript = page.el("transcript");
+  assert.ok(!transcript.children.includes(card), "the card became a row of the transcript");
+  const deep = (node) => [node.textContent, ...node.children.map(deep)].join(" ");
+  assert.match(deep(transcript.children[transcript.children.length - 1]), /anything else for the channel/);
+  const kids = page.el("pane-voice").children;
+  assert.ok(kids.indexOf(transcript) < kids.indexOf(card), "a turn landed under the card");
+
+  await showDiscord(page, [message({ id: "300", content: "is the build green yet" })]);
+  assert.equal(card.parentNode, page.el("pane-discord"), "the card did not follow the owner to the channel");
+  assert.equal(card.nextSibling, page.el("channel-composer"), "the card is not just above the channel's box");
+  assert.equal(card.getAttribute("data-place"), "channel");
+  assert.equal(card.hidden, false);
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(card.parentNode, page.el("pane-voice"), "the card did not come back to the call");
+
+  for (const [open, close] of [["open-settings", "close-settings"], ["open-help", "close-help"]]) {
+    if (open === "open-help") await page.el("open-settings").click();
+    await page.el(open).click();
+    await page.settle();
+    assert.equal(card.parentNode, page.el("frame-body"), `the card did not dock on ${page.screen()}`);
+    assert.equal(card.getAttribute("data-place"), "dock");
+    assert.equal(card.hidden, false, `the draft is out of sight on ${page.screen()}`);
+    await page.el(close).click();
+    if (close === "close-help") await page.el("close-settings").click();
+    await page.settle();
+  }
+  assert.equal(page.screen(), "main");
+  assert.equal(card.nextSibling, page.el("voice-composer"));
+
+  // Docked or not, it is the same card: Send from Settings commits it, once.
+  await page.el("open-settings").click();
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.proposalCommits.length, 1);
+  assert.equal(card.hidden, true);
+  assert.ok(!page.el("screen-main").hasAttribute("data-draft"), "the room for the card outlived it");
+});
+
+test("`#269 approval-card-inline`: a reader at the newest line follows the card down, and one reading older turns is told a draft waits", async () => {
+  const pinnedPage = newPage();
+  await startTalking(pinnedPage);
+  const pinnedArea = fillTranscript(pinnedPage);
+  pinnedArea.scrollTop = pinnedArea.scrollHeight;
+  pinnedPage.propose(proposal());
+  await pinnedPage.settle();
+  assert.equal(
+    pinnedArea.scrollTop,
+    pinnedArea.scrollHeight - pinnedArea.clientHeight,
+    "a reader at the newest line was left above the card"
+  );
+
+  const page = newPage();
+  await startTalking(page);
+  const area = fillTranscript(page);
+  area.scrollTop = 120;
+  page.propose(proposal());
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false);
+  assert.equal(area.scrollTop, 120, "the card pulled a reader away from what he was reading");
+  assert.equal(page.el("jump-newest").hidden, false, "nothing says a draft is waiting below");
+  assert.equal(page.el("jump-newest-label").textContent, "Draft to send");
+  assert.equal(page.el("jump-newest").getAttribute("aria-label"), "Jump to the draft waiting to be sent");
+  await page.el("jump-newest").click();
+  await page.settle();
+  assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight, "the jump did not go to the draft");
+});
+
+test("`#269 approval-card-inline`: Send says where, and the line under the words names what it answers, never an id", async () => {
+  const page = newPage();
+  await proposedDuringACall(page, proposal({
+    reply_to: "1122334455667788990",
+    reply_to_author: "Alex",
+    reply_to_excerpt: "is the build green yet…",
+    thread_name: "release",
+  }));
+  assert.equal(page.el("post-confirm-send-label").textContent, "Send to lead team");
+  assert.equal(page.el("post-confirm-send").getAttribute("aria-label"), "Send to lead team");
+  assert.equal(
+    page.el("post-confirm-where").textContent,
+    "To lead team · replying to Alex: “is the build green yet…” · in thread “release”"
+  );
+  assert.match(page.el("post-confirm-expiry").textContent, /^Waiting for you · lapses in \d+ s$/);
+  for (const [pending, said] of [
+    [proposal({ reply_to: null }), "To lead team"],
+    [proposal({ reply_to: "1122334455667788990", reply_to_author: "Alex" }), "To lead team · replying to Alex"],
+    [proposal({ reply_to: "1122334455667788990" }), "To lead team · as a reply to an earlier message"],
+  ]) {
+    page.propose({ ...pending, serial: pending.serial + 100, handle: `${pending.handle}-${said.length}` });
+    await page.settle();
+    const where = page.el("post-confirm-where").textContent;
+    assert.equal(where, said);
+    assert.doesNotMatch(where, /\d{10}/, "an id reached the card");
+  }
+  // A long name is cut on screen and whole for a screen reader.
+  const long = "the very long channel name nobody would ever say out loud in one breath";
+  page.propose(proposal({ serial: 300, handle: "lOnG-0123456789abcdef", channel_name: long }));
+  await page.settle();
+  assert.equal(page.el("post-confirm-send").getAttribute("aria-label"), `Send to ${long}`);
+  assert.match(cssBlock("#post-confirm-send-label"), /text-overflow:\s*ellipsis/);
+});
+
+test("`#269 approval-card-inline`: while a draft is up the message box is one line, and its own Send hides until something is typed", () => {
+  assert.match(cssBlock("#screen-main[data-draft] #compose-text"), /height:\s*2\.75rem/);
+  assert.match(cssBlock("#screen-main[data-draft] #compose-text:placeholder-shown ~ #send-text"),
+    /display:\s*none/, "the box's Send stays up beside the card's");
+  assert.match(cssBlock("#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ #channel-send"),
+    /display:\s*none/, "the channel box's Send stays up beside the card's");
+  assert.match(cssBlock("#screen-main[data-draft] #pane-voice > #post-confirm"), /margin-top:\s*auto/);
+  assert.match(cssBlock("#pane-voice > #post-confirm"), /margin-left:\s*15%/,
+    "the card is not at the owner's own inset, so freezing it would move it sideways");
+});
+
+test("`#269 approval-card-inline`: a long draft is folded with More, and More opens it in place", async () => {
+  const page = newPage();
+  const text = `${"long words ".repeat(60)}the end`;
+  await proposedDuringACall(page, proposal({ text }));
+  const card = page.el("post-confirm");
+  const more = page.el("post-confirm-more");
+  assert.equal(more.hidden, false, "a long draft has no way to read the rest");
+  assert.ok(card.hasAttribute("data-folded"));
+  assert.equal(more.getAttribute("aria-expanded"), "false");
+  assert.equal(page.el("post-confirm-text").textContent, text, "folding shortened what is confirmed");
+  await more.click();
+  assert.ok(!card.hasAttribute("data-folded"), "More did not open the draft");
+  assert.equal(more.getAttribute("aria-expanded"), "true");
+  await more.click();
+  assert.ok(card.hasAttribute("data-folded"), "Less did not fold it again");
+  // A short draft has nothing to fold.
+  page.propose(proposal({ serial: 12, handle: "sHoRt-0123456789abcde", text: "on it" }));
+  await page.settle();
+  assert.equal(more.hidden, true);
+  assert.ok(!card.hasAttribute("data-folded"));
+});
+
+test("`#269 approval-card-inline`: a spoken yes settling says so on the card, with how to stop it", async () => {
+  const page = newPage();
+  const socket = await readBackDuringACall(page);
+  page.expireTimers(2000);
+  hostedHears(socket, "yes");
+  await page.settle();
+  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — sending… Tap Don't send to stop.");
+  // The countdown's tick does not write over it.
+  page.expireTimers(1000);
+  assert.equal(page.el("post-confirm-expiry").textContent, "Heard yes — sending… Tap Don't send to stop.");
+  await page.el("post-confirm-cancel").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits, []);
+  assert.equal(page.proposalCancels.length, 1);
+});
+
+test("`#269 approval-card-inline`: the card going with the focus in it never puts the focus in the message box on a touch screen", async () => {
+  for (const [kind, expected] of [["touch", "scroll-area"], ["mouse", "compose-text"]]) {
+    const page = newPage();
+    await proposedDuringACall(page);
+    const cancel = page.el("post-confirm-cancel");
+    await page.documentEvent("pointerdown", { target: cancel, pointerType: kind });
+    cancel.focus();
+    await cancel.click();
+    await page.settle();
+    assert.equal(page.el("post-confirm").hidden, true);
+    assert.equal(
+      page.document.activeElement,
+      page.el(expected),
+      `after a ${kind} tap the focus went to ${page.document.activeElement && page.document.activeElement.id}`
+    );
+  }
+});
+
+test("`#269 approval-card-inline`: a new draft is said once on the status line, and a changed one says it changed", async () => {
+  const page = newPage();
+  await proposedDuringACall(page);
+  assert.equal(page.el("status").textContent, "Draft to lead team is waiting: Send or Don't send.");
+  page.propose(proposal({ serial: 8, handle: "nEwEr-0123456789abcde", text: "actually, tomorrow" }));
+  await page.settle();
+  assert.equal(page.el("status").textContent, "The assistant changed the draft to lead team — read it again.");
 });
 
 test("a read-scope call never asks about proposals", async () => {
@@ -34283,6 +34497,7 @@ test("`#264 voice-send-approval`: a tap during the settle window commits once, a
 test("`#264 voice-send-approval`: Don't send tapped during the settle window withdraws the draft, and the agent is told once", async () => {
   const page = newPage();
   const socket = await readBackDuringACall(page);
+  page.expireTimers(2000); // the card's own hold on both buttons, `#269 approval-card-inline`
   hostedHears(socket, "yes");
   await page.el("post-confirm-cancel").click();
   await page.settle();
@@ -35022,6 +35237,7 @@ test("`#264 voice-send-approval`: a tap on the card during a call is told to the
 
   const withdrawn = newPage();
   const other = await readBackDuringACall(withdrawn);
+  withdrawn.expireTimers(2000); // the card's own hold on both buttons, `#269 approval-card-inline`
   await withdrawn.el("post-confirm-cancel").click();
   await withdrawn.settle();
   assert.match(pageNotices(other)[0] || "", /^Voice page: the user tapped Don't send, so the draft was withdrawn and NOT sent\./);
