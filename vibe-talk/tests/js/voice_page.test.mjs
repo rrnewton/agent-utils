@@ -52180,6 +52180,28 @@ test("`#278 page-live-reads`: a reply the stream never placed, removed while the
     `Main's root still says ${threadBadge(rowWithId(page, "201")).textContent} after the reply was removed`);
 });
 
+test("`#278 page-live-reads`: the heading over an open thread takes the count and the activity a placed reply gives, and loses them when it is removed", async () => {
+  const { page, server } = await pushedPage();
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  await page.settle();
+  const facts = () => page.el("thread-facts").textContent;
+  assert.match(facts(), / · 1$/, `the heading does not count one reply, so this proves nothing: ${facts()}`);
+  const root = page.messages.find((m) => m.id === "201");
+  const reply = server.post(message({ id: "580", content: "a placed reply in the open thread",
+    timestamp: new Date(page.clock()).toISOString(), thread: { ...root.thread, is_root: false } }));
+  const reads = server.reads.length;
+  await deliver(page, page.stream(), sseMessage(reply, { thread_facts: placedFacts(reply, 2) }));
+  await page.settle();
+  assert.deepStrictEqual(server.reads.slice(reads), [], "a placed reply was read for");
+  assert.ok(shownIds(page).includes("580"), "the placed reply was not drawn");
+  assert.match(facts(), /^now · 2$/, `the heading did not take the reply: ${facts()}`);
+  server.remove("580");
+  await deliver(page, page.stream(), sseDelete("remove-580", CHANNEL.id, "580"));
+  await page.settle();
+  assert.ok(!shownIds(page).includes("580"), "the removal was not drawn");
+  assert.match(facts(), / · 1$/, `the heading still counts the removed reply: ${facts()}`);
+});
+
 test("`#278 page-live-reads`: removing the reply that was its thread's latest activity reads the list of threads again, which puts its card back", async () => {
   const { page, server, data } = await twoColumnServer((p) => {
     p.liveDelivery = "push";

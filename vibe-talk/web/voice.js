@@ -32266,6 +32266,9 @@ function drawLiveChange(positions = null) {
   });
   renderSideColumn();
   renderThreadSelect();
+  // ...and the heading over a thread open in one column, whose age and count are its summary's, as
+  // the picker's are: a read draws it with the picker (`refreshThreadDirectory`, `applyTimelinePage`).
+  renderThreadHeading();
   saveChannelScope();
 }
 
