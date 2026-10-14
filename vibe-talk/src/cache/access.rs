@@ -65,12 +65,17 @@ pub const CONFIRM_AFTER: Duration = Duration::from_secs(600);
 
 /// The operations that read a channel's messages, or one thread's: the only ones whose 403 or 404
 /// can mean access to the channel or the thread is lost.
-pub const CHANNEL_READS: [&str; 6] = [
+///
+/// `fetch_live` is the live poller's read of a channel whose provider reads its thread replies
+/// apart (`#307 slack-reply-live`). Only its read of the channel's own messages can fail it: a
+/// failed read of a thread there leaves that thread for the next read, and fails nothing.
+pub const CHANNEL_READS: [&str; 7] = [
     "fetch_timeline",
     "fetch_timeline_since",
     "fetch_page",
     "fetch_recent",
     "fetch_recent_dated",
+    "fetch_live",
     "probe_channel",
 ];
 

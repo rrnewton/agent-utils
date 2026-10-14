@@ -37,7 +37,8 @@
 //! - **The live poller's walk forward from its cursor**, when it ended on a page shorter than it
 //!   asked for rather than at its page bound, and found a row: `(cursor, newest row seen]`, and
 //!   on Discord's own API, where that shorter page is the channel's newest end, up to the newest
-//!   end. Its first read, which seeds the cursor, is a recent window like any other.
+//!   end. Its first read, which seeds the cursor, is a recent window like any other. The thread
+//!   replies a provider reads apart for it (`#307 slack-reply-live`) are never part of the walk.
 //!
 //! Everything else gives rows only: a page a caller stepped `before` to (nothing joins it to the
 //! page above it), a page carrying a `notice` (the provider says it left something out), a delta
@@ -54,7 +55,7 @@
 //!
 //! | Shape | Listed with a proof | Rows only |
 //! |---|---|---|
-//! | Slack | Main newest; Thread newest, from its oldest row; Flat newest only when it holds no thread at all; the poller's walk | Flat otherwise; the thread list |
+//! | Slack | Main newest; Thread newest, from its oldest row; Flat newest only when it holds no thread at all; a recent window only when it holds no reply; the poller's walk | Flat otherwise; a recent window holding a reply; the replies the poller reads apart; the thread list |
 //! | Slack, narrowed to one thread | Main (every view) newest, as `main` of that channel, from its oldest row; the poller's walk | the thread list |
 //! | Bridge | Flat newest; a recent read through Flat | Main, Thread, `/messages` windows, a read of several channels at once, `/page`, `/count`, the poller's walk |
 //! | Discord | Main newest; Thread newest; the poller's walk | Flat; the thread list |
@@ -65,6 +66,13 @@
 //! at all — no root with replies, and no reply — which is when it IS the Main page. Otherwise every
 //! row is offered with its own home and no claim, and a Flat page never claims a thread: it holds
 //! only the newest replies of each, so a claim would erase the older ones.
+//!
+//! **Slack windows and live replies** (`#307 slack-reply-live`). A Slack conversation's newest
+//! messages carry the replies Flat holds for the threads active among them, so a recent window is
+//! taken as Main's only when it holds no reply, for the reason Flat is. The live poller reads a
+//! conversation's own messages and, apart, the new replies of the threads whose root moved, each
+//! from where it last stood in that thread: its walk lists the conversation's own messages, and
+//! the replies are rows only, since nothing joins them into a span of their thread.
 //!
 //! **Bridge windows.** A recent read through the bridge's Flat view is the newest stretch of the
 //! channel's whole list, and is listed as `flat`. One through `/messages` is not proven to be that
@@ -217,6 +225,11 @@ pub fn timeline(
 
 /// What a read of a channel's most recent messages tells the cache: `fetch_recent_dated`, which
 /// reads a bridge's Flat view when `via_flat`, or `fetch_recent` (never through Flat).
+///
+/// A Slack conversation's newest messages carry the replies Flat holds for the threads active
+/// among them (`#307 slack-reply-live`), and a reply says nothing of whether it was also sent to
+/// the channel: a window holding any reply is no more Main's listing than a Flat page holding one
+/// is, and gives rows only, each at its home and listed in nothing.
 #[must_use]
 pub fn window(
     shape: Shape,
@@ -234,12 +247,13 @@ pub fn window(
         ListStart::At(oldest)
     };
     let bounded = read.notice.is_some();
+    let with_replies = shape == Shape::Slack && holds_a_reply(messages);
     let (scope, proven) = match shape {
         Shape::Bridge => (Scope::Flat, via_flat && !bounded),
-        _ => (Scope::Main, !bounded),
+        _ => (Scope::Main, !bounded && !with_replies),
     };
     if !proven {
-        let listed_in = (shape != Shape::Bridge).then_some(scope);
+        let listed_in = (shape != Shape::Bridge && !with_replies).then_some(scope);
         return rows(shape, messages, None, listed_in, observed_ms)
             .into_iter()
             .collect();
@@ -452,7 +466,8 @@ pub fn posted(
 }
 
 /// What the live poller's walk forward from its cursor tells the cache: every message its pages
-/// returned, all of them newer than `after_ms`, the provider time of the cursor it walked from.
+/// returned, all of them newer than `after_ms`, the provider time of the cursor it walked from,
+/// and `replies`, the thread replies the provider read apart (`#307 slack-reply-live`).
 ///
 /// A walk forward reads the oldest messages after its cursor, page after page, each page starting
 /// after the last message the one before it returned, so what it read is every message between
@@ -463,8 +478,32 @@ pub fn posted(
 /// author, so its shorter page is no proof of the end and the listing stops at the newest message
 /// seen. A bridge's walk reads its `/messages`, which is not proven to be its Flat list: rows only,
 /// as is a walk that ended for any other reason.
+///
+/// The replies are never part of that listing: the provider read each thread from where it last
+/// stood in it, and says nothing a reader could join into any span of that thread. They are rows
+/// only, each at its home and listed in nothing; one that is also among the walk's own messages
+/// (a reply also sent to the channel) is told once, as one of those.
 #[must_use]
 pub fn forward(
+    shape: Shape,
+    rows_read: &[Message],
+    replies: &[Message],
+    after_ms: i64,
+    reached_end: bool,
+    observed_ms: i64,
+) -> Vec<Observation> {
+    let mut out = walked(shape, rows_read, after_ms, reached_end, observed_ms);
+    let apart: Vec<Message> = replies
+        .iter()
+        .filter(|reply| !rows_read.iter().any(|row| row.id == reply.id))
+        .cloned()
+        .collect();
+    out.extend(rows(shape, &apart, None, None, observed_ms));
+    out
+}
+
+/// The part of [`forward`] that the walk's own messages tell the cache.
+fn walked(
     shape: Shape,
     rows_read: &[Message],
     after_ms: i64,
@@ -566,6 +605,16 @@ fn holds_no_thread(messages: &[Message]) -> bool {
             .thread
             .as_ref()
             .is_none_or(|thread| thread.is_root && thread.reply_count.unwrap_or(0) == 0)
+    })
+}
+
+/// Whether a read holds a thread reply: a row of a thread that is not its root.
+fn holds_a_reply(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_root)
     })
 }
 
@@ -1185,12 +1234,92 @@ mod tests {
             (Shape::DiscordNative, Vec::new(), true, vec![]),
         ];
         for (shape, rows, reached_end, expected) in cases {
-            let got = forward(shape, &rows, T, reached_end, OBSERVED);
+            let got = forward(shape, &rows, &[], T, reached_end, OBSERVED);
             assert_eq!(
                 describe(&got),
                 expected,
                 "{shape:?} reached_end={reached_end}"
             );
+            every_observation_is_at(&got, OBSERVED);
+        }
+    }
+
+    /// `#307 slack-reply-live`: a Slack conversation's newest messages carry thread replies, and a
+    /// reply says nothing of whether it was also sent to the channel, so a window holding one is
+    /// rows only, listed in nothing, whatever else the read says. A channel narrowed to one thread
+    /// is that thread, replies and all; Discord's own windows are as before.
+    #[test]
+    fn a_slack_window_holding_a_reply_is_rows_only() {
+        let read = |messages: Vec<Message>, exhausted: bool| RecentRead {
+            messages,
+            exhausted,
+            ..RecentRead::default()
+        };
+        let with_reply = vec![
+            root("m100", T, 1),
+            reply("m150", "m100", "only in the thread", T + 30_000),
+            root("m200", T + 60_000, 0),
+        ];
+        #[rustfmt::skip]
+        let cases: Vec<(Shape, bool, Vec<&str>)> = vec![
+            (Shape::Slack, false, vec!["rows in=- m100=main,m150=thread:m100,m200=main"]),
+            (Shape::Slack, true, vec!["rows in=- m100=main,m150=thread:m100,m200=main"]),
+            (Shape::SlackThread, false,
+             vec!["listing main [+0,newest) complete=false full=true Read m100=main,m150=main,m200=main"]),
+            (Shape::DiscordNative, false,
+             vec!["listing main [+0,newest) complete=true full=true Read m100=main,m150=thread:m100,m200=main"]),
+        ];
+        for (shape, exhausted, expected) in cases {
+            let window_read = read(with_reply.clone(), exhausted);
+            assert_eq!(
+                describe(&window(shape, &window_read, false, OBSERVED)),
+                expected,
+                "{shape:?} exhausted={exhausted}"
+            );
+            assert_eq!(
+                describe(&window_among_several(shape, &window_read, OBSERVED)),
+                expected,
+                "{shape:?} exhausted={exhausted}, among several"
+            );
+        }
+        // The same window with no reply in it, as when every reply fell below its newest rows, is
+        // the conversation's own newest messages: Main's, as before.
+        let own = vec![root("m100", T, 1), root("m200", T + 60_000, 0)];
+        assert_eq!(
+            describe(&window(Shape::Slack, &read(own, false), false, OBSERVED)),
+            ["listing main [+0,newest) complete=false full=true Read m100=main,m200=main"]
+        );
+    }
+
+    /// `#307 slack-reply-live`: the thread replies a provider reads apart for the poller are rows
+    /// only beside its walk, at their homes and listed in nothing, never part of the walk's listing
+    /// nor a claim on their thread; one also among the walk's own messages is told once, there.
+    #[test]
+    fn the_replies_the_poller_reads_apart_are_rows_only_beside_its_walk() {
+        let walked = vec![
+            root("m100", T + 60_000, 2),
+            reply("m300", "m100", "sent to the channel too", T + 300_000),
+        ];
+        let replies = vec![
+            reply("m150", "m100", "only in the thread", T + 90_000),
+            reply("m300", "m100", "sent to the channel too", T + 300_000),
+        ];
+        #[rustfmt::skip]
+        let cases: Vec<(Vec<Message>, bool, Vec<&str>)> = vec![
+            (walked.clone(), true, vec![
+                "listing main [+1,+300001) complete=false full=true Poll m100=main,m300=thread:m100",
+                "rows in=- m150=thread:m100",
+            ]),
+            (walked.clone(), false, vec![
+                "rows in=main m100=main,m300=thread:m100",
+                "rows in=- m150=thread:m100",
+            ]),
+            // A tick whose own messages brought nothing new still tells its replies.
+            (Vec::new(), true, vec!["rows in=- m150=thread:m100,m300=thread:m100"]),
+        ];
+        for (rows_read, reached_end, expected) in cases {
+            let got = forward(Shape::Slack, &rows_read, &replies, T, reached_end, OBSERVED);
+            assert_eq!(describe(&got), expected, "reached_end={reached_end}");
             every_observation_is_at(&got, OBSERVED);
         }
     }

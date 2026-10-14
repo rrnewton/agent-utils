@@ -3762,6 +3762,13 @@ with the process.
   word about the one place it looked. Slack's coverage is never complete, because its client
   omits a message that has no author.
 
+  Slack's newest messages carry the replies Flat holds for the threads active among them
+  (`#307 slack-reply-live`), and nothing in a reply says whether it was also sent to the channel.
+  So a window holding a reply, read for `/messages`, the voice tools or the catch-up, is rows
+  only, each reply kept in its thread alone. The live poller's walk lists the conversation's own
+  messages and nothing else; the replies it reads apart are rows only, and claim nothing of their
+  thread, since each thread is read from where the poller last stood in it.
+
 ### What the cache would have served
 
 Some reads are ones a later build will answer from the cache: `/messages` and its callers (the
@@ -3792,6 +3799,11 @@ starts:
 
 With a table but no file open, an ask counts as `off`. With no table, nothing is counted. An ask
 the cache would never answer, such as Slack's Flat view, is not counted at all.
+
+A Slack window upstream carries thread replies (`#307 slack-reply-live`), and the cache answers a
+window from the channel's own messages. Where it would have served one, the replies upstream
+listed in the stretch both answers cover count as missing rows: a serving build has to answer
+those windows from the threads too, or not at all. That is open in #297 cache-coverage-races.
 
 `backfill` and `timeline_fallback_ms` are read and checked, and do nothing in this build. There is
 no backfill yet, and nothing is answered from the cache when a timeline read is slow.

@@ -1006,6 +1006,54 @@ async fn a_slack_http_403_with_no_slack_code_never_erases_nor_forgets_summaries(
         .await;
 }
 
+/// `#307 slack-reply-live`: the live poller reads a Slack conversation through `fetch_live`, which
+/// reads its history as `fetch_page` did. Slack's `channel_not_found` there is heard as a read of
+/// the channel refused, whoever made the read: the channel is in doubt and blocked, and the
+/// poller's next read that succeeds lifts both.
+#[tokio::test]
+async fn the_slack_pollers_live_read_refused_puts_the_channel_in_doubt_and_its_next_read_lifts_it()
+{
+    let fake = slack_fake::Fake::start(slack_history(), 10).await;
+    let dir = TempDir::new("cache-access-slack-live");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let chan = ChanKey::new(SLACK, SLACK_CH);
+    let channel = id(SLACK_CH);
+    let mut cursor = None;
+    vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("seeded");
+    assert!(state.providers.access().suspects().is_empty());
+
+    fake.with(|s| {
+        s.fail.insert(
+            "conversations.history".to_owned(),
+            "channel_not_found".to_owned(),
+        );
+    });
+    vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+        .await
+        .expect_err("refused");
+    let suspects = state.providers.access().suspects();
+    assert_eq!(suspects.len(), 1, "{suspects:?}");
+    assert_eq!(suspects[0].provider_key, SLACK);
+    assert_eq!(suspects[0].channel, channel);
+    assert_eq!(suspects[0].thread, None);
+    assert!(blocked(&cache, &chan, &CacheScope::Main));
+
+    fake.with(|s| s.fail.clear());
+    vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("read again");
+    assert!(
+        state.providers.access().suspects().is_empty(),
+        "the poller's read that succeeded cleared the doubt"
+    );
+    assert!(!blocked(&cache, &chan, &CacheScope::Main));
+    assert_eq!(total(&cache), 6, "nothing erased");
+}
+
 #[tokio::test]
 async fn one_refusal_blocks_without_erasing_and_the_servers_own_read_ten_minutes_on_erases() {
     let dir = TempDir::new("cache-access-confirmed");

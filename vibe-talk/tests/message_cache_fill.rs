@@ -720,6 +720,133 @@ async fn a_newest_slack_window_with_an_authorless_row_never_claims_the_channels_
     );
 }
 
+/// Six messages a minute apart from the Slack fake's base time; the second roots a thread with
+/// one reply ten seconds after it. Returns the fixture and the root's `ts`.
+fn slack_conversation_with_a_thread() -> (slack_fake::FakeState, String) {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    let root = slack_fake::ts(60, 0);
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut list[1],
+        &[(slack_fake::ts(70, 0), "an earlier reply".to_owned())],
+    );
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    (fixture, root)
+}
+
+/// `#307 slack-reply-live`: a Slack conversation's newest messages carry the replies Flat holds for
+/// the threads active among them, and nothing in a reply says whether it was also sent to the
+/// channel. A write-scope window holding one keeps every row, the reply in its thread alone, and
+/// claims nothing: taken as Main's listing, it would have put the reply in Main.
+#[tokio::test]
+async fn a_slack_window_holding_a_thread_reply_keeps_its_rows_and_claims_nothing() {
+    let (fixture, root) = slack_conversation_with_a_thread();
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-slack-reply-window");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let window =
+        vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+            .await
+            .expect("a window");
+    let reply = slack_id(&slack_fake::ts(70, 0));
+    assert!(
+        window.messages.iter().any(|message| message.id == reply),
+        "the window holds the thread's reply"
+    );
+    let cache = state.message_cache.cache().expect("installed");
+    assert_eq!(held(&cache), 7, "every row is kept, the reply included");
+    assert_eq!(
+        cache
+            .memberships(&slack_chan(), &reply)
+            .served()
+            .expect("a read"),
+        [CacheScope::Thread(root.clone())],
+        "the reply is in its thread, not in Main"
+    );
+    assert!(
+        coverage(&cache, &slack_chan(), &CacheScope::Main).is_empty(),
+        "a window holding a reply is no listing of Main"
+    );
+    assert!(coverage(&cache, &slack_chan(), &CacheScope::Thread(root)).is_empty());
+}
+
+/// `#307 slack-reply-live`: the live poller reads a Slack conversation through `fetch_live`. Its
+/// seed, the conversation's own newest messages, is a recent window as before; a reply it reads
+/// apart is kept, in its thread alone, and claims nothing of Main or of the thread.
+#[tokio::test]
+async fn the_slack_pollers_replies_read_apart_are_kept_as_rows_and_claim_nothing() {
+    let (fixture, root) = slack_conversation_with_a_thread();
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-slack-poller");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let channel = id(SLACK_CH);
+    let mut cursor = None;
+
+    let seeded_at = clock.now();
+    vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("seeded");
+    let seed = Interval {
+        t0_ms: slack_ms(0),
+        t1_ms: slack_ms(300) - SETTLE_MS,
+        listed_ms: seeded_at,
+        full_ms: Some(seeded_at),
+        complete: false,
+        source: Source::Read,
+    };
+    assert_eq!(held(&cache), 6, "the seed reads no thread");
+    assert_eq!(coverage(&cache, &slack_chan(), &CacheScope::Main), [seed]);
+
+    fake.with(|state| {
+        slack_fake::add_reply(
+            state,
+            SLACK_CH,
+            &root,
+            &slack_fake::ts(400, 0),
+            "a new reply",
+        );
+    });
+    clock.advance(MINUTE);
+    let tick =
+        vibe_talk::live::poll_once(state.chat.as_ref(), &state.live, &channel, 50, &mut cursor)
+            .await
+            .expect("polled");
+    assert_eq!(tick.published, 1, "the reply, read apart");
+    let reply = slack_id(&slack_fake::ts(400, 0));
+    assert_eq!(held(&cache), 7);
+    assert_eq!(
+        cache
+            .memberships(&slack_chan(), &reply)
+            .served()
+            .expect("a read"),
+        [CacheScope::Thread(root.clone())],
+        "the reply is in its thread, not in Main"
+    );
+    assert_eq!(
+        coverage(&cache, &slack_chan(), &CacheScope::Main),
+        [seed],
+        "the reply claims nothing of Main"
+    );
+    assert!(
+        coverage(&cache, &slack_chan(), &CacheScope::Thread(root)).is_empty(),
+        "nor of its thread"
+    );
+}
+
 #[tokio::test]
 async fn a_long_slack_thread_whose_read_narrows_never_claims_its_start_nor_erases_its_older_replies(
 ) {

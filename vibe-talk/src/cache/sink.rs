@@ -492,12 +492,20 @@ impl Fill {
     }
 
     /// Offer what the live poller's walk forward from its cursor read: every message its pages
-    /// returned, `after_ms` the provider time of the cursor it walked from, and `reached_end`
-    /// whether it ended on a page shorter than it asked for, rather than at its page bound.
-    pub fn offer_forward(self, messages: &[Message], after_ms: i64, reached_end: bool) {
+    /// returned, the thread replies its provider read apart (`#307 slack-reply-live`), `after_ms`
+    /// the provider time of the cursor it walked from, and `reached_end` whether it ended on a page
+    /// shorter than it asked for, rather than at its page bound.
+    pub fn offer_forward(
+        self,
+        messages: &[Message],
+        replies: &[Message],
+        after_ms: i64,
+        reached_end: bool,
+    ) {
         let observations = observe::forward(
             self.shape,
             messages,
+            replies,
             after_ms,
             reached_end,
             self.observed_ms,
@@ -1914,7 +1922,7 @@ mod tests {
             }),
             ("single", |fill, message| fill.offer_single(message, "1")),
             ("forward", |fill, message| {
-                fill.offer_forward(std::slice::from_ref(message), T, false);
+                fill.offer_forward(std::slice::from_ref(message), &[], T, false);
             }),
             ("posted", |fill, message| fill.offer_posted(message, None)),
         ];

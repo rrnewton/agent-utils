@@ -800,6 +800,12 @@ pub struct Tick {
 /// publishes reaches the cache through the hub as well, as every published change does, as of when
 /// the tick's read began rather than when it is published.
 ///
+/// Through [`ChatClient::fetch_live`] (`#307 slack-reply-live`), the seed is the conversation's
+/// own newest messages, offered as a recent window as well, though from no copy, so as of the
+/// read's start; the walk's listing holds the conversation's own messages and nothing else; and
+/// the thread replies read apart are offered as rows only, never as part of that listing nor as
+/// a claim on their thread: the provider read each thread from where it last stood in it.
+///
 /// # Errors
 ///
 /// [`ChatError`] from the fetch. **The cursor is not advanced past anything that was not
@@ -869,6 +875,8 @@ pub async fn poll_once(
     // messages: a page shorter than asked for, rather than the page bound or a page it could not
     // move past.
     let mut walked: Vec<Message> = Vec::new();
+    // The thread replies the provider read apart, for the cache too: rows only.
+    let mut walked_replies: Vec<Message> = Vec::new();
     let mut ran_out = false;
     for page in 0..MAX_PAGES_PER_TICK {
         let after = MessageId(at.to_string());
@@ -902,6 +910,7 @@ pub async fn poll_once(
         let before = at;
         if fill.is_some() {
             walked.extend(messages.iter().cloned());
+            walked_replies.extend(replies.iter().cloned());
         }
         // Each arrival with its id, and whether it is a reply read apart.
         let mut arrivals: Vec<(u64, Message, bool)> = Vec::new();
@@ -949,6 +958,7 @@ pub async fn poll_once(
         let after_ms = MessageId(seen.to_string()).created_at_ms();
         fill.offer_forward(
             &walked,
+            &walked_replies,
             after_ms.unwrap_or(i64::MAX),
             ran_out && after_ms.is_some(),
         );
