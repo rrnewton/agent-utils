@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-292-cf9963acf4c",
+    "issue_id": "agent-utils-292",
+    "author": "opus 5.5",
+    "body": "[opus 5.5] Delivered on the bridge in 6a4c89c1, de569f8b, 76f54531 and 2392b053 (stacked on #291 stop-lost-wakeup): an unanswered delivered request gets one reminder once a Claude Code coordinator has been idle for --reply-reminder-idle (default 60s, 10s to 12h), recorded in reply-reminders.json before it is queued, never queued behind another prompt, taken back out of the queue when not typed within 10 s or after any failed send, never sent for requests older than the record's start or 24 h; a reminder taken back holds off the next until the agent is seen working or a doubling retry delay (at most 60 minutes) passes. Each rule has a test. Not done: chat tick and other senders do not take back a reminder stuck in the queue; chat status does not report reminder state; the Python Google Chat bridge has the same thinking-only gap; the composer take-back of a never-accepted reminder is tested at the queue level only, since the managed-agent test double has no composer; the 60 s default rests on reasoning plus one measurement (0.7-0.9 s per claude agents --json at load ~75).",
+    "created_at": "2026-10-14T19:08:44.454939817Z",
+    "updated_at": "2026-10-14T19:08:44.454939817Z"
+  }
+]
