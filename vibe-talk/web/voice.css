@@ -7159,8 +7159,18 @@ textarea {
  * card up with the cards of the list under it.
  *
  * A FIXED HEIGHT: three lines of text, clamped as a list card's are, then a facts line as tall as the
- * X. So the card is the same height whatever it says, and a summary or a count arriving after the
- * thread opened moves nothing under the reader (`#280 scroll-stability`).
+ * X, and never less than two lines of the count. So the card is the same height whatever it says, and
+ * a summary or a count arriving after the thread opened moves nothing under the reader (`#280
+ * scroll-stability`).
+ *
+ * LARGER TYPE ON A PHONE. The facts line holds the age, the count and the X, and at 150% type on a
+ * 360px phone they no longer fit on one line. The age is never narrower than its own words, which
+ * were drawn over the count when it was the only column that could give way, and the X is a thumb's
+ * 44px rather than a size that grows with the type until it is off the screen. The count gives way:
+ * it wraps, between its parts first ("123 replies ·" over "99+ unread"), in a line height that puts
+ * two of its lines in the facts line's least height, so wrapping moves nothing either. The gaps
+ * between the three stop growing with the type at 10px, which leaves the count that much more room
+ * before it has to break inside a part.
  *
  * It must never carry `data-highlighted`, whose rule unclamps a card's text: the ring and the tint are
  * stated here instead.
@@ -7175,7 +7185,9 @@ textarea {
 .side-card-row.thread-card-header {
   flex: 1 1 auto;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(min-content, 1fr) minmax(min-content, auto) auto;
+  grid-template-rows: auto minmax(1.75rem, auto);
+  column-gap: min(0.6rem, 10px);
   padding-inline-end: 0.3rem;
   border-color: hsl(var(--thread-hue, 210) 55% 50%);
   background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
@@ -7194,16 +7206,25 @@ textarea {
 }
 
 /* "3 replies · 2 unread", said rather than pressed: the thread is open. Its unread in the accent, as
-   on the card's button (`.side-card-unread`). */
+   on the card's button (`.side-card-unread`). Where the facts line is too narrow for it, it wraps
+   (above): each part as a whole, onto a line of its own, and within a part only where the part alone
+   is wider than the line. Two of its lines are the facts line's least height. */
 .thread-card-count {
   grid-column: 2;
   font-size: 0.8rem;
-  white-space: nowrap;
+  line-height: calc(1.75rem / 2);
+  text-align: end;
   color: var(--ink);
 }
 
+.thread-card-count > span {
+  display: inline-block;
+  max-width: 100%;
+}
+
 /* The X, at the end of the facts line: a mouse's way back to the cards, the size of the card's own
-   chip on a desk, and a thumb's under a finger. */
+   chip on a desk, and a thumb's under a finger — 44px whatever the type size, which a size in rem
+   was not: at 175% type it ended past the edge of a 360px phone, and at 200% it was off it. */
 .thread-card-close {
   grid-column: 3;
   width: 1.75rem;
@@ -7212,8 +7233,8 @@ textarea {
 
 @media (pointer: coarse) {
   .thread-card-close {
-    width: 2.75rem;
-    height: 2.75rem;
+    width: 44px;
+    height: 44px;
   }
 }
 

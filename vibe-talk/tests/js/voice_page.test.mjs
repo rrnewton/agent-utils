@@ -46419,6 +46419,24 @@ test("`#298 thread-card-header`: the card at the top of a thread is in the right
   // size on the facts line, which the count beside it is shorter than.
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /(^|[^-])height:\s*calc\(3 \* 1\.35em\)/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-close"), /(^|[^-])height:\s*1\.75rem/);
+  // From review, larger type on a phone: the facts line no longer fits on one line at 150% type on a
+  // 360px phone, and the age, the only column that could give way, was squeezed under its own words
+  // and drawn over the count, while an X sized in rem grew off the screen. The age is never narrower
+  // than its words; the count gives way, wrapping its parts whole, two of its lines being the facts
+  // line's least height so that wrapping moves nothing; and the X is a thumb's 44px at any type size.
+  // tests/thread_card_header_browser.py measures it at 130% and 150% type.
+  assert.match(look, /grid-template-columns:\s*minmax\(min-content, 1fr\) minmax\(min-content, auto\) auto;/,
+    "the age can be squeezed under its own words");
+  assert.match(look, /grid-template-rows:\s*auto minmax\(1\.75rem, auto\);/, "the facts line has no least height for two lines of count");
+  const count = cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-count");
+  assert.doesNotMatch(count, /white-space:\s*nowrap/, "the count cannot give way");
+  assert.match(count, /line-height:\s*calc\(1\.75rem \/ 2\);/, "two lines of the count are not the facts line's least height");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-count > span"), /display:\s*inline-block;/,
+    "the count's parts do not wrap whole");
+  assert.match(CSS_CODE, /@media \(pointer: coarse\) \{\s*\.thread-card-close \{\s*width: 44px;\s*height: 44px;\s*\}\s*\}/,
+    "the X under a finger is not 44px whatever the type size");
+  assert.ok(cssRules(CSS_CODE, ".thread-card-close").every((rule) => !/rem/.test(rule) || /1\.75rem/.test(rule)),
+    "the X under a finger grows with the type");
   // Opened, its text whole over the list, above the links and the line under the heading.
   const opened = cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-expanded] > .side-card > .side-card-text");
   assert.match(opened, /-webkit-line-clamp:\s*none/);

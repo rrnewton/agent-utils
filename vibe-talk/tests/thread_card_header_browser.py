@@ -55,6 +55,13 @@ On a 412x915 phone by touch, in the dark scheme and the light: the thread list f
 -> a card's replies button: the card moves up to the top of the screen and heads the thread, two
 lines of it, its X a thumb's size -> the thread scrolled: the card does not move -> the X: the list.
 
+With the larger type a phone reader's own settings give, stood in for by the root font as
+tests/offline_cache_browser.py does (130% and 150% on a 360x800 phone, 150% on 412x915): the card
+heading the thread, saying what it says and then what a busier thread would ("3d3h", "123 replies ·
+99+ unread") -> its age whole and ending before the count starts, the count before the X, the X a
+thumb's size inside the card and the screen, the page no wider than the screen, the card the same
+height whatever it says -> the X: the list.
+
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each state
 for review; --web-root DIR to run the same walk against another copy of the page.
 """
@@ -72,7 +79,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
-from offline_cache_browser import Json, check, handler_for
+from offline_cache_browser import Json, check, handler_for, larger_root_font
 from offline_cache_browser import TOKEN
 from thread_card_focus_browser import COLOURED, COLOURED_PIXEL, PIXELS_JS, chroma, open_two_columns
 from two_column_browser import REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
@@ -80,14 +87,19 @@ from two_column_browser import REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
 
-# (label, width, height, colour scheme, walk): the desk in both schemes, the desk asking for reduced
-# motion, and the phone in both schemes.
+# (label, width, height, colour scheme, walk, root font percent): the desk in both schemes, the desk
+# asking for reduced motion, the phone in both schemes, and the phones with larger type — where the
+# facts line's age, count and X stop fitting on one line: 360px at 130% and 150%, and 412px at 150%,
+# the sizes tests/offline_cache_browser.py walks the other phone controls at.
 SIZES = (
-    ("desk-1280-dark", 1280, 800, "dark", "desk"),
-    ("desk-1280-light", 1280, 800, "light", "desk"),
-    ("desk-1280-reduced", 1280, 800, "dark", "reduced"),
-    ("phone-412-dark", 412, 915, "dark", "phone"),
-    ("phone-412-light", 412, 915, "light", "phone"),
+    ("desk-1280-dark", 1280, 800, "dark", "desk", 100),
+    ("desk-1280-light", 1280, 800, "light", "desk", 100),
+    ("desk-1280-reduced", 1280, 800, "dark", "reduced", 100),
+    ("phone-412-dark", 412, 915, "dark", "phone", 100),
+    ("phone-412-light", 412, 915, "light", "phone", 100),
+    ("phone-360-font-130", 360, 800, "dark", "type", 130),
+    ("phone-360-font-150", 360, 800, "dark", "type", 150),
+    ("phone-412-font-150", 412, 915, "dark", "type", 150),
 )
 
 # The root of the summarised thread's card on Main.
@@ -190,6 +202,39 @@ WIDE_JS = """() => {
 }"""
 
 
+# The facts line of the card heading a thread across the window — its age, its count and its X — as
+# Chromium lays it out: the box each has and the box its words are drawn in, line by line for the
+# count. With `busier`, first saying what a busier thread's card would ("3d3h", "123 replies · 99+
+# unread"), in the parts the page draws them in (web/voice.js `cardCountParts`).
+FACTS_JS = """(busier) => {
+    const box = (r) => ({left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height});
+    const card = document.getElementById('thread-card');
+    const age = document.getElementById('thread-card-age');
+    const count = document.getElementById('thread-card-count');
+    if (busier) {
+        const part = (name, words) => { const span = document.createElement('span'); span.className = name; span.textContent = words; return span; };
+        age.textContent = '3d3h';
+        count.replaceChildren(part('side-card-replies', '123 replies'), document.createTextNode(' · '), part('side-card-unread', '99+ unread'));
+        count.hidden = false;
+    }
+    const words = (node) => { const range = document.createRange(); range.selectNodeContents(node);
+        return [...range.getClientRects()].filter((r) => r.width > 0).map(box); };
+    const ageWords = words(age), countWords = words(count);
+    const lineHeight = parseFloat(getComputedStyle(count).lineHeight);
+    return {
+        age: box(age.getBoundingClientRect()), ageWords: box(ageWords.reduce((a, r) => ({left: Math.min(a.left, r.left),
+            right: Math.max(a.right, r.right), top: Math.min(a.top, r.top), bottom: Math.max(a.bottom, r.bottom)}),
+            {left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity})),
+        countWords, countLines: countWords.length ? Math.round((Math.max(...countWords.map((r) => r.bottom))
+            - Math.min(...countWords.map((r) => r.top))) / lineHeight) : 0,
+        said: [age.textContent, count.textContent],
+        close: box(document.getElementById('thread-back').getBoundingClientRect()),
+        card: box(card.getBoundingClientRect()),
+        overflow: document.documentElement.scrollWidth,
+    };
+}"""
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -225,15 +270,15 @@ def main() -> int:
     fixture.WEB_ROOT = args.web_root.resolve()
     report: list[str] = []
     with sync_playwright() as playwright:
-        for label, width, height, scheme, kind in SIZES:
-            report.append(walk(playwright.chromium, args, label, width, height, scheme, kind))
+        for label, width, height, scheme, kind, root_percent in SIZES:
+            report.append(walk(playwright.chromium, args, label, width, height, scheme, kind, root_percent))
     for line in report:
         print(line)
     return 0
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, scheme: str,
-         kind: str) -> str:
+         kind: str, root_percent: int) -> str:
     """One reader at one size in one scheme, against a fresh fake API and a fresh browser profile."""
     api = ColumnsApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
@@ -242,7 +287,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-card-header-") as profile:
-            if kind == "phone":
+            if kind in ("phone", "type"):
                 context = chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": width, "height": height}, color_scheme="light" if scheme == "light" else "dark",
@@ -260,6 +305,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, label, width, height)
+            larger_root_font(page, root_percent)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             if kind == "desk":
                 desk_walk(desk)
@@ -267,11 +313,14 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 esc_walk(desk)
             elif kind == "reduced":
                 reduced_walk(desk)
+            elif kind == "type":
+                type_walk(desk, root_percent)
             else:
                 phone_walk(desk)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
-            return f"{version} at {width}x{height}, {scheme}{', reduced motion' if kind == 'reduced' else ''}: " + "; ".join(desk.notes)
+            said = f"{', reduced motion' if kind == 'reduced' else ''}{f', root font {root_percent}%' if root_percent != 100 else ''}"
+            return f"{version} at {width}x{height}, {scheme}{said}: " + "; ".join(desk.notes)
     finally:
         api.stopping.set()
         server.shutdown()
@@ -767,7 +816,8 @@ def reduced_walk(desk: Desk) -> None:
 # --- on a phone --------------------------------------------------------------------------------------------
 
 
-def phone_walk(desk: Desk) -> None:
+def phone_thread_list(desk: Desk) -> None:
+    """Signed in on a phone, the channel in All, then the thread list from the view picker."""
     page = desk.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
@@ -780,6 +830,11 @@ def phone_walk(desk: Desk) -> None:
                   "the view picker did not show the thread list")
     desk.settled()
     desk.settled()
+
+
+def phone_walk(desk: Desk) -> None:
+    page = desk.page
+    phone_thread_list(desk)
     card, said = list_card(desk, RUNNER)
     desk.shot("1-thread-list")
 
@@ -803,6 +858,68 @@ def phone_walk(desk: Desk) -> None:
     desk.notes.append(f"a tap on a replies button in the thread list moved its card up {card['y'] - number(box, 'top'):.0f}px "
                       f"to head the thread, two lines and {number(box, 'height'):.0f}px, its X {number(back, 'width'):.0f}px, "
                       "fixed while the thread scrolled; the X went back to the list")
+
+
+
+# --- on a phone, with larger type -----------------------------------------------------------------------
+
+
+def facts(desk: Desk, busier: bool = False) -> Json:
+    found: Json = desk.page.evaluate(FACTS_JS, busier)
+    return found
+
+
+def check_facts(desk: Desk, found: Json, where: str) -> None:
+    """The facts line legible: the age whole, inside its own box, and ending before the count starts;
+    the count's words ending before the X, on at most two lines; the X a thumb's size, inside the card
+    and the screen; the card inside the screen, and the page no wider than it."""
+    age, words, close, card = part(found, "age"), part(found, "ageWords"), part(found, "close"), part(found, "card")
+    lines, said = found["countWords"], found["said"]
+    assert isinstance(lines, list) and isinstance(said, list)
+    age_said, count_said = str(said[0]), str(said[1])
+    counted = [line for line in lines if isinstance(line, dict)]
+    desk.check(bool(counted), f"{where}: the count says nothing: {said}")
+    desk.check(number(words, "right") <= number(age, "right") + 0.5,
+               f"{where}: the age {age_said!r} is drawn past its own box, {words['right']:.1f} > {age['right']:.1f}")
+    start = min(number(line, "left") for line in counted)
+    end = max(number(line, "right") for line in counted)
+    desk.check(number(words, "right") + 4 <= start,
+               f"{where}: the age {age_said!r} ends at {words['right']:.1f}, and the count {count_said!r} starts at {start:.1f}")
+    desk.check(end <= number(close, "left"), f"{where}: the count ends at {end:.1f}, over the X at {close['left']:.1f}")
+    desk.check(number(found, "countLines") <= 2, f"{where}: the count {count_said!r} takes {found['countLines']} lines")
+    desk.check(number(close, "width") >= 44 and number(close, "height") >= 44, f"{where}: the X is not a thumb's size: {close}")
+    desk.check(number(close, "left") >= number(card, "left") and number(close, "right") <= number(card, "right")
+               and number(close, "top") >= number(card, "top") and number(close, "bottom") <= number(card, "bottom"),
+               f"{where}: the X is not inside the card: {close} in {card}")
+    desk.check(number(card, "left") >= 0 and number(card, "right") <= desk.width and number(close, "right") <= desk.width,
+               f"{where}: the card or its X is past the edge of the {desk.width}px screen: {card}, the X {close}")
+    desk.check(number(found, "overflow") <= desk.width, f"{where}: the page is {found['overflow']}px wide on a {desk.width}px screen")
+
+
+def type_walk(desk: Desk, root_percent: int) -> None:
+    """`#298 thread-card-header` with larger type: the card heading a thread across the window, from the
+    thread list, saying what it says and then what a busier thread would, each legible and the card
+    the same height; then its X, by touch, back to the list."""
+    phone_thread_list(desk)
+    into_list_thread(desk, RUNNER, tap=True)
+    at_rest(desk, "thread-card", "pane-discord")
+    plain = facts(desk)
+    check_facts(desk, plain, f"at {root_percent}% type, its own words")
+    desk.shot("1-thread")
+    busy = facts(desk, busier=True)
+    check_facts(desk, busy, f"at {root_percent}% type, a busier thread's words")
+    plain_card, busy_card = part(plain, "card"), part(busy, "card")
+    desk.check(abs(number(busy_card, "height") - number(plain_card, "height")) <= 0.5,
+               f"at {root_percent}% type the card is {plain_card['height']}px tall saying {plain['said']} and "
+               f"{busy_card['height']}px saying {busy['said']}")
+    desk.shot("2-busier")
+    close = part(busy, "close")
+    desk.page.touchscreen.tap(number(close, "left") + number(close, "width") / 2, number(close, "top") + number(close, "height") / 2)
+    back_in_list(desk, "the X")
+    desk.notes.append(f"at {root_percent}% type the card heading the thread said {plain['said']}, then {busy['said']} on "
+                      f"{number(busy, 'countLines'):.0f} lines of count, its age whole and clear of the count, its "
+                      f"{number(close, 'width'):.0f}px X inside the card and the screen, {number(plain_card, 'height'):.0f}px "
+                      "tall either way; the X went back to the list")
 
 
 if __name__ == "__main__":
