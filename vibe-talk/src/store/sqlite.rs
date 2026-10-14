@@ -5747,6 +5747,157 @@ mod tests {
         assert_eq!(page.turns[0].turn.detail, None);
     }
 
+    /// The README's rollback for the detail step, exactly as an operator would paste it: the
+    /// lines between `<<'SQL'` and `SQL` in the block after "Step 17".
+    fn readme_rollback() -> Vec<String> {
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("the README");
+        let step = readme
+            .find("**Step 17 (`#270 voice-transcript-markers`)**")
+            .expect("the README describes undoing the detail step");
+        let after = &readme[step..];
+        let open = after
+            .find("<<'SQL'\n")
+            .expect("the rollback is a here-document")
+            + 8;
+        let body = &after[open..];
+        let close = body.find("\nSQL\n").expect("the here-document ends");
+        body[..close].lines().map(str::to_owned).collect()
+    }
+
+    /// Every table, index and trigger of a file, as SQLite wrote their definitions.
+    fn schema_of(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+            .expect("schema query");
+        statement
+            .query_map([], |row| {
+                Ok(format!(
+                    "{} {} {}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default()
+                ))
+            })
+            .expect("schema rows")
+            .collect::<Result<_, _>>()
+            .expect("schema")
+    }
+
+    #[tokio::test]
+    async fn the_readme_rollback_stops_before_changing_anything_and_restores_the_previous_schema() {
+        // An older sqlite3 refuses the `DROP COLUMN` (and cannot read the STRICT tables at all).
+        // Without `.bail on` the tool carried on: it stamped the old version and committed with the
+        // column still there, leaving a file this build could not open again (the column its
+        // upgrade adds already existed). So the script stops at the first refusal, and that
+        // refusal comes before its first change.
+        let script = readme_rollback();
+        assert_eq!(
+            script.first().map(String::as_str),
+            Some(".bail on"),
+            "{script:?}"
+        );
+        let statements: Vec<&String> = script
+            .iter()
+            .filter(|line| !line.starts_with('.'))
+            .collect();
+        assert_eq!(statements[0], "BEGIN IMMEDIATE;", "{script:?}");
+        assert!(
+            statements[1].starts_with("ALTER TABLE turns DROP COLUMN detail"),
+            "the first change is not the one an older sqlite3 refuses: {script:?}"
+        );
+        assert_eq!(statements.last().map(|line| line.as_str()), Some("COMMIT;"));
+
+        let at = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("ADD COLUMN detail"))
+            .expect("the detail step");
+        let dir = TempDir::new("sqlite-detail-rollback");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        {
+            let store =
+                SqliteStore::open(&file, Retention::default()).expect("a file at this step");
+            for row in [
+                Turn::now(Speaker::Agent, "To lead team: ship it. Send it?"),
+                Turn::record(Speaker::You, "yes", Some(TurnDetail::Answer { serial: 7 })),
+                sent(7, "ship it"),
+            ] {
+                store
+                    .append_turn(&id("spoken"), &row)
+                    .await
+                    .expect("append");
+            }
+            // A conversation that holds nothing but a marker goes with it.
+            store
+                .append_turn(&id("marked"), &marker(start(RecapNone::Off)))
+                .await
+                .expect("append");
+        }
+        // The bundled SQLite is new enough for `DROP COLUMN`, as the README requires.
+        let connection = Connection::open(&file).expect("open for the rollback");
+        let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();
+        connection
+            .execute_batch(&pasted)
+            .expect("the rollback runs");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(
+            version,
+            i64::try_from(at).expect("small"),
+            "the file is not at the previous step"
+        );
+        let fresh_dir = TempDir::new("sqlite-detail-rollback-fresh");
+        let fresh = Connection::open(fresh_dir.path().join("fresh.sqlite3")).expect("fresh");
+        for migration in &MIGRATIONS[..at] {
+            fresh.execute_batch(migration).expect("previous schema");
+        }
+        assert_eq!(
+            schema_of(&connection),
+            schema_of(&fresh),
+            "the rollback left another schema"
+        );
+        let speakers: Vec<(String, String)> = connection
+            .prepare("SELECT conversation_id, speaker FROM turns ORDER BY conversation_id, seq")
+            .expect("rows")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            speakers,
+            [
+                ("spoken".to_owned(), "agent".to_owned()),
+                ("spoken".to_owned(), "you".to_owned())
+            ],
+            "a record row survived, or a spoken one went"
+        );
+        let conversations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(conversations, 1, "a conversation of markers alone survived");
+        let broken: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign keys");
+        assert_eq!(broken, 0);
+        drop(connection);
+
+        // And this build upgrades the rolled-back file again.
+        let store = SqliteStore::open(&file, Retention::default()).expect("upgrade again");
+        let turns = store.turns(&id("spoken")).await.expect("turns");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[1].text, "yes",
+            "the tagged yes is an ordinary turn now"
+        );
+        store
+            .append_turn(&id("spoken"), &sent(8, "and again"))
+            .await
+            .expect("a record row after upgrading again");
+    }
+
     #[tokio::test]
     async fn the_disabled_store_refuses_record_rows_like_any_other() {
         let disabled = crate::store::disabled::DisabledStore;
