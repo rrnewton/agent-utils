@@ -1640,7 +1640,6 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // Every `ChannelInfo` the server serializes carries both, so a test that describes only
         // the fields it cares about still gets a conformant answer.
         channels: page.channels.map((channel) => ({ alias: null, added: false, ...channel })),
-        elevenlabs_agent_id: page.agentId,
         conversational_voice: {
           name: page.voiceProviderName,
           settings_url: page.agentSettingsUrl,

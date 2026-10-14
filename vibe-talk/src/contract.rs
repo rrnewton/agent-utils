@@ -56,9 +56,6 @@ pub struct ClientConfigResponse {
     /// none are hidden, and from an older server, which could not hide one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_channels: Vec<ChannelInfo>,
-    /// ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
-    /// widget. The API key never leaves the server.
-    pub elevenlabs_agent_id: Option<String>,
     /// Selected conversational voice provider, named by its implementation.
     pub conversational_voice: crate::conversation::VoiceDescription,
     /// Selected read-aloud backend and the playback interface the browser should use.

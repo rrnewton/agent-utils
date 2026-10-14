@@ -403,7 +403,7 @@ Keep ElevenLabs' hosted LLM. Nothing in this project needs you to bring your own
 
 1. Create the agent: <https://elevenlabs.io/app/agents> → new agent. A blank/default template is
    fine. Open it, and **the agent id is in the dashboard URL** — it starts `agent_`. That is
-   `VIBE_TALK_ELEVENLABS_AGENT_ID`, and it is public: it identifies a widget.
+   `VIBE_TALK_ELEVENLABS_AGENT_ID`, and it is public: it names an agent, not an account.
 2. Create the API key: <https://elevenlabs.io/app/settings/api-keys> → **Create API Key** → copy
    it. **It is shown once.** That is `VIBE_TALK_ELEVENLABS_API_KEY`, and it is used for two things:
    minting the short-lived signed URLs that open a conversation with an authenticated agent, and

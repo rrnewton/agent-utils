@@ -183,11 +183,6 @@ declare namespace VibeTalk {
      */
     conversational_voice: VoiceDescription;
     /**
-     * ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
-     * widget. The API key never leaves the server.
-     */
-    elevenlabs_agent_id: string | null;
-    /**
      * Channels from the configuration file the owner took off his list, in configuration order.
      * `#199 removable-config-channels`.
      *

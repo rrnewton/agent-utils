@@ -100,7 +100,6 @@
         "name": "voice",
         "settings_url": "https://voice.example/settings"
       },
-      "elevenlabs_agent_id": "agent",
       "hidden_channels": [
         {
           "added": false,
@@ -215,7 +214,6 @@
       "conversational_voice": {
         "name": "voice"
       },
-      "elevenlabs_agent_id": null,
       "live_delivery": "poll",
       "live_poll_seconds": 5,
       "owner_author_id": null,
@@ -294,7 +292,6 @@
       "conversational_voice": {
         "name": "voice"
       },
-      "elevenlabs_agent_id": null,
       "live_delivery": "off",
       "live_poll_seconds": 5,
       "owner_author_id": null,

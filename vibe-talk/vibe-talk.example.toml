@@ -221,9 +221,10 @@ enabled = true
 # turned on: that setting closes the public talk-to link, and a conversation can then only be
 # started from a short-lived signed URL minted with the account API key.
 #
-# agent_id is public (it identifies a widget) and is handed to the web app. api_key is an ACCOUNT
-# secret — it can spend money — and never leaves the server: it goes to ElevenLabs in a header, is
-# never put in a URL, and is redacted out of every error message.
+# agent_id is public (it names an agent, not an account) and the web app shows it in Settings,
+# beside a link to the agent's configuration. api_key is an ACCOUNT secret — it can spend money —
+# and never leaves the server: it goes to ElevenLabs in a header, is never put in a URL, and is
+# redacted out of every error message.
 #
 # Where to get them:
 #   agent_id  https://elevenlabs.io/app/agents -> create or open an agent; the id is in the

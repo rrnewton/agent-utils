@@ -192,13 +192,6 @@
           "$ref": "#/$defs/VoiceDescription",
           "description": "Selected conversational voice provider, named by its implementation."
         },
-        "elevenlabs_agent_id": {
-          "description": "ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public\nwidget. The API key never leaves the server.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "hidden_channels": {
           "description": "Channels from the configuration file the owner took off his list, in configuration order.\n`#199 removable-config-channels`.\n\nSettings lists them so each can be shown again; `channels` above already leaves them out.\nSent only to a write-scope caller, because showing one again takes that scope and a\nread-scope credential has no use for the names of channels the owner put away. Absent when\nnone are hidden, and from an older server, which could not hide one.",
           "items": {
@@ -321,7 +314,6 @@
       "required": [
         "chat_provider_name",
         "channels",
-        "elevenlabs_agent_id",
         "conversational_voice",
         "read_aloud",
         "version",

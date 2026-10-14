@@ -863,7 +863,9 @@ async fn browser_config_advertises_device_playback_and_never_uses_elevenlabs() {
         config["read_aloud"],
         json!({"backend": "browser", "label": "Device voice", "playback": "browser", "local_only": true})
     );
-    assert_eq!(config["elevenlabs_agent_id"], Value::Null);
+    // `#302 root-is-the-app`. The agent id used to ride here for the older page's hosted widget,
+    // the one thing that read it; the app's own provider description carries what it needs.
+    assert!(config.get("elevenlabs_agent_id").is_none(), "{config}");
 
     let (status, bytes) = call(
         &app,

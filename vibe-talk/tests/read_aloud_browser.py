@@ -187,7 +187,6 @@ class FakeApi:
             "read_aloud": {"backend": "conversation", "label": "Test voice", "playback": "audio",
                            "local_only": False},
             "token_scope": "write",
-            "elevenlabs_agent_id": None,
             "conversational_voice": {"name": "Test voice provider"},
             "replay_enabled": False,
             "self_author_id": None,

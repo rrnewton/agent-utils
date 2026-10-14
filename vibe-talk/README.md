@@ -722,7 +722,8 @@ server — it travels to ElevenLabs in a header, never in a URL, and is redacted
 
 <https://elevenlabs.io/app/agents> → create an agent (a default template is fine; keep their
 hosted LLM). Open it, and the id is in the dashboard URL — it starts `agent_`. It goes in
-`elevenlabs.agent_id` / `VIBE_TALK_ELEVENLABS_AGENT_ID` and is public: it identifies a widget.
+`elevenlabs.agent_id` / `VIBE_TALK_ELEVENLABS_AGENT_ID` and is public: it names an agent, not an
+account.
 
 ### 7. An ElevenLabs voice id — OPTIONAL, and most deployments should skip it
 

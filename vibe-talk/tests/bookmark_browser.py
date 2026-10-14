@@ -107,7 +107,7 @@ class FakeApi:
             "threading_supported": True, "channel_registration_supported": False,
             "read_aloud": {"backend": "browser", "label": "Browser voice", "playback": "browser",
                            "local_only": True},
-            "elevenlabs_agent_id": None, "conversational_voice": {"name": "Test voice provider"},
+            "conversational_voice": {"name": "Test voice provider"},
             "replay_enabled": False, "self_author_id": None, "owner_author_id": None,
             "channel_discovery_supported": False, "upstream_read_mark_supported": False,
             "speech_prep_enabled": False,

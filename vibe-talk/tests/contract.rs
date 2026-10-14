@@ -174,7 +174,6 @@ fn client_config(
         } else {
             Vec::new()
         },
-        elevenlabs_agent_id: full.then(|| "agent".into()),
         conversational_voice: VoiceDescription {
             name: "voice".into(),
             settings_url: full.then(|| "https://voice.example/settings".into()),

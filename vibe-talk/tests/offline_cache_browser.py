@@ -335,7 +335,6 @@ class FakeApi:
             "channel_registration_supported": False,
             "read_aloud": {"backend": "provider", "label": "Voice provider", "playback": "audio",
                            "local_only": False},
-            "elevenlabs_agent_id": None,
             "conversational_voice": {"name": "Test voice provider"},
             "replay_enabled": False,
             "self_author_id": None,

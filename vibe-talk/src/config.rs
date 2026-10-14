@@ -863,7 +863,8 @@ impl IngestConfig {
 // cannot be handed the settings at call time and must be built with them.
 #[derive(Clone, Debug)]
 pub struct ElevenLabsConfig {
-    /// Agent id, recorded so the deployment is self-describing. Public: it identifies a widget.
+    /// Agent id, recorded so the deployment is self-describing. Public: it names an agent, not an
+    /// account.
     pub agent_id: Option<String>,
     /// Account API key, used to mint short-lived signed conversation URLs. A secret.
     pub api_key: Option<Secret>,

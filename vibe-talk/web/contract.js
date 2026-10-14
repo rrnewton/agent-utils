@@ -67,7 +67,7 @@ return errors === 0;
 validate100.evaluated = {"props":{"detail":true,"error":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.ClientConfigResponse = validate101;
-const schema33 = {"properties":{"channel_discovery_supported":{"type":"boolean"},"channel_registration_supported":{"type":"boolean"},"channels":{"items":{"$ref":"#/$defs/ChannelInfo"},"type":"array"},"chat_provider_name":{"type":"string"},"conversational_voice":{"$ref":"#/$defs/VoiceDescription"},"elevenlabs_agent_id":{"type":["string","null"]},"hidden_channels":{"items":{"$ref":"#/$defs/ChannelInfo"},"type":"array"},"idempotent_posts_supported":{"type":"boolean"},"live_delivery":{"$ref":"#/$defs/LiveDelivery"},"live_poll_seconds":{"format":"uint64","minimum":0,"type":"integer"},"noise_rules":{"anyOf":[{"$ref":"#/$defs/NoiseRules"},{"type":"null"}]},"owner_author_id":{"type":["string","null"]},"providers":{"items":{"$ref":"#/$defs/ProviderDescription"},"type":"array"},"read_aloud":{"$ref":"#/$defs/Description"},"replay_enabled":{"type":"boolean"},"replies_in_thread":{"type":"boolean"},"self_author_id":{"type":["string","null"]},"speech_prep_enabled":{"type":"boolean"},"summaries_unavailable":{"type":["string","null"]},"threading_supported":{"type":"boolean"},"token_scope":{"$ref":"#/$defs/TokenScope"},"upstream_clear_supported":{"type":"boolean"},"upstream_read_mark_supported":{"type":"boolean"},"version":{"type":"string"},"voice_prompt":{"anyOf":[{"$ref":"#/$defs/VoicePromptSettings"},{"type":"null"}]},"voice_settings":{"anyOf":[{"$ref":"#/$defs/VoiceSettings"},{"type":"null"}]}},"required":["chat_provider_name","channels","elevenlabs_agent_id","conversational_voice","read_aloud","version","replay_enabled","self_author_id","owner_author_id","live_poll_seconds","live_delivery","channel_registration_supported","channel_discovery_supported","upstream_read_mark_supported","threading_supported","speech_prep_enabled","token_scope"],"type":"object"};
+const schema33 = {"properties":{"channel_discovery_supported":{"type":"boolean"},"channel_registration_supported":{"type":"boolean"},"channels":{"items":{"$ref":"#/$defs/ChannelInfo"},"type":"array"},"chat_provider_name":{"type":"string"},"conversational_voice":{"$ref":"#/$defs/VoiceDescription"},"hidden_channels":{"items":{"$ref":"#/$defs/ChannelInfo"},"type":"array"},"idempotent_posts_supported":{"type":"boolean"},"live_delivery":{"$ref":"#/$defs/LiveDelivery"},"live_poll_seconds":{"format":"uint64","minimum":0,"type":"integer"},"noise_rules":{"anyOf":[{"$ref":"#/$defs/NoiseRules"},{"type":"null"}]},"owner_author_id":{"type":["string","null"]},"providers":{"items":{"$ref":"#/$defs/ProviderDescription"},"type":"array"},"read_aloud":{"$ref":"#/$defs/Description"},"replay_enabled":{"type":"boolean"},"replies_in_thread":{"type":"boolean"},"self_author_id":{"type":["string","null"]},"speech_prep_enabled":{"type":"boolean"},"summaries_unavailable":{"type":["string","null"]},"threading_supported":{"type":"boolean"},"token_scope":{"$ref":"#/$defs/TokenScope"},"upstream_clear_supported":{"type":"boolean"},"upstream_read_mark_supported":{"type":"boolean"},"version":{"type":"string"},"voice_prompt":{"anyOf":[{"$ref":"#/$defs/VoicePromptSettings"},{"type":"null"}]},"voice_settings":{"anyOf":[{"$ref":"#/$defs/VoiceSettings"},{"type":"null"}]}},"required":["chat_provider_name","channels","conversational_voice","read_aloud","version","replay_enabled","self_author_id","owner_author_id","live_poll_seconds","live_delivery","channel_registration_supported","channel_discovery_supported","upstream_read_mark_supported","threading_supported","speech_prep_enabled","token_scope"],"type":"object"};
 const schema36 = {"properties":{"instance_id":{"type":["string","null"]},"name":{"type":"string"},"settings_url":{"type":["string","null"]}},"required":["name"],"type":"object"};
 const schema37 = {"oneOf":[{"const":"off","type":"string"},{"const":"poll","type":"string"},{"const":"push","type":"string"}]};
 const schema38 = {"properties":{"matching":{"type":"string"},"rules":{"items":{"type":"string"},"type":"array"}},"required":["rules","matching"],"type":"object"};
@@ -950,7 +950,7 @@ evaluated0.items = undefined;
 if(errors === 0){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing0;
-if((((((((((((((((((data.chat_provider_name === undefined) && (missing0 = "chat_provider_name")) || ((data.channels === undefined) && (missing0 = "channels"))) || ((data.elevenlabs_agent_id === undefined) && (missing0 = "elevenlabs_agent_id"))) || ((data.conversational_voice === undefined) && (missing0 = "conversational_voice"))) || ((data.read_aloud === undefined) && (missing0 = "read_aloud"))) || ((data.version === undefined) && (missing0 = "version"))) || ((data.replay_enabled === undefined) && (missing0 = "replay_enabled"))) || ((data.self_author_id === undefined) && (missing0 = "self_author_id"))) || ((data.owner_author_id === undefined) && (missing0 = "owner_author_id"))) || ((data.live_poll_seconds === undefined) && (missing0 = "live_poll_seconds"))) || ((data.live_delivery === undefined) && (missing0 = "live_delivery"))) || ((data.channel_registration_supported === undefined) && (missing0 = "channel_registration_supported"))) || ((data.channel_discovery_supported === undefined) && (missing0 = "channel_discovery_supported"))) || ((data.upstream_read_mark_supported === undefined) && (missing0 = "upstream_read_mark_supported"))) || ((data.threading_supported === undefined) && (missing0 = "threading_supported"))) || ((data.speech_prep_enabled === undefined) && (missing0 = "speech_prep_enabled"))) || ((data.token_scope === undefined) && (missing0 = "token_scope"))){
+if(((((((((((((((((data.chat_provider_name === undefined) && (missing0 = "chat_provider_name")) || ((data.channels === undefined) && (missing0 = "channels"))) || ((data.conversational_voice === undefined) && (missing0 = "conversational_voice"))) || ((data.read_aloud === undefined) && (missing0 = "read_aloud"))) || ((data.version === undefined) && (missing0 = "version"))) || ((data.replay_enabled === undefined) && (missing0 = "replay_enabled"))) || ((data.self_author_id === undefined) && (missing0 = "self_author_id"))) || ((data.owner_author_id === undefined) && (missing0 = "owner_author_id"))) || ((data.live_poll_seconds === undefined) && (missing0 = "live_poll_seconds"))) || ((data.live_delivery === undefined) && (missing0 = "live_delivery"))) || ((data.channel_registration_supported === undefined) && (missing0 = "channel_registration_supported"))) || ((data.channel_discovery_supported === undefined) && (missing0 = "channel_discovery_supported"))) || ((data.upstream_read_mark_supported === undefined) && (missing0 = "upstream_read_mark_supported"))) || ((data.threading_supported === undefined) && (missing0 = "threading_supported"))) || ((data.speech_prep_enabled === undefined) && (missing0 = "speech_prep_enabled"))) || ((data.token_scope === undefined) && (missing0 = "token_scope"))){
 validate101.errors = [{instancePath,schemaPath:"#/required",keyword:"required",params:{missingProperty: missing0},message:"must have required property '"+missing0+"'"}];
 return false;
 }
@@ -1085,33 +1085,20 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.elevenlabs_agent_id !== undefined){
-let data9 = data.elevenlabs_agent_id;
-const _errs19 = errors;
-if((typeof data9 !== "string") && (data9 !== null)){
-validate101.errors = [{instancePath:instancePath+"/elevenlabs_agent_id",schemaPath:"#/properties/elevenlabs_agent_id/type",keyword:"type",params:{type: schema33.properties.elevenlabs_agent_id.type},message:"must be string,null"}];
-return false;
-}
-var valid0 = _errs19 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
 if(data.hidden_channels !== undefined){
-let data10 = data.hidden_channels;
-const _errs21 = errors;
-if(errors === _errs21){
-if(Array.isArray(data10)){
+let data9 = data.hidden_channels;
+const _errs19 = errors;
+if(errors === _errs19){
+if(Array.isArray(data9)){
 var valid4 = true;
-const len1 = data10.length;
+const len1 = data9.length;
 for(let i1=0; i1<len1; i1++){
-const _errs23 = errors;
-if(!(validate22(data10[i1], {instancePath:instancePath+"/hidden_channels/" + i1,parentData:data10,parentDataProperty:i1,rootData,dynamicAnchors}))){
+const _errs21 = errors;
+if(!(validate22(data9[i1], {instancePath:instancePath+"/hidden_channels/" + i1,parentData:data9,parentDataProperty:i1,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate22.errors : vErrors.concat(validate22.errors);
 errors = vErrors.length;
 }
-var valid4 = _errs23 === errors;
+var valid4 = _errs21 === errors;
 if(!valid4){
 break;
 }
@@ -1122,32 +1109,32 @@ validate101.errors = [{instancePath:instancePath+"/hidden_channels",schemaPath:"
 return false;
 }
 }
-var valid0 = _errs21 === errors;
+var valid0 = _errs19 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.idempotent_posts_supported !== undefined){
-const _errs24 = errors;
+const _errs22 = errors;
 if(typeof data.idempotent_posts_supported !== "boolean"){
 validate101.errors = [{instancePath:instancePath+"/idempotent_posts_supported",schemaPath:"#/properties/idempotent_posts_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid0 = _errs24 === errors;
+var valid0 = _errs22 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.live_delivery !== undefined){
-let data13 = data.live_delivery;
+let data12 = data.live_delivery;
+const _errs24 = errors;
 const _errs26 = errors;
-const _errs28 = errors;
 let valid6 = false;
 let passing0 = null;
-const _errs29 = errors;
-if(typeof data13 !== "string"){
+const _errs27 = errors;
+if(typeof data12 !== "string"){
 const err0 = {instancePath:instancePath+"/live_delivery",schemaPath:"#/$defs/LiveDelivery/oneOf/0/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err0];
@@ -1157,7 +1144,7 @@ vErrors.push(err0);
 }
 errors++;
 }
-if("off" !== data13){
+if("off" !== data12){
 const err1 = {instancePath:instancePath+"/live_delivery",schemaPath:"#/$defs/LiveDelivery/oneOf/0/const",keyword:"const",params:{allowedValue: "off"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err1];
@@ -1167,13 +1154,13 @@ vErrors.push(err1);
 }
 errors++;
 }
-var _valid0 = _errs29 === errors;
+var _valid0 = _errs27 === errors;
 if(_valid0){
 valid6 = true;
 passing0 = 0;
 }
-const _errs31 = errors;
-if(typeof data13 !== "string"){
+const _errs29 = errors;
+if(typeof data12 !== "string"){
 const err2 = {instancePath:instancePath+"/live_delivery",schemaPath:"#/$defs/LiveDelivery/oneOf/1/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err2];
@@ -1183,7 +1170,7 @@ vErrors.push(err2);
 }
 errors++;
 }
-if("poll" !== data13){
+if("poll" !== data12){
 const err3 = {instancePath:instancePath+"/live_delivery",schemaPath:"#/$defs/LiveDelivery/oneOf/1/const",keyword:"const",params:{allowedValue: "poll"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err3];
@@ -1193,7 +1180,7 @@ vErrors.push(err3);
 }
 errors++;
 }
-var _valid0 = _errs31 === errors;
+var _valid0 = _errs29 === errors;
 if(_valid0 && valid6){
 valid6 = false;
 passing0 = [passing0, 1];
@@ -1203,8 +1190,8 @@ if(_valid0){
 valid6 = true;
 passing0 = 1;
 }
-const _errs33 = errors;
-if(typeof data13 !== "string"){
+const _errs31 = errors;
+if(typeof data12 !== "string"){
 const err4 = {instancePath:instancePath+"/live_delivery",schemaPath:"#/$defs/LiveDelivery/oneOf/2/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err4];
@@ -1214,7 +1201,7 @@ vErrors.push(err4);
 }
 errors++;
 }
-if("push" !== data13){
+if("push" !== data12){
 const err5 = {instancePath:instancePath+"/live_delivery",schemaPath:"#/$defs/LiveDelivery/oneOf/2/const",keyword:"const",params:{allowedValue: "push"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err5];
@@ -1224,7 +1211,7 @@ vErrors.push(err5);
 }
 errors++;
 }
-var _valid0 = _errs33 === errors;
+var _valid0 = _errs31 === errors;
 if(_valid0 && valid6){
 valid6 = false;
 passing0 = [passing0, 2];
@@ -1249,54 +1236,54 @@ validate101.errors = vErrors;
 return false;
 }
 else {
-errors = _errs28;
+errors = _errs26;
 if(vErrors !== null){
-if(_errs28){
-vErrors.length = _errs28;
+if(_errs26){
+vErrors.length = _errs26;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs26 === errors;
+var valid0 = _errs24 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.live_poll_seconds !== undefined){
-let data14 = data.live_poll_seconds;
-const _errs35 = errors;
-if(!(((typeof data14 == "number") && (!(data14 % 1) && !isNaN(data14))) && (isFinite(data14)))){
+let data13 = data.live_poll_seconds;
+const _errs33 = errors;
+if(!(((typeof data13 == "number") && (!(data13 % 1) && !isNaN(data13))) && (isFinite(data13)))){
 validate101.errors = [{instancePath:instancePath+"/live_poll_seconds",schemaPath:"#/properties/live_poll_seconds/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
 return false;
 }
-if(errors === _errs35){
-if((typeof data14 == "number") && (isFinite(data14))){
-if(data14 < 0 || isNaN(data14)){
+if(errors === _errs33){
+if((typeof data13 == "number") && (isFinite(data13))){
+if(data13 < 0 || isNaN(data13)){
 validate101.errors = [{instancePath:instancePath+"/live_poll_seconds",schemaPath:"#/properties/live_poll_seconds/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
 return false;
 }
 }
 }
-var valid0 = _errs35 === errors;
+var valid0 = _errs33 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.noise_rules !== undefined){
-let data15 = data.noise_rules;
+let data14 = data.noise_rules;
+const _errs35 = errors;
+const _errs36 = errors;
+let valid7 = false;
 const _errs37 = errors;
 const _errs38 = errors;
-let valid7 = false;
-const _errs39 = errors;
-const _errs40 = errors;
-if(errors === _errs40){
-if(data15 && typeof data15 == "object" && !Array.isArray(data15)){
+if(errors === _errs38){
+if(data14 && typeof data14 == "object" && !Array.isArray(data14)){
 let missing2;
-if(((data15.rules === undefined) && (missing2 = "rules")) || ((data15.matching === undefined) && (missing2 = "matching"))){
+if(((data14.rules === undefined) && (missing2 = "rules")) || ((data14.matching === undefined) && (missing2 = "matching"))){
 const err7 = {instancePath:instancePath+"/noise_rules",schemaPath:"#/$defs/NoiseRules/required",keyword:"required",params:{missingProperty: missing2},message:"must have required property '"+missing2+"'"};
 if(vErrors === null){
 vErrors = [err7];
@@ -1307,9 +1294,9 @@ vErrors.push(err7);
 errors++;
 }
 else {
-if(data15.matching !== undefined){
-const _errs42 = errors;
-if(typeof data15.matching !== "string"){
+if(data14.matching !== undefined){
+const _errs40 = errors;
+if(typeof data14.matching !== "string"){
 const err8 = {instancePath:instancePath+"/noise_rules/matching",schemaPath:"#/$defs/NoiseRules/properties/matching/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err8];
@@ -1319,22 +1306,22 @@ vErrors.push(err8);
 }
 errors++;
 }
-var valid9 = _errs42 === errors;
+var valid9 = _errs40 === errors;
 }
 else {
 var valid9 = true;
 }
 if(valid9){
-if(data15.rules !== undefined){
-let data17 = data15.rules;
-const _errs44 = errors;
-if(errors === _errs44){
-if(Array.isArray(data17)){
+if(data14.rules !== undefined){
+let data16 = data14.rules;
+const _errs42 = errors;
+if(errors === _errs42){
+if(Array.isArray(data16)){
 var valid10 = true;
-const len2 = data17.length;
+const len2 = data16.length;
 for(let i2=0; i2<len2; i2++){
-const _errs46 = errors;
-if(typeof data17[i2] !== "string"){
+const _errs44 = errors;
+if(typeof data16[i2] !== "string"){
 const err9 = {instancePath:instancePath+"/noise_rules/rules/" + i2,schemaPath:"#/$defs/NoiseRules/properties/rules/items/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err9];
@@ -1344,7 +1331,7 @@ vErrors.push(err9);
 }
 errors++;
 }
-var valid10 = _errs46 === errors;
+var valid10 = _errs44 === errors;
 if(!valid10){
 break;
 }
@@ -1361,7 +1348,7 @@ vErrors.push(err10);
 errors++;
 }
 }
-var valid9 = _errs44 === errors;
+var valid9 = _errs42 === errors;
 }
 else {
 var valid9 = true;
@@ -1380,15 +1367,15 @@ vErrors.push(err11);
 errors++;
 }
 }
-var _valid1 = _errs39 === errors;
+var _valid1 = _errs37 === errors;
 valid7 = valid7 || _valid1;
 if(_valid1){
 var props0 = {};
 props0.matching = true;
 props0.rules = true;
 }
-const _errs48 = errors;
-if(data15 !== null){
+const _errs46 = errors;
+if(data14 !== null){
 const err12 = {instancePath:instancePath+"/noise_rules",schemaPath:"#/properties/noise_rules/anyOf/1/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err12];
@@ -1398,7 +1385,7 @@ vErrors.push(err12);
 }
 errors++;
 }
-var _valid1 = _errs48 === errors;
+var _valid1 = _errs46 === errors;
 valid7 = valid7 || _valid1;
 if(!valid7){
 const err13 = {instancePath:instancePath+"/noise_rules",schemaPath:"#/properties/noise_rules/anyOf",keyword:"anyOf",params:{},message:"must match a schema in anyOf"};
@@ -1413,49 +1400,49 @@ validate101.errors = vErrors;
 return false;
 }
 else {
-errors = _errs38;
+errors = _errs36;
 if(vErrors !== null){
-if(_errs38){
-vErrors.length = _errs38;
+if(_errs36){
+vErrors.length = _errs36;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs37 === errors;
+var valid0 = _errs35 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.owner_author_id !== undefined){
-let data19 = data.owner_author_id;
-const _errs50 = errors;
-if((typeof data19 !== "string") && (data19 !== null)){
+let data18 = data.owner_author_id;
+const _errs48 = errors;
+if((typeof data18 !== "string") && (data18 !== null)){
 validate101.errors = [{instancePath:instancePath+"/owner_author_id",schemaPath:"#/properties/owner_author_id/type",keyword:"type",params:{type: schema33.properties.owner_author_id.type},message:"must be string,null"}];
 return false;
 }
-var valid0 = _errs50 === errors;
+var valid0 = _errs48 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.providers !== undefined){
-let data20 = data.providers;
-const _errs52 = errors;
-if(errors === _errs52){
-if(Array.isArray(data20)){
+let data19 = data.providers;
+const _errs50 = errors;
+if(errors === _errs50){
+if(Array.isArray(data19)){
 var valid11 = true;
-const len3 = data20.length;
+const len3 = data19.length;
 for(let i3=0; i3<len3; i3++){
-const _errs54 = errors;
-if(!(validate25(data20[i3], {instancePath:instancePath+"/providers/" + i3,parentData:data20,parentDataProperty:i3,rootData,dynamicAnchors}))){
+const _errs52 = errors;
+if(!(validate25(data19[i3], {instancePath:instancePath+"/providers/" + i3,parentData:data19,parentDataProperty:i3,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate25.errors : vErrors.concat(validate25.errors);
 errors = vErrors.length;
 }
-var valid11 = _errs54 === errors;
+var valid11 = _errs52 === errors;
 if(!valid11){
 break;
 }
@@ -1466,28 +1453,40 @@ validate101.errors = [{instancePath:instancePath+"/providers",schemaPath:"#/prop
 return false;
 }
 }
-var valid0 = _errs52 === errors;
+var valid0 = _errs50 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.read_aloud !== undefined){
-const _errs55 = errors;
+const _errs53 = errors;
 if(!(validate27(data.read_aloud, {instancePath:instancePath+"/read_aloud",parentData:data,parentDataProperty:"read_aloud",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate27.errors : vErrors.concat(validate27.errors);
 errors = vErrors.length;
 }
-var valid0 = _errs55 === errors;
+var valid0 = _errs53 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.replay_enabled !== undefined){
-const _errs56 = errors;
+const _errs54 = errors;
 if(typeof data.replay_enabled !== "boolean"){
 validate101.errors = [{instancePath:instancePath+"/replay_enabled",schemaPath:"#/properties/replay_enabled/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs54 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.replies_in_thread !== undefined){
+const _errs56 = errors;
+if(typeof data.replies_in_thread !== "boolean"){
+validate101.errors = [{instancePath:instancePath+"/replies_in_thread",schemaPath:"#/properties/replies_in_thread/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs56 === errors;
@@ -1496,10 +1495,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.replies_in_thread !== undefined){
+if(data.self_author_id !== undefined){
+let data24 = data.self_author_id;
 const _errs58 = errors;
-if(typeof data.replies_in_thread !== "boolean"){
-validate101.errors = [{instancePath:instancePath+"/replies_in_thread",schemaPath:"#/properties/replies_in_thread/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if((typeof data24 !== "string") && (data24 !== null)){
+validate101.errors = [{instancePath:instancePath+"/self_author_id",schemaPath:"#/properties/self_author_id/type",keyword:"type",params:{type: schema33.properties.self_author_id.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs58 === errors;
@@ -1508,11 +1508,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.self_author_id !== undefined){
-let data25 = data.self_author_id;
+if(data.speech_prep_enabled !== undefined){
 const _errs60 = errors;
-if((typeof data25 !== "string") && (data25 !== null)){
-validate101.errors = [{instancePath:instancePath+"/self_author_id",schemaPath:"#/properties/self_author_id/type",keyword:"type",params:{type: schema33.properties.self_author_id.type},message:"must be string,null"}];
+if(typeof data.speech_prep_enabled !== "boolean"){
+validate101.errors = [{instancePath:instancePath+"/speech_prep_enabled",schemaPath:"#/properties/speech_prep_enabled/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs60 === errors;
@@ -1521,10 +1520,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.speech_prep_enabled !== undefined){
+if(data.summaries_unavailable !== undefined){
+let data26 = data.summaries_unavailable;
 const _errs62 = errors;
-if(typeof data.speech_prep_enabled !== "boolean"){
-validate101.errors = [{instancePath:instancePath+"/speech_prep_enabled",schemaPath:"#/properties/speech_prep_enabled/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if((typeof data26 !== "string") && (data26 !== null)){
+validate101.errors = [{instancePath:instancePath+"/summaries_unavailable",schemaPath:"#/properties/summaries_unavailable/type",keyword:"type",params:{type: schema33.properties.summaries_unavailable.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs62 === errors;
@@ -1533,11 +1533,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.summaries_unavailable !== undefined){
-let data27 = data.summaries_unavailable;
+if(data.threading_supported !== undefined){
 const _errs64 = errors;
-if((typeof data27 !== "string") && (data27 !== null)){
-validate101.errors = [{instancePath:instancePath+"/summaries_unavailable",schemaPath:"#/properties/summaries_unavailable/type",keyword:"type",params:{type: schema33.properties.summaries_unavailable.type},message:"must be string,null"}];
+if(typeof data.threading_supported !== "boolean"){
+validate101.errors = [{instancePath:instancePath+"/threading_supported",schemaPath:"#/properties/threading_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs64 === errors;
@@ -1546,26 +1545,14 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.threading_supported !== undefined){
-const _errs66 = errors;
-if(typeof data.threading_supported !== "boolean"){
-validate101.errors = [{instancePath:instancePath+"/threading_supported",schemaPath:"#/properties/threading_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
-return false;
-}
-var valid0 = _errs66 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
 if(data.token_scope !== undefined){
-let data29 = data.token_scope;
+let data28 = data.token_scope;
+const _errs66 = errors;
 const _errs68 = errors;
-const _errs70 = errors;
 let valid13 = false;
 let passing1 = null;
-const _errs71 = errors;
-if(typeof data29 !== "string"){
+const _errs69 = errors;
+if(typeof data28 !== "string"){
 const err14 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/0/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err14];
@@ -1575,7 +1562,7 @@ vErrors.push(err14);
 }
 errors++;
 }
-if("read" !== data29){
+if("read" !== data28){
 const err15 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/0/const",keyword:"const",params:{allowedValue: "read"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err15];
@@ -1585,13 +1572,13 @@ vErrors.push(err15);
 }
 errors++;
 }
-var _valid2 = _errs71 === errors;
+var _valid2 = _errs69 === errors;
 if(_valid2){
 valid13 = true;
 passing1 = 0;
 }
-const _errs73 = errors;
-if(typeof data29 !== "string"){
+const _errs71 = errors;
+if(typeof data28 !== "string"){
 const err16 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/1/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err16];
@@ -1601,7 +1588,7 @@ vErrors.push(err16);
 }
 errors++;
 }
-if("write" !== data29){
+if("write" !== data28){
 const err17 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/1/const",keyword:"const",params:{allowedValue: "write"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err17];
@@ -1611,7 +1598,7 @@ vErrors.push(err17);
 }
 errors++;
 }
-var _valid2 = _errs73 === errors;
+var _valid2 = _errs71 === errors;
 if(_valid2 && valid13){
 valid13 = false;
 passing1 = [passing1, 1];
@@ -1635,26 +1622,38 @@ validate101.errors = vErrors;
 return false;
 }
 else {
-errors = _errs70;
+errors = _errs68;
 if(vErrors !== null){
-if(_errs70){
-vErrors.length = _errs70;
+if(_errs68){
+vErrors.length = _errs68;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs68 === errors;
+var valid0 = _errs66 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.upstream_clear_supported !== undefined){
-const _errs75 = errors;
+const _errs73 = errors;
 if(typeof data.upstream_clear_supported !== "boolean"){
 validate101.errors = [{instancePath:instancePath+"/upstream_clear_supported",schemaPath:"#/properties/upstream_clear_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs73 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.upstream_read_mark_supported !== undefined){
+const _errs75 = errors;
+if(typeof data.upstream_read_mark_supported !== "boolean"){
+validate101.errors = [{instancePath:instancePath+"/upstream_read_mark_supported",schemaPath:"#/properties/upstream_read_mark_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs75 === errors;
@@ -1663,10 +1662,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.upstream_read_mark_supported !== undefined){
+if(data.version !== undefined){
 const _errs77 = errors;
-if(typeof data.upstream_read_mark_supported !== "boolean"){
-validate101.errors = [{instancePath:instancePath+"/upstream_read_mark_supported",schemaPath:"#/properties/upstream_read_mark_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.version !== "string"){
+validate101.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs77 === errors;
@@ -1675,29 +1674,17 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.version !== undefined){
-const _errs79 = errors;
-if(typeof data.version !== "string"){
-validate101.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
-return false;
-}
-var valid0 = _errs79 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
 if(data.voice_prompt !== undefined){
-let data33 = data.voice_prompt;
-const _errs81 = errors;
-const _errs82 = errors;
+let data32 = data.voice_prompt;
+const _errs79 = errors;
+const _errs80 = errors;
 let valid14 = false;
-const _errs83 = errors;
-if(!(validate29(data33, {instancePath:instancePath+"/voice_prompt",parentData:data,parentDataProperty:"voice_prompt",rootData,dynamicAnchors}))){
+const _errs81 = errors;
+if(!(validate29(data32, {instancePath:instancePath+"/voice_prompt",parentData:data,parentDataProperty:"voice_prompt",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate29.errors : vErrors.concat(validate29.errors);
 errors = vErrors.length;
 }
-var _valid3 = _errs83 === errors;
+var _valid3 = _errs81 === errors;
 valid14 = valid14 || _valid3;
 if(_valid3){
 var props1 = {};
@@ -1711,8 +1698,8 @@ props1.prompt_version = true;
 props1.system_prompt = true;
 props1.system_prompt_edited = true;
 }
-const _errs84 = errors;
-if(data33 !== null){
+const _errs82 = errors;
+if(data32 !== null){
 const err19 = {instancePath:instancePath+"/voice_prompt",schemaPath:"#/properties/voice_prompt/anyOf/1/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err19];
@@ -1722,7 +1709,7 @@ vErrors.push(err19);
 }
 errors++;
 }
-var _valid3 = _errs84 === errors;
+var _valid3 = _errs82 === errors;
 valid14 = valid14 || _valid3;
 if(!valid14){
 const err20 = {instancePath:instancePath+"/voice_prompt",schemaPath:"#/properties/voice_prompt/anyOf",keyword:"anyOf",params:{},message:"must match a schema in anyOf"};
@@ -1737,33 +1724,33 @@ validate101.errors = vErrors;
 return false;
 }
 else {
-errors = _errs82;
+errors = _errs80;
 if(vErrors !== null){
-if(_errs82){
-vErrors.length = _errs82;
+if(_errs80){
+vErrors.length = _errs80;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs81 === errors;
+var valid0 = _errs79 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.voice_settings !== undefined){
-let data34 = data.voice_settings;
+let data33 = data.voice_settings;
+const _errs84 = errors;
+const _errs85 = errors;
+let valid15 = false;
 const _errs86 = errors;
 const _errs87 = errors;
-let valid15 = false;
-const _errs88 = errors;
-const _errs89 = errors;
-if(errors === _errs89){
-if(data34 && typeof data34 == "object" && !Array.isArray(data34)){
+if(errors === _errs87){
+if(data33 && typeof data33 == "object" && !Array.isArray(data33)){
 let missing3;
-if(((data34.ask_before_send === undefined) && (missing3 = "ask_before_send")) || ((data34.changeable === undefined) && (missing3 = "changeable"))){
+if(((data33.ask_before_send === undefined) && (missing3 = "ask_before_send")) || ((data33.changeable === undefined) && (missing3 = "changeable"))){
 const err21 = {instancePath:instancePath+"/voice_settings",schemaPath:"#/$defs/VoiceSettings/required",keyword:"required",params:{missingProperty: missing3},message:"must have required property '"+missing3+"'"};
 if(vErrors === null){
 vErrors = [err21];
@@ -1774,9 +1761,9 @@ vErrors.push(err21);
 errors++;
 }
 else {
-if(data34.ask_before_send !== undefined){
-const _errs91 = errors;
-if(typeof data34.ask_before_send !== "boolean"){
+if(data33.ask_before_send !== undefined){
+const _errs89 = errors;
+if(typeof data33.ask_before_send !== "boolean"){
 const err22 = {instancePath:instancePath+"/voice_settings/ask_before_send",schemaPath:"#/$defs/VoiceSettings/properties/ask_before_send/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"};
 if(vErrors === null){
 vErrors = [err22];
@@ -1786,15 +1773,15 @@ vErrors.push(err22);
 }
 errors++;
 }
-var valid17 = _errs91 === errors;
+var valid17 = _errs89 === errors;
 }
 else {
 var valid17 = true;
 }
 if(valid17){
-if(data34.changeable !== undefined){
-const _errs93 = errors;
-if(typeof data34.changeable !== "boolean"){
+if(data33.changeable !== undefined){
+const _errs91 = errors;
+if(typeof data33.changeable !== "boolean"){
 const err23 = {instancePath:instancePath+"/voice_settings/changeable",schemaPath:"#/$defs/VoiceSettings/properties/changeable/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"};
 if(vErrors === null){
 vErrors = [err23];
@@ -1804,7 +1791,7 @@ vErrors.push(err23);
 }
 errors++;
 }
-var valid17 = _errs93 === errors;
+var valid17 = _errs91 === errors;
 }
 else {
 var valid17 = true;
@@ -1823,15 +1810,15 @@ vErrors.push(err24);
 errors++;
 }
 }
-var _valid4 = _errs88 === errors;
+var _valid4 = _errs86 === errors;
 valid15 = valid15 || _valid4;
 if(_valid4){
 var props2 = {};
 props2.ask_before_send = true;
 props2.changeable = true;
 }
-const _errs95 = errors;
-if(data34 !== null){
+const _errs93 = errors;
+if(data33 !== null){
 const err25 = {instancePath:instancePath+"/voice_settings",schemaPath:"#/properties/voice_settings/anyOf/1/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err25];
@@ -1841,7 +1828,7 @@ vErrors.push(err25);
 }
 errors++;
 }
-var _valid4 = _errs95 === errors;
+var _valid4 = _errs93 === errors;
 valid15 = valid15 || _valid4;
 if(!valid15){
 const err26 = {instancePath:instancePath+"/voice_settings",schemaPath:"#/properties/voice_settings/anyOf",keyword:"anyOf",params:{},message:"must match a schema in anyOf"};
@@ -1856,21 +1843,20 @@ validate101.errors = vErrors;
 return false;
 }
 else {
-errors = _errs87;
+errors = _errs85;
 if(vErrors !== null){
-if(_errs87){
-vErrors.length = _errs87;
+if(_errs85){
+vErrors.length = _errs85;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs86 === errors;
+var valid0 = _errs84 === errors;
 }
 else {
 var valid0 = true;
-}
 }
 }
 }
@@ -1906,7 +1892,7 @@ return false;
 validate101.errors = vErrors;
 return errors === 0;
 }
-validate101.evaluated = {"props":{"channel_discovery_supported":true,"channel_registration_supported":true,"channels":true,"chat_provider_name":true,"conversational_voice":true,"elevenlabs_agent_id":true,"hidden_channels":true,"idempotent_posts_supported":true,"live_delivery":true,"live_poll_seconds":true,"noise_rules":true,"owner_author_id":true,"providers":true,"read_aloud":true,"replay_enabled":true,"replies_in_thread":true,"self_author_id":true,"speech_prep_enabled":true,"summaries_unavailable":true,"threading_supported":true,"token_scope":true,"upstream_clear_supported":true,"upstream_read_mark_supported":true,"version":true,"voice_prompt":true,"voice_settings":true},"dynamicProps":false,"dynamicItems":false};
+validate101.evaluated = {"props":{"channel_discovery_supported":true,"channel_registration_supported":true,"channels":true,"chat_provider_name":true,"conversational_voice":true,"hidden_channels":true,"idempotent_posts_supported":true,"live_delivery":true,"live_poll_seconds":true,"noise_rules":true,"owner_author_id":true,"providers":true,"read_aloud":true,"replay_enabled":true,"replies_in_thread":true,"self_author_id":true,"speech_prep_enabled":true,"summaries_unavailable":true,"threading_supported":true,"token_scope":true,"upstream_clear_supported":true,"upstream_read_mark_supported":true,"version":true,"voice_prompt":true,"voice_settings":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.VoiceSession = validate107;
 const schema47 = {"properties":{"agent_prompt":{"anyOf":[{"$ref":"#/$defs/SessionPrompt"},{"type":"null"}]},"input_sample_rate":{"format":"uint32","minimum":0,"type":"integer"},"output_sample_rate":{"format":"uint32","minimum":0,"type":"integer"},"protocol":{"type":"string"},"provider":{"type":"string"},"valid_for_seconds":{"format":"uint32","minimum":0,"type":["integer","null"]},"websocket_url":{"type":"string"}},"required":["websocket_url","protocol","provider","input_sample_rate","output_sample_rate"],"type":"object"};

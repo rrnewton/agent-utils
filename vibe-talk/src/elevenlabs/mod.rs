@@ -322,7 +322,7 @@ pub trait SpeechProvider: Send + Sync {
 pub struct SignedUrl {
     /// The `wss://` URL the browser connects to. Short-lived, and itself a credential.
     pub signed_url: String,
-    /// The agent it was minted for. Public: it identifies a widget, not an account.
+    /// The agent it was minted for. Public: it names an agent, not an account.
     pub agent_id: String,
     /// How long ElevenLabs documents the URL as being valid for.
     pub valid_for_seconds: u32,

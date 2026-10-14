@@ -766,7 +766,6 @@ pub async fn client_config(
         } else {
             Vec::new()
         },
-        elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         conversational_voice: state.conversation.describe(),
         read_aloud: state.speech.describe(),
         version: env!("CARGO_PKG_VERSION"),
