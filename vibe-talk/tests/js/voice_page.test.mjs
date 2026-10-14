@@ -22140,6 +22140,68 @@ test("`#301 semicolon-expand-cycle` x `#49 cached-summaries`: ALL, DRAWN AGAIN f
   }
 });
 
+test("`#301 semicolon-expand-cycle`: A FIRST PRESS (2) WOULD ALSO LEAVE AS IT IS goes on round to the third step — ; in a list all open with nothing read collapses all, : in one all folded with everything read expands all", async () => {
+  const back = { shiftKey: true };
+  const ids = (page) => page.el("discord-log").children.map((li) => li.getAttribute("data-id"));
+  const openAll = async (page) => {
+    for (const li of page.el("discord-log").children) await foldButton(li).click();
+    assert.deepStrictEqual(foldState(page), { open: ids(page), shut: [] }, "the fixture did not open every message");
+  };
+  /** A channel of twelve long messages, `read` of them read. */
+  const channelReading = async (read) => {
+    const page = newPage();
+    const messages = tallChannel(12);
+    for (const one of messages) if (read(String(one.id))) page.dealtWith.add(String(one.id));
+    await signIn(page);
+    await showDiscord(page, messages);
+    return page;
+  };
+  // ; in a list all open with nothing read: Expanded all, and Expanded unread, collapsed read, would both
+  // leave it as it is, so Collapsed all. Before, it went to (2), and the first press did nothing.
+  let page = await channelReading(() => false);
+  await openAll(page);
+  let event = await press(page, page.el("scroll-area"), ";");
+  assert.equal(event.defaulted, false);
+  assert.deepStrictEqual(foldState(page), { open: [], shut: ids(page) }, "the first ; in a list all open and unread did nothing");
+  assert.equal(statusSaid(page), FOLD_SAID.collapse);
+  // The rotation goes on from the step it took: the next ; is (1).
+  await press(page, page.el("scroll-area"), ";");
+  assert.equal(statusSaid(page), FOLD_SAID.expand, "; did not go on from the third step");
+  assert.deepStrictEqual(foldState(page), { open: ids(page), shut: [] });
+  // : in a list all folded with every message read: Collapsed all and (2) would both leave it, so Expanded all.
+  page = await channelReading(() => true);
+  assert.ok(page.el("discord-log").children.every((li) => li.getAttribute("data-archived") === "true"),
+    "the fixture is not every message read");
+  assert.deepStrictEqual(foldState(page), { open: [], shut: ids(page) }, "the fixture is not every message folded");
+  event = await press(page, page.el("scroll-area"), ":", back);
+  assert.equal(event.defaulted, false);
+  assert.deepStrictEqual(foldState(page), { open: ids(page), shut: [] }, "the first : in a list all folded and read did nothing");
+  assert.equal(statusSaid(page), FOLD_SAID.expand);
+  await press(page, page.el("scroll-area"), ":", back);
+  assert.equal(statusSaid(page), FOLD_SAID.collapse, ": did not go on from the step it took");
+  // Negative controls: where (2) changes something, the first press stops there. One message read in a
+  // list all open: the first ; folds that one alone…
+  page = await channelReading((id) => id === "3");
+  await openAll(page);
+  await press(page, page.el("scroll-area"), ";");
+  assert.equal(statusSaid(page), FOLD_SAID.unread, "the first ; went past (2) though (2) folded a read message");
+  assert.deepStrictEqual(foldState(page).shut, ["3"]);
+  // …and one unread in a list all folded and otherwise read: the first : opens that one alone.
+  page = await channelReading((id) => id !== "6");
+  await press(page, page.el("scroll-area"), ":", back);
+  assert.equal(statusSaid(page), FOLD_SAID.unread, "the first : went past (2) though (2) opened an unread message");
+  assert.deepStrictEqual(foldState(page).open, ["6"]);
+  // The rule is the first press's alone: a list that has a step goes round from it, as before, even to a
+  // step that changes nothing. With nothing read, : goes past Collapsed all (the list is all folded) to
+  // (2), which opens everything; the next : is (1), which changes nothing, and is still (1).
+  page = await channelReading(() => false);
+  await press(page, page.el("scroll-area"), ":", back);
+  assert.equal(statusSaid(page), FOLD_SAID.unread);
+  assert.deepStrictEqual(foldState(page), { open: ids(page), shut: [] });
+  await press(page, page.el("scroll-area"), ":", back);
+  assert.equal(statusSaid(page), FOLD_SAID.expand, "a list with a step skipped a step");
+});
+
 test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chosen from — Main, All or a thread in one column, or two columns — and never to a thread opened from it", async () => {
   // The owner, of the Threads screen the list replaced: "rather ESC works". A view is left the way it was come to.
   const page = await threadPage();

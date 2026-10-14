@@ -2619,8 +2619,10 @@ function setAllFolded(folded) {
 //     Pinned list, each by its pane's own name for it (`foldStepKey`). A press goes on from the step that
 //     list was left at, whatever has been opened or shut by hand since. The FIRST press in a list goes
 //     to the first step its way round — ; to Expand all, : to Collapse all, as the two keys did before —
-//     unless the list is already so, and then to (2), so that no first press does nothing. The chips,
-//     pressed, are (1) and (3) of Main's list (`setAllFolded`).
+//     unless that would change nothing, and then on round to the first step that changes something:
+//     (2), or past it to the third when (2) would leave the list as it is too, as it does a list all
+//     open with nothing in it read. No first press does nothing. The chips, pressed, are (1) and (3) of
+//     Main's list (`setAllFolded`).
 //   * IN THE COLUMN THE KEYS ARE IN, as every key on the messages is (`onPageKey`).
 //   * THE READER STAYS PUT (`#280 scroll-stability`): the selected message while any of it shows, else
 //     the first message showing, keeps its top where it was, and is then held as a filter change holds
@@ -2661,19 +2663,26 @@ function foldStepKey() {
 /** Whether `entry` is open once `step` is applied. */
 const openAtStep = (step, entry) => step === "expand" || (step === "unread" && !rowIsRead(entry.li));
 
+/** Whether applying `step` would open or fold any of `folds`. */
+const stepChangesAny = (step, folds) => folds.some((entry) => isFolded(entry) === openAtStep(step, entry));
+
 /**
  * The step a press going `way` round (1 for ;, -1 for :) applies, from `from`, the step the list was
  * left at, or null for a list it has never been applied in: then the first step that way round, or
- * past it to (2) when every fold in `folds` is already as that step would leave it.
+ * when that would leave every fold in `folds` as it is, the next step on round that would not. Expand
+ * all and Collapse all cannot both change nothing in a list with a fold in it, so one of the three
+ * always changes something.
  *
  * @param {string | null} from
  * @param {number} way
  * @param {any[]} folds
  */
 function nextFoldStep(from, way, folds) {
-  if (from !== null) return FOLD_STEPS[(FOLD_STEPS.indexOf(from) + way + FOLD_STEPS.length) % FOLD_STEPS.length];
-  const first = way > 0 ? "expand" : "collapse";
-  return folds.every((entry) => isFolded(entry) !== openAtStep(first, entry)) ? "unread" : first;
+  const after = (step) => FOLD_STEPS[(FOLD_STEPS.indexOf(step) + way + FOLD_STEPS.length) % FOLD_STEPS.length];
+  if (from !== null) return after(from);
+  let step = way > 0 ? "expand" : "collapse";
+  for (let tried = 1; tried < FOLD_STEPS.length && !stepChangesAny(step, folds); tried += 1) step = after(step);
+  return step;
 }
 
 /**
@@ -8301,14 +8310,14 @@ const KEYMAP = [
     group: KEYS_VIEW, chords: [{ key: ";" }],
     does: "The long messages, a step a press: expand all, then open the unread and fold the read, then collapse " +
       "all, and round again. Each list, in either column, goes on from the step it was left at; the first press " +
-      "in one expands all, or opens the unread and folds the read if all are open already. The message you are on " +
-      "stays where it is",
+      "in one expands all, or if they are all open already goes on round to the first step that changes " +
+      "something. The message you are on stays where it is",
     run: () => foldStepFromKeyboard(1),
   },
   {
     group: KEYS_VIEW, chords: [{ key: ":" }],
-    does: "The same steps the other way round: the first press in a list collapses all, or opens the unread and " +
-      "folds the read if all are folded already",
+    does: "The same steps the other way round: the first press in a list collapses all, or if they are all " +
+      "folded already goes on round to the first step that changes something",
     run: () => foldStepFromKeyboard(-1),
   },
   {

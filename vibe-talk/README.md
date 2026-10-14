@@ -5656,11 +5656,14 @@ stands for is Done, read automatically, or your own (with that setting on).
 **Each list keeps its own step**, for as long as the page is open: Main, All, a thread, the Pinned list
 and the right column's thread are each stepped on from where that list was left, whatever you have
 opened or folded by hand since. The first press in a list goes to the first step its way round — `;`
-to Expanded all and `:` to Collapsed all, as the two keys did before — unless the list is already
-like that, when it goes on to the second step, so that no first press does nothing. The chips count
-as steps: after **Collapse all** the next `;` expands all, and after **Expand all** it opens the unread
-and folds the read. The keys work wherever the page's single keys do (never while you are typing in a
-box), in either column in two columns, on the list the keys are in; in the call's view they do nothing.
+to Expanded all and `:` to Collapsed all, as the two keys did before — unless that would change
+nothing, when it goes on round to the first step that does: the second, or the third when the second
+would change nothing either. So a first `;` in a list already all open folds the read messages, or,
+with none of them read, collapses all; a first `:` in a list already all folded opens the unread, or,
+with every one read, expands all. No first press does nothing. The chips count as steps: after
+**Collapse all** the next `;` expands all, and after **Expand all** it opens the unread and folds the
+read. The keys work wherever the page's single keys do (never while you are typing in a box), in
+either column in two columns, on the list the keys are in; in the call's view they do nothing.
 
 **The message you are on stays where it is.** The selected message while any of it shows, or else the
 first message showing, keeps its place on the screen through every step, even at the newest line:
