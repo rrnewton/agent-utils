@@ -679,3 +679,75 @@ async fn through_the_router_an_emulated_head_is_a_one_message_read_per_channel()
     assert_eq!(counting.count("channel_heads"), 0);
     assert_eq!(counting.count("fetch_recent"), 2);
 }
+
+/// remote-ops-audit W12, the refresh permits: each provider reads at most four channels at once
+/// for a catch-up or a warm-up, and one provider's queue never holds up another's reads. Five
+/// channels on one provider and one on another, every read two seconds: the second provider's
+/// read lands at two seconds, not behind the first provider's fifth.
+#[tokio::test(start_paused = true)]
+async fn each_provider_refreshes_four_channels_at_a_time_without_waiting_for_another() {
+    const SLACK_CHANNEL: &str = "C0SLACK001";
+    let extra: String = ["3333333333", "4444444444", "5555555555"]
+        .iter()
+        .map(|id| format!("[[channels]]\nid = \"{id}\"\nlabel = \"{id}\"\nwritable = false\n\n"))
+        .collect();
+    let toml = format!(
+        "[[providers]]\nkey = \"slack\"\nkind = \"slack\"\ntoken = \"xoxb-test\"\n\n\
+         [[channels]]\nid = \"{SLACK_CHANNEL}\"\nlabel = \"slack team\"\nwritable = false\n\
+         provider = \"slack\"\n\n{}",
+        vibe_talk::testing::config_toml().replace("[elevenlabs]", &format!("{extra}[elevenlabs]"))
+    );
+    let (mut state, discord, _elevenlabs) = vibe_talk::testing::state_from_toml(&toml);
+    let slack = Arc::new(FakeDiscord::new());
+    slack.seed(&channel(SLACK_CHANNEL), "ada", "from slack");
+    let discord_channels = [
+        READ_CHANNEL,
+        WRITE_CHANNEL,
+        "3333333333",
+        "4444444444",
+        "5555555555",
+    ];
+    for id in discord_channels {
+        discord.seed(&channel(id), "ada", "from discord");
+    }
+    let read = Duration::from_secs(2);
+    let entries = vec![
+        ProviderEntry {
+            key: "discord".to_owned(),
+            namespace: state.config.providers[0].namespace(),
+            client: Arc::new(
+                CountingChat::new(Arc::clone(&discord) as Arc<dyn ChatClient>).with_delay(read),
+            ),
+            live_poll_seconds: 0,
+        },
+        ProviderEntry {
+            key: "slack".to_owned(),
+            namespace: state.config.providers[1].namespace(),
+            client: Arc::new(
+                CountingChat::new(Arc::clone(&slack) as Arc<dyn ChatClient>).with_delay(read),
+            ),
+            live_poll_seconds: 0,
+        },
+    ];
+    let router = ChatRouter::new(entries, state.config.default_provider_key());
+    state.replace_providers(Arc::new(router));
+    assert_eq!(
+        state.providers.key_for(&channel(SLACK_CHANNEL)).as_deref(),
+        Some("slack")
+    );
+
+    assert_eq!(vibe_talk::recent::warm(&state), 6);
+    tokio::time::sleep(read + Duration::from_millis(100)).await;
+    let recent = state.live.recent();
+    assert!(
+        recent.holds(&channel(SLACK_CHANNEL)),
+        "the second provider's read did not wait for the first provider's permits"
+    );
+    let held = discord_channels
+        .iter()
+        .filter(|id| recent.holds(&channel(id)))
+        .count();
+    assert_eq!(held, 4, "the first provider still reads four at a time");
+    tokio::time::sleep(read).await;
+    assert!(discord_channels.iter().all(|id| recent.holds(&channel(id))));
+}

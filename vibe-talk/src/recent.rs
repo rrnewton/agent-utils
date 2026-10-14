@@ -102,9 +102,13 @@ pub const REUSE_LIVE_FED: Duration = Duration::from_secs(60);
 /// that a second catch-up in the same conversation reads again.
 pub const REUSE_UNFED: Duration = Duration::from_secs(15);
 
-/// How many refreshes read at once, across every channel. Four, as the catch-up's fan-out always
+/// How many refreshes read at once from each provider. Four, as the catch-up's fan-out always
 /// was: enough that three channels cost one round trip against a provider that can take them,
 /// few enough that a long channel list does not burst a provider's rate limit.
+///
+/// Per provider, not across the deployment (remote-ops-audit W12 `#287 bulk-reads`): the limit is
+/// there for each provider's rate limit, and one provider's slow channels must not hold up
+/// another's reads. A deployment with one provider reads exactly as it did.
 pub const REFRESH_CONCURRENCY: usize = 4;
 
 /// How many pushes each channel keeps, to apply again to a read that was running when they
@@ -258,8 +262,9 @@ pub struct RecentWindows {
     timing: Timing,
     windows: Mutex<Windows>,
     next_refresh: std::sync::atomic::AtomicU64,
-    /// [`REFRESH_CONCURRENCY`] permits; a refresh holds one while it reads.
-    reading: tokio::sync::Semaphore,
+    /// [`REFRESH_CONCURRENCY`] permits per provider, by provider key (`None` for a channel no
+    /// provider holds); a refresh holds one of its provider's while it reads.
+    reading: Mutex<BTreeMap<Option<String>, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Default for RecentWindows {
@@ -282,8 +287,22 @@ impl RecentWindows {
             timing,
             windows: Mutex::new(Windows::default()),
             next_refresh: std::sync::atomic::AtomicU64::new(1),
-            reading: tokio::sync::Semaphore::new(REFRESH_CONCURRENCY),
+            reading: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The refresh permits of the provider `provider` names: [`REFRESH_CONCURRENCY`] of them,
+    /// made the first time that provider reads.
+    fn permits(&self, provider: Option<&str>) -> Arc<tokio::sync::Semaphore> {
+        let mut reading = self
+            .reading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            reading
+                .entry(provider.map(str::to_owned))
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(REFRESH_CONCURRENCY))),
+        )
     }
 
     /// The durations in force.
@@ -674,7 +693,10 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
             // and every push from then on is applied to it again. See the module documentation.
             let mark = claim.windows.mark(&claim.channel);
             let started = mark.started();
-            let read = match claim.windows.reading.acquire().await {
+            let permits = claim
+                .windows
+                .permits(state.providers.key_for(&claim.channel).as_deref());
+            let read = match permits.acquire().await {
                 // `remote-ops-audit`: counted as the catch-up's, whoever's request queued it.
                 Ok(_permit) => {
                     crate::read_reason::ReadReason::Recent

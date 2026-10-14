@@ -5874,7 +5874,8 @@ the held copy and its block says `NOT CURRENT`, how old the copy is, and that it
 newer messages; one with nothing held says it was not read in time and to ask again in a moment.
 A window read within the last 15 seconds — 60 when a live producer feeds it — is used without a
 read at all, and opening a voice session (`GET /api/v1/voice-session`) starts the reads in the
-background, so the greeting covers them. The access log's `tool` line carries `millis=`, each
+background, so the greeting covers them. At most four of these reads run at once for each provider
+(remote-ops-audit W12), so one provider's long channel list never holds up another's reads. The access log's `tool` line carries `millis=`, each
 catch-up writes `recent_activity current= held= unread= millis=`, and a call the caller abandoned
 writes `outcome="abandoned"` instead of nothing.
 
