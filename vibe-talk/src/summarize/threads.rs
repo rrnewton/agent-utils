@@ -15,10 +15,28 @@
 //! Never on the read path. [`ThreadNames::annotate`] runs on every timeline answer and only READS:
 //! it attaches what is already known and, for a write-scope caller, queues the threads that are
 //! due. The queue is worked in the background one thread at a time — read the thread, ask the
-//! summariser, file the result — so a list of fifty unnamed threads costs fifty calls paced by the
-//! summariser's rate limit, not fifty calls at once and not a slow page. A name produced after a
-//! page was read reaches that page on its next refresh, a forward delta included: a delta of the
-//! thread list carries every thread renamed in the last [`RECENT_WINDOW`].
+//! summariser, file the result — so a list of fifty unnamed threads is never fifty calls at once
+//! and never a slow page. A name produced after a page was read reaches that page on its next
+//! refresh, a forward delta included: a delta of the thread list carries every thread renamed in
+//! the last [`RECENT_WINDOW`].
+//!
+//! # How often the chat provider is read for it
+//!
+//! Each naming reads its thread from the chat provider, and on a bridge one read can cost many
+//! upstream calls, so the reads are budgeted PER CHANNEL (remote-ops-audit W5):
+//!
+//! * at most one naming read per channel per `summaries.thread_naming_interval_seconds`
+//!   ([`DEFAULT_NAMING_INTERVAL_SECONDS`] by default). Due threads wait in that channel's queue,
+//!   at most [`MAX_QUEUED_PER_CHANNEL`] of them and [`MAX_QUEUED`] in all, and the one with the
+//!   newest activity is taken first. A thread waits at most [`MAX_QUEUED_WAIT`]; a later read
+//!   that still finds it due queues it again.
+//! * A thread is named ONLY from the read made at its turn. A thread already waiting keeps its
+//!   place when a later page shows it changed; that page's copy is never named from, and the read
+//!   at its turn sees the change.
+//! * After a naming read meets a provider failure — an HTTP 5xx, a read that never completed or
+//!   outlasted [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out — no thread
+//!   in that CHANNEL is read for [`CHANNEL_PAUSE`]. Other channels go on as before.
+//! * Taking a channel off the list drops its queue ([`ThreadNames::forget_channel_queue`]).
 //!
 //! # Where it is kept
 //!
@@ -98,8 +116,25 @@ const MAX_RECENT: usize = 64;
 /// How long a thread whose naming failed is left alone before it is tried again, so a thread the
 /// model cannot name is not asked about on every refresh.
 pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(10 * 60);
-/// The most threads queued at once. A thread past this is queued by a later read.
-const MAX_PENDING: usize = 256;
+/// The least time, by default, between two naming reads in one channel, in seconds:
+/// `summaries.thread_naming_interval_seconds`. remote-ops-audit W5.
+pub const DEFAULT_NAMING_INTERVAL_SECONDS: u64 = 30;
+/// How long no thread in a channel is read for naming after a naming read there met a provider
+/// failure. Before remote-ops-audit W5 only the one thread was left alone, so a failing provider
+/// was asked for every other due thread of the channel in turn.
+pub const CHANNEL_PAUSE: Duration = Duration::from_secs(10 * 60);
+/// The longest one naming read may take before it counts as a timeout, and pauses its channel. A
+/// backstop: a provider client's own request timeout normally answers first.
+pub const NAMING_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// The most threads waiting in one channel's queue. Past it, a thread whose activity is newer than
+/// the oldest waiting one takes that one's place; any other is left for a later read to queue.
+pub const MAX_QUEUED_PER_CHANNEL: usize = 32;
+/// The most threads waiting in every channel's queue together. Past it, a thread is left for a
+/// later read to queue.
+pub const MAX_QUEUED: usize = 256;
+/// The longest a thread waits in a queue. Past it, it is dropped unread; a later read that still
+/// finds it due queues it again.
+pub const MAX_QUEUED_WAIT: Duration = Duration::from_secs(30 * 60);
 /// The most thread records held in memory before the cache is dropped and re-read from the store.
 const MAX_KNOWN: usize = 10_000;
 /// What a thread NAME row's id is prefixed with in the summary cache. No provider's message id
@@ -409,14 +444,18 @@ enum Lookup {
     Unknown(Option<String>),
 }
 
-/// The thread names this server knows, and the queue of threads waiting for one.
+/// The thread names this server knows, and the queues of threads waiting for one.
 #[derive(Debug)]
 pub struct ThreadNames {
     state: Mutex<NamesState>,
-    /// One naming at a time: the summariser's limiter paces the model calls, and this paces the
-    /// chat-provider reads that come before them, which nothing else would. It also makes the
-    /// re-read of a filed name in [`name_one`] and the write after it one step.
+    /// One naming at a time, across every channel: the summariser's limiter paces the model calls,
+    /// and this and [`ThreadNames::interval`] pace the chat-provider reads that come before them,
+    /// which nothing else would. It also makes the re-read of a filed name in
+    /// [`ThreadNames::name_turn`] and the write after it one step.
     turn: tokio::sync::Semaphore,
+    /// The least time between two naming reads in one channel. Zero spaces them not at all; they
+    /// are still made one at a time.
+    interval: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -424,10 +463,196 @@ struct NamesState {
     /// What the store holds, or `None` for "it holds nothing", so an unnamed thread is not read
     /// from the store on every refresh either.
     known: HashMap<Key, Option<ThreadRecord>>,
-    pending: HashSet<Key>,
+    /// Each channel's queue and read budget.
+    channels: HashMap<ChannelId, ChannelQueue>,
+    /// The threads taken from a queue and not yet settled: being read, named or filed.
+    naming: HashSet<Key>,
     failed: HashMap<Key, Instant>,
     recent: VecDeque<Recent>,
     named: usize,
+    /// The last worker token handed out; see [`ChannelQueue::worker`].
+    tokens: u64,
+    /// The last queue position handed out, so threads of equal activity are taken first come
+    /// first served.
+    sequence: u64,
+}
+
+/// One channel's due threads, and when it may next be read for naming.
+#[derive(Debug, Default)]
+struct ChannelQueue {
+    /// The threads waiting for their turn, by thread id.
+    waiting: HashMap<String, Waiting>,
+    /// When the last naming read in this channel began.
+    last_read: Option<Instant>,
+    /// Until when no thread here is read, after a provider failure.
+    paused_until: Option<Instant>,
+    /// The token of the one worker serving this queue, when one is. A worker whose token this no
+    /// longer holds stops, and files nothing it was still naming: that is how taking the channel
+    /// off the list stops it.
+    worker: Option<u64>,
+}
+
+/// A thread waiting for its turn, and what it was queued with.
+///
+/// Nothing in here is named from. The snapshot is the newest copy of the thread a write-scope page
+/// showed: its id says what to read, its reply count says how many messages the sentence was
+/// written at, and, once the thread is named, it is the copy a forward delta carries with the
+/// name attached. What the thread is ABOUT comes only from the read at its turn.
+struct Waiting {
+    deps: ThreadDeps,
+    snapshot: ThreadSummary,
+    prior: Option<ThreadRecord>,
+    /// The thread's activity when it was queued; newest is taken first.
+    activity: jiff::Timestamp,
+    queued_at: Instant,
+    sequence: u64,
+}
+
+impl Waiting {
+    /// The order threads are taken in, greatest first: newest activity, then first queued.
+    fn order(&self) -> (jiff::Timestamp, std::cmp::Reverse<u64>) {
+        (self.activity, std::cmp::Reverse(self.sequence))
+    }
+}
+
+impl std::fmt::Debug for Waiting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waiting")
+            .field("thread", &self.snapshot.id)
+            .field("activity", &self.activity)
+            .field("queued_at", &self.queued_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NamesState {
+    /// How many threads wait in every queue together.
+    fn queued(&self) -> usize {
+        self.channels
+            .values()
+            .map(|queue| queue.waiting.len())
+            .sum()
+    }
+
+    /// Whether `token` is still the worker serving `channel`.
+    fn serving(&self, channel: &ChannelId, token: u64) -> bool {
+        self.channels
+            .get(channel)
+            .is_some_and(|queue| queue.worker == Some(token))
+    }
+
+    /// When worker `token` may next read in `channel`, or `None` when it should stop: the channel's
+    /// queue is empty (and then it is marked unserved, in the same step, so the next thread queued
+    /// starts a new worker), or the worker is no longer the one serving it. Threads that have
+    /// waited [`MAX_QUEUED_WAIT`] are dropped first.
+    fn ready_at(&mut self, channel: &ChannelId, token: u64, interval: Duration) -> Option<Instant> {
+        let queue = self.channels.get_mut(channel)?;
+        if queue.worker != Some(token) {
+            return None;
+        }
+        let before = queue.waiting.len();
+        queue
+            .waiting
+            .retain(|_, waiting| waiting.queued_at.elapsed() < MAX_QUEUED_WAIT);
+        if queue.waiting.len() < before {
+            tracing::debug!(
+                dropped = before - queue.waiting.len(),
+                "threads waited too long to be named and were dropped; a later read queues them \
+                 again"
+            );
+        }
+        if queue.waiting.is_empty() {
+            queue.worker = None;
+            return None;
+        }
+        let now = Instant::now();
+        Some(
+            [queue.last_read.map(|at| at + interval), queue.paused_until]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(now),
+        )
+    }
+
+    /// Take `channel`'s waiting thread with the newest activity, and start its read budget now.
+    fn take_newest(&mut self, channel: &ChannelId) -> Option<(String, Waiting)> {
+        let queue = self.channels.get_mut(channel)?;
+        let thread = queue
+            .waiting
+            .iter()
+            .max_by_key(|(_, waiting)| waiting.order())
+            .map(|(thread, _)| thread.clone())?;
+        let waiting = queue.waiting.remove(&thread)?;
+        queue.last_read = Some(Instant::now());
+        self.naming.insert((channel.clone(), thread.clone()));
+        Some((thread, waiting))
+    }
+
+    /// Forget channels with nothing waiting, no worker, and no budget or pause still running, so
+    /// the map holds only channels that matter.
+    fn forget_idle_channels(&mut self, interval: Duration) {
+        let now = Instant::now();
+        self.channels.retain(|_, queue| {
+            !(queue.waiting.is_empty()
+                && queue.worker.is_none()
+                && queue.last_read.is_none_or(|at| at + interval <= now)
+                && queue.paused_until.is_none_or(|until| until <= now))
+        });
+    }
+}
+
+/// Marks a worker's channel unserved if the worker ends any way other than by finding its queue
+/// empty — a panic, or its runtime shutting down — so the next thread queued starts a new one.
+struct WorkerRelease {
+    names: Arc<ThreadNames>,
+    channel: ChannelId,
+    token: u64,
+}
+
+impl Drop for WorkerRelease {
+    fn drop(&mut self) {
+        let mut state = self.names.lock();
+        if let Some(queue) = state.channels.get_mut(&self.channel) {
+            if queue.worker == Some(self.token) {
+                queue.worker = None;
+            }
+        }
+    }
+}
+
+/// Why one naming turn did not file a name.
+enum TurnFailure {
+    /// The chat provider failed the read: an HTTP 5xx, a read that never completed or took longer
+    /// than [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out. Pauses the
+    /// whole channel for [`CHANNEL_PAUSE`].
+    Provider(String),
+    /// The read says the thread no longer exists: HTTP 404 or 410, or an answer with no thread and
+    /// no message at all.
+    Gone,
+    /// Anything else: the store, the model, or a thread with no text. Only this thread is left
+    /// alone, for [`RETRY_AFTER_FAILURE`].
+    Other(SummaryError),
+}
+
+impl TurnFailure {
+    fn of_read(error: &crate::chat::ChatError) -> Self {
+        use crate::chat::ChatError;
+        match error.cause() {
+            ChatError::Status {
+                status: 404 | 410, ..
+            } => Self::Gone,
+            ChatError::Status { status, .. } if (500..=599).contains(status) => {
+                Self::Provider(error.to_string())
+            }
+            ChatError::Transport(_) | ChatError::RateLimited(_) => {
+                Self::Provider(error.to_string())
+            }
+            _ => Self::Other(SummaryError::Transport(format!(
+                "the thread could not be read: {error}"
+            ))),
+        }
+    }
 }
 
 impl Default for ThreadNames {
@@ -444,12 +669,22 @@ struct Recent {
 }
 
 impl ThreadNames {
-    /// An empty set, with nothing queued.
+    /// An empty set, with nothing queued, reading each channel at most once per
+    /// [`DEFAULT_NAMING_INTERVAL_SECONDS`].
     #[must_use]
     pub fn new() -> Self {
+        Self::with_interval(Duration::from_secs(DEFAULT_NAMING_INTERVAL_SECONDS))
+    }
+
+    /// An empty set reading each channel at most once per `interval` for naming:
+    /// `summaries.thread_naming_interval_seconds`. Zero spaces the reads not at all; they are
+    /// still made one at a time, and a provider failure still pauses the channel.
+    #[must_use]
+    pub fn with_interval(interval: Duration) -> Self {
         Self {
             state: Mutex::new(NamesState::default()),
             turn: tokio::sync::Semaphore::new(1),
+            interval,
         }
     }
 
@@ -459,10 +694,32 @@ impl ThreadNames {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// How many threads are queued or being named right now.
+    /// How many threads are queued or being named right now, in every channel.
     #[must_use]
     pub fn pending(&self) -> usize {
-        self.lock().pending.len()
+        let state = self.lock();
+        state.queued() + state.naming.len()
+    }
+
+    /// How many threads wait in `channel`'s queue right now, not counting one being named.
+    #[must_use]
+    pub fn queued(&self, channel: &ChannelId) -> usize {
+        self.lock()
+            .channels
+            .get(channel)
+            .map_or(0, |queue| queue.waiting.len())
+    }
+
+    /// Drop every thread waiting in `channel`'s queue and stop its worker. Called when the channel
+    /// is taken off the list: nothing more is read there for naming, and a naming already under
+    /// way files nothing. The channel's read budget and any pause are kept, so taking it off and
+    /// back on does not buy an extra read. remote-ops-audit W5.
+    pub fn forget_channel_queue(&self, channel: &ChannelId) {
+        let mut state = self.lock();
+        if let Some(queue) = state.channels.get_mut(channel) {
+            queue.waiting.clear();
+            queue.worker = None;
+        }
     }
 
     /// How many namings have completed since this server started.
@@ -679,6 +936,10 @@ impl ThreadNames {
         });
     }
 
+    /// Queue a due thread in its channel, and start the channel's worker if none is serving it.
+    ///
+    /// A thread already waiting keeps its place: only the copy it will be filed against is brought
+    /// up to date. A thread being named now, or one whose naming failed recently, is not queued.
     fn enqueue(
         self: &Arc<Self>,
         deps: &ThreadDeps,
@@ -687,67 +948,323 @@ impl ThreadNames {
         prior: Option<ThreadRecord>,
     ) {
         let key = (channel.clone(), snapshot.id.clone());
-        {
-            let mut state = self.lock();
-            let recently_failed = state
-                .failed
-                .get(&key)
-                .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE);
-            if recently_failed || state.pending.contains(&key) || state.pending.len() >= MAX_PENDING
-            {
-                return;
+        let mut state = self.lock();
+        let recently_failed = state
+            .failed
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE);
+        if recently_failed || state.naming.contains(&key) {
+            return;
+        }
+        if !state.channels.contains_key(channel) {
+            state.forget_idle_channels(self.interval);
+        }
+        let total = state.queued();
+        state.sequence += 1;
+        let sequence = state.sequence;
+        state.tokens += 1;
+        let token = state.tokens;
+        let queue = state.channels.entry(channel.clone()).or_default();
+        if let Some(waiting) = queue.waiting.get_mut(&key.1) {
+            waiting.snapshot = snapshot;
+            waiting.prior = prior;
+            waiting.deps = deps.clone();
+            return;
+        }
+        let entry = Waiting {
+            deps: deps.clone(),
+            activity: activity_of(&snapshot),
+            snapshot,
+            prior,
+            queued_at: Instant::now(),
+            sequence,
+        };
+        if queue.waiting.len() >= MAX_QUEUED_PER_CHANNEL {
+            // Full: the newcomer takes the place of the thread that would be read last, if it
+            // would be read before that one; otherwise a later read queues it again.
+            let last = queue
+                .waiting
+                .iter()
+                .min_by_key(|(_, waiting)| waiting.order())
+                .map(|(thread, waiting)| (thread.clone(), waiting.order()));
+            match last {
+                Some((thread, order)) if entry.order() > order => {
+                    queue.waiting.remove(&thread);
+                }
+                _ => return,
             }
-            state.pending.insert(key.clone());
+        } else if total >= MAX_QUEUED {
+            return;
+        }
+        queue.waiting.insert(key.1.clone(), entry);
+        if queue.worker.is_some() {
+            return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            self.lock().pending.remove(&key);
+            queue.waiting.remove(&key.1);
             return;
         };
-        let this = Arc::clone(self);
-        let deps = deps.clone();
-        runtime.spawn(async move {
-            // The semaphore is never closed, so this only ever waits.
-            let _turn = this.turn.acquire().await;
-            let outcome = name_one(&deps, &key.0, &snapshot, prior.as_ref()).await;
-            let mut state = this.lock();
-            state.pending.remove(&key);
-            match outcome {
-                Ok(record) => {
-                    state.failed.remove(&key);
-                    state.named += 1;
-                    let mut renamed = snapshot;
-                    renamed.display_name = Some(record.name.clone());
-                    renamed.summary = record.sentence.as_ref().map(|sentence| {
-                        super::cut_for_serving(&sentence.summary, deps.sentence_chars)
-                    });
-                    state
-                        .recent
-                        .retain(|recent| !(recent.channel == key.0 && recent.thread.id == key.1));
-                    if state.recent.len() >= MAX_RECENT {
-                        state.recent.pop_front();
-                    }
-                    state.recent.push_back(Recent {
-                        channel: key.0.clone(),
-                        at: Instant::now(),
-                        thread: renamed,
-                    });
-                    state.known.insert(key, Some(record));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        code = error.code(),
-                        %error,
-                        retry_after_seconds = RETRY_AFTER_FAILURE.as_secs(),
-                        "a thread could not be named"
-                    );
-                    state
-                        .failed
-                        .retain(|_, at| at.elapsed() < RETRY_AFTER_FAILURE);
-                    state.failed.insert(key, Instant::now());
-                }
-            }
-        });
+        queue.worker = Some(token);
+        drop(state);
+        runtime.spawn(Arc::clone(self).work(key.0, token));
     }
+
+    /// Serve `channel`'s queue until it is empty or the worker is replaced: wait for the channel's
+    /// read budget and any pause, take the turn, take the waiting thread with the newest activity,
+    /// and name it from a read made then.
+    async fn work(self: Arc<Self>, channel: ChannelId, token: u64) {
+        let _release = WorkerRelease {
+            names: Arc::clone(&self),
+            channel: channel.clone(),
+            token,
+        };
+        loop {
+            let Some(ready_at) = self.lock().ready_at(&channel, token, self.interval) else {
+                return;
+            };
+            tokio::time::sleep_until(ready_at).await;
+            // The semaphore is never closed, so this only ever waits.
+            let _turn = self.turn.acquire().await;
+            // Looked at again with the turn held: the turn may have taken a while, and the read
+            // below is made at once, so the budget is counted from when it really begins.
+            let taken = {
+                let mut state = self.lock();
+                match state.ready_at(&channel, token, self.interval) {
+                    None => return,
+                    Some(at) if at > Instant::now() => None,
+                    Some(_) => state.take_newest(&channel),
+                }
+            };
+            let Some((thread, waiting)) = taken else {
+                continue;
+            };
+            let outcome = self.name_turn(&channel, token, &waiting).await;
+            self.settle(&channel, thread, waiting, outcome);
+        }
+    }
+
+    /// File what one naming turn came to.
+    fn settle(
+        &self,
+        channel: &ChannelId,
+        thread: String,
+        waiting: Waiting,
+        outcome: Result<Option<ThreadRecord>, TurnFailure>,
+    ) {
+        let key = (channel.clone(), thread);
+        let mut state = self.lock();
+        state.naming.remove(&key);
+        let failure = match outcome {
+            Ok(Some(record)) => {
+                state.failed.remove(&key);
+                state.named += 1;
+                let mut renamed = waiting.snapshot;
+                renamed.display_name = Some(record.name.clone());
+                renamed.summary = record.sentence.as_ref().map(|sentence| {
+                    super::cut_for_serving(&sentence.summary, waiting.deps.sentence_chars)
+                });
+                state
+                    .recent
+                    .retain(|recent| !(recent.channel == key.0 && recent.thread.id == key.1));
+                if state.recent.len() >= MAX_RECENT {
+                    state.recent.pop_front();
+                }
+                state.recent.push_back(Recent {
+                    channel: key.0.clone(),
+                    at: Instant::now(),
+                    thread: renamed,
+                });
+                state.known.insert(key, Some(record));
+                return;
+            }
+            // The channel was taken off the list while the thread was being named.
+            Ok(None) => return,
+            Err(failure) => failure,
+        };
+        state
+            .failed
+            .retain(|_, at| at.elapsed() < RETRY_AFTER_FAILURE);
+        state.failed.insert(key.clone(), Instant::now());
+        match failure {
+            TurnFailure::Provider(detail) => {
+                tracing::warn!(
+                    channel = %key.0,
+                    detail,
+                    pause_seconds = CHANNEL_PAUSE.as_secs(),
+                    "a thread-naming read failed at the chat provider; no thread in this channel \
+                     is read for naming until the pause ends"
+                );
+                state
+                    .channels
+                    .entry(key.0.clone())
+                    .or_default()
+                    .paused_until = Some(Instant::now() + CHANNEL_PAUSE);
+            }
+            TurnFailure::Gone => {
+                tracing::info!("a thread queued for naming no longer exists; it was not named");
+                // Nor is it carried on a forward delta as recently renamed: the reader's page would
+                // draw back a thread that is gone.
+                state
+                    .recent
+                    .retain(|recent| !(recent.channel == key.0 && recent.thread.id == key.1));
+            }
+            TurnFailure::Other(error) => tracing::warn!(
+                code = error.code(),
+                %error,
+                retry_after_seconds = RETRY_AFTER_FAILURE.as_secs(),
+                "a thread could not be named"
+            ),
+        }
+    }
+
+    /// Read one thread, ask for its name and sentence, and file them: `Ok(None)` when the channel
+    /// was taken off the list before anything was filed.
+    ///
+    /// The thread is read HERE, at its turn, and the prompt holds exactly what that read returned:
+    /// no copy held from the page that queued it, which may be many minutes old by now.
+    async fn name_turn(
+        &self,
+        channel: &ChannelId,
+        token: u64,
+        waiting: &Waiting,
+    ) -> Result<Option<ThreadRecord>, TurnFailure> {
+        let deps = &waiting.deps;
+        let snapshot = &waiting.snapshot;
+        // Chosen ONCE. What this naming was queued with is not the last word: the store is asked
+        // again, so a name filed earlier is kept even if the queue was fed from stale or missing
+        // knowledge — and if the store cannot say, nothing is changed and no model call is made.
+        let kept = match &waiting.prior {
+            Some(prior) => Some(prior.name.clone()),
+            None => filed_name(deps, channel, &snapshot.id)
+                .await
+                .map_err(TurnFailure::Other)?
+                .map(|filed| filed.name),
+        };
+        let request = TimelineRequest {
+            view: TimelineView::Thread,
+            thread_id: Some(snapshot.id.clone()),
+            before: None,
+            after: None,
+            limit: THREAD_FETCH_LIMIT,
+        };
+        // `remote-ops-audit`: counted as naming, whoever's request queued it.
+        let read = tokio::time::timeout(
+            NAMING_READ_TIMEOUT,
+            crate::read_reason::ReadReason::Naming
+                .scope(deps.chat.fetch_timeline(channel, &request)),
+        )
+        .await;
+        let page = match read {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => return Err(TurnFailure::of_read(&error)),
+            Err(_) => {
+                return Err(TurnFailure::Provider(format!(
+                    "the thread read took longer than {} seconds",
+                    NAMING_READ_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        // Taken off the list while the read was out: the model is not asked about it.
+        let serving = self.lock().serving(channel, token);
+        if !serving {
+            tracing::info!(
+                "a channel was taken off the list while one of its threads was read for naming; \
+                 nothing was asked or filed"
+            );
+            return Ok(None);
+        }
+        if page.thread.is_none() && page.messages.is_empty() {
+            // No thread and not one message: a provider that answers a deleted thread this way,
+            // rather than with a 404.
+            return Err(TurnFailure::Gone);
+        }
+        let mut messages: Vec<Message> = Vec::new();
+        if let Some(root) = page.thread.and_then(|thread| thread.root) {
+            messages.push(root);
+        }
+        for message in page.messages {
+            if !messages.iter().any(|kept| kept.id == message.id) {
+                messages.push(message);
+            }
+        }
+        messages.retain(|message| !message.content.trim().is_empty());
+        if messages.is_empty() {
+            return Err(TurnFailure::Other(SummaryError::Shape(
+                "the thread has no text to name it by".to_owned(),
+            )));
+        }
+        let request = ThreadRequest::new(&messages, deps.sentence_chars);
+        let began = std::time::Instant::now();
+        let naming = deps
+            .summarizer
+            .name_thread(&request)
+            .await
+            .map_err(TurnFailure::Other)?;
+        let renamed = kept.is_none();
+        let cut_at = naming.cut_at;
+        let record = ThreadRecord {
+            // A thread that already has a name keeps it, whatever the model offered this time.
+            name: kept.unwrap_or(naming.slug),
+            touched: now_seconds(),
+            sentence: Some(FiledSentence {
+                summary: naming.sentence,
+                at: snapshot
+                    .reply_count
+                    .map_or(messages.len() as u64, |replies| replies.saturating_add(1)),
+            }),
+            sentence_below_cap: super::cut_below_cap(cut_at, deps.sentence_chars),
+        };
+        // ...or while the model was.
+        let serving = self.lock().serving(channel, token);
+        if !serving {
+            tracing::info!(
+                "a channel was taken off the list while one of its threads was named; nothing was \
+                 filed"
+            );
+            return Ok(None);
+        }
+        tracing::info!(
+            backend = deps.summarizer.backend(),
+            elapsed_ms = began.elapsed().as_millis(),
+            messages = record.sentence.as_ref().map_or(0, |sentence| sentence.at),
+            renamed,
+            "named a thread"
+        );
+        // The name row is rewritten every time, which also restarts its age.
+        file_name(deps, channel, &snapshot.id, &record.name, record.touched).await;
+        if let Some(sentence) = &record.sentence {
+            let filed = serde_json::to_string(sentence).map_err(|error| {
+                TurnFailure::Other(SummaryError::Shape(format!(
+                    "the thread sentence would not encode: {error}"
+                )))
+            })?;
+            match deps
+                .store
+                .cache_summary(
+                    &sentence_key(&deps.version, channel, &snapshot.id),
+                    &filed,
+                    cut_at,
+                )
+                .await
+            {
+                Ok(()) | Err(StoreError::Unavailable(_)) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "a thread sentence could not be filed; it is kept in memory until the server restarts"
+                ),
+            }
+        }
+        Ok(Some(record))
+    }
+}
+
+/// A thread's last activity as a page gave it, for ordering a queue. One that cannot be read
+/// counts as the oldest.
+fn activity_of(snapshot: &ThreadSummary) -> jiff::Timestamp {
+    snapshot
+        .updated_at
+        .parse::<jiff::Timestamp>()
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
 }
 
 /// Whether a thread needs a name, or a fresh sentence.
@@ -827,105 +1344,6 @@ async fn file_name(deps: &ThreadDeps, channel: &ChannelId, thread: &str, name: &
             "a thread name could not be filed; it is kept in memory until the server restarts"
         ),
     }
-}
-
-/// Read one thread, ask for its name and sentence, and file them.
-async fn name_one(
-    deps: &ThreadDeps,
-    channel: &ChannelId,
-    snapshot: &ThreadSummary,
-    prior: Option<&ThreadRecord>,
-) -> Result<ThreadRecord, SummaryError> {
-    // Chosen ONCE. What this naming was queued with is not the last word: the store is asked
-    // again, so a name filed earlier is kept even if the queue was fed from stale or missing
-    // knowledge — and if the store cannot say, nothing is changed and no model call is made.
-    let kept = match prior {
-        Some(prior) => Some(prior.name.clone()),
-        None => filed_name(deps, channel, &snapshot.id)
-            .await?
-            .map(|filed| filed.name),
-    };
-    let request = TimelineRequest {
-        view: TimelineView::Thread,
-        thread_id: Some(snapshot.id.clone()),
-        before: None,
-        after: None,
-        limit: THREAD_FETCH_LIMIT,
-    };
-    // `remote-ops-audit`: counted as naming, whoever's request queued it.
-    let page = crate::read_reason::ReadReason::Naming
-        .scope(deps.chat.fetch_timeline(channel, &request))
-        .await
-        .map_err(|error| {
-            SummaryError::Transport(format!("the thread could not be read: {error}"))
-        })?;
-    let root = page
-        .thread
-        .as_ref()
-        .and_then(|thread| thread.root.clone())
-        .or_else(|| snapshot.root.clone());
-    let mut messages: Vec<Message> = Vec::new();
-    if let Some(root) = root {
-        messages.push(root);
-    }
-    for message in page.messages {
-        if !messages.iter().any(|kept| kept.id == message.id) {
-            messages.push(message);
-        }
-    }
-    messages.retain(|message| !message.content.trim().is_empty());
-    if messages.is_empty() {
-        return Err(SummaryError::Shape(
-            "the thread has no text to name it by".to_owned(),
-        ));
-    }
-    let request = ThreadRequest::new(&messages, deps.sentence_chars);
-    let began = std::time::Instant::now();
-    let naming = deps.summarizer.name_thread(&request).await?;
-    let renamed = kept.is_none();
-    let cut_at = naming.cut_at;
-    let record = ThreadRecord {
-        // A thread that already has a name keeps it, whatever the model offered this time.
-        name: kept.unwrap_or(naming.slug),
-        touched: now_seconds(),
-        sentence: Some(FiledSentence {
-            summary: naming.sentence,
-            at: snapshot
-                .reply_count
-                .map_or(messages.len() as u64, |replies| replies.saturating_add(1)),
-        }),
-        sentence_below_cap: super::cut_below_cap(cut_at, deps.sentence_chars),
-    };
-    tracing::info!(
-        backend = deps.summarizer.backend(),
-        elapsed_ms = began.elapsed().as_millis(),
-        messages = record.sentence.as_ref().map_or(0, |sentence| sentence.at),
-        renamed,
-        "named a thread"
-    );
-    // The name row is rewritten every time, which also restarts its age.
-    file_name(deps, channel, &snapshot.id, &record.name, record.touched).await;
-    if let Some(sentence) = &record.sentence {
-        let filed = serde_json::to_string(sentence).map_err(|error| {
-            SummaryError::Shape(format!("the thread sentence would not encode: {error}"))
-        })?;
-        match deps
-            .store
-            .cache_summary(
-                &sentence_key(&deps.version, channel, &snapshot.id),
-                &filed,
-                cut_at,
-            )
-            .await
-        {
-            Ok(()) | Err(StoreError::Unavailable(_)) => {}
-            Err(error) => tracing::warn!(
-                %error,
-                "a thread sentence could not be filed; it is kept in memory until the server restarts"
-            ),
-        }
-    }
-    Ok(record)
 }
 
 #[cfg(test)]

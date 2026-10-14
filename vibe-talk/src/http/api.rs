@@ -4866,6 +4866,8 @@ pub async fn remove_channel(
 /// The sentences this server remembers go too, so a channel shown again in the same process is not
 /// shown from memory what was just deleted from the store.
 async fn forget_channel_summaries(state: &AppState, channel: &crate::model::ChannelId) -> u64 {
+    // Nothing more is read there to name a thread either (remote-ops-audit W5).
+    state.thread_names.forget_channel_queue(channel);
     state.thread_names.forget_channel_sentences(channel);
     match state.store.forget_channel_summaries(channel).await {
         Ok(deleted) => deleted,

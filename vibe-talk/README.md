@@ -1553,8 +1553,9 @@ and never logged**; writing `api_key` or `bearer_token` inline is refused at sta
 this section, only `dialect`, `model` and `max_tokens` are part of the summary cache key: changing
 one re-derives every summary and thread sentence (thread names are kept; see below), while
 rotating a credential or moving an endpoint does not. Of the other `[summaries]` settings, every
-one that changes what a summary says is part of the key too; `threshold_chars` and
-`reply_timeout_seconds` are not (see [Summaries are kept](#summaries-are-kept)).
+one that changes what a summary says is part of the key too; `threshold_chars`,
+`reply_timeout_seconds` and `thread_naming_interval_seconds` are not (see
+[Summaries are kept](#summaries-are-kept)).
 
 ### No tools, by construction
 
@@ -1588,6 +1589,26 @@ exist but never causes a call. A name produced after a page was read reaches it 
 refresh, a forward delta included. A thread whose naming failed is left alone for ten minutes. The
 model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
 characters); any other answer fails that naming by name rather than being cut into shape.
+
+**How often a channel is read for names.** Each naming reads its thread from the chat provider,
+and through a bridge one read can cost many upstream calls, so those reads are budgeted per
+channel:
+
+* **At most one naming read per channel every `summaries.thread_naming_interval_seconds`**
+  (seconds; default `30`; `0` to `3600`, where `0` spaces them not at all and they are still made
+  one at a time). Twenty threads falling due in a minute cost two reads, not twenty.
+* Due threads wait in their channel's queue, **newest activity first**: at most 32 per channel
+  (a newer thread takes the place of the one that would be read last) and 256 in all, and none
+  longer than 30 minutes. A thread dropped from a queue is queued again by the next write-token
+  read that finds it still due.
+* **A thread is named only from the read made at its turn.** A thread already waiting keeps its
+  place when a later page shows it changed — a reply edited, a reply added — and its name is made
+  from what the provider says then, never from a copy the page held. A thread deleted while it
+  waited is not named, and is not carried on a delta.
+* **After a provider failure on a naming read — an HTTP 5xx, a read that never completed or took
+  longer than five minutes, or a rate limit the client could not wait out — no thread in that
+  channel is read for names for ten minutes.** Other channels go on at their own pace.
+* Taking a channel off the list drops its queue; a naming already under way there files nothing.
 
 **A name is chosen once and kept.** Both halves live in the summary cache, by different rules:
 
@@ -1635,9 +1656,9 @@ was reloaded, the server restarted, or a setting changed that changes no word of
 * **Only a change of wording makes a summary unreachable.** The cache key's policy version hashes
   the prompt and whatever the summariser adds to it, the backend, `model`, `target_chars`,
   `context_messages`, `max_per_socket`, `socket_idle_seconds`, and `[summaries.llm]`'s `dialect`,
-  `model` and `max_tokens`. `threshold_chars` (which messages are summarised) and
-  `reply_timeout_seconds` (how long one is waited for) are not in it, and neither is the length an
-  answer is cut at. The version is `v2-…`; the first start after this change re-keys every summary
+  `model` and `max_tokens`. `threshold_chars` (which messages are summarised),
+  `reply_timeout_seconds` (how long one is waited for) and `thread_naming_interval_seconds` (when a
+  thread is named) are not in it, and neither is the length an answer is cut at. The version is `v2-…`; the first start after this change re-keys every summary
   filed under the previous `v1-…` version of the same configuration instead of deleting it, and
   logs `re-keyed=N swept=M` at INFO on every start — `re-keyed=0 swept=0` once there is nothing
   left to move.
@@ -1741,6 +1762,7 @@ model provider or a real gateway.
 | Agent conversation budget | `summaries.max_per_socket` | — | summaries one conversation serves before it is recycled, default `8`, minimum 1 |
 | Agent conversation idle close | `summaries.socket_idle_seconds` | — | default `30` |
 | Agent turn deadline | `summaries.reply_timeout_seconds` | — | one turn, and one opening handshake, default `30`, minimum 1 |
+| Thread-naming read budget | `summaries.thread_naming_interval_seconds` | — | seconds between two reads of a channel's threads to name them, default `30`, `0` to `3600` (`0`: not spaced, still one at a time); not part of the summary cache key — see [Thread names](#thread-names) |
 | Resuming | `replay.enabled` | `VIBE_TALK_REPLAY_ENABLED` | **off by default**; on, every new call re-sends earlier conversation content to the vendor. Only the ElevenLabs backend can carry it: with `conversation.backend = "websocket"` the page is told replay is off, and the server warns at startup |
 | Replay budget | `replay.max_chars` / `replay.max_turns` | `VIBE_TALK_REPLAY_MAX_CHARS` / `_TURNS` | default `6000` / `40`; oldest dropped first; `0` is refused, not "unlimited" |
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |

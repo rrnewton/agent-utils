@@ -375,10 +375,21 @@ struct Harness {
     store: Arc<FakeStore>,
 }
 
+/// Thread names with no per-channel spacing between naming reads.
+///
+/// These tests are about WHAT a thread is named and where it is kept, on the real clock, and both
+/// of their threads are in one channel: at the default budget (remote-ops-audit W5) the second
+/// would wait thirty seconds. How often a channel is read is tested in `tests/naming_budget.rs`,
+/// on a paused clock.
+fn unpaced() -> ThreadNames {
+    ThreadNames::with_interval(Duration::ZERO)
+}
+
 fn harness() -> Harness {
     let summarizer = Arc::new(FakeSummarizer::naming_threads());
     let (mut state, _discord, store) =
         testing::state_with_backend(&testing::config_toml(), summarizer.clone());
+    state.thread_names = Arc::new(unpaced());
     let threads = Arc::new(Threads::default());
     state.replace_chat(threads.clone());
     Harness {
@@ -601,7 +612,7 @@ async fn names_survive_a_restart_through_the_store() {
 
     // A restart: the same store, nothing in memory.
     let restarted = AppState {
-        thread_names: Arc::new(ThreadNames::new()),
+        thread_names: Arc::new(unpaced()),
         ..h.state.clone()
     };
     let names = Arc::clone(&restarted.thread_names);
@@ -658,7 +669,7 @@ async fn a_name_survives_a_policy_change_and_a_flood_of_newer_summaries() {
             .expect("cache");
     }
     let restarted = AppState {
-        thread_names: Arc::new(ThreadNames::new()),
+        thread_names: Arc::new(unpaced()),
         summary_version: Arc::clone(&version),
         ..h.state.clone()
     };
@@ -701,7 +712,7 @@ async fn a_store_that_cannot_be_read_never_gives_a_thread_a_second_name() {
     let names_before = page_names(&page);
 
     // A restart, so nothing is in memory, and the store's next read fails.
-    let names = Arc::new(ThreadNames::new());
+    let names = Arc::new(unpaced());
     h.store.fail_next("the disk is busy");
     let (request, mut page) = thread_page(&h.threads).await;
     names
@@ -739,7 +750,7 @@ async fn a_naming_queued_on_stale_knowledge_keeps_the_name_already_filed() {
     // "unnamed" and it queues both — and the naming must re-read the store and keep the names.
     let h = harness();
     let deps = ThreadDeps::from_state(&h.state);
-    let stale = Arc::new(ThreadNames::new());
+    let stale = Arc::new(unpaced());
     let (request, mut page) = thread_page(&h.threads).await;
     stale
         .annotate(&deps, &channel(), &request, &mut page, false)
@@ -1000,7 +1011,7 @@ async fn a_thread_sentence_is_filed_whole_and_cut_wherever_it_is_shown() {
 
     // After a restart the record is read back from the store, and cut the same way.
     let restarted = AppState {
-        thread_names: Arc::new(ThreadNames::new()),
+        thread_names: Arc::new(unpaced()),
         ..h.state.clone()
     };
     let app = vibe_talk::http::router(restarted);

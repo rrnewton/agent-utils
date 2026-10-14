@@ -325,8 +325,9 @@ fn yes() -> bool {
 /// What a summary is, in numbers.
 ///
 /// Every field that changes what a summary SAYS is folded into
-/// [`crate::summarize::policy_version`] and therefore into the cache key; `threshold_chars` and
-/// `reply_timeout_seconds` change no word of one and are not (`#208 persistent-cache`). A field
+/// [`crate::summarize::policy_version`] and therefore into the cache key; `threshold_chars`,
+/// `reply_timeout_seconds` and `thread_naming_interval_seconds` change no word of one and are not
+/// (`#208 persistent-cache`, remote-ops-audit W5). A field
 /// added later must be decided one way or the other there, and the unit test that enumerates every
 /// field fails until it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +360,12 @@ pub struct SummariesConfig {
     pub socket_idle_seconds: u64,
     /// How long one turn with the agent, or one opening handshake, may take.
     pub reply_timeout_seconds: u64,
+    /// The least time between two thread-naming reads in one channel, in seconds; `0` spaces them
+    /// not at all. remote-ops-audit W5: on a bridge one thread read can cost many upstream calls,
+    /// and a list of due threads used to read them all back to back. It changes WHEN a thread is
+    /// named, never what it is named, so it is not in the cache key. See
+    /// [`crate::summarize::threads`].
+    pub thread_naming_interval_seconds: u64,
     /// A direct Messages API summariser, when `[summaries.llm]` is present. `#233 llm-summarizer`.
     ///
     /// When present it is THE summariser, and it is also the one that names threads; see
@@ -377,6 +384,8 @@ impl Default for SummariesConfig {
             max_per_socket: crate::summarize::agent::DEFAULT_MAX_PER_SOCKET,
             socket_idle_seconds: crate::summarize::agent::DEFAULT_SOCKET_IDLE_SECONDS,
             reply_timeout_seconds: crate::summarize::agent::DEFAULT_REPLY_TIMEOUT_SECONDS,
+            thread_naming_interval_seconds:
+                crate::summarize::threads::DEFAULT_NAMING_INTERVAL_SECONDS,
             llm: None,
         }
     }
@@ -1109,6 +1118,7 @@ struct FileSummaries {
     max_per_socket: Option<usize>,
     socket_idle_seconds: Option<u64>,
     reply_timeout_seconds: Option<u64>,
+    thread_naming_interval_seconds: Option<u64>,
     llm: Option<FileLlm>,
 }
 
@@ -1661,6 +1671,9 @@ fn deprecated_backend(raw: &str) -> Result<(), ConfigError> {
     }
 }
 
+/// The most `summaries.thread_naming_interval_seconds` may be: an hour.
+pub const MAX_THREAD_NAMING_INTERVAL_SECONDS: u64 = 3_600;
+
 /// Resolve the `[summaries]` section.
 fn summaries_config(
     model_from_env: Option<&str>,
@@ -1705,8 +1718,21 @@ fn summaries_config(
         reply_timeout_seconds: file
             .reply_timeout_seconds
             .unwrap_or(defaults.reply_timeout_seconds),
+        thread_naming_interval_seconds: file
+            .thread_naming_interval_seconds
+            .unwrap_or(defaults.thread_naming_interval_seconds),
         llm,
     };
+    if summaries.thread_naming_interval_seconds > MAX_THREAD_NAMING_INTERVAL_SECONDS {
+        return Err(ConfigError::Invalid {
+            field: "summaries.thread_naming_interval_seconds".to_owned(),
+            detail: format!(
+                "must be from 0 to {MAX_THREAD_NAMING_INTERVAL_SECONDS} seconds between two \
+                 thread-naming reads in one channel, not {}",
+                summaries.thread_naming_interval_seconds
+            ),
+        });
+    }
     if summaries.max_per_socket == 0 {
         // Zero is not "unlimited" and must not read as it. A conversation that may serve no
         // summaries is one that is opened and immediately recycled, for ever, at a mint and a
@@ -4184,6 +4210,28 @@ provider = "slack"
         let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_SUMMARY_MODEL, "from-env")]))
             .expect("valid config");
         assert_eq!(cfg.summaries.model.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn the_thread_naming_interval_defaults_to_thirty_seconds_and_is_bounded() {
+        // remote-ops-audit W5. At most one thread-naming read per channel per this many seconds.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.summaries.thread_naming_interval_seconds, 30);
+        for value in [0, 90, MAX_THREAD_NAMING_INTERVAL_SECONDS] {
+            let text = format!("{FULL}\n[summaries]\nthread_naming_interval_seconds = {value}\n");
+            let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+            assert_eq!(cfg.summaries.thread_naming_interval_seconds, value);
+        }
+        let text = format!(
+            "{FULL}\n[summaries]\nthread_naming_interval_seconds = {}\n",
+            MAX_THREAD_NAMING_INTERVAL_SECONDS + 1
+        );
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("past an hour");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. }
+                if field == "summaries.thread_naming_interval_seconds"),
+            "{err}"
+        );
     }
 
     #[test]

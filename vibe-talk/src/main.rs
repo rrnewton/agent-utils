@@ -671,6 +671,10 @@ async fn main() -> anyhow::Result<()> {
         config.elevenlabs.clone(),
     );
     let live_limit = config.chat.default_fetch_limit;
+    // remote-ops-audit W5: at most one thread-naming read per channel per this many seconds.
+    let thread_names = Arc::new(vibe_talk::summarize::threads::ThreadNames::with_interval(
+        std::time::Duration::from_secs(config.summaries.thread_naming_interval_seconds),
+    ));
     let state = AppState {
         config: Arc::new(config),
         chat: Arc::clone(&chat),
@@ -698,7 +702,7 @@ async fn main() -> anyhow::Result<()> {
         summarizer,
         summary_version: summary_version.into(),
         summary_counters: Arc::new(vibe_talk::summarize::counters::SummaryCounters::new()),
-        thread_names: Arc::new(vibe_talk::summarize::threads::ThreadNames::new()),
+        thread_names,
     };
     // CHANNELS THE OWNER ADDED FROM INSIDE THE APP, brought back into the allowlist before the
     // server answers anything. They were probed when they were added; they are not probed again

@@ -303,9 +303,10 @@ enabled = true
 # summary SAYS is folded into the cache key (see src/summarize/policy_version), so changing one
 # makes every summary produced under the old settings unreachable at once and a startup sweep
 # deletes them. That is the intent: a changed instruction is a changed summary, and serving the old
-# text would be worse than regenerating. threshold_chars and reply_timeout_seconds change no word
-# of a summary and are NOT in the key, and neither is the length an answer is cut at: an answer is
-# stored whole and cut when it is shown, so changing them asks the model for nothing again.
+# text would be worse than regenerating. threshold_chars, reply_timeout_seconds and
+# thread_naming_interval_seconds change no word of a summary and are NOT in the key, and neither is
+# the length an answer is cut at: an answer is stored whole and cut when it is shown, so changing
+# them asks the model for nothing again.
 #
 # threshold_chars: below this a message is not summarised at all — it is already short enough to
 # read, and it must be at least target_chars or the "summary" comes back longer than the original.
@@ -358,6 +359,14 @@ enabled = true
 # max_per_socket = 8            # summaries one conversation serves before it is recycled; min 1
 # socket_idle_seconds = 30      # quiet after which a held conversation is closed
 # reply_timeout_seconds = 30    # ceiling on one turn, and on one opening handshake; min 1
+
+# HOW OFTEN A CHANNEL IS READ TO NAME ITS THREADS. Each thread naming reads that thread from the chat
+# provider (through a bridge, one read can cost many upstream calls), so at most one such read is
+# made per channel every this many seconds; due threads wait their turn, newest activity first, and
+# each is named from the read made at its turn. After a provider failure on one of those reads (an
+# HTTP 5xx, a timeout, a rate limit not cleared) that channel is not read for names for ten
+# minutes. Changes when a thread is named, never what, so it is not in the cache key.
+# thread_naming_interval_seconds = 30   # 0 to 3600; 0 does not space the reads
 
 # [summaries.llm] — SUMMARIES AND THREAD NAMES FROM ONE PLAIN MESSAGES API CALL APIECE.
 # No agent harness and NO TOOLS: the request type cannot carry one. Each long message becomes one

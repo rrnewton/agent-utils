@@ -400,17 +400,19 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
 ///
 /// That is the prompt (with whatever the backend adds, [`Summarizer::policy_input`]), the backend,
 /// `model`, `target_chars`, `context_messages`, `max_per_socket`, `socket_idle_seconds`, and the
-/// `[summaries.llm]` dialect, model and output budget. Three settings are deliberately NOT here:
+/// `[summaries.llm]` dialect, model and output budget. Four settings are deliberately NOT here:
 ///
 /// * `threshold_chars` decides WHICH messages are summarised, not what a summary says;
 /// * `reply_timeout_seconds` decides how long one is waited for;
 /// * the [`hard_cap_chars`] an answer is cut at decides how much of a stored answer is SHOWN, and
-///   the answer is stored uncut ([`Summary`]).
+///   the answer is stored uncut ([`Summary`]);
+/// * `thread_naming_interval_seconds` decides WHEN a thread is named, not what it is named
+///   (remote-ops-audit W5).
 ///
-/// [`policy_version_v1`] folded all three in, under a rule of "every field", and paid for it with
-/// a full re-summarisation whenever one moved. A setting added to [`SummariesConfig`] later must be
-/// decided here one way or the other: the unit tests below enumerate every field and fail on one
-/// they do not name.
+/// [`policy_version_v1`] folded the first three in, under a rule of "every field", and paid for it
+/// with a full re-summarisation whenever one moved. A setting added to [`SummariesConfig`] later
+/// must be decided here one way or the other: the unit tests below enumerate every field and fail
+/// on one they do not name.
 #[must_use]
 pub fn policy_version_v2(prompt: &str, config: &SummariesConfig, backend: &str) -> String {
     // `[summaries.llm]`: only what changes the WORDING — see `LlmConfig` for why endpoints,
@@ -603,6 +605,7 @@ mod tests {
             max_per_socket: _,
             socket_idle_seconds: _,
             reply_timeout_seconds: _,
+            thread_naming_interval_seconds: _,
             llm: _,
         } = config();
         vec![
@@ -625,6 +628,12 @@ mod tests {
                 "reply_timeout_seconds",
                 false,
                 moved(|c| c.reply_timeout_seconds += 1),
+            ),
+            // When a thread is named, never what it is named.
+            (
+                "thread_naming_interval_seconds",
+                false,
+                moved(|c| c.thread_naming_interval_seconds += 1),
             ),
         ]
     }
