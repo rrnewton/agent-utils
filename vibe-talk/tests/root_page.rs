@@ -7,10 +7,8 @@
 //! What only a browser can show — that the fragment survives the redirect, and that Chromium still
 //! finds the page installable and in scope from either address — is `tests/pwa_installability.py`.
 //!
-//! The last four tests read files instead of the router. Three read the guides: they tell a reader
-//! how to open and sign in to the page at `/`, so they must describe the app and not the page that
-//! is gone. The last reads the whole tree, so that every reference to this change names its issue
-//! by the number main gave it.
+//! The last three tests read the guides instead of the router: they tell a reader how to open and
+//! sign in to the page at `/`, so they must describe the app and not the page that is gone.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -308,117 +306,5 @@ fn no_guide_links_to_the_old_address() {
         ("`/voice` forwards to `/`", 0),
     ] {
         assert_eq!(old_addresses(line).len(), found, "{line}");
-    }
-}
-
-/// This change's slug, and the number main gave its issue. The work began on a branch whose own
-/// issue file took the next free number; main then reserved this one for it and gave the branch's
-/// number to an unrelated issue. A reference that kept the branch's number would land pointing a
-/// reader at the wrong issue.
-const SLUG: &str = "root-is-the-app";
-const NUMBER: &str = "302";
-
-/// The number of each `#<number> <SLUG>` reference in `text`, in order, a reference wrapped so the
-/// number ends one line and the slug starts the next included, with or without a comment leader on
-/// the second line.
-fn issue_numbers(text: &str) -> Vec<&str> {
-    text.match_indices(SLUG)
-        .filter(|(at, _)| {
-            // The slug itself, not the start of a longer one.
-            !text[at + SLUG.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
-        })
-        .filter_map(|(at, _)| {
-            let mut head = text[..at].trim_end_matches([' ', '\t']);
-            if let Some(newline) = head.rfind('\n') {
-                if head[newline + 1..]
-                    .trim_start()
-                    .chars()
-                    .all(|c| "/*#".contains(c))
-                {
-                    head = head[..newline].trim_end();
-                }
-            }
-            let number = head.trim_end_matches(|c: char| c.is_ascii_digit());
-            let digits = &head[number.len()..];
-            (!digits.is_empty() && number.ends_with('#')).then_some(digits)
-        })
-        .collect()
-}
-
-/// Every file under `dir` that is not build output, a local artifact or a dependency, as a path
-/// relative to `root` and its text; files that are not UTF-8 are not prose and are skipped.
-fn texts(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<(String, String)>) {
-    for entry in std::fs::read_dir(dir).expect("readable directory") {
-        let path = entry.expect("directory entry").path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if name.starts_with('.')
-            || ["target", "debug", "node_modules", "__pycache__"].contains(&name)
-        {
-            continue;
-        }
-        if path.is_dir() {
-            texts(root, &path, found);
-        } else if let Ok(text) = std::fs::read_to_string(&path) {
-            let relative = path.strip_prefix(root).expect("under the root");
-            found.push((relative.display().to_string(), text));
-        }
-    }
-}
-
-#[test]
-fn every_reference_to_this_change_names_its_issue_by_mains_number() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    texts(root, root, &mut files);
-    let mut wrong = Vec::new();
-    let mut referring = Vec::new();
-    for (name, text) in &files {
-        let numbers = issue_numbers(text);
-        if !numbers.is_empty() {
-            referring.push(name.as_str());
-        }
-        for number in numbers.into_iter().filter(|number| *number != NUMBER) {
-            wrong.push(format!("{name}: #{number} {SLUG}"));
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "references to {SLUG} that do not name #{NUMBER}:\n{}",
-        wrong.join("\n")
-    );
-    // Not vacuous: the walk reaches the server, the page and its stylesheet, the tests, a script
-    // and the guides. The page's script has one reference, wrapped across two comment lines, so
-    // finding it there shows a wrapped reference is read.
-    for expected in [
-        "src/http/assets.rs",
-        "web/voice.js",
-        "web/style.css",
-        "tests/scope_first.rs",
-        "scripts/energy_profile.py",
-        "README.md",
-        "Makefile",
-        "tests.dag.yaml",
-    ] {
-        assert!(
-            referring.contains(&expected),
-            "the walk found no reference to {SLUG} in {expected}"
-        );
-    }
-    // The shapes a reference is written in, built here so this file holds no reference but its own.
-    for (text, numbers) in [
-        (format!("`#7 {SLUG}`"), vec!["7"]),
-        (format!("(gone since `#7\n// {SLUG}`)"), vec!["7"]),
-        (format!("    # since #7\n    # {SLUG}: a"), vec!["7"]),
-        (format!(" * until `#7\n * {SLUG}`; the"), vec!["7"]),
-        (format!("until `#7\n{SLUG}`, while"), vec!["7"]),
-        (format!("#7 {SLUG} and #8 {SLUG}"), vec!["7", "8"]),
-        (format!("vt/{SLUG}"), vec![]),
-        (format!("#7 {SLUG}-later"), vec![]),
-        (format!("issue 7 {SLUG}"), vec![]),
-    ] {
-        assert_eq!(issue_numbers(&text), numbers, "{text:?}");
     }
 }

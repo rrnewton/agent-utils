@@ -59,7 +59,8 @@ for the full list and for the threat model.
 ///
 /// Deliberately long-winded and repetitive, because that is the problem this project exists for:
 /// a driver returns to a dozen verbose agent messages and cannot skim them. Two cheerful one-liners
-/// would make the digest and the scrollback look like they work when neither had anything to do.
+/// would make the API's `/digest` and `/messages` routes look like they work when neither had
+/// anything to do.
 /// Several entries also share vocabulary ("runner", "cache", "token") so that
 /// `POST /resolve` is exercised against real competition rather than a single obvious hit.
 const SEEDED_BACKLOG: &[(&str, &str)] = &[

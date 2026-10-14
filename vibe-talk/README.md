@@ -785,8 +785,8 @@ and no network.
 
 **You do not have to.** A deployment that is only ever reached over your LAN, or only over
 `localhost` through an SSH session, is a supported and complete deployment. The Discord half, the
-web app, the digest, the scrollback and the deployment check all work with no ingress whatsoever.
-Skip to step 3 if that is you.
+web app, the API's `/digest` and `/messages` routes and the deployment check all work with no
+ingress whatsoever. Skip to step 3 if that is you.
 
 If you do want to reach it from elsewhere, **any** mechanism is fine, because vibe-talk takes no
 position on how bytes arrive. The actual requirement is short:
@@ -837,8 +837,8 @@ cargo run -- --config vibe-talk.toml --fake-discord
 
 `--fake-discord` serves in-memory channels seeded with a dozen deliberately long-winded agent
 messages, and logs a warning on every start. It is how you look at the web app without a bot.
-The seed is verbose on purpose: two cheerful one-liners make the digest and the scrollback look
-like they work when neither of them had anything to do.
+The seed is verbose on purpose: two cheerful one-liners make the API's `/digest` and `/messages`
+routes look like they work when neither of them had anything to do.
 
 Against real Discord — **note that this is very nearly first contact.** The Discord client is
 unit-tested and the whole server is end-to-end tested against an in-memory fake. Exactly one path

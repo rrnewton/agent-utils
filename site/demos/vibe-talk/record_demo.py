@@ -394,7 +394,7 @@ class Stage:
 
 async def open_channel(page: Page, base_url: str) -> None:
     """Load the app and switch it from the voice view to the channel, before recording starts."""
-    await page.goto(f"{base_url}/voice", wait_until="load")
+    await page.goto(f"{base_url}/", wait_until="load")
     await page.wait_for_function("() => document.getElementById('view-switch')", timeout=15_000)
     await page.click("#view-switch")
     await page.wait_for_function(

@@ -290,10 +290,11 @@ containing a unique marker and tells you the marker; look at the channel and con
 ## Step 4 — OPTIONAL: put it on the internet
 
 **Skip this if you do not need it.** LAN-only and `localhost`-only are complete, supported
-deployments: the Discord half, the web app, the digest, the scrollback and the verification script
-all work with no ingress at all. You need this step only to reach the server from outside your own
-network — and, specifically, if you want a **hosted** voice agent, because ElevenLabs calls the
-MCP endpoint machine-to-machine from its own infrastructure and must be able to reach you.
+deployments: the Discord half, the web app, the API's `/digest` and `/messages` routes and the
+verification script all work with no ingress at all. You need this step only to reach the server
+from outside your own network — and, specifically, if you want a **hosted** voice agent, because
+ElevenLabs calls the MCP endpoint machine-to-machine from its own infrastructure and must be able to
+reach you.
 
 **Any way in is fine, and vibe-talk has no opinion about which.** What it actually requires is:
 
