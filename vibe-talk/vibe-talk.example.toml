@@ -54,6 +54,10 @@ thread_api = "native"
 # GET /channels/{id}/messages?since=&until=&order=&limit=&cursor= (README, "A bridge's range
 # reads"). Off by default; turn it on only for a bridge that serves that request.
 # range_reads = false
+# With thread_api = "bridge" only: whether the bridge looks several messages up by id itself,
+# GET /channels/{id}/messages?ids=&ids=&thread= (README, "A bridge's lookups by id"). Off by
+# default; turn it on only for a bridge that serves that request.
+# id_reads = false
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
 upstream_read_marks = false

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse as _;
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use slack_fake::{profiled, system, ts, FakeState};
@@ -1009,4 +1010,120 @@ async fn slack_answers_a_message_by_id_with_one_pinned_read() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
     assert_eq!(answer["error"], "unknown_message");
     assert_eq!(fake.calls("conversations.history"), 2, "no window was read");
+}
+
+// ---- A bridge: every id in one request, only when configured to --------------------------------
+
+/// A loopback bridge holding [`thread`]'s messages, which answers a lookup by id and a lookup of
+/// one thread message, and records every request it is sent.
+async fn lookup_bridge() -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let wire = |message: &Message| {
+        json!({
+            "id": message.id.as_str(),
+            "channel_id": READ_CHANNEL,
+            "content": message.content,
+            "timestamp": message.timestamp,
+            "author": { "id": "7", "username": "grace", "bot": false },
+            "thread": { "id": THREAD, "root_message_id": "t0", "is_root": message.id.as_str() == "t0",
+                        "reply_count": null, "reply_count_exact": false },
+        })
+    };
+    let held: Vec<Value> = thread().iter().map(wire).collect();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let held = held.clone();
+        async move {
+            log.lock().expect("log").push(uri.to_string());
+            let id_of = |value: &Value| value["id"].as_str().unwrap_or_default().to_owned();
+            if let Some(query) = uri.query().filter(|query| query.contains("ids=")) {
+                let asked: Vec<String> = query
+                    .split('&')
+                    .filter_map(|pair| pair.strip_prefix("ids="))
+                    .map(str::to_owned)
+                    .collect();
+                let found: Vec<Value> = held
+                    .iter()
+                    .filter(|m| asked.contains(&id_of(m)))
+                    .cloned()
+                    .collect();
+                let missing: Vec<&String> = asked
+                    .iter()
+                    .filter(|id| !found.iter().any(|m| id_of(m) == **id))
+                    .collect();
+                return axum::Json(json!({ "messages": found, "missing": missing }))
+                    .into_response();
+            }
+            let id = uri.path().rsplit('/').next().unwrap_or_default().to_owned();
+            match held.iter().find(|m| id_of(m) == id) {
+                Some(message) => axum::Json(message.clone()).into_response(),
+                None => (StatusCode::NOT_FOUND, "no such message").into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (base, seen)
+}
+
+fn bridge_deployment(base: &str, extra: &str) -> AppState {
+    let text = vibe_talk::testing::config_toml().replace(
+        "[discord]",
+        &format!("[discord]\nthread_api = \"bridge\"\napi_base = \"{base}\"\n{extra}"),
+    );
+    let (mut state, _discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    state
+}
+
+/// remote-ops-audit W11 `#287 bulk-reads`: a bridge configured with `id_reads` is asked for eight
+/// thread messages in one request; without the setting, the same preparation is the eight lookups
+/// of one message it always was, and the bridge is never sent the request it may not serve.
+#[tokio::test]
+async fn a_bridge_looks_up_eight_thread_messages_in_one_request_only_when_configured_to() {
+    let eight: Vec<String> = (4..12).map(|n| format!("t{n}")).collect();
+    let body = json!({ "ids": eight, "thread_id": THREAD });
+    let uri = format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare");
+
+    let (base, seen) = lookup_bridge().await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, "id_reads = true"));
+    let (status, answer) = call(&router, READ_TOKEN, "POST", &uri, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(prepared_ids(&answer), eight);
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        asked[0],
+        format!(
+            "/channels/{READ_CHANNEL}/messages?{}&thread={}",
+            eight
+                .iter()
+                .map(|id| format!("ids={id}"))
+                .collect::<Vec<_>>()
+                .join("&"),
+            THREAD.replace('/', "%2F")
+        )
+    );
+
+    let (base, seen) = lookup_bridge().await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, ""));
+    let (status, answer) = call(&router, READ_TOKEN, "POST", &uri, Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(prepared_ids(&answer), eight, "the same answer");
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(asked.len(), 8, "{asked:?}");
+    assert!(
+        asked.iter().all(|uri| uri.starts_with(&format!(
+            "/channels/{READ_CHANNEL}/threads/{}/messages/t",
+            THREAD.replace('/', "%2F")
+        ))),
+        "{asked:?}"
+    );
 }

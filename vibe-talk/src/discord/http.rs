@@ -243,6 +243,140 @@ pub fn parse_range_read(
     })
 }
 
+/// The most ids one bridge lookup names; a longer list is several requests. remote-ops-audit W11
+/// `#287 bulk-reads`.
+pub const BRIDGE_LOOKUP_IDS: usize = 50;
+
+/// Build a compatible bridge's lookup of several messages by id. remote-ops-audit W11
+/// `#287 bulk-reads`.
+///
+/// `GET /channels/{id}/messages?ids=…&ids=…&thread=…`, one `ids` per message (opaque ids may hold
+/// any character, so they are never joined), and `thread` only for a lookup inside one thread.
+/// Sent only to a bridge configured with `id_reads`; the README's "A bridge's lookups by id" is
+/// the contract.
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] when the configured API base is not a URL that can take a path.
+pub fn ids_request(
+    api_base: &str,
+    channel: &ChannelId,
+    thread: Option<&str>,
+    ids: &[MessageId],
+) -> Result<PreparedRequest, ChatError> {
+    let mut url = reqwest::Url::parse(api_base.trim_end_matches('/'))
+        .map_err(|_| ChatError::Shape("invalid chat API base".to_owned()))?;
+    url.path_segments_mut()
+        .map_err(|_| ChatError::Shape("chat API base cannot contain path segments".to_owned()))?
+        .pop_if_empty()
+        .extend(["channels", channel.as_str(), "messages"]);
+    {
+        let mut query = url.query_pairs_mut();
+        for id in ids {
+            query.append_pair("ids", id.as_str());
+        }
+        if let Some(thread) = thread {
+            query.append_pair("thread", thread);
+        }
+    }
+    Ok(PreparedRequest {
+        method: "GET",
+        url: url.into(),
+        body: None,
+    })
+}
+
+/// Read a bridge's answer to [`ids_request`]: each id it answered for, and what it found.
+/// remote-ops-audit W11 `#287 bulk-reads`.
+///
+/// Strict, because the request is sent only on the operator's word that the bridge serves it: a
+/// bridge that does not would answer with a plain message list, and that must fail the lookup
+/// rather than pass the newest messages off as the ones asked for. Every message must be one
+/// asked for, in the channel (and the thread) asked about, answered once; every id in `missing`
+/// one asked for and not also answered. An answer that carries `as_of` came from a copy older
+/// than now, which may lack an edit or a deletion since: everything in it is
+/// [`crate::chat::Lookup::Unseen`], so the caller looks each one up as before. An id the bridge
+/// does not mention is left out, and so unseen.
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] for anything but `{messages: [...], missing: [...]}` with an optional
+/// string `as_of`, read as above.
+pub fn parse_id_lookup(
+    value: &serde_json::Value,
+    channel: &ChannelId,
+    thread: Option<&str>,
+    asked: &[MessageId],
+) -> Result<Vec<(MessageId, crate::chat::Lookup)>, ChatError> {
+    use crate::chat::Lookup;
+    use serde_json::Value;
+    let shape = |detail: &str| ChatError::Shape(format!("lookup by id answer: {detail}"));
+    let object = value.as_object().ok_or_else(|| {
+        shape(
+            "expected an object with messages and missing; a bridge that answers a plain message \
+             list does not serve lookups by id, so turn id_reads off for it",
+        )
+    })?;
+    let messages = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shape("messages must be an array"))?;
+    let missing = object
+        .get("missing")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shape("missing must be an array of ids"))?;
+    let current = match object.get("as_of") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(_)) => false,
+        Some(_) => return Err(shape("as_of must be a string")),
+    };
+    let asked: std::collections::HashSet<&str> = asked.iter().map(MessageId::as_str).collect();
+    let mut answered = std::collections::HashSet::new();
+    let mut answers = Vec::with_capacity(messages.len() + missing.len());
+    for value in messages {
+        let message = parse_message(value)?;
+        if message.channel_id != *channel {
+            return Err(shape("a message of a different channel"));
+        }
+        if let Some(thread) = thread {
+            if message.thread.as_ref().map(|member| member.id.as_str()) != Some(thread) {
+                return Err(shape("a message of a different thread"));
+            }
+        }
+        if !asked.contains(message.id.as_str()) {
+            return Err(shape("a message that was not asked for"));
+        }
+        if !answered.insert(message.id.0.clone()) {
+            return Err(shape("a message answered twice"));
+        }
+        let id = message.id.clone();
+        let answer = if current {
+            Lookup::Found(Box::new(message))
+        } else {
+            Lookup::Unseen
+        };
+        answers.push((id, answer));
+    }
+    for id in missing {
+        let id = id
+            .as_str()
+            .ok_or_else(|| shape("missing must be an array of ids"))?;
+        if !asked.contains(id) {
+            return Err(shape("missing names an id that was not asked for"));
+        }
+        if !answered.insert(id.to_owned()) {
+            return Err(shape("an id both answered and missing"));
+        }
+        let answer = if current {
+            Lookup::Absent
+        } else {
+            Lookup::Unseen
+        };
+        answers.push((MessageId(id.to_owned()), answer));
+    }
+    Ok(answers)
+}
+
 /// Build the request that reads the most recent messages, with no cursor.
 #[must_use]
 pub fn fetch_request(api_base: &str, channel: &ChannelId, limit: u16) -> PreparedRequest {
@@ -787,6 +921,9 @@ pub struct HttpDiscordClient {
     /// Whether the bridge reads a span of time itself; see [`range_request`]. remote-ops-audit
     /// W10 `#287 bulk-reads`.
     range_reads: bool,
+    /// Whether the bridge looks several messages up by id itself; see [`ids_request`].
+    /// remote-ops-audit W11 `#287 bulk-reads`.
+    id_reads: bool,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -842,6 +979,7 @@ impl HttpDiscordClient {
             post_limit: config.post_limit(),
             recent: config.recent,
             range_reads: config.range_reads,
+            id_reads: config.id_reads,
             limiter: RateLimiter::new(),
         })
     }
@@ -1199,9 +1337,10 @@ impl ChatClient for HttpDiscordClient {
     /// which is already one `after=` page of up to 100 per step.
     ///
     /// A lookup by id is native against Discord's own threads (`thread_api = "native"`): ids near
-    /// each other are one `after=` page (W11, see `native_lookup`).
+    /// each other are one `after=` page (W11, see `native_lookup`). On a bridge it is native only
+    /// with `id_reads`, which asks the bridge for every id at once ([`ids_request`]).
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
-        let by_ids = if self.thread_api == crate::threads::ThreadApi::Native {
+        let by_ids = if self.thread_api == crate::threads::ThreadApi::Native || self.id_reads {
             crate::chat::Support::Native
         } else {
             crate::chat::Support::Emulated
@@ -1248,12 +1387,14 @@ impl ChatClient for HttpDiscordClient {
         thread: Option<&str>,
         ids: &[MessageId],
     ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
-        if self.thread_api != crate::threads::ThreadApi::Native {
+        let looked = if self.thread_api == crate::threads::ThreadApi::Native {
+            self.native_lookup(channel, thread, ids).await
+        } else if self.id_reads {
+            self.bridge_lookup(channel, thread, ids).await
+        } else {
             return crate::chat::emulated_messages(self, channel, thread, ids).await;
-        }
-        self.native_lookup(channel, thread, ids)
-            .await
-            .map_err(|error| error.with_provider(self.provider_name()))
+        };
+        looked.map_err(|error| error.with_provider(self.provider_name()))
     }
 
     async fn post_message(
@@ -1375,6 +1516,7 @@ mod tests {
             max_post_bytes: None,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
         }
     }
 
@@ -1670,6 +1812,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         };
         client
@@ -1694,6 +1837,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         }
     }
@@ -1890,6 +2034,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         };
         let registered = client
@@ -1953,6 +2098,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -2005,6 +2151,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -2061,6 +2208,7 @@ mod tests {
                 post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
                 recent: crate::config::RecentReads::default(),
                 range_reads: false,
+                id_reads: false,
                 limiter: RateLimiter::new(),
             };
             let error = client
@@ -2110,6 +2258,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         };
         let error = client
@@ -2185,6 +2334,7 @@ mod tests {
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
             recent: crate::config::RecentReads::default(),
             range_reads: false,
+            id_reads: false,
             limiter: RateLimiter::new(),
         };
         client

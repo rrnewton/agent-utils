@@ -1782,6 +1782,7 @@ model provider or a real gateway.
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
 | Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether `messages` reads are checked against Flat for diagnostics, one at a time once recent reads stop (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
 | Bridge range reads | `discord.range_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, `/page` through a span and `/count` since an instant ask the bridge for the window itself — see [A bridge's range reads](#a-bridges-range-reads) |
+| Bridge lookups by id | `discord.id_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, speech preparation of a thread, a thread summary's parts and a message by id ask the bridge for every message at once — see [A bridge's lookups by id](#a-bridges-lookups-by-id) |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -1872,7 +1873,7 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
 `thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`,
-`recent_view_shadow` and `range_reads`, with the same meaning as in `[discord]`. Slack providers
+`recent_view_shadow`, `range_reads` and `id_reads`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
@@ -2190,6 +2191,52 @@ than mistaking the newest messages for the span.
 A bridge can serve it with its service's own creation-time filters, or from its copy of the
 channel. vibe-talk reads `/page` through a span and `/count` since an instant this way; every other
 read is unchanged.
+
+### A bridge's lookups by id
+
+**The problem.** Preparing a thread's messages for speech, summarising a row of a thread, checking
+a message before an upstream read mark and looking up one message read a bridge one message at a
+time: `GET /channels/{id}/threads/{thread_id}/messages/{message_id}` per message, and for a message
+of the channel's own timeline the whole recent window. A bridge that holds a copy of the channel,
+or a cache of the messages it has served, could answer every id at once, often without asking its
+service at all.
+
+**What you get.** `id_reads = true` (in `[discord]`, or on a `[[providers]]` entry of kind
+`discord`, only with `thread_api = "bridge"`; off by default, refused anywhere else) asks for every
+message a caller needs in one request. Preparing eight messages of a thread is one request where it
+was eight. A message the bridge does not mention is looked up one at a time, as before, so nothing
+is lost to a bridge that answers only part of a lookup. With it off, the bridge is read exactly as
+before. Turn it on only for a bridge that implements this request: one that does not answers it
+with a plain message list, which vibe-talk refuses as an answer it cannot read rather than
+mistaking the newest messages for the ones asked for.
+
+**The request.** `GET /channels/{id}/messages?ids=…&ids=…&thread=…`
+
+* `ids` is repeated, once per message, at most 50 times; a longer lookup is several requests. Ids
+  are opaque and never joined, so they may hold any character.
+* `thread` is present only for a lookup inside one thread: every message answered must be in it.
+  Without `thread`, the ids are looked up among the channel's own timeline, as `/messages` lists
+  it.
+
+**The answer** is an object:
+
+```json
+{"messages": [ … ], "missing": ["id", …], "as_of": "2026-10-13T12:00:00Z"}
+```
+
+* `messages`: the messages found, each once, in the message wire format `/messages` uses, each one
+  asked for and in the channel (and thread) asked about. Order does not matter.
+* `missing`: the ids the bridge KNOWS do not exist there now, because its service said so. An id
+  that is neither found nor missing is fine: vibe-talk looks it up on its own. Never list an id
+  merely because a copy or a cache did not have it.
+* `as_of` (optional): present only when the answer came from a copy the bridge could not bring up
+  to date. vibe-talk then trusts none of it, neither the text (an edit since would be lost) nor
+  `missing` (a deletion is not proved by an old copy), and looks every id up on its own. Absent
+  means now: answer from a copy only while it is current, for example while the bridge's live feed
+  of the channel is healthy.
+
+A message named in `missing` is reported gone to whoever asked (a summary of it is a 404, an
+upstream read mark through it is refused), so `missing` must be the service's word, not a guess.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 

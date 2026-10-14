@@ -1265,6 +1265,42 @@ impl HttpDiscordClient {
             .collect())
     }
 
+    /// [`crate::chat::ChatClient::fetch_messages`] against a bridge configured with `id_reads`.
+    /// remote-ops-audit W11 `#287 bulk-reads`.
+    ///
+    /// Every distinct id in one request ([`super::ids_request`]), or one per
+    /// [`super::BRIDGE_LOOKUP_IDS`] of them, with the time a thread read is allowed: a bridge may
+    /// have to ask its service for some of them. What it answers is read strictly
+    /// ([`super::parse_id_lookup`]); an id it does not mention is [`crate::chat::Lookup::Unseen`].
+    pub(super) async fn bridge_lookup(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        wanted: &[MessageId],
+    ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
+        let mut seen = HashSet::new();
+        let distinct: Vec<MessageId> = wanted
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .cloned()
+            .collect();
+        let mut answers = std::collections::HashMap::new();
+        for chunk in distinct.chunks(super::BRIDGE_LOOKUP_IDS) {
+            let request = super::ids_request(&self.api_base, channel, thread, chunk)?;
+            let value = self.send_with_timeout(request, TIMELINE_TIMEOUT).await?;
+            answers.extend(super::parse_id_lookup(&value, channel, thread, chunk)?);
+        }
+        Ok(wanted
+            .iter()
+            .map(|id| {
+                answers
+                    .get(id)
+                    .cloned()
+                    .unwrap_or(crate::chat::Lookup::Unseen)
+            })
+            .collect())
+    }
+
     /// One of the channel's own messages, from Discord itself, as its message history has it.
     async fn channel_message(
         &self,
@@ -3248,5 +3284,164 @@ mod tests {
             ["found message-id", "found message-id"]
         );
         assert_eq!(mock.seen.lock().expect("seen").len(), 2, "one each");
+    }
+
+    fn in_thread(id: &str, thread: &str) -> Value {
+        let mut wire = message("parent", id, &format!("text of {id}"));
+        wire["thread"] = json!({"id":thread,"root_message_id":"root","is_root":false,"reply_count":null,"reply_count_exact":false});
+        wire
+    }
+
+    async fn id_reading_bridge(routes: Replies) -> Mock {
+        mock_with(routes, |discord| {
+            discord.thread_api = ThreadApi::Bridge;
+            discord.id_reads = true;
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_bridge_with_id_reads_asks_for_every_id_in_one_request() {
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/channels/parent/messages?ids=m%2F1&ids=m%2F2&ids=m%2C3&thread=opaque%2Fthread",
+            json!({
+                "messages": [in_thread("m/1", "opaque/thread"), in_thread("m,3", "opaque/thread")],
+                "missing": ["m/2"],
+            }),
+        );
+        let mock = id_reading_bridge(routes).await;
+        let channel = ChannelId("parent".into());
+        assert_eq!(
+            mock.client.read_caps(&channel).by_ids,
+            crate::chat::Support::Native
+        );
+        let answers = mock
+            .client
+            .fetch_messages(
+                &channel,
+                Some("opaque/thread"),
+                &lookup_ids(&["m/1", "m/2", "m,3", "m/1"]),
+            )
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found m/1", "absent", "found m,3", "found m/1"]
+        );
+        assert_eq!(mock.seen.lock().expect("seen").len(), 1, "one request");
+    }
+
+    #[tokio::test]
+    async fn a_bridge_lookup_of_many_ids_is_a_request_per_fifty() {
+        let ids: Vec<String> = (0..120).map(|n| format!("m{n}")).collect();
+        let mut routes = Replies::new();
+        for chunk in ids.chunks(super::super::BRIDGE_LOOKUP_IDS) {
+            let query: Vec<String> = chunk.iter().map(|id| format!("ids={id}")).collect();
+            ok(
+                &mut routes,
+                &format!("/channels/parent/messages?{}", query.join("&")),
+                json!({"messages": [], "missing": chunk}),
+            );
+        }
+        let mock = id_reading_bridge(routes).await;
+        let asked: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let answers = mock
+            .client
+            .fetch_messages(&ChannelId("parent".into()), None, &lookup_ids(&asked))
+            .await
+            .expect("lookup");
+        assert!(answers
+            .iter()
+            .all(|answer| *answer == crate::chat::Lookup::Absent));
+        assert_eq!(mock.seen.lock().expect("seen").len(), 3, "50, 50 and 20");
+    }
+
+    #[test]
+    fn a_bridges_lookup_answer_is_read_strictly() {
+        let channel = ChannelId("parent".into());
+        let asked = lookup_ids(&["a", "b"]);
+        let read = |value: Value, thread: Option<&str>| {
+            super::super::parse_id_lookup(&value, &channel, thread, &asked)
+        };
+        let refused = |value: Value, thread: Option<&str>, expected: &str| {
+            let error = read(value, thread).expect_err(expected);
+            assert!(
+                matches!(&error, ChatError::Shape(detail) if detail.contains(expected)),
+                "{error}"
+            );
+        };
+        refused(json!([in_thread("a", "t")]), None, "plain message list");
+        refused(json!({"messages": []}), None, "missing must be an array");
+        refused(json!({"missing": []}), None, "messages must be an array");
+        refused(
+            json!({"messages": [in_thread("c", "t")], "missing": []}),
+            None,
+            "not asked for",
+        );
+        refused(
+            json!({"messages": [in_thread("a", "u")], "missing": []}),
+            Some("t"),
+            "different thread",
+        );
+        let mut elsewhere = in_thread("a", "t");
+        elsewhere["channel_id"] = json!("other");
+        refused(
+            json!({"messages": [elsewhere], "missing": []}),
+            None,
+            "different channel",
+        );
+        refused(
+            json!({"messages": [in_thread("a", "t"), in_thread("a", "t")], "missing": []}),
+            None,
+            "answered twice",
+        );
+        refused(
+            json!({"messages": [], "missing": ["z"]}),
+            None,
+            "not asked for",
+        );
+        refused(
+            json!({"messages": [in_thread("a", "t")], "missing": ["a"]}),
+            None,
+            "both answered and missing",
+        );
+        refused(
+            json!({"messages": [], "missing": [7]}),
+            None,
+            "array of ids",
+        );
+        refused(
+            json!({"messages": [], "missing": [], "as_of": 5}),
+            None,
+            "as_of must be a string",
+        );
+
+        let current = read(
+            json!({"messages": [in_thread("a", "t")], "missing": ["b"]}),
+            Some("t"),
+        )
+        .expect("read");
+        assert_eq!(
+            current
+                .iter()
+                .map(|(_, answer)| outcome(answer))
+                .collect::<Vec<_>>(),
+            ["found a", "absent"]
+        );
+        // A copy older than now proves neither the text nor the absence.
+        let stale = read(
+            json!({"messages": [in_thread("a", "t")], "missing": ["b"], "as_of": "2026-10-13T12:00:00Z"}),
+            Some("t"),
+        )
+        .expect("read");
+        assert_eq!(
+            stale
+                .iter()
+                .map(|(_, answer)| outcome(answer))
+                .collect::<Vec<_>>(),
+            ["unseen", "unseen"]
+        );
     }
 }
