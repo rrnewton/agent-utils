@@ -1809,3 +1809,54 @@ async fn a_slack_page_walk_crosses_a_run_of_system_events_one_step_cannot_prove_
     }
     assert_eq!(walked, ["in 0", "in 1", "in 2"]);
 }
+
+/// Fix round 2 of remote-ops-audit W10 `#287 bulk-reads`: on Slack, a run of system events too long
+/// for `MAX_SPAN_STEPS` range reads to cross leaves the step to the read `/page` made before range
+/// reads existed, and that read remembers the stretch it proved empty. So asking for the same step
+/// again moves forward, as it did before, until it reaches the first real message after the run.
+/// Before, the range read answered every repeat from `since` again, proved the same stretch, and
+/// never got further.
+#[tokio::test]
+async fn a_repeated_slack_span_step_moves_past_a_run_of_system_events_no_step_can_cross() {
+    let mut state = FakeState::default();
+    let mut list: Vec<Value> = (0..5)
+        .map(|i| profiled(&ts(i, 0), "UADA00001", "Ada", &format!("old {i}")))
+        .collect();
+    list.extend((0..300).map(|i| system(&ts(10_000 + i, 0), "channel_join")));
+    list.extend(
+        (0..3).map(|i| profiled(&ts(10_300 + i, 0), "UADA00001", "Ada", &format!("in {i}"))),
+    );
+    state.history.insert(SLACK_CH.to_owned(), list);
+    let fake = Fake::start(state, 2).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let query = format!(
+        "/api/v1/channels/{SLACK_CH}/page?since={}&limit=5",
+        iso(slack_ms(10_000))
+    );
+    let mut answers: Vec<Vec<String>> = Vec::new();
+    for _ in 0..12 {
+        let (status, body) = get(&router, &query).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let said: Vec<String> = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content").to_owned())
+            .collect();
+        let reached = !said.is_empty();
+        answers.push(said);
+        if reached {
+            break;
+        }
+    }
+    assert!(
+        answers[0].is_empty(),
+        "the fixture is the case: one request does not cross the run: {answers:?}"
+    );
+    let last = answers.last().expect("asked");
+    assert_eq!(
+        last.first().map(String::as_str),
+        Some("in 0"),
+        "repeats move forward to the first message after the run, skipping none: {answers:?}"
+    );
+}
