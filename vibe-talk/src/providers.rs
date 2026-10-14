@@ -894,6 +894,16 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    async fn upstream_read_scope(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<crate::chat::UpstreamReadScope, ChatError> {
+        self.route(channel)?
+            .client
+            .upstream_read_scope(channel)
+            .await
+    }
+
     fn supports_upstream_clear(&self) -> bool {
         self.entries
             .iter()

@@ -25,6 +25,7 @@ use vibe_talk::chat::{
     ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, Lookup, PostLimit, RangeOrder,
     RangeRead, ReadCaps, ReadScope, RecentAnswers, RecentAsk, RecentRead, RegisteredChannel,
     SourceClaim, Support, ThreadAnswers, ThreadAsk, TimeRange, UpstreamClearOutcome,
+    UpstreamReadScope,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -572,6 +573,13 @@ impl ChatClient for Recorder {
         self.note("mark_read_upstream");
         Ok(())
     }
+    async fn upstream_read_scope(
+        &self,
+        _channel: &ChannelId,
+    ) -> Result<UpstreamReadScope, ChatError> {
+        self.note("upstream_read_scope");
+        Ok(UpstreamReadScope::Wider)
+    }
     fn supports_upstream_clear(&self) -> bool {
         self.note("supports_upstream_clear");
         true
@@ -823,6 +831,14 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         .await
         .expect("mark");
     ran("mark_read_upstream");
+    assert_eq!(
+        client
+            .upstream_read_scope(&channel)
+            .await
+            .expect("read scope"),
+        UpstreamReadScope::Wider
+    );
+    ran("upstream_read_scope");
     assert!(client.supports_upstream_clear());
     ran("supports_upstream_clear");
     assert!(

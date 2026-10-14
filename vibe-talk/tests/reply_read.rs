@@ -15,7 +15,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
-use vibe_talk::chat::ChatError;
+use vibe_talk::chat::{ChatError, UpstreamReadScope};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::http::router;
 use vibe_talk::model::ChannelId;
@@ -350,6 +350,194 @@ async fn a_reply_mark_where_the_provider_cannot_mark_is_refused_and_asks_nothing
     assert!(harness.discord.upstream_read_marks().is_empty());
 }
 
+// --- never wider than the channel ------------------------------------------------------------
+
+/// The bridge's refusal of a channel whose marker would clear messages vibe-talk never received.
+fn thread_channel_refusal() -> ChatError {
+    ChatError::Status {
+        status: 409,
+        body: r#"{"code":"thread_channel"}"#.to_owned(),
+    }
+}
+
+/// Every channel the provider was asked what its marker covers in, in order.
+fn scope_asks(harness: &Harness) -> Vec<String> {
+    harness
+        .discord
+        .upstream_read_scope_asks()
+        .into_iter()
+        .map(|channel| channel.0)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_reply_in_a_channel_narrowed_to_one_thread_asks_the_provider_nothing() {
+    let (harness, ids) = harness(4);
+    harness.discord.set_upstream_read_scope(
+        &ChannelId(WRITE_CHANNEL.to_owned()),
+        UpstreamReadScope::Wider,
+    );
+    let (status, body) = reply_mark(&harness, &ids[2]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "thread_channel", "{body}");
+    assert!(
+        body["upstream_read_notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("was not asked")),
+        "the answer says the cursor was moved: {body}"
+    );
+    // A newer message, and the first again: still nothing, and what the marker covers is not asked
+    // twice.
+    let (_, body) = reply_mark(&harness, &ids[3]).await;
+    assert_eq!(body["outcome"], "thread_channel", "{body}");
+    assert_eq!(
+        asked(&harness),
+        Vec::<String>::new(),
+        "a reply in one thread of a larger space moved the whole space's marker"
+    );
+    assert_eq!(scope_asks(&harness), vec![WRITE_CHANNEL.to_owned()]);
+
+    // THE CONTROL: a whole channel beside it, on the same provider, is marked.
+    let other = harness.discord.seed(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "codex-eng",
+        "a whole channel",
+    );
+    let (_, body) = reply_mark_in(&harness, READ_CHANNEL, &other.0).await;
+    assert_eq!(body["outcome"], "marked", "{body}");
+    assert_eq!(asked(&harness), vec![format!("{READ_CHANNEL}:{}", other.0)]);
+
+    // The owner's own Mark read in is his choice, labelled with the whole space, and still asks.
+    let (status, body) = owners_mark(&harness, &ids[1]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        asked(&harness),
+        vec![format!("{READ_CHANNEL}:{}", other.0), here(&ids[1])]
+    );
+}
+
+#[tokio::test]
+async fn the_read_that_tells_a_markers_scope_is_counted_as_the_reply_marks() {
+    // Attribution (`remote-ops-audit`): the read is the server's own, made for a reply's mark, and
+    // the upstream profile says so rather than counting it untagged.
+    let (state, discord, store) = vibe_talk::testing::state_with_store();
+    discord.enable_upstream_read_marks();
+    let id = discord.seed(&ChannelId(WRITE_CHANNEL.to_owned()), "codex-eng", "hello");
+    let harness = Harness {
+        router: router(state.clone()),
+        discord,
+        store,
+    };
+    let (_, body) = reply_mark(&harness, &id.0).await;
+    assert_eq!(body["outcome"], "marked", "{body}");
+    let counted: Vec<(&str, &str, u64)> = state
+        .providers
+        .profile()
+        .report()
+        .providers
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .reasons
+                .iter()
+                .map(|row| (row.name, row.reason.as_str(), row.count))
+        })
+        .filter(|(name, _, _)| *name == "upstream_read_scope")
+        .collect();
+    assert_eq!(counted, vec![("upstream_read_scope", "reply-mark", 1)]);
+}
+
+#[tokio::test]
+async fn a_reply_where_the_provider_cannot_say_what_its_marker_covers_asks_nothing() {
+    let (harness, ids) = harness(3);
+    harness.discord.set_upstream_read_scope(
+        &ChannelId(WRITE_CHANNEL.to_owned()),
+        UpstreamReadScope::Unknown,
+    );
+    let (status, body) = reply_mark(&harness, &ids[1]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "scope_unknown", "{body}");
+    assert!(asked(&harness).is_empty(), "a blind reply-mark was asked");
+    // Not an answer to keep: the next reply asks again, and once the provider says, it is marked.
+    harness.discord.set_upstream_read_scope(
+        &ChannelId(WRITE_CHANNEL.to_owned()),
+        UpstreamReadScope::Channel,
+    );
+    let (_, body) = reply_mark(&harness, &ids[2]).await;
+    assert_eq!(body["outcome"], "marked", "{body}");
+    assert_eq!(asked(&harness), vec![here(&ids[2])]);
+    assert_eq!(
+        scope_asks(&harness),
+        vec![WRITE_CHANNEL.to_owned(), WRITE_CHANNEL.to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_scope_read_marks_nothing_and_the_next_reply_asks_again() {
+    let (harness, ids) = harness(3);
+    harness
+        .discord
+        .fail_upstream_read_scope_next(ChatError::Transport("bridge timed out".to_owned()));
+    let (status, body) = reply_mark(&harness, &ids[1]).await;
+    assert!(
+        status.is_server_error(),
+        "a failed scope read answered {status}: {body}"
+    );
+    assert!(asked(&harness).is_empty(), "a mark was asked blind");
+    let (_, body) = reply_mark(&harness, &ids[1]).await;
+    assert_eq!(body["outcome"], "marked", "{body}");
+    assert_eq!(asked(&harness), vec![here(&ids[1])]);
+    assert_eq!(scope_asks(&harness).len(), 2);
+}
+
+#[tokio::test]
+async fn a_thread_channel_refusal_is_remembered_whoever_asked_the_mark() {
+    // The owner's own mark, refused: no reply asks the provider after it, nor asks its scope.
+    let (harness, ids) = harness(4);
+    harness
+        .discord
+        .fail_upstream_read_mark_next(thread_channel_refusal());
+    let (status, body) = owners_mark(&harness, &ids[1]).await;
+    assert!(
+        !status.is_success(),
+        "a refused mark answered {status}: {body}"
+    );
+    let (_, body) = reply_mark(&harness, &ids[3]).await;
+    assert_eq!(body["outcome"], "thread_channel", "{body}");
+    assert_eq!(asked(&harness), vec![here(&ids[1])]);
+    assert!(
+        scope_asks(&harness).is_empty(),
+        "{:?}",
+        scope_asks(&harness)
+    );
+
+    // A reply's own mark, refused although the scope read said the marker is the channel's: the
+    // provider's refusal wins, and the next reply asks nothing.
+    let (harness, ids) = crate::harness(4);
+    harness
+        .discord
+        .fail_upstream_read_mark_next(thread_channel_refusal());
+    let (status, body) = reply_mark(&harness, &ids[1]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "thread_channel", "{body}");
+    let (_, body) = reply_mark(&harness, &ids[3]).await;
+    assert_eq!(body["outcome"], "thread_channel", "{body}");
+    assert_eq!(asked(&harness), vec![here(&ids[1])]);
+
+    // THE CONTROL: any other failure is not remembered, and the next reply asks.
+    let (harness, ids) = crate::harness(4);
+    harness
+        .discord
+        .fail_upstream_read_mark_next(ChatError::Status {
+            status: 409,
+            body: r#"{"code":"conflict"}"#.to_owned(),
+        });
+    let (status, _) = owners_mark(&harness, &ids[1]).await;
+    assert!(!status.is_success(), "{status}");
+    let (_, body) = reply_mark(&harness, &ids[3]).await;
+    assert_eq!(body["outcome"], "marked", "{body}");
+}
+
 // --- a voice agent's reply -------------------------------------------------------------------
 
 async fn post_reply(harness: &Harness, arguments: Value) -> String {
@@ -513,4 +701,47 @@ async fn a_voice_reply_where_the_provider_cannot_mark_is_still_done() {
     settle().await;
     assert_eq!(done_here(&harness).await, vec![id.0.clone()]);
     assert!(harness.discord.upstream_read_marks().is_empty());
+}
+
+#[tokio::test]
+async fn a_voice_reply_in_a_channel_narrowed_to_one_thread_is_done_and_asks_the_provider_nothing() {
+    let (harness, ids) = harness(3);
+    harness.discord.set_upstream_read_scope(
+        &ChannelId(WRITE_CHANNEL.to_owned()),
+        UpstreamReadScope::Wider,
+    );
+    ask_before_send(&harness, false).await;
+    let said = post_reply(
+        &harness,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "on it", "reply_to": ids[1] }),
+    )
+    .await;
+    assert!(said.starts_with("SENT."), "{said}");
+    // The Done is this server's own, and stands.
+    assert_eq!(done_here(&harness).await, vec![ids[1].clone()]);
+    // The provider was asked what its marker covers, and then nothing more.
+    for _ in 0..400 {
+        if !scope_asks(&harness).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    settle().await;
+    assert_eq!(scope_asks(&harness), vec![WRITE_CHANNEL.to_owned()]);
+    assert_eq!(
+        asked(&harness),
+        Vec::<String>::new(),
+        "a voice agent's reply in one thread of a larger space moved the whole space's marker"
+    );
+
+    // THE CONTROL: the same reply in a whole channel moves it.
+    let (harness, ids) = crate::harness(3);
+    ask_before_send(&harness, false).await;
+    let said = post_reply(
+        &harness,
+        json!({ "channel_id": WRITE_CHANNEL, "text": "on it", "reply_to": ids[1] }),
+    )
+    .await;
+    assert!(said.starts_with("SENT."), "{said}");
+    assert_eq!(asked_at_least(&harness, 1).await, vec![here(&ids[1])]);
 }
