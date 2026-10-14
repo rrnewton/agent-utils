@@ -1206,6 +1206,8 @@ pub async fn page(
         .await
         .mark(&mut messages);
     // `#191 read-aloud-first-lag`: the page draws the channel from this, and then asks to hear it.
+    // Not as current, for thread naming: a page of this format has no room for `as_of`, so a
+    // provider answering from an older copy cannot say so (`#278 naming-throttle`).
     state
         .read_ahead
         .remember(&channel.id, None, &messages, fetch_began);
@@ -2714,7 +2716,9 @@ pub async fn summarize_message_scoped(
             messages.push(message);
         }
         state.summary_counters.fetched(messages.len());
-        // As speech preparation does: the next request for these rows recalls them.
+        // As speech preparation does: the next request for these rows recalls them. Not as
+        // current, for thread naming: a single-message lookup has no room for `as_of`
+        // (`#278 naming-throttle`).
         state
             .read_ahead
             .remember(&channel.id, Some(thread_id), &messages, fetching);

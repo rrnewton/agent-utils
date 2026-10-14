@@ -50,10 +50,13 @@
 //! Thread naming (`#278 naming-throttle`) names a thread from rows held here only when they are
 //! what a read of it would bring now, so it needs two things speech does not:
 //!
-//! - whether each row came from a page the provider had brought up to date. A page that carries
-//!   `as_of` ([`ReadAhead::remember_as_of`]) may hold a message as it was before an edit pushed
-//!   earlier: its fetch began after the edit's tombstone, so the tombstone cannot keep it out.
-//!   Such a row is [`Recalled::current`] `false`, and naming does not use it.
+//! - whether each row came from a page that SAID the provider had brought it up to date: an answer
+//!   that could carry `as_of` and did not ([`ReadAhead::remember_as_of`]: `ops::timeline` and
+//!   `ops::messages`). A page that carries `as_of` may hold a message as it was before an edit
+//!   pushed earlier: its fetch began after the edit's tombstone, so the tombstone cannot keep it
+//!   out. A fetch with no room for `as_of` ([`ReadAhead::remember`]: a single-message lookup for
+//!   speech or a summary, a page of `ops::page`) cannot say either way. Such rows are
+//!   [`Recalled::current`] `false`, and naming does not use them.
 //! - which threads the live feed has said changed ([`ThreadChanges`]): a reply pushed into a thread
 //!   adds no row to forget, but it does make every count read before it out of date.
 
@@ -122,7 +125,7 @@ struct Recent {
     thread: Option<String>,
     /// When the fetch that read it began.
     fetched: Instant,
-    /// Whether the page it came from was current: carried no `as_of`.
+    /// Whether the page it came from said it was current: it could carry `as_of`, and did not.
     current: bool,
 }
 
@@ -134,8 +137,10 @@ pub struct Recalled {
     /// When the fetch that read it began. The copy is what the provider answered then or a little
     /// later, if it was [`Recalled::current`].
     pub fetched: Instant,
-    /// Whether the page it came from was one the provider had brought up to date (it carried no
-    /// `as_of`). A copy from one that was not may be older than its fetch, older even than an edit
+    /// Whether the page it came from said the provider had brought it up to date: an answer that
+    /// could carry `as_of` and did not ([`ReadAhead::remember_as_of`]). A copy from one that was
+    /// not, or from a fetch that could not say ([`ReadAhead::remember`]: a single-message lookup,
+    /// a page of the bare message format), may be older than its fetch, older even than an edit
     /// pushed before the fetch began. `#278 naming-throttle`.
     pub current: bool,
 }
@@ -228,6 +233,12 @@ impl ReadAhead {
     /// instant, or everything if the memory was cleared after it, is not kept: the fetch may have
     /// read it before the change that forgot it. And the message expires [`RECENT_TTL`] after it,
     /// not after this call, because that is the oldest the text can be.
+    ///
+    /// For a fetch whose answer cannot say whether the provider had brought it up to date: a
+    /// single-message lookup, or a page of the bare message format (`ops::page`), neither of which
+    /// has room for `as_of`. Speech reads these rows as any other; they are recalled as not
+    /// [`Recalled::current`], so thread naming never stands them in for a read
+    /// (`#278 naming-throttle`). A fetch that can say uses [`ReadAhead::remember_as_of`].
     pub fn remember(
         &self,
         channel: &ChannelId,
@@ -238,9 +249,9 @@ impl ReadAhead {
         self.remember_at(channel, thread, messages, fetch_began, Instant::now());
     }
 
-    /// Keep `messages` as [`ReadAhead::remember`] does, from a page that answered with `as_of`:
-    /// `Some` when the provider could not bring it up to date, and it is complete only up to then.
-    /// Such rows are kept for speech as any other, and recalled as not
+    /// Keep `messages` as [`ReadAhead::remember`] does, from a page whose answer says how current
+    /// it is: `as_of` is `Some` when the provider could not bring it up to date, and it is complete
+    /// only up to then. Only a page answered with no `as_of` is recalled as
     /// [`Recalled::current`]. `#278 naming-throttle`.
     pub fn remember_as_of(
         &self,
@@ -268,7 +279,7 @@ impl ReadAhead {
         fetch_began: Instant,
         now: Instant,
     ) {
-        self.keep(channel, thread, messages, fetch_began, true, now);
+        self.keep(channel, thread, messages, fetch_began, false, now);
     }
 
     fn keep(
@@ -754,6 +765,7 @@ pub async fn messages_for_speech(
                 .try_collect()
                 .await?;
             found.fetches = fetched.len();
+            // Not as current, for thread naming: a single-message lookup has no room for `as_of`.
             state
                 .read_ahead
                 .remember(&channel.id, Some(thread), &fetched, fetching);
@@ -1112,7 +1124,14 @@ mod tests {
         let read_ahead = ReadAhead::new();
         let channel = ChannelId("1".to_owned());
         let then = Instant::now();
-        read_ahead.remember_at(&channel, None, &[message("10", Some("T"))], then, then);
+        read_ahead.keep(
+            &channel,
+            None,
+            &[message("10", Some("T"))],
+            then,
+            true,
+            then,
+        );
         let current = read_ahead.recall_thread_at(&channel, "T", then);
         assert!(current[0].current);
         let edited = then + Duration::from_secs(1);
@@ -1162,6 +1181,39 @@ mod tests {
             .recall_thread(&channel, "T")
             .iter()
             .any(|held| held.message.id.0 == "11" && !held.current));
+    }
+
+    #[test]
+    fn a_row_from_a_fetch_that_cannot_say_how_current_it_is_is_not_recalled_as_current() {
+        // `#278 naming-throttle`. A single-message lookup in a thread (speech preparation, a
+        // summary) and a page of the bare message format (`ops::page`) have no room for `as_of`,
+        // so a provider answering from an older copy cannot say so. A pushed edit's tombstone
+        // does not keep such a copy out when the fetch began after it.
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let edited = Instant::now();
+        read_ahead.forget_at(&channel, &MessageId("10".to_owned()), edited);
+        let lookup = edited + Duration::from_millis(1);
+        read_ahead.remember_at(&channel, Some("T"), &[message("10", None)], lookup, lookup);
+        read_ahead.remember(&channel, None, &[message("11", Some("T"))], Instant::now());
+        let held = read_ahead.recall_thread_at(&channel, "T", lookup);
+        assert_eq!(held.len(), 2, "kept, for speech");
+        assert!(
+            held.iter().all(|held| !held.current),
+            "a copy nothing dates is recalled as current"
+        );
+        // A later page that says it is current makes the row current again.
+        read_ahead.remember_as_of(
+            &channel,
+            None,
+            &[message("10", Some("T"))],
+            Instant::now(),
+            None,
+        );
+        assert!(read_ahead
+            .recall_thread(&channel, "T")
+            .iter()
+            .any(|held| held.message.id.0 == "10" && held.current));
     }
 
     #[test]

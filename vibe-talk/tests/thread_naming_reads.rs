@@ -17,10 +17,10 @@
 //! turn, the root included, never copied when it is queued, and checked against the newest summary
 //! any page has carried of the thread since: an exact count of at most 50, from a current page,
 //! read no earlier than any reply held and with nothing pushed or posted into the thread since,
-//! matched exactly by rows that all came from current pages, the newest reply no older than the
-//! thread's last activity. What changes while a thread waits (an edit or delete pushed, a reply
-//! pushed or posted here, a reply counted by a later page, a delta that removes it) is seen at its
-//! turn; a reply added with nothing pushed is not, unless a page
+//! matched exactly by rows that all came from pages that said they were current (a single-message
+//! lookup cannot say), the newest reply no older than the thread's last activity. What changes
+//! while a thread waits (an edit or delete pushed, a reply pushed or posted here, a reply counted by
+//! a later page, a delta that removes it) is seen at its turn; a reply added with nothing pushed is not, unless a page
 //! counts it first, and no test here claims otherwise. Pages that land out of order are ordered by
 //! the instant their answers are complete up to (when a current read began; no later than an
 //! `as_of`), so a renamed thread rides a delta as the newest read showed it, and never once a delta
@@ -89,6 +89,9 @@ struct Forum {
     unlisted: Mutex<Vec<String>>,
     /// When set, a post to a thread arrives upstream and its answer is lost on the way back.
     lose_post_answers: Mutex<bool>,
+    /// When set, a single-message lookup in a thread answers from THESE threads: a provider that
+    /// answers a lookup from an older copy it keeps, in a format with no room for `as_of`.
+    stale_lookups: Mutex<Option<Vec<ForumThread>>>,
 }
 
 fn message(channel: &ChannelId, id: u64, content: &str, thread: &str, is_root: bool) -> Message {
@@ -353,6 +356,26 @@ impl ChatClient for Forum {
             ));
         }
         Ok(posted)
+    }
+    async fn fetch_thread_message(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        message_id: &MessageId,
+    ) -> Result<Message, ChatError> {
+        let threads = self
+            .stale_lookups
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.threads(channel));
+        threads
+            .iter()
+            .filter(|thread| thread.id == thread_id)
+            .flat_map(|thread| std::iter::once(&thread.root).chain(&thread.replies))
+            .find(|message| message.id == *message_id)
+            .cloned()
+            .ok_or_else(|| ChatError::Refused("no such message".to_owned()))
     }
 }
 
@@ -1952,7 +1975,7 @@ async fn a_list_the_provider_could_not_bring_up_to_date_does_not_replace_a_curre
     );
 }
 
-// --- third re-review: what a read is complete up to ----------------------------------------------
+// --- third re-review: what a read is complete up to, and rows nothing dates ----------------------
 
 #[tokio::test(start_paused = true)]
 async fn a_list_complete_up_to_after_the_last_current_read_is_what_deltas_carry() {
@@ -1982,6 +2005,57 @@ async fn a_list_complete_up_to_after_the_last_current_read_is_what_deltas_carry(
          back: {renamed}"
     );
     assert_eq!(renamed["updated_at"], shown["updated_at"], "{renamed}");
+}
+
+/// Ask for the summary of reply `index` of thread `n` of the write channel, in its thread, as the
+/// page does for a row it draws in a thread: answered by single-message lookups.
+async fn summary_in_thread(h: &Harness, n: usize, index: usize) {
+    let thread = &h.forum.threads(&write_channel())[n];
+    let id = thread.replies[index].id.clone();
+    get(
+        h,
+        &format!(
+            "/api/v1/channels/{WRITE_CHANNEL}/messages/{id}/summary?thread_id={}",
+            urlencode(&thread.id)
+        ),
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_a_lookup_brought_from_an_older_copy_does_not_undo_a_pushed_edit() {
+    // A reply is edited upstream and the edit pushed, which drops it from read-ahead and leaves a
+    // tombstone. The page then asks for the reply's summary in its thread; the provider answers
+    // the lookup from the copy it had before the edit, in a format that cannot say so. The
+    // lookup began after the tombstone, so read-ahead keeps that copy. A current list follows:
+    // the thread must not be named from the old text with no read.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 1, 1));
+    let before_the_edit = h.forum.threads(&write_channel());
+    let mut edited = None;
+    h.forum.change(&write_channel(), |threads| {
+        let reply = &mut threads[0].replies[0];
+        reply.content = "EDITED REPLY in thread 0".to_owned();
+        edited = Some(reply.clone());
+    });
+    push(&h, "edit-1", "update", &edited.expect("a reply")).await;
+    *h.forum.stale_lookups.lock().unwrap() = Some(before_the_edit);
+    summary_in_thread(&h, 0, 0).await;
+    *h.forum.stale_lookups.lock().unwrap() = None;
+    assert_eq!(
+        h.chat.count("fetch_thread_message"),
+        1,
+        "{:?}",
+        h.chat.calls()
+    );
+    thread_list(&h, WRITE_CHANNEL).await;
+    until_named(&h.names, 1).await;
+    let prompt = prompt_about(&h, "thread 0 starts here");
+    assert!(
+        prompt.contains("EDITED REPLY in thread 0"),
+        "named from a lookup's old copy of a reply whose edit was pushed: {prompt}"
+    );
+    assert!(!prompt.contains("reply 1 in thread 0"), "{prompt}");
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
 }
 
 fn urlencode(raw: &str) -> String {

@@ -50,15 +50,19 @@
 //!   ([`crate::read_ahead::ThreadChanges`]: a message pushed into it, or pushed into its channel
 //!   with no thread label, or a reply this server posted to it, whether or not the post said it
 //!   arrived). If a delta has said the thread left the list, the count must have been read after
-//!   that delta. Every row, the root included, must come from a page the provider had brought up to
-//!   date: a page with `as_of` can hold a message as it was before an edit pushed earlier, which
-//!   the push's tombstone cannot keep out because the page's read began after it. Exactly as many
-//!   replies as the count must be held, the newest no older than the thread's last activity. So an
-//!   edit or delete pushed while the thread waits (which drops the row from read-ahead), a reply
-//!   pushed or posted here, a reply counted by a page read since, a delta saying the thread left
-//!   the list, or rows that expired while it waited all send the thread to the provider. A thread
-//!   of more than [`THREAD_FETCH_LIMIT`] replies is always read: rows held cannot show they are its
-//!   newest replies rather than an older page of them.
+//!   that delta. Every row, the root included, must come from a page that SAID the provider had
+//!   brought it up to date: a timeline page or channel window answered with no `as_of`. A page with
+//!   `as_of` can hold a message as it was before an edit pushed earlier, which the push's tombstone
+//!   cannot keep out because the page's read began after it; and a single-message lookup (speech
+//!   preparation, a summary in a thread) or a page of the bare message format (`ops::page`) has no
+//!   room for `as_of`, so a provider answering it from an older copy cannot say so. Rows from
+//!   either are never named from. Exactly as many replies as the count must be held, the newest no
+//!   older than the thread's last activity. So an edit or delete pushed while the thread waits
+//!   (which drops the row from read-ahead), a reply pushed or posted here, a reply counted by a
+//!   page read since, a delta saying the thread left the list, or rows that expired while it waited
+//!   all send the thread to the provider. A thread of more than [`THREAD_FETCH_LIMIT`] replies is
+//!   always read: rows held cannot show they are its newest replies rather than an older page of
+//!   them.
 //! * What that still accepts is a change the server is not told of, inside the 30 s a row is held.
 //!   An edit, to the root or a reply, changes neither the count nor the last activity, so the
 //!   thread is named from the text as the page read it. A delete can go unseen too: a deleted reply
@@ -75,7 +79,8 @@
 //!   thread list) are not used until a page reads the count again; a reply pushed or posted into a
 //!   thread does the same to it, and a message pushed with no thread label to every thread of its
 //!   channel. A list the provider could not bring up to date names nothing without a read, and rows
-//!   from any page it could not bring up to date are never named from.
+//!   from any page it could not bring up to date, or from a fetch that cannot say, are never named
+//!   from.
 //! * Any other thread costs one read, and naming reads at most one thread per channel per
 //!   [`READ_INTERVAL`]. A thread over the budget waits for its channel's next turn without holding
 //!   up the queue, and at most [`MAX_PENDING_PER_CHANNEL`] wait per channel, so another channel is
@@ -1321,9 +1326,11 @@ impl From<SummaryError> for NameError {
 ///   count says nothing about the thread now.
 /// * no change to the thread, or to its channel with no thread known, has been noted in `changes`
 ///   since the count was read: a reply pushed, or posted by this server, after it.
-/// * every row, the root included, came from a page the provider had brought up to date. A page
-///   that carried `as_of` may hold a message as it was before an edit pushed earlier, which its
-///   tombstone cannot keep out because the page's read began after it.
+/// * every row, the root included, came from a page that said the provider had brought it up to
+///   date ([`crate::read_ahead::Recalled::current`]). A page that carried `as_of` may hold a
+///   message as it was before an edit pushed earlier, which its tombstone cannot keep out because
+///   the page's read began after it; a single-message lookup or a page of the bare message format
+///   cannot say either way.
 /// * the reply count is EXACT. An estimate, or no count at all, proves nothing.
 /// * it is at most [`THREAD_FETCH_LIMIT`]. Past that a read brings the newest replies, and rows
 ///   held cannot show they are those rather than an older page the reader scrolled to, or a newest
@@ -1907,7 +1914,7 @@ mod tests {
         // The thread list read the root, and its count, just now.
         let listed_at = std::time::Instant::now();
         let listed = ReadAhead::new();
-        listed.remember(&channel, Some("T"), &[message(100, true)], listed_at);
+        listed.remember_as_of(&channel, Some("T"), &[message(100, true)], listed_at, None);
         let counted = Some(std::time::Instant::now());
         let no_replies = as_listed(Some(0), true, &at(100));
         assert_eq!(
@@ -1978,11 +1985,12 @@ mod tests {
         // A page read the thread, the root included, out of order; the count was read after it.
         let read_ahead = ReadAhead::new();
         let rows_read = std::time::Instant::now();
-        read_ahead.remember(
+        read_ahead.remember_as_of(
             &channel,
             None,
             &[message(103, false), message(100, true), message(101, false)],
             rows_read,
+            None,
         );
         let counted = Some(std::time::Instant::now());
         assert_eq!(
@@ -2135,11 +2143,12 @@ mod tests {
         let stale_as_of = Some("2026-10-13T00:00:00Z");
         let stale_reply = ReadAhead::new();
         let stale_read = std::time::Instant::now();
-        stale_reply.remember(
+        stale_reply.remember_as_of(
             &channel,
             None,
             &[message(100, true), message(101, false)],
             stale_read,
+            None,
         );
         stale_reply.remember_as_of(
             &channel,
@@ -2149,11 +2158,12 @@ mod tests {
             stale_as_of,
         );
         let stale_root = ReadAhead::new();
-        stale_root.remember(
+        stale_root.remember_as_of(
             &channel,
             None,
             &[message(101, false), message(103, false)],
             stale_read,
+            None,
         );
         stale_root.remember_as_of(
             &channel,
@@ -2162,8 +2172,23 @@ mod tests {
             stale_read,
             stale_as_of,
         );
+        // A copy from a fetch that cannot say how current it is: a single-message lookup, or a page
+        // of the bare message format. It too may predate an edit pushed before it began.
+        let undated = ReadAhead::new();
+        undated.remember_as_of(
+            &channel,
+            None,
+            &[message(100, true), message(101, false)],
+            stale_read,
+            None,
+        );
+        undated.remember(&channel, Some("T"), &[message(103, false)], stale_read);
         let counted_after = Some(std::time::Instant::now());
-        for (held, what) in [(&stale_reply, "a reply"), (&stale_root, "the root")] {
+        for (held, what) in [
+            (&stale_reply, "a reply"),
+            (&stale_root, "the root"),
+            (&undated, "a reply from a lookup"),
+        ] {
             assert!(
                 held_thread(
                     held,
@@ -2194,7 +2219,7 @@ mod tests {
         let mut whole = vec![message(100, true)];
         whole.extend((1..=limit).map(|n| message(100 + n, false)));
         let full = ReadAhead::new();
-        full.remember(&channel, Some("T"), &whole, std::time::Instant::now());
+        full.remember_as_of(&channel, Some("T"), &whole, std::time::Instant::now(), None);
         let counted = Some(std::time::Instant::now());
         let held = ids(held_thread(
             &full,
@@ -2210,7 +2235,13 @@ mod tests {
         let long = ReadAhead::new();
         let mut longer = vec![message(100, true)];
         longer.extend((1..=limit + 5).map(|n| message(100 + n, false)));
-        long.remember(&channel, Some("T"), &longer, std::time::Instant::now());
+        long.remember_as_of(
+            &channel,
+            Some("T"),
+            &longer,
+            std::time::Instant::now(),
+            None,
+        );
         let counted = Some(std::time::Instant::now());
         for replies in [limit + 1, limit + 5, 500] {
             assert!(
