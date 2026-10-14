@@ -8177,6 +8177,9 @@ def _outstanding_absent_validate_batch(
 
 def _validate_global_state_beside_absent_batch(
     config: Config,
+    *,
+    require_repository: bool = True,
+    announce: bool = True,
 ) -> tuple[list[ActiveState], list[ArchiveState], frozenset[Path], frozenset[str]]:
     """Global state for a create, allowing only an absent-row batch's exact overlap.
 
@@ -8189,15 +8192,20 @@ def _validate_global_state_beside_absent_batch(
     """
     batch = _outstanding_absent_validate_batch(config)
     if batch is None:
-        states, archives = _validate_global_state(config)
+        states, archives = _validate_global_state(
+            config, require_repository=require_repository
+        )
         return states, archives, frozenset(), frozenset()
     path, items = batch
-    states, archives = _absent_validate_rows_state(config, items, allow_exact_overlap=True)
-    print(
-        f"wrkslots: proceeding beside the interrupted absent-validation-row batch in "
-        f"{path}: its {len(items)} row(s) stay active and archived until it is replayed",
-        file=sys.stderr,
+    states, archives = _absent_validate_rows_state(
+        config, items, allow_exact_overlap=True, require_repository=require_repository
     )
+    if announce:
+        print(
+            f"wrkslots: proceeding beside the interrupted absent-validation-row batch in "
+            f"{path}: its {len(items)} row(s) stay active and archived until it is replayed",
+            file=sys.stderr,
+        )
     return states, archives, frozenset({path}), frozenset(item.slot for item in items)
 
 
@@ -23278,7 +23286,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             journal_path=journal_path,
         )
         after_states, after_archives, _paths, _slots = (
-            _validate_global_state_beside_absent_batch(config)
+            _validate_global_state_beside_absent_batch(config, announce=False)
         )
         _assert_only_slot_changed(
             before,
@@ -30941,8 +30949,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
-        all_states, _archives = _validate_global_state(
-            config, require_repository=False
+        # validate-run reads status after admission (scorecard handoff and its
+        # sweep), so a run admitted beside an interrupted absent-row batch
+        # must still read it; the batch's journal stays listed below.
+        all_states, _archives, _absent_paths, _absent_slots = (
+            _validate_global_state_beside_absent_batch(
+                config, require_repository=False, announce=False
+            )
         )
         storage_inconsistencies = _registry_storage_inconsistencies(
             config, all_states, tolerate_unavailable_repositories=True
@@ -50749,9 +50762,10 @@ def _absent_validate_rows_state(
     items: Sequence[AbsentValidateRow],
     *,
     allow_exact_overlap: bool,
+    require_repository: bool = True,
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
-    states = _load_all_active(config)
-    archives = _load_all_archives(config)
+    states = _load_all_active(config, require_repository=require_repository)
+    archives = _load_all_archives(config, require_repository=require_repository)
     allowed = {(item.machine, item.slot): item for item in items}
     active = {record.slot: (state.machine, record) for state in states for record in state.slots}
     for archive in archives:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import dataclasses
 import fnmatch
 import hashlib
 import datetime as dt
@@ -45121,6 +45122,13 @@ def test_create_and_classification_proceed_beside_an_interrupted_absent_validate
     made = create(project, slot="fresh-c", agent="validate-fresh-c", branch=None,
                   slot_type="validate")
     assert made.returncode == 0, made.stderr
+    assert made.stderr.count("proceeding beside the interrupted absent-validation-row") == 1
+
+    # validate-run reads status after admission (scorecard handoff, sweep).
+    capsys.readouterr()
+    assert wrkslots.main(
+        ["--project-root", str(project), "status", "--slot", "fresh-c", "--format", "json"]
+    ) == 0, capsys.readouterr().err
 
     # The replay still finishes the batch exactly, around the new slot.
     assert run_absent_validate_recovery(project, input_path, apply=True) == 0
@@ -45166,6 +45174,107 @@ def test_an_overlap_the_absent_validate_batch_does_not_name_still_refuses(
     assert "is active on testhost and archived on" in capsys.readouterr().err
 
 
+def test_a_batch_named_row_whose_archive_is_not_the_batch_recovery_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    real_archives = wrkslots._load_all_archives
+
+    def archived_by_another_path(*args, **kwargs):
+        # The rows stay archived, but no longer as this batch's typed recovery,
+        # as when a different removal path archived them.
+        return [
+            dataclasses.replace(archive, absent_validate_recoveries=frozenset())
+            for archive in real_archives(*args, **kwargs)
+        ]
+
+    monkeypatch.setattr(wrkslots, "_load_all_archives", archived_by_another_path)
+    capsys.readouterr()
+
+    assert classify_validate(project, "fresh-c") != 0
+    assert "is active on testhost and archived on testhost" in capsys.readouterr().err
+
+
+def test_a_batch_named_row_changed_since_the_batch_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    real_active = wrkslots._load_all_active
+
+    def row_changed(*args, **kwargs):
+        return [
+            dataclasses.replace(
+                state,
+                slots=tuple(
+                    dataclasses.replace(record, task=f"{record.task} (changed)")
+                    if record.slot == "gone-a"
+                    else record
+                    for record in state.slots
+                ),
+            )
+            for state in real_active(*args, **kwargs)
+        ]
+
+    monkeypatch.setattr(wrkslots, "_load_all_active", row_changed)
+    capsys.readouterr()
+
+    assert classify_validate(project, "fresh-c") != 0
+    assert "validation row testhost/gone-a changed" in capsys.readouterr().err
+
+
+def test_host_context_recover_resumes_an_absent_agent_row_outside_the_coordinator_ancestry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The absent-agent-row branch of 'recover' accepts the host-context handoff too."""
+
+    project, repository, _remote = make_project(tmp_path)
+    record, sidecar = prepare_absent_agent_row_with_sidecar(
+        project, repository, tmp_path, read=True
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-archive":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert (config.control / "ACTIVE.testhost.journal").exists()
+
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        with pytest.raises(wrkslots.Refusal, match="not in the invoking process ancestry"):
+            wrkslots._assert_caller_process(identity, "coordinator")
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+        capsys.readouterr()
+        result = wrkslots.main(
+            ["--project-root", str(project), "recover", "--coordinator-pid", str(identity.pid)]
+        )
+        captured = capsys.readouterr()
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+    assert result == 0, captured.err
+    assert "not in the invoking process ancestry" not in captured.err
+    assert not wrkslots._load_active(config).slots
+    assert not sidecar.exists()
+
+
 @pytest.mark.parametrize("handoff", ("coordinator-writer", "unrelated-writer"))
 def test_host_context_recover_resumes_an_absent_validate_batch_outside_the_coordinator_ancestry(
     tmp_path: Path,
@@ -45180,7 +45289,10 @@ def test_host_context_recover_resumes_an_absent_validate_batch_outside_the_coord
     branch checked direct ancestry, so it refused every row with "coordinator
     PID N is not in the invoking process ancestry" and the batch could only be
     replayed through recover-absent-validate-rows with its exact input. A
-    writer that does not descend from the coordinator must still refuse.
+    writer that does not descend from the coordinator must still refuse; that
+    refusal comes from the handoff capture at the start of 'recover', before
+    the absent-row branch, so the refusal arm alone does not bind the
+    branch's own authority check (the accepting arm does).
     """
 
     project, _input_path, _config = _absent_batch_refused_after_its_archives(
