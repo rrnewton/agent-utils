@@ -1942,6 +1942,8 @@ thread.join()
 @dataclass(frozen=True)
 class _ThreadedHandoff:
     child: subprocess.Popen[bytes]
+    # The child's other thread, and the generation its handle records.
+    thread: int
     recorded: int
     start_ticks: int
     # Every process table the judgment read, and how many user-systemd
@@ -2020,7 +2022,7 @@ def _threaded_handoff(
 
         monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
         monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", processes)
-        yield _ThreadedHandoff(child, recorded, start_ticks, tables, enumerations)
+        yield _ThreadedHandoff(child, thread, recorded, start_ticks, tables, enumerations)
     finally:
         if child.poll() is None:
             child.kill()
@@ -2035,7 +2037,8 @@ def test_a_recorded_generation_that_the_process_tables_omit_is_read_directly(
 
     The tables list thread groups and skip terminal ones.  A thread group
     leader that has exited while another of its threads runs is terminal,
-    and a thread ID is not a group, so neither table shows the recorded
+    and the tables show that thread, under its own ID, in its place; a
+    thread ID is not a group.  So neither table shows the recorded
     generation while the child runs.  The child queues its unit after the
     second enumeration and exits; the generation read just before the host
     evidence keeps its run.
@@ -2060,7 +2063,7 @@ def test_a_recorded_generation_that_the_process_tables_omit_is_read_directly(
         assert (handoff.recorded, handoff.start_ticks) not in {
             (process.pid, process.start_ticks) for process in table
         }
-    shown = [] if leader_exits else [handoff.child.pid]
+    shown = [handoff.thread] if leader_exits else [handoff.child.pid]
     assert [[process.pid for process in table] for table in handoff.tables] == [shown, shown]
     assert len(states) == 1
     state, message = next(iter(states.values()))

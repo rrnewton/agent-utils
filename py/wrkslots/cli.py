@@ -46798,6 +46798,70 @@ def _process_generation_is_terminal(pid_dir: Path, generation: _ProcessStat) -> 
     return True
 
 
+def _zombie_leader_thread_dirs(pid_dir: Path) -> tuple[Path, ...]:
+    """Return the proc entries of the other threads of a zombie thread-group leader.
+
+    A leader that calls pthread_exit is left in State Z while its other
+    threads keep running.  Its own cwd, root, exe and ns/mnt then read as
+    ENOENT, its fd directory belongs to root (EACCES to its own user), its
+    maps read as empty and its mountinfo as EINVAL, although the surviving
+    threads still share and use all of them, and lsof +D reports nothing
+    (measured 2026-10-14, Linux 7.1).  Each survivor
+    shows them at PID/task/TID, which proc readdir never lists.  A census that
+    finds a leader in State Z or X observes these entries in its place; the
+    survivor's own PID is its TID, so /proc/TID names the same task.
+
+    Only a leader stands for its threads: a thread's Tgid is its leader's, so
+    a non-leader returns nothing rather than its leader and siblings.  The
+    common case, a whole-process zombie, lists only itself and is answered
+    without reading its status.  This covers threads that outlive their
+    leader, not threads of a LIVE leader that called unshare(CLONE_FS or
+    CLONE_FILES), whose private cwd or descriptor table no census here walks.
+    """
+
+    task = pid_dir / "task"
+    try:
+        with os.scandir(task) as entries:
+            names = [entry.name for entry in entries]
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            return ()
+        raise Refusal(
+            f"thread group is indeterminate because {task} is unreadable: {exc}"
+        ) from exc
+    if not all(name.isdecimal() for name in names):
+        raise Refusal(f"thread group listing is invalid for PID {pid_dir.name}")
+    others = sorted((name for name in names if name != pid_dir.name), key=int)
+    if not others:
+        return ()
+    try:
+        status = _read_process_status(pid_dir)
+    except FileNotFoundError:
+        # A leader is reaped only after its last thread: the group is gone.
+        return ()
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(
+            f"thread group is indeterminate because {pid_dir / 'status'} is unreadable: {exc}"
+        ) from exc
+    tgids = [line.split() for line in status.split("\n") if line.startswith("Tgid:")]
+    if len(tgids) != 1 or len(tgids[0]) != 2 or not tgids[0][1].isdecimal():
+        raise Refusal(f"thread group is invalid for PID {pid_dir.name}")
+    if tgids[0][1] != pid_dir.name:
+        return ()
+    return tuple(task / name for name in others)
+
+
+def _zombie_leader_has_live_threads(pid_dir: Path) -> bool:
+    """Whether a zombie leader's threads still run, and so still hold its files."""
+
+    for thread_dir in _zombie_leader_thread_dirs(pid_dir):
+        if _read_process_stat(thread_dir) is None:
+            continue
+        if not _process_is_zombie(thread_dir):
+            return True
+    return False
+
+
 def _absent_validate_process_snapshot(
     proc_root: Path = Path("/proc"),
     *,
@@ -46811,11 +46875,16 @@ def _absent_validate_process_snapshot(
     except OSError as exc:
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
-    for pid_dir in pid_dirs:
+    # Popped from the end, so the surviving threads of a zombie leader, pushed
+    # back on top, are observed next, in their leader's place.
+    pending = pid_dirs[::-1]
+    while pending:
+        pid_dir = pending.pop()
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
         if _process_generation_is_terminal(pid_dir, generation):
+            pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
             continue
         try:
             if _process_uid(pid_dir) is None:
@@ -46828,6 +46897,7 @@ def _absent_validate_process_snapshot(
             raise
         if mount_namespace is None:
             if _process_is_zombie(pid_dir):
+                pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
                 continue
             if _process_start_ticks(pid_dir) is None:
                 continue
@@ -47584,13 +47654,26 @@ def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
 
 
 def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
-    """Return whether the observed generation still names a non-zombie process."""
+    """Return whether the observed generation still names a non-zombie process.
+
+    A leader that became a zombie while its other threads still run has not
+    released its files, but its own entries no longer show them.  That
+    evidence changed: the attempt is discarded, and a fresh snapshot observes
+    the threads in its place.
+    """
 
     pid_dir = Path("/proc") / str(process.pid)
     before = _read_process_stat(pid_dir)
     if before is None or before.start_ticks != process.start_ticks:
         return False
     if _process_is_zombie(pid_dir):
+        if _zombie_leader_has_live_threads(pid_dir):
+            current = _read_process_stat(pid_dir)
+            if current is not None and current.start_ticks == process.start_ticks:
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} exited as thread-group leader while its "
+                    "threads still run"
+                )
         return False
     after = _read_process_stat(pid_dir)
     return after is not None and after.start_ticks == process.start_ticks
@@ -47618,7 +47701,9 @@ def _preflight_process_observations(
         # same generation is proven terminal it cannot retain path or mount
         # references, so do not send it to privileged readers. A merely
         # vanished identity is retained above because PID reuse can race those
-        # readers and must still be detected downstream.
+        # readers and must still be detected downstream. A zombie leader whose
+        # threads still run never reaches here: the activity check above
+        # discards the attempt instead.
         current = _read_process_stat(pid_dir)
         if current is None:
             retained.append(process)
@@ -47925,12 +48010,17 @@ def _same_uid_process_observations(
     except OSError as exc:
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
-    for pid_dir in pid_dirs:
+    # As in _absent_validate_process_snapshot: a zombie leader's surviving
+    # threads are observed next, in its place.
+    pending = pid_dirs[::-1]
+    while pending:
+        pid_dir = pending.pop()
         budget.remaining_seconds()
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
         if _process_generation_is_terminal(pid_dir, generation):
+            pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
             continue
         filesystem_uid = _process_filesystem_uid(pid_dir)
         if filesystem_uid is None or filesystem_uid != os.getuid():
@@ -47945,7 +48035,10 @@ def _same_uid_process_observations(
                 continue
             raise
         if mount_namespace is None:
-            if _process_is_zombie(pid_dir) or _process_start_ticks(pid_dir) is None:
+            if _process_is_zombie(pid_dir):
+                pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
+                continue
+            if _process_start_ticks(pid_dir) is None:
                 continue
             if _process_is_exiting_namespace_init(pid_dir):
                 continue
