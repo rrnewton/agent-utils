@@ -98,6 +98,10 @@ struct State {
     directory_calls: Vec<DirectoryRequest>,
     upstream_read_marks_enabled: bool,
     upstream_read_marks: Vec<(ChannelId, MessageId)>,
+    /// `#292 reply-marks-read`: queued failures for the owner's mark, and an optional gate a test
+    /// holds to keep one in flight. A failed or held mark is still recorded as asked.
+    upstream_read_mark_failures: VecDeque<ChatError>,
+    upstream_read_mark_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// `#232 upstream-mark-read`: whether automatic clearing is offered, every call in order as
     /// `(channel, through, dry_run)`, each channel's provider cursor, queued failures, and an
     /// optional gate a test holds to keep a call in flight.
@@ -255,10 +259,24 @@ impl FakeDiscord {
         self.lock().upstream_read_marks_enabled = true;
     }
 
-    /// Provider read boundaries accepted by this fake, in call order.
+    /// Provider read boundaries asked of this fake, in call order: every call that reached the
+    /// provider, the ones it then failed included.
     #[must_use]
     pub fn upstream_read_marks(&self) -> Vec<(ChannelId, MessageId)> {
         self.lock().upstream_read_marks.clone()
+    }
+
+    /// Make the next upstream read mark fail with `error`, after it is recorded as asked.
+    pub fn fail_upstream_read_mark_next(&self, error: ChatError) {
+        self.lock().upstream_read_mark_failures.push_back(error);
+    }
+
+    /// Hold every upstream read mark until the returned semaphore is given a permit per call, so a
+    /// test can keep one in flight while another arrives.
+    pub fn hold_upstream_read_marks(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        self.lock().upstream_read_mark_gate = Some(std::sync::Arc::clone(&gate));
+        gate
     }
 
     /// A seeded message, as this fake would answer for it, or `None` when it holds none by that id.
@@ -859,22 +877,34 @@ impl ChatClient for FakeDiscord {
         channel: &ChannelId,
         through: &MessageId,
     ) -> Result<(), ChatError> {
-        let mut state = self.lock();
-        if !state.upstream_read_marks_enabled {
-            return Err(ChatError::Refused(
-                "the configured chat provider does not support upstream read marks".to_owned(),
-            ));
+        let gate = {
+            let mut state = self.lock();
+            if !state.upstream_read_marks_enabled {
+                return Err(ChatError::Refused(
+                    "the configured chat provider does not support upstream read marks".to_owned(),
+                ));
+            }
+            if !state.known.contains(channel) {
+                return Err(ChatError::Status {
+                    status: 404,
+                    body: "Unknown Channel".to_owned(),
+                });
+            }
+            state
+                .upstream_read_marks
+                .push((channel.clone(), through.clone()));
+            state.upstream_read_mark_gate.clone()
+        };
+        if let Some(gate) = gate {
+            gate.acquire()
+                .await
+                .expect("the test keeps the gate open")
+                .forget();
         }
-        if !state.known.contains(channel) {
-            return Err(ChatError::Status {
-                status: 404,
-                body: "Unknown Channel".to_owned(),
-            });
+        match self.lock().upstream_read_mark_failures.pop_front() {
+            Some(failure) => Err(failure),
+            None => Ok(()),
         }
-        state
-            .upstream_read_marks
-            .push((channel.clone(), through.clone()));
-        Ok(())
     }
 
     fn supports_upstream_clear(&self) -> bool {

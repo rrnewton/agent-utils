@@ -277,6 +277,7 @@ fn state_pieces_with(
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
         post_gate: Arc::new(crate::post_gate::PostGate::new()),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
+        reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live: Arc::new(crate::live::LiveHub::new()),
         summarizer: Arc::clone(&summarizer),
