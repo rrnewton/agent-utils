@@ -2636,13 +2636,24 @@ function setAllFolded(folded) {
 //     right column's box its thread — and for the search, which belongs to no column, the column the
 //     keys moved last.
 //   * THE READER STAYS PUT (`#280 scroll-stability`): the selected message while any of it shows, else
-//     the first message showing, keeps its top where it was, and is then held as a filter change holds
-//     its message (`placeFilterAnchor`) — the chips changing height under the list, a message arriving,
-//     a reader at the foot of the right column (`footKeeper`) move it no further — until the reader
-//     scrolls or acts in the list. Not the newest line for a reader on it, as `preservingScroll` would:
-//     opening everything under a reader at the foot leaves them on the message they were reading. A
-//     message taller than the screen whose top was above it, folded so short that none of it would
-//     show, comes back under the floating line with its head showing, where reading it starts.
+//     the first message showing, keeps its top where it was, as far as the list's ends allow, and is
+//     then held as a filter change holds its message (`placeFilterAnchor`) — the chips changing height
+//     under the list, a message arriving, a reader at the foot of the right column (`footKeeper`) move
+//     it no further — until the reader scrolls or acts in the list. Not the newest line for a reader on
+//     it, as `preservingScroll` would: opening everything under a reader at the foot leaves them on the
+//     message they were reading. Folding what is under it near the list's end can leave too little
+//     below it to keep it there: the browser scrolls no further than the end, and it comes down by the
+//     difference, held where it lands; near the head, folding what is above it, likewise up. A row
+//     whose top was above the floating line, folded so short that none of it would show where it stood,
+//     comes back under the floating line with its head showing, where reading it starts.
+//   * A CHORD PRESSED IN A MESSAGE BOX SHOWING IN THE LIST keeps THAT BOX where it is instead
+//     (`foldStepField`). From review: Ctrl+; in the channel's box at the foot held the message the
+//     reader was on, and everything opening between the two took the box being typed in off the
+//     screen. The box is the last thing in its list, so a box at the list's end stays at the end, the
+//     messages opening or folding above it, and nothing is held after: the list follows its end as for
+//     a reader on the newest line, through the chips changing height and the right column's keeper. A
+//     box scrolled out of sight, the search and a reply open at a column's foot (under its list, not in
+//     it) leave the reader's row the one kept.
 //   * SAID, briefly and politely, on the status line: "Expanded all", "Expanded unread, collapsed read",
 //     "Collapsed all". A list with no long message in it says so, and keeps its step.
 
@@ -2710,15 +2721,49 @@ function foldStepAnchor() {
 }
 
 /**
+ * The message box a chord was pressed in, `target`, while any of it shows in the list of the column
+ * being worked on — the channel's box at the foot of its list, the right column's at the foot of its
+ * thread — else null: a key pressed on the list, the search, which floats over no list, a reply open
+ * at a column's foot, which is under its list and not in it, or a box scrolled out of sight.
+ *
+ * @param {EventTarget | null | undefined} target
+ * @returns {HTMLElement | null}
+ */
+function foldStepField(target) {
+  const node = /** @type {HTMLElement | null} */ (target || null);
+  const pane = sideActive ? sidePane : channelPane;
+  const area = pane.scroller();
+  if (!node || !isTextField(node) || !nodeWithin(area, node)) return null;
+  const box = node.getBoundingClientRect();
+  const foot = area.getBoundingClientRect().top + (area.clientHeight || 0);
+  return box.bottom > pane.head() && box.top < foot ? node : null;
+}
+
+/**
  * Apply `step` to `folds`, the folds of the list on screen in the column being worked on, the reader's
- * row kept where it is and held there (see the head of this section).
+ * row kept where it is and held there — or, for a chord pressed in a message box showing in that list,
+ * `field`, the box kept where it is (see the head of this section).
  *
  * @param {string} step
  * @param {any[]} folds
+ * @param {HTMLElement | null} [field]
  */
-function applyFoldStep(step, folds) {
+function applyFoldStep(step, folds, field = null) {
   // The reader's own act: whatever an earlier change held is let go, and this measures from here.
   readerActed();
+  if (field) {
+    // A landing a thread's entry made, or still owes, is spent, as a filter change spends it: nothing
+    // is held here to stand in its way.
+    entryLanding = null;
+    threadEntryOwed = null;
+    threadEntryAwaitsRead = false;
+    const area = (sideActive ? sidePane : channelPane).scroller();
+    const top = field.getBoundingClientRect().top;
+    for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
+    area.scrollTop += field.getBoundingClientRect().top - top;
+    renderScrollTools();
+    return;
+  }
   const anchor = foldStepAnchor();
   for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
   if (anchor) {
@@ -2742,8 +2787,10 @@ function applyFoldStep(step, folds) {
  *
  * @param {number} way
  * @param {KeyboardEvent} [event]
+ * @param {EventTarget | null} [target] Where the focus was: a message box showing in the list is kept
+ *   where it is through the step (`foldStepField`).
  */
-function foldStepFromKeyboard(way, event) {
+function foldStepFromKeyboard(way, event, target = null) {
   if (!channelOnScreen()) return false;
   if (event && event.repeat) return modHeld(event);
   const folds = visibleFolds();
@@ -2753,7 +2800,7 @@ function foldStepFromKeyboard(way, event) {
   }
   const key = foldStepKey();
   const step = nextFoldStep(foldSteps.get(key) || null, way, folds);
-  applyFoldStep(step, folds);
+  applyFoldStep(step, folds, foldStepField(target));
   foldSteps.set(key, step);
   setStatus(FOLD_STEP_WORDS[step]);
   return true;
@@ -8333,16 +8380,17 @@ const KEYMAP = [
     does: () => "The long messages, a step a press: expand all, then open the unread and fold the read, then " +
       "collapse all, and round again. Each list, in either column, goes on from the step it was left at; the first " +
       "press in one expands all, or if they are all open already goes on round to the first step that changes " +
-      `something. The message you are on stays where it is. ${modKeyName()}+; works from anywhere, a message box or ` +
-      "the search included, on the list of the column you are in",
-    run: (event) => foldStepFromKeyboard(1, event),
+      `something. The message you are on stays where it is, as far as the list allows. ${modKeyName()}+; works from ` +
+      "anywhere, a message box or the search included, on the list of the column you are in; pressed in a message " +
+      "box, the box stays where it is",
+    run: (event, target) => foldStepFromKeyboard(1, event, target),
   },
   {
     group: KEYS_VIEW, chords: [{ key: ":" }, { key: ":", mod: true }], repeats: true,
     does: () => "The same steps the other way round: the first press in a list collapses all, or if they are all " +
       `folded already goes on round to the first step that changes something. ${modKeyName()}+: ` +
       `(${modKeyName()}+Shift+;) from anywhere, as ${modKeyName()}+; does`,
-    run: (event) => foldStepFromKeyboard(-1, event),
+    run: (event, target) => foldStepFromKeyboard(-1, event, target),
   },
   {
     group: KEYS_WRITING, chords: [{ key: "c" }],

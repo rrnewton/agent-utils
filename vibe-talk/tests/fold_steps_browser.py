@@ -24,9 +24,12 @@ At 1280x800, with the keys:
   selected message held within a pixel throughout. Then : once more, End to the newest line and k twice,
   and ; -> Expanded all, everything opening above and below the selected message, which holds still:
   the newest line is not followed. Then : to Collapsed all, End and k twice again, and the focus in the
-  channel's message box, with "half a thought;" typed into it -> the ; is the draft's and steps nothing;
-  Ctrl+; -> Expanded all, Cmd+; -> Expanded unread, collapsed read, Ctrl+: (Ctrl+Shift+;) -> Expanded
-  all again, each from the box, which keeps the focus and the draft, the selected message held.
+  channel's message box at the list's foot, with "half a thought;" typed into it -> the ; is the draft's
+  and steps nothing; Ctrl+; -> Expanded all, Cmd+; -> Expanded unread, collapsed read, Ctrl+:
+  (Ctrl+Shift+;) -> Expanded all again, each from the box, which keeps the focus and the draft and is
+  itself what holds still: shown whole and within a pixel of where it was at every frame for 0.8 s after
+  each press, the list still at its foot, the messages opening and folding above it. Held by the
+  selected message instead, as a press from the list is, the box went below the screen.
 
   in two columns, the thread opened on the right by its card's replies button, ] to the right column, End
   to its foot and k twice, to its first read reply: ; -> the right column's thread all open, Main
@@ -38,7 +41,8 @@ At 1280x800, with the keys:
   first step, Expanded all, the right column untouched; ] back, : to Collapsed all, at its foot on the
   first read reply again, and the focus in the right column's message box with "and another;" typed ->
   the ; steps nothing, and Ctrl+; -> the right column's thread Expanded all, Main untouched: the chord
-  steps the list of the box's own column.
+  steps the list of the box's own column, and that box holds still at the column's foot, shown whole at
+  every frame, its focus and draft as they were.
 
 No page error at any step. Pass --screenshots DIR to keep a PNG of each step; --web-root DIR to run the
 walk against another copy of the page.
@@ -236,6 +240,24 @@ STATUS_JS = """() => {
 SCROLL_JS = """(id) => { const area = document.getElementById(id);
   return {top: area.scrollTop, gap: area.scrollHeight - area.scrollTop - area.clientHeight}; }"""
 
+# Message box `box`'s top and bottom in scroller `area`, and the scroller's room, sampled at every frame
+# until UNWATCH_BOX_JS.
+WATCH_BOX_JS = """([box, area]) => {
+  const field = document.getElementById(box);
+  const scroller = document.getElementById(area);
+  const watch = {samples: [], on: true};
+  window.__boxWatch = watch;
+  const tick = () => {
+    if (!watch.on) return;
+    const room = scroller.getBoundingClientRect();
+    const edge = field.getBoundingClientRect();
+    watch.samples.push({top: edge.top - room.top, bottom: edge.bottom - room.top, room: scroller.clientHeight});
+    requestAnimationFrame(tick);
+  };
+  tick();
+}"""
+UNWATCH_BOX_JS = "() => { const watch = window.__boxWatch; watch.on = false; return watch.samples; }"
+
 # Where the focus is, and what the message box holds.
 FOCUS_JS = """(box) => ({focused: document.activeElement ? document.activeElement.id : null,
   value: document.getElementById(box).value})"""
@@ -328,12 +350,44 @@ class Desk:
         check(self.box(box_id) == (box_id, draft), f"{self.label} {what}: the box holds {self.box(box_id)}, not {draft!r}")
         check(self.state(list_id) == before, f"{self.label} {what}: a ; typed in the box stepped #{list_id}")
 
-    def chord_step(self, chord: str, box_id: str, list_id: str, step: str, what: str) -> None:
-        """`held_step` for a chord pressed in message box `box_id`, whose focus and draft it leaves as they were."""
+    def box_step(self, chord: str, box_id: str, area: str, list_id: str, step: str, what: str) -> None:
+        """Press `chord` in message box `box_id`, at the foot of scroller `area`, the box watched at every frame.
+
+        The box is what holds still: shown whole, and within a pixel of where it was, at every frame; the
+        focus and the draft left as they were; the selection on the same message; the step drawn as said.
+        """
         before = self.box(box_id)
         check(before[0] == box_id, f"{self.label} {what}: the focus is on {before[0]}, not #{box_id}")
-        self.held_step(chord, list_id, step, what)
+        _top, gap = self.scroll(area)
+        check(gap <= 24, f"{self.label} {what}: #{area} is not at its foot ({gap}px above it)")
+        row, _row_top = self.selected(list_id)
+        self.page.evaluate(WATCH_BOX_JS, [box_id, area])
+        self.key(chord)
+        self.page.wait_for_timeout(WATCH_MS)
+        found: object = self.page.evaluate(UNWATCH_BOX_JS)
+        assert isinstance(found, list)
+        samples: list[Json] = []
+        for sample in found:
+            assert isinstance(sample, dict)
+            samples.append({str(key): value for key, value in sample.items()})
+        check(len(samples) >= 10, f"{self.label} {what}: only {len(samples)} frames were sampled")
+        start = number(samples[0]["top"])
+        hidden = [at for at, sample in enumerate(samples)
+                  if number(sample["top"]) < -0.5 or number(sample["bottom"]) > number(sample["room"]) + 0.5]
+        check(not hidden, f"{self.label} {what}: #{box_id} was not shown whole at frames {hidden[:5]} "
+              f"({[(round(number(s['top'])), round(number(s['bottom'])), s['room']) for s in samples[:8]]})")
+        worst = max(abs(number(sample["top"]) - start) for sample in samples)
+        check(worst <= STILL_PX, f"{self.label} {what}: #{box_id} moved by up to {worst:.1f}px in {len(samples)} "
+              f"frames (from {start:.1f}px: {[round(number(s['top']), 1) for s in samples[:12]]})")
         check(self.box(box_id) == before, f"{self.label} {what}: the box went from {before} to {self.box(box_id)}")
+        now_row, _now_top = self.selected(list_id)
+        check(now_row == row, f"{self.label} {what}: the selection moved from {row} to {now_row}")
+        _top, gap = self.scroll(area)
+        check(gap <= 24, f"{self.label} {what}: #{area} left its foot ({gap}px above it)")
+        self.judge(list_id, step, what)
+        self.notes.append(f"{what}: {SAID[step]}, the box shown whole and held within {worst:.1f}px over "
+                          f"{len(samples)} frames")
+        self.photo(what)
 
     def key(self, chord: str) -> None:
         self.page.keyboard.press(chord)
@@ -441,7 +495,8 @@ def one_column(desk: Desk) -> None:
     check(gap > 200, f"{desk.label}: the list followed its newest line after ; ({gap}px above it)")
     # The chords from the channel's message box, where ; is typed: everything folded again, back at the
     # newest line with the box under the last message, a message near the foot selected by the keys, and
-    # the focus then put in the box.
+    # the focus then put in the box. Each chord keeps the box where it is, not the selected message: held
+    # by that message, everything opening between the two took the box off the screen.
     desk.key("Shift+Semicolon")
     page.wait_for_timeout(400)
     desk.judge("discord-log", "collapse", "one column, : to collapse before the box")
@@ -452,12 +507,12 @@ def one_column(desk: Desk) -> None:
         page.wait_for_timeout(200)
     page.wait_for_timeout(400)
     desk.typed_in_box("channel-compose-text", "discord-log", "half a thought;", "one column, ; typed in the box")
-    desk.chord_step("Control+Semicolon", "channel-compose-text", "discord-log", "expand",
-                    "one column, Ctrl+; in the box to expand")
-    desk.chord_step("Meta+Semicolon", "channel-compose-text", "discord-log", "unread",
-                    "one column, Cmd+; in the box to unread")
-    desk.chord_step("Control+Shift+Semicolon", "channel-compose-text", "discord-log", "expand",
-                    "one column, Ctrl+: in the box back to expand")
+    desk.box_step("Control+Semicolon", "channel-compose-text", "scroll-area", "discord-log", "expand",
+                  "one column, Ctrl+; in the box at the foot to expand")
+    desk.box_step("Meta+Semicolon", "channel-compose-text", "scroll-area", "discord-log", "unread",
+                  "one column, Cmd+; in the box at the foot to unread")
+    desk.box_step("Control+Shift+Semicolon", "channel-compose-text", "scroll-area", "discord-log", "expand",
+                  "one column, Ctrl+: in the box at the foot back to expand")
 
 
 def two_columns(desk: Desk) -> None:
@@ -516,8 +571,8 @@ def two_columns(desk: Desk) -> None:
     desk.held_step(";", "discord-log", "expand", "Main beside it, its own first ; to expand")
     check(desk.state("side-log") == side, f"{desk.label}: ; in Main folded the right column")
     # The chord in the right column's message box steps the right column's thread, the box's own list,
-    # and leaves Main as it is. The thread folded again by : from the right column's keys, then at its
-    # foot, its box under its last reply.
+    # and leaves Main as it is, the box held where it is. The thread folded again by : from the right
+    # column's keys, then at its foot, its box under its last reply.
     desk.key("]")
     page.wait_for_timeout(300)
     desk.key("Shift+Semicolon")
@@ -526,8 +581,8 @@ def two_columns(desk: Desk) -> None:
     to_first_read("before its box")
     main = desk.state("discord-log")
     desk.typed_in_box("side-compose-text", "side-log", "and another;", "right column, ; typed in its box")
-    desk.chord_step("Control+Semicolon", "side-compose-text", "side-log", "expand",
-                    "right column, Ctrl+; in its box to expand")
+    desk.box_step("Control+Semicolon", "side-compose-text", "side-scroll", "side-log", "expand",
+                  "right column, Ctrl+; in its box at its foot to expand")
     check(desk.state("discord-log") == main, f"{desk.label}: Ctrl+; in the right column's box folded Main")
 
 
@@ -561,9 +616,10 @@ def main() -> int:
     print(f"Chromium {version} at 1280x800: ; went round Expanded all, Expanded unread, collapsed read, and"
           " Collapsed all, and : the other way, each drawn as said and said politely; the selected message held"
           " within a pixel at every frame, at the newest line too; Ctrl+;, Cmd+; and Ctrl+: stepped from the"
-          " message box, where a typed ; stepped nothing; in two columns ; on the right folded the right column"
-          " alone and held its reader at its foot, ; in Main was Main's own first step, and Ctrl+; in the right"
-          " column's box stepped the right column alone:")
+          " message box at the list's foot, where a typed ; stepped nothing, the box itself shown whole and held"
+          " within a pixel at every frame; in two columns ; on the right folded the right column alone and held"
+          " its reader at its foot, ; in Main was Main's own first step, and Ctrl+; in the right column's box"
+          " stepped the right column alone, that box held:")
     for note in notes:
         print(f"  {note}")
     return 0

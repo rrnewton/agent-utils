@@ -5684,13 +5684,32 @@ so the spell check never runs in the message box. Off a Mac, Chrome's own table 
 (`chrome/browser/ui/accelerator_table.cc`) has nothing on Ctrl+; or Ctrl+:. All of this was read from
 Chromium's source; the chord has not yet been pressed in Chrome on a real Mac.
 
-**The message you are on stays where it is.** The selected message while any of it shows, or else the
-first message showing, keeps its place on the screen through every step, even at the newest line:
-everything opening under it does not take the list to its new end. It is then held there as a filter
-change holds its message — the chips changing height, a message arriving and the right column's
-keeping of a reader at its foot leave it alone — until you scroll or act in the list. A message taller
-than the screen that you were reading past the top of, folded so short that none of it would show,
-comes back with its first lines at the top of the list. A list with nothing long in it says so.
+**The message you are on stays where it is, as far as the list allows.** The selected message while
+any of it shows, or else the first message showing, keeps its place on the screen through a step, at
+the newest line too: everything opening under it does not take the list to its new end. It is then
+held there as a filter change holds its message — the chips changing height, a message arriving and the
+right column's keeping of a reader at its foot leave it alone — until you scroll or act in the list.
+Where it does not stay put:
+
+- **Near the end of the list, folding what is under it.** At or near the newest line, a step that folds
+  the message you are on, or messages below it, can leave too little below it to keep it there. The
+  browser scrolls no further than the end of the list, so the end stays at the foot of the screen and
+  your message comes down by as much as the list came up short: from the newest line, by the height
+  folded away below its top (less, if the list ends up shorter than the screen). It is held where it
+  lands. Near the top of the list, folding what is above it moves it up the same way.
+- **A message you were reading down into.** When the message kept is one whose top had scrolled off
+  above the screen, and folding it would leave none of it showing where it stood, it is not kept out of
+  sight: the list scrolls back to put its first lines at the top of the list, under the floating line
+  where there is one (as far as the list's ends allow), and it is held there instead.
+- **A chord pressed in a message box.** Ctrl+; or Ctrl+: (Cmd on a Mac) pressed in the channel's
+  message box, or the right column's, while that box shows, keeps the box where it is instead, so the
+  box you are typing in, your draft and the focus stay in front of you; the messages open and fold
+  above it. The box is the last thing in its list, so a box at the end of the list stays at the end,
+  and the list then follows its end as it does for a reader on the newest line. The message you were on
+  may go off the top of the screen; it stays selected. With the box scrolled out of sight, or from the
+  search, the message you are on is the one kept.
+
+A list with nothing long in it says so.
 
 The status line says each step for a moment — "Expanded all", "Expanded unread, collapsed read",
 "Collapsed all" — and a screen reader hears it politely. Building this found that a view the page
@@ -5702,13 +5721,16 @@ the folds from the rows on screen.
 presses the real keys in Chromium at a 1280x800 desk: `;` four times and `:` three times in one column,
 each step judged by whether each message's text overflows its box, with the status line read, and the
 selected message sampled at every frame for 0.8 s after each press, which must not move it by more than
-a pixel; then `;` at the newest line; then, from the channel's message box with a draft in it, a `;`
-typed into the draft that steps nothing, and Ctrl+;, Cmd+; and Ctrl+: that step, the focus and the
-draft left as they were; then in two columns, the right column's thread at its foot, `;` and `;` and a
-`:` that opens only what is under the reader, Main untouched, `;` in Main, the right column untouched,
-and Ctrl+; in the right column's box, which steps that column's thread and leaves Main alone. The page
-suite holds the rest: the chords from the search, with the single-key shortcuts off, held down, on
-Settings and the call's view, and the first press that goes on to the third step.
+a pixel; then `;` at the newest line; then, from the channel's message box at the end of the list with
+a draft in it, a `;` typed into the draft that steps nothing, and Ctrl+;, Cmd+; and Ctrl+: that step,
+the focus and the draft left as they were and the box itself shown whole and within a pixel of where it
+was at every frame for 0.8 s (against the page before this rule, Ctrl+; moved the box's top from 568px
+to 1063px down a list 750px tall, out of sight); then in two columns, the right column's thread at its foot, `;` and `;` and a `:` that opens
+only what is under the reader, Main untouched, `;` in Main, the right column untouched, and Ctrl+; in
+the right column's box, which steps that column's thread, leaves Main alone, and holds that box where
+it is. The page suite holds the rest: the chords from the search, with the single-key shortcuts off,
+held down, on Settings and the call's view, the first press that goes on to the third step, and a
+chord in a box scrolled out of sight or pressed on the list, which keeps the message you are on.
 
 ### The reading bookmark
 

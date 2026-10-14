@@ -22357,6 +22357,82 @@ test("`#301 semicolon-expand-cycle`: IN TWO COLUMNS THE CHORD IN A MESSAGE BOX S
   assert.deepStrictEqual(foldState(page, "side-log"), right(false), "Ctrl+: in the search stepped the right column, where the keys were not");
 });
 
+test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: A CHORD IN THE CHANNEL'S BOX AT THE LIST'S FOOT KEEPS THE BOX WHERE IT IS, its focus and draft with it, while a chord from the list keeps the reader's row", async () => {
+  // From review: Ctrl+; in the channel's box held the message the reader was on, near the foot, and
+  // everything opening between it and the box took the box being typed in off the screen. Pressed in a
+  // box showing in the list, the step keeps the box where it is, the messages opening and folding above it.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = tallChannel(30);
+    for (const one of messages) if (Number(one.id) % 2 === 1) page.dealtWith.add(String(one.id));
+    await signIn(page);
+    await showDiscord(page, messages);
+    const area = page.el("scroll-area");
+    const box = page.el("channel-compose-text");
+    // As tall as a browser draws its three rows: the model gives an empty field no height of its own.
+    box.style.height = "80px";
+    scrollToBottom(area);
+    // The newest message selected by the keys, as a reader at the keys does, the list at its foot with
+    // the box under that message, and then the focus put in the box with a draft in it.
+    await press(page, area, "End");
+    const row = focused(page);
+    assert.ok(row && row.parentNode === page.el("discord-log"), `the keys did not select a message: ${focusName(page)}`);
+    assert.equal(row.getAttribute("data-id"), "30", "End did not select the newest message");
+    scrollToBottom(area);
+    await area.dispatch("scroll");
+    await box.setValue("half a thought");
+    const at = box.getBoundingClientRect();
+    assert.ok(atBottomOf(area), "the premise: the list is at its foot");
+    assert.ok(at.top >= 0 && at.bottom <= SCROLL_VIEWPORT_PX, `the premise: the box shows whole (${at.top}px to ${at.bottom}px)`);
+    const rowAt = row.getBoundingClientRect().top;
+    assert.ok(rowAt >= 0 && rowAt < at.top, `the premise: the selected message shows above the box (${rowAt}px)`);
+    const steps = [];
+    // Ctrl+: twice (all folded, so the first goes on round to the unread open, then to every message
+    // open: the list grows above the box), then Ctrl+; (from all open, the read folded: it shrinks).
+    for (const [key, fields] of [[":", { ctrlKey: true, shiftKey: true }], [":", { ctrlKey: true, shiftKey: true }], [";", { ctrlKey: true }]]) {
+      await press(page, box, key, fields);
+      const now = box.getBoundingClientRect();
+      steps.push({ said: statusSaid(page), moved: now.top - at.top, shows: now.top >= 0 && now.bottom <= SCROLL_VIEWPORT_PX,
+        focus: focused(page) === box, draft: box.value, foot: atBottomOf(area) });
+    }
+    return { page, area, box, row, steps };
+  };
+  const real = await run(SCRIPT);
+  const kept = { moved: 0, shows: true, focus: true, draft: "half a thought", foot: true };
+  assert.deepStrictEqual(real.steps, [
+    { said: FOLD_SAID.unread, ...kept }, { said: FOLD_SAID.expand, ...kept }, { said: FOLD_SAID.unread, ...kept },
+  ], "a chord in the box at the list's foot did not keep the box where it was");
+  // A chord from the list, the focus back on the messages and a few up from the newest, far enough from
+  // the list's end for folding under it to leave room: the reader's row is the one kept, as for the bare
+  // keys, and the box goes where the folds take it.
+  const { page, area } = real;
+  real.row.focus();
+  for (let i = 0; i < 3; i += 1) await pressHere(page, "k");
+  const row = focused(page);
+  assert.ok(row.parentNode === page.el("discord-log") && Number(row.getAttribute("data-id")) <= 28, `k did not go up the list: ${focusName(page)}`);
+  area.scrollTop += row.getBoundingClientRect().top - 100;
+  await area.dispatch("scroll");
+  const rowAt = row.getBoundingClientRect().top;
+  assert.equal(rowAt, 100, "the premise: the selected message shows");
+  await pressHere(page, ";", { ctrlKey: true });
+  assert.equal(statusSaid(page), FOLD_SAID.collapse);
+  assert.ok(Math.abs(row.getBoundingClientRect().top - rowAt) <= 1, `Ctrl+; on the list moved the selected message by ${row.getBoundingClientRect().top - rowAt}px`);
+  // A box scrolled out of sight, the focus still in it: the reader is reading the list, and the first
+  // message showing is the one kept.
+  area.scrollTop = 0;
+  const first = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  const firstAt = first.getBoundingClientRect().top;
+  await press(page, real.box, ";", { ctrlKey: true });
+  assert.equal(statusSaid(page), FOLD_SAID.expand);
+  assert.equal(focused(page), real.box);
+  assert.ok(Math.abs(first.getBoundingClientRect().top - firstAt) <= 1, "Ctrl+; in a box out of sight did not keep the first message showing");
+  // THE CONTROL: the reader's row kept for a chord in the box too. The first step opens the selected
+  // message, unread, under its top, and the box goes below the screen.
+  const unkept = await run(brokenScript("applyFoldStep(step, folds, foldStepField(target));", "applyFoldStep(step, folds, null);"));
+  assert.equal(unkept.steps[0].said, FOLD_SAID.unread);
+  assert.equal(unkept.steps[0].shows, false, `with the reader's row kept the box still showed, ${unkept.steps[0].moved}px down, so this cannot see it`);
+});
+
 test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chosen from — Main, All or a thread in one column, or two columns — and never to a thread opened from it", async () => {
   // The owner, of the Threads screen the list replaced: "rather ESC works". A view is left the way it was come to.
   const page = await threadPage();

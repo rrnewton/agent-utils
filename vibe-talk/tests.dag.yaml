@@ -727,13 +727,14 @@ steps:
   # columns, the right column's thread at its foot, ; there steps it alone and holds its reader — a : that
   # opens only what is under the reader too, which scrolls nothing and so, unheld, the right column's keeper
   # of its foot took 679px down a frame later — and ; in Main is Main's own first step. Ctrl+;, Cmd+; and
-  # Ctrl+: step from the channel's message box, where a ; typed is the draft's and steps nothing, the focus
-  # and the draft left as they were, and Ctrl+; in the right column's box steps the right column's thread,
-  # Main untouched. Served through Playwright's request routing, so it opens no port. Measured on
-  # 2026-10-14: about 28s wall, most of it the 0.8 s watch after each press.
+  # Ctrl+: step from the channel's message box at the list's foot, where a ; typed is the draft's and steps
+  # nothing, the focus and the draft left as they were and the box itself, not the selected message, held
+  # where it is and shown whole at every frame; and Ctrl+; in the right column's box steps the right
+  # column's thread, Main untouched, that box held. Served through Playwright's request routing, so it
+  # opens no port. Measured on 2026-10-14: about 28s wall, most of it the 0.8 s watch after each press.
   - group: check
     job: fold-steps-browser
-    desc: "the semicolon and colon keys, and Ctrl or Cmd with them from a message box, step the long messages round expand all, unread only and collapse all, drawn as said, the reader's row held within a pixel at every frame, in one column and two, in current Chromium at 1280x800"
+    desc: "the semicolon and colon keys, and Ctrl or Cmd with them from a message box, step the long messages round expand all, unread only and collapse all, drawn as said, the reader's row held within a pixel at every frame, or for a chord in a message box that box, in one column and two, in current Chromium at 1280x800"
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/fold_steps_browser.py
     jobs_flag: ""
