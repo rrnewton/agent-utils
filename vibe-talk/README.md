@@ -3807,6 +3807,21 @@ established.
 {"event_id":"provider-event-42","historical":false,"kind":"create","message":{"id":"9001","channel_id":"123","author":"Ada","author_id":"7","author_is_bot":false,"timestamp":"2026-09-18T12:00:00Z","spoken_time":"","reply_to":null,"content":"done"}}
 ```
 
+A provider with threads says which thread each message is in, as its reads do: `message.thread`,
+the record a timeline row carries, with `id`, `root_message_id` (or `null`), `is_root`,
+`reply_count` (or `null`) and `reply_count_exact`. The server relays it untouched, and the page
+places a live message by that record alone. A thread reply pushed into its thread looks like this:
+
+```json
+{"event_id":"provider-event-43","historical":false,"kind":"create","message":{"id":"9002","channel_id":"123","author":"Ada","author_id":"7","author_is_bot":false,"timestamp":"2026-09-18T12:01:00Z","spoken_time":"","reply_to":null,"content":"answered in the thread","thread":{"id":"thread-1","root_message_id":"9001","is_root":false,"reply_count":1,"reply_count_exact":true}}}
+```
+
+A message pushed WITHOUT a thread record is not known to be anywhere. The page draws it on Main,
+where most such messages belong, and once the read behind it is done reads All's newest page to
+place it (`reason=place`); a thread reply pushed that way shows on Main until that read lands, which
+behind a slow chat service can be most of a minute (`#308 live-reply-in-main`). So an adapter that
+can say where a message is should say so in every create and update, not only in its reads.
+
 Updates use `kind: "update"` with the complete current message. Deletes use
 `{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
 They become `event: message_update` and `event: message_delete`; the page re-reads the authoritative
