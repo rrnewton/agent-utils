@@ -610,6 +610,7 @@ checks and repairs:
 | the Herdr server answers | `systemctl --user start` the `herdr_unit` |
 | each of `units` is active | `reset-failed`, then `start` |
 | each of `timers` is active, will fire again, and fired within `max_age_seconds` | `restart` the timer; if it still never fires, start the service it triggers once, which gives a timer that counts from its service's last run a base again |
+| the service each timer triggers did not fail on its last run (`Result=`, which honours `SuccessExitStatus=`) | none: restarting cannot fix a service that fails on every run, so this is only reported |
 | slot images are mounted (first pass, then every tenth) | `wrkslots image status` |
 | this boot's restore completed (after 15 minutes of uptime) | none |
 | the coordinator's harness is alive | none; reviving is restore's job |

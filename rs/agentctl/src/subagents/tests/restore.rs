@@ -537,3 +537,64 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
         "no repeat within the hour"
     );
 }
+
+#[test]
+fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it() {
+    let fixture = Fixture::new();
+    let registry = fixture.root.join("registry");
+    let host = ScriptedHost::new();
+    let fresh = "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1999999990\n";
+    host.answer(
+        "show observer.timer --timestamp=unix -p ActiveState",
+        0,
+        fresh,
+        "",
+    );
+    host.answer(
+        "show observer.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=observer.service\n",
+        "",
+    );
+    host.answer(
+        "show observer.service",
+        0,
+        "ActiveState=failed\nResult=exit-code\nExecMainStatus=1\n",
+        "",
+    );
+    let config = RestoreConfig {
+        units: Vec::new(),
+        timers: vec![TimerWatch {
+            unit: "observer.timer".to_owned(),
+            max_age_seconds: 1800,
+        }],
+        ..config(&fixture, None)
+    };
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: None,
+            state_dir: None,
+        },
+    );
+    let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
+    assert_eq!(timer["ok"], false);
+    assert_eq!(
+        timer["detail"],
+        "observer.service failed on its last run (Result=exit-code, exit status 1)"
+    );
+    assert!(
+        !host
+            .commands()
+            .iter()
+            .any(|command| command.contains(" restart ") || command.contains(" start ")),
+        "{:?}",
+        host.commands()
+    );
+}

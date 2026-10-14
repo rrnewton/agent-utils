@@ -1000,6 +1000,29 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
     }
 }
 
+/// Why the service a timer triggers failed on its last run, or `None` when it did not.
+///
+/// A timer can keep a perfect schedule while its service fails on every run. Restarting either
+/// cannot repair that, so this is reported, never repaired. `Result=` already honours the
+/// service's `SuccessExitStatus=`.
+fn service_failure(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
+    let triggers = show(host, &timer.unit, &["Triggers"]);
+    let service = triggers.get("Triggers").filter(|value| unit_name(value))?;
+    let state = show(host, service, &["ActiveState", "Result", "ExecMainStatus"]);
+    let result = state.get("Result").map(String::as_str).unwrap_or("");
+    let active = state.get("ActiveState").map(String::as_str).unwrap_or("");
+    (active == "failed" || !matches!(result, "" | "success")).then(|| {
+        format!(
+            "{service} failed on its last run (Result={}, exit status {})",
+            if result.is_empty() { "unknown" } else { result },
+            state
+                .get("ExecMainStatus")
+                .map(String::as_str)
+                .unwrap_or("unknown")
+        )
+    })
+}
+
 /// One pass of checks, repairs, and findings.
 pub fn watch_once<A: ManagedApi + ?Sized>(
     client: &A,
@@ -1058,13 +1081,16 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     }
     for timer in &config.timers {
         let Some(problem) = timer_problem(host, timer) else {
-            findings.push(finding(
-                "timer",
-                &timer.unit,
-                true,
-                "keeps its schedule",
-                Value::Null,
-            ));
+            findings.push(match service_failure(host, timer) {
+                Some(failure) => finding("timer", &timer.unit, false, failure, Value::Null),
+                None => finding(
+                    "timer",
+                    &timer.unit,
+                    true,
+                    "keeps its schedule",
+                    Value::Null,
+                ),
+            });
             continue;
         };
         if options.check_only {
@@ -1086,6 +1112,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 remaining = timer_problem(host, timer);
             }
         }
+        let remaining = remaining.or_else(|| service_failure(host, timer));
         findings.push(finding(
             "timer",
             &timer.unit,
