@@ -1684,10 +1684,10 @@ was reloaded, the server restarted, or a setting changed that changes no word of
   `context_messages`, `max_per_socket`, `socket_idle_seconds`, and `[summaries.llm]`'s `dialect`,
   `model` and `max_tokens`. `threshold_chars` (which messages are summarised),
   `reply_timeout_seconds` (how long one is waited for) and `thread_naming_interval_seconds` (when a
-  thread is named) are not in it, and neither is the length an answer is cut at. The version is `v2-…`; the first start after this change re-keys every summary
-  filed under the previous `v1-…` version of the same configuration instead of deleting it, and
-  logs `re-keyed=N swept=M` at INFO on every start — `re-keyed=0 swept=0` once there is nothing
-  left to move.
+  thread is named) are not in it, and neither is the length an answer is cut at. The version is
+  `v2-…`; the first start after this change re-keys every summary filed under the previous `v1-…`
+  version of the same configuration instead of deleting it, and logs `re-keyed=N swept=M` at INFO
+  on every start — `re-keyed=0 swept=0` once there is nothing left to move.
 * **An answer is stored whole and cut when it is shown.** A summary is filed as the model wrote it
   (flattened, up to four times the cut length, as a backstop against a model that ignored the
   instruction) together with the length it was cut at, if it was. It is cut to the length in force

@@ -20,15 +20,16 @@ use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tokio::time::Instant;
 use tower::ServiceExt as _;
-use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
+use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity, RateLimitExhausted};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::state::AppState;
 use vibe_talk::summarize::fake::FakeSummarizer;
 use vibe_talk::summarize::threads::{
-    name_key, ThreadDeps, ThreadNames, ThreadRequest, CHANNEL_PAUSE,
+    name_key, ThreadDeps, ThreadNames, ThreadNaming, ThreadRequest, CHANNEL_PAUSE,
     DEFAULT_NAMING_INTERVAL_SECONDS, MAX_QUEUED, MAX_QUEUED_PER_CHANNEL, MAX_QUEUED_TURNS,
-    MAX_QUEUED_WAIT, NAMING_READ_TIMEOUT, OVERDUE_TURNS,
+    MAX_QUEUED_WAIT, NAMING_READ_TIMEOUT, OVERDUE_TURNS, RETRY_AFTER_FAILURE,
 };
+use vibe_talk::summarize::{Summarizer, Summary, SummaryError, SummaryRequest};
 use vibe_talk::testing::{
     self, CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN,
 };
@@ -64,6 +65,8 @@ struct Upstream {
     /// How many of its newest replies every thread read leaves out, count and messages both, with
     /// no `as_of`: a provider whose thread view lags its thread list.
     thread_view_lag: Mutex<usize>,
+    /// How many of the next thread reads panic rather than answer.
+    panic_reads: Mutex<usize>,
 }
 
 fn thread_id(channel: &str, n: usize) -> String {
@@ -215,6 +218,13 @@ impl ChatClient for Upstream {
             }
             TimelineView::Thread => {
                 let id = request.thread_id.clone().unwrap_or_default();
+                let panics = {
+                    let mut left = self.panic_reads.lock().unwrap();
+                    let panics = *left > 0;
+                    *left = left.saturating_sub(1);
+                    panics
+                };
+                assert!(!panics, "a thread read panicked, as a test asked");
                 let gate = self.holds.lock().unwrap().get(&id).cloned();
                 if let Some(gate) = gate {
                     let _permit = gate.acquire().await;
@@ -283,12 +293,55 @@ impl ChatClient for Upstream {
 
 // --- the server around it -----------------------------------------------------------------------
 
+/// The test summariser, with a gate a test can put in front of its namings.
+struct HeldModel {
+    fake: Arc<FakeSummarizer>,
+    /// While set, each naming waits for a permit before the model is asked.
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+}
+
+impl HeldModel {
+    /// Make namings wait until the returned gate is given a permit.
+    fn hold(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+}
+
+#[async_trait::async_trait]
+impl Summarizer for HeldModel {
+    fn describe(&self) -> &'static str {
+        self.fake.describe()
+    }
+    fn backend(&self) -> &'static str {
+        self.fake.backend()
+    }
+    fn policy_input(&self) -> &str {
+        self.fake.policy_input()
+    }
+    fn names_threads(&self) -> bool {
+        self.fake.names_threads()
+    }
+    async fn name_thread(&self, request: &ThreadRequest<'_>) -> Result<ThreadNaming, SummaryError> {
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let _permit = gate.acquire().await;
+        }
+        self.fake.name_thread(request).await
+    }
+    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
+        self.fake.summarize(request).await
+    }
+}
+
 struct Harness {
     app: axum::Router,
     state: AppState,
     upstream: Arc<Upstream>,
     counting: Arc<CountingChat>,
     summarizer: Arc<FakeSummarizer>,
+    model: Arc<HeldModel>,
     names: Arc<ThreadNames>,
     start: Instant,
 }
@@ -300,8 +353,12 @@ fn harness() -> Harness {
 
 fn harness_with(names: ThreadNames) -> Harness {
     let summarizer = Arc::new(FakeSummarizer::naming_threads());
+    let model = Arc::new(HeldModel {
+        fake: Arc::clone(&summarizer),
+        gate: Mutex::new(None),
+    });
     let (mut state, _discord, _store) =
-        testing::state_with_backend(&testing::config_toml(), summarizer.clone());
+        testing::state_with_backend(&testing::config_toml(), model.clone());
     let upstream = Arc::new(Upstream::default());
     let counting = Arc::new(CountingChat::new(upstream.clone()));
     state.replace_chat(counting.clone());
@@ -313,6 +370,7 @@ fn harness_with(names: ThreadNames) -> Harness {
         upstream,
         counting,
         summarizer,
+        model,
         start: Instant::now(),
     }
 }
@@ -762,6 +820,56 @@ async fn a_provider_failure_stops_naming_that_channel_for_ten_minutes_then_namin
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_naming_read_that_could_not_reach_the_provider_pauses_the_channel() {
+    failure_pauses_the_channel(ChatError::Transport("connection reset".to_owned())).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rate_limit_the_client_could_not_wait_out_pauses_the_channel() {
+    failure_pauses_the_channel(
+        ChatError::RateLimited(RateLimitExhausted {
+            provider: "google chat",
+            route: "GET /v1/spaces/threads".to_owned(),
+            attempts: 3,
+            waited: Duration::from_secs(20),
+            budget: Duration::from_secs(30),
+            retry_after: Duration::from_secs(60),
+            global: false,
+        })
+        .with_provider("Google Chat"),
+    )
+    .await;
+}
+
+/// The read at the first thread's turn fails with `error`, a provider failure: no thread in the
+/// channel is read for names until the pause ends, though the page polls and two more threads are
+/// due all along, and naming resumes when it ends.
+async fn failure_pauses_the_channel(error: ChatError) {
+    let h = harness();
+    h.upstream.add(WRITE_CHANNEL, 3);
+    h.counting
+        .fail_next("fetch_timeline", Some(TimelineView::Thread), error);
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    let pause = CHANNEL_PAUSE.as_secs();
+    let mut at = 45;
+    while at < pause {
+        h.at(at).await;
+        h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+        at += 45;
+    }
+    h.at(pause - 1).await;
+    assert_eq!(
+        h.thread_reads(WRITE_CHANNEL),
+        1,
+        "a channel whose provider failed was read for naming inside the pause"
+    );
+    assert_eq!(h.names.named(), 0);
+    h.at(pause + 1).await;
+    assert_eq!(h.thread_reads(WRITE_CHANNEL), 2, "naming did not resume");
+    assert_eq!(h.names.named(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_naming_read_that_never_answers_is_a_timeout_and_pauses_the_channel() {
     // Before W5 a read that never answered held the one naming turn for ever: no thread in any
     // channel was named again.
@@ -822,6 +930,40 @@ async fn one_channels_pause_leaves_every_other_channel_naming() {
         "the failing channel was read again"
     );
     assert_eq!(h.names.named(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_naming_that_panics_is_tried_again_as_a_failed_naming_is() {
+    // A panic anywhere in a naming (the provider client, the store, the summariser) ends its
+    // channel's worker. The thread it was naming stayed marked as being named, so no later read
+    // queued it again until the server restarted. It is now settled as a failed naming: left alone
+    // for `RETRY_AFTER_FAILURE`, then queued and named by the next read that finds it due.
+    let h = harness();
+    h.upstream.add(WRITE_CHANNEL, 1);
+    *h.upstream.panic_reads.lock().unwrap() = 1;
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(1).await;
+    assert_eq!(h.thread_reads(WRITE_CHANNEL), 1, "the read that panicked");
+    assert_eq!(
+        h.names.pending(),
+        0,
+        "the thread a panicked naming was naming is still counted as being named"
+    );
+
+    let retry = RETRY_AFTER_FAILURE.as_secs();
+    h.at(retry - 1).await;
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(retry).await;
+    assert_eq!(
+        h.thread_reads(WRITE_CHANNEL),
+        1,
+        "tried again before a failed one is"
+    );
+    h.at(retry + 1).await;
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(retry + 2).await;
+    assert_eq!(h.thread_reads(WRITE_CHANNEL), 2, "never tried again");
+    assert_eq!(h.names.named(), 1);
 }
 
 // --- read scope ---------------------------------------------------------------------------------
@@ -1078,6 +1220,45 @@ async fn taking_a_channel_off_the_list_drops_its_queue_and_files_nothing_in_flig
     h.at(301).await;
     assert_eq!(h.thread_reads(READ_CHANNEL), 2);
     assert_eq!(h.names.named(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn taking_a_channel_off_the_list_while_the_model_names_its_thread_files_nothing() {
+    // As above, but the channel goes after the read at the thread's turn answered, while the model
+    // is naming it: what the model answers is not filed either.
+    let h = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let ids = h.upstream.add(READ_CHANNEL, 1);
+    let gate = h.model.hold();
+    h.list(READ_CHANNEL, WRITE_TOKEN).await;
+    h.at(1).await;
+    assert_eq!(h.named_reads(READ_CHANNEL), [ids[0].clone()]);
+    assert_eq!(h.names.pending(), 1, "the naming is under way");
+
+    let (status, body) = h
+        .send(
+            "DELETE",
+            &format!("/api/v1/channels/{READ_CHANNEL}"),
+            WRITE_TOKEN,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    gate.add_permits(1);
+    h.at(2).await;
+    assert_eq!(
+        h.summarizer.thread_prompts().len(),
+        1,
+        "the model was asked"
+    );
+    assert_eq!(h.names.pending(), 0);
+    assert_eq!(h.names.named(), 0, "a hidden channel's thread was named");
+    assert!(h
+        .state
+        .store
+        .cached_summary(&name_key(&channel, &ids[0]))
+        .await
+        .expect("readable")
+        .is_none());
 }
 
 // --- the copy a forward delta carries -----------------------------------------------------------

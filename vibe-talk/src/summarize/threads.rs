@@ -718,11 +718,15 @@ impl NamesState {
 }
 
 /// Marks a worker's channel unserved if the worker ends any way other than by finding its queue
-/// empty — a panic, or its runtime shutting down — so the next thread queued starts a new one.
+/// empty — a panic, or its runtime shutting down — so the next thread queued starts a new one; and
+/// settles the thread it was naming then, if any, as a failed naming, so a later read queues it
+/// again once [`RETRY_AFTER_FAILURE`] has passed rather than finding it being named for ever.
 struct WorkerRelease {
     names: Arc<ThreadNames>,
     channel: ChannelId,
     token: u64,
+    /// The thread taken from the queue and not yet settled.
+    naming: Option<String>,
 }
 
 impl Drop for WorkerRelease {
@@ -731,6 +735,16 @@ impl Drop for WorkerRelease {
         if let Some(queue) = state.channels.get_mut(&self.channel) {
             if queue.worker == Some(self.token) {
                 queue.worker = None;
+            }
+        }
+        if let Some(thread) = self.naming.take() {
+            let key = (self.channel.clone(), thread);
+            if state.naming.remove(&key).is_some() {
+                tracing::warn!(
+                    retry_after_seconds = RETRY_AFTER_FAILURE.as_secs(),
+                    "a thread naming ended without settling; it is tried again as a failed one is"
+                );
+                state.failed.insert(key, Instant::now());
             }
         }
     }
@@ -1172,10 +1186,11 @@ impl ThreadNames {
     /// read budget and any pause, take the turn, take the waiting thread of greatest [`Rank`], and
     /// name it from a read made then.
     async fn work(self: Arc<Self>, channel: ChannelId, token: u64) {
-        let _release = WorkerRelease {
+        let mut release = WorkerRelease {
             names: Arc::clone(&self),
             channel: channel.clone(),
             token,
+            naming: None,
         };
         let max_wait = self.max_wait();
         loop {
@@ -1201,7 +1216,9 @@ impl ThreadNames {
             let Some((thread, waiting)) = taken else {
                 continue;
             };
+            release.naming = Some(thread.clone());
             let outcome = self.name_turn(&channel, token, &waiting).await;
+            release.naming = None;
             self.settle(&channel, thread, waiting, outcome);
         }
     }
