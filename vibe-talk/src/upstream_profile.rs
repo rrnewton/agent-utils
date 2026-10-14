@@ -1056,6 +1056,35 @@ impl ProfiledClient {
         answers
     }
 
+    /// One native read of several threads, timed as `fetch_threads`: its rows are the messages of
+    /// every thread answered, its content theirs, and it failed when no thread was answered.
+    /// Nothing is asked, or timed, for no asks. remote-ops-audit W14 `#287 bulk-reads`.
+    async fn timed_threads(
+        &self,
+        channel: &ChannelId,
+        asks: &[crate::chat::ThreadAsk],
+    ) -> crate::chat::ThreadAnswers {
+        if asks.is_empty() {
+            return Vec::new();
+        }
+        let timer = self.profile.start(Series::Operation, "fetch_threads");
+        let answers = self.inner.fetch_threads(channel, asks).await;
+        let pages: Vec<&crate::threads::TimelinePage> = answers
+            .iter()
+            .filter_map(|(_, page)| page.as_ref().ok())
+            .collect();
+        match answers.iter().find_map(|(_, page)| page.as_ref().err()) {
+            Some(error) if pages.is_empty() => timer.finish(Outcome::of(error), 0),
+            _ => {
+                let rows = pages.iter().map(|page| page.rows()).sum();
+                timer.finish(Outcome::Ok, rows)
+            }
+        };
+        self.profile
+            .record_content(pages.iter().flat_map(|page| page.messages()));
+        answers
+    }
+
     async fn timed<T, F>(
         &self,
         operation: &'static str,
@@ -1377,6 +1406,24 @@ impl ChatClient for ProfiledClient {
             &channels,
             vec![(native, native_answers), (emulated, emulated_answers)],
         )
+    }
+
+    async fn fetch_threads(
+        &self,
+        channel: &ChannelId,
+        asks: &[crate::chat::ThreadAsk],
+    ) -> crate::chat::ThreadAnswers {
+        // Timed under what it costs upstream, as a lookup by id is. A provider without a read of
+        // several threads of its own is asked exactly the thread view reads the trait's default is
+        // made of, so the default runs HERE and each is timed as the `fetch_timeline` it is, as it
+        // was before this method existed; only a native read is `fetch_threads`.
+        // remote-ops-audit W14 `#287 bulk-reads`.
+        match self.inner.read_caps(channel).many_threads {
+            crate::chat::Support::Native => self.timed_threads(channel, asks).await,
+            crate::chat::Support::Emulated => {
+                crate::chat::emulated_threads(self, channel, asks).await
+            }
+        }
     }
 
     async fn post_message(

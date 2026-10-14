@@ -1431,7 +1431,9 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   `fetch_recent` per channel, counted as that. Likewise a provider that reads the newest messages
   of several channels together itself counts one `fetch_recent_many` per call, its rows every
   message it returned; on any other that read is one `fetch_recent_dated` per channel, counted as
-  that.
+  that. And a provider that reads several threads of a channel itself counts one `fetch_threads`
+  per call, its rows every message it returned; on any other that read is one thread view
+  `fetch_timeline` per thread, counted as that.
   Operations are timed around each provider's
   own client, so the live poller and this report's own token check count as well as the page and
   the voice agent. Questions a provider answers from memory, such as whether it supports threads,
@@ -2449,6 +2451,29 @@ cannot read, and then reads each channel as it would have without it.
 
 Every field but `channel` and `messages` may be absent or `null`; an unknown field is ignored;
 anything else that cannot be read fails the request, and vibe-talk reads its channels as before.
+
+### Reads of several threads
+
+**The problem.** Naming the threads that fell due (see [Thread names](#thread-names)) reads each
+thread's newest page through the thread view, one upstream read per thread, so a channel whose
+twenty threads fell due at once is twenty reads, each of which may itself be several calls.
+
+**What it is.** `ChatClient::fetch_threads(channel, asks)` reads several threads of one channel at
+once: per thread, how many messages (`limit`) and optionally only those created after an instant
+(`newer_than`). Without `newer_than` the answer is what the thread view's newest page of that size
+answers. With it, the answer holds only the messages created after the instant (a message whose
+instant cannot be read is kept), and it is a delta of additions, never a whole thread: its
+`delta.complete` is false and `delta.deleted` empty, so a message it leaves out is unchanged as far
+as it says, never deleted; an edit or a delete of an older message is not in it; and it carries no
+cursor and no `has_more`. Nothing may prune, stamp as complete or tombstone on such an answer.
+`delta.more` is true when more than `limit` messages may be newer than the instant and the answer
+does not hold them all. One answer per thread, in the order asked, a failure in its own place; the
+router asks the channel's own provider.
+
+**Who answers it natively.** No provider yet. Every provider answers with the trait's default, one
+thread view read per thread, at most two in flight, which costs exactly what reading each thread
+did, and says so (`ReadCaps::many_threads` is emulated). A caller that would gather its thread
+reads into one only to save calls gathers them only for a provider that reads them natively.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 

@@ -485,6 +485,11 @@ pub struct ReadCaps {
     /// upstream calls than a read of each. A caller that would gather reads into one only to save
     /// calls (a catch-up, a warm-up) gathers them only when this is native. remote-ops-audit W13.
     pub many_channels: Support,
+    /// [`ChatClient::fetch_threads`]: the newest messages of several threads of one channel in
+    /// fewer upstream calls than a thread view read of each. A caller that would gather thread
+    /// reads into one only to save calls (naming the threads that fell due) gathers them only when
+    /// this is native. remote-ops-audit W14.
+    pub many_threads: Support,
     /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
     /// 100 unless the provider says otherwise.
     pub page_rows: u16,
@@ -498,6 +503,7 @@ impl Default for ReadCaps {
             heads: Support::Emulated,
             heads_cover_edits: false,
             many_channels: Support::Emulated,
+            many_threads: Support::Emulated,
             page_rows: crate::discord::http::DISCORD_MAX_LIMIT,
         }
     }
@@ -610,6 +616,52 @@ pub type RecentAnswers = ChannelAnswers<RecentRead>;
 /// How many [`ChatClient::fetch_recent_dated`] reads [`emulated_recent_many`] keeps in flight: the
 /// bounded fan-out every bulk default keeps, per provider. remote-ops-audit W13 `#287 bulk-reads`.
 pub const RECENT_IN_FLIGHT: usize = 4;
+
+/// What one thread's part of a [`ChatClient::fetch_threads`] asks for. remote-ops-audit W14
+/// `#287 bulk-reads`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadAsk {
+    /// The thread, as a thread view's [`crate::threads::TimelineRequest::thread_id`] names it.
+    pub id: String,
+    /// Only the thread's messages created after this instant, in Unix milliseconds; `None` for
+    /// the thread view's newest page. An answer to an ask with it is a delta of additions, never
+    /// a whole thread: see [`ChatClient::fetch_threads`] for what it says and what it never does.
+    pub newer_than_ms: Option<i64>,
+    /// At most this many messages, as a thread view's page takes it.
+    pub limit: u16,
+}
+
+impl ThreadAsk {
+    /// The newest `limit` messages of thread `id`, as the thread view's newest page reads them.
+    #[must_use]
+    pub fn newest(id: impl Into<String>, limit: u16) -> Self {
+        Self {
+            id: id.into(),
+            newer_than_ms: None,
+            limit,
+        }
+    }
+
+    /// The thread view read [`emulated_threads`] makes for this ask: the newest page of `limit`.
+    #[must_use]
+    pub fn request(&self) -> crate::threads::TimelineRequest {
+        crate::threads::TimelineRequest {
+            view: crate::threads::TimelineView::Thread,
+            thread_id: Some(self.id.clone()),
+            before: None,
+            after: None,
+            limit: self.limit,
+        }
+    }
+}
+
+/// One answer per ask of a [`ChatClient::fetch_threads`] call, in the order asked: each thread's
+/// id, with its page or why it could not be read.
+pub type ThreadAnswers = Vec<(String, Result<crate::threads::TimelinePage, ChatError>)>;
+
+/// How many thread view reads [`emulated_threads`] keeps in flight. remote-ops-audit W14
+/// `#287 bulk-reads`.
+pub const THREADS_IN_FLIGHT: usize = 2;
 
 /// Read and post access to configured chat channels.
 #[async_trait]
@@ -955,6 +1007,36 @@ pub trait ChatClient: Send + Sync {
     /// whole call.
     async fn fetch_recent_many(&self, asks: &[(ChannelId, RecentAsk)]) -> RecentAnswers {
         emulated_recent_many(self, asks).await
+    }
+
+    /// The newest messages of several threads of `channel`: one answer per ask, in the order
+    /// asked, a repeated ask answered each time. remote-ops-audit W14 `#287 bulk-reads`.
+    ///
+    /// An ask without `newer_than_ms` is answered with what the thread view's newest page of
+    /// `limit` answers ([`ThreadAsk::request`]): the thread's newest messages, its root among them
+    /// where it falls, and the thread's summary.
+    ///
+    /// An ask with `newer_than_ms` is answered with only the messages created after that instant,
+    /// and only as a delta of additions ([`newer_than_trimmed`]): `delta.complete` is false and
+    /// `delta.deleted` empty, so a message the answer leaves out is unchanged as far as it says,
+    /// never deleted, and an edit or a delete of an older message is not in it. Such an answer is
+    /// never exhaustive below `newer_than_ms`, so nothing may stamp, prune or tombstone on it; and
+    /// `delta.more` says when it is not exhaustive above it either, because more than `limit`
+    /// messages were newer. It carries no cursors.
+    ///
+    /// A native read ([`ReadCaps::many_threads`]) costs fewer upstream calls than a thread view
+    /// read of each (a bridge's is one request for all of them, and Slack does not read a thread
+    /// whose root says nothing is newer), so a caller may gather its thread reads into one for it.
+    /// An emulated one costs exactly the reads it is made of, so a caller that would gather reads
+    /// only to save calls does not.
+    ///
+    /// The default is [`emulated_threads`]: one [`ChatClient::fetch_timeline`] of the thread view
+    /// per ask, [`THREADS_IN_FLIGHT`] at a time. The router asks the channel's own provider.
+    ///
+    /// A thread that cannot be read is an `Err` in its own place, never a failure of the whole
+    /// call.
+    async fn fetch_threads(&self, channel: &ChannelId, asks: &[ThreadAsk]) -> ThreadAnswers {
+        emulated_threads(self, channel, asks).await
     }
 
     /// Post `content` to `channel`, optionally as a reply to an existing message.
@@ -1335,6 +1417,97 @@ pub fn since_trimmed(read: RecentRead, since_ms: Option<i64>) -> RecentRead {
         messages,
         as_of: read.as_of,
         exhausted: read.exhausted && !trimmed,
+    }
+}
+
+/// [`ChatClient::fetch_threads`]'s default: a read of several threads made of the thread view read
+/// of each. remote-ops-audit W14 `#287 bulk-reads`.
+///
+/// One [`ChatClient::fetch_timeline`] of [`ThreadAsk::request`] per ask, [`THREADS_IN_FLIGHT`] at a
+/// time, in the order asked; each read's failure is that thread's answer, and each answer is
+/// [`newer_than_trimmed`] to its ask. An ask without `newer_than_ms` is answered with its read
+/// exactly as the provider gave it. Nothing is read for an empty list.
+pub async fn emulated_threads<C: ChatClient + ?Sized>(
+    client: &C,
+    channel: &ChannelId,
+    asks: &[ThreadAsk],
+) -> ThreadAnswers {
+    use futures_util::StreamExt as _;
+
+    let requests: Vec<crate::threads::TimelineRequest> =
+        asks.iter().map(ThreadAsk::request).collect();
+    // Made before they are streamed, as in `emulated_messages`.
+    let reads: Vec<_> = requests
+        .iter()
+        .map(|request| client.fetch_timeline(channel, request))
+        .collect();
+    let answers: Vec<_> = futures_util::stream::iter(reads)
+        .buffered(THREADS_IN_FLIGHT)
+        .collect()
+        .await;
+    asks.iter()
+        .zip(answers)
+        .map(|(ask, page)| {
+            (
+                ask.id.clone(),
+                page.map(|page| newer_than_trimmed(page, ask.newer_than_ms)),
+            )
+        })
+        .collect()
+}
+
+/// A thread view's newest page as the answer to an ask for only what is newer than
+/// `newer_than_ms`, when one is given; the page unchanged when it is not. remote-ops-audit W14
+/// `#287 bulk-reads`.
+///
+/// Keeps the messages created after `newer_than_ms`, and one whose instant cannot be read
+/// ([`Message::created_ms`]), as every time-bounded read here keeps it. The answer is a delta of
+/// additions: `delta.complete` false, `delta.deleted` and `delta.removed_threads` empty, so it
+/// never says a message is gone, and no cursor, since it is neither a page to step back from nor
+/// a newest page to read forward from (`has_more` false, `next_before` and `next_after` absent).
+/// `delta.more` is true when the page said there was more before it and none of its messages but
+/// the root was old enough to show it reached `newer_than_ms`: messages newer than that may then
+/// have been left out. The thread's summary, `has_threads`, `notice` and `as_of` are kept.
+#[must_use]
+pub fn newer_than_trimmed(
+    page: crate::threads::TimelinePage,
+    newer_than_ms: Option<i64>,
+) -> crate::threads::TimelinePage {
+    let Some(newer_than_ms) = newer_than_ms else {
+        return page;
+    };
+    let root = page
+        .thread
+        .as_ref()
+        .and_then(|thread| thread.root.as_ref())
+        .map(|root| root.id.clone());
+    // A provider may attach the root to a page whose replies stop well short of it, so only a
+    // reply old enough proves the page reached back past the instant.
+    let reached = page.messages.iter().any(|message| {
+        Some(&message.id) != root.as_ref()
+            && message.created_ms().is_some_and(|ms| ms <= newer_than_ms)
+    });
+    let more = page.has_more && !reached;
+    crate::threads::TimelinePage {
+        messages: page
+            .messages
+            .into_iter()
+            .filter(|message| message.created_ms().is_none_or(|ms| ms > newer_than_ms))
+            .collect(),
+        threads: page.threads,
+        thread: page.thread,
+        has_threads: page.has_threads,
+        has_more: false,
+        next_before: None,
+        notice: page.notice,
+        next_after: None,
+        delta: Some(crate::threads::TimelineDelta {
+            more,
+            complete: false,
+            deleted: Vec::new(),
+            removed_threads: Vec::new(),
+        }),
+        as_of: page.as_of,
     }
 }
 
@@ -2229,5 +2402,142 @@ mod range_tests {
         assert_eq!(fake.fetch_count(), 0);
         assert_eq!(fake.read_caps(&channel), ReadCaps::default());
         assert_eq!(fake.read_caps(&channel).range, Support::Emulated);
+    }
+}
+
+#[cfg(test)]
+mod threads_tests {
+    use super::*;
+    use crate::threads::{ThreadSummary, TimelinePage};
+
+    const BASE_MS: i64 = 1_787_000_000_000;
+
+    fn message(id: &str, timestamp: &str) -> Message {
+        Message {
+            thread: None,
+            id: MessageId(id.to_owned()),
+            channel_id: ChannelId("c".to_owned()),
+            author: "ada".to_owned(),
+            author_id: crate::model::UserId("1".to_owned()),
+            author_is_bot: false,
+            content: id.to_owned(),
+            spoken_content: String::new(),
+            content_html: String::new(),
+            noise: false,
+            timestamp: timestamp.to_owned(),
+            spoken_time: String::new(),
+            reply_to: None,
+            reactions: None,
+            heading: None,
+        }
+    }
+
+    fn at(id: &str, ms: i64) -> Message {
+        message(
+            id,
+            &jiff::Timestamp::from_millisecond(ms)
+                .expect("in range")
+                .to_string(),
+        )
+    }
+
+    fn page(messages: Vec<Message>, root: Message, has_more: bool) -> TimelinePage {
+        TimelinePage {
+            messages,
+            thread: Some(ThreadSummary {
+                id: "t".to_owned(),
+                root: Some(root),
+                title: "t".to_owned(),
+                reply_count: Some(9),
+                reply_count_exact: true,
+                updated_at: String::new(),
+                display_name: None,
+                summary: None,
+            }),
+            has_threads: true,
+            has_more,
+            next_before: has_more.then(|| "older".to_owned()),
+            next_after: Some("forward".to_owned()),
+            as_of: Some("2026-10-13T12:00:00Z".to_owned()),
+            ..TimelinePage::default()
+        }
+    }
+
+    fn ids(page: &TimelinePage) -> Vec<&str> {
+        page.messages.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn without_newer_than_the_page_is_passed_on_untouched() {
+        let root = at("root", BASE_MS);
+        let original = page(vec![root.clone(), at("r1", BASE_MS + 1)], root, true);
+        assert_eq!(newer_than_trimmed(original.clone(), None), original);
+    }
+
+    #[test]
+    fn a_message_whose_instant_cannot_be_read_is_kept_and_the_copy_age_is_kept() {
+        let root = at("root", BASE_MS);
+        let trimmed = newer_than_trimmed(
+            page(
+                vec![
+                    root.clone(),
+                    at("r1", BASE_MS + 1_000),
+                    message("timeless", "not a time"),
+                    at("r2", BASE_MS + 3_000),
+                ],
+                root,
+                false,
+            ),
+            Some(BASE_MS + 1_000),
+        );
+        assert_eq!(
+            ids(&trimmed),
+            ["timeless", "r2"],
+            "strictly newer, to the ms"
+        );
+        assert_eq!(trimmed.as_of.as_deref(), Some("2026-10-13T12:00:00Z"));
+        assert!(trimmed.has_threads);
+        assert_eq!(trimmed.delta.as_ref().map(|d| d.more), Some(false));
+    }
+
+    #[test]
+    fn a_root_attached_to_replies_that_stop_short_of_the_instant_does_not_make_the_answer_whole() {
+        // A provider that attaches the root to the newest replies: the root is older than the
+        // instant, but no reply is, so replies between them may be missing.
+        let root = at("root", BASE_MS);
+        let trimmed = newer_than_trimmed(
+            page(
+                vec![
+                    root.clone(),
+                    at("r8", BASE_MS + 8_000),
+                    at("r9", BASE_MS + 9_000),
+                ],
+                root.clone(),
+                true,
+            ),
+            Some(BASE_MS + 1_000),
+        );
+        assert_eq!(ids(&trimmed), ["r8", "r9"]);
+        let delta = trimmed.delta.expect("a delta");
+        assert!(
+            delta.more,
+            "messages newer than the instant may have been left out"
+        );
+        assert!(!delta.complete && delta.deleted.is_empty() && delta.removed_threads.is_empty());
+        assert!(!trimmed.has_more);
+        assert_eq!(trimmed.next_before, None);
+        assert_eq!(trimmed.next_after, None);
+
+        // Once a reply shows the page reached the instant, nothing newer is missing.
+        let reached = newer_than_trimmed(
+            page(
+                vec![at("r1", BASE_MS + 1_000), at("r2", BASE_MS + 2_000)],
+                root,
+                true,
+            ),
+            Some(BASE_MS + 1_000),
+        );
+        assert_eq!(ids(&reached), ["r2"]);
+        assert_eq!(reached.delta.map(|d| d.more), Some(false));
     }
 }

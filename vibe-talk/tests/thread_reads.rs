@@ -19,17 +19,26 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
-use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
+use vibe_talk::chat::{
+    newer_than_trimmed, ChatClient, ChatError, ChatIdentity, ReadCaps, Support, ThreadAnswers,
+    ThreadAsk, THREADS_IN_FLIGHT,
+};
+use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
+use vibe_talk::providers::{ChatRouter, ProviderEntry};
 use vibe_talk::store::fake::FakeStore;
 use vibe_talk::summarize::fake::FakeSummarizer;
 use vibe_talk::summarize::threads::{ThreadDeps, ThreadNames};
-use vibe_talk::threads::{ThreadSummary, TimelinePage, TimelineRequest, TimelineView};
+use vibe_talk::testing::CountingChat;
+use vibe_talk::threads::{
+    ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView,
+};
+use vibe_talk::upstream_profile::{ProfiledClient, UpstreamProfile};
 
 /// When every thread of the test starts, in Unix milliseconds.
 const BASE_MS: i64 = 1_791_000_000_000;
@@ -166,6 +175,26 @@ impl Plain {
             .insert(thread.to_owned());
     }
 
+    /// The thread view's newest page of `limit` of thread `id`, as upstream holds it now, without
+    /// logging: what every read of one thread here answers.
+    fn read(&self, channel: &ChannelId, id: &str, limit: u16) -> Result<TimelinePage, ChatError> {
+        if self.failing.lock().expect("failing").contains(id) {
+            return Err(ChatError::Status {
+                status: 502,
+                body: "the thread is unreachable".to_owned(),
+            });
+        }
+        let threads = self.threads.lock().expect("threads");
+        threads
+            .get(channel.as_str())
+            .and_then(|list| list.iter().find(|t| t.id == id))
+            .map(|thread| thread.page(channel, limit))
+            .ok_or_else(|| ChatError::Status {
+                status: 404,
+                body: "no such thread in this channel".to_owned(),
+            })
+    }
+
     /// The thread list of `channel`, as a timeline answer, without reading upstream: the page a
     /// test hands naming, as the timeline route would.
     fn list(&self, channel: &ChannelId) -> TimelinePage {
@@ -205,22 +234,11 @@ impl ChatClient for Plain {
                 "this test reads threads only".to_owned(),
             ));
         }
-        let id = request.thread_id.clone().unwrap_or_default();
-        if self.failing.lock().expect("failing").contains(&id) {
-            return Err(ChatError::Status {
-                status: 502,
-                body: "the thread is unreachable".to_owned(),
-            });
-        }
-        let threads = self.threads.lock().expect("threads");
-        threads
-            .get(channel.as_str())
-            .and_then(|list| list.iter().find(|t| t.id == id))
-            .map(|thread| thread.page(channel, request.limit))
-            .ok_or_else(|| ChatError::Status {
-                status: 404,
-                body: "no such thread in this channel".to_owned(),
-            })
+        self.read(
+            channel,
+            request.thread_id.as_deref().unwrap_or_default(),
+            request.limit,
+        )
     }
 
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
@@ -496,4 +514,440 @@ async fn a_provider_without_a_read_of_several_threads_gets_todays_names_at_today
     let failed = case("a channel where one thread cannot be read")["shown"].to_string();
     assert!(failed.contains(r#"["d01",null,null]"#), "{failed}");
     assert!(upstream("a read token lists a channel with due threads").is_empty());
+}
+
+// --- the method, its default and the router ------------------------------------------------------
+
+/// A provider that reads several threads of a channel itself, in one call: each ask is answered
+/// from the pages `plain` holds, as one thread view read of it would be, and only the call is
+/// logged, as `fetch_threads <channel> <ids>`.
+struct Native {
+    plain: Arc<Plain>,
+    asked: Mutex<Vec<Vec<String>>>,
+}
+
+impl Native {
+    fn new(plain: Arc<Plain>) -> Self {
+        Self {
+            plain,
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<Vec<String>> {
+        self.asked.lock().expect("asked").clone()
+    }
+}
+
+#[async_trait]
+impl ChatClient for Native {
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            many_threads: Support::Native,
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &TimelineRequest,
+    ) -> Result<TimelinePage, ChatError> {
+        self.plain.fetch_timeline(channel, request).await
+    }
+
+    async fn fetch_threads(&self, channel: &ChannelId, asks: &[ThreadAsk]) -> ThreadAnswers {
+        let ids: Vec<String> = asks.iter().map(|ask| ask.id.clone()).collect();
+        self.plain
+            .note(format!("fetch_threads {channel} {}", ids.join(",")));
+        self.asked.lock().expect("asked").push(ids);
+        asks.iter()
+            .map(|ask| {
+                (
+                    ask.id.clone(),
+                    self.plain
+                        .read(channel, &ask.id, ask.limit)
+                        .map(|page| newer_than_trimmed(page, ask.newer_than_ms)),
+                )
+            })
+            .collect()
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.plain.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.plain.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.plain.post_message(channel, content, reply_to).await
+    }
+}
+
+/// `Plain`, answering every thread view read after a pause, and counting how many are in flight.
+struct Slow {
+    plain: Arc<Plain>,
+    in_flight: AtomicUsize,
+    most: AtomicUsize,
+}
+
+#[async_trait]
+impl ChatClient for Slow {
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &TimelineRequest,
+    ) -> Result<TimelinePage, ChatError> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        let answer = self.plain.fetch_timeline(channel, request).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        answer
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.plain.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.plain.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.plain.post_message(channel, content, reply_to).await
+    }
+}
+
+fn ids(page: &TimelinePage) -> Vec<String> {
+    page.messages.iter().map(|m| m.id.0.clone()).collect()
+}
+
+/// The instant reply `n` of thread `n_thread` of a channel seeded by [`Plain::seed`] was created.
+fn reply_ms(n_thread: i64, n: i64) -> i64 {
+    BASE_MS + n_thread * 10 * MINUTE_MS + n * MINUTE_MS
+}
+
+/// remote-ops-audit W14: the default is one thread view read per ask, its own size, two in flight,
+/// started in the order asked; a repeated ask is read again, and a thread that cannot be read is
+/// an error in its own place while the others are answered.
+#[tokio::test(start_paused = true)]
+async fn the_default_reads_one_thread_view_per_ask_two_at_a_time_in_order() {
+    let plain = Arc::new(Plain::default());
+    let a = channel("A0000000001");
+    plain.seed(&a, "a", &[0, 1, 2, 3]);
+    let slow = Slow {
+        plain: Arc::clone(&plain),
+        in_flight: AtomicUsize::new(0),
+        most: AtomicUsize::new(0),
+    };
+    let asks = [
+        ThreadAsk::newest("a00", 50),
+        ThreadAsk::newest("a03", 2),
+        ThreadAsk::newest("zz", 50),
+        ThreadAsk::newest("a00", 50),
+        ThreadAsk::newest("a02", 50),
+    ];
+    let answers = slow.fetch_threads(&a, &asks).await;
+
+    assert_eq!(
+        plain.take(),
+        [
+            "fetch_timeline A0000000001 view=thread thread=a00 limit=50 before=- after=-",
+            "fetch_timeline A0000000001 view=thread thread=a03 limit=2 before=- after=-",
+            "fetch_timeline A0000000001 view=thread thread=zz limit=50 before=- after=-",
+            "fetch_timeline A0000000001 view=thread thread=a00 limit=50 before=- after=-",
+            "fetch_timeline A0000000001 view=thread thread=a02 limit=50 before=- after=-",
+        ]
+    );
+    assert_eq!(slow.most.load(Ordering::SeqCst), THREADS_IN_FLIGHT);
+    assert_eq!(THREADS_IN_FLIGHT, 2);
+    assert_eq!(
+        answers
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["a00", "a03", "zz", "a00", "a02"]
+    );
+    let page = |at: usize| answers[at].1.as_ref().expect("a page");
+    assert_eq!(ids(page(0)), ["a00-root"]);
+    assert_eq!(ids(page(1)), ["a03-r2", "a03-r3"], "its own size");
+    assert!(
+        page(1).has_more,
+        "a page is passed on as the provider gave it"
+    );
+    assert!(matches!(
+        answers[2].1,
+        Err(ChatError::Status { status: 404, .. })
+    ));
+    assert_eq!(ids(page(3)), ["a00-root"]);
+    assert_eq!(ids(page(4)), ["a02-root", "a02-r1", "a02-r2"]);
+    for at in [0, 1, 3, 4] {
+        assert_eq!(
+            page(at).delta,
+            None,
+            "no newer_than: the newest page itself"
+        );
+    }
+    // Byte for byte the thread view's own answer.
+    let direct = plain
+        .fetch_timeline(&a, &ThreadAsk::newest("a03", 2).request())
+        .await
+        .expect("a page");
+    assert_eq!(*page(1), direct);
+    plain.take();
+    assert!(slow.fetch_threads(&a, &[]).await.is_empty());
+    assert!(plain.take().is_empty(), "nothing is read for no asks");
+}
+
+/// remote-ops-audit W14's second proof: an answer to `newer_than` holds only what is newer, and is
+/// a delta of additions. It never claims to be the whole thread below the instant (no cursor, no
+/// `has_more`, `complete` false) and never says a message is gone (`deleted` empty), so nothing
+/// can stamp or tombstone on it; it says when it may not hold everything above the instant either.
+#[tokio::test]
+async fn the_default_answers_newer_than_with_additions_only_and_never_a_whole_thread() {
+    let plain = Plain::default();
+    let a = channel("A0000000001");
+    plain.seed(&a, "a", &[0, 0, 0, 3, 12]);
+    let ask = |id: &str, newer_than_ms: Option<i64>, limit: u16| ThreadAsk {
+        id: id.to_owned(),
+        newer_than_ms,
+        limit,
+    };
+    let answers = plain
+        .fetch_threads(
+            &a,
+            &[
+                ask("a03", Some(reply_ms(3, 1)), 50),
+                ask("a03", Some(reply_ms(3, 0) - 1), 50),
+                ask("a03", Some(reply_ms(3, 3)), 50),
+                ask("a04", Some(reply_ms(4, 0) - 1), 5),
+                ask("a04", Some(reply_ms(4, 9)), 5),
+                ask("a03", None, 50),
+            ],
+        )
+        .await;
+    let page = |at: usize| answers[at].1.as_ref().expect("a page");
+    let additions_only = |at: usize, more: bool| {
+        let page = page(at);
+        assert_eq!(
+            page.delta,
+            Some(TimelineDelta {
+                more,
+                complete: false,
+                deleted: Vec::new(),
+                removed_threads: Vec::new(),
+            }),
+            "{at}"
+        );
+        assert!(
+            !page.has_more,
+            "{at}: no step back from an answer to newer_than"
+        );
+        assert_eq!(page.next_before, None, "{at}");
+        assert_eq!(page.next_after, None, "{at}");
+        let summary = page.thread.as_ref().expect("the thread's summary is kept");
+        assert!(summary.root.is_some(), "{at}: its root too, on the summary");
+    };
+    assert_eq!(ids(page(0)), ["a03-r2", "a03-r3"]);
+    additions_only(0, false);
+    assert_eq!(
+        ids(page(1)),
+        ["a03-root", "a03-r1", "a03-r2", "a03-r3"],
+        "a root newer than the instant is news too"
+    );
+    additions_only(1, false);
+    assert!(ids(page(2)).is_empty(), "nothing is newer than the newest");
+    additions_only(2, false);
+    // Twelve replies read five at a time: all five are newer, and the page did not reach the
+    // instant, so newer messages may have been left out.
+    assert_eq!(
+        ids(page(3)),
+        ["a04-r8", "a04-r9", "a04-r10", "a04-r11", "a04-r12"]
+    );
+    additions_only(3, true);
+    // The page reached back past the instant: everything newer is here.
+    assert_eq!(ids(page(4)), ["a04-r10", "a04-r11", "a04-r12"]);
+    additions_only(4, false);
+    assert_eq!(
+        *page(5),
+        plain
+            .read(&a, "a03", 50)
+            .expect("the thread view's own page"),
+        "no newer_than is the newest page itself"
+    );
+}
+
+fn routed(id: &str, provider: &str) -> ChannelInfo {
+    ChannelInfo {
+        id: channel(id),
+        label: id.to_owned(),
+        writable: false,
+        alias: None,
+        added: false,
+        provider: Some(provider.to_owned()),
+    }
+}
+
+/// remote-ops-audit W14, the router's part: a channel's threads are read by that channel's own
+/// provider, in one call when it reads several threads itself and one thread view read each when
+/// it does not; a channel no provider holds is refused for every thread and asked of nobody.
+#[tokio::test]
+async fn the_router_asks_the_channels_own_provider_and_refuses_an_unrouted_channel() {
+    let plain_n = Arc::new(Plain::default());
+    let plain_p = Arc::new(Plain::default());
+    let (n, p) = (channel("N0000000001"), channel("P0000000002"));
+    plain_n.seed(&n, "n", &[1, 2, 3]);
+    plain_p.seed(&p, "p", &[1, 2]);
+    let native = Arc::new(Native::new(Arc::clone(&plain_n)));
+    let counting_n = Arc::new(CountingChat::new(Arc::clone(&native) as Arc<dyn ChatClient>));
+    let counting_p = Arc::new(CountingChat::new(
+        Arc::clone(&plain_p) as Arc<dyn ChatClient>
+    ));
+    let entry = |key: &str, client: Arc<CountingChat>| ProviderEntry {
+        key: key.to_owned(),
+        namespace: key.to_owned(),
+        client,
+        live_poll_seconds: 0,
+    };
+    let router = ChatRouter::new(
+        vec![
+            entry("n", Arc::clone(&counting_n)),
+            entry("p", Arc::clone(&counting_p)),
+        ],
+        None,
+    );
+    router.replace_routes(&[routed(n.as_str(), "n"), routed(p.as_str(), "p")]);
+    let asks = |ids: &[&str]| -> Vec<ThreadAsk> {
+        ids.iter().map(|id| ThreadAsk::newest(*id, 50)).collect()
+    };
+
+    let answers = router
+        .fetch_threads(&n, &asks(&["n02", "n00", "n01"]))
+        .await;
+    assert_eq!(counting_n.count("fetch_threads"), 1);
+    assert_eq!(
+        counting_n.calls().len(),
+        1,
+        "one call, and no thread view read"
+    );
+    assert_eq!(native.asked(), [vec!["n02", "n00", "n01"]]);
+    assert_eq!(plain_n.take(), ["fetch_threads N0000000001 n02,n00,n01"]);
+    assert_eq!(
+        answers
+            .iter()
+            .map(|(id, page)| (id.as_str(), ids(page.as_ref().expect("a page")).len()))
+            .collect::<Vec<_>>(),
+        [("n02", 4), ("n00", 2), ("n01", 3)]
+    );
+
+    let answers = router.fetch_threads(&p, &asks(&["p01", "p00"])).await;
+    assert_eq!(counting_p.count("fetch_threads"), 0);
+    assert_eq!(
+        counting_p.timeline_reads(&p, TimelineView::Thread),
+        2,
+        "a provider that does not read several threads is read as it always was"
+    );
+    assert_eq!(
+        answers
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["p01", "p00"]
+    );
+
+    let before = (counting_n.calls().len(), counting_p.calls().len());
+    let answers = router
+        .fetch_threads(&channel("NOWHERE"), &asks(&["x", "y"]))
+        .await;
+    assert_eq!(answers.len(), 2);
+    assert!(answers
+        .iter()
+        .all(|(_, page)| matches!(page, Err(ChatError::Refused(_)))));
+    assert_eq!(
+        (counting_n.calls().len(), counting_p.calls().len()),
+        before,
+        "asked of nobody"
+    );
+}
+
+/// remote-ops-audit W14: a provider that does not read several threads itself is asked the thread
+/// view reads the default is made of, and each is timed and counted as the `fetch_timeline` it is;
+/// nothing is ever timed as `fetch_threads` for it. One that does is timed once, its rows every
+/// message it answered.
+#[tokio::test]
+async fn an_emulated_read_of_several_threads_is_timed_and_counted_as_the_thread_views_it_is_made_of(
+) {
+    let plain = Arc::new(Plain::default());
+    let a = channel("A0000000001");
+    plain.seed(&a, "a", &[0, 2]);
+    let asks = [ThreadAsk::newest("a00", 50), ThreadAsk::newest("a01", 50)];
+    let operations = |profile: &UpstreamProfile| -> Vec<(&'static str, u64, Option<u64>)> {
+        profile.report().providers[0]
+            .operations
+            .iter()
+            .map(|row| (row.name, row.count, row.rows))
+            .collect()
+    };
+
+    let profile = UpstreamProfile::new();
+    let profiled = ProfiledClient::new(
+        Arc::clone(&plain) as Arc<dyn ChatClient>,
+        profile.provider("plain", "Plain"),
+    );
+    let answers = profiled.fetch_threads(&a, &asks).await;
+    assert!(answers.iter().all(|(_, page)| page.is_ok()));
+    let timed = operations(&profile);
+    assert_eq!(timed.len(), 1, "{timed:?}");
+    assert_eq!((timed[0].0, timed[0].1), ("fetch_timeline", 2));
+
+    let counting = CountingChat::new(Arc::clone(&plain) as Arc<dyn ChatClient>);
+    counting.fetch_threads(&a, &asks).await;
+    assert_eq!(counting.count("fetch_timeline"), 2);
+    assert_eq!(counting.count("fetch_threads"), 0);
+
+    let native = Arc::new(Native::new(Arc::clone(&plain)));
+    let profile = UpstreamProfile::new();
+    let profiled = ProfiledClient::new(
+        Arc::clone(&native) as Arc<dyn ChatClient>,
+        profile.provider("native", "Native"),
+    );
+    profiled.fetch_threads(&a, &asks).await;
+    assert_eq!(
+        operations(&profile),
+        [("fetch_threads", 1, Some(4))],
+        "one call; a root, and a root with two replies"
+    );
 }

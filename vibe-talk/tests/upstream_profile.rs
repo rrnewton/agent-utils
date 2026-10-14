@@ -24,7 +24,7 @@ use tower::ServiceExt as _;
 use vibe_talk::chat::{
     ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, Lookup, PostLimit, RangeOrder,
     RangeRead, ReadCaps, ReadScope, RecentAnswers, RecentAsk, RecentRead, RegisteredChannel,
-    SourceClaim, Support, TimeRange, UpstreamClearOutcome,
+    SourceClaim, Support, ThreadAnswers, ThreadAsk, TimeRange, UpstreamClearOutcome,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -436,6 +436,7 @@ impl ChatClient for Recorder {
             heads: Support::Native,
             heads_cover_edits: true,
             many_channels: Support::Native,
+            many_threads: Support::Native,
             page_rows: 7,
         }
     }
@@ -501,6 +502,20 @@ impl ChatClient for Recorder {
                         messages: vec![self.message.clone()],
                         as_of: Some("2026-10-12T10:00:00Z".to_owned()),
                         exhausted: false,
+                    }),
+                )
+            })
+            .collect()
+    }
+    async fn fetch_threads(&self, _channel: &ChannelId, asks: &[ThreadAsk]) -> ThreadAnswers {
+        self.note("fetch_threads");
+        asks.iter()
+            .map(|ask| {
+                (
+                    ask.id.clone(),
+                    Ok(TimelinePage {
+                        as_of: Some("2026-10-12T11:00:00Z".to_owned()),
+                        ..self.page()
                     }),
                 )
             })
@@ -753,6 +768,29 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         calls.drain(..2);
     }
     ran("fetch_recent_many");
+    let threads = client
+        .fetch_threads(
+            &channel,
+            &[ThreadAsk::newest("t1", 5), ThreadAsk::newest("t2", 5)],
+        )
+        .await;
+    assert_eq!(
+        threads
+            .iter()
+            .map(|(id, page)| (id.as_str(), page.as_ref().expect("a page").as_of.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("t1", Some("2026-10-12T11:00:00Z")),
+            ("t2", Some("2026-10-12T11:00:00Z"))
+        ]
+    );
+    // As for a lookup: the profiler asks whether the read of several threads is the provider's own.
+    {
+        let mut calls = recorder.calls.lock().expect("calls");
+        assert_eq!(calls.first(), Some(&"read_caps"), "{calls:?}");
+        calls.remove(0);
+    }
+    ran("fetch_threads");
     client
         .post_message(&channel, "hi", None)
         .await
@@ -836,11 +874,17 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         Some(2),
         "one message from each of two channels"
     );
-    // Nine reads each return the one message (a lookup's absent id is no message), and the read
-    // of two channels returns it twice; posts return ours and are not counted.
+    assert_eq!(
+        rows("fetch_threads"),
+        Some(2),
+        "one message from each of two threads"
+    );
+    // Nine reads each return the one message (a lookup's absent id is no message), and the reads
+    // of two channels and of two threads return it twice each; posts return ours and are not
+    // counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 11, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 11 * bytes);
+    assert_eq!(rec.content_bytes.messages, 13, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 13 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),

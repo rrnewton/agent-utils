@@ -923,6 +923,40 @@ impl crate::chat::ChatClient for CountingChat {
         )
     }
 
+    /// Counted as what it costs upstream, as `ProfiledClient` times it: a provider that reads
+    /// several threads itself is one `fetch_threads` in the channel; for any other the trait's
+    /// default runs here, so each thread view read it is made of is counted as the
+    /// `fetch_timeline` it is. A scripted failure of `fetch_threads` is every ask's answer.
+    /// Nothing is counted for no asks. remote-ops-audit W14 `#287 bulk-reads`.
+    async fn fetch_threads(
+        &self,
+        channel: &crate::model::ChannelId,
+        asks: &[crate::chat::ThreadAsk],
+    ) -> crate::chat::ThreadAnswers {
+        if asks.is_empty() {
+            return Vec::new();
+        }
+        match self.inner.read_caps(channel).many_threads {
+            crate::chat::Support::Native => {
+                match self
+                    .counted(call_in("fetch_threads", channel), async {
+                        Ok(self.inner.fetch_threads(channel, asks).await)
+                    })
+                    .await
+                {
+                    Ok(answers) => answers,
+                    Err(error) => asks
+                        .iter()
+                        .map(|ask| (ask.id.clone(), Err(error.clone())))
+                        .collect(),
+                }
+            }
+            crate::chat::Support::Emulated => {
+                crate::chat::emulated_threads(self, channel, asks).await
+            }
+        }
+    }
+
     async fn post_message(
         &self,
         channel: &crate::model::ChannelId,

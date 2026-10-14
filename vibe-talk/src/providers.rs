@@ -657,6 +657,24 @@ impl ChatClient for ChatRouter {
         crate::chat::recent_in_order(&channels, parts)
     }
 
+    /// The channel's own provider reads its threads, so a bridge channel's threads may be one
+    /// request while a Slack channel's are read Slack's way. remote-ops-audit W14
+    /// `#287 bulk-reads`. A channel no provider holds is refused in every thread's place and asked
+    /// of nobody, as a read of one of its threads always was.
+    async fn fetch_threads(
+        &self,
+        channel: &ChannelId,
+        asks: &[crate::chat::ThreadAsk],
+    ) -> crate::chat::ThreadAnswers {
+        match self.route(channel) {
+            Ok(entry) => entry.client.fetch_threads(channel, asks).await,
+            Err(error) => asks
+                .iter()
+                .map(|ask| (ask.id.clone(), Err(error.clone())))
+                .collect(),
+        }
+    }
+
     fn supports_channel_registration(&self) -> bool {
         match self.entries.as_slice() {
             [only] => only.client.supports_channel_registration(),
