@@ -325,12 +325,14 @@ steps:
   # at All's foot at it again with Send on screen, one 100 or 225px up All and one 100 to 380px up Main
   # on their row; and with no card up as the list comes, a draft arriving under it leaving a reader 40
   # or 100px up Main on their row behind the cards and back, and with none at all, one 100px up All on
-  # theirs (`#280`).
+  # theirs (`#280`); and at 1280x800 a reader 60 to 300px up the list's cards, the card docked under them,
+  # on their card again by Ctrl+4 and Ctrl+3, though two columns put them at the foot of their cards, and
+  # one who moved the cards in two columns where they moved to.
   # Measured on 2026-10-13: about 235s wall and 45s CPU on a loaded host, with a draft arriving under the
   # thread list; its wall limit goes from 300s to 420s for that headroom, and its CPU limit stays 200s.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800, and the cards' reader kept across two columns and back at 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""

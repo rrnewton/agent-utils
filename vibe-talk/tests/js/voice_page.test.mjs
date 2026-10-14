@@ -58625,7 +58625,10 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
   // column's dock-growth keeper takes it the rest of the way (the next test), so what the placement after
   // the picker spares is the list drawn off its foot and then moved. (From All the left column goes to Main
   // behind the list first, which draws the picker before the cards are placed.)
-  const placedEarly = await run(brokenScript("  renderThreadSelect();\n  placeCardAnchor(place);\n", "  renderThreadSelect();\n"));
+  const placedEarly = await run(brokenScript(
+    "  } else {\n    // Where the card the list's place was on has gone since, the place two columns had.\n" +
+    "    placeCardAnchor(place);\n  }\n",
+    "  }\n"));
   assert.deepStrictEqual(placedEarly, { ...real, listFoot: false });
   // The right column's reader kept on its foot in two columns only: a card growing under a reader at the
   // foot of the thread list leaves them above it.
@@ -60998,4 +61001,100 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   const unkept = brokenScript(BACK_IN_ALL, NOT_BACK_IN_ALL);
   assert.deepStrictEqual({ card: await run(unkept, true), none: await run(unkept, false) },
     { card: all((up) => up === 200), none: all(false) });
+});
+
+// `#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`, from review's third round. A send
+// card docked under the thread list takes its height from the foot of the cards, so their column is that
+// much shorter there than two columns' right column, where the card is back at the foot of Main. In Chromium
+// at a desk, the long draft's card 246px tall, every reader 60 to 300px up the list's cards was at their foot
+// in two columns — the one 300px up 10px from it, inside the slack — and Ctrl+3 put them at the list's foot,
+// whether the list had been opened from Main or from two columns.
+
+/** The first of the cards on screen, and where it stands: "id@top". */
+const cardOnScreen = (page) => {
+  const card = firstCardInView(page);
+  const side = page.el("side-scroll");
+  return card ? `${card.getAttribute("data-id")}@${card.getBoundingClientRect().top - side.getBoundingClientRect().top}` : null;
+};
+
+test("`#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`: A READER UP THE THREAD LIST'S CARDS with a send card docked under them is on their card again by Cmd-4 and Cmd-3, the list opened from Main or from two columns — at the cards' foot in two columns only because the card leaves their column, or within the slack of it — and one who moved in two columns is placed where they moved to", async () => {
+  const DOCKED = 150;
+  const run = async (script) => {
+    const { page, card, main, side, isDocked, settled } = await draftOverThreads(script, DOCKED);
+    page.wideDesk = true;
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const key = async (digit) => {
+      await press(page, focused(page) || main, digit, { metaKey: true });
+      await settled();
+    };
+    const gap = () => side.scrollHeight - side.scrollTop - side.clientHeight;
+    const scrollUp = async (up) => {
+      side.scrollTop = side.scrollHeight - side.clientHeight - up;
+      await side.dispatch("scroll");
+      await settled();
+      assert.equal(gap(), up, `the premise: the reader is ${up}px up the cards`);
+    };
+    const toList = async (from) => {
+      if (from === "Main" && layout() !== null) await key("1");
+      if (from === "Two" && layout() !== "two") await key("4");
+      assert.equal(layout(), from === "Main" ? null : "two", `the premise: the list is opened from ${from}`);
+      await key("3");
+      assert.ok(layout() === "list" && isDocked(), "the premise: Cmd-3 shows the thread list, the card docked under it");
+    };
+    const result = {};
+    // `near` and `mid`: nearer the foot than the card is tall, at the cards' foot in two columns. `slack`: 10px
+    // from it there, inside the slack, and read there as at it. `far`: up the cards in two columns too.
+    for (const [name, up] of [["near", 40], ["mid", 100], ["slack", DOCKED + 10], ["far", DOCKED + 100]]) {
+      for (const from of ["Main", "Two"]) {
+        await toList(from);
+        await scrollUp(up);
+        const before = cardOnScreen(page);
+        await key("4");
+        assert.ok(inTwoColumns(page) && card.parentNode === page.el("pane-discord"),
+          "the premise: Cmd-4 shows two columns, the card back in Main");
+        assert.equal(gap(), Math.max(0, up - DOCKED), `the premise: two columns' cards ${up - DOCKED}px from their foot`);
+        await press(page, focused(page) || main, "3", { metaKey: true });
+        const atOnce = layout() === "list" && cardOnScreen(page) === before;
+        await settled();
+        result[`${name}${from}`] = atOnce && cardOnScreen(page) === before;
+      }
+    }
+    // A reader who moves the cards in two columns: where they are there, not where they were in the list.
+    await toList("Main");
+    await scrollUp(40);
+    await key("4");
+    await scrollUp(200);
+    const moved = cardOnScreen(page);
+    await press(page, focused(page) || main, "3", { metaKey: true });
+    const movedAtOnce = cardOnScreen(page) === moved;
+    await settled();
+    result.moved = movedAtOnce && cardOnScreen(page) === moved && gap() === 200 + DOCKED;
+    result.untouched = page.proposalCommits.length === 0 && page.proposalCancels.length === 0 && !card.hidden;
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, {
+    nearMain: true, nearTwo: true, midMain: true, midTwo: true, slackMain: true, slackTwo: true, farMain: true,
+    farTwo: true, moved: true, untouched: true,
+  });
+
+  // THE CONTROLS. No place held in the list's cards: whoever two columns read as at the foot of the cards is
+  // put at the list's foot. The reader up the cards in two columns too is kept as before.
+  const unheld = await run(brokenScript(
+    "  if (place && kept && now === \"list\" && next === \"two\") listCardsHeld = { place: kept, placed: cardAnchor(), channel };\n",
+    ""));
+  assert.deepStrictEqual(unheld, {
+    ...real, nearMain: false, nearTwo: false, midMain: false, midTwo: false, slackMain: false, slackTwo: false,
+  });
+  // The right column's keeper not told the cards were placed: the card docked again under the list is taken
+  // for the dock growing, and anyone within the slack plus its height of the list's foot is pulled to it.
+  // The reader further up, and the one who moved 200px up two columns' cards, 350px up the list's, are kept.
+  assert.ok(DOCKED + BOTTOM_SLACK_PX < DOCKED + 100, "the premise: the far reader is beyond the keeper's reach");
+  const untold = await run(brokenScript("    cardsPlacedUnderLists();\n", ""));
+  assert.deepStrictEqual(untold, {
+    ...real, nearMain: false, nearTwo: false, midMain: false, midTwo: false, slackMain: false, slackTwo: false,
+  });
+  // The held place put back whether or not the reader moved the cards in two columns.
+  const always = await run(brokenScript("function sameCardPlace(one, other) {\n", "function sameCardPlace(one, other) {\n  return true;\n"));
+  assert.deepStrictEqual(always, { ...real, moved: false });
 });
