@@ -38,9 +38,10 @@
 //!   time in the queue when a later page shows it changed (newer activity moves it up); that
 //!   page's copy is never named from, and the read at its turn sees the change.
 //! * The copy of the thread a forward delta then carries with the name is the one the read at its
-//!   turn returned, or, when that read says it is behind (`as_of`), the newer of it and what pages
-//!   showed while the thread waited; after it, each later page that shows the thread. An answer
-//!   that lands after a newer one never takes the copy back while the thread waits.
+//!   turn returned. When that read says it is behind (`as_of`), or returns no copy of the thread,
+//!   it is the copy the latest page to show the thread showed, as for a thread already named —
+//!   never the newer-looking of the two: a page that showed a reply deleted shows fewer replies
+//!   and no later activity. After it, each later page that shows the thread.
 //! * After a naming read meets a provider failure — an HTTP 5xx, a read that never completed or
 //!   outlasted [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out — no thread
 //!   in that CHANNEL is read for [`CHANNEL_PAUSE`]. Other channels go on as before.
@@ -511,13 +512,20 @@ struct ChannelQueue {
 
 /// A thread waiting for its turn, and what it was queued with.
 ///
-/// Nothing in here is named from. The snapshot is the newest copy of the thread any page has shown
-/// while it waits ([`not_older`]; an answer that lands after a newer one does not replace it): its
-/// id says what to read, and it stands in for the read at the turn where that read says too
-/// little. What the thread is ABOUT comes only from the read at its turn.
+/// Nothing in here is named from: what the thread is ABOUT comes only from the read at its turn.
 struct Waiting {
     deps: ThreadDeps,
+    /// The newest copy of the thread any page has shown while it waits ([`not_older`]; an answer
+    /// that lands after a newer one does not replace it). Its id says what to read, and its reply
+    /// count stands in for the read's when that read gives none, so the sentence is not filed at
+    /// fewer messages than a page already showed.
     snapshot: ThreadSummary,
+    /// The copy of the thread the latest page to show it showed, whatever it showed, as a renamed
+    /// thread's copy is kept ([`ThreadNames::refresh_copies`]): what a forward delta carries once
+    /// the thread is named, unless the read at its turn supplies a current one ([`InFlight`]).
+    /// Not [`Waiting::snapshot`]: a page that showed a reply deleted shows fewer replies and no
+    /// later activity, which [`not_older`] cannot tell from an answer that landed late.
+    shown: ThreadSummary,
     prior: Option<ThreadRecord>,
     /// The newest activity a WRITE-scope page has shown for the thread; newest is taken first. A
     /// read token's page refreshes the snapshot and moves nothing in the queue.
@@ -574,14 +582,11 @@ enum Rank {
 /// A thread taken from its queue and not yet settled.
 #[derive(Debug)]
 struct InFlight {
-    /// The copy of the thread a forward delta carries once it is named. Until the read at its turn
-    /// answers, the newest a page has shown, as while it waited. That read then supplies it — or,
-    /// when it says it is behind, the newer of it and this. From then on every later page that
-    /// shows the thread replaces it, as one already renamed is kept current
-    /// ([`ThreadNames::refresh_copies`]).
+    /// The copy of the thread a forward delta carries once it is named: [`Waiting::shown`] to begin
+    /// with, and then replaced by every later page that shows the thread, as one already renamed is
+    /// kept current ([`ThreadNames::refresh_copies`]) — and by the read at its turn, unless that
+    /// read says it is behind (`as_of`) or returns no copy of the thread.
     copy: ThreadSummary,
-    /// Whether the read at its turn has answered.
-    read: bool,
 }
 
 impl std::fmt::Debug for Waiting {
@@ -662,8 +667,7 @@ impl NamesState {
         self.naming.insert(
             (channel.clone(), thread.clone()),
             InFlight {
-                copy: waiting.snapshot.clone(),
-                read: false,
+                copy: waiting.shown.clone(),
             },
         );
         Some((thread, waiting))
@@ -959,9 +963,9 @@ impl ThreadNames {
     }
 
     /// Keep every copy of a thread a forward delta may carry as current as the pages that show it,
-    /// whoever's they are: a renamed thread's, replaced by each later page; a waiting thread's,
-    /// replaced by a copy that is not older ([`not_older`]); and one being named, either way,
-    /// according to whether the read at its turn has answered (see [`InFlight`]).
+    /// whoever's they are: a renamed thread's, a waiting thread's and one being named are each
+    /// replaced by every later page, as the reader's own page replaces its copy. A waiting
+    /// thread's newest copy ([`Waiting::snapshot`]) is replaced only by one not older.
     fn refresh_copies(&self, channel: &ChannelId, summary: &ThreadSummary) {
         let mut state = self.lock();
         if let Some(recent) = state
@@ -979,11 +983,10 @@ impl ThreadNames {
             if not_older(summary, &waiting.snapshot) {
                 waiting.snapshot = summary.clone();
             }
+            waiting.shown = summary.clone();
         }
         if let Some(in_flight) = state.naming.get_mut(&(channel.clone(), summary.id.clone())) {
-            if in_flight.read || not_older(summary, &in_flight.copy) {
-                in_flight.copy = summary.clone();
-            }
+            in_flight.copy = summary.clone();
         }
     }
 
@@ -1044,8 +1047,8 @@ impl ThreadNames {
     /// Queue a due thread in its channel, and start the channel's worker if none is serving it.
     ///
     /// A thread already waiting keeps its time in the queue; newer activity than it was queued with
-    /// moves it up, and its record and copy are brought up to date (a copy only by one not older).
-    /// A thread being named now, or one whose naming failed recently, is not queued.
+    /// moves it up, and its record and copies are brought up to date (its newest copy only by one
+    /// not older). A thread being named now, or one whose naming failed recently, is not queued.
     fn enqueue(
         self: &Arc<Self>,
         deps: &ThreadDeps,
@@ -1077,6 +1080,7 @@ impl ThreadNames {
             // An answer that lands after a newer one can be older: neither its activity nor its
             // copy is taken back.
             waiting.activity = waiting.activity.max(activity_of(&snapshot));
+            waiting.shown = snapshot.clone();
             if not_older(&snapshot, &waiting.snapshot) {
                 waiting.snapshot = snapshot;
             }
@@ -1087,6 +1091,7 @@ impl ThreadNames {
         let entry = Waiting {
             deps: deps.clone(),
             activity: activity_of(&snapshot),
+            shown: snapshot.clone(),
             snapshot,
             prior,
             queued_at,
@@ -1173,9 +1178,9 @@ impl ThreadNames {
             Ok(Some(record)) => {
                 state.failed.remove(&key);
                 state.named += 1;
-                // The read at its turn, or anything newer since: never the copy it was queued
+                // The read at its turn, or what a page showed since: never the copy it was queued
                 // with, which a page may have shown out of date long before its turn.
-                let mut renamed = in_flight.map_or(waiting.snapshot, |in_flight| in_flight.copy);
+                let mut renamed = in_flight.map_or(waiting.shown, |in_flight| in_flight.copy);
                 renamed.display_name = Some(record.name.clone());
                 renamed.summary = record.sentence.as_ref().map(|sentence| {
                     super::cut_for_serving(&sentence.summary, waiting.deps.sentence_chars)
@@ -1295,25 +1300,24 @@ impl ThreadNames {
             // rather than with a 404.
             return Err(TurnFailure::Gone);
         }
-        // The thread as this read found it: the copy a delta carries once it is named.
+        // The thread as this read found it: the copy a delta carries once it is named. Begun
+        // after every page that showed the thread before its turn had landed, so newer than each
+        // of them — unless it says it is behind: a bridge serving a copy it could not bring up to
+        // date. Then the copy the latest page showed is kept, as it is for a thread already named,
+        // even where this one looks newer: a page that showed a reply deleted shows fewer replies
+        // and no later activity than a copy from before the deletion.
         let read_copy = page
             .thread
             .clone()
             .filter(|thread| thread.id == snapshot.id);
-        if let Some(in_flight) = self
-            .lock()
-            .naming
-            .get_mut(&(channel.clone(), snapshot.id.clone()))
-        {
-            if let Some(read_copy) = &read_copy {
-                // Begun after every page that showed the thread while it waited had landed, so
-                // newer than each of them — unless it says it is behind (a bridge serving a copy
-                // it could not bring up to date), and then only if it is not older.
-                if page.as_of.is_none() || not_older(read_copy, &in_flight.copy) {
-                    in_flight.copy = read_copy.clone();
-                }
+        if let Some(read_copy) = read_copy.as_ref().filter(|_| page.as_of.is_none()) {
+            if let Some(in_flight) = self
+                .lock()
+                .naming
+                .get_mut(&(channel.clone(), snapshot.id.clone()))
+            {
+                in_flight.copy = read_copy.clone();
             }
-            in_flight.read = true;
         }
         let mut messages: Vec<Message> = Vec::new();
         if let Some(root) = page.thread.and_then(|thread| thread.root) {

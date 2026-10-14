@@ -1164,6 +1164,70 @@ async fn a_read_at_the_turn_that_says_it_is_behind_does_not_take_back_a_newer_co
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_read_that_says_it_is_behind_does_not_bring_back_a_reply_deleted_while_waiting() {
+    reply_deleted_while_waiting(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_deleted_without_moving_the_threads_last_activity_is_not_brought_back_either() {
+    reply_deleted_while_waiting(true).await;
+}
+
+/// `older`, with three replies, waits behind a newer thread. Five seconds in, one of its replies is
+/// deleted upstream — its last reply, so its last activity goes back too, or with
+/// `same_activity` its first — and a bridge goes on answering reads of the thread from its copy
+/// from before the deletion, saying so with `as_of`. A read token's page shows the deletion. The
+/// name is made from the read at its turn, but the copy a delta carries is what that page showed:
+/// fewer replies and no later activity look older than the read's copy, and are newer.
+async fn reply_deleted_while_waiting(same_activity: bool) {
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 2);
+    let (older, newer) = (ids[0].clone(), ids[1].clone());
+    reply_at(&h, &older, 30);
+    let before = h.upstream.channels.lock().unwrap()[WRITE_CHANNEL][0].clone();
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(1).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), std::slice::from_ref(&newer));
+
+    h.at(5).await;
+    h.upstream.change(&older, |thread| {
+        if same_activity {
+            thread.replies.remove(0);
+        } else {
+            thread.replies.pop();
+            thread.active_second = 0;
+        }
+    });
+    h.upstream
+        .behind
+        .lock()
+        .unwrap()
+        .insert(older.clone(), (before, "2026-10-13T08:05:00Z".to_owned()));
+    h.at(6).await;
+    let page = h.list(WRITE_CHANNEL, READ_TOKEN).await;
+    let shown = find(&page, &older).expect("listed").clone();
+    assert_eq!(shown["reply_count"], 2, "{shown}");
+    let after = page["next_after"].as_str().expect("a cursor").to_owned();
+
+    h.at(40).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), [newer, older.clone()]);
+    let prompts = h.summarizer.thread_prompts();
+    assert!(
+        prompts[1].contains("a reply at 30s"),
+        "named from something other than the read at its turn: {}",
+        prompts[1]
+    );
+    let delta = h.delta(WRITE_CHANNEL, &after, READ_TOKEN).await;
+    let carried = find(&delta, &older).expect("the renamed thread rides the delta");
+    assert!(carried["display_name"].is_string(), "{carried}");
+    assert_eq!(
+        (&carried["reply_count"], &carried["updated_at"]),
+        (&shown["reply_count"], &shown["updated_at"]),
+        "the delta brought back a deleted reply: {carried}"
+    );
+}
+
 // --- the order threads are read in --------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
