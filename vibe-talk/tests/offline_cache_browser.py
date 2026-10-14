@@ -1525,7 +1525,12 @@ COALESCE_LOOK_JS = """async ({png, check, id, parent, stack}) => {""" + FLOAT_HE
         else if (Math.abs((Math.min(...stub) + Math.max(...stub)) / 2 - middle) > 1) {
             problems.push(`${label} leaves the box at y ${((Math.min(...stub) + Math.max(...stub)) / 2).toFixed(1)}, its middle is ${middle.toFixed(1)}`);
         }
-        const bend = r.left - 0.5 * rem, d = 0.45 * rem;
+        // The bend is where the drawing turns: half a rem out from where the drawing itself starts, its
+        // right edge, which is on the box's side within the 1.5px allowed above (it is the padding box's
+        // edge, a border inside the box). Measured from the box instead, the point fell a pixel outside
+        // the run's centre line and only just inside its stroke, so a row whose middle moved by a fraction
+        // of a pixel (taller by a wrapped button, `#299 all-thread-strip`) missed it by one device pixel.
+        const bend = mark.right - 0.5 * rem, d = 0.45 * rem;
         if (!ink(bend - d, middle - d)) problems.push(`${label} is not drawn at its 45-degree point`);
         if (ink(bend - d, middle)) problems.push(`${label} runs level with where it starts`);
         if (ink(bend, middle - d)) problems.push(`${label} runs straight up`);
