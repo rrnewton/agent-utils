@@ -18259,6 +18259,10 @@ function outgoingFromSaved(held) {
     // A reply whose destination was still to be found out keeps finding it out on Retry.
     placement: held.placement === "unknown" ? "unknown" : null,
     replyTo: typeof held.replyTo === "string" ? held.replyTo : null,
+    // `#292 reply-marks-read`. What it marks read once sent. An entry saved before this was kept
+    // marks what it answers, as it always did.
+    marksRead: typeof held.marksRead === "string" ? held.marksRead
+      : held.marksRead === null ? null : typeof held.replyTo === "string" ? held.replyTo : null,
     originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
     text: held.text,
     remaining: typeof held.remaining === "string" ? held.remaining : held.text.trim(),
@@ -18945,9 +18949,10 @@ async function dispatchOutgoingMessage(entry, job) {
       if (pinned) scrollToNewest();
       if (sidePinned) inColumn(columns.side, scrollToNewest);
     }
-    // `#256 reply-marks-read`. Sent, so what it answers is Done. Only here: a reply that failed,
-    // or is unconfirmed, answered nothing yet.
-    if (entry.replyTo) guardQuietly(markAnsweredDone)(entry);
+    // `#256 reply-marks-read`. Sent, so what it marks is read: what it answers, or the root of the
+    // thread it starts (`#292 reply-marks-read`). Only here: a send that failed, or is unconfirmed,
+    // answered nothing yet.
+    if (entry.marksRead) guardQuietly(markSentRead)(entry);
   } catch (error) {
     if (job.stopped) return;
     entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
@@ -19495,7 +19500,12 @@ async function sendChannelMessage() {
   }
   if (!text.trim() || !channel) return;
   rememberChannelDraft();
-  const completion = queueOutgoingMessage({ channel, threadId: selectedThreadId, replyTo: null, text });
+  // `#292 reply-marks-read`. The first reply in a thread nobody has answered marks its root, as Reply
+  // on the root would; a later one marks nothing, and the main channel's box never does.
+  const completion = queueOutgoingMessage({
+    channel, threadId: selectedThreadId, replyTo: null, text,
+    marksRead: rootThisStarts(channel, selectedThreadId),
+  });
   channelDrafts.delete(key);
   // A failed outbox write leaves the previous durable draft available as a last resort.
   if (outgoingStorageOkay) saveChannelDrafts();
@@ -29170,6 +29180,8 @@ async function sendReply() {
   const branch = route.branch && el("reply-branch").checked ? route.branch : null;
   const completion = queueOutgoingMessage({
     channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
+    // `#292 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes.
+    marksRead: String(target.id),
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
     ...(route.unknown ? { placement: "unknown" } : {}),
   }, replyDocked ? replyColumn : null);
@@ -29451,6 +29463,26 @@ function unseenColumnReply() {
 // the message answered, as the row standing for it, and never the rest of its thread. Nothing is
 // marked when the send fails, and nothing when the message is Done already, so the Undo chip is not
 // taken over by a Done that changed nothing. Opening Reply marks nothing.
+//
+// `#292 reply-marks-read`. The owner, 2026-10-14: Reply on a message and opening its thread to write in
+// it both make a reply to the message before, and they marked read differently — Reply marked the
+// message, and the first reply written in a thread opened from the grey Thread marked nothing. The
+// rule agreed, decided when the send is queued and kept on the outbox entry as `marksRead`:
+//
+//   * THE FIRST REPLY THAT STARTS A THREAD marks its root, whichever way it was started: Reply on the
+//     root (its target is the root), or the thread opened and written in while it had no replies
+//     (`rootThisStarts`: the store holds the root and nothing else of the thread, its count says zero,
+//     and nothing written here is on its way there already).
+//   * A LATER MESSAGE in an existing thread's box marks nothing on its own.
+//   * A TARGETED REPLY — Reply, Quote reply, a row's Draft, in one column or docked in two — marks the
+//     message it answers, on Main or inside a thread. Only that message.
+//   * MARKING READ is what this page's own read action does for that message, and only once the send
+//     is confirmed (`markSentRead`): Done, as above; and, where the channel's provider lets the server
+//     move its own read marker (the "⋯" menu's "In <service> only"), that marker moved through the
+//     message, asked `after_reply` so the server never moves it back behind a message already marked
+//     and never asks twice for one (src/reply_read.rs).
+//   * A VOICE AGENT'S REPLY follows the same rule, marked by the server, which posts it: see
+//     src/reply_read.rs. This page shows its Done at its next read of the channel.
 
 /**
  * The row standing for message `id` and the column drawing it: the column the last reply was opened
@@ -29483,7 +29515,7 @@ function doneWhereNotDrawn(id) {
 }
 
 /**
- * Mark Done the message that `entry`, a reply just sent, answers. See the section note.
+ * Mark Done message `id` of `channel`, which a send just confirmed marks read. See the section note.
  *
  * Done in the column that draws it (mirrored into the other by `mirrorArchived`), on every message
  * of its row, since the Done button reads a row half Done as unread and would go on offering Done.
@@ -29492,12 +29524,12 @@ function doneWhereNotDrawn(id) {
  * would put back a message of this one. `#245 done-feedback`: the moment of the Done is drawn on the
  * row answered, the one found here, and on no row where no column draws it.
  *
- * @param {{channel: string, replyTo: string}} entry
+ * @param {string} channel
+ * @param {string} id
  */
-async function markAnsweredDone(entry) {
-  const id = String(entry.replyTo);
-  if (entry.channel !== String(el("discord-channel").value)) {
-    await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/dismiss`,
+async function markAnsweredDone(channel, id) {
+  if (channel !== String(el("discord-channel").value)) {
+    await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`,
       { method: "POST", body: { messages: [id] } }));
     return;
   }
@@ -29510,7 +29542,64 @@ async function markAnsweredDone(entry) {
   if (marking === null) return;
   await marking;
   // `#240 reading-bookmark`. Send said where the way back is, and the Done's own words took the line.
-  if (bookmarkAnchor(entry.channel)) setStatus("b goes back to your bookmark.");
+  if (bookmarkAnchor(channel)) setStatus("b goes back to your bookmark.");
+}
+
+/**
+ * Whether `channel`'s provider lets the server move its own read marker — what offers the "⋯" menu's
+ * "In <service> only" — by the server's account. With several providers each channel answers for its
+ * own, as in `channelPostsOnce`. `#292 reply-marks-read`.
+ */
+function channelMarksUpstream(channel) {
+  if (providerDescriptions.size) {
+    const provider = providerOfChannel(channel);
+    return Boolean(provider && provider.upstream_read_mark_supported === true);
+  }
+  return deploymentCapabilities.upstreamReadMark;
+}
+
+/**
+ * The root a message written now in thread `thread` of `channel` would be the first reply to, by id,
+ * or null: the store holds the thread's root and nothing else of it, its count says nobody has
+ * answered it (`heldUnansweredRoot`, the rule the grey Thread is painted by), and nothing written here
+ * is in the outbox for that thread already — the one before this, still on its way or sent and not
+ * yet read back, is the thread's first reply, and this is a later one. `#292 reply-marks-read`.
+ *
+ * @param {string} channel
+ * @param {string | null} thread
+ */
+function rootThisStarts(channel, thread) {
+  if (!threadingSupported || !thread || channelCanon.channel !== String(channel)) return null;
+  const root = heldUnansweredRoot(thread);
+  if (!root) return null;
+  const key = String(thread);
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel === String(channel) && (entry.threadId === key || entry.continueIn === key)) return null;
+  }
+  return String(root.id);
+}
+
+/**
+ * Mark read what `entry`, a send just confirmed, marks (`marksRead`): Done, and then, where its
+ * channel's provider has one, the provider's own read marker moved through it. The second waits for
+ * the first and is not asked when the Done failed, as "Mark read through here" goes. See the section
+ * note. `#292 reply-marks-read`.
+ *
+ * @param {{channel: string, marksRead: string}} entry
+ */
+async function markSentRead(entry) {
+  const id = String(entry.marksRead);
+  await markAnsweredDone(entry.channel, id);
+  if (!channelMarksUpstream(entry.channel)) return;
+  await api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/upstream-read`, {
+    method: "POST", body: { message_id: id, after_reply: true },
+  });
+  // Said over the Done's own words, which say it was not marked in the chat service. Only for the
+  // channel on screen: a reply that finished after the reader moved on says nothing over another.
+  if (entry.channel !== String(el("discord-channel").value)) return;
+  const service = chatProviderName || "the chat service";
+  setStatus(`Marked read here and in ${service}.` +
+    (bookmarkAnchor(entry.channel) ? " b goes back to your bookmark." : ""));
 }
 
 // --- the conversation a reply goes into ---------------------------------------------------------
