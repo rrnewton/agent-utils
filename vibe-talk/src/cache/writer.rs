@@ -2031,6 +2031,13 @@ impl Writer<'_> {
     /// Erase one scope of a channel: every message whose home it is goes as a deletion upstream
     /// would (a tombstone stays, and the store is told), and its memberships, coverage, head and
     /// thread record are dropped.
+    ///
+    /// A message whose home it is may belong to another scope too (a Slack reply also sent to the
+    /// channel is in `main`; a thread's root is in its thread), and there it may still be listed
+    /// upstream: the erase is the cache's doing, not a deletion. So every other scope it belongs
+    /// to gives up what it claimed of the instant the message was created
+    /// ([`Writer::give_up_instant`]): none may go on saying it holds every message there with one
+    /// of them removed.
     fn erase_scope(&mut self, chan: &ChanKey, scope_key: &str) -> rusqlite::Result<()> {
         let Some(chan_id) = self.find_chan(chan)? else {
             return Ok(());
@@ -2063,11 +2070,31 @@ impl Writer<'_> {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        // Read before the rows go, and their memberships with them.
+        let elsewhere: Vec<(String, i64)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT scope_key, created_ms FROM message_scope
+                 WHERE chan = ?1 AND row_id = ?2 AND scope_key <> ?3",
+            )?;
+            let mut found = Vec::new();
+            for (row_id, _, _) in &homes {
+                let memberships = statement
+                    .query_map(params![chan_id, row_id, scope_key], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                found.extend(memberships);
+            }
+            found
+        };
         let now = self.now();
         for (row_id, message_id, created_ms) in homes {
             self.tombstone(chan, chan_id, row_id, &message_id, created_ms, now)?;
         }
         self.flush_deletes()?;
+        for (other, created_ms) in elsewhere {
+            self.give_up_instant(chan_id, &other, created_ms)?;
+        }
         for table in ["message_scope", "coverage", "scope_head"] {
             self.conn.execute(
                 &format!("DELETE FROM {table} WHERE chan = ?1 AND scope_key = ?2"),
@@ -2080,6 +2107,32 @@ impl Writer<'_> {
                 params![chan_id, id],
             )?;
         }
+        Ok(())
+    }
+
+    /// The cache removed a message of `scope_key` created at `created_ms` that the scope may still
+    /// hold upstream. Below the head's settled top, the scope's claims over that instant go
+    /// ([`coverage::puncture`]), as [`Writer::raise_floor`] trims them under rows evicted or
+    /// expired; at or above it, where only the latest read of the newest end vouches for anything,
+    /// that read no longer vouches for any stretch reaching down to the instant: where its listing
+    /// began moves up past it. Either way the scope stops saying it holds every message there,
+    /// until a read lists that stretch again.
+    fn give_up_instant(
+        &self,
+        chan_id: i64,
+        scope_key: &str,
+        created_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let existing = self.load_coverage(chan_id, scope_key)?;
+        let punctured = coverage::puncture(&existing, created_ms);
+        if punctured != existing {
+            self.store_coverage(chan_id, scope_key, &punctured)?;
+        }
+        self.conn.execute(
+            "UPDATE scope_head SET checked_from_ms = ?3
+             WHERE chan = ?1 AND scope_key = ?2 AND checked_from_ms <= ?3",
+            params![chan_id, scope_key, created_ms.saturating_add(1)],
+        )?;
         Ok(())
     }
 

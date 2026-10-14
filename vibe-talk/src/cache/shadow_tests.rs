@@ -822,3 +822,90 @@ fn a_read_of_one_scope_never_vouches_for_a_row_in_anothers_band() {
         "the thread's own read vouches for its band"
     );
 }
+
+// ---- an erase of another scope ------------------------------------------------------------------
+
+/// Slack. Main lists r1, a reply also sent to the channel. Its thread is erased (access to it
+/// confirmed lost): r1 goes, as a deletion would, though Main still lists it upstream. Main no
+/// longer claims the instant r1 was written in, so neither a window nor, an hour on, a newest page
+/// is served without it; nor when r1 lay in Main's band, where only the latest read vouched for it.
+#[test]
+fn erasing_a_thread_never_leaves_main_claiming_a_reply_it_also_sent_to_the_channel() {
+    for (label, broadcast_ms) in [
+        ("below the band", T0 + 3 * STEP + 5),
+        ("in the band", T0 + 6 * STEP - 30_000),
+    ] {
+        let fx = Fixture::new("shadow-erase-broadcast");
+        let first = T0 + 6 * STEP + 1_000;
+        fx.clock.set(first);
+        main_with_broadcast(&fx, broadcast_ms, first);
+        let before = fx
+            .cache
+            .coverage(&fx.chan, &Scope::Main)
+            .served()
+            .expect("served");
+        assert!(fx.ids(&Scope::Main).contains(&"r1".to_owned()), "{label}");
+        fx.clock.set(first + 1_000);
+        fx.cache
+            .erase_scope(&fx.chan, &Scope::Thread("m1".to_owned()));
+        fx.settle();
+        assert!(!fx.ids(&Scope::Main).contains(&"r1".to_owned()), "{label}");
+        let after = fx
+            .cache
+            .coverage(&fx.chan, &Scope::Main)
+            .served()
+            .expect("served");
+        if label == "below the band" {
+            assert!(
+                coverage::covers(&before, broadcast_ms, broadcast_ms + 1).is_some()
+                    && coverage::covers(&after, broadcast_ms, broadcast_ms + 1).is_none(),
+                "{label}: Main still claims r1's instant: {after:?}"
+            );
+        } else {
+            assert_eq!(after, before, "{label}: no claim holds the band");
+        }
+        let window = shadow::Ask::Window {
+            consumer: shadow::Consumer::Messages,
+            limit: 4,
+        };
+        for (ask, asked_ms) in [(window, first + 3_000), (main_page(4), first + HOUR)] {
+            let (decision, view) = decide_on(
+                &fx.cache,
+                &fx.chan,
+                &ask,
+                observe::Shape::Slack,
+                false,
+                facts(asked_ms, false, None, shadow::Feed::AdditionsOnly),
+            );
+            assert_eq!(
+                decision,
+                shadow::Decision::Miss(shadow::Miss::Gap),
+                "{label}: {ask:?} served {:?} without r1",
+                row_ids(&view)
+            );
+        }
+        // A read of Main's newest end that lists r1 again makes it whole: r1 is held again, and
+        // the window is served.
+        let relisted = first + 10_000;
+        fx.clock.set(relisted);
+        main_with_broadcast(&fx, broadcast_ms, relisted);
+        let (decision, view) = decide_on(
+            &fx.cache,
+            &fx.chan,
+            &shadow::Ask::Window {
+                consumer: shadow::Consumer::Messages,
+                limit: 4,
+            },
+            observe::Shape::Slack,
+            false,
+            facts(relisted + 1_000, false, None, shadow::Feed::AdditionsOnly),
+        );
+        assert!(row_ids(&view).contains(&"r1".to_owned()), "{label}");
+        assert_eq!(
+            decision,
+            shadow::Decision::Serve,
+            "{label}: {:?}",
+            row_ids(&view)
+        );
+    }
+}

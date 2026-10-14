@@ -3726,7 +3726,9 @@ with the process.
   answer for, at once and in memory. Ten minutes later the server reads the channel again on its
   own account, and only the same refusal erases what the cache held of it. That erase removes what
   was read and writes no text: a thread's erase leaves only the ids and times of its messages, so
-  that a read landing late cannot bring them back.
+  that a read landing late cannot bring them back. A reply also sent to the channel goes with its
+  thread, so the channel no longer counts the moment it was written as held whole, until a read of
+  the channel lists it again.
 * **Rows belong to an account.** Nothing of a provider is filled until that provider's own client
   has said, in this process, which account it is, and the file agrees. Deletions are the
   exception: see "Deletions and edits" above.

@@ -291,6 +291,36 @@ fn enforce_cap(intervals: &mut Vec<Interval>, head_ms: Option<i64>, params: &Par
     }
 }
 
+/// The claims of `intervals` with the instant `at_ms` taken out of them: what is left when the
+/// cache itself removes a message created then that the scope still holds upstream (an erase of
+/// another scope it also belongs to), and the claims that said every message of their stretch is
+/// held may no longer say so there. Each claim over the instant is split in two around it, each
+/// part keeping the claim's times; a part with nothing left in it goes. The rest is untouched.
+#[must_use]
+pub fn puncture(intervals: &[Interval], at_ms: i64) -> Vec<Interval> {
+    let mut out = Vec::with_capacity(intervals.len() + 1);
+    for interval in intervals {
+        if interval.t0_ms > at_ms || at_ms >= interval.t1_ms {
+            out.push(*interval);
+            continue;
+        }
+        if interval.t0_ms < at_ms {
+            out.push(Interval {
+                t1_ms: at_ms,
+                ..*interval
+            });
+        }
+        let after = at_ms.saturating_add(1);
+        if after < interval.t1_ms {
+            out.push(Interval {
+                t0_ms: after,
+                ..*interval
+            });
+        }
+    }
+    out
+}
+
 /// The newest end of one scope: nothing newer than `head_ms` was listed at `head_listed_ms`, and
 /// `[unsettled_from_ms, head_ms]` is the late-visibility band (empty once settled).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,6 +543,38 @@ mod tests {
         );
         // An empty claim is no claim.
         assert_eq!(stamp(&two, claim(7, 7, 99), None, &EXACT), two);
+    }
+
+    #[test]
+    fn a_punctured_claim_no_longer_covers_the_instant_and_keeps_its_times_either_side() {
+        let stored = vec![claim(0, 100, 50), claim(100, 200, 60)];
+        let holed = puncture(&stored, 40);
+        assert_eq!(
+            holed,
+            vec![claim(0, 40, 50), claim(41, 100, 50), claim(100, 200, 60)]
+        );
+        assert_eq!(covers(&holed, 0, 40).map(|c| c.listed_ms), Some(50));
+        assert_eq!(covers(&holed, 41, 200).map(|c| c.listed_ms), Some(50));
+        assert!(
+            covers(&holed, 39, 42).is_none(),
+            "the instant is no longer held"
+        );
+        // At an end of a claim only one part is left; a claim of that instant alone goes.
+        assert_eq!(
+            puncture(&stored, 0),
+            vec![claim(1, 100, 50), claim(100, 200, 60)]
+        );
+        assert_eq!(
+            puncture(&stored, 99),
+            vec![claim(0, 99, 50), claim(100, 200, 60)]
+        );
+        assert_eq!(puncture(&[claim(7, 8, 9)], 7), Vec::new());
+        // Outside every claim, nothing changes; a later stamp over the hole fills it again.
+        assert_eq!(puncture(&stored, 200), stored);
+        assert_eq!(
+            stamp(&holed, claim(0, 200, 70), None, &EXACT),
+            vec![claim(0, 200, 70)]
+        );
     }
 
     #[test]
