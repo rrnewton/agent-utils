@@ -50,6 +50,10 @@ thread_api = "native"
 # seconds; a read soon after a quiet spell or a bridge restart can still wait behind one.
 # recent_view = "messages"
 # recent_view_shadow = false
+# The five settings below each turn on one bulk read a bridge serves itself, so several channels,
+# threads or ids, or a window of time, cost one request; README, "Bulk and time-range reads", lists
+# every request they send and the answer each expects. GET /api/v1/diagnostics then says under
+# upstream.providers[].reads which reads are native, and each operation's calls what it cost.
 # With thread_api = "bridge" only: whether the bridge answers a read of a span of time itself,
 # GET /channels/{id}/messages?since=&until=&order=&limit=&cursor= (README, "A bridge's range
 # reads"). Off by default; turn it on only for a bridge that serves that request.

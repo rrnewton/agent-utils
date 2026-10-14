@@ -1451,7 +1451,8 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   operations of a call or more each (ten `fetch_recent`, `count: 10, calls: 10`). An operation the
   caller abandoned keeps the calls it had already sent. A request a provider's client sends
   outside every operation is on no row (Slack's shim calls still list it).
-* **`reads`** says which of the bulk reads above the provider answers itself, `native`, and which the trait's default answers with the reads it
+* **`reads`** says which of the bulk reads (see [Bulk and time-range reads](#bulk-and-time-range-reads))
+  the provider answers itself, `native`, and which the trait's default answers with the reads it
   is made of, `emulated`, keyed by the operation a native one is timed as; `heads_cover_edits`
   says whether its heads vouch for edits and deletes as well as additions, and `page_rows` how many
   rows one of its upstream calls returns. An emulated read never shows under its own name: its
@@ -2011,6 +2012,12 @@ With `thread_api = "bridge"`, a compatible HTTP bridge implements these paths re
 * `GET /channels/{id}/threads/{thread_id}/messages/{message_id}`
 * `POST /channels/{id}/threads/{thread_id}/messages`
 
+and, only once the matching setting is on, five bulk reads, each answering many channels, threads,
+ids or a window of time in one request: `GET /channels/{id}/messages?since=…` (`range_reads`),
+`GET /channels/{id}/messages?ids=…` (`id_reads`), `GET /heads` (`head_reads`), `GET /recent`
+(`recent_many_reads`) and `GET /channels/{id}/threads?ids=…` (`thread_reads`); see
+[Bulk and time-range reads](#bulk-and-time-range-reads).
+
 Thread identifiers and pagination cursors are opaque. Each path segment is percent encoded;
 neither callers nor bridges should interpret a thread as a quoted-message reference. Thread reads
 and writes must verify membership in the registered parent channel, including any narrower scope
@@ -2186,6 +2193,89 @@ above: the channel probe at startup and in `GET /api/v1/diagnostics`, the first 
 the check of a channel's newest message when upstream unread clearing starts or is run now, and
 `find_message`. Those carry no `as_of`; neither do the to-do list or the JSON of `/digest` and
 `/activity`. A cold copy can take a diagnostics probe past its 20-second budget.
+
+### Bulk and time-range reads
+
+**The problem.** Most reads this server makes upstream are one per channel, per thread or per
+message. Against a slow or rate-limited service, a voice warm-up of five channels is five reads,
+naming twenty threads that fell due is twenty, preparing eight replies of a thread for speech is
+eight, and a count since an instant walks back a hundred messages at a time from the newest until
+it passes the instant. Wherever a provider can answer in bulk (a window of time, several channels,
+several threads or several ids in one request) this server now asks it to, and the cost is counted
+in upstream calls, not in messages (remote-ops-audit W10 to W14).
+
+**Five reads, each with a default that is today's.** Each is a `ChatClient` method whose default
+body is exactly the reads this server made before, at exactly their cost, so a provider that does
+not implement one answers as it always did. `ReadCaps` says, per channel, whether each answer is
+`Native` (the provider's own, cheaper) or `Emulated` (the default); a caller that would use a read
+only because it is cheap uses it only where it is native.
+
+| Read | What it answers | The default (emulated) | Who uses it |
+|---|---|---|---|
+| `fetch_range` | the messages created in `[since, until)`, oldest first, from whichever end of the window the caller asks, a step at a time with the provider's own cursor; `exhausted` only where the provider proved the window holds no more | one `fetch_page` from the window's edge (after the millisecond before `since`, or before `until`), trimmed to the window, never exhausted | `/page` through a span; `/count` since an instant, only where native (elsewhere it walks back as before) |
+| `fetch_messages` | one answer per id: found, proved absent, or not seen | in a thread, one `fetch_thread_message` per id, four at a time; otherwise one recent window, searched | speech preparation of a thread, a thread summary's parts, a message by id (the page's and the `read_message` tool's), the check of a message before an upstream read mark, only where native |
+| `channel_heads` | each channel's newest message id and instant, its latest activity, and where the provider can vouch for it, an instant since which nothing changed | one one-message `fetch_recent` per channel | the live poller, only where native; a voice catch-up or warm-up, only where native and vouching for edits and deletes; the probe and diagnostics check it |
+| `fetch_recent_many` | each channel's newest messages, optionally only those since an instant | one `fetch_recent_dated` per channel, four at a time | a voice catch-up or warm-up, only where native |
+| `fetch_threads` | each thread's newest page, or only the messages added after an instant | one thread view `fetch_timeline` per thread, two at a time | naming the threads that fell due, only where native |
+
+The sections below say what each one means in detail: [A bridge's range reads](#a-bridges-range-reads),
+[A bridge's lookups by id](#a-bridges-lookups-by-id), [Channel heads](#channel-heads),
+[Recent reads of several channels](#recent-reads-of-several-channels) and
+[Reads of several threads](#reads-of-several-threads).
+
+**Which providers answer natively.**
+
+| Read | Slack | Discord (`thread_api = "native"`) | A bridge (`thread_api = "bridge"`) |
+|---|---|---|---|
+| `fetch_range` | native: `conversations.history` or `conversations.replies` pinned to the window with `oldest`, `latest` and `inclusive`, following Slack's cursor, 20 rows a call | emulated: `after=` from the window's start is already a call per 100 rows | native with `range_reads` |
+| `fetch_messages` | native: a call per run of timestamps | native: one `after=` page for ids near each other, the thread checked once | native with `id_reads` |
+| `channel_heads` | emulated: no Slack call answers several conversations | native: each server's channel list, a call per server; additions only | native with `head_reads`; may vouch for edits and deletes |
+| `fetch_recent_many` | emulated | emulated | native with `recent_many_reads` |
+| `fetch_threads` | native: one `conversations.replies` window per thread instead of two calls; after an instant, no replies read for a thread whose root's `latest_reply` did not move | native: the parent read once for all threads instead of once each; after an instant, a thread whose `last_message_id` did not move costs only its check | native with `thread_reads` |
+
+**What a bridge must serve, and the setting that turns each on.** A bridge advertises nothing:
+each request is off until the operator turns its setting on for that provider (`[discord]`, or a
+`[[providers]]` entry of kind `discord`, only with `thread_api = "bridge"`; refused anywhere else).
+With a setting off, the bridge is read exactly as before. With it on and a bridge that does not
+serve the request, the answer is refused as unreadable: a range read or a lookup fails as a read
+does, and a head read, a read of several channels or of several threads falls back to reading each
+channel or thread as before, at the cost of the wasted request. All five are `GET` requests
+relative to `discord.api_base`, with the bot token, answering JSON in the message and timeline wire
+formats the other endpoints use:
+
+| Setting | Request | Answer | Exhaustive, or not | `as_of` |
+|---|---|---|---|---|
+| `range_reads` | `/channels/{id}/messages?since=&until=&order=oldest\|newest&limit=&cursor=` (RFC 3339 instants, `until` absent for now, `limit` 1 to 200) | `{"messages", "next", "exhausted", "as_of"}` | `exhausted: true` only when the bridge KNOWS the window holds nothing more in that direction, and never beside a `next`; a short answer is not exhaustion | present: `/page` and `/count` make the read they made without the setting |
+| `id_reads` | `/channels/{id}/messages?ids=…&ids=…&thread=` (at most 50 ids) | `{"messages", "missing", "as_of"}` | `missing` only for ids the service SAID do not exist; an id neither found nor missing is looked up on its own | present: vibe-talk trusts none of the answer and looks every id up on its own |
+| `head_reads` | `/heads?channels=…&channels=…` (at most 50) | `{"heads": [{"channel", "newest_id", "newest_at", "activity_at", "unchanged_since", "as_of"}]}` | `unchanged_since` only while the bridge's own feed has seen every creation, edit and delete since that instant; a channel left out is read as before | present: nothing is done on that head |
+| `recent_many_reads` | `/recent?channels=…&limit=&since=` (at most 50 channels, `limit` 1 to 100) | `{"recent": [{"channel", "messages", "exhausted", "as_of"}]}` | never fewer messages than `/messages?limit=` would answer now; `exhausted` only when they reach back to the channel's first message; a channel left out is read as before | present: that channel is read again on its own |
+| `thread_reads` | `/channels/{id}/threads?ids=…&ids=…&limit=` (at most 50) | `{"threads": [{"thread_id", "page"}]}` | each `page` exactly what the thread view of that thread would answer now; a thread left out is read on its own | a page with one: that thread is read on its own |
+
+A bridge that keeps a copy of its channels current from its service's live feed (the Google Chat
+bridge adapter is the case in mind) can answer every one of these from that copy without asking its
+service at all, as long as it says `as_of` the moment the copy stops being current. Each request's
+own section gives the full shape and every rule.
+
+**What a native answer may never do.** These are why every caller above falls back to today's read
+rather than trust an answer it cannot vouch for:
+
+* **Never infer exhaustion from a short page.** Only `exhausted` (Slack's `has_more: false`, a
+  bridge's own word) says a window or a channel ends; a count is exact only then.
+* **Never serve anything older than today's read would.** An answer from a copy that was not
+  current (`as_of`) is read again the way it was before, never kept or named from.
+* **Edits and deletes must still be seen.** A head whose newest id has not moved proves only that
+  nothing was added, so it gates the live poller (which reads only additions) and nothing else; only
+  a head with `unchanged_since` lets a catch-up keep a held window, and a delta of additions after an
+  instant is never taken for a whole thread.
+* **Correctness before savings.** Where a native answer leaves a channel, a thread or an id out,
+  that one is read as before.
+
+**Telling native from emulated.** `GET /api/v1/diagnostics` shows both, per provider, in its
+`upstream` section (see [How long upstream takes](#how-long-upstream-takes)): `reads` says which of
+the five the provider answers natively, a native read is timed under its own name while an emulated
+one is timed as the reads it is made of, and every operation row says how many upstream requests it
+sent (`calls`). The same three heads are `channel_heads count 1, calls 1` from a provider that reads
+heads itself and `fetch_recent count 3, calls 3` from one that does not.
 
 ### A bridge's range reads
 
