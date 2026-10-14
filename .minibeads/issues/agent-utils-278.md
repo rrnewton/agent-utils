@@ -1,13 +1,12 @@
 ---
 title: 'naming-throttle: name threads from rows already read, read at most one thread per channel per 30 s, and stop a failing channel''s naming reads for 10 min'
-status: closed
+status: open
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-13T20:01:45.302303854+00:00
-updated_at: 2026-10-13T23:46:02.139008663+00:00
-closed_at: 2026-10-13T23:46:02.139007822+00:00
+updated_at: 2026-10-14T00:34:09.855317020+00:00
 ---
 
 # Description
