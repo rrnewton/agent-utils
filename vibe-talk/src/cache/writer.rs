@@ -860,6 +860,33 @@ impl Writer<'_> {
                 }
                 self.report("sweep", result);
             }
+            Op::SetAccount {
+                provider_key,
+                account_id,
+                workspace_id,
+            } => {
+                // As rows are: a provider the snapshot does not configure is about to be swept,
+                // and its account row with it.
+                if !self.routed_provider(&provider_key) {
+                    Stats::add(&self.shared.stats.ops_unrouted, 1);
+                    return;
+                }
+                let now = self.now();
+                let result = self.transaction(|w| {
+                    w.conn
+                        .execute(
+                            "INSERT INTO account (provider_key, account_id, workspace_id, verified_ms)
+                             VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT (provider_key) DO UPDATE SET
+                                account_id = excluded.account_id,
+                                workspace_id = excluded.workspace_id,
+                                verified_ms = excluded.verified_ms",
+                            params![provider_key, account_id, workspace_id, now],
+                        )
+                        .map(drop)
+                });
+                self.report("account", result);
+            }
             Op::Maintain { kind } => self.maintain(kind),
             #[cfg(test)]
             Op::Probe { reply } => {
@@ -884,6 +911,15 @@ impl Writer<'_> {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .is_some_and(|routes| routes.allows(chan))
+    }
+
+    fn routed_provider(&self, provider_key: &str) -> bool {
+        self.shared
+            .routes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|routes| routes.has_provider(provider_key))
     }
 
     /// Run `work` in its own transaction, outside any batch, and send what it did that the store

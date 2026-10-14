@@ -497,6 +497,26 @@ pub enum WriterEvent {
     },
 }
 
+/// The account a provider's rows were read as, as the file records it: what a later start compares
+/// the provider's answer to, so that rows read as one account are never served as another's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Account {
+    /// The provider's own id for the account.
+    pub account_id: String,
+    /// The workspace the account belongs to, where the provider has workspaces.
+    pub workspace_id: Option<String>,
+    /// Local time the row was written, by the cache's clock.
+    pub verified_ms: i64,
+}
+
+impl Account {
+    /// Whether this is the account `account_id` in `workspace_id`: both must match.
+    #[must_use]
+    pub fn is(&self, account_id: &str, workspace_id: Option<&str>) -> bool {
+        self.account_id == account_id && self.workspace_id.as_deref() == workspace_id
+    }
+}
+
 /// What happened to an offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offered {
@@ -719,6 +739,14 @@ impl Epochs {
         *lock(&self.providers)
             .entry(provider_key.to_owned())
             .or_insert(0) += 1;
+    }
+
+    /// A provider's own count: it moves on every erase of the provider.
+    pub(crate) fn provider_epoch(&self, provider_key: &str) -> u64 {
+        lock(&self.providers)
+            .get(provider_key)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn stamp(&self, chan: &ChanKey) -> Stamp {
@@ -947,6 +975,11 @@ pub(crate) enum Op {
     },
     RetainOnly {
         routes: Arc<RouteSnapshot>,
+    },
+    SetAccount {
+        provider_key: String,
+        account_id: String,
+        workspace_id: Option<String>,
     },
     Maintain {
         kind: Maintenance,
@@ -1326,6 +1359,63 @@ impl MessageCache {
             provider_key: provider_key.to_owned(),
         });
         lock(&self.shared.erasing).insert(key, seq.unwrap_or(u64::MAX));
+    }
+
+    /// Record that `provider_key`'s rows are read as the account `account_id`, in `workspace_id`
+    /// where the provider has workspaces. A control operation, so a full queue never drops it; the
+    /// writer applies it only while the route snapshot names the provider, as it does rows. The
+    /// sequence number that applies it, or `None` when no file is open or its writer has gone.
+    pub fn set_account(
+        &self,
+        provider_key: &str,
+        account_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Option<u64> {
+        self.control(Op::SetAccount {
+            provider_key: provider_key.to_owned(),
+            account_id: account_id.to_owned(),
+            workspace_id: workspace_id.map(str::to_owned),
+        })
+    }
+
+    /// The account the file says `provider_key`'s rows were read as, if it says one.
+    ///
+    /// [`Read::Blocked`] while an erase of the provider is waiting to be applied, or failed: the
+    /// row it would find is the one the erase is about to delete. [`Read::Moved`] when the
+    /// provider or the file was erased while the read ran.
+    #[must_use]
+    pub fn account(&self, provider_key: &str) -> Read<Option<Account>> {
+        let epoch = self.shared.epochs.provider_epoch(provider_key);
+        if self.provider_erasing(provider_key) {
+            return Read::Blocked;
+        }
+        let read = self.read(None, |connection| reader::account(connection, provider_key));
+        if self.shared.epochs.provider_epoch(provider_key) != epoch {
+            return Read::Moved;
+        }
+        if self.provider_erasing(provider_key) {
+            return Read::Blocked;
+        }
+        read
+    }
+
+    /// The file generation now. It moves on every file erase, so whatever was checked against
+    /// one generation is known to be about a file that is gone once it has moved.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.shared.epochs.generation()
+    }
+
+    /// Whether an erase of `provider_key` is waiting to be applied, or failed.
+    fn provider_erasing(&self, provider_key: &str) -> bool {
+        let key = Erasing::Provider(provider_key.to_owned());
+        if lock(&self.shared.erase_failed).contains(&key) {
+            return true;
+        }
+        let applied = self.shared.seq.applied();
+        let mut pending = lock(&self.shared.erasing);
+        pending.retain(|_, seq| *seq > applied);
+        pending.contains_key(&key)
     }
 
     /// Whether reads of a channel are blocked: it is off the route snapshot (or there is none

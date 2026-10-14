@@ -1718,6 +1718,79 @@ fn retain_only_sweeps_every_channel_and_provider_off_the_list() {
     assert_eq!(fx.cache.counts().served().expect("counts").messages, 0);
 }
 
+// ---- accounts ----------------------------------------------------------------------------------
+
+#[test]
+fn an_account_is_written_read_back_and_erased_with_its_provider() {
+    let fx = Fixture::new("cache-account");
+    assert_eq!(fx.cache.account("p"), Read::Served(None), "none yet");
+
+    fx.clock.set(T0 + 5);
+    assert!(fx.cache.set_account("p", "U1", Some("T1")).is_some());
+    fx.settle();
+    let written = fx.cache.account("p").served().flatten().expect("written");
+    assert_eq!(
+        written,
+        Account {
+            account_id: "U1".to_owned(),
+            workspace_id: Some("T1".to_owned()),
+            verified_ms: T0 + 5,
+        }
+    );
+    assert!(written.is("U1", Some("T1")));
+    assert!(!written.is("U1", None), "the workspace must match too");
+    assert!(!written.is("U2", Some("T1")));
+
+    // Written again, it is updated in place: one row per provider.
+    fx.cache.set_account("p", "U2", None);
+    fx.settle();
+    assert!(fx
+        .cache
+        .account("p")
+        .served()
+        .flatten()
+        .expect("held")
+        .is("U2", None));
+    assert_eq!(sql_count(&fx.cache, "SELECT COUNT(*) FROM account"), 1);
+
+    // A provider the route snapshot does not configure gets no account row.
+    let unrouted = fx.cache.stats().ops_unrouted;
+    fx.cache.set_account("q", "U9", None);
+    fx.settle();
+    assert_eq!(fx.cache.account("q"), Read::Served(None));
+    assert_eq!(fx.cache.stats().ops_unrouted, unrouted + 1);
+
+    // While an erase of the provider waits for the writer, its account is not read: the row
+    // found would be the one being erased.
+    let resume = fx.cache.pause_writer();
+    fx.cache.erase_provider("p");
+    assert_eq!(fx.cache.account("p"), Read::Blocked);
+    drop(resume);
+    fx.settle();
+    assert_eq!(fx.cache.account("p"), Read::Served(None), "erased with it");
+
+    // An erase then a write, in that order, leave the new account: one queue, applied in order.
+    fx.cache.set_account("p", "U1", Some("T1"));
+    let resume = fx.cache.pause_writer();
+    fx.cache.erase_provider("p");
+    fx.cache.set_account("p", "U3", Some("T1"));
+    drop(resume);
+    fx.settle();
+    assert!(fx
+        .cache
+        .account("p")
+        .served()
+        .flatten()
+        .expect("held")
+        .is("U3", Some("T1")));
+
+    // A file erase takes it, and the generation moves on.
+    let generation = fx.cache.generation();
+    fx.cache.erase_file(true).expect("reopened");
+    assert_ne!(fx.cache.generation(), generation);
+    assert_eq!(fx.cache.account("p"), Read::Served(None));
+}
+
 // ---- bounds and maintenance --------------------------------------------------------------------
 
 #[test]

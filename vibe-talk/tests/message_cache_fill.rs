@@ -241,7 +241,7 @@ async fn a_channel_the_owner_hides_is_swept_out_of_the_cache() {
     let dir = TempDir::new("cache-sweep-hidden");
     let clock = ManualClock::at(T0 + HOUR);
     let (state, _fake, store) = testing::state_with_store();
-    let state = testing::with_message_cache(state, dir.path(), clock.clone());
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
     let cache = state.message_cache.cache().expect("installed");
     offer_rows(&cache, LEGACY, READ_CHANNEL, 3, clock.now());
     offer_rows(&cache, LEGACY, WRITE_CHANNEL, 4, clock.now());
@@ -275,7 +275,7 @@ async fn a_channel_taken_out_of_the_configuration_is_swept_at_the_next_start() {
     let clock = ManualClock::at(T0 + HOUR);
     {
         let (state, _fake) = testing::state();
-        let state = testing::with_message_cache(state, dir.path(), clock.clone());
+        let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
         let cache = state.message_cache.cache().expect("installed");
         offer_rows(&cache, LEGACY, READ_CHANNEL, 3, clock.now());
         offer_rows(&cache, LEGACY, WRITE_CHANNEL, 4, clock.now());
@@ -288,7 +288,7 @@ async fn a_channel_taken_out_of_the_configuration_is_swept_at_the_next_start() {
     let removed = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
     let name = thread_name(WRITE_CHANNEL);
     file_summaries(&store, &[&listed, &removed, &name]).await;
-    let state = testing::with_message_cache(state, dir.path(), clock.clone());
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
     let cache = state.message_cache.cache().expect("installed");
     assert_eq!(
         held(&cache),
@@ -307,7 +307,7 @@ async fn a_renamed_provider_key_leaves_nothing_behind_under_the_old_one() {
     let clock = ManualClock::at(T0 + HOUR);
     {
         let (state, _fake) = keyed_deployment("first");
-        let state = testing::with_message_cache(state, dir.path(), clock.clone());
+        let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
         let cache = state.message_cache.cache().expect("installed");
         offer_rows(&cache, "first", READ_CHANNEL, 3, clock.now());
         offer_rows(&cache, "first", WRITE_CHANNEL, 4, clock.now());
@@ -318,7 +318,7 @@ async fn a_renamed_provider_key_leaves_nothing_behind_under_the_old_one() {
     let read = summary(&state, READ_CHANNEL, "1000000000000000001", "row 1");
     let write = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
     file_summaries(&store, &[&read, &write]).await;
-    let state = testing::with_message_cache(state, dir.path(), clock.clone());
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
     let cache = state.message_cache.cache().expect("installed");
     assert_eq!(
         held(&cache),
@@ -457,7 +457,7 @@ fn upstream(bridge: bool, count: i64) -> Upstream {
     }
 }
 
-fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment {
+async fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment {
     let dir = TempDir::new("cache-fill");
     let Upstream {
         state,
@@ -466,7 +466,7 @@ fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment 
         store,
         ids,
     } = upstream(bridge, count);
-    let state = testing::with_message_cache(state, dir.path(), clock.clone());
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
     let cache = state.message_cache.cache().expect("installed");
     assert!(cache.quiesce_blocking(WAIT), "the first sweep landed");
     Deployment {
@@ -512,7 +512,7 @@ async fn get(state: &AppState, uri: &str) -> Value {
 #[tokio::test]
 async fn a_write_token_timeline_of_discord_main_fills_rows_and_coverage() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     get(
         &d.state,
         &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
@@ -547,7 +547,7 @@ async fn a_write_token_timeline_of_discord_main_fills_rows_and_coverage() {
 #[tokio::test]
 async fn a_write_token_timeline_of_a_bridge_flat_page_is_listed_as_of_when_the_bridge_says() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 10, &clock);
+    let d = deployment(true, 10, &clock).await;
     let as_of = clock.now() - 10 * MINUTE;
     d.chat.set_as_of(Some(vibe_talk::clock::iso_from_ms(as_of)));
     get(
@@ -593,7 +593,11 @@ fn slack_chan() -> ChanKey {
 }
 
 /// A Slack deployment against `fake`, with a cache in `dir` read by `clock`.
-fn slack_deployment(fake: &slack_fake::Fake, dir: &TempDir, clock: &Arc<ManualClock>) -> AppState {
+async fn slack_deployment(
+    fake: &slack_fake::Fake,
+    dir: &TempDir,
+    clock: &Arc<ManualClock>,
+) -> AppState {
     let text = format!(
         r#"
 [auth]
@@ -618,7 +622,7 @@ writable = true
     let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
     let router = ChatRouter::from_config(&state.config).expect("providers build");
     state.replace_providers(Arc::new(router));
-    let state = testing::with_message_cache(state, dir.path(), clock.clone());
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
     assert!(state
         .message_cache
         .cache()
@@ -645,7 +649,7 @@ async fn a_write_token_timeline_of_slack_main_that_reached_the_start_claims_it_b
     let fake = slack_fake::Fake::start(fixture, 4).await;
     let dir = TempDir::new("cache-fill-slack");
     let clock = ManualClock::at(slack_ms(3_600));
-    let state = slack_deployment(&fake, &dir, &clock);
+    let state = slack_deployment(&fake, &dir, &clock).await;
     get(
         &state,
         &format!("/api/v1/channels/{SLACK_CH}/timeline?view=main&limit=50"),
@@ -684,7 +688,7 @@ async fn a_newest_slack_window_with_an_authorless_row_never_claims_the_channels_
     let fake = slack_fake::Fake::start(fixture, 10).await;
     let dir = TempDir::new("cache-fill-slack-window");
     let clock = ManualClock::at(slack_ms(3_600));
-    let state = slack_deployment(&fake, &dir, &clock);
+    let state = slack_deployment(&fake, &dir, &clock).await;
     // Twenty asked, two returned: shorter than asked is still no proof of the channel's start.
     let window =
         vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
@@ -731,7 +735,7 @@ async fn a_bounded_slack_flat_page_never_tombstones_a_reply_nor_claims_a_thread(
     let fake = slack_fake::Fake::start(fixture, 20).await;
     let dir = TempDir::new("cache-fill-slack-flat");
     let clock = ManualClock::at(slack_ms(3_600));
-    let state = slack_deployment(&fake, &dir, &clock);
+    let state = slack_deployment(&fake, &dir, &clock).await;
     let cache = state.message_cache.cache().expect("installed");
 
     // The busy thread read whole: its sixty replies, and a claim over the thread.
@@ -784,7 +788,7 @@ async fn a_bounded_slack_flat_page_never_tombstones_a_reply_nor_claims_a_thread(
 #[tokio::test]
 async fn an_empty_page_claims_nothing_and_a_walk_from_since_claims_its_span() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(false, 0, &clock);
+    let d = deployment(false, 0, &clock).await;
     for n in 10..=20 {
         d.fake.seed_at(
             &id(READ_CHANNEL),
@@ -839,7 +843,7 @@ async fn an_empty_page_claims_nothing_and_a_walk_from_since_claims_its_span() {
 #[tokio::test]
 async fn a_before_page_gives_rows_only_and_a_delta_never_claims_but_a_complete_one_deletes() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 5, &clock);
+    let d = deployment(true, 5, &clock).await;
     let flat =
         |extra: &str| format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=flat&limit=50{extra}");
 
@@ -890,8 +894,10 @@ async fn a_before_page_gives_rows_only_and_a_delta_never_claims_but_a_complete_o
 
 /// A fresh deployment with a thread in the read-only channel: a root and two replies to it, after
 /// eight plain messages.
-fn deployment_with_a_thread(clock: &Arc<ManualClock>) -> (Deployment, MessageId, Vec<MessageId>) {
-    let d = deployment(false, 8, clock);
+async fn deployment_with_a_thread(
+    clock: &Arc<ManualClock>,
+) -> (Deployment, MessageId, Vec<MessageId>) {
+    let d = deployment(false, 8, clock).await;
     let root = d.ids[2].clone();
     let replies = (0..2)
         .map(|n| {
@@ -914,7 +920,7 @@ async fn every_read_site_fills_under_a_write_grant() {
     let clock = ManualClock::at(T0 + HOUR);
 
     // `/count`: the walk's own pages, newest first.
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     get(&d.state, &format!("/api/v1/channels/{READ_CHANNEL}/count")).await;
     assert_eq!(held(&d.cache), 10);
     assert_eq!(
@@ -923,7 +929,7 @@ async fn every_read_site_fills_under_a_write_grant() {
     );
 
     // `/resolve`: the window it searched.
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     vibe_talk::ops::resolve(
         &d.state,
         Scope::Write,
@@ -937,7 +943,7 @@ async fn every_read_site_fills_under_a_write_grant() {
     assert_eq!(held(&d.cache), 10);
 
     // `/page`, the newest page: the newest stretch.
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     get(
         &d.state,
         &format!("/api/v1/channels/{READ_CHANNEL}/page?limit=5"),
@@ -946,7 +952,7 @@ async fn every_read_site_fills_under_a_write_grant() {
     assert_eq!(held(&d.cache), 6, "the page and the one more it asked for");
 
     // A message read by id from a thread: that row, listed in its thread.
-    let (d, root, replies) = deployment_with_a_thread(&clock);
+    let (d, root, replies) = deployment_with_a_thread(&clock).await;
     let uri = format!(
         "/api/v1/channels/{READ_CHANNEL}/messages/{}?thread_id={}",
         replies[1].as_str(),
@@ -960,7 +966,7 @@ async fn every_read_site_fills_under_a_write_grant() {
     );
 
     // A catch-up's refresh of a channel's window: the grant of the caller that claimed it.
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     vibe_talk::ops::activity(
         &d.state,
         Scope::Write,
@@ -971,7 +977,7 @@ async fn every_read_site_fills_under_a_write_grant() {
     assert_eq!(held(&d.cache), 10);
 
     // `/messages` itself.
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     get(
         &d.state,
         &format!("/api/v1/channels/{READ_CHANNEL}/messages"),
@@ -1075,7 +1081,7 @@ fn cached(
 #[tokio::test]
 async fn a_pushed_edit_and_a_pushed_deletion_reach_the_cache() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 5, &clock);
+    let d = deployment(true, 5, &clock).await;
     get(&d.state, &flat_page()).await;
     assert_eq!(held(&d.cache), 5);
 
@@ -1106,7 +1112,7 @@ async fn a_pushed_edit_and_a_pushed_deletion_reach_the_cache() {
 #[tokio::test]
 async fn a_deletion_pushed_while_a_read_is_in_flight_is_not_undone_by_that_read() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 5, &clock);
+    let d = deployment(true, 5, &clock).await;
     get(&d.state, &flat_page()).await;
     let gone = d.ids[2].clone();
     assert!(holds(&d.cache, &read_chan(), &gone));
@@ -1144,7 +1150,7 @@ async fn a_deletion_pushed_while_a_read_is_in_flight_is_not_undone_by_that_read(
 #[tokio::test]
 async fn a_stale_bridge_snapshot_does_not_revert_a_later_push() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 5, &clock);
+    let d = deployment(true, 5, &clock).await;
     get(&d.state, &flat_page()).await;
 
     clock.advance(10 * MINUTE);
@@ -1182,7 +1188,7 @@ async fn a_stale_bridge_snapshot_does_not_revert_a_later_push() {
 async fn a_pushed_creation_is_a_possible_snippet_until_a_read_and_a_pushed_snippet_never_overwrites_one(
 ) {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 5, &clock);
+    let d = deployment(true, 5, &clock).await;
 
     // Written upstream with a long body; the live event carries only the start of it.
     let full = "a long body that the live event cut short";
@@ -1225,7 +1231,7 @@ async fn a_message_this_server_posts_is_written_to_the_cache() {
         .created_at_ms()
         .expect("a snowflake");
     let clock = ManualClock::at(posted_at + HOUR);
-    let d = deployment(false, 0, &clock);
+    let d = deployment(false, 0, &clock).await;
     let (_channel, first, parts) =
         vibe_talk::ops::reply(&d.state, WRITE_CHANNEL, "posted by this server", None)
             .await
@@ -1255,7 +1261,7 @@ use vibe_talk::live::{poll_once, Tick};
 async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_it() {
     let clock = ManualClock::at(T0 + HOUR);
     // Discord's own API, ten messages a minute apart from T0.
-    let d = deployment(false, 10, &clock);
+    let d = deployment(false, 10, &clock).await;
     let channel = id(READ_CHANNEL);
     let mut cursor = None;
 
@@ -1469,7 +1475,7 @@ async fn edit_and_delete(
 #[tokio::test]
 async fn an_edit_or_a_deletion_forgets_only_that_messages_summaries_of_other_text() {
     let clock = ManualClock::at(T0 + HOUR);
-    let d = deployment(true, 10, &clock);
+    let d = deployment(true, 10, &clock).await;
     get(&d.state, &flat_page()).await;
     let filed = file_for(&d.state, &d.store, &d.ids).await;
 
@@ -1545,7 +1551,7 @@ async fn the_sweep_forgets_a_channel_off_the_list_but_not_one_still_listed_under
         let dir = TempDir::new("cache-sweep-summaries");
         {
             let (state, _fake) = keyed_deployment("first");
-            let state = testing::with_message_cache(state, dir.path(), clock.clone());
+            let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
             let cache = state.message_cache.cache().expect("installed");
             offer_rows(&cache, "first", READ_CHANNEL, 3, clock.now());
             offer_rows(&cache, "first", WRITE_CHANNEL, 4, clock.now());
@@ -1558,7 +1564,7 @@ async fn the_sweep_forgets_a_channel_off_the_list_but_not_one_still_listed_under
         let name = thread_name(WRITE_CHANNEL);
         file_summaries(&store, &[&renamed, &removed, &name]).await;
         let state = if cache_on {
-            testing::with_message_cache(state, dir.path(), clock.clone())
+            testing::with_message_cache(state, dir.path(), clock.clone()).await
         } else {
             // A server with the cache off starts as `main` does, and opens none.
             let (added, hidden) = state.restore_channel_lists().await;

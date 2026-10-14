@@ -1236,7 +1236,7 @@ mod read_scope_writes_nothing {
             })
             .collect();
         state.replace_chat(Arc::new(TimelineChat::new(fake.clone())));
-        let state = testing::with_message_cache(state, dir.path(), clock.clone());
+        let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
         let cache = state.message_cache.cache().expect("installed");
         let router = vibe_talk::http::router(state.clone());
 

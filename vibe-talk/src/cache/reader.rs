@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, InterruptHandle, OpenFlags, OptionalExtension
 use super::coverage::{Head, Interval, Source};
 use super::rows::{self, CachedMessage, ChanKey, Scope};
 use super::schema::{apply_per_open, sqlite_code};
-use super::{CacheError, Counts, ThreadRecord};
+use super::{Account, CacheError, Counts, ThreadRecord};
 use crate::model::MessageId;
 
 /// Two read-only connections. A read takes whichever is free.
@@ -269,6 +269,25 @@ pub(crate) fn thread(
                         .and_then(|n| u64::try_from(n).ok()),
                     reply_count_exact: row.get(2)?,
                     last_activity_ms: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+}
+
+pub(crate) fn account(
+    connection: &Connection,
+    provider_key: &str,
+) -> rusqlite::Result<Option<Account>> {
+    connection
+        .query_row(
+            "SELECT account_id, workspace_id, verified_ms FROM account WHERE provider_key = ?1",
+            [provider_key],
+            |row| {
+                Ok(Account {
+                    account_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    verified_ms: row.get(2)?,
                 })
             },
         )

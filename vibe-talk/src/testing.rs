@@ -1391,15 +1391,39 @@ pub fn install_message_cache(
 }
 
 /// `state` with a message cache open in `dir` behind its sink, armed, and told the channels the
-/// server answers for: what a server with the cache on looks like once it has started. `#208
-/// persistent-cache`. Call it after the state's providers are final ([`AppState::replace_chat`],
-/// [`AppState::replace_providers`]): the cache names each channel under the provider that owns
-/// it when this is called, and a provider swapped in later is told to the cache as a change of
-/// routes.
+/// server answers for, and every provider's account checked against it: what a server with the
+/// cache on looks like once it has started. `#208 persistent-cache`. Call it after the state's
+/// providers are final ([`AppState::replace_chat`], [`AppState::replace_providers`]): the cache
+/// names each channel under the provider that owns it when this is called, and a provider swapped
+/// in later is told to the cache as a change of routes, and checked again.
 ///
 /// The cache is reached again through `state.message_cache.cache()`.
+///
+/// # Panics
+///
+/// Panics if the cache cannot be opened, or a provider's account is not checked within twenty
+/// seconds: a provider that cannot say which account it is wants
+/// [`with_message_cache_unverified`].
+pub async fn with_message_cache(
+    state: AppState,
+    dir: &std::path::Path,
+    clock: Arc<ManualClock>,
+) -> AppState {
+    let state = with_message_cache_unverified(state, dir, clock);
+    assert!(
+        state
+            .message_cache
+            .identities_verified(Duration::from_secs(20))
+            .await,
+        "every provider's account was checked against the new message cache"
+    );
+    state
+}
+
+/// [`with_message_cache`] without waiting for the providers' accounts to be checked: for a test
+/// of that check itself. Until it is done, nothing of a provider is filled.
 #[must_use]
-pub fn with_message_cache(
+pub fn with_message_cache_unverified(
     state: AppState,
     dir: &std::path::Path,
     clock: Arc<ManualClock>,
