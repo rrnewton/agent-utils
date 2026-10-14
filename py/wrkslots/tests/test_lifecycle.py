@@ -36064,6 +36064,122 @@ def test_recover_absent_agent_row_cleans_read_sidecar_only_after_archive(
     assert not sidecar.exists()
 
 
+def test_read_handoff_reads_sidecar_of_absent_slot_so_recovery_can_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """https://github.com/rrnewton/agent-utils/issues/244: no mutual deadlock.
+
+    A dead row with no slot directory and an unread external sidecar was
+    refused by recovery (read the handoff first) and by read-handoff (no slot
+    directory). read-handoff now reads the sidecar, so recovery proceeds.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    record, sidecar = prepare_absent_agent_row_with_sidecar(
+        project, repository, tmp_path, read=False
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "unread HANDOFF.md or handoff sidecar" in capsys.readouterr().err
+
+    read = raw_command(
+        project,
+        "read-handoff",
+        record.slot,
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 0, read.stderr
+    assert "preserve this handoff" in read.stdout
+    assert str(sidecar) in read.stdout
+    assert f"recorded HANDOFF.md read slot={record.slot}" in read.stdout
+    assert sidecar.is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    reads = [
+        wrkslots._as_mapping(event["payload"], "test handoff-read payload")
+        for event in wrkslots._load_events(config)
+        if event["kind"] == "handoff-read"
+    ]
+    assert [payload["retirement_enqueued"] for payload in reads] == [True]
+    assert reads[0]["generation"] == record.generation
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not wrkslots._load_active(config).slots
+    assert wrkslots._load_archive(config).records[-1]["slot"] == record.slot
+    assert not sidecar.exists()
+
+
+def test_read_handoff_still_refuses_absent_slot_without_sidecar(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(
+        project,
+        slot="gone-agent",
+        agent="agent-gone-agent",
+        branch="agent/gone-agent",
+    )
+    assert made.returncode == 0, made.stderr
+    record = mark_recorded_owner_dead(project, "gone-agent")
+    config = wrkslots._load_config(str(project), "testhost")
+    shutil.rmtree(wrkslots._slot_directory(config, record.slot, "agent"))
+
+    read = raw_command(
+        project,
+        "read-handoff",
+        record.slot,
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 3
+    assert "active row but no slot directory" in read.stderr
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+def test_read_handoff_refuses_absent_slot_with_fenced_sibling(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record, sidecar = prepare_absent_agent_row_with_sidecar(
+        project, repository, tmp_path, read=False
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    fenced = (
+        wrkslots._slot_roots(config)["agent"]
+        / f".{record.slot}.fenced.{record.generation}.planted"
+    )
+    fenced.mkdir()
+
+    read = raw_command(
+        project,
+        "read-handoff",
+        record.slot,
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert read.returncode == 3
+    assert "possible fenced path" in read.stderr
+    assert "preserve this handoff" not in read.stdout
+    assert sidecar.is_file()
+    assert fenced.is_dir()
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
 def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

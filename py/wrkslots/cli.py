@@ -9780,12 +9780,20 @@ def _assert_target_record_storage_consistent(
     record: ActiveRecord,
     *,
     before_any_change: bool = False,
-) -> None:
+    tolerate_absent_slot_directory: bool = False,
+) -> bool:
     """Refuse physical or Git drift attributable to one requested record.
 
     ``before_any_change`` marks the check that ``remove`` makes before its
     first change to the slot; only that check reports the drift as
     ``_TargetStorageDrift``.
+
+    ``tolerate_absent_slot_directory`` lets ``read-handoff`` pass a row whose
+    slot directory is wholly absent (finding ``row-without-directory``) so it
+    can still read the generation-bound handoff sidecar, which lives outside
+    the checkout. Every other finding still refuses. Returns whether that
+    absence was tolerated; the caller must then refuse unless the handoff it
+    reads is the sidecar.
     """
 
     authoritative_state = next(
@@ -9804,12 +9812,19 @@ def _assert_target_record_storage_consistent(
         config,
         (dataclasses.replace(authoritative_state, slots=(record,)),),
     )
+    absent_tolerated = False
     for finding in findings:
         if (
             finding.slot == record.slot
             and finding.slot_type == record.slot_type
             and finding.machine in {None, record.machine}
         ):
+            if (
+                tolerate_absent_slot_directory
+                and finding.kind == "row-without-directory"
+            ):
+                absent_tolerated = True
+                continue
             raise _target_storage_refusal(
                 finding.detail,
                 finding.remedy,
@@ -9819,6 +9834,7 @@ def _assert_target_record_storage_consistent(
     _assert_no_cross_repository_target_registrations(
         config, states, record, before_any_change=before_any_change
     )
+    return absent_tolerated
 
 
 def _assert_no_cross_repository_target_registrations(
@@ -24895,6 +24911,48 @@ def _write_and_flush_handoff(path: Path, rendered: str) -> None:
         ) from exc
 
 
+def _assert_read_handoff_storage(
+    config: Config, states: Sequence[ActiveState], record: ActiveRecord
+) -> bool:
+    """Check target storage for ``read-handoff``; return whether it is absent.
+
+    A dead owner's slot directory may be gone while its generation-bound
+    handoff sidecar, kept outside the checkout, is still unread. Refusing the
+    read there deadlocked with ``recover-absent-agent-row``, which refuses an
+    unread sidecar and names ``read-handoff`` as the remedy
+    (https://github.com/rrnewton/agent-utils/issues/244). An absent directory
+    is tolerated only when it is wholly absent, with no checkout path and no
+    fenced sibling left, exactly as absent-row recovery requires; the caller
+    must still refuse unless the handoff it reads is the sidecar.
+    """
+
+    absent = _assert_target_record_storage_consistent(
+        config, states, record, tolerate_absent_slot_directory=True
+    )
+    if absent:
+        _assert_absent_agent_storage(config, record)
+    return absent
+
+
+def _refuse_absent_slot_without_sidecar(
+    config: Config,
+    states: Sequence[ActiveState],
+    record: ActiveRecord,
+    artifact: _HandoffArtifact | None,
+) -> None:
+    """Restore the absent-directory refusal unless the artifact is the sidecar."""
+
+    sidecar_path = _handoff_sidecar_path(
+        config, record.slot, record.generation, record.machine
+    )
+    if artifact is not None and artifact.path == sidecar_path:
+        return
+    _assert_target_record_storage_consistent(config, states, record)
+    raise StateError(
+        f"slot {record.slot} directory is absent and has no handoff sidecar"
+    )
+
+
 def _cmd_read_handoff(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -24917,7 +24975,7 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 "state: REFUSED -- no event was recorded. remedy: inspect its run evidence "
                 "under the project's validation evidence directory"
             )
-        _assert_target_record_storage_consistent(config, states, record)
+        storage_absent = _assert_read_handoff_storage(config, states, record)
         slot_path = _slot_directory(config, record.slot, record.slot_type)
         artifact: _HandoffArtifact | None
         if args.expected_generation is not None:
@@ -24932,6 +24990,8 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 f"{exc}. state: REFUSED -- no read was recorded; preserve both the "
                 "slot and any handoff sidecar"
             ) from exc
+        if storage_absent:
+            _refuse_absent_slot_without_sidecar(config, states, record, artifact)
         if artifact is None:
             raise Refusal(
                 f"slot {record.slot} has no handoff sidecar or legacy HANDOFF.md. "
@@ -24946,7 +25006,11 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 "REFUSED -- no read was recorded. remedy: preserve and repair the handoff file"
             ) from exc
         legacy_path = slot_path / "HANDOFF.md"
-        display_path = legacy_path if artifact.source == "legacy-slot-file" else artifact.path
+        display_path = (
+            legacy_path
+            if artifact.source == "legacy-slot-file" and not storage_absent
+            else artifact.path
+        )
         record_snapshot = _record_to_obj(record)
         latest_snapshot = _latest_handoff_read(record, _load_events(config, record.machine))
 
@@ -24964,7 +25028,7 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 f"slot {args.slot} changed while its handoff was displayed; no read or "
                 "retirement queue event was recorded"
             )
-        _assert_target_record_storage_consistent(config, states, current_record)
+        current_absent = _assert_read_handoff_storage(config, states, current_record)
         current_slot_path = _slot_directory(
             config, current_record.slot, current_record.slot_type
         )
@@ -24980,6 +25044,10 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
         current_artifact = _resolve_handoff_artifact(
             config, current_record, current_slot_path
         )
+        if current_absent:
+            _refuse_absent_slot_without_sidecar(
+                config, states, current_record, current_artifact
+            )
         if current_artifact is None or not _same_handoff_snapshot(
             current_artifact, artifact
         ):
