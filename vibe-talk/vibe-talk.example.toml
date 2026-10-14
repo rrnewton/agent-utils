@@ -62,6 +62,10 @@ thread_api = "native"
 # channels itself, GET /heads?channels=&channels= (README, "A bridge's channel heads"). Off by
 # default; turn it on only for a bridge that serves that request.
 # head_reads = false
+# With thread_api = "bridge" only: whether the bridge reads the newest messages of several channels
+# itself, GET /recent?channels=&channels=&limit= (README, "A bridge's recent reads of several
+# channels"). Off by default; turn it on only for a bridge that serves that request.
+# recent_many_reads = false
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
 upstream_read_marks = false

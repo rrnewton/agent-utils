@@ -583,7 +583,7 @@ pub const HEADS_IN_FLIGHT: usize = 4;
 
 /// What one channel's part of a [`ChatClient::fetch_recent_many`] asks for. remote-ops-audit W13
 /// `#287 bulk-reads`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecentAsk {
     /// At most this many of the channel's most recent messages, as
     /// [`ChatClient::fetch_recent_dated`] takes them.

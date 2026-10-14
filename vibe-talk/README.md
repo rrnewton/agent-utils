@@ -1790,6 +1790,7 @@ model provider or a real gateway.
 | Bridge range reads | `discord.range_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, `/page` through a span and `/count` since an instant ask the bridge for the window itself — see [A bridge's range reads](#a-bridges-range-reads) |
 | Bridge lookups by id | `discord.id_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, speech preparation of a thread, a thread summary's parts and a message by id ask the bridge for every message at once — see [A bridge's lookups by id](#a-bridges-lookups-by-id) |
 | Bridge channel heads | `discord.head_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, the newest message of several channels is one request to the bridge — see [A bridge's channel heads](#a-bridges-channel-heads) |
+| Bridge recent reads of several channels | `discord.recent_many_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, the newest messages of several channels are one request to the bridge — see [A bridge's recent reads of several channels](#a-bridges-recent-reads-of-several-channels) |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -1880,7 +1881,7 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
 `thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`,
-`recent_view_shadow`, `range_reads`, `id_reads` and `head_reads`, with the same meaning as in `[discord]`. Slack providers
+`recent_view_shadow`, `range_reads`, `id_reads`, `head_reads` and `recent_many_reads`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
@@ -2360,6 +2361,73 @@ it would have without heads.
 
 Every field but `channel` may be absent or `null`; an unknown field is ignored; anything else that
 cannot be read fails the request, and vibe-talk reads its channels as before.
+
+### Recent reads of several channels
+
+**The problem.** A voice catch-up and a call start's warm-up read the newest messages of every
+channel whose held copy is past its reuse period, one upstream read per channel. Behind a bridge
+that runs one service command at a time, five channels are five reads in series.
+
+**What it is.** `ChatClient::fetch_recent_many(asks)` reads the newest messages of several channels
+at once: per channel, how many (`limit`) and optionally only those created since an instant
+(`since`). Each answer is what a recent read of that one channel would answer, less any message
+created before `since` (a message whose instant cannot be read is kept, and an answer that lost a
+message to the trim never claims to reach back to the channel's first message). One answer per
+channel, in the order asked, a failure in its own place; the router asks each provider once for its
+own channels.
+
+**Who answers it natively.** A bridge configured with `recent_many_reads`, one request for every
+channel (see [A bridge's recent reads of several channels](#a-bridges-recent-reads-of-several-channels)).
+Every other provider answers with the trait's default, one recent read per channel, at most four in
+flight, which costs exactly what reading each channel did, and says so
+(`ReadCaps::many_channels` is emulated). Discord itself and Slack are among them: neither has a
+call that reads several channels at once. A caller that would gather its reads into one only to
+save calls gathers them only for a provider that reads them natively.
+
+### A bridge's recent reads of several channels
+
+**The problem.** A bridge is asked for each channel's newest messages one channel at a time,
+`GET /channels/{id}/messages?limit=…` each, and a bridge in front of a slow service may spend a
+service call on each. A bridge that keeps its channels current from its own live feed can answer
+all of them at once, often without asking its service at all.
+
+**What you get.** `recent_many_reads = true` (in `[discord]`, or on a `[[providers]]` entry of kind
+`discord`, only with `thread_api = "bridge"`; off by default, refused anywhere else) asks the bridge
+for the newest messages of several channels in one request, and lets the callers in
+[Recent reads of several channels](#recent-reads-of-several-channels) use it. With it off, the
+bridge is read exactly as before. Turn it on only for a bridge that implements this request: one
+that does not answers it with an error or a message list, which vibe-talk refuses as an answer it
+cannot read, and then reads each channel as it would have without it.
+
+**The request.** `GET /recent?channels=…&channels=…&limit=…&since=…`
+
+* `channels` is repeated, once per channel, at most 50 times; a longer list is several requests.
+  Ids are opaque and never joined, so they may hold any character.
+* `limit` is 1 to 100: how many of each channel's newest messages, as `/messages?limit=` takes it.
+* `since` (optional) is an RFC 3339 instant: only messages created at or after it. Channels asked
+  with a different `limit` or `since` are a request each.
+
+**The answer** is an object:
+
+```json
+{"recent": [{"channel": "id", "messages": [ … ], "exhausted": false, "as_of": null}]}
+```
+
+* One entry per channel the bridge can answer for, in any order, each channel asked about and
+  answered once. A channel the bridge leaves out is fine: vibe-talk reads that one as before.
+* `messages`: the channel's newest messages, at most `limit`, exactly the list
+  `GET /channels/{id}/messages?limit=` would give now (thread replies included where that list has
+  them), in the message wire format `/messages` uses, each message once, every one's `channel_id`
+  the channel asked about. Order does not matter; vibe-talk sorts them oldest first. vibe-talk keeps
+  only the newest `limit`, and drops any created before `since`.
+* `exhausted` (optional): `true` only when the bridge KNOWS these messages reach back to the
+  channel's first message. A short list is not that; vibe-talk never infers it from one.
+* `as_of` (optional): present only when the answer came from a copy the bridge could not bring up
+  to date, as on a timeline read. Absent means now: answer from a copy only while it is current,
+  for example while the bridge's live feed of the channel is healthy.
+
+Every field but `channel` and `messages` may be absent or `null`; an unknown field is ignored;
+anything else that cannot be read fails the request, and vibe-talk reads its channels as before.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 
