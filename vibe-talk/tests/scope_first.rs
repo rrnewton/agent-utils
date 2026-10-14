@@ -1086,3 +1086,343 @@ async fn every_api_answer_is_no_store_whoever_asks_and_however() {
     assert!(checked > 300, "only {checked} answers were checked");
     assert!(granted > 20, "only {granted} answers were successes");
 }
+
+/// `#208 persistent-cache`: what a read-scope session leaves in the message cache — nothing.
+mod read_scope_writes_nothing {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt as _;
+    use serde_json::{json, Value};
+    use tower::ServiceExt as _;
+    use vibe_talk::cache::coverage::{Head, Interval};
+    use vibe_talk::cache::{CachedMessage, ChanKey, Counts, MessageCache, Scope as CacheScope};
+    use vibe_talk::model::{ChannelId, MessageId};
+    use vibe_talk::testing::{
+        self, ManualClock, TempDir, TimelineChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL,
+        WRITE_TOKEN,
+    };
+
+    use super::{inventory, Auth, Input, INGEST_TOKEN};
+
+    /// 2026-08-18T12:00:00Z.
+    const T0: i64 = 1_787_054_400_000;
+    const MINUTE: i64 = 60_000;
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// Everything the file says, read back through the cache.
+    #[derive(Debug, PartialEq)]
+    struct Held {
+        counts: Counts,
+        coverage: Vec<Vec<Interval>>,
+        heads: Vec<Option<Head>>,
+        tombstones: Vec<bool>,
+        messages: Vec<Option<CachedMessage>>,
+    }
+
+    fn held(
+        cache: &MessageCache,
+        scopes: &[(ChanKey, CacheScope)],
+        ids: &[(ChanKey, MessageId)],
+    ) -> Held {
+        assert!(cache.quiesce_blocking(WAIT), "the writer is idle");
+        Held {
+            counts: cache.counts().served().expect("counts"),
+            coverage: scopes
+                .iter()
+                .map(|(chan, scope)| cache.coverage(chan, scope).served().expect("coverage"))
+                .collect(),
+            heads: scopes
+                .iter()
+                .map(|(chan, scope)| cache.head(chan, scope).served().expect("a head"))
+                .collect(),
+            tombstones: ids
+                .iter()
+                .map(|(chan, id)| cache.tombstoned(chan, id).served().expect("a tombstone"))
+                .collect(),
+            messages: ids
+                .iter()
+                .map(|(chan, id)| cache.message(chan, id).served().expect("a row"))
+                .collect(),
+        }
+    }
+
+    /// The file's bytes, the database and its write-ahead log, once the writer is idle.
+    fn bytes(cache: &MessageCache) -> (Vec<u8>, Vec<u8>) {
+        assert!(cache.quiesce_blocking(WAIT), "the writer is idle");
+        let path = cache.path().to_owned();
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        (
+            std::fs::read(&path).expect("the database"),
+            std::fs::read(&wal).unwrap_or_default(),
+        )
+    }
+
+    /// One request; the status, and the body unless the route streams.
+    async fn send(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = builder
+            .body(Body::from(body.unwrap_or_default().to_owned()))
+            .expect("request");
+        let response =
+            tokio::time::timeout(Duration::from_secs(20), router.clone().oneshot(request))
+                .await
+                .expect("the router answers in time")
+                .expect("the router answers");
+        let status = response.status();
+        if uri.ends_with("/stream") {
+            return (status, Value::Null);
+        }
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_read_token_session_across_every_read_route_and_tool_leaves_the_cache_unchanged() {
+        let clock = ManualClock::at(T0 + 60 * MINUTE);
+        let dir = TempDir::new("scope-first-cache");
+        let text = format!(
+            "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n",
+            testing::config_toml()
+        );
+        let (mut state, fake, _voice) = testing::state_from_toml(&text);
+        let read = ChannelId(READ_CHANNEL.to_owned());
+        let ids: Vec<MessageId> = (0..12)
+            .map(|n| {
+                fake.seed_at(
+                    &read,
+                    "Ada",
+                    &format!("message {n} about lunch"),
+                    T0 + n * MINUTE,
+                )
+            })
+            .collect();
+        let root = ids[4].clone();
+        for n in [7, 9] {
+            fake.set_reply_to(&ids[n], &root);
+        }
+        let written: Vec<MessageId> = (0..4)
+            .map(|n| {
+                fake.seed_at(
+                    &ChannelId(WRITE_CHANNEL.to_owned()),
+                    "Bo",
+                    &format!("note {n}"),
+                    T0 + n * MINUTE,
+                )
+            })
+            .collect();
+        state.replace_chat(Arc::new(TimelineChat::new(fake.clone())));
+        let state = testing::with_message_cache(state, dir.path(), clock.clone());
+        let cache = state.message_cache.cache().expect("installed");
+        let router = vibe_talk::http::router(state.clone());
+
+        // A write-token session first, so the file holds rows, coverage, heads and a tombstone.
+        let channel = |id: &str, rest: &str| format!("/api/v1/channels/{id}{rest}");
+        for uri in [
+            channel(READ_CHANNEL, "/messages?limit=50"),
+            channel(READ_CHANNEL, "/timeline?view=main&limit=50"),
+            channel(
+                READ_CHANNEL,
+                &format!("/timeline?view=thread&thread_id={}", root.as_str()),
+            ),
+            channel(WRITE_CHANNEL, "/messages?limit=50"),
+        ] {
+            let (status, body) = send(&router, "GET", &uri, WRITE_TOKEN, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+        let deleted = ids[2].clone();
+        fake.delete(&deleted);
+        clock.advance(MINUTE);
+        let uri = channel(READ_CHANNEL, "/timeline?view=main&limit=50");
+        let (status, _) = send(&router, "GET", &uri, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK);
+        clock.advance(MINUTE);
+
+        let legacy = vibe_talk::config::LEGACY_DISCORD_PROVIDER_KEY;
+        let read_chan = ChanKey::new(legacy, READ_CHANNEL);
+        let write_chan = ChanKey::new(legacy, WRITE_CHANNEL);
+        let scopes: Vec<(ChanKey, CacheScope)> = [&read_chan, &write_chan]
+            .into_iter()
+            .flat_map(|chan| {
+                [
+                    CacheScope::Main,
+                    CacheScope::Flat,
+                    CacheScope::Thread(root.as_str().to_owned()),
+                ]
+                .into_iter()
+                .map(move |scope| (chan.clone(), scope))
+            })
+            .collect();
+        let every_id: Vec<(ChanKey, MessageId)> = ids
+            .iter()
+            .map(|id| (read_chan.clone(), id.clone()))
+            .chain(written.iter().map(|id| (write_chan.clone(), id.clone())))
+            .collect();
+        let before = held(&cache, &scopes, &every_id);
+        assert!(before.counts.messages >= 15, "{before:?}");
+        assert!(!before.coverage[0].is_empty(), "main is covered");
+        assert!(before.heads[0].is_some());
+        assert!(before.tombstones[2], "the deleted message is a tombstone");
+        let applied = cache.applied_seq();
+        let file = bytes(&cache);
+
+        // Every read route, at real channel and message ids, with the read token.
+        let message = ids[6].as_str();
+        let mut uris: Vec<(&'static str, String, Option<String>)> = Vec::new();
+        for route in inventory().iter().filter(|route| route.auth == Auth::Read) {
+            let path = route
+                .path
+                .replace("{channel_id}", READ_CHANNEL)
+                .replace("{message_id}", message);
+            let (query, body) = match route.input {
+                Input::Query(good, _) => (good.to_owned(), None),
+                Input::Json(body) | Input::OwnJson(body) | Input::Bytes(body, _) => {
+                    (String::new(), Some(body.replace("3333333333", message)))
+                }
+                Input::Nothing => (String::new(), None),
+            };
+            uris.push((route.method, format!("{path}{query}"), body));
+        }
+        // And every way a read route reads: each timeline view and direction, a thread lookup, a
+        // walk from an instant, a count from one.
+        let at = vibe_talk::clock::iso_from_ms;
+        for rest in [
+            "/timeline?view=flat&limit=50".to_owned(),
+            "/timeline?view=threads".to_owned(),
+            format!("/timeline?view=thread&thread_id={}", root.as_str()),
+            format!("/timeline?view=main&before={}", ids[8].as_str()),
+            format!("/messages/{}?thread_id={}", ids[9].as_str(), root.as_str()),
+            format!("/page?since={}&until={}", at(T0), at(T0 + 60 * MINUTE)),
+            format!("/page?before={}", ids[8].as_str()),
+            format!("/count?since={}", at(T0)),
+        ] {
+            uris.push(("GET", channel(READ_CHANNEL, &rest), None));
+        }
+        let mut answered = 0;
+        for (method, uri, body) in &uris {
+            let (status, _) = send(&router, method, uri, READ_TOKEN, body.as_deref()).await;
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_ne!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            if status.is_success() {
+                answered += 1;
+            }
+        }
+        // A forward read, from the cursor the newest page handed back.
+        let (_, newest) = send(
+            &router,
+            "GET",
+            &channel(READ_CHANNEL, "/timeline?view=main"),
+            READ_TOKEN,
+            None,
+        )
+        .await;
+        let cursor = newest["next_after"].as_str().expect("a forward cursor");
+        let (status, _) = send(
+            &router,
+            "GET",
+            &channel(READ_CHANNEL, &format!("/timeline?view=main&after={cursor}")),
+            READ_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            answered >= 25,
+            "only {answered} of {} read requests succeeded",
+            uris.len()
+        );
+
+        // Every tool a read-scope MCP session is offered.
+        let arguments: BTreeMap<&str, Vec<Value>> = BTreeMap::from([
+            ("recent_activity", vec![json!({})]),
+            ("list_channels", vec![json!({})]),
+            (
+                "digest_channel",
+                vec![json!({"channel_id": READ_CHANNEL, "limit": 20})],
+            ),
+            (
+                "read_page",
+                vec![
+                    json!({"channel_id": READ_CHANNEL, "limit": 5}),
+                    json!({"channel_id": READ_CHANNEL, "since": at(T0), "until": at(T0 + 60 * MINUTE)}),
+                ],
+            ),
+            ("count_messages", vec![json!({"channel_id": READ_CHANNEL})]),
+            (
+                "find_message",
+                vec![json!({"channel_id": READ_CHANNEL, "query": "message 6 about lunch"})],
+            ),
+            (
+                "read_message",
+                vec![json!({"channel_id": READ_CHANNEL, "message_id": message})],
+            ),
+        ]);
+        let offered: BTreeSet<String> =
+            vibe_talk::mcp::protocol::tools_for(&state, vibe_talk::auth::Scope::Read)
+                .await
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("a name").to_owned())
+                .collect();
+        assert_eq!(
+            offered,
+            arguments.keys().map(|name| (*name).to_owned()).collect(),
+            "every tool a read-scope session is offered is called here"
+        );
+        for (name, calls) in &arguments {
+            for args in calls {
+                let call = json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": args},
+                });
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", format!("Bearer {READ_TOKEN}"))
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .body(Body::from(call.to_string()))
+                    .expect("request");
+                let response = router.clone().oneshot(request).await.expect("answered");
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let reply: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                assert_eq!(status, StatusCode::OK, "{name}: {reply}");
+                assert_eq!(reply["result"]["isError"], false, "{name} {args}: {reply}");
+            }
+        }
+
+        // Nothing was offered, so nothing changed, down to the bytes.
+        assert_eq!(cache.applied_seq(), applied, "nothing reached the writer");
+        assert_eq!(held(&cache, &scopes, &every_id), before);
+        assert!(bytes(&cache) == file, "the file's bytes changed");
+    }
+}
