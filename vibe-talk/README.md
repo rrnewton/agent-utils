@@ -2267,9 +2267,10 @@ How a deployment with several providers behaves:
 
 ## Durable state
 
-Almost nothing in this server is remembered. Nothing about a channel is written to disk, and
-the page and the tools read channels from the chat provider. Two short-lived copies are the
-exceptions. Both are in MEMORY only, they are kept apart, and both are gone when the process
+Almost nothing in this server is remembered. Unless an operator turns on the message cache, a
+separate file described in "The message cache" below, nothing about a channel is written to disk.
+Either way, the page and the tools read channels from the chat provider. Two short-lived copies
+are the exceptions. Both are in MEMORY only, they are kept apart, and both are gone when the process
 restarts. Messages fetched for the page in the last 30 seconds are kept so that preparing them
 for read-aloud does not fetch them again (`#191 read-aloud-first-lag`, `src/read_ahead.rs`).
 Nothing else reads them, a pushed edit or deletion drops the message, two reads that overlap and
@@ -3238,10 +3239,13 @@ put back into the to-do list purely because time passed, and the **channel alias
 bound would rename back months later with nothing on screen saying why. Both are bounded by
 something other than time — a count, and the channel allowlist.
 
-The age bound is the only thing that collects an **orphan**: a cached summary whose message was
-edited or deleted upstream is unreachable by key, is filed under the current policy version, and
-nothing will ever announce that it went. The startup sweep cannot help — it deletes by policy
-version, and an orphan is under the live one.
+Without the message cache, the age bound is the only thing that collects an **orphan**. An orphan
+is a cached summary whose message was edited or deleted upstream: it is unreachable by key, it is
+filed under the current policy version, and nothing announces that its message changed. The
+startup sweep cannot help — it deletes by policy version, and an orphan is under the live one.
+With the message cache on, the cache is where the server learns of an edit or a deletion, and a
+summary of the old text is deleted once the change is written (see "The message cache"). A change
+the cache never hears of is still left to the age bound.
 
 **Deleted means overwritten.** The store sets SQLite's `secure_delete`, so from this version on a
 purged or pruned row is zeroed in the file rather than left in a free page for anyone who reads it.
@@ -3966,7 +3970,10 @@ case of: every durable write — a turn, a read mark, a cached summary — needs
 `/summary` is the interesting one, because it is readable at read scope and yet has something to
 file: a read token is served from the cache when there is a hit and its answer is never written
 back. `/inbox` is the single durable READ a read token may make, because how far you have
-read is the thing the voice agent has to be able to say out loud.
+read is the thing the voice agent has to be able to say out loud. Nothing a read token reads is
+written to the message cache either. The one durable change a read-scope request can set off is
+an erase: a provider's refusal of a channel read, once the server's own read has confirmed it,
+erases the cached copy of that channel, whoever noticed first. See "The message cache".
 
 **`/api/v1/inbox` carries `read_state_notice` on every answer**, including the local mutating ones,
 saying that this read state is vibe-talk's own and is synchronised with Discord in neither
@@ -7955,6 +7962,11 @@ makes it, not the voice agent, the real security boundary of the whole design.
   speech and the channel text the agent read aloud sit in the clear in a SQLite file that
   outlives the container. Anyone with host filesystem access can read it. Retention bounds how
   much accumulates; it does not protect what is there.
+* **The message cache is not encrypted at rest either.** Once an operator turns it on, other
+  people's channel text sits in the clear in a second SQLite file, `0600`, in a directory only
+  this account can enter. Erasing it is logical, not physical, and copies a backup or sync agent
+  already took are not reached. Keep it outside anything synced or backed up; see "The message
+  cache".
 * **The bot's own permissions are the real ceiling.** Give the bot the narrowest Discord
   permissions that work, in the fewest channels. Server-side allowlisting is a second fence, not
   the first one.
@@ -8257,12 +8269,13 @@ Beyond the security list above:
   warns, and it says so on the page — but the cache stays empty forever and there is no reduced
   service to fall back on. `summaries.model` is still recorded in the cache key and read by
   nothing, which is the last vestige of a selector that no longer exists.
-* No caching of channel content on disk. Two short-lived copies are kept in memory for reading:
-  read-aloud preparation reuses messages the page fetched in the last 30 seconds
-  (`#191 read-aloud-first-lag`), and the voice catch-up answers from each channel's newest window
-  when the provider is slow (`#210 voice-catchup-speed`; see "The eight tools"). Obeying `Retry-After`
-  does not change that — it buys time, not quota, so a poll interval still spends one request per
-  channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
+* Nothing is answered from channel content on disk. The message cache, once an operator turns it
+  on, keeps a copy but answers nothing yet (see "The message cache"). Two short-lived copies are
+  kept in memory for reading: read-aloud preparation reuses messages the page fetched in the last
+  30 seconds (`#191 read-aloud-first-lag`), and the voice catch-up answers from each channel's
+  newest window when the provider is slow (`#210 voice-catchup-speed`; see "The eight tools").
+  Obeying `Retry-After` does not change that — it buys time, not quota, so a poll interval still
+  spends one request per channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
   defaults to OFF and why an interval under five seconds is still refused outright rather than
   clamped. The summary cache is the one exception and it is a cache of DERIVED text, bounded and
   purgeable — see "Durable state". The two copies in memory named above are not the only channel
