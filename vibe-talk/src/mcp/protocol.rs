@@ -1636,7 +1636,9 @@ mod tests {
         // `#34 voice-chat-write-confirm`. The model is told, first, that nothing went out, and is
         // given the exact text to read back — but never the handle that would send it.
         assert!(text.starts_with("NOT SENT."), "{text}");
-        assert!(text.contains("Exact text: landed it"), "{text}");
+        // `#303 voice-post-prefix`: with the owner's tag, which is what will be posted.
+        let tagged = format!("{}landed it", crate::post_prefix::DEFAULT_PREFIX);
+        assert!(text.contains(&format!("Exact text: {tagged}")), "{text}");
         let handle = state.post_gate.pending().expect("pending").handle;
         assert!(
             !text.contains(&handle),
@@ -1647,7 +1649,7 @@ mod tests {
         let recorded = fake.posted();
         assert_eq!(recorded.len(), 1, "{recorded:?}");
         assert_eq!(recorded[0].channel.as_str(), WRITE_CHANNEL);
-        assert_eq!(recorded[0].content, "landed it");
+        assert_eq!(recorded[0].content, tagged);
     }
 
     #[tokio::test]

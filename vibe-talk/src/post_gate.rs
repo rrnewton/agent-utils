@@ -94,6 +94,10 @@ pub struct Proposal {
     pub handle: String,
     /// What was proposed.
     pub binding: Binding,
+    /// The start of `binding.text` that this server put there — the owner's tag for what the voice
+    /// agent posts (`#303 voice-post-prefix`) — or empty when it added nothing. Not part of the
+    /// binding: a commit restates the whole text, tag and all, and is never tagged again.
+    pub prefix: String,
     /// When it was made.
     pub created: Instant,
     /// How long it lives.
@@ -354,6 +358,17 @@ impl PostGate {
 
     /// Record a proposal, replacing any pending one, and return it with whatever it displaced.
     pub fn propose(&self, binding: Binding) -> (Proposal, Option<Displaced>) {
+        self.propose_tagged(binding, String::new())
+    }
+
+    /// [`Self::propose`], for a text this server tagged: `prefix` is the start of `binding.text` it
+    /// put there. `#303 voice-post-prefix`.
+    pub fn propose_tagged(
+        &self,
+        binding: Binding,
+        prefix: String,
+    ) -> (Proposal, Option<Displaced>) {
+        debug_assert!(binding.text.starts_with(&prefix));
         let now = Instant::now();
         let mut inner = self.lock();
         let displaced = match inner.expire(now) {
@@ -376,6 +391,7 @@ impl PostGate {
             serial: inner.next_serial,
             handle: fresh_handle(),
             binding,
+            prefix,
             created: now,
             ttl: self.ttl,
         };

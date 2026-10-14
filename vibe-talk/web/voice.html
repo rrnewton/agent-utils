@@ -918,6 +918,36 @@
                   <p id="voice-send-hosted" class="hint" hidden>The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.</p>
                 </div>
                 <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
+                <!--
+                  `#303 voice-post-prefix`. The tag the SERVER puts before every message the voice
+                  agent posts — "(Voice-agent relayed, from user) " until the owner saves his own —
+                  so a reader can tell a relayed message from one he typed. Kept in the server's
+                  store beside his instructions for the agent, shared by every device and every
+                  call, so it is drawn from client-config and redrawn from what the PUT or DELETE
+                  answered, never from the box alone.
+
+                  Save sends the box as typed; an empty box is saved as empty, which turns the tag
+                  off and is not the same as never having saved one. Reset to default forgets his
+                  own and puts the default back. The line under the buttons, written by
+                  `renderVoicePostPrefix` in web/voice.js, says which is in force. Hidden as a whole
+                  when the server does not report it, which is an older server that tags nothing.
+                -->
+                <div id="voice-post-prefix-editor" hidden>
+                  <label for="voice-post-prefix">Prefix on messages the agent posts</label>
+                  <input
+                    id="voice-post-prefix"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    aria-describedby="voice-post-prefix-help voice-post-prefix-state"
+                  />
+                  <p id="voice-post-prefix-help" class="hint">Put in front of every message the voice agent posts, and in its read-back, but never on what you type. Empty turns it off.</p>
+                  <div class="channel-actions">
+                    <button id="save-voice-post-prefix" class="secondary" type="button" disabled>Save</button>
+                    <button id="reset-voice-post-prefix" class="secondary" type="button">Reset to default</button>
+                  </div>
+                  <p id="voice-post-prefix-state" class="hint" aria-live="polite"></p>
+                </div>
               </section>
 
               <!--
@@ -2329,6 +2359,19 @@
                 this page replace its prompt; otherwise it needs the new prompt pasted again. Its
                 approval for post_reply, set in the same console, is changed by hand either way.
                 The line under the switch says which applies, from what the last call was given.
+              </p>
+              <p class="hint">
+                <strong>Prefix on messages the agent posts</strong> is put in front of every message
+                the voice agent posts, so the people reading the channel can tell it from one you
+                typed: <em>(Voice-agent relayed, from user)</em> unless you save your own. The server
+                adds it, the same for every device and every call, whether you confirm or the agent
+                sends at once, to a reply as to the channel, and on the first part of a message too
+                long to go as one. It counts toward that length. The read-back and the card show it,
+                because they show exactly what will be posted; its brackets or symbols do not stop a
+                spoken yes, because the server wrote them, not the agent. Messages you type on this
+                page never get it. It is put in front exactly as saved, so end it with a space; save
+                it empty to turn it off, and <strong>Reset to default</strong> to go back to the
+                shipped one.
               </p>
             </details>
 

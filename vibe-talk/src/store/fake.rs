@@ -73,6 +73,9 @@ struct State {
     /// The owner's words for the voice agent; `None` until he saves any.
     /// `#272 voice-agent-instructions`.
     owner_prompt: Option<OwnerPrompt>,
+    /// The owner's tag for what the voice agent posts; `None` until he saves one, `Some("")` for
+    /// none at all. `#303 voice-post-prefix`.
+    post_prefix: Option<String>,
     /// `(channel, message)` to `(when it was exempted, insertion order)`: the "not noise" list,
     /// with enough of the real table's shape to reproduce its count bound and its eviction order.
     noise_exemptions: BTreeMap<(String, String), (i64, u64)>,
@@ -679,6 +682,19 @@ impl StateStore for FakeStore {
         Ok(prompt.clone())
     }
 
+    async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.post_prefix.clone())
+    }
+
+    async fn set_post_prefix(&self, prefix: Option<&str>) -> Result<Option<String>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.post_prefix = prefix.map(str::to_owned);
+        Ok(state.post_prefix.clone())
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -1097,6 +1113,7 @@ impl StateStore for FakeStore {
         state.noise_rules = None;
         state.ask_before_send = None;
         state.owner_prompt = None;
+        state.post_prefix = None;
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();

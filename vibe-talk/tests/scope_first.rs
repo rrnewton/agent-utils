@@ -364,6 +364,15 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"instructions":"Be brief."}"#),
         ),
+        // `#303 voice-post-prefix`.
+        route("GET", "/api/v1/voice-post-prefix", Read, Nothing),
+        route(
+            "PUT",
+            "/api/v1/voice-post-prefix",
+            Write,
+            Json(r#"{"prefix":"[voice] "}"#),
+        ),
+        route("DELETE", "/api/v1/voice-post-prefix", Write, Nothing),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/not-noise",

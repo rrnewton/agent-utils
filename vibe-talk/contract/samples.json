@@ -165,6 +165,13 @@
       "upstream_clear_supported": true,
       "upstream_read_mark_supported": true,
       "version": "0.0.0",
+      "voice_post_prefix": {
+        "changeable": true,
+        "custom": false,
+        "default_prefix": "(Voice-agent relayed, from user) ",
+        "max_chars": 100,
+        "prefix": "(Voice-agent relayed, from user) "
+      },
       "voice_prompt": {
         "changeable": true,
         "delivery": "page",
@@ -612,9 +619,10 @@
         "channel_name": "lead team",
         "expires_in_ms": 120000,
         "handle": "AAAAAAAAAAAAAAAAAAAAAA",
+        "prefix": "(Voice-agent relayed, from user) ",
         "reply_to": "300",
         "serial": 3,
-        "text": "on my way"
+        "text": "(Voice-agent relayed, from user) on my way"
       }
     },
     {
@@ -1415,6 +1423,36 @@
       "detail": "why",
       "message": "failed",
       "type": "error"
+    }
+  ],
+  "VoicePostPrefix": [
+    {
+      "changeable": true,
+      "custom": false,
+      "default_prefix": "(Voice-agent relayed, from user) ",
+      "max_chars": 100,
+      "prefix": "(Voice-agent relayed, from user) "
+    },
+    {
+      "changeable": true,
+      "custom": true,
+      "default_prefix": "(Voice-agent relayed, from user) ",
+      "max_chars": 100,
+      "prefix": "[voice] "
+    },
+    {
+      "changeable": true,
+      "custom": true,
+      "default_prefix": "(Voice-agent relayed, from user) ",
+      "max_chars": 100,
+      "prefix": ""
+    },
+    {
+      "changeable": false,
+      "custom": false,
+      "default_prefix": "(Voice-agent relayed, from user) ",
+      "max_chars": 100,
+      "prefix": "(Voice-agent relayed, from user) "
     }
   ],
   "VoicePromptSettings": [

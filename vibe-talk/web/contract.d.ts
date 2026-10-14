@@ -325,6 +325,16 @@ declare namespace VibeTalk {
      */
     version: string;
     /**
+     * The tag this server puts before every message the voice agent posts, as Settings shows it.
+     * `#303 voice-post-prefix`.
+     *
+     * Here so the Sending section's field is drawn at sign-in, as the send setting is. Readable at
+     * read scope — it is in every post the agent makes, which any reader of the channel sees —
+     * and changed only by a write-scope `PUT` or `DELETE /api/v1/voice-post-prefix`. Absent from
+     * an older server, which tags nothing; the page then hides the field.
+     */
+    voice_post_prefix?: VoicePostPrefix | null;
+    /**
      * The owner's own words for the voice agent, as Settings shows them. `#272
      * voice-agent-instructions`.
      *
@@ -778,6 +788,13 @@ declare namespace VibeTalk {
      * The single-use confirmation handle.
      */
     handle: string;
+    /**
+     * The start of `text` that this server put there: the owner's tag for what the voice agent
+     * posts (`#303 voice-post-prefix`). `text` begins with exactly this. Absent when nothing was
+     * added — tagging is off — and from an older server. It is his own words, not the agent's, so
+     * a client judging whether the agent's words can be confirmed by voice judges the rest.
+     */
+    prefix?: string;
     /**
      * The message it would reply to, when any.
      */
@@ -1543,6 +1560,40 @@ declare namespace VibeTalk {
   }
 
   /**
+   * The tag this server puts before every message the voice agent posts. `#303 voice-post-prefix`.
+   *
+   * The body of `GET`, `PUT` and `DELETE /api/v1/voice-post-prefix`, and `voice_post_prefix` in
+   * client-config. The tag counts toward the provider's post-size limit and goes on the first part
+   * of a post that has to be cut; posts typed on the page never carry it.
+   */
+  interface VoicePostPrefix {
+    /**
+     * Whether this server can keep a change. False with no store configured, and when the store
+     * cannot be read — the server then tags with the default.
+     */
+    changeable: boolean;
+    /**
+     * Whether `prefix` is the owner's own saved choice — possibly empty, which turns the tag off —
+     * rather than the default because he has saved none.
+     */
+    custom: boolean;
+    /**
+     * The tag this server ships, which a reset brings back.
+     */
+    default_prefix: string;
+    /**
+     * The longest tag a save may carry, in characters.
+     */
+    max_chars: number;
+    /**
+     * The tag in force: the owner's saved one when `custom`, otherwise `default_prefix`. Empty
+     * means the voice agent's posts carry no tag. Put before the words exactly as it is, so a
+     * trailing space is what separates the two.
+     */
+    prefix: string;
+  }
+
+  /**
    * The owner's own words for the voice agent, as Settings shows them. `#272
    * voice-agent-instructions`.
    *
@@ -1675,6 +1726,7 @@ declare namespace VibeTalk {
     VoiceSettings: VoiceSettings;
     MessagesResponse: MessagesResponse;
     VoicePromptSettings: VoicePromptSettings;
+    VoicePostPrefix: VoicePostPrefix;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

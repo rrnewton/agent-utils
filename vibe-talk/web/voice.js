@@ -123,7 +123,7 @@ let sideActive = false;
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
  *   | "reply-branch" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
- *   | "voice-ask-before-send"} id
+ *   | "voice-ask-before-send" | "voice-post-prefix"} id
  * @returns {HTMLInputElement}
  */
 /**
@@ -163,8 +163,9 @@ let sideActive = false;
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send"
+ *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
- *   | "save-voice-system-prompt"
+ *   | "save-voice-post-prefix" | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
  *   | "thread-back"
@@ -9408,6 +9409,8 @@ function settlePostCard(proposal) {
 //     a mention (the model says a name there), a link, a symbol such as + or #, an emoji, or
 //     markup — ~~struck~~, ||hidden||, > quoted, *stressed*, `code` — could change what is posted
 //     while every word still matched: "~~don't~~ merge the PR" is heard as "don't merge the PR".
+//     The owner's tag the server put in front of the agent's words (`#303 voice-post-prefix`) is
+//     read back with them, but is not judged so: it is his, not the model's (`agentDraft`).
 //   * A REAL SPOKEN CALL with echo cancellation on. A typed call has no spoken answer, and without
 //     echo cancellation the agent's own "Send it?" can come back as the answer.
 //   * AN UNINTERRUPTED READ-BACK. Nothing cut the assistant off since the user last spoke, and on
@@ -9721,6 +9724,25 @@ function unsayableDraft(text) {
     .replace(/[.,;:!?\u2026]+(?=\s|$)/gu, "")
     .replace(/[\p{L}\p{Nd}\u0027\s]/gu, "");
   return rest ? "symbols" : null;
+}
+
+/**
+ * What the agent wrote of a draft: its text without the tag the server put in front of it, which
+ * the proposal names (`prefix`, `#303 voice-post-prefix`).
+ *
+ * Pure. The tag is the owner's own words, saved in Settings and added by the server to every post
+ * the agent makes, so nothing the agent was told or read can change it. It is still held to the
+ * read-back word for word — `isExactReadBack` compares the whole text, tag and all, because the tag
+ * is posted — but it is not judged by `unsayableDraft`: that guards against a model hiding meaning
+ * where a voice cannot say it, and the shipped tag's parentheses would otherwise make every draft
+ * tap-only. A proposal with no `prefix` — tagging off, or an older server — is the agent's text
+ * whole.
+ *
+ * @param {{text: string, prefix?: string}} shown
+ */
+function agentDraft(shown) {
+  const prefix = typeof shown.prefix === "string" ? shown.prefix : "";
+  return prefix && shown.text.startsWith(prefix) ? shown.text.slice(prefix.length) : shown.text;
 }
 
 /**
@@ -10314,7 +10336,8 @@ function spokenYesRefusal(shown, answer, heard) {
   if (session.echoCancellation !== true) return "echo_cancellation_off";
   if (heard.cut || (session.protocol === "vibe-talk-v1" && !heard.done)) return "interrupted";
   // Before the read-back, which cannot see what makes a draft unsayable: its words may all match.
-  const unsayable = unsayableDraft(shown.text);
+  // The agent's words only: the owner's tag in front of them is the server's (`agentDraft`).
+  const unsayable = unsayableDraft(agentDraft(shown));
   if (unsayable) return unsayable;
   const readBack = readBackRefusal(shown, heard.turns);
   if (readBack) {
@@ -28463,6 +28486,112 @@ function renderVoiceSendSettingWhileSaving(wanted) {
   el("voice-ask-before-send").disabled = true;
 }
 
+// --- the prefix on the voice agent's posts ---------------------------------------------------------
+//
+// `#303 voice-post-prefix`. The tag the SERVER puts before every message the voice agent posts, so
+// the channel can tell a relayed message from one the owner typed. Like the send switch above it is
+// the server's — kept in its store, the same for every device and every call — so the box is filled
+// from client-config and refilled from what the PUT or DELETE answered. Save is its own, because a
+// half-typed tag must not go out on the agent's next post. An empty box saved is the owner's choice
+// of no tag, which the server keeps apart from never having chosen; Reset to default is the way back
+// to the shipped one.
+
+/** The tag as the server last reported it, or null when it does not say (an older server). */
+let voicePostPrefix = null;
+
+/** True while a save or a reset is on its way, so a second click cannot race it. */
+let voicePostPrefixSaving = false;
+
+/**
+ * A tag as the server keeps it (`post_prefix::clean`): one line, any control character a space, no
+ * space in front, and nothing at all when it is nothing but space. Trailing space stays: it is what
+ * keeps the tag off the first word.
+ */
+function cleanPostPrefix(text) {
+  const oneLine = String(text).replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/^\s+/u, "");
+  return oneLine.trim() === "" ? "" : oneLine;
+}
+
+/** Take down what the server said — from client-config, or from a save — and fill the box from it. */
+function applyVoicePostPrefix(view) {
+  voicePostPrefix =
+    view && typeof view.prefix === "string" && typeof view.default_prefix === "string" ? view : null;
+  if (voicePostPrefix !== null) el("voice-post-prefix").value = voicePostPrefix.prefix;
+  renderVoicePostPrefix();
+}
+
+/** Whether the box holds a tag the server does not. */
+function voicePostPrefixDirty() {
+  return voicePostPrefix !== null && cleanPostPrefix(el("voice-post-prefix").value) !== voicePostPrefix.prefix;
+}
+
+/** The line under the box: what is in force, or why the box cannot be saved. */
+function voicePostPrefixLine(dirty, length) {
+  const settings = /** @type {VibeTalk.VoicePostPrefix} */ (voicePostPrefix);
+  if (length > settings.max_chars) {
+    return `${length} characters; at most ${settings.max_chars} are kept. Shorten it to save.`;
+  }
+  if (dirty) return "Not saved yet.";
+  if (!settings.custom) return "The default.";
+  return settings.prefix ? "Saved. Every message the agent posts starts with it." : "Off: the agent's messages carry no prefix.";
+}
+
+/** Draw the box, its two buttons and its line from `voicePostPrefix` and the token's scope. */
+function renderVoicePostPrefix() {
+  el("voice-post-prefix-editor").hidden = voicePostPrefix === null;
+  if (voicePostPrefix === null) return;
+  const lock = tokenScope !== "write"
+    ? "Only the write token can change this."
+    : voicePostPrefix.changeable ? "" : "This server keeps no settings, so this cannot be changed here.";
+  const box = el("voice-post-prefix");
+  const dirty = voicePostPrefixDirty();
+  const length = [...cleanPostPrefix(box.value)].length;
+  const held = Boolean(lock) || voicePostPrefixSaving;
+  box.disabled = Boolean(lock);
+  el("save-voice-post-prefix").disabled = held || !dirty || length > voicePostPrefix.max_chars;
+  // Nothing to reset when the default is in force and in the box.
+  el("reset-voice-post-prefix").disabled = held || (!voicePostPrefix.custom && !dirty);
+  el("voice-post-prefix-state").textContent = [lock, voicePostPrefixLine(dirty, length)].filter(Boolean).join(" ");
+}
+
+/**
+ * Save the box (`reset` false) or go back to the default (`reset` true), then draw what the server
+ * STORED. On failure the typed tag stays in the box, and the error says it was not saved.
+ */
+async function saveVoicePostPrefix(reset) {
+  if (voicePostPrefix === null) return;
+  if (reset && !voicePostPrefix.custom) {
+    // Nothing of his is saved: put the default back in the box and write nothing.
+    el("voice-post-prefix").value = voicePostPrefix.default_prefix;
+    renderVoicePostPrefix();
+    return;
+  }
+  voicePostPrefixSaving = true;
+  renderVoicePostPrefix();
+  let stored = null;
+  try {
+    stored = await apiDecoded(
+      "VoicePostPrefix",
+      "/api/v1/voice-post-prefix",
+      reset ? { method: "DELETE" } : { method: "PUT", body: { prefix: el("voice-post-prefix").value } }
+    );
+  } catch (error) {
+    voicePostPrefixSaving = false;
+    renderVoicePostPrefix();
+    showError(`The prefix was not ${reset ? "reset" : "saved"}: ${error.detail || error.message}`);
+    return;
+  }
+  voicePostPrefixSaving = false;
+  applyVoicePostPrefix(stored);
+  setStatus(
+    !stored.custom
+      ? "Reset. The voice agent's messages start with the default prefix again."
+      : stored.prefix
+        ? "Saved. Every message the voice agent posts starts with this prefix."
+        : "Saved. The voice agent's messages carry no prefix."
+  );
+}
+
 // --- the voice agent's instructions ----------------------------------------------------------------
 //
 // `#272 voice-agent-instructions`. The owner's own words for the agent — additional instructions,
@@ -35494,6 +35623,8 @@ function applyClientConfig(config) {
   applyVoiceSendSetting(config.voice_settings);
   // `#272 voice-agent-instructions`. After `tokenScope` too, for the same reason.
   applyVoicePrompt(config.voice_prompt);
+  // `#303 voice-post-prefix`. After `tokenScope` too, for the same reason.
+  applyVoicePostPrefix(config.voice_post_prefix);
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
@@ -36275,6 +36406,9 @@ el("save-voice-system-prompt").addEventListener(
   guardQuietly(() => saveVoicePrompt("system_prompt", el("voice-system-prompt").value))
 );
 el("restore-voice-system-prompt").addEventListener("click", guardQuietly(restoreVoiceSystemPrompt));
+el("voice-post-prefix").addEventListener("input", renderVoicePostPrefix);
+el("save-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(false)));
+el("reset-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(true)));
 el("noise-rule-new").addEventListener("keydown", (event) => {
   if (event.key === "Enter") guardQuietly(addNoiseRule)();
 });

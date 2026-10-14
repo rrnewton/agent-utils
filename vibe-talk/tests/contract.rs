@@ -19,7 +19,7 @@ use vibe_talk::contract::{
     PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals,
     TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoicePromptSettings, VoiceSettings,
+    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSettings,
 };
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
@@ -246,6 +246,20 @@ fn client_config(
             changeable: true,
         }),
         voice_prompt: full.then(|| voice_prompt(true, PromptDelivery::Page)),
+        voice_post_prefix: full.then(|| post_prefix(None, true)),
+    }
+}
+
+/// The tag on the voice agent's posts: the shipped default, the owner's own, or his empty one.
+/// `#303 voice-post-prefix`.
+fn post_prefix(saved: Option<&str>, changeable: bool) -> VoicePostPrefix {
+    const DEFAULT: &str = "(Voice-agent relayed, from user) ";
+    VoicePostPrefix {
+        prefix: saved.unwrap_or(DEFAULT).into(),
+        default_prefix: DEFAULT.into(),
+        custom: saved.is_some(),
+        max_chars: 100,
+        changeable,
     }
 }
 
@@ -421,7 +435,10 @@ fn samples() -> Value {
                     handle: "AAAAAAAAAAAAAAAAAAAAAA".into(),
                     channel_id: ChannelId("111".into()),
                     channel_name: "lead team".into(),
-                    text: "on my way".into(),
+                    // `#303 voice-post-prefix`: the owner's tag on the agent's words, and which
+                    // part of the text it is.
+                    text: "(Voice-agent relayed, from user) on my way".into(),
+                    prefix: "(Voice-agent relayed, from user) ".into(),
                     reply_to: Some(MessageId("300".into())),
                     expires_in_ms: 120_000,
                 }),
@@ -433,6 +450,7 @@ fn samples() -> Value {
                     channel_id: ChannelId("111".into()),
                     channel_name: "lead team".into(),
                     text: "on my way".into(),
+                    prefix: String::new(),
                     reply_to: None,
                     expires_in_ms: 1,
                 }),
@@ -820,6 +838,14 @@ fn samples() -> Value {
         "VoicePromptSettings": [
             to(&voice_prompt(true, PromptDelivery::Page)),
             to(&voice_prompt(false, PromptDelivery::Profile)),
+        ],
+        // `#303 voice-post-prefix`: the shipped tag, the owner's own, his empty one that turns the
+        // tag off, and a server that keeps no settings.
+        "VoicePostPrefix": [
+            to(&post_prefix(None, true)),
+            to(&post_prefix(Some("[voice] "), true)),
+            to(&post_prefix(Some(""), true)),
+            to(&post_prefix(None, false)),
         ],
         // `#208 persistent-cache`: a current window, and one a provider served from a copy it
         // could not bring up to date, so `as_of` is seen omitted and present.

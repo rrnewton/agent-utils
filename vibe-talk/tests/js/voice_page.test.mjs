@@ -1417,6 +1417,24 @@ function voicePromptView(fields = {}) {
   };
 }
 
+/** `vibe_talk::post_prefix::DEFAULT_PREFIX`: the tag on the voice agent's posts until he saves one. */
+const DEFAULT_POST_PREFIX = "(Voice-agent relayed, from user) ";
+
+/**
+ * What client-config says about the tag on the voice agent's posts when he has saved none.
+ * `#303 voice-post-prefix`.
+ */
+function voicePostPrefixView(fields = {}) {
+  return {
+    prefix: DEFAULT_POST_PREFIX,
+    default_prefix: DEFAULT_POST_PREFIX,
+    custom: false,
+    max_chars: 100,
+    changeable: true,
+    ...fields,
+  };
+}
+
 /**
  * Stand-in for `vibe_talk::replay::PREAMBLE`.
  *
@@ -1678,6 +1696,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         voice_settings: page.voiceSettings,
         // `#272 voice-agent-instructions`. Absent when a test sets it to `undefined`.
         voice_prompt: page.voicePrompt,
+        // `#303 voice-post-prefix`. Absent when a test sets it to `undefined`.
+        voice_post_prefix: page.voicePostPrefix,
         // `#199 removable-config-channels`. Absent when nothing is hidden, as the server omits it.
         hidden_channels: page.hiddenChannels.length
           ? page.hiddenChannels.map((channel) => ({ alias: null, added: false, ...channel }))
@@ -2061,6 +2081,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     voicePromptCalls: [],
     /** Set to a status to make the voice prompt route refuse, the way a store-less server does. */
     voicePromptStatus: null,
+    /**
+     * `#303 voice-post-prefix`: the tag on the voice agent's posts, as client-config reports it.
+     * `undefined` sends nothing, as an older server does.
+     */
+    voicePostPrefix: voicePostPrefixView(),
+    /** Every request the page made of the prefix route, as `{method, body}`, in order. */
+    voicePostPrefixCalls: [],
+    /** Set to a status to make the prefix route refuse, the way a store-less server does. */
+    voicePostPrefixStatus: null,
     /** How many times the page has read the to-do list. */
     todoReads: 0,
     /**
@@ -2872,6 +2901,24 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         }
         page.voicePrompt = next;
         return json(200, next);
+      }
+      // `#303 voice-post-prefix`. A real little store, tidying as the server does: PUT keeps what
+      // was sent as one line with no space in front — empty included, which is not the default —
+      // and DELETE goes back to the default.
+      if (String(path) === "/api/v1/voice-post-prefix") {
+        const method = (options && options.method) || "GET";
+        const body = JSON.parse((options && options.body) || "null");
+        page.voicePostPrefixCalls.push({ method, body });
+        if (page.voicePostPrefixStatus) {
+          return json(page.voicePostPrefixStatus, { error: "storage_not_configured", detail: "storage.path" });
+        }
+        if (method === "DELETE") {
+          page.voicePostPrefix = voicePostPrefixView();
+        } else if (method === "PUT") {
+          const oneLine = String(body.prefix).replace(/[\u0000-\u001f]/gu, " ").replace(/^\s+/u, "");
+          page.voicePostPrefix = voicePostPrefixView({ prefix: oneLine.trim() ? oneLine : "", custom: true });
+        }
+        return json(200, page.voicePostPrefix);
       }
       if (/\/not-noise$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
@@ -54831,4 +54878,220 @@ test("`remote-ops-audit` W7: once the read given up on has answered, or failed, 
       `the poll was put off after the read given up on had ${failWith ? "failed" : "answered"}: ${page.timelineCalls.slice(calls)}`);
     assert.ok(shownIds(page).includes("451"), `the poll after the read given up on ${failWith ? "failed" : "answered"} was not drawn`);
   }
+});
+
+// --- `#303 voice-post-prefix` ---------------------------------------------------------------------
+//
+// Every message the voice agent posts starts with the owner's tag, which the SERVER adds. The page's
+// part is the Settings field that keeps it, and showing and confirming exactly what will be posted:
+// the card and the read-back carry the tag, and the tag — his words, not the model's — does not make
+// a draft tap-only.
+
+/** Sign in with the tag as the server reports it, and open Settings. */
+async function postPrefixPage(fields = {}, arrange = (_page) => {}) {
+  const page = newPage();
+  page.voicePostPrefix = voicePostPrefixView(fields);
+  arrange(page);
+  await signIn(page);
+  await page.el("open-settings").click();
+  return page;
+}
+
+test("`#303 voice-post-prefix`: the Sending group has a labelled box, a help line, Save and Reset to default", () => {
+  const sending = settingsGroup("Sending");
+  const opens = sending.indexOf('<div id="voice-post-prefix-editor" hidden>');
+  assert.ok(opens > 0, "the prefix field is not in the Sending group, hidden until the server reports it");
+  const editor = sending.slice(opens);
+  assert.match(editor, /<label for="voice-post-prefix">Prefix on messages the agent posts<\/label>/);
+  assert.equal(PAGE_ELEMENTS.get("voice-post-prefix").tag, "input");
+  assert.match(editor, /<p id="voice-post-prefix-help" class="hint">Put in front of every message the voice agent posts, and in its read-back, but never on what you type\. Empty turns it off\.<\/p>/);
+  assert.match(editor, /<button id="save-voice-post-prefix" class="secondary" type="button" disabled>Save<\/button>/);
+  assert.match(editor, /<button id="reset-voice-post-prefix" class="secondary" type="button">Reset to default<\/button>/);
+  assert.ok(sending.indexOf('id="voice-ask-before-send"') < opens, "the prefix comes before the switch about asking");
+  const help = helpEntry("voice-send");
+  assert.match(help, /Prefix on messages the agent posts/);
+  assert.match(help, /Messages you type on this\s+page never get it/);
+  assert.match(help, /save\s+it empty to turn it off/);
+});
+
+test("`#303 voice-post-prefix`: the box shows the tag the server holds, and says it is the default", async () => {
+  const page = await postPrefixPage();
+  assert.equal(page.el("voice-post-prefix-editor").hidden, false);
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX, "the trailing space was lost");
+  assert.equal(page.el("voice-post-prefix-state").textContent, "The default.");
+  assert.equal(page.el("save-voice-post-prefix").disabled, true, "Save is live with nothing to save");
+  assert.equal(page.el("reset-voice-post-prefix").disabled, true, "Reset is live on the default");
+
+  const own = await postPrefixPage({ prefix: "[voice] ", custom: true });
+  assert.equal(own.el("voice-post-prefix").value, "[voice] ");
+  assert.equal(own.el("voice-post-prefix-state").textContent, "Saved. Every message the agent posts starts with it.");
+  assert.equal(own.el("reset-voice-post-prefix").disabled, false);
+
+  const off = await postPrefixPage({ prefix: "", custom: true });
+  assert.equal(off.el("voice-post-prefix").value, "");
+  assert.equal(off.el("voice-post-prefix-state").textContent, "Off: the agent's messages carry no prefix.");
+});
+
+test("`#303 voice-post-prefix`: Save sends the box as typed and draws what the server stored", async () => {
+  const page = await postPrefixPage();
+  await page.el("voice-post-prefix").setValue("  [voice] ");
+  assert.equal(page.el("voice-post-prefix-state").textContent, "Not saved yet.");
+  assert.equal(page.el("save-voice-post-prefix").disabled, false);
+  assert.equal(page.el("reset-voice-post-prefix").disabled, false, "an edit cannot be put back");
+  await page.el("save-voice-post-prefix").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePostPrefixCalls, [{ method: "PUT", body: { prefix: "  [voice] " } }]);
+  assert.equal(page.el("voice-post-prefix").value, "[voice] ", "the box kept the click, not what was stored");
+  assert.equal(page.el("voice-post-prefix-state").textContent, "Saved. Every message the agent posts starts with it.");
+  assert.equal(page.el("save-voice-post-prefix").disabled, true);
+  assert.match(page.el("status").textContent, /Every message the voice agent posts starts with this prefix/);
+});
+
+test("`#303 voice-post-prefix`: an empty box is saved as off, and Reset to default brings the default back", async () => {
+  const page = await postPrefixPage();
+  await page.el("voice-post-prefix").setValue("");
+  await page.el("save-voice-post-prefix").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePostPrefixCalls, [{ method: "PUT", body: { prefix: "" } }]);
+  assert.equal(page.el("voice-post-prefix-state").textContent, "Off: the agent's messages carry no prefix.");
+  assert.match(page.el("status").textContent, /carry no prefix/);
+  // Off is a choice, so Reset has something to forget.
+  assert.equal(page.el("reset-voice-post-prefix").disabled, false);
+  await page.el("reset-voice-post-prefix").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePostPrefixCalls[1], { method: "DELETE", body: null });
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
+  assert.equal(page.el("voice-post-prefix-state").textContent, "The default.");
+  assert.equal(page.el("reset-voice-post-prefix").disabled, true);
+  assert.match(page.el("status").textContent, /default prefix again/);
+});
+
+test("`#303 voice-post-prefix`: Reset with nothing saved puts the default back in the box and writes nothing", async () => {
+  const page = await postPrefixPage();
+  await page.el("voice-post-prefix").setValue("half a tag");
+  await page.el("reset-voice-post-prefix").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePostPrefixCalls, [], "putting back an unsaved edit wrote to the server");
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
+  assert.equal(page.el("voice-post-prefix-state").textContent, "The default.");
+});
+
+test("`#303 voice-post-prefix`: a tag over the limit cannot be saved, and a refused save keeps what was typed", async () => {
+  const page = await postPrefixPage({ max_chars: 10 });
+  await page.el("voice-post-prefix").setValue("x".repeat(11));
+  assert.equal(page.el("save-voice-post-prefix").disabled, true);
+  assert.equal(page.el("voice-post-prefix-state").textContent, "11 characters; at most 10 are kept. Shorten it to save.");
+  // Counted as the server counts, by character, after the space in front is gone.
+  await page.el("voice-post-prefix").setValue(`  ${"🎙".repeat(10)}`);
+  assert.equal(page.el("save-voice-post-prefix").disabled, false);
+
+  const refused = await postPrefixPage({}, (p) => { p.voicePostPrefixStatus = 503; });
+  await refused.el("voice-post-prefix").setValue("[voice] ");
+  await refused.el("save-voice-post-prefix").click();
+  await refused.settle();
+  assert.equal(refused.el("voice-post-prefix").value, "[voice] ", "a refused save lost the text");
+  assert.equal(refused.el("voice-post-prefix-state").textContent, "Not saved yet.");
+  assert.equal(refused.el("save-voice-post-prefix").disabled, false, "the text cannot be tried again");
+  assert.match(refused.el("error").textContent, /The prefix was not saved/);
+});
+
+test("`#303 voice-post-prefix`: a read token and a store-less server show the tag but cannot change it; an older server hides it", async () => {
+  const read = await postPrefixPage({ prefix: "[voice] ", custom: true }, (p) => { p.tokenScope = "read"; });
+  assert.equal(read.el("voice-post-prefix").value, "[voice] ");
+  assert.equal(read.el("voice-post-prefix").disabled, true);
+  assert.equal(read.el("save-voice-post-prefix").disabled, true);
+  assert.equal(read.el("reset-voice-post-prefix").disabled, true);
+  assert.match(read.el("voice-post-prefix-state").textContent, /^Only the write token can change this\. Saved\./);
+
+  const storeless = await postPrefixPage({ changeable: false });
+  assert.equal(storeless.el("voice-post-prefix").disabled, true);
+  assert.match(storeless.el("voice-post-prefix-state").textContent, /keeps no settings/);
+
+  const older = await postPrefixPage({}, (p) => { p.voicePostPrefix = undefined; });
+  assert.equal(older.el("voice-post-prefix-editor").hidden, true);
+});
+
+/** A draft as the server holds one the voice agent proposed, with the owner's tag in front. */
+const taggedDraft = (words = "on it, rebasing now", overrides = {}) =>
+  spokenDraft({ text: `${DEFAULT_POST_PREFIX}${words}`, prefix: DEFAULT_POST_PREFIX, ...overrides });
+
+test("`#303 voice-post-prefix`: the card shows the tagged text exactly as it will be posted, and Send restates it", async () => {
+  const page = newPage();
+  const pending = await proposedDuringACall(page, proposal({
+    text: `${DEFAULT_POST_PREFIX}on my way`, prefix: DEFAULT_POST_PREFIX,
+  }));
+  assert.equal(page.el("post-confirm-text").textContent, `${DEFAULT_POST_PREFIX}on my way`);
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits, [{
+    handle: pending.handle,
+    channel_id: pending.channel_id,
+    text: `${DEFAULT_POST_PREFIX}on my way`,
+    reply_to: pending.reply_to,
+    confirmed_by: "ui",
+  }], "Send did not restate the text as posted, tag and all");
+});
+
+test("`#303 voice-post-prefix`: the agent's words are judged for a spoken yes; the owner's tag in front of them is not", () => {
+  const draft = newPage().pure("agentDraft");
+  assert.equal(draft({ text: `${DEFAULT_POST_PREFIX}on it`, prefix: DEFAULT_POST_PREFIX }), "on it");
+  // Tagging off, or an older server: the whole text is the agent's.
+  assert.equal(draft({ text: "(aside) on it" }), "(aside) on it");
+  assert.equal(draft({ text: "(aside) on it", prefix: "" }), "(aside) on it");
+  // A prefix the text does not start with names nothing.
+  assert.equal(draft({ text: "on it", prefix: DEFAULT_POST_PREFIX }), "on it");
+  const unsayable = newPage().pure("unsayableDraft");
+  assert.equal(unsayable(DEFAULT_POST_PREFIX), "symbols", "fixture: the default tag is not plain words");
+});
+
+test("`#303 voice-post-prefix`: a yes after the exact read-back, tag included, sends the tagged draft once", async () => {
+  const page = newPage();
+  const pending = taggedDraft();
+  // As a voice says it: the parentheses are silent, and the words match the card's.
+  const socket = await readBackDuringACall(page, {
+    pending, said: "To lead team: Voice-agent relayed, from user: on it, rebasing now. Send it?",
+  });
+  hostedHears(socket, "Yes.");
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [{
+    handle: pending.handle,
+    channel_id: pending.channel_id,
+    text: pending.text,
+    reply_to: null,
+    confirmed_by: "speaker_turn",
+  }]);
+  assert.match(pageNotices(socket)[0], /^Voice page: the message you read back was SENT/);
+});
+
+test("`#303 voice-post-prefix`: a read-back that leaves the tag out, or a draft whose own words a voice cannot say, sends nothing", async () => {
+  // The tag is posted, so it must be read back: what is heard is what goes.
+  const dropped = newPage();
+  const socket = await readBackDuringACall(dropped, {
+    pending: taggedDraft(), said: "To lead team: on it, rebasing now. Send it?",
+  });
+  hostedHears(socket, "yes");
+  await settleSpokenYes(dropped);
+  assert.deepEqual(dropped.proposalCommits, []);
+  assert.match(pageNotices(socket)[0], /not the card's text word for word/);
+
+  // The agent's words after the tag are judged as ever.
+  const struck = newPage();
+  const strikeSocket = await readBackDuringACall(struck, {
+    pending: taggedDraft("~~don't~~ merge the PR"),
+    said: `To lead team: ${DEFAULT_POST_PREFIX}don't merge the PR. Send it?`,
+  });
+  hostedHears(strikeSocket, "yes");
+  await settleSpokenYes(struck);
+  assert.deepEqual(struck.proposalCommits, []);
+  assert.match(pageNotices(strikeSocket)[0], /a link, a symbol or formatting/);
+
+  // The same parentheses written by the agent, with no tag named by the server, are the agent's.
+  const unnamed = newPage();
+  const unnamedSocket = await readBackDuringACall(unnamed, {
+    pending: spokenDraft({ text: `${DEFAULT_POST_PREFIX}on it, rebasing now` }),
+  });
+  hostedHears(unnamedSocket, "yes");
+  await settleSpokenYes(unnamed);
+  assert.deepEqual(unnamed.proposalCommits, []);
+  assert.match(pageNotices(unnamedSocket)[0], /a link, a symbol or formatting/);
 });

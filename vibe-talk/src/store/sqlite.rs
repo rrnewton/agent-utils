@@ -340,6 +340,25 @@ pub const MIGRATIONS: &[&str] = &[
         CHECK ((system_prompt IS NULL) = (edited_from IS NULL))
     ) STRICT;
     ",
+    // v16 — the tag the server puts before every message the voice agent posts. `#303
+    // voice-post-prefix`.
+    //
+    // ONE row or none, for the reason `voice_settings` gives: no row means the owner has never
+    // saved one, so the shipped default is used, and a row holding '' is his choice to turn the tag
+    // off. Seeding the default would make "never set" and "set to the default" indistinguishable,
+    // and an empty column could not then say "off". A table of its own rather than a column on
+    // `voice_prompt`, because that row's absence already means "the shipped prompt", and resetting
+    // one must not reach the other. His own text; no channel text is ever kept here.
+    //
+    // This step's place in the ladder is all that numbers it: a step landed meanwhile goes before
+    // it, and the tests find it by what it does rather than by its index.
+    "
+    CREATE TABLE voice_post_prefix (
+        id        INTEGER PRIMARY KEY CHECK (id = 1),
+        prefix    TEXT    NOT NULL,
+        set_at_ms INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -1571,6 +1590,43 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT prefix FROM voice_post_prefix WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(backend)
+        })
+        .await
+    }
+
+    async fn set_post_prefix(&self, prefix: Option<&str>) -> Result<Option<String>, StoreError> {
+        let prefix = prefix.map(str::to_owned);
+        self.with_connection(move |connection| {
+            match &prefix {
+                Some(text) => connection
+                    .execute(
+                        "INSERT INTO voice_post_prefix (id, prefix, set_at_ms) VALUES (1, ?1, ?2)
+                         ON CONFLICT(id) DO UPDATE SET
+                            prefix    = excluded.prefix,
+                            set_at_ms = excluded.set_at_ms",
+                        rusqlite::params![text, now_ms()],
+                    )
+                    .map_err(backend)?,
+                // Back to the shipped default, which is what no row means.
+                None => connection
+                    .execute("DELETE FROM voice_post_prefix", [])
+                    .map_err(backend)?,
+            };
+            Ok(prefix)
+        })
+        .await
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
@@ -2144,6 +2200,10 @@ impl StateStore for SqliteStore {
             // voice-agent-instructions`.
             transaction
                 .execute("DELETE FROM voice_prompt", [])
+                .map_err(backend)?;
+            // Back to the shipped tag on what the voice agent posts. `#303 voice-post-prefix`.
+            transaction
+                .execute("DELETE FROM voice_post_prefix", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -4767,6 +4827,106 @@ mod tests {
                 "an edit and its version must be present together ({text}, {from})"
             );
         }
+    }
+
+    // --- #303 voice-post-prefix ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_post_tag_starts_unset_keeps_an_empty_choice_apart_and_the_purge_forgets_it() {
+        // Never set (the shipped default) and set to nothing (tagging off) are two states, and both
+        // survive a restart.
+        let dir = TempDir::new("sqlite-post-prefix");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            assert_eq!(store.post_prefix().await.expect("read"), None);
+            assert_eq!(
+                store.set_post_prefix(Some("")).await.expect("save"),
+                Some(String::new())
+            );
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(
+            reopened.post_prefix().await.expect("read back"),
+            Some(String::new()),
+            "an empty tag did not survive a restart as a choice"
+        );
+        reopened
+            .set_post_prefix(Some("[voice] "))
+            .await
+            .expect("save");
+        assert_eq!(
+            reopened.post_prefix().await.expect("read"),
+            Some("[voice] ".to_owned()),
+            "the trailing space was not kept"
+        );
+        // Reset: back to no row, which is the default.
+        assert_eq!(reopened.set_post_prefix(None).await.expect("reset"), None);
+        assert_eq!(reopened.post_prefix().await.expect("read"), None);
+        reopened.set_post_prefix(Some("")).await.expect("save");
+        reopened.purge_everything().await.expect("purge");
+        assert_eq!(
+            reopened.post_prefix().await.expect("read"),
+            None,
+            "the purge left the owner's tag behind instead of the default"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_post_tag_table_arrives_on_a_file_at_the_previous_schema_unset() {
+        // Found by what it does rather than by its index, so a step landed meanwhile can go before
+        // it without this test numbering the ladder.
+        let at = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("CREATE TABLE voice_post_prefix"))
+            .expect("the voice_post_prefix step");
+        let dir = TempDir::new("sqlite-post-prefix-migrate");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..at] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch("INSERT INTO voice_prompt VALUES (1, 'Be brief.', NULL, NULL, 5);")
+                .expect("the owner's instructions");
+            connection
+                .pragma_update(None, "user_version", i64::try_from(at).expect("small"))
+                .expect("stamp old schema");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        assert_eq!(
+            store
+                .owner_prompt()
+                .await
+                .expect("read")
+                .map(|p| p.instructions),
+            Some("Be brief.".to_owned()),
+            "the upgrade lost the owner's instructions"
+        );
+        assert_eq!(
+            store.post_prefix().await.expect("read"),
+            None,
+            "an upgraded file arrived with a tag nobody chose"
+        );
+        store.set_post_prefix(Some("")).await.expect("save");
+    }
+
+    #[test]
+    fn the_post_tag_table_holds_one_row() {
+        let connection = Connection::open_in_memory().expect("open");
+        migrate(&connection).expect("schema");
+        connection
+            .execute_batch("INSERT INTO voice_post_prefix VALUES (1, '', 5);")
+            .expect("the one row");
+        assert!(
+            connection
+                .execute_batch("INSERT INTO voice_post_prefix VALUES (2, 'x', 5);")
+                .is_err(),
+            "a second tag row was accepted"
+        );
     }
 
     // --- #208 persistent-cache, milestone summary-keep ---------------------------------------

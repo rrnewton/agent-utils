@@ -788,7 +788,55 @@ pub async fn client_config(
         noise_rules: noise_rules_view(&state).await,
         voice_settings: Some(crate::send_approval::view(&state).await),
         voice_prompt: Some(crate::voice_prompt::view(&state).await),
+        voice_post_prefix: Some(crate::post_prefix::view(&state).await),
     }))
+}
+
+/// `GET /api/v1/voice-post-prefix` — the tag this server puts before every message the voice agent
+/// posts. `#303 voice-post-prefix`.
+///
+/// READ scope: it is in every post the agent makes, which any reader of the channel sees, and it
+/// rides on client-config. `no-store`, because it changes when the owner saves.
+pub async fn voice_post_prefix(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Response, ApiError> {
+    Ok(no_store(Json(crate::post_prefix::view(&state).await)))
+}
+
+/// The owner's tag for what the voice agent posts, from Settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoicePostPrefixRequest {
+    /// The tag, exactly as typed. Empty turns tagging off; it is not "go back to the default",
+    /// which is `DELETE`.
+    pub prefix: String,
+}
+
+/// `PUT /api/v1/voice-post-prefix` — save the owner's tag. `#303 voice-post-prefix`.
+///
+/// WRITE scope, and — as with [`set_voice_settings`] — **the scope is not what keeps the voice
+/// agent out**: no tool reaches this route, so a model cannot take its own tag off. An empty tag is
+/// saved as such and turns tagging off. 413 `too_large` over the limit, 503
+/// `storage_not_configured` with no store.
+pub async fn set_voice_post_prefix(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<VoicePostPrefixRequest>,
+) -> Result<Response, ApiError> {
+    let shown = crate::post_prefix::set(&state, Some(&request.prefix)).await?;
+    Ok(no_store(Json(shown)))
+}
+
+/// `DELETE /api/v1/voice-post-prefix` — forget the owner's tag, so the shipped default is used
+/// again: Settings' "Reset to default". `#303 voice-post-prefix`. Idempotent; WRITE scope, and no
+/// tool, for [`set_voice_post_prefix`]'s reason.
+pub async fn reset_voice_post_prefix(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+) -> Result<Response, ApiError> {
+    let shown = crate::post_prefix::set(&state, None).await?;
+    Ok(no_store(Json(shown)))
 }
 
 /// `GET /api/v1/voice-prompt` — the owner's additional instructions and his edited system prompt.
@@ -2085,6 +2133,7 @@ async fn pending_view(
             channel_id,
             channel_name,
             text: proposal.binding.text,
+            prefix: proposal.prefix,
             reply_to: proposal.binding.reply_to.map(MessageId),
         }),
     }

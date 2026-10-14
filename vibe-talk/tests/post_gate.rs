@@ -118,6 +118,12 @@ async fn commit(harness: &Harness, body: Value) -> (StatusCode, Value) {
     .await
 }
 
+/// `text` as the voice agent's post carries it: the owner's tag in front, by default. `#303
+/// voice-post-prefix`.
+fn tagged(text: &str) -> String {
+    format!("{}{text}", vibe_talk::post_prefix::DEFAULT_PREFIX)
+}
+
 /// Propose over MCP with the write token, check nothing went out, and return the pending proposal.
 async fn propose(harness: &Harness, text: &str) -> Value {
     let (status, response) = post_reply(
@@ -135,7 +141,12 @@ async fn propose(harness: &Harness, text: &str) -> Value {
         harness.discord.posted()
     );
     let proposal = pending(harness).await;
-    assert_eq!(proposal["text"], text, "{proposal}");
+    assert_eq!(proposal["text"], tagged(text), "{proposal}");
+    assert_eq!(
+        proposal["prefix"],
+        vibe_talk::post_prefix::DEFAULT_PREFIX,
+        "{proposal}"
+    );
     proposal
 }
 
@@ -150,7 +161,10 @@ async fn a_write_scope_post_reply_without_confirmation_posts_nothing() {
     .await;
     let said = tool_text(&response);
     assert!(said.starts_with("NOT SENT."), "{said}");
-    assert!(said.contains("Exact text: ship it"), "{said}");
+    assert!(
+        said.contains(&format!("Exact text: {}", tagged("ship it"))),
+        "{said}"
+    );
     // Asking again is not confirming: it replaces the proposal, and still nothing goes out.
     let (_status, again) = post_reply(
         &harness,
@@ -181,14 +195,14 @@ async fn a_confirmed_handle_posts_exactly_once() {
     let (status, body) = commit(&harness, restated(&proposal)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["serial"], proposal["serial"]);
-    assert_eq!(body["posted"]["content"], "on my way");
+    assert_eq!(body["posted"]["content"], tagged("on my way"));
     let (status, body) = commit(&harness, restated(&proposal)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "proposal_used");
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1, "{posted:?}");
     assert_eq!(posted[0].channel.as_str(), WRITE_CHANNEL);
-    assert_eq!(posted[0].content, "on my way");
+    assert_eq!(posted[0].content, tagged("on my way"));
     assert_eq!(pending(&harness).await, Value::Null);
 }
 
@@ -302,7 +316,7 @@ async fn a_superseded_handle_is_refused_and_only_the_current_draft_can_be_sent()
     assert_eq!(status, StatusCode::OK, "{body}");
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1);
-    assert_eq!(posted[0].content, "running late");
+    assert_eq!(posted[0].content, tagged("running late"));
 }
 
 #[tokio::test]
@@ -400,7 +414,10 @@ async fn the_rest_propose_route_proposes_and_posts_nothing() {
         .as_str()
         .expect("a result sentence for the model");
     assert!(result.starts_with("NOT SENT."), "{result}");
-    assert!(result.contains("Exact text: on my way"), "{result}");
+    assert!(
+        result.contains(&format!("Exact text: {}", tagged("on my way"))),
+        "{result}"
+    );
     assert!(harness.discord.posted().is_empty());
     // The answer may be relayed to a model, so it must not carry the capability that commits.
     let (_, pending) = send(&harness, "GET", "/api/v1/post-proposals", WRITE_TOKEN, None).await;

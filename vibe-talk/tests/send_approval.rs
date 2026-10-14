@@ -21,6 +21,10 @@ use vibe_talk::http::router;
 use vibe_talk::store::fake::FakeStore;
 use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 
+/// The owner's tag, which every post the voice agent makes starts with unless he changed it.
+/// `#303 voice-post-prefix`.
+const TAG: &str = vibe_talk::post_prefix::DEFAULT_PREFIX;
+
 struct Harness {
     router: axum::Router,
     discord: Arc<FakeDiscord>,
@@ -192,14 +196,14 @@ async fn with_confirmation_off_post_reply_posts_once_and_says_sent_with_what_and
         "{said}"
     );
     assert!(
-        said.contains("Exact text posted: rebase onto main"),
+        said.contains(&format!("Exact text posted: {TAG}rebase onto main")),
         "{said}"
     );
     assert!(said.contains("Do not call post_reply again"), "{said}");
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1, "{posted:?}");
     assert_eq!(posted[0].channel.as_str(), WRITE_CHANNEL);
-    assert_eq!(posted[0].content, "rebase onto main");
+    assert_eq!(posted[0].content, format!("{TAG}rebase onto main"));
     assert_eq!(
         posted[0].reply_to.as_ref().map(|id| id.as_str()),
         Some("1000")
@@ -233,7 +237,17 @@ async fn a_long_direct_send_is_split_by_the_shared_send_path_and_says_so() {
         )),
         "{said}"
     );
-    // Whatever the cut, every word went, once, in order.
+    // Whatever the cut, every word went, once, in order, after the owner's tag (`#303
+    // voice-post-prefix`), which is in the first part only.
+    assert!(posted[0].content.starts_with(TAG), "{:?}", posted[0]);
+    assert!(posted[1..]
+        .iter()
+        .all(|part| !part.content.contains(TAG.trim_end())));
+    let words: Vec<String> = TAG
+        .split_whitespace()
+        .map(str::to_owned)
+        .chain(words)
+        .collect();
     let rejoined: Vec<String> = posted
         .iter()
         .flat_map(|part| {
@@ -345,7 +359,7 @@ async fn the_same_direct_send_again_is_answered_from_the_first_and_posts_nothing
     assert!(said.contains("lead team"), "{said}");
     assert!(said.contains("posted nothing more"), "{said}");
     assert!(
-        said.contains("Exact text posted: rebase onto main"),
+        said.contains(&format!("Exact text posted: {TAG}rebase onto main")),
         "{said}"
     );
     assert_eq!(
@@ -495,7 +509,7 @@ async fn with_confirmation_on_post_reply_still_only_proposes() {
         None,
     )
     .await;
-    assert_eq!(body["proposal"]["text"], "ship it", "{body}");
+    assert_eq!(body["proposal"]["text"], format!("{TAG}ship it"), "{body}");
     // The read-back is built from the same channel name and text the voice page's card shows, so
     // the page can hold what was said to exactly that sentence.
     let card = &body["proposal"];

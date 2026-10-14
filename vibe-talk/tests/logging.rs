@@ -811,11 +811,14 @@ async fn the_post_gate_logs_every_step_without_a_word_of_the_message_or_its_hand
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let fourth = propose().await;
+    // What was proposed, and so what a commit restates: the owner's tag, then the words. `#303
+    // voice-post-prefix`.
+    let tagged = format!("{}{SECRET}", vibe_talk::post_prefix::DEFAULT_PREFIX);
     let (status, _) = json_call(
         &harness,
         "POST",
         "/api/v1/post-proposals/commit",
-        Some(restated(&fourth, SECRET, "speaker_turn")),
+        Some(restated(&fourth, &tagged, "speaker_turn")),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -862,7 +865,7 @@ async fn the_post_gate_logs_every_step_without_a_word_of_the_message_or_its_hand
         assert!(gate_lines.contains(step), "no {step} in:\n{gate_lines}");
     }
     assert!(
-        gate_lines.contains(&format!("text_len={}", SECRET.chars().count())),
+        gate_lines.contains(&format!("text_len={}", tagged.chars().count())),
         "{gate_lines}"
     );
     let everything = capture.text();
@@ -1204,8 +1207,12 @@ async fn a_direct_send_and_the_setting_that_allowed_it_are_logged_without_a_word
             || sent.contains(&format!("channel={WRITE_CHANNEL}")),
         "{sent}"
     );
+    // The length posted, the owner's tag included. `#303 voice-post-prefix`.
     assert!(
-        sent.contains(&format!("text_len={}", SECRET.chars().count())),
+        sent.contains(&format!(
+            "text_len={}",
+            vibe_talk::post_prefix::DEFAULT_PREFIX.chars().count() + SECRET.chars().count()
+        )),
         "{sent}"
     );
     assert!(
@@ -1268,6 +1275,43 @@ async fn saving_the_owners_words_for_the_voice_agent_logs_sizes_and_never_the_wo
     assert!(
         !everything.contains("vault code") && !everything.contains("Priya"),
         "the owner's words reached the INFO log:\n{everything}"
+    );
+}
+
+#[tokio::test]
+async fn saving_the_tag_on_the_voice_agents_posts_logs_its_length_and_never_the_words() {
+    // `#303 voice-post-prefix`. The tag is the owner's own text: the access log records that he
+    // saved one, and how long, or that he went back to the default, and nothing he wrote.
+    const SECRET: &str = "[Priya's car] ";
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let (status, body) = json_call(
+        &harness,
+        "PUT",
+        "/api/v1/voice-post-prefix",
+        Some(json!({ "prefix": SECRET })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_call(&harness, "DELETE", "/api/v1/voice-post-prefix", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lines: Vec<String> = capture
+        .access_lines()
+        .into_iter()
+        .filter(|line| line.contains("voice_post_prefix"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains("event=\"changed\""), "{}", lines[0]);
+    assert!(
+        lines[0].contains(&format!("prefix_chars={}", SECRET.chars().count())),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[1].contains("event=\"reset\""), "{}", lines[1]);
+    let everything = capture.text();
+    assert!(
+        !everything.contains("Priya"),
+        "the owner's tag reached the INFO log:\n{everything}"
     );
 }
 

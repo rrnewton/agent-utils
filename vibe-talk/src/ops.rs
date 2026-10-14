@@ -1844,6 +1844,10 @@ pub async fn resolve(
 /// proposal the owner is asked to confirm is one that could actually be sent. Whatever proposal
 /// was pending is superseded, and says so in the log.
 ///
+/// `prefix` is the start of `text` this server put there — the owner's tag for what the voice
+/// agent posts (`#303 voice-post-prefix`, [`crate::post_prefix::apply`]) — or empty. It is recorded
+/// on the proposal, so the page can tell the owner's tag from the agent's words.
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::ChannelNotWritable`], or [`OpError::Chat`] for an empty
@@ -1852,6 +1856,7 @@ pub async fn propose_reply(
     state: &AppState,
     channel_id: &str,
     text: &str,
+    prefix: &str,
     reply_to: Option<&str>,
 ) -> Result<(ChannelInfo, crate::post_gate::Proposal), OpError> {
     let info = allowed(state, channel_id).await?;
@@ -1863,11 +1868,14 @@ pub async fn propose_reply(
             "message content is empty".to_owned(),
         )));
     }
-    let (proposal, displaced) = state.post_gate.propose(crate::post_gate::Binding {
-        channel_id: info.id.as_str().to_owned(),
-        text: text.to_owned(),
-        reply_to: reply_to.map(str::to_owned),
-    });
+    let (proposal, displaced) = state.post_gate.propose_tagged(
+        crate::post_gate::Binding {
+            channel_id: info.id.as_str().to_owned(),
+            text: text.to_owned(),
+            reply_to: reply_to.map(str::to_owned),
+        },
+        prefix.to_owned(),
+    );
     if let Some(crate::post_gate::Displaced { proposal: old, why }) = displaced {
         log_gate_step(
             if why == crate::post_gate::Refusal::Expired {

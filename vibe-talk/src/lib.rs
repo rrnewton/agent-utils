@@ -69,6 +69,7 @@ pub mod noise;
 pub mod ops;
 pub mod post_gate;
 pub mod post_lanes;
+pub mod post_prefix;
 pub mod probe;
 pub mod providers;
 pub mod read_ahead;

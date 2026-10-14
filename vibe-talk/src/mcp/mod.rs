@@ -393,6 +393,11 @@ fn post_reply_description(approval: crate::send_approval::Approval, writable: &s
                     beside their name in a message you read — writing @their-name is plain text \
                     and notifies nobody, and there is no way to look up a person who has not \
                     posted.";
+    // `#303 voice-post-prefix`. The server tags every post the agent makes; one that tagged its own
+    // would post the tag twice.
+    let tag = "This server puts the owner's own tag, when one is set, at the start of what is \
+               posted: pass only the words to post, with no tag, signature or relay note of your \
+               own.";
     if approval.asks() {
         format!(
             "Propose a message to post to a channel AS THE OWNER'S BOT. This does NOT send it: \
@@ -401,7 +406,8 @@ fn post_reply_description(approval: crate::send_approval::Approval, writable: &s
              answer gives you word for word, adding nothing; it ends with: Send it? Then wait. If \
              the speaker says yes, say only \"One moment.\": the voice page reports the result in \
              a message that starts with \"Voice page:\". Calling this again replaces the proposal; \
-             never call it again as the confirmation. {mentions} Writable channels: {writable}."
+             never call it again as the confirmation. {tag} {mentions} Writable channels: \
+             {writable}."
         )
     } else {
         format!(
@@ -413,7 +419,7 @@ fn post_reply_description(approval: crate::send_approval::Approval, writable: &s
              and NOT CONFIRMED when this server could not tell. A call that fails without any \
              result, such as a timeout, is not confirmed either: it may have posted. After NOT \
              CONFIRMED or no result, do not call it again for the same words; the same words to \
-             the same channel within a minute of a send are not posted again. {mentions} \
+             the same channel within a minute of a send are not posted again. {tag} {mentions} \
              Writable channels: {writable}."
         )
     }

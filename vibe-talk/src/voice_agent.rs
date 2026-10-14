@@ -87,7 +87,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the five prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 9;
+pub const PROMPT_VERSION: u32 = 10;
 
 /// The [`fingerprint`] of [`OWNER_INSTRUCTIONS_HEADING`] at [`PROMPT_VERSION`]. It reaches the
 /// agent only with the owner's instructions, so it is pinned on its own rather than inside a
@@ -98,10 +98,10 @@ pub const PINNED_OWNER_HEADING_FINGERPRINT: &str = "fnv1a64:946b5fc6e4828976";
 pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:9392415d3f073548";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:2b7b564cb9012db4";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:0869137c660df45d";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:98ebb1b0013036a5";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -603,19 +603,23 @@ mod tests {
     }
 
     /// The load-bearing phrases of the send rules, in both sending variants. None of them may
-    /// reach a read-only caller.
-    const SEND_RULES: [&str; 4] = [
+    /// reach a read-only caller. The last is `#303 voice-post-prefix`: this server tags every
+    /// post the agent makes, so an agent that tagged its own would post the tag twice.
+    const SEND_RULES: [&str; 5] = [
         "only when the user explicitly asks you to",
         "only when the human explicitly requests it",
         "exact provider mention",
         "You can also send",
+        "never add a tag, a signature or a note saying you relayed it",
     ];
 
     /// What only the variant that asks first may say: the read-back, the question, and that the
     /// confirmation and its result are the voice page's.
-    const CONFIRM_RULES: [&str; 7] = [
+    const CONFIRM_RULES: [&str; 8] = [
         "outside your tools",
         "word for word",
+        // `#303 voice-post-prefix`: the read-back is the posted text, the owner's tag and all.
+        "tag included",
         "adding nothing before or after it",
         "Send it?",
         "say only \"One moment.\"",

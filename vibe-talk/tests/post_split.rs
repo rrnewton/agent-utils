@@ -660,6 +660,66 @@ async fn a_direct_voice_send_continues_in_the_first_parts_thread_and_says_where(
     task.abort();
 }
 
+/// `#303 voice-post-prefix`. The owner's tag is part of what the voice agent posts, so it counts
+/// toward the bytes Google Chat takes in one message, and a post that has to be cut carries it on
+/// its first part only: words that fill what the tag leaves go as one message, and one byte more —
+/// which alone would have fitted — as two.
+#[tokio::test]
+async fn the_tag_on_a_voice_post_counts_toward_max_post_bytes_and_goes_on_the_first_part() {
+    const TAG: &str = vibe_talk::post_prefix::DEFAULT_PREFIX;
+    const LIMIT: usize = 600;
+    // Two bytes a character, so the limit is counted in bytes and not in characters.
+    let words = |bytes: usize| "é".repeat(bytes / 2);
+    let room = LIMIT - TAG.len();
+    assert_eq!(
+        room % 2,
+        1,
+        "the fixture assumes the room is an odd number of bytes"
+    );
+
+    let (state, posts, task) = google_chat(LIMIT, &[]).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let fits = words(room - 1);
+    voice_post_reply(&state, &fits).await;
+    {
+        let posts = posts.lock().expect("posts");
+        assert_eq!(posts.len(), 1, "words that fit with the tag were cut");
+        assert_eq!(posts[0].1["content"], format!("{TAG}{fits}"));
+    }
+    task.abort();
+
+    let (state, posts, task) = google_chat(LIMIT, &[]).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let over = words(room + 1);
+    assert!(over.len() <= LIMIT, "these words fit without the tag");
+    let said = voice_post_reply(&state, &over).await;
+    {
+        let posts = posts.lock().expect("posts");
+        assert_eq!(posts.len(), 2, "{said}");
+        let contents: Vec<&str> = posts
+            .iter()
+            .map(|(_, body)| body["content"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            contents.iter().all(|part| part.len() <= LIMIT),
+            "{contents:?}"
+        );
+        assert!(contents[0].starts_with(TAG), "{}", contents[0]);
+        assert!(!contents[1].contains(TAG.trim_end()), "{}", contents[1]);
+        assert_eq!(contents.concat(), format!("{TAG}{over}"));
+        assert_eq!(posts[1].0, in_thread("t_91940001"));
+    }
+    task.abort();
+}
+
 /// `#264 voice-send-approval`, a direct send that answers a message on Slack. A Slack reply is a
 /// thread reply, so every part, the first too, goes into the answered message's thread, and the
 /// model is told so: not that the first is in the channel, where the speaker would not find it.

@@ -1577,6 +1577,30 @@ pub trait StateStore: Send + Sync {
         prompt: &crate::voice_agent::OwnerPrompt,
     ) -> Result<crate::voice_agent::OwnerPrompt, StoreError>;
 
+    /// The owner's own tag for what the voice agent posts, or `None` when he has never saved one.
+    /// `#303 voice-post-prefix`.
+    ///
+    /// `None` is the shipped default's turn, which [`crate::post_prefix::current`] applies at read
+    /// time; `Some("")` is his choice to post with no tag at all, and the two must stay apart, so
+    /// nothing ever writes the default here on his behalf. Not covered by [`Retention`], for the
+    /// reason [`StateStore::ask_before_send`] is not.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn post_prefix(&self) -> Result<Option<String>, StoreError>;
+
+    /// Save the owner's tag — `Some`, possibly empty, which turns the tag off — or forget it, `None`,
+    /// so the shipped default applies again. Returns what is now stored. The caller has cleaned it
+    /// ([`crate::post_prefix::clean`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_post_prefix(&self, prefix: Option<&str>) -> Result<Option<String>, StoreError>;
+
     /// The messages in this channel the owner has said are NOT noise, whatever the rules say.
     ///
     /// The ids alone, for the same reason [`StateStore::dismissals`] returns ids alone.

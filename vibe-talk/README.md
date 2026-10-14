@@ -2137,7 +2137,11 @@ one store, `src/store/`, and it holds these:
 * **the owner's instructions for the voice agent** — the additional instructions and his edited
   copy of the system prompt, one row holding two texts he wrote, with the prompt version the copy
   was made from. No row means the shipped prompt; the purge deletes the row. See "Instructions for
-  the voice agent". `#272 voice-agent-instructions`.
+  the voice agent". `#272 voice-agent-instructions`; and
+* **the tag on the voice agent's posts** — the owner's own, one row holding one short text he wrote,
+  and an instant. No row means the default tag; a row holding an empty text means none; the purge
+  deletes the row. See "Every post the agent makes carries the owner's tag". `#303
+  voice-post-prefix`.
 
 The first three are your own record. The cached summaries are a derived cache, bounded by the
 same retention as the rest, erased by the same purge, and never filled by a read-scope token.
@@ -3070,8 +3074,8 @@ they were made.
 Three ways, all of which erase everything — transcripts, read marks, "dealt with" marks,
 cached summaries, channel aliases, the noise rules (back to the default), the voice send setting
 (back to the configured default), the owner's instructions for the voice agent (back to the
-shipped prompt), and every channel's clear-unread setting (back to off, in the running server too)
-alike:
+shipped prompt), the tag on the voice agent's posts (back to the default), and every channel's
+clear-unread setting (back to off, in the running server too) alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
@@ -3253,6 +3257,18 @@ the minted URL**, which carries a single-use token and is quoted verbatim by a c
 *newer* vibe-talk is **refused**, naming the reason — a downgrade that wrote through the old
 statements would corrupt data quietly.
 
+**Rolling back past a step.** Because a newer file is refused, going back to an older build means
+taking the file back too. Step 16 (`#303 voice-post-prefix`) only adds the one-row
+`voice_post_prefix` table, so with the server stopped it can be undone in place, losing nothing but
+the owner's saved tag:
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE voice_post_prefix; PRAGMA user_version = 15;'
+```
+
+Run that only on a file at version 16 (`PRAGMA user_version;` says), and only when the build being
+returned to predates the step; a later step must be undone first, and its own note says how.
+
 ## The access log
 
 At `RUST_LOG=info` this server used to log **nothing per request**. That gap has a specific cost,
@@ -3338,8 +3354,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent. Posts to one destination — the channel, or one thread — are made one at a time, in the order they arrive, a long post's parts together; a post whose caller disconnects still holds its destination until the provider answers or its request timeout gives up (`#277 send-order`) |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
-| GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting asks first, unless you turn that off" |
-| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does: propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder, and the thread it belongs in, as the reply route answers, when only part went; the same words again within a minute post nothing, answering the first send's `{sent: true}` when it posted and `409 post_repeated` when it may have) — see "Posting asks first, unless you turn that off" |
+| GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen`. Its `text` is what would be posted, the owner's tag included, and `prefix`, when present, is the start of `text` the server put there (`#303 voice-post-prefix`) — see "Posting asks first, unless you turn that off" |
+| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does, the owner's tag put in front of `text` first (`#303 voice-post-prefix`): propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder, and the thread it belongs in, as the reply route answers, when only part went; the same words again within a minute post nothing, answering the first send's `{sent: true}` when it posted and `409 post_repeated` when it may have) — see "Posting asks first, unless you turn that off" |
 | POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once; posted whole, its `reply_to` is then marked Done, and read at the provider where it can be (`#300 reply-marks-read`) |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
@@ -3366,6 +3382,9 @@ own adapter-only token; every other route uses the read/write tokens described a
 | PUT | `/api/v1/voice-settings` | **write** | `{ask_before_send: bool}` and nothing else — the owner's choice, kept in the store; answers what was stored; 503 `storage_not_configured` with no store. No MCP tool reaches it |
 | GET | `/api/v1/voice-prompt` | read | `{instructions, system_prompt, system_prompt_edited, edited_from_version?, prompt_version, max_instructions_chars, max_system_prompt_chars, changeable, delivery}` — the owner's additional instructions and the base prompt in force (his copy or the shipped one); also client-config's `voice_prompt`. See "Instructions for the voice agent" |
 | PUT | `/api/v1/voice-prompt` | **write** | `{instructions?, system_prompt?}`, at least one — save either text; an absent field keeps its text, an empty `instructions` removes them, and an empty `system_prompt` (or the shipped one) restores the shipped prompt. Answers what was stored; 413 `too_large` over 4,000 / 20,000 characters; 503 `storage_not_configured` with no store. No MCP tool reaches it |
+| GET | `/api/v1/voice-post-prefix` | read | `{prefix, default_prefix, custom, max_chars, changeable}` — the tag the server puts before every message the voice agent posts: the owner's own when `custom` (possibly empty, which turns it off), otherwise the default; also client-config's `voice_post_prefix`. See "Every post the agent makes carries the owner's tag" |
+| PUT | `/api/v1/voice-post-prefix` | **write** | `{prefix}` and nothing else — save the owner's tag as typed, made one line with no space in front; `""` turns tagging off and is kept apart from never having saved one. Answers what was stored; 413 `too_large` over 100 characters; 503 `storage_not_configured` with no store. No MCP tool reaches it |
+| DELETE | `/api/v1/voice-post-prefix` | **write** | forget the owner's tag, so the default is used again (Settings' **Reset to default**); answers the tag now in force. No MCP tool reaches it |
 | POST | `/api/v1/channels/{id}/not-noise` | **write** | `{messages:[…]}` — these are real messages; stop reading them automatically, leaving the rules alone |
 | GET | `/api/v1/channels/{id}/pins` | read | this app's pinned messages in the channel, oldest message first, each with the snapshot kept of it, and the list's `revision`; see "Pinned messages" |
 | PUT | `/api/v1/channels/{id}/pins/{message_id}` | **write** | `{author, author_id, author_is_bot?, content, timestamp, thread_id?, thread_root?}` — pin it, keeping that much of the row; idempotent. At 100 pins in the channel the oldest is unpinned and named in `unpinned` |
@@ -6697,7 +6716,10 @@ hold, for both wire protocols:
   …`) followed by a space or the end. A mention (the model says a name there), a link or a bare
   domain, a sign such as `+1` or `#123`, an emoji, a time or a decimal (`10:30`, `3.5`), and any
   markup — strike, spoiler, quote, emphasis, code — make it tap-only, and the agent and the status
-  line say why.
+  line say why. The owner's tag in front of the agent's words (`#303 voice-post-prefix`, below) is
+  read back with them and held to the card word for word, but is not judged by this rule: the
+  server put it there from the owner's own setting, and nothing the model was told or read can
+  change it. The proposal's `prefix` names it; a draft with none is judged whole.
 * **It was heard to the end.** The answer arrived after the read-back's audio finished playing. On
   `vibe-talk-v1`, which sends partial transcripts, that is when the answer began; on the hosted
   protocol, which sends only final transcripts, it is when the answer's transcript arrived, so a
@@ -6907,6 +6929,50 @@ allowlisted channel. See "The API" above for why there is no lookup tool.
 **Every read tool's text output is fenced.** Channel content comes back inside the
 `src/untrusted.rs` fence, with the data-not-instructions notice attached, with any forged fence
 marked (not deleted) and control characters stripped. That is what the model actually receives.
+
+### Every post the agent makes carries the owner's tag
+
+`#303 voice-post-prefix`. A message the voice agent posts goes out as the owner's bot, and nothing
+in it used to say that a voice agent had relayed it: the channel could not tell his own typed words
+from words a model heard, drafted and posted for him. So the server puts a tag in front of every
+post the agent makes — **`(Voice-agent relayed, from user) `** by default, trailing space included
+— and never in front of anything typed on the page.
+
+**One place, so no path is missed.** `send_approval::voice_post` is the one function MCP's
+`post_reply` and `POST /api/v1/post-proposals` both call, in both modes, and it tags the text
+(`post_prefix::apply`) before anything else. So:
+
+* **A proposal** holds the tagged text. The card shows it, the read-back the agent is handed says
+  it (`To lead team: (Voice-agent relayed, from user) on it. Send it?`), and the commit — a tap on
+  Send or a spoken yes — restates it and posts exactly it. A commit does not pass through
+  `voice_post`, so it is never tagged twice.
+* **A direct send** with confirmation off posts the tagged text, and `SENT.` quotes it.
+* **A reply** carries it, whichever way the provider threads replies.
+* **A long post** is cut after tagging, so the tag counts toward the provider's `max_post_bytes` /
+  `max_post_chars` and goes on the first part only (`#263 post-split-per-provider`).
+* **The page's own posts** go to `POST /api/v1/channels/{id}/reply`, which never reaches
+  `voice_post`: nothing the owner types is tagged.
+
+**Once, never twice.** The model is shown the tagged text and may hand it straight back — a
+correction proposed from "Exact text:", a retried direct send — so a text that already starts with
+the tag keeps one, and a retried direct send is still recognised as the same words. Its prompt and
+`post_reply`'s description tell it the server adds the tag, so it adds none of its own. A text
+whose first line opens a Markdown block — a code fence, a quote, a list item, a heading — gets the
+tag on a line of its own, so the block still renders. An empty post, or one that is only the tag,
+is refused as empty, as before.
+
+**The setting.** Settings → **Voice agent** → **Sending** → **Prefix on messages the agent posts**:
+a box, a help line, **Save**, and **Reset to default**. It is the server's, kept in the store beside
+the owner's instructions for the agent (`#272 voice-agent-instructions`), so every device and every
+call uses the same one: read at read scope through `GET /api/v1/voice-post-prefix` and
+client-config's `voice_post_prefix`, saved only by a write-scope `PUT` (`{prefix}`), and forgotten by
+`DELETE`. It is put in front exactly as saved — one line, no space in front, at most 100 characters
+— so the owner ends it with a space. An empty tag turns tagging off, and is kept apart from never
+having saved one: no row in the store is the default, a row holding `''` is off. No MCP tool reaches
+it, because a model that could take its own tag off could pass its words off as the owner's. A store
+that cannot be read tags with the default; with no store configured the default stands and Settings
+cannot change it. A purge restores the default. Saving logs `voice_post_prefix event="changed"
+prefix_chars=…`, and a reset `event="reset"`: never the words.
 
 ### Registering it with an ElevenLabs agent
 

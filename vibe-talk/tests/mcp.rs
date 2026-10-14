@@ -383,7 +383,14 @@ async fn the_write_token_proposes_and_a_confirmed_post_lands_in_the_channel_that
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1, "{posted:?}");
     assert_eq!(posted[0].channel.as_str(), WRITE_CHANNEL);
-    assert_eq!(posted[0].content, "ack, landing it now");
+    // `#303 voice-post-prefix`: with the owner's tag in front, as every voice agent post has.
+    assert_eq!(
+        posted[0].content,
+        format!(
+            "{}ack, landing it now",
+            vibe_talk::post_prefix::DEFAULT_PREFIX
+        )
+    );
 }
 
 // --- the allowlist ----------------------------------------------------------------------------
@@ -1114,8 +1121,12 @@ async fn every_tool_result_carries_a_usable_mention_and_a_reply_built_from_it_pi
     confirm_pending(&harness).await;
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1);
+    // After the owner's tag (`#303 voice-post-prefix`), and verbatim.
     assert!(
-        posted[0].content.starts_with(&mention),
+        posted[0].content.starts_with(&format!(
+            "{}{mention}",
+            vibe_talk::post_prefix::DEFAULT_PREFIX
+        )),
         "the mention must reach Discord verbatim: {}",
         posted[0].content
     );

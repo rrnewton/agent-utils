@@ -40,6 +40,12 @@
 //! store that is not configured at all is different: there is no choice to lose, so the configured
 //! default applies, exactly as it does for the noise rules.
 //!
+//! # Every post it makes is tagged
+//!
+//! `#303 voice-post-prefix`. [`voice_post`] puts the owner's tag ([`crate::post_prefix`]) before
+//! the words first, in both modes, so what is proposed, read back, shown on the card, posted and
+//! quoted in `SENT.` is one text. Posts typed on the page never come through here.
+//!
 //! # Why this is its own module
 //!
 //! The direct send calls [`crate::ops::reply`] and nothing below it. How a long post is cut, and
@@ -185,6 +191,12 @@ pub enum VoicePost {
 /// `POST /api/v1/post-proposals` both call, so a client that maps the tool onto the REST route gets
 /// the same behaviour and hands its model the same words.
 ///
+/// It is also the one place the owner's tag goes on (`#303 voice-post-prefix`): the text is tagged
+/// by [`crate::post_prefix::apply`] before anything else, so a proposal, its read-back and its card,
+/// a direct send and its `SENT.`, a reply, and the first part of a long post all carry exactly the
+/// words that are posted. A commit posts the proposal's text as it stands, and is never tagged
+/// again.
+///
 /// # Errors
 ///
 /// Whatever [`ops::propose_reply`] or [`ops::reply`] refuses with — the allowlist, the write
@@ -196,9 +208,12 @@ pub async fn voice_post(
     text: &str,
     reply_to: Option<&str>,
 ) -> Result<VoicePost, OpError> {
+    let tagged = crate::post_prefix::apply(&crate::post_prefix::current(state).await, text);
+    let text = tagged.text.as_str();
     match current(state).await {
         Approval::Ask => {
-            let (channel, proposal) = ops::propose_reply(state, channel_id, text, reply_to).await?;
+            let (channel, proposal) =
+                ops::propose_reply(state, channel_id, text, &tagged.prefix, reply_to).await?;
             Ok(VoicePost::Proposed { channel, proposal })
         }
         Approval::Direct => {
@@ -514,11 +529,111 @@ mod tests {
             said.starts_with("SENT. Posted to lead team (id 2222222222) as a reply to message 42"),
             "{said}"
         );
+        // `#303 voice-post-prefix`: the words as posted, the owner's tag in front.
+        let tagged = format!("{}rebase onto main", crate::post_prefix::DEFAULT_PREFIX);
+        assert_eq!(text, tagged);
+        assert_eq!(discord.posted()[0].content, tagged);
         assert!(
-            said.contains("Exact text posted: rebase onto main"),
+            said.contains(&format!("Exact text posted: {tagged}")),
             "{said}"
         );
         assert!(!said.contains("went as"), "{said}");
+    }
+
+    // --- `#303 voice-post-prefix` ------------------------------------------------------------------
+
+    const TAG: &str = crate::post_prefix::DEFAULT_PREFIX;
+
+    #[tokio::test]
+    async fn a_proposal_holds_the_tagged_text_and_says_which_part_is_the_tag() {
+        let (state, discord, _store) = testing::state_with_store();
+        let outcome = voice_post(&state, WRITE_CHANNEL, "on it", Some("42"))
+            .await
+            .expect("proposed");
+        let VoicePost::Proposed { channel, proposal } = outcome else {
+            panic!("asking did not propose: {outcome:?}");
+        };
+        assert_eq!(proposal.binding.text, format!("{TAG}on it"));
+        assert_eq!(proposal.prefix, TAG);
+        assert_eq!(proposal.binding.reply_to.as_deref(), Some("42"));
+        // What the agent is handed to read back is the posted text, tag and all.
+        let notice = ops::proposal_notice(&channel, &proposal);
+        assert!(
+            notice.contains(&format!("Read-back: To lead team: {TAG}on it. Send it?")),
+            "{notice}"
+        );
+        // The commit restates that text and posts it as it stands: tagged once.
+        ops::commit_proposal(
+            &state,
+            &proposal.handle,
+            &proposal.binding,
+            ops::ConfirmedBy::SpeakerTurn,
+        )
+        .await
+        .expect("committed");
+        assert_eq!(discord.posted()[0].content, format!("{TAG}on it"));
+    }
+
+    #[tokio::test]
+    async fn text_handed_back_with_the_tag_is_tagged_once_in_both_modes() {
+        let (state, discord, store) = testing::state_with_store();
+        let VoicePost::Proposed { proposal, .. } =
+            voice_post(&state, WRITE_CHANNEL, &format!("{TAG}on it"), None)
+                .await
+                .expect("proposed")
+        else {
+            panic!("asking did not propose");
+        };
+        assert_eq!(proposal.binding.text, format!("{TAG}on it"));
+        assert_eq!(proposal.prefix, TAG);
+
+        store.set_ask_before_send(false).await.expect("direct");
+        voice_post(&state, WRITE_CHANNEL, "rebase", None)
+            .await
+            .expect("sent");
+        // A retry with the text the model was shown is the same send, not a second post.
+        let again = voice_post(&state, WRITE_CHANNEL, &format!("{TAG}rebase"), None)
+            .await
+            .expect("answered");
+        assert!(matches!(again, VoicePost::Repeat { .. }), "{again:?}");
+        assert_eq!(discord.posted().len(), 1);
+        assert_eq!(discord.posted()[0].content, format!("{TAG}rebase"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_tag_posts_the_words_alone_and_an_owners_own_tag_is_used_as_saved() {
+        let (state, discord, store) = testing::state_with_store();
+        store.set_ask_before_send(false).await.expect("direct");
+        crate::post_prefix::set(&state, Some(""))
+            .await
+            .expect("saved");
+        voice_post(&state, WRITE_CHANNEL, "plain", None)
+            .await
+            .expect("sent");
+        crate::post_prefix::set(&state, Some("[voice] "))
+            .await
+            .expect("saved");
+        voice_post(&state, WRITE_CHANNEL, "tagged", None)
+            .await
+            .expect("sent");
+        let posted: Vec<String> = discord.posted().into_iter().map(|p| p.content).collect();
+        assert_eq!(posted, ["plain", "[voice] tagged"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_post_or_a_bare_tag_is_still_refused_as_empty() {
+        let (state, discord, store) = testing::state_with_store();
+        for direct in [false, true] {
+            store.set_ask_before_send(!direct).await.expect("setting");
+            for text in ["", "   ", TAG] {
+                let error = voice_post(&state, WRITE_CHANNEL, text, None)
+                    .await
+                    .expect_err("nothing to post");
+                assert!(error.to_string().contains("empty"), "{text:?}: {error}");
+            }
+        }
+        assert!(discord.posted().is_empty());
+        assert!(state.post_gate.pending().is_none());
     }
 
     /// One posted part per entry of `inside`, each where it says: `None` in the channel with no

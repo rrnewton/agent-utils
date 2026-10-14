@@ -354,6 +354,16 @@ fn routes(state: AppState) -> Router {
                 .put(api::set_voice_prompt)
                 .layer(DefaultBodyLimit::max(api::VOICE_PROMPT_BODY_BYTES)),
         )
+        // `#303 voice-post-prefix`. The tag the server puts before every message the voice agent
+        // posts. READ scope to see it, WRITE scope to save it (PUT) or go back to the default
+        // (DELETE) — and NO MCP TOOL, because a model that could take its own tag off could pass
+        // its words off as the owner's.
+        .route(
+            "/api/v1/voice-post-prefix",
+            get(api::voice_post_prefix)
+                .put(api::set_voice_post_prefix)
+                .delete(api::reset_voice_post_prefix),
+        )
         .route(
             "/api/v1/channels/{channel_id}/not-noise",
             post(api::not_noise),

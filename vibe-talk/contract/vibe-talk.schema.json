@@ -288,6 +288,17 @@
           "description": "Server version, so a stale cached page is visible.",
           "type": "string"
         },
+        "voice_post_prefix": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoicePostPrefix"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tag this server puts before every message the voice agent posts, as Settings shows it.\n`#303 voice-post-prefix`.\n\nHere so the Sending section's field is drawn at sign-in, as the send setting is. Readable at\nread scope — it is in every post the agent makes, which any reader of the channel sees —\nand changed only by a write-scope `PUT` or `DELETE /api/v1/voice-post-prefix`. Absent from\nan older server, which tags nothing; the page then hides the field."
+        },
         "voice_prompt": {
           "anyOf": [
             {
@@ -765,6 +776,10 @@
         },
         "handle": {
           "description": "The single-use confirmation handle.",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "The start of `text` that this server put there: the owner's tag for what the voice agent\nposts (`#303 voice-post-prefix`). `text` begins with exactly this. Absent when nothing was\nadded — tagging is off — and from an older server. It is his own words, not the agent's, so\na client judging whether the agent's words can be confirmed by voice judges the rest.",
           "type": "string"
         },
         "reply_to": {
@@ -2052,6 +2067,41 @@
       ],
       "type": "object"
     },
+    "VoicePostPrefix": {
+      "description": "The tag this server puts before every message the voice agent posts. `#303 voice-post-prefix`.\n\nThe body of `GET`, `PUT` and `DELETE /api/v1/voice-post-prefix`, and `voice_post_prefix` in\nclient-config. The tag counts toward the provider's post-size limit and goes on the first part\nof a post that has to be cut; posts typed on the page never carry it.",
+      "properties": {
+        "changeable": {
+          "description": "Whether this server can keep a change. False with no store configured, and when the store\ncannot be read — the server then tags with the default.",
+          "type": "boolean"
+        },
+        "custom": {
+          "description": "Whether `prefix` is the owner's own saved choice — possibly empty, which turns the tag off —\nrather than the default because he has saved none.",
+          "type": "boolean"
+        },
+        "default_prefix": {
+          "description": "The tag this server ships, which a reset brings back.",
+          "type": "string"
+        },
+        "max_chars": {
+          "description": "The longest tag a save may carry, in characters.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prefix": {
+          "description": "The tag in force: the owner's saved one when `custom`, otherwise `default_prefix`. Empty\nmeans the voice agent's posts carry no tag. Put before the words exactly as it is, so a\ntrailing space is what separates the two.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prefix",
+        "default_prefix",
+        "custom",
+        "max_chars",
+        "changeable"
+      ],
+      "type": "object"
+    },
     "VoicePromptSettings": {
       "description": "The owner's own words for the voice agent, as Settings shows them. `#272\nvoice-agent-instructions`.\n\nThe body of `GET` and `PUT /api/v1/voice-prompt`, and `voice_prompt` in client-config. Both\ntexts join only the scope-neutral part of the prompt: what the agent can do — read, send, or\nask first — is added by the server from the caller's token and the send setting, after them.",
       "properties": {
@@ -2256,6 +2306,9 @@
     },
     {
       "$ref": "#/$defs/VoicePromptSettings"
+    },
+    {
+      "$ref": "#/$defs/VoicePostPrefix"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

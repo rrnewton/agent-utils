@@ -183,6 +183,38 @@ pub struct ClientConfigResponse {
     /// the page then hides the editor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_prompt: Option<VoicePromptSettings>,
+    /// The tag this server puts before every message the voice agent posts, as Settings shows it.
+    /// `#303 voice-post-prefix`.
+    ///
+    /// Here so the Sending section's field is drawn at sign-in, as the send setting is. Readable at
+    /// read scope — it is in every post the agent makes, which any reader of the channel sees —
+    /// and changed only by a write-scope `PUT` or `DELETE /api/v1/voice-post-prefix`. Absent from
+    /// an older server, which tags nothing; the page then hides the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_post_prefix: Option<VoicePostPrefix>,
+}
+
+/// The tag this server puts before every message the voice agent posts. `#303 voice-post-prefix`.
+///
+/// The body of `GET`, `PUT` and `DELETE /api/v1/voice-post-prefix`, and `voice_post_prefix` in
+/// client-config. The tag counts toward the provider's post-size limit and goes on the first part
+/// of a post that has to be cut; posts typed on the page never carry it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct VoicePostPrefix {
+    /// The tag in force: the owner's saved one when `custom`, otherwise `default_prefix`. Empty
+    /// means the voice agent's posts carry no tag. Put before the words exactly as it is, so a
+    /// trailing space is what separates the two.
+    pub prefix: String,
+    /// The tag this server ships, which a reset brings back.
+    pub default_prefix: String,
+    /// Whether `prefix` is the owner's own saved choice — possibly empty, which turns the tag off —
+    /// rather than the default because he has saved none.
+    pub custom: bool,
+    /// The longest tag a save may carry, in characters.
+    pub max_chars: u32,
+    /// Whether this server can keep a change. False with no store configured, and when the store
+    /// cannot be read — the server then tags with the default.
+    pub changeable: bool,
 }
 
 /// The owner's own words for the voice agent, as Settings shows them. `#272
@@ -628,6 +660,12 @@ pub struct PendingPost {
     pub channel_name: String,
     /// The exact text that would be posted.
     pub text: String,
+    /// The start of `text` that this server put there: the owner's tag for what the voice agent
+    /// posts (`#303 voice-post-prefix`). `text` begins with exactly this. Absent when nothing was
+    /// added — tagging is off — and from an older server. It is his own words, not the agent's, so
+    /// a client judging whether the agent's words can be confirmed by voice judges the rest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
     /// The message it would reply to, when any.
     pub reply_to: Option<MessageId>,
     /// Milliseconds until the handle expires.
@@ -884,6 +922,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<MessagesResponse>(),
         // `#272 voice-agent-instructions`. Appended, for the same reason.
         generator.subschema_for::<VoicePromptSettings>(),
+        // `#303 voice-post-prefix`. Appended, for the same reason.
+        generator.subschema_for::<VoicePostPrefix>(),
     ]
 }
 

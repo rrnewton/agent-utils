@@ -176,6 +176,16 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
+        // A refusal, not `Ok(None)`, for the noise rules' reason: Settings must not believe it
+        // could save. `post_prefix::current` applies the shipped tag by name.
+        refuse()
+    }
+
+    async fn set_post_prefix(&self, _: Option<&str>) -> Result<Option<String>, StoreError> {
+        refuse()
+    }
+
     async fn noise_exemptions(&self, _: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         refuse()
     }
