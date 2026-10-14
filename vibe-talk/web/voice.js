@@ -15244,8 +15244,21 @@ function allReachesThread(id, summary) {
 /**
  * A held view missed what the stream delivered while it was hidden; the store did not. True when
  * that changed the rows on screen.
+ *
+ * NOT ONLY WHICH ROWS: WHAT THEY SAY. An edit the stream delivered while this view was not shown
+ * went into the store and was drawn only in the columns on screen; it owes no read, being carried
+ * whole. Comparing the ids alone, a thread gone back to kept the words from before the edit until
+ * the fifteen-minute reconcile, where the page before `#278 page-live-reads` read it within forty-
+ * five seconds. So each row is compared with the store's copy too: the same object, or the same
+ * message word for word (`sameMessage`); a card with its summary likewise.
+ *
+ * `words` false compares the ids alone, as before: for a read that landed overtaken by a read of
+ * the same view queued behind it, which draws what changed when it lands (`rowsAsDrawn` compares
+ * each row with the store's copy), and polls at forty-five seconds if it fails (`readsBehind`).
+ *
+ * @param {boolean} [words]
  */
-function catchUpHeldView() {
+function catchUpHeldView(words = true) {
   const projected = threadingSupported ? projectView() : null;
   if (!projected) return false;
   const cover = channelCanon.views.get(viewKey());
@@ -15258,7 +15271,9 @@ function catchUpHeldView() {
   const threads = channelView === "threads";
   const held = threads ? timelineThreads : timelineMessages;
   const ids = (items) => items.map((item) => String(item.id)).join("\n");
-  if (ids(projected) === ids(held)) return false;
+  if (words ? projected.length === held.length &&
+      projected.every((item, at) => item === held[at] || sameMessage(held[at], item))
+    : ids(projected) === ids(held)) return false;
   if (threads) {
     timelineThreads = projected;
     el("thread-list").replaceChildren(...projected.map(threadCard));
@@ -17588,7 +17603,7 @@ async function loadTimeline(options) {
           // the store has it, so that view is current from its next showing.
           canon.views.get(viewKey(view, thread)).landedHidden = true;
           if (context === channelContextKey()) {
-            catchUpHeldView();
+            catchUpHeldView(!discordQueuedLoads.has(steps.column));
             renderChannelFreshness();
           } else if (view === "flat") {
             catchUpFromAll();
@@ -17716,9 +17731,11 @@ function foldLateTimelinePage(payload, read) {
     // still that read: a landing made on the held rows is kept through it, and one left to it is paid.
     // On what the page says is read, as that read would have drawn it: the first unread message and
     // the runs of read messages are decided by it.
+    // Its words too (`catchUpHeldView`), unless a read of this view queued behind it will draw them:
+    // the reader may have come back while it was out, and no other read follows it then.
     const landing = entryLandingMark();
     noteArchived(payload, false);
-    catchUpHeldView();
+    catchUpHeldView(!discordQueuedLoads.has(activeColumn));
     renderChannelFreshness();
     if (entryReadOwed === read.context) entryReadOwed = null;
     if (landing) keepEntryLanding(landing);

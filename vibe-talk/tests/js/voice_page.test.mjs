@@ -38709,7 +38709,7 @@ test("...and a landing left to the read behind held rows is paid by that read wh
     "    if (landing) keepEntryLanding(landing);\n  } else if")), { open: "true", atTheHead: false },
   "the overtaken read landed without paying the landing; the control proves nothing");
   // ...nor on the page's read messages drawn unread: the landing goes to the oldest of them instead.
-  assert.deepStrictEqual(await run(brokenScript("    noteArchived(payload, false);\n    catchUpHeldView();", "    catchUpHeldView();")),
+  assert.deepStrictEqual(await run(brokenScript("    noteArchived(payload, false);\n    catchUpHeldView(", "    catchUpHeldView(")),
     { open: "true", atTheHead: false }, "the overtaken read found the answer without what it says is read; the control proves nothing");
 });
 
@@ -52279,9 +52279,10 @@ test("`#278 page-live-reads`: a placed reply removed while a read sent before it
 //
 // Gaps the fifteen-minute poll left. A delta of a channel whose deltas carry additions only — the
 // Google Chat bridge's today, behind its pushed stream — was taken as answering the read a reply
-// the stream did not place had owed, when it carries no reply and no root whose count moved. Each
-// test below fails on 8eb312bc's page; those named PROBE are the reviewer's probes, and the others
-// reach the same gaps another way.
+// the stream did not place had owed, when it carries no reply and no root whose count moved. A view
+// this page held while another was shown came back with the words from before an edit the stream
+// had delivered, since only its ids were compared. Each test below fails on 8eb312bc's page; those
+// named PROBE are the reviewer's probes, and the others reach the same gaps another way.
 
 /**
  * A reply into the first thread (root 201) as the server comes to hold it — its root and its
@@ -52375,6 +52376,111 @@ test("`#278 page-live-reads`: on a channel whose deltas carry additions only, ev
   assert.equal(mainShows(page, "611"), "Thread(3):placed",
     `90 s after the second reply Main shows ${mainShows(page, "611")}, read ${page.timelineCalls.slice(calls).map((path) => path.replace(/^.*\?/, ""))}`);
   assert.deepStrictEqual(sideIds(page), ["203", "204"], "a reply into the first thread was drawn in the second");
+});
+
+/** web/voice.js with a held view caught up by its ids alone, as on 8eb312bc: the control for PROBE-E1. */
+const idsOnlyCatchUp = () => brokenScript(
+  "  if (words ? projected.length === held.length &&\n" +
+  "      projected.every((item, at) => item === held[at] || sameMessage(held[at], item))\n" +
+  "    : ids(projected) === ids(held)) return false;",
+  "  if (ids(projected) === ids(held)) return false;");
+
+test("`#278 page-live-reads`: an edit delivered while the reader is in Main is shown when the reader goes back to the thread it was in, with no read (PROBE-E1)", async () => {
+  /** The thread's words 90 s after going back to it, and the reads since the edit. */
+  const run = async (script) => {
+    const { page, server } = await pushedPage({}, script);
+    const thread = page.threads[0].id;
+    await pickThread(page, `thread:${thread}`);
+    await page.settle();
+    assert.match(page.el("discord-log").text(), /first thread answer/, "the thread is not open, so this proves nothing");
+    await pickThread(page, "main");
+    await page.settle();
+    server.edit("202", { content: "edited while the reader was in Main" });
+    const calls = page.timelineCalls.length;
+    await deliver(page, page.stream(), sseUpdate("edit-202", bareOf(page.messages.find((m) => m.id === "202"))));
+    await page.settle();
+    await pickThread(page, `thread:${thread}`);
+    await page.settle();
+    await healthyWalk(page, 90000);
+    return { edited: /edited while the reader was in Main/.test(page.el("discord-log").text()), reads: readViewsSince(page, calls) };
+  };
+  const { edited, reads } = await run(SCRIPT);
+  assert.ok(edited, "the thread came back with the words from before the edit");
+  assert.deepStrictEqual(reads, [], "an edit carried whole on its event was read for");
+  // THE CONTROL: the held rows compared by their ids alone.
+  assert.ok(!(await run(idsOnlyCatchUp())).edited, "the control showed the edit anyway, so this test cannot see it lost");
+});
+
+test("`#278 page-live-reads`: an edit delivered while the reader is in a thread is shown when the reader goes back to Main, with no read (PROBE-E2)", async () => {
+  const { page, server } = await pushedPage();
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  await page.settle();
+  server.edit("200", { content: "edited while the reader was in the thread" });
+  const calls = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseUpdate("edit-200", page.messages.find((m) => m.id === "200")));
+  await page.settle();
+  await pickThread(page, "main");
+  await page.settle();
+  await healthyWalk(page, 90000);
+  assert.ok(rowShowing(page, "edited while the reader was in the thread"), "Main came back with the words from before the edit");
+  assert.ok(!rowShowing(page, "main channel announcement"));
+  assert.deepStrictEqual(readViewsSince(page, calls), [], "an edit carried whole on its event was read for");
+});
+
+test("`#278 page-live-reads`: in two columns, an edit delivered while the right column shows another thread is shown when it goes back to the thread it was in (PROBE-C2)", async () => {
+  const { page, server } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the first thread is not open on the right");
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "the second thread is not open on the right");
+  server.edit("202", { content: "edited while the right column showed the other thread" });
+  await deliver(page, page.stream(), sseUpdate("edit-202", bareOf(page.messages.find((m) => m.id === "202"))));
+  await page.settle();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await healthyWalk(page, 90000);
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the first thread is not back on the right");
+  assert.match(page.el("side-log").text(), /edited while the right column showed the other thread/,
+    "the right column came back to the thread with the words from before the edit");
+  assert.doesNotMatch(page.el("side-log").text(), /first thread answer/);
+});
+
+test("`#278 page-live-reads`: a thread the reader leaves and comes back to while its read is out shows the words that read brings when it lands", async () => {
+  /** The thread's words once the reconcile's read, out while the reader went to Main and back, lands. */
+  const run = async (script) => {
+    const { page, server } = await pushedPage({}, script);
+    const thread = page.threads[0].id;
+    await pickThread(page, `thread:${thread}`);
+    await page.settle();
+    assert.match(page.el("discord-log").text(), /first thread answer/, "the thread is not open, so this proves nothing");
+    // Edited where the stream could not say so; the reconcile's read of the thread goes out, and is slow.
+    server.edit("202", { content: "edited, and only a read says so" });
+    const held = holdCutAnswers(server);
+    page.setClock(page.clock() + TIMELINE_RECONCILE_MS);
+    assert.equal(page.expireTimers(TIMELINE_RECONCILE_MS), 1, "no reconcile was armed behind the pushed stream");
+    await page.settle();
+    assert.equal(held.cut.length, 1, "the reconcile did not read, so this proves nothing");
+    assert.match(held.cut[0], /view=thread/, "the reconcile did not read the thread, so this proves nothing");
+    await pickThread(page, "main");
+    await page.settle();
+    await pickThread(page, `thread:${thread}`);
+    await page.settle();
+    assert.equal(held.cut.length, 1, "coming back read the thread again, so this proves nothing");
+    held.open();
+    await page.settle();
+    await page.settle();
+    await page.settle();
+    return /edited, and only a read says so/.test(page.el("discord-log").text());
+  };
+  assert.ok(await run(SCRIPT), "the read landed with the edit and the thread kept the words from before it");
+  // THE CONTROL: the rows compared by their ids alone, as before.
+  assert.ok(!(await run(brokenScript("    catchUpHeldView(!discordQueuedLoads.has(activeColumn));", "    catchUpHeldView(false);"))),
+    "the control drew the edit anyway, so this test cannot see it kept out");
 });
 
 test("`#278 page-live-reads`: an additions-only delta sent before a reply replayed from the tail does not answer for it: the poll reads Main in full and places it", async () => {
