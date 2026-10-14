@@ -25055,10 +25055,12 @@ function takeDeferredOlder() {
 //     hang for as long as the connection stalls, which is just when the owner bounces against the
 //     bottom, and a pull that showed nothing then would be "I don't get a refresh that shows in
 //     the UI" all over again. On a channel with threads the read waited on answers the pull only if
-//     it is one a pull could have been — sent as a pull or an opening, which the server never answers
-//     from the few seconds it keeps a newest answer, and in full or as a delta known complete. A
-//     poll's or a live message's read is followed by the pull's own (`waitedReadFallsShortOfPull`,
-//     `#278 timeline-single-flight`): correctness over the read saved.
+//     it is one a pull could have been — a read of this view in this column, on the wire at the
+//     release or sent since, sent as a pull or an opening, which the server always reads afresh, and
+//     in full or as a delta known complete. In two columns the read waited on may be the other
+//     column's. A poll's or a live message's read, or the other column's, is followed by the pull's
+//     own (`waitedReadFallsShortOfPull`, `#278 timeline-single-flight`): correctness over the read
+//     saved.
 //   * WHAT IT REPORTS IS ABOUT THE VIEW IT WAS ASKED OVER, AND FROM THE RELEASE ON. A reader on a
 //     slow read taps another tab, another thread or another channel; the read they pulled for is
 //     then folded away for later, and the freshness the page restores belongs to the view they
@@ -25347,11 +25349,17 @@ async function pullEnd() {
  */
 async function refreshFromNewest() {
   renderPull("busy", { edge: "end", travel: PULL_ARM_PX });
-  // What the result will be about: this view of this channel, from this moment on.
+  // What the result will be about: this view of this channel, from this moment on. And which read
+  // of it the pull may take for its own: the one on the wire now if it is this view's, in this
+  // column, or one sent after now (`waitedReadFallsShortOfPull`).
+  const context = channelContextKey();
+  const onWire = timelineReadContext === context;
   const asked = {
-    context: channelContextKey(),
+    context,
     at: Date.now(),
     newest: discordNewestId,
+    onWire,
+    firstRead: onWire ? timelineReadsStarted : timelineReadsStarted + 1,
   };
   let failure = null;
   try {
@@ -25362,12 +25370,12 @@ async function refreshFromNewest() {
       while (discordFetchInFlight) {
         await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
       }
-      // ...unless it was a read the pull could not have been, on a channel with threads: one the
-      // server may answer from the few seconds it keeps a newest answer (the poll's, a live
+      // ...unless it was a read the pull could not have been, on a channel with threads: the other
+      // column's, one the server may answer by a read from before it (the poll's, a live
       // message's), or one of what changed where the channel's deltas may carry additions alone.
-      // Either could leave a change made upstream and never pushed on screen after the pull, so the
+      // Any could leave a change made upstream and never pushed on screen after the pull, so the
       // pull reads for itself. `#278 timeline-single-flight`.
-      if (waitedReadFallsShortOfPull(asked.context)) {
+      if (waitedReadFallsShortOfPull(asked)) {
         await loadDiscord({ keepPosition: true, reason: "pull" });
       }
     } else {
@@ -25387,23 +25395,33 @@ async function refreshFromNewest() {
 }
 
 /**
- * Whether the read a pull up waited on, the last this column sent of the view the pull was over,
- * falls short of what the pull asks for — the channel as it stands now. `#278 timeline-single-flight`.
- * It does if it did not say a reason the server reads afresh for (`FRESH_READ_REASONS`): the poll,
- * a live message or a return to the page may be answered from the few seconds the server keeps a
- * newest answer, which a pull never is, and nothing the page sees tells the two apart. And it does
+ * Whether the reads a pull up waited on fall short of what the pull asks for — the channel as it
+ * stands now. `#278 timeline-single-flight`.
+ *
+ * Only a read of the view the pull was over, by this column, counts: the one on the wire at the
+ * release, or one sent since (`asked.firstRead`). In two columns the read waited on may have been
+ * the other column's, and this column's last record then names a read from before the release,
+ * which the pull cannot take for its own however fresh it was — the reads fall short. So they do
+ * if no such read was sent; except that a read of this view on the wire at the release that then
+ * failed is the pull's own failure, said as "Refresh failed", rather than a reason to read again.
+ *
+ * A read that does count falls short if it did not say a reason the server reads afresh for
+ * (`FRESH_READ_REASONS`): the poll, a live message or a return to the page may be answered by a read
+ * from before it, which a pull never is, and nothing the page sees tells the two apart. And it does
  * if it read only what changed where a pull itself would read in full (`forwardCursor`), the
  * channel's deltas not being known to carry edits and deletions. Only a pull's or an opening's read,
  * in full or as a delta shown complete, answers the pull, and then no second read is sent. An
  * un-threaded channel's reads go to `/page`, which keeps no answer, and are not asked: there the
  * read in flight is the refresh, as "A READ ALREADY IN FLIGHT IS THE REFRESH" says.
  *
- * @param {string} context the view the pull was over (`channelContextKey`)
+ * @param {{context: string, onWire: boolean, firstRead: number}} asked the view the pull was over
+ *   (`channelContextKey`), whether a read of it in this column was on the wire at the release, and
+ *   the number among `timelineReadsStarted` of the first read that may answer the pull
  */
-function waitedReadFallsShortOfPull(context) {
-  if (!threadingSupported || context !== channelContextKey()) return false;
+function waitedReadFallsShortOfPull(asked) {
+  if (!threadingSupported || asked.context !== channelContextKey()) return false;
   const sent = columnReadsSent.get(activeColumn);
-  if (!sent || sent.context !== context) return false;
+  if (!sent || sent.context !== asked.context || sent.read < asked.firstRead) return !asked.onWire;
   return !sent.fresh || (!sent.full && forwardCursor("pull") === null);
 }
 

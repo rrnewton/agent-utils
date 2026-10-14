@@ -51213,3 +51213,46 @@ test("a pull up that waits on a pull's delta over complete deltas sends nothing 
   assert.deepStrictEqual(forwardReadKinds(server, from), [true], "a second read followed a pull's complete delta");
   assert.ok(rowShowing(page, "edited upstream, never pushed"), "the complete delta did not carry the edit");
 });
+
+test("`#278 timeline-single-flight` x `#229 desktop-two-column`: a pull up in Main that waited on the right column's read reads Main for itself", async () => {
+  // Round-3 review of #278: the pull up asked whether Main's own last read could have been the pull
+  // (`waitedReadFallsShortOfPull`), never whether that was the read it waited on. In two columns it
+  // waited on the thread's read on the right; Main's last read was a pull twenty seconds before,
+  // fresh and full, so nothing read Main, an edit made upstream since stayed off screen, and the foot
+  // said "Updated · nothing new". Only a read of Main on the wire at the release, or sent since,
+  // answers the pull now.
+  const { page, server, data } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  // The server sees creations only, and the page learns so from the poll's first round.
+  server.complete = false;
+  await pollOnce(page);
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight;
+  const earlier = server.reads.length;
+  await pullUp(page, PULL_ARM_PX);
+  await page.settle();
+  assert.deepStrictEqual(server.reads.slice(earlier).map((read) => [read.view, read.after !== null]), [["main", false]],
+    "fixture: the first pull up did not read Main in full");
+  page.setClock(page.clock() + 20 * 1000);
+  server.edit("200", { content: "edited upstream, never pushed" });
+  const reads = server.reads.length;
+  const release = holdView(server, "thread");
+  const reply = server.post(message({ id: "205", content: "a second answer", thread: { ...data.messages[1].thread, is_root: false } }));
+  await deliver(page, page.stream(), sseMessage(reply));
+  await page.settle();
+  area.scrollTop = area.scrollHeight;
+  const { lifted } = await pullUpAndHold(page);
+  assert.equal(page.el("pull-refresh").getAttribute("data-edge"), "end", "fixture: not the foot's pull");
+  release();
+  await page.settle();
+  page.expireTimers(PULL_WAIT_MS);
+  await lifted;
+  await page.settle();
+  assert.deepStrictEqual(server.reads.slice(reads).map((read) => read.view), ["thread", "main"],
+    `the pull up in Main took the thread's read for Main's: ${JSON.stringify(server.reads.slice(reads))}`);
+  assert.equal(server.reads.at(-1).after, null, "a pull where deltas carry additions only did not read in full");
+  assert.ok(rowShowing(page, "edited upstream, never pushed"), "the pull up in Main did not show an edit made upstream");
+  assert.ok(sideIds(page).includes("205"), "the live reply left the thread on the right");
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "done", "the pull up did not say what it found");
+});

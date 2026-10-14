@@ -1943,10 +1943,11 @@ are: they always read for themselves, joining no read already running and taking
 memory, so they show every change made before they were sent. A later poll may join their read. A
 page load that stands for several refreshes queued behind a read in flight sends the one that asks
 for a fresh read. A pull up released while the page already has a timeline read on the wire waits
-for it, and then reads for itself unless that read was sent as a pull or an opening and read in
-full or as a delta known to be complete: the poll's read, or a live message's, may have been
-answered by a read from before it, and on a channel whose deltas carry additions only it may have
-been a delta. A pull is a delta only where the channel's deltas are known complete (see "A refresh
+for it, and then reads for itself unless a read of the same view, in the same column, on the wire
+at the release or sent since, was sent as a pull or an opening and read in full or as a delta known
+to be complete: in two columns the read waited on may be the other column's, the poll's read or a
+live message's may have been answered by a read from before it, and on a channel whose deltas carry
+additions only it may have been a delta. A pull is a delta only where the channel's deltas are known complete (see "A refresh
 asks only for what changed").
 
 Nor is a request handed shared text older than what another read of the channel may already have
