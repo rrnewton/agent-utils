@@ -60,6 +60,24 @@
 //! file's generation, so one erased since the account was checked is checked again before any
 //! fill reaches it.
 //!
+//! # When the provider stops letting the server read
+//!
+//! While a cache is behind an armed sink, the sink listens to the router's
+//! [`super::access::AccessWatch`], which every provider client reports each operation's outcome
+//! to (plan section 6.3):
+//!
+//! - **a channel or a thread in doubt** (a 403 or 404 from a read of it) is not served from the
+//!   cache until a read of it succeeds again. Ten minutes on, the sink reads it again itself; the
+//!   same refusal confirms the loss, and the sink erases the channel and the store's summaries of
+//!   it, or erases the thread, each of whose messages the store's summaries then follow. A loss
+//!   confirmed this way is erased whoever noticed it first, a read-scope request included: the
+//!   erase removes data and writes none;
+//! - **a credential refused** (any 401) suspends the provider: nothing of it is served or filled.
+//!   Its own client is asked which account it is every [`SUSPENDED_RECHECK`], and the suspension
+//!   ends when the answer matches the file (or is recorded, the file holding none). Slack's
+//!   `account_inactive` or `token_revoked`, or a refusal still heard [`CREDENTIAL_GRACE`] after the
+//!   first, erases everything held for the provider.
+//!
 //! # The store's summaries
 //!
 //! A cache put behind the sink ([`Sink::install`]) is followed by a task that deletes the store's
@@ -75,16 +93,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
+use async_trait::async_trait;
+
+use super::access::{AccessListener, Suspect};
 use super::grant::{FillGrant, ServerFill};
 use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
-use super::{Account, ChanKey, MessageCache, Observation, Read, RouteSnapshot, Stamp};
-use crate::chat::{ChatClient, RecentRead};
+use super::{Account, ChanKey, MessageCache, Observation, Read, RouteSnapshot, Scope, Stamp};
+use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
 use crate::live::LiveMessage;
 use crate::model::{ChannelId, ChannelInfo, Message};
 use crate::providers::ChatRouter;
-use crate::threads::{TimelinePage, TimelineRequest};
+use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 
 /// How long a provider that gave no account is left before it is asked again. Each further
 /// failure doubles the wait, up to [`VERIFY_RETRY_CAP`].
@@ -94,18 +115,35 @@ pub const VERIFY_RETRY_CAP: Duration = Duration::from_secs(600);
 /// How long a verification waits for the writer to apply what it asked before it reads the
 /// account back. Longer, and it asks again later.
 const ACCOUNT_WAIT: Duration = Duration::from_secs(10);
+/// How often a provider that refused the credential is asked which account it is.
+pub const SUSPENDED_RECHECK: Duration = Duration::from_secs(600);
+/// How long a provider may go on refusing the credential before what is held for it is erased.
+pub const CREDENTIAL_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The message cache as the server sees it: an empty slot, or an open cache, and the channels it
 /// may hold.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Sink {
-    /// Shared with the tasks the sink starts: each provider's verification.
+    /// Shared with the tasks the sink starts, and listened through: see the module documentation.
     state: Arc<State>,
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Self {
+            state: Arc::new_cyclic(|me| State {
+                me: me.clone(),
+                ..State::default()
+            }),
+        }
+    }
 }
 
 /// What the sink knows, shared with the tasks it starts.
 #[derive(Debug, Default)]
 struct State {
+    /// The sink's own state, for what it starts from a listener's call.
+    me: Weak<State>,
     slot: RwLock<Option<Arc<MessageCache>>>,
     /// Taken before the slot whenever both are held, never the other way round.
     routes: Mutex<Routes>,
@@ -128,6 +166,8 @@ struct Identities {
     round: u64,
     /// By provider key. A provider not here is unverified.
     providers: HashMap<String, Standing>,
+    /// The providers a verification task of this round is running for.
+    running: HashSet<String>,
 }
 
 /// A provider's standing, when it has one; one with none is unverified.
@@ -136,6 +176,12 @@ enum Standing {
     /// The provider's account matched the one the file records (or was recorded), while the file
     /// was at this generation.
     Verified { generation: u64 },
+    /// The provider refused the credential, first at `since`; `erased` once what was held for it
+    /// has been erased for that.
+    Suspended {
+        since: tokio::time::Instant,
+        erased: bool,
+    },
 }
 
 /// Whether one provider's channels may be filled: its account has been checked against the file.
@@ -146,6 +192,9 @@ pub enum Verification {
     Unverified,
     /// Checked: fills may begin.
     Verified,
+    /// The provider refused the credential: nothing of it is served or filled until its account
+    /// is checked again.
+    Suspended,
 }
 
 /// How many of the writer's events the summaries task has followed, against the count the cache
@@ -382,17 +431,23 @@ impl Sink {
             }
         }
         State::verify_all(state);
+        State::listen(state);
     }
 
-    /// Take the cache out from behind the sink, leaving it empty. The cache itself is closed when
-    /// the last handle on it is dropped.
+    /// Take the cache out from behind the sink, leaving it empty, and stop listening to the
+    /// providers' access signals. The cache itself is closed when the last handle on it is
+    /// dropped.
     pub fn uninstall(&self) -> Option<Arc<MessageCache>> {
-        let _routes = self.state.routes();
-        self.state
-            .slot
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        let taken = {
+            let _routes = self.state.routes();
+            self.state
+                .slot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        };
+        State::listen(&self.state);
+        taken
     }
 
     /// The cache behind the sink, if any.
@@ -413,6 +468,7 @@ impl Sink {
             }
         }
         State::verify_all(&self.state);
+        State::listen(&self.state);
     }
 
     /// Whether [`Sink::arm`] has been called.
@@ -463,24 +519,28 @@ impl Sink {
             .write()
             .unwrap_or_else(PoisonError::into_inner) =
             channels.iter().map(|channel| channel.id.clone()).collect();
-        let new_router = {
+        let replaced = {
             let mut routes = self.state.routes();
             routes.fills = fills;
             routes.snapshot = Some(snapshot.clone());
-            let new_router = !routes
+            let replaced = (!routes
                 .router
                 .as_ref()
-                .is_some_and(|known| Arc::ptr_eq(known, router));
-            routes.router = Some(Arc::clone(router));
+                .is_some_and(|known| Arc::ptr_eq(known, router)))
+            .then(|| routes.router.replace(Arc::clone(router)));
             if routes.armed {
                 if let Some(cache) = self.cache() {
                     cache.retain_only(snapshot);
                 }
             }
-            new_router
+            replaced
         };
-        if new_router {
+        if let Some(previous) = replaced {
+            if let Some(previous) = previous {
+                previous.access().listen(None);
+            }
             State::verify_all(&self.state);
+            State::listen(&self.state);
         }
     }
 
@@ -540,7 +600,12 @@ impl Sink {
     /// Whether `provider_key`'s account has been checked against the cache behind the sink.
     #[must_use]
     pub fn verification(&self, provider_key: &str) -> Verification {
+        let suspended = matches!(
+            self.state.identities().providers.get(provider_key),
+            Some(Standing::Suspended { .. })
+        );
         match self.cache() {
+            _ if suspended => Verification::Suspended,
             Some(cache) if self.state.standing(provider_key, &cache) => Verification::Verified,
             _ => Verification::Unverified,
         }
@@ -664,9 +729,9 @@ impl State {
         false
     }
 
-    /// Start verification over: every provider unverified, and, with a cache behind an armed
-    /// sink and a runtime to run on, one task per provider asking its own client which account it
-    /// is. Tasks of an earlier round see the round has moved and stop.
+    /// Start verification over: every provider unverified (a suspended one stays suspended), and,
+    /// with a cache behind an armed sink and a runtime to run on, one task per provider asking its
+    /// own client which account it is. Tasks of an earlier round see the round has moved and stop.
     fn verify_all(state: &Arc<Self>) {
         let cache = state.cache();
         let router = {
@@ -676,23 +741,48 @@ impl State {
         let round = {
             let mut identities = state.identities();
             identities.round += 1;
-            identities.providers.clear();
+            identities
+                .providers
+                .retain(|_, standing| matches!(standing, Standing::Suspended { .. }));
+            identities.running.clear();
             identities.round
         };
-        let (Some(cache), Some(router), Ok(runtime)) =
-            (cache, router, tokio::runtime::Handle::try_current())
-        else {
+        let (Some(cache), Some(router)) = (cache, router) else {
             return;
         };
         for entry in router.entries() {
-            runtime.spawn(verify(
-                Arc::clone(state),
-                Arc::downgrade(&cache),
-                Arc::clone(&entry.client),
-                entry.key.clone(),
-                round,
-            ));
+            Self::start_verifying(state, &cache, &router, &entry.key, round);
         }
+    }
+
+    /// Start `provider_key`'s verification task for `round`, unless one is running, and when there
+    /// is a runtime to run it on.
+    fn start_verifying(
+        state: &Arc<Self>,
+        cache: &Arc<MessageCache>,
+        router: &ChatRouter,
+        provider_key: &str,
+        round: u64,
+    ) {
+        let (Some(entry), Ok(runtime)) = (
+            router.entry(provider_key),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
+        };
+        {
+            let mut identities = state.identities();
+            if identities.round != round || !identities.running.insert(provider_key.to_owned()) {
+                return;
+            }
+        }
+        runtime.spawn(verify(
+            Arc::clone(state),
+            Arc::downgrade(cache),
+            Arc::clone(&entry.client),
+            provider_key.to_owned(),
+            round,
+        ));
     }
 
     /// The cache a verification of `round` was started against, while that still matters: the
@@ -702,7 +792,16 @@ impl State {
         (self.identities().round == round && self.holds(&cache)).then_some(cache)
     }
 
-    /// `provider_key` matched the file at `generation`, in `round`.
+    /// Whether `provider_key` is suspended.
+    fn suspended(&self, provider_key: &str) -> bool {
+        matches!(
+            self.identities().providers.get(provider_key),
+            Some(Standing::Suspended { .. })
+        )
+    }
+
+    /// `provider_key` matched the file at `generation`, in `round`: fills may begin, and a
+    /// suspension ends.
     fn verified(&self, round: u64, cache: &Arc<MessageCache>, provider_key: &str, generation: u64) {
         if !self.holds(cache) {
             return;
@@ -712,6 +811,166 @@ impl State {
             identities
                 .providers
                 .insert(provider_key.to_owned(), Standing::Verified { generation });
+            cache.resume_provider(provider_key);
+        }
+    }
+
+    /// `provider_key`'s verification task of `round` has ended.
+    fn stopped_verifying(&self, round: u64, provider_key: &str) {
+        let mut identities = self.identities();
+        if identities.round == round {
+            identities.running.remove(provider_key);
+        }
+    }
+
+    /// Listen to the router's access signals while a cache is behind an armed sink, and stop
+    /// otherwise. On starting, what is in doubt or suspended is blocked in the cache afresh: a
+    /// cache opened since holds no blocks.
+    fn listen(state: &Arc<Self>) {
+        let (router, armed) = {
+            let routes = state.routes();
+            (routes.router.clone(), routes.armed)
+        };
+        let Some(router) = router else {
+            return;
+        };
+        let Some(cache) = state.cache().filter(|_| armed) else {
+            router.access().listen(None);
+            return;
+        };
+        let suspended: Vec<String> = state
+            .identities()
+            .providers
+            .iter()
+            .filter(|(_, standing)| matches!(standing, Standing::Suspended { .. }))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &suspended {
+            cache.suspend_provider(key);
+        }
+        let listener: Weak<dyn AccessListener> = Arc::downgrade(state) as Weak<dyn AccessListener>;
+        router.access().listen(Some(listener));
+        for suspect in router.access().suspects() {
+            state.block(&suspect);
+        }
+    }
+
+    /// The cache's name for a suspect's channel, and the scope in doubt when it is one thread.
+    fn suspect_scope(suspect: &Suspect) -> (ChanKey, Option<Scope>) {
+        (
+            ChanKey::new(suspect.provider_key.clone(), suspect.channel.as_str()),
+            suspect.thread.clone().map(Scope::Thread),
+        )
+    }
+}
+
+#[async_trait]
+impl AccessListener for State {
+    fn block(&self, suspect: &Suspect) {
+        let Some(cache) = self.cache() else {
+            return;
+        };
+        match Self::suspect_scope(suspect) {
+            (chan, None) => cache.block_channel(&chan),
+            (chan, Some(scope)) => cache.block_scope(&chan, &scope),
+        }
+    }
+
+    fn unblock(&self, suspect: &Suspect) {
+        if let Some(cache) = self.cache() {
+            let (chan, scope) = Self::suspect_scope(suspect);
+            cache.unblock(&chan, scope.as_ref());
+        }
+    }
+
+    /// The server's own read: the channel's sample, or the newest message of the thread.
+    async fn probe(&self, suspect: &Suspect) -> Option<Result<(), ChatError>> {
+        self.cache()?;
+        let router = self.routes().router.clone()?;
+        let client = Arc::clone(&router.entry(&suspect.provider_key)?.client);
+        Some(match &suspect.thread {
+            None => client.probe_channel(&suspect.channel, 1).await.map(drop),
+            Some(thread) => client
+                .fetch_timeline(
+                    &suspect.channel,
+                    &TimelineRequest {
+                        view: TimelineView::Thread,
+                        thread_id: Some(thread.clone()),
+                        limit: 1,
+                        ..TimelineRequest::default()
+                    },
+                )
+                .await
+                .map(drop),
+        })
+    }
+
+    /// Erase the channel and forget the store's summaries of it, which the task that follows the
+    /// cache's erases would not (the channel is still listed); or erase the thread, whose messages'
+    /// summaries that task does follow, one by one.
+    fn confirmed(&self, suspect: &Suspect) {
+        let Some(cache) = self.cache() else {
+            return;
+        };
+        let (chan, scope) = Self::suspect_scope(suspect);
+        tracing::warn!(
+            provider = suspect.provider_key.as_str(),
+            scope = if scope.is_some() { "thread" } else { "channel" },
+            "a provider confirmed this server can no longer read a conversation; its saved copy \
+             is erased"
+        );
+        match scope {
+            None => {
+                cache.erase_channels(std::slice::from_ref(&chan));
+                cache.unblock(&chan, None);
+                if let (Some(summaries), Ok(runtime)) =
+                    (self.summaries.get(), tokio::runtime::Handle::try_current())
+                {
+                    let summaries = summaries.clone();
+                    let channel = suspect.channel.clone();
+                    runtime.spawn(async move { summaries.forget_channel(&channel).await });
+                }
+            }
+            Some(scope) => {
+                cache.erase_scope(&chan, &scope);
+                cache.unblock(&chan, Some(&scope));
+            }
+        }
+    }
+
+    fn credential_refused(&self, provider_key: &str, revoked: bool) {
+        let (Some(state), Some(cache)) = (self.me.upgrade(), self.cache()) else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let (erase, round) = {
+            let mut identities = self.identities();
+            let (since, erased) = match identities.providers.get(provider_key) {
+                Some(Standing::Suspended { since, erased }) => (*since, *erased),
+                _ => (now, false),
+            };
+            let erase = !erased && (revoked || now.duration_since(since) >= CREDENTIAL_GRACE);
+            identities.providers.insert(
+                provider_key.to_owned(),
+                Standing::Suspended {
+                    since,
+                    erased: erased || erase,
+                },
+            );
+            (erase, identities.round)
+        };
+        cache.suspend_provider(provider_key);
+        if erase {
+            tracing::warn!(
+                provider = provider_key,
+                revoked,
+                "a provider refuses this server's credential; everything saved from it is erased"
+            );
+            cache.erase_provider(provider_key);
+        }
+        let router = self.routes().router.clone();
+        if let Some(router) = router {
+            Self::start_verifying(&state, &cache, &router, provider_key, round);
         }
     }
 }
@@ -754,14 +1013,20 @@ async fn verify(
                 if let Some(cache) = state.in_round(round, &cache) {
                     state.verified(round, &cache, &provider_key, generation);
                 }
-                return;
+                break;
             }
-            Checked::Off => return,
+            Checked::Off => break,
             Checked::Unanswered => {}
         }
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(VERIFY_RETRY_CAP);
+        // A suspended provider is asked on its own schedule, which a refusal does not shorten.
+        if state.suspended(&provider_key) {
+            tokio::time::sleep(SUSPENDED_RECHECK).await;
+        } else {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(VERIFY_RETRY_CAP);
+        }
     }
+    state.stopped_verifying(round, &provider_key);
 }
 
 /// Check `provider_key`'s account against the file once: see the module documentation.

@@ -65,6 +65,14 @@ impl Summaries {
         }
     }
 
+    /// Forget every summary and thread sentence of `channel`, as taking it off the list does:
+    /// for a channel the provider confirmed this server can no longer read, which stays listed
+    /// and so is not forgotten by [`Summaries::follow`] when its rows are erased.
+    pub(crate) async fn forget_channel(&self, channel: &ChannelId) {
+        crate::ops::forget_channel_summaries(self.store.as_ref(), &self.thread_names, channel)
+            .await;
+    }
+
     /// Delete what one event says is stale.
     async fn follow(&self, event: &WriterEvent, listed: &RwLock<HashSet<ChannelId>>) {
         match event {

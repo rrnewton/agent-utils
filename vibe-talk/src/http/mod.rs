@@ -13,7 +13,11 @@
 //!   every durable write — appending a turn, moving a read mark, filing a cached summary —
 //!   requires the write scope. `/summary` is readable at read scope and is served from the cache
 //!   when there is a hit, but a read-scope caller's generated summary is NOT filed; see
-//!   [`crate::ops::summarize_message`].
+//!   [`crate::ops::summarize_message`]. One durable change can follow a read-scope request, and
+//!   it writes nothing: a confirmed loss of access erases cached copies whoever noticed it. A
+//!   provider's refusal of a channel read is confirmed by the server's own read before the
+//!   message cache erases what it held of it (`#208 persistent-cache`; see
+//!   [`crate::cache::access`]).
 //! * The write scope is ALSO required to READ a transcript. A stored transcript is the owner's
 //!   own speech plus whatever channel text was read aloud to him, which is not a read of a
 //!   channel he already allowlisted. The one durable read a read-scope token may make is
