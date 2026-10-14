@@ -60,11 +60,17 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      the foot of the cards there, and Main behind them on its newest line, the status pill standing
      on the card, and a reader up the cards on the very card, within a pixel; and Cmd+1 brings it
      back on screen at the foot of Main.
+ 12. The card going to the dock under the thread list and back moves the left column's reader no
+     more than the list coming and going does (`#280 scroll-stability`), with a long draft up, which
+     stands taller in the list than docked: a reader at All's foot, Cmd+3 and then Esc (the list was
+     chosen from All) or Cmd+2, is at All's foot again with Send on screen; a reader 100, 200 and
+     380px up Main, Cmd+3 and then Cmd+1, Esc and, at the desk, Cmd+4, is on the same row within a
+     pixel, and from 200px up on it behind the cards too.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
-9 and 10 once; the docked card alone at 667x375 and 375x330; point 11 at 393x852; and points 8 and
-11 at 1280x800 with a mouse.
+9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 and 12 at 393x852; and points
+8, 11 and 12 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1134,6 +1140,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             listed = ""
             if size == PHONES[0]:
                 listed = "; " + thread_list_case(page, url, voice, api, size, True, args.screenshots)
+                listed += "; " + thread_list_place_case(page, url, voice, api, size, True)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -1523,6 +1530,97 @@ def thread_list_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size:
             " foot, Send on screen; a reader at the foot or up the cards kept as a draft arrived")
 
 
+PICKED_VIEW_JS = "() => document.getElementById('thread-select').value"
+
+
+def leave_thread_list(page: Page, mod: str, key: str) -> None:
+    """Out of the thread list by Esc, or by a view key, and a moment for anything that would move after it."""
+    if key == "Escape":
+        page.keyboard.press("Escape")
+        page.wait_for_function("() => document.getElementById('screen-main').getAttribute('data-columns') === null",
+                               timeout=10_000)
+        page.wait_for_timeout(400)
+    else:
+        view_key(page, mod, int(key), None, "two" if key == "4" else None)
+
+
+def thread_list_place_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                           phone: bool) -> str:
+    """Point 12: the card going to the dock under the thread list and back moves the left column's reader
+    no more than the list coming and going does."""
+    width, height = size
+    where = f"{width}x{height}, thread list and back"
+    mod = "Meta" if phone else "Control"
+    keys = ("Escape", "1") if phone else ("Escape", "1", "4")
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        propose(page, api, 41, LONG_DRAFT)
+        page.wait_for_timeout(HOLD_MS + 200)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+
+        # A reader at All's foot: Cmd+3, then Esc, the list having been chosen from All, or Cmd+2, finds All
+        # at its foot again with the card's Send on screen.
+        view_key(page, mod, 2, None, None)
+        page.evaluate(TO_NEWEST_JS)
+        page.wait_for_timeout(300)
+        for key in ("Escape", "2"):
+            how = "Esc" if key == "Escape" else f"{mod}+2"
+            view_key(page, mod, 3, None, "list")
+            leave_thread_list(page, mod, key)
+            back = thread_list_measure(page)
+            check(page.evaluate(PICKED_VIEW_JS) == "flat" and back["parent"] == "pane-discord",
+                  f"{where}: {how} from the thread list did not show All with the card: "
+                  f"{page.evaluate(PICKED_VIEW_JS)}, #{back['parent']}")
+            check(float(str(back["mainGap"])) <= 1,
+                  f"{where}: {how} left a reader who was at All's foot {float(str(back['mainGap'])):.0f}px above it")
+            check(back["send"] is not None and
+                  inside(back["send"], float(str(back["innerHeight"])), float(str(back["innerWidth"]))),
+                  f"{where}: after {how} the card's Send is off screen")
+
+        # A reader up Main, the card in view or just below it: on their row behind the cards and on it again
+        # by Cmd+1, Esc and, at the desk, Cmd+4. Nearer the foot than the card is taller in the list than
+        # docked (150px on the phone, 118px at the desk), Main behind the cards is too short to keep them
+        # where they were, and only the way back is judged.
+        view_key(page, mod, 1, None, None)
+        for up in (100, 200, 380):
+            for key in keys:
+                how = "Esc" if key == "Escape" else f"{mod}+{key}"
+                if page.evaluate("() => document.getElementById('screen-main').getAttribute('data-columns')"):
+                    view_key(page, mod, 1, None, None)
+                page.evaluate("(up) => { const a = document.getElementById('scroll-area');"
+                              " a.scrollTop = a.scrollHeight - a.clientHeight - up; }", up)
+                page.wait_for_timeout(300)
+                before = still(page)
+                first = before["first"]
+                check(isinstance(first, dict) and rect(before, "gap") > 30,
+                      f"{where}: the premise, a reader {up}px up Main: {before}")
+                assert isinstance(first, dict)
+                view_key(page, mod, 3, None, "list")
+                if up >= 200:
+                    behind = still(page)["first"]
+                    check(isinstance(behind, dict) and behind["id"] == first["id"] and
+                          abs(rect(behind, "offset") - rect(first, "offset")) <= 1,
+                          f"{where}: {mod}+3 moved the row a reader {up}px up Main was on from {first} to {behind},"
+                          " behind the cards")
+                leave_thread_list(page, mod, key)
+                now = still(page)["first"]
+                check(isinstance(now, dict) and now["id"] == first["id"] and
+                      abs(rect(now, "offset") - rect(first, "offset")) <= 1,
+                      f"{where}: {mod}+3 and {how} moved the row a reader {up}px up Main was on from {first} to {now}")
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: a view key posted or withdrew the draft ({api.commits}, {api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader at All's foot at it again by Esc and {mod}+2, Send on screen; one 100 to 380px up"
+            f" Main on their row by {', '.join('Esc' if key == 'Escape' else f'{mod}+{key}' for key in keys)}")
+
+
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
     """Points 8 and 11 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
@@ -1539,6 +1637,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             page.on("pageerror", lambda error: errors.append(str(error)))
             line = columns_case(page, url, voice, api, args.screenshots)
             line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
+            line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
