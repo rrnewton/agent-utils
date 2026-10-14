@@ -2229,7 +2229,10 @@ than mistaking the newest messages for the span.
   that direction. A short answer is not exhaustion; vibe-talk never infers it from one, and an
   answer that is `exhausted` and still gives a `next` is refused.
 * `as_of` (optional): as on a timeline read, the instant up to which the bridge knows its answer is
-  complete when it could not bring its copy up to date. Absent means now.
+  complete when it could not bring its copy up to date. Absent means now. vibe-talk never answers
+  from such a window: `/page` and `/count` then make the read they made without `range_reads`, so
+  an `as_of` costs a wasted request rather than an older answer. Answer from a copy only while it is
+  current, for example while the bridge's live feed of the channel is healthy.
 
 A bridge can serve it with its service's own creation-time filters, or from its copy of the
 channel. vibe-talk reads `/page` through a span and `/count` since an instant this way; every other

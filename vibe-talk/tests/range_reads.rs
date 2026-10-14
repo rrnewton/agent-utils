@@ -1110,3 +1110,103 @@ async fn a_bridge_reads_a_count_window_itself_only_when_configured_to() {
         "the walk back it always was"
     );
 }
+
+/// A loopback bridge whose range reads answer `window` from a copy it could not bring up to date
+/// (`as_of`), while its plain message list, the read `/page` and `/count` always made, has
+/// `current`. Records every request it is sent.
+async fn stale_range_bridge(
+    window: Vec<Value>,
+    current: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let (window, current) = (window.clone(), current.clone());
+        async move {
+            let asked = uri.to_string();
+            log.lock().expect("log").push(asked.clone());
+            if asked.contains("since=") {
+                axum::Json(json!({
+                    "messages": window,
+                    "next": null,
+                    "exhausted": true,
+                    "as_of": "2026-08-17T21:00:00Z"
+                }))
+            } else {
+                axum::Json(Value::Array(current))
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (base, seen)
+}
+
+/// remote-ops-audit section 4.3 `#287 bulk-reads`: never serve anything older than today's read
+/// would. A bridge that answers a window from a copy it could not bring up to date says so with
+/// `as_of`, and may be missing what was said since; `/count` and `/page` then make the read they
+/// always made instead of answering from that copy, at the cost of the wasted request.
+#[tokio::test]
+async fn a_bridge_window_from_an_older_copy_is_read_again_as_it_always_was() {
+    let since = BASE_MS + 10 * MINUTE_MS;
+    let current = vec![
+        bridge_wire(since, "on the edge"),
+        bridge_wire(since + MINUTE_MS, "inside"),
+        bridge_wire(since + 2 * MINUTE_MS, "said after the copy"),
+    ];
+    let window = current[..2].to_vec();
+    let (base, seen) = stale_range_bridge(window, current).await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, "range_reads = true"));
+    let range_request = format!(
+        "/channels/{READ_CHANNEL}/messages?since={}",
+        vibe_talk::clock::iso_from_ms(since).replace(':', "%3A")
+    );
+
+    let (status, body) = get(
+        &router,
+        &format!("/api/v1/channels/{READ_CHANNEL}/count?since={}", iso(since)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 3, "not the older copy's 2: {body}");
+    let asked = std::mem::take(&mut *seen.lock().expect("log"));
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(asked[0].starts_with(&range_request), "{asked:?}");
+    assert_eq!(
+        asked[1],
+        format!("/channels/{READ_CHANNEL}/messages?limit=100"),
+        "then the walk back it always was"
+    );
+
+    let (status, body) = get(
+        &router,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=10",
+            iso(since)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let said: Vec<&str> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| m["content"].as_str().expect("content"))
+        .collect();
+    assert_eq!(said, ["on the edge", "inside", "said after the copy"]);
+    let asked = std::mem::take(&mut *seen.lock().expect("log"));
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(asked[0].starts_with(&range_request), "{asked:?}");
+    assert!(
+        asked[1].starts_with(&format!(
+            "/channels/{READ_CHANNEL}/messages?limit=11&after="
+        )),
+        "then the page after `since` it always was: {asked:?}"
+    );
+}

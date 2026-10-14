@@ -1307,21 +1307,39 @@ pub async fn page(
             // `after` the millisecond before `since`, because Discord's `after` is EXCLUSIVE and
             // the `since` edge inclusive. Off by one there silently drops a message that sits
             // exactly on the boundary — the edge the issue asks be tested.
-            let native = state.chat.read_caps(&channel.id).range == crate::chat::Support::Native;
-            let read = state
+            let mut native =
+                state.chat.read_caps(&channel.id).range == crate::chat::Support::Native;
+            let range = crate::chat::TimeRange {
+                since_ms: from,
+                until_ms: until,
+            };
+            let mut read = state
                 .chat
                 .fetch_range(
                     &channel.id,
                     &crate::chat::ReadScope::Main,
-                    crate::chat::TimeRange {
-                        since_ms: from,
-                        until_ms: until,
-                    },
+                    range,
                     crate::chat::RangeOrder::OldestFirst,
                     probe,
                     None,
                 )
                 .await?;
+            if native && read.as_of.is_some() {
+                // An answer from a copy the provider could not bring up to date never stands in
+                // for the read this route always made: that one is made instead, at the cost of
+                // the wasted request. remote-ops-audit section 4.3 `#287 bulk-reads`.
+                read = crate::chat::emulated_range(
+                    state.chat.as_ref(),
+                    &channel.id,
+                    &crate::chat::ReadScope::Main,
+                    range,
+                    crate::chat::RangeOrder::OldestFirst,
+                    probe,
+                    None,
+                )
+                .await?;
+                native = false;
+            }
             // A native read says whether it reached the span's end. One that did not, and came
             // back no longer than a page, may have stopped short of more: Slack's, narrowing a
             // window too large to read whole, returns the run next to `since` that it could
@@ -1472,7 +1490,9 @@ pub async fn count_within(
     let filter = crate::noise::filter_for(state, &channel.id).await;
     if let Some(from) = since {
         if state.chat.read_caps(&channel.id).range == crate::chat::Support::Native {
-            return count_range(state, channel, from, cap, &filter).await;
+            if let Some(count) = count_range(state, &channel, from, cap, &filter).await? {
+                return Ok(count);
+            }
         }
     }
 
@@ -1548,13 +1568,17 @@ const MAX_COUNT_STEPS: usize = 16;
 /// what this morning holds rather than a walk back past it. `newest_seen` and `oldest_seen` are
 /// the newest and oldest messages read inside the window. The count is exact only on that proof:
 /// a provider that stops without one leaves `at_least` set, as the cap does.
+///
+/// `None` when a step answered from a copy the provider could not bring up to date
+/// ([`crate::chat::RangeRead::as_of`]): such a count could miss what was said since, so the caller
+/// counts the way it always did instead.
 async fn count_range(
     state: &AppState,
-    channel: ChannelInfo,
+    channel: &ChannelInfo,
     since_ms: i64,
     cap: u32,
     filter: &crate::noise::NoiseFilter,
-) -> Result<MessageCount, OpError> {
+) -> Result<Option<MessageCount>, OpError> {
     let ceiling = usize::try_from(cap).unwrap_or(usize::MAX);
     let range = crate::chat::TimeRange {
         since_ms,
@@ -1579,6 +1603,9 @@ async fn count_range(
                 cursor.as_deref(),
             )
             .await?;
+        if read.as_of.is_some() {
+            return Ok(None);
+        }
         if newest_seen.is_none() {
             newest_seen = read.messages.last().map(|m| m.id.clone());
         }
@@ -1600,15 +1627,15 @@ async fn count_range(
             None => break,
         }
     }
-    Ok(MessageCount {
-        channel,
+    Ok(Some(MessageCount {
+        channel: channel.clone(),
         counted,
         at_least,
         cap,
         oldest_seen,
         newest_seen,
         noise,
-    })
+    }))
 }
 
 /// Semantic random access: describe a message, get that message. Read scope.
