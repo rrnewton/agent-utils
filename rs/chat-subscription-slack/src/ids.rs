@@ -173,12 +173,14 @@ pub fn unescape_text(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// The Slack reaction name for a configured acknowledgement emoji.
+/// The Slack reaction name for a reaction emoji the bridge sends.
 ///
-/// The bridge configures reactions as Unicode emoji (the default ACK is 🤖 and the reply receipt
-/// is ✅), while Slack names reactions by shortcode. A shortcode, with or without colons, passes
-/// through unchanged; a small table covers common Unicode emoji. Anything else returns `None`
-/// and the reaction is refused as not applied rather than guessed.
+/// The bridge sends reactions as Unicode emoji, while Slack names reactions by shortcode. A
+/// shortcode, with or without colons, passes through unchanged. The bridge's built-in
+/// acknowledgement and receipt map through the Slack names defined beside them in
+/// [`chat_subscription::reactions`], so those two have one definition; a small table covers
+/// other common Unicode emoji a bridge may configure. Anything else returns `None` and the
+/// reaction is refused as not applied rather than guessed.
 #[must_use]
 pub fn reaction_name(emoji: &str) -> Option<String> {
     let trimmed = emoji.trim();
@@ -194,11 +196,15 @@ pub fn reaction_name(emoji: &str) -> Option<String> {
         return Some(shortcode.to_owned());
     }
     let normalized = trimmed.trim_end_matches('\u{fe0f}');
+    if let Some(reaction) = chat_subscription::reactions::DEFAULT_REACTIONS
+        .iter()
+        .find(|reaction| reaction.emoji == normalized)
+    {
+        return Some(reaction.slack_name.to_owned());
+    }
     let name = match normalized {
         "🤖" => "robot_face",
-        "✅" => "white_check_mark",
         "✔" => "heavy_check_mark",
-        "👀" => "eyes",
         "👍" => "+1",
         "👌" => "ok_hand",
         "⏳" => "hourglass_flowing_sand",
@@ -263,9 +269,26 @@ mod tests {
     fn reactions_map_to_shortcodes() {
         assert_eq!(reaction_name("🤖").as_deref(), Some("robot_face"));
         assert_eq!(reaction_name("✅").as_deref(), Some("white_check_mark"));
+        assert_eq!(reaction_name("👀").as_deref(), Some("eyes"));
+        // An emoji presentation selector does not change the name.
+        assert_eq!(
+            reaction_name("✅\u{fe0f}").as_deref(),
+            Some("white_check_mark")
+        );
         assert_eq!(reaction_name(":eyes:").as_deref(), Some("eyes"));
         assert_eq!(reaction_name("thumbsup").as_deref(), Some("thumbsup"));
         assert_eq!(reaction_name("🦀"), None);
         assert_eq!(unescape_text("a &lt;b&gt; &amp;amp;"), "a <b> &amp;");
+    }
+
+    #[test]
+    fn the_bridge_default_reactions_map_through_their_shared_slack_names() {
+        use chat_subscription::reactions::{DEFAULT_ACK_REACTION, DEFAULT_RECEIPT_REACTION};
+        for reaction in [DEFAULT_ACK_REACTION, DEFAULT_RECEIPT_REACTION] {
+            assert_eq!(
+                reaction_name(reaction.emoji).as_deref(),
+                Some(reaction.slack_name)
+            );
+        }
     }
 }

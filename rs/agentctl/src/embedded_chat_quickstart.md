@@ -24,7 +24,6 @@ directory.
      "agent_name": "coordinator",
      "agent_label": "codex coordinator",
      "outbound_enabled": true,
-     "ack_reaction": null,
      "backend_configuration": {
        "schema": "provider.example/v1",
        "data": {}
@@ -39,8 +38,12 @@ directory.
    }
    ```
 
-   The helper is independent of the inbound plugin. Omit `outbound_command`,
-   set `outbound_enabled` to `false`, and keep `ack_reaction` null for an
+   The helper is independent of the inbound plugin. The bridge reacts to each
+   request twice: 👀 once it is admitted and ✅ once its prompt is verified in
+   the agent's pane. Those defaults are defined once in agentctl; set
+   `ack_reaction` or `receipt_reaction` to another emoji to override one, or
+   to `null`, `""` or `false` to disable it. Omit `outbound_command`, set
+   `outbound_enabled` to `false`, and set `ack_reaction` to null for an
    intentionally inbound-only bridge. Add only subscription-plugin environment
    variable names to `subscription_environment`; every named value must exist
    when the service starts, while its value is never saved in bridge state.

@@ -33,7 +33,6 @@ Create a private owner-only JSON file (normally mode `0600`):
   "agent_name": "coordinator",
   "agent_label": "codex coordinator",
   "outbound_enabled": true,
-  "ack_reaction": "🤖",
   "backend_configuration": {
     "schema": "provider.example/v1",
     "data": {}
@@ -70,6 +69,34 @@ startup the host validates and hashes a native helper of at most 64 MiB, copies
 those exact bytes into a sealed in-memory executable, and retains that image for
 the generation. Reply and reaction operations neither reopen nor rehash the
 source path.
+
+### Reactions
+
+The bridge marks each request's chat message in two stages. The
+**acknowledgement** goes on once the request is durably admitted; the
+**receipt** goes on once the request's prompt is verified in the agent's pane,
+as described under "Initialize and run". agentctl defines both defaults in one
+place, shared with the bundled Slack provider: 👀 for the acknowledgement
+(Slack `eyes`) and ✅ for the receipt (Slack `white_check_mark`).
+
+| Key | Absent | Unicode emoji | `null`, `""` or `false` |
+| --- | --- | --- | --- |
+| `ack_reaction` | inherit 👀 | use this emoji | no acknowledgement, and so no receipt |
+| `receipt_reaction` | inherit ✅ | use this emoji | no receipt |
+
+An emoji is one line of at most 64 bytes. A key left absent stays absent in the
+saved bridge state, so a later agentctl with a different default changes the
+bridge's reaction too; a key that is set keeps its value. Only an acknowledged
+request earns a receipt, so a bridge without an acknowledgement adds neither.
+`chat init` refuses a configuration whose two reactions are the same emoji. An
+outbound-disabled configuration must disable `ack_reaction` and may not choose a
+`receipt_reaction`. The outbound helper receives both reactions as
+`ensure_reaction` requests, so it must accept both emoji.
+
+Before `receipt_reaction` existed, an absent `ack_reaction` meant 🤖 and the
+receipt was always ✅. `chat init` saved `ack_reaction` explicitly then, so a
+bridge state directory initialized earlier keeps the emoji it was given until
+the key is removed from its `bridge.json` while no service runs on it.
 
 If outbound messages use an allowed sender identity, prevent their labelled text
 from becoming new requests with a runtime-only exclusion, for example
@@ -1422,7 +1449,9 @@ null while no reply is sent or when the first reply's record cannot be read,
 `reason` are null once the prompt is recorded as typed. Like the rest of
 `chat status`, these need no running service.
 
-When `ack_reaction` is set, the service also adds ✅ to a request's Chat
+When the acknowledgement is enabled, the service also adds the receipt reaction
+(`receipt_reaction`, ✅ unless the configuration overrides or disables it; see
+"Reactions" under Configuration, and read ✅ below as that emoji) to a request's Chat
 message once the queue has verified the request's prompt against the agent's
 composer: the pane printed it, or it left the composer the queue checked before
 typing. After the queue presses
@@ -1463,15 +1492,16 @@ that some panes' adapters make. That confirmation does not check the composer,
 so such a prompt earns no ✅. The delivery
 alarm above covers a prompt that is not recorded as typed at all.
 
-`chat init` refuses ✅ as the `ack_reaction`, since ✅ marks a verified prompt. A
-state made before with ✅ as its acknowledgement still opens; its
-acknowledgement already shows ✅ once the request is acknowledged, and no
-separate receipt is added.
+`chat init` refuses an `ack_reaction` equal to the receipt reaction, since the
+receipt marks a verified prompt. A state made before with its receipt emoji as
+its acknowledgement still opens; its acknowledgement already shows that emoji
+once the request is acknowledged, and no separate receipt is added.
 
 Each prompt that a drain types and the queue verifies earns its request
 ✅, subject to the limits below, including the other requests' prompts that the
 drain reaches and those it types while it delivers a routing-error prompt. A request admitted while
-`ack_reaction` was `null` earns none. The service saves the ✅ as soon as the
+the acknowledgement was disabled earns none, and no request earns one while
+`receipt_reaction` disables the receipt. The service saves the ✅ as soon as the
 queue verifies the prompt, before the queue records the prompt as
 processed and before the pass records it as typed, as
 `receipt-reactions/KEY.json` in the bridge state directory, where KEY is the
@@ -1517,12 +1547,14 @@ any ✅ is refused. When `run` starts, it
 hands the worker every ✅ already saved. `chat tick` adds at most four saved ✅
 reactions each time it runs, least recently tried first, so one that always
 fails does not hold back the rest. The outbound helper receives each as the
-same `ensure_reaction` request as an ACK, with `✅` as its emoji, so a helper
-must accept ✅ as well as the configured `ack_reaction`. A saved reaction's
+same `ensure_reaction` request as an ACK, with the receipt emoji as its emoji,
+so a helper must accept the receipt as well as the acknowledgement. A saved
+receipt keeps the emoji it was saved with. A saved reaction's
 path, `receipt-reactions/KEY.json`, that holds something other than a regular
 file is not opened and counts as failing; nor is the record of losses opened
-when it is not a regular file. `chat status` reports `receipt_reactions`, with `reaction`, which is
-`✅`; `waiting`, the number saved and not yet added; `failing`, how many of
+when it is not a regular file. `chat status` reports `receipt_reactions`, with `reaction`, the receipt emoji
+the bridge adds (`null` when it adds none: `receipt_reaction` or `ack_reaction`
+is disabled, or the acknowledgement is the receipt emoji itself); `waiting`, the number saved and not yet added; `failing`, how many of
 those failed at their last attempt or cannot be read; and the `lost`,
 `oldest_lost_key`, `refused`, `oldest_refused_key` and `last_refusal` above.
 
@@ -1695,7 +1727,8 @@ does not report reminders yet; the log and `reply-reminders.json` do.
 The Slack provider is a subscription plugin and a matching outbound helper,
 built from their own source package, with the same
 request/reply contract as any other provider: durable cursor, reply IDs,
-per-thread replies, the 🤖 admission ACK and the ✅ delivery reaction.
+per-thread replies, the 👀 admission ACK and the ✅ delivery reaction (or the
+emoji the configuration chooses instead).
 
 * `agentctl-slack-plugin` is the subscription plugin (manifest name `slack`,
   capability `chat-subscription.slack`). It runs the installed Slack
@@ -1735,9 +1768,10 @@ record, or a saved position the stream can no longer replay, is reported as a
 `Gap`, which stops `run` for operator review as described above. The tail
 exiting is a retryable failure, and the host reconnects from the saved cursor.
 
-Reaction names. Slack names reactions by shortcode. The helper maps 🤖 to
-`robot_face`, ✅ to `white_check_mark`, and a few other common emoji; a
-shortcode such as `eyes` or `:eyes:` passes through. An unmapped emoji is
+Reaction names. Slack names reactions by shortcode. The helper maps the
+bridge's default reactions through the Slack names defined with them, 👀 to
+`eyes` and ✅ to `white_check_mark`, and a few other common emoji such as 🤖 to
+`robot_face`; a shortcode such as `eyes` or `:eyes:` passes through. An unmapped emoji is
 refused as not applied rather than guessed.
 
 Idempotent replies. Slack has no idempotency key for posts. The helper keeps one
@@ -1831,7 +1865,6 @@ Write `$ROOT/chat.json` (mode `0600`), replacing the placeholders:
   "agent_name": "slack-test",
   "agent_label": "slack-test",
   "outbound_enabled": true,
-  "ack_reaction": "🤖",
   "backend_configuration": {
     "schema": "agentctl.slack.v1",
     "data": {
@@ -1866,7 +1899,7 @@ AGENTCTL_HOME="$ROOT/home" "$AGENTCTL" --registry "$ROOT/registry" \
 ```
 
 Run `chat run` in its own terminal or as its own user unit. Post a message in the
-channel as an allowed sender: the bridge reacts with 🤖 once the request is
+channel as an allowed sender: the bridge reacts with 👀 once the request is
 admitted, types the prompt into the `slack-test` pane and adds ✅ once that
 delivery is verified, and posts the agent's reply into the message's thread as
 the app. `chat status --bridge-state "$ROOT/bridge"` and the two diagnostics

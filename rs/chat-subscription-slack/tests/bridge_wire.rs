@@ -6,8 +6,8 @@
 use agentctl::chat_runtime::{
     decode_reaction_response, decode_root_message_response, decode_send_response,
     encode_reaction_request, encode_root_message_request, encode_send_request,
-    BackendConfigurationDocument, BridgeConfiguration, OutboundOutcome, ReactionSubmission,
-    ReplySubmission, RootMessageSubmission,
+    BackendConfigurationDocument, BridgeConfiguration, OutboundOutcome, ReactionSetting,
+    ReactionSubmission, ReplySubmission, RootMessageSubmission,
 };
 use chat_subscription_slack::fake::FakeTransport;
 use chat_subscription_slack::outbound::{handle_request, OutboundConfig};
@@ -123,7 +123,8 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
         agent_name: "slack-test".to_owned(),
         agent_label: "slack test agent".to_owned(),
         outbound_enabled: true,
-        ack_reaction: Some("🤖".to_owned()),
+        ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
+        receipt_reaction: ReactionSetting::Inherit,
         backend_configuration: Some(BackendConfigurationDocument {
             schema: "agentctl.slack.v1".to_owned(),
             data: Map::from_iter([

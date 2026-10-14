@@ -580,7 +580,9 @@ mod tests {
         MessageId, ProviderCursor, SenderId, ThreadId,
     };
 
-    use super::super::{unix_millis, BridgeConfiguration, CoordinatorDeliveryResult};
+    use super::super::{
+        unix_millis, BridgeConfiguration, CoordinatorDeliveryResult, ReactionSetting,
+    };
     use super::*;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -605,7 +607,8 @@ mod tests {
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
-                ack_reaction: None,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
             },

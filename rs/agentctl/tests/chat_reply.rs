@@ -16,7 +16,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agentctl::chat_runtime::{BridgeConfiguration, BridgeState};
+use agentctl::chat_runtime::{BridgeConfiguration, BridgeState, ReactionSetting};
 use chat_subscription::{
     ChannelId, CommittableEvent, DeliveryBatch, DeliveryId, EventSequence, InboundMessage,
     MessageId, ProviderCursor, SenderId, ThreadId,
@@ -63,7 +63,8 @@ impl Scratch {
                 agent_name: "worker".to_owned(),
                 agent_label: "worker".to_owned(),
                 outbound_enabled: true,
-                ack_reaction: None,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
             },

@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod reactions;
+
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};

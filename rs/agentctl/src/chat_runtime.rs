@@ -147,9 +147,10 @@ const DELIVERY_ALARM_FILE: &str = "delivery-alarm.json";
 // not on its message yet: see `ReceiptReactionRecord`.
 const RECEIPT_REACTION_SCHEMA: &str = "agentctl-chat-receipt-reaction/v1";
 const RECEIPT_REACTION_DIRECTORY: &str = "receipt-reactions";
-// The reaction a request's message gets once a queue drain verifies the request's prompt against
-// the coordinator's composer: the pane printed it, or it left the composer checked before typing.
-pub(crate) const RECEIPT_REACTION: &str = "✅";
+// The receipt reaction, a request's second reaction, goes on once a queue drain verifies the
+// request's prompt against the coordinator's composer: the pane printed it, or it left the
+// composer checked before typing. Its emoji is the configured `receipt_reaction`, by default
+// `chat_subscription::reactions::DEFAULT_RECEIPT_REACTION`.
 // As many waiting reactions as the requests the state can hold. A reaction can outlive its
 // request's retirement, so the request cap does not bound them.
 pub(crate) const MAX_RECEIPT_REACTIONS: usize = MAX_REQUESTS as usize;
@@ -271,8 +272,113 @@ impl Ord for SentEntry {
     }
 }
 
-fn default_ack_reaction() -> Option<String> {
-    Some("🤖".to_owned())
+/// A bridge configuration's choice for one of its two reactions: the acknowledgement added once a
+/// request is durably admitted (`ack_reaction`), or the receipt added once its prompt is verified
+/// in the agent's pane (`receipt_reaction`).
+///
+/// A key that is absent inherits the built-in default that the bridge shares with its provider
+/// plugins, and stays absent when the configuration is saved in the state directory, so a later
+/// change of the default reaches the bridge. `null`, `""` and `false`
+/// disable the stage; a string chooses the emoji.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ReactionSetting {
+    /// The key is absent: use the built-in default.
+    #[default]
+    Inherit,
+    /// `null`, `""` or `false`: add no reaction at this stage.
+    Disabled,
+    /// The emoji this bridge chose.
+    Emoji(String),
+}
+
+impl ReactionSetting {
+    /// Whether the key is absent, so that saving the configuration leaves it absent.
+    #[must_use]
+    pub fn is_inherit(&self) -> bool {
+        matches!(self, Self::Inherit)
+    }
+
+    /// The emoji this setting resolves to, given the built-in `default`; `None` when disabled.
+    #[must_use]
+    pub fn resolve<'a>(&'a self, default: &'static str) -> Option<&'a str> {
+        match self {
+            Self::Inherit => Some(default),
+            Self::Disabled => None,
+            Self::Emoji(emoji) => Some(emoji),
+        }
+    }
+}
+
+impl Serialize for ReactionSetting {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            // `null` means disabled, so an inherited setting has no value it could be written as.
+            Self::Inherit => Err(serde::ser::Error::custom(
+                "an inherited reaction is saved by omitting its key",
+            )),
+            Self::Disabled => serializer.serialize_none(),
+            Self::Emoji(emoji) => serializer.serialize_str(emoji),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReactionSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ReactionSetting;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an emoji string, or null, \"\" or false to disable")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(ReactionSetting::Disabled)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(ReactionSetting::Disabled)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> std::result::Result<Self::Value, D::Error> {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                if value {
+                    Err(E::custom(
+                        "a reaction is an emoji string, or null, \"\" or false to disable; \
+                         true is not a reaction",
+                    ))
+                } else {
+                    Ok(ReactionSetting::Disabled)
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(if value.is_empty() {
+                    ReactionSetting::Disabled
+                } else {
+                    ReactionSetting::Emoji(value.to_owned())
+                })
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 const fn default_outbound_enabled() -> bool {
@@ -447,9 +553,14 @@ pub struct BridgeConfiguration {
     /// Whether coordinator output is captured and published back to chat.
     #[serde(default = "default_outbound_enabled")]
     pub outbound_enabled: bool,
-    /// Optional reaction placed only after durable inbound admission.
-    #[serde(default = "default_ack_reaction")]
-    pub ack_reaction: Option<String>,
+    /// The acknowledgement, placed only after durable inbound admission: see
+    /// [`Self::ack_emoji`].
+    #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
+    pub ack_reaction: ReactionSetting,
+    /// The receipt, placed once a request's prompt is verified in the agent's pane: see
+    /// [`Self::receipt_emoji`].
+    #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
+    pub receipt_reaction: ReactionSetting,
     /// Optional provider-specific non-secret resource configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_configuration: Option<BackendConfigurationDocument>,
@@ -459,6 +570,36 @@ pub struct BridgeConfiguration {
 }
 
 impl BridgeConfiguration {
+    /// The acknowledgement emoji this bridge adds once a request is durably admitted, or `None`
+    /// when `ack_reaction` disables it. An absent key inherits the built-in default
+    /// acknowledgement.
+    #[must_use]
+    pub fn ack_emoji(&self) -> Option<&str> {
+        self.ack_reaction
+            .resolve(chat_subscription::reactions::DEFAULT_ACK_REACTION.emoji)
+    }
+
+    /// The receipt emoji this bridge adds once a request's prompt is verified in the agent's
+    /// pane, or `None` when `receipt_reaction` disables it. An absent key inherits the built-in
+    /// default receipt. Only a request that was admitted with an acknowledgement earns a
+    /// receipt: see [`Self::receipt_emoji_in_use`].
+    #[must_use]
+    pub fn receipt_emoji(&self) -> Option<&str> {
+        self.receipt_reaction
+            .resolve(chat_subscription::reactions::DEFAULT_RECEIPT_REACTION.emoji)
+    }
+
+    /// The receipt emoji this bridge actually adds, or `None` when it adds none: the receipt is
+    /// disabled, the acknowledgement is disabled (only an acknowledged request earns a receipt),
+    /// or the acknowledgement is the receipt emoji itself, which a state made before the two
+    /// were kept apart may have, and which already shows it at admission.
+    #[must_use]
+    pub fn receipt_emoji_in_use(&self) -> Option<&str> {
+        let acknowledgement = self.ack_emoji()?;
+        self.receipt_emoji()
+            .filter(|receipt| *receipt != acknowledgement)
+    }
+
     fn validate(&self) -> Result<()> {
         validate_slug(
             &self.subscription_plugin,
@@ -469,14 +610,21 @@ impl BridgeConfiguration {
             .map_err(ChatRuntimeError::invalid)?;
         validate_slug(&self.agent_name, "agent name", MAX_AGENT_NAME_BYTES)?;
         validate_single_line(&self.agent_label, "agent label", MAX_AGENT_LABEL_BYTES)?;
-        if let Some(reaction) = self.ack_reaction.as_deref() {
+        if let Some(reaction) = self.ack_emoji() {
             validate_single_line(reaction, "ack reaction", 64)?;
+        }
+        if let Some(reaction) = self.receipt_emoji() {
+            validate_single_line(reaction, "receipt reaction", 64)?;
         }
         if let Some(outbound) = &self.outbound_command {
             outbound.validate()?;
         }
+        // A receipt goes only to a request that was acknowledged, so an outbound-disabled
+        // configuration may leave `receipt_reaction` to inherit, but may not choose one.
         if !self.outbound_enabled
-            && (self.ack_reaction.is_some() || self.outbound_command.is_some())
+            && (self.ack_emoji().is_some()
+                || matches!(self.receipt_reaction, ReactionSetting::Emoji(_))
+                || self.outbound_command.is_some())
         {
             return Err(ChatRuntimeError::invalid(
                 "outbound-disabled chat configuration cannot enable reactions or a reply helper",
@@ -2463,7 +2611,8 @@ struct DeliveryAlarmDocument<'a> {
     credential_problems: &'a [crate::credentials::CredentialProblem],
 }
 
-/// A ✅ receipt reaction that a request earned and that is not on its message yet, saved as
+/// A receipt reaction (✅ unless configured otherwise) that a request earned and that is not on
+/// its message yet, saved as
 /// `receipt-reactions/<key>.json` in the state directory. A request earns it when a queue drain
 /// types its prompt and the pane prints that prompt after the submission key: see
 /// [`BridgeState::save_receipt_reactions`]. The reaction is added with the operation ID saved here,
@@ -2493,7 +2642,9 @@ impl ReceiptReactionRecord {
         if self.schema != RECEIPT_REACTION_SCHEMA
             || self.key != key
             || !valid_key(key)
-            || self.emoji != RECEIPT_REACTION
+            // The emoji the state was configured with when the receipt was earned: a later
+            // change of the default must not strand a receipt already waiting.
+            || validate_single_line(&self.emoji, "receipt reaction", 64).is_err()
             || !valid_operation_uuid(&self.request_id)
             || self
                 .error
@@ -4235,13 +4386,17 @@ impl BridgeState {
     /// Create a new private bridge state directory.
     pub fn initialize(root: &Path, config: BridgeConfiguration) -> Result<Self> {
         config.validate()?;
-        // ✅ marks a request whose prompt the queue verified in the agent's pane, so a new state
-        // does not take it as the acknowledgement as well. A state made before keeps it and adds no separate receipt.
-        if config.ack_reaction.as_deref() == Some(RECEIPT_REACTION) {
-            return Err(ChatRuntimeError::invalid(format!(
-                "ack_reaction cannot be {RECEIPT_REACTION}, which marks a request whose prompt \
-                 the queue verified in the agent's pane; choose another emoji"
-            )));
+        // The receipt marks a request whose prompt the queue verified in the agent's pane, so a
+        // new state does not take it as the acknowledgement as well. A state made before keeps
+        // it and adds no separate receipt.
+        if let Some(receipt) = config.receipt_emoji() {
+            if config.ack_emoji() == Some(receipt) {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "ack_reaction cannot be {receipt}, the receipt_reaction, which marks a \
+                     request whose prompt the queue verified in the agent's pane; choose \
+                     another emoji for one of them"
+                )));
+            }
         }
         let existed = fs::symlink_metadata(root).is_ok();
         agent::create_private_directory(root, "chat state directory", true, true)?;
@@ -5237,10 +5392,8 @@ impl BridgeState {
                     {
                         continue;
                     }
-                    let mut record = RequestRecord::from_saved_message(
-                        source,
-                        self.config.ack_reaction.as_deref(),
-                    )?;
+                    let mut record =
+                        RequestRecord::from_saved_message(source, self.config.ack_emoji())?;
                     record.admitted_host_batch_sequence = Some(host_batch_sequence);
                     record.admitted_provider_sequence = Some(batch.sequence().get());
                     record.admitted_delivery_id = Some(batch.delivery_id().as_str().to_owned());
@@ -5955,16 +6108,9 @@ impl BridgeState {
     /// that finds `MAX_RECEIPT_REACTIONS` already waiting is lost and counted in
     /// [`ReceiptReactionLoss`].
     pub(crate) fn save_receipt_reactions(&self, message_ids: &[String]) -> Result<ReceiptSaves> {
-        // An acknowledgement that is itself ✅ already shows it at admission, so a receipt would
-        // say nothing more.
-        if self
-            .config
-            .ack_reaction
-            .as_deref()
-            .is_none_or(|reaction| reaction == RECEIPT_REACTION)
-        {
+        let Some(receipt) = self.config.receipt_emoji_in_use() else {
             return Ok(ReceiptSaves::default());
-        }
+        };
         let mut keys: Vec<&str> = Vec::new();
         for message_id in message_ids {
             if let Some(key) = request_key_of_message(message_id) {
@@ -6024,7 +6170,7 @@ impl BridgeState {
                 key: key.to_owned(),
                 channel_id: request.message.channel_id,
                 message_id: request.message.message_id,
-                emoji: RECEIPT_REACTION.to_owned(),
+                emoji: receipt.to_owned(),
                 request_id: random_operation_uuid()?,
                 error: None,
                 recorded_at_millis: unix_millis(),
@@ -6467,7 +6613,7 @@ impl BridgeState {
         let lost = self.lost_receipt_reactions_locked()?;
         let refused = self.refused_receipt_reactions_locked()?;
         Ok(json!({
-            "reaction": RECEIPT_REACTION,
+            "reaction": self.config.receipt_emoji_in_use(),
             "waiting": keys.len(),
             "failing": failing,
             "lost": lost.count,
@@ -13702,6 +13848,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{mpsc, Arc, Mutex};
 
+    use chat_subscription::reactions::{DEFAULT_ACK_REACTION, DEFAULT_RECEIPT_REACTION};
     use chat_subscription::{
         BackendCapabilities, BackendFailure, CancellationError, ChatSubscriptionBackend,
         ChatSubscriptionCancellation, ChatSubscriptionDriver, DeliveryId, EventKind, EventSequence,
@@ -14073,7 +14220,8 @@ mod tests {
             agent_name: "coordinator".to_owned(),
             agent_label: "codex coordinator".to_owned(),
             outbound_enabled: true,
-            ack_reaction: Some("🤖".to_owned()),
+            ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
+            receipt_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: None,
         }
@@ -14081,7 +14229,7 @@ mod tests {
 
     fn config_without_reaction() -> BridgeConfiguration {
         let mut configuration = config();
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         configuration
     }
 
@@ -16813,7 +16961,7 @@ mod tests {
         let root = temporary("retirement-churn");
         let mut configuration = config();
         configuration.outbound_enabled = false;
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         let state = BridgeState::initialize(&root, configuration).expect("initialize state");
         let delivery = FakeDelivery::default();
         let mut admitted = Vec::new();
@@ -21747,7 +21895,7 @@ written, so the prompt was not written: pane is gone"
 
         let mut configuration = config();
         configuration.outbound_enabled = false;
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         let state = BridgeState::initialize(&root, configuration).expect("initialize state");
         let keys = admitted(&state, 1);
         let delivery = FakeDelivery::default();
@@ -25676,7 +25824,7 @@ The user's request arrived through the configured chat bridge."
         let root = temporary("prompt-send-time-inbound-only");
         let mut configuration = config();
         configuration.outbound_enabled = false;
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         let state = BridgeState::initialize(&root, configuration).expect("initialize state");
         let admission = state
             .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
@@ -25700,7 +25848,7 @@ The user's request arrived through your configured inbound-only chat bridge."
         let root = temporary("inbound-only");
         let mut configuration = config();
         configuration.outbound_enabled = false;
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         let state = BridgeState::initialize(&root, configuration).expect("initialize state");
         let admission = state
             .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
@@ -27691,7 +27839,8 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     fn a_check_mark_acknowledgement_is_refused_for_a_new_state_and_adds_no_receipt_in_an_old_one() {
         let root = temporary("receipt-check-mark-ack");
         let mut configuration = config();
-        configuration.ack_reaction = Some(RECEIPT_REACTION.to_owned());
+        configuration.ack_reaction =
+            ReactionSetting::Emoji(DEFAULT_RECEIPT_REACTION.emoji.to_owned());
         let Err(error) = BridgeState::initialize(&root, configuration) else {
             panic!("a new state refuses a check mark acknowledgement");
         };
@@ -27710,7 +27859,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         let path = root.join("bridge.json");
         let mut envelope: Value =
             serde_json::from_slice(&fs::read(&path).expect("bridge.json")).expect("JSON");
-        envelope["config"]["ack_reaction"] = json!(RECEIPT_REACTION);
+        envelope["config"]["ack_reaction"] = json!(DEFAULT_RECEIPT_REACTION.emoji);
         fs::write(&path, serde_json::to_vec(&envelope).expect("encode")).expect("write");
         let state = BridgeState::open(&root).expect("an old state still opens");
         let saves = state
@@ -27720,6 +27869,230 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         fs::remove_dir_all(root).expect("cleanup");
         assert_eq!(saves, ReceiptSaves::default());
         assert!(!exists);
+    }
+
+    /// The bridge configuration `config()` builds, as the JSON document an operator writes, with
+    /// `reactions` merged in; a `null` value in `reactions` removes the key instead.
+    fn config_document_with(reactions: &Value) -> Value {
+        let mut document = serde_json::to_value(config()).expect("encode configuration");
+        let fields = document.as_object_mut().expect("object");
+        fields.remove("ack_reaction");
+        for (key, value) in reactions.as_object().expect("object") {
+            fields.insert(key.clone(), value.clone());
+        }
+        document
+    }
+
+    /// Admit one request into a new state made from `document`, print its prompt, and return
+    /// the request's acknowledgement emoji, the receipt it saved (if any), and the reopened
+    /// state's saved `bridge.json` configuration.
+    fn admit_and_print(
+        name: &str,
+        document: &Value,
+    ) -> (Option<String>, Option<ReceiptReactionRecord>, Value) {
+        let configuration: BridgeConfiguration =
+            serde_json::from_value(document.clone()).expect("decode configuration");
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, configuration).expect("initialize");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "reaction-defaults"))
+            .expect("admit")
+            .new_request_keys[0]
+            .clone();
+        let acknowledgement = state.read_request(&key).expect("request").ack_reaction;
+        state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save receipt");
+        let receipt = root
+            .join(RECEIPT_REACTION_DIRECTORY)
+            .join(format!("{key}.json"))
+            .exists()
+            .then(|| saved_receipt_reaction(&root, &key));
+        drop(state);
+        let saved: Value =
+            serde_json::from_slice(&fs::read(root.join("bridge.json")).expect("bridge.json"))
+                .expect("JSON");
+        let reopened = BridgeState::open(&root).expect("reopen");
+        assert_eq!(
+            serde_json::to_value(reopened.config()).expect("encode"),
+            saved["config"]
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("cleanup");
+        (acknowledgement, receipt, saved["config"].clone())
+    }
+
+    #[test]
+    fn a_configuration_without_reaction_keys_inherits_the_built_in_eyes_then_check_mark() {
+        let document = config_document_with(&json!({}));
+        let configuration: BridgeConfiguration =
+            serde_json::from_value(document.clone()).expect("decode");
+        assert_eq!(configuration.ack_reaction, ReactionSetting::Inherit);
+        assert_eq!(configuration.receipt_reaction, ReactionSetting::Inherit);
+        assert_eq!(configuration.ack_emoji(), Some(DEFAULT_ACK_REACTION.emoji));
+        assert_eq!(configuration.ack_emoji(), Some("👀"));
+        assert_eq!(
+            configuration.receipt_emoji(),
+            Some(DEFAULT_RECEIPT_REACTION.emoji)
+        );
+        assert_eq!(configuration.receipt_emoji(), Some("✅"));
+        assert_eq!(configuration.receipt_emoji_in_use(), Some("✅"));
+
+        let (acknowledgement, receipt, saved) = admit_and_print("reaction-inherit", &document);
+        assert_eq!(acknowledgement.as_deref(), Some("👀"));
+        assert_eq!(receipt.expect("a receipt is saved").emoji, "✅");
+        // The state keeps the keys absent, so a later change of the default reaches it.
+        assert!(saved.get("ack_reaction").is_none(), "{saved}");
+        assert!(saved.get("receipt_reaction").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn a_configuration_overrides_either_reaction_and_the_state_keeps_the_override() {
+        let document = config_document_with(&json!({
+            "ack_reaction": "🤖",
+            "receipt_reaction": "🎉",
+        }));
+        let configuration: BridgeConfiguration =
+            serde_json::from_value(document.clone()).expect("decode");
+        assert_eq!(configuration.ack_emoji(), Some("🤖"));
+        assert_eq!(configuration.receipt_emoji(), Some("🎉"));
+        let (acknowledgement, receipt, saved) = admit_and_print("reaction-override", &document);
+        assert_eq!(acknowledgement.as_deref(), Some("🤖"));
+        assert_eq!(receipt.expect("a receipt is saved").emoji, "🎉");
+        assert_eq!(saved["ack_reaction"], "🤖");
+        assert_eq!(saved["receipt_reaction"], "🎉");
+
+        // Overriding only the receipt keeps the inherited acknowledgement.
+        let document = config_document_with(&json!({ "receipt_reaction": "🚀" }));
+        let (acknowledgement, receipt, saved) =
+            admit_and_print("reaction-override-receipt", &document);
+        assert_eq!(acknowledgement.as_deref(), Some(DEFAULT_ACK_REACTION.emoji));
+        assert_eq!(receipt.expect("a receipt is saved").emoji, "🚀");
+        assert!(saved.get("ack_reaction").is_none(), "{saved}");
+        assert_eq!(saved["receipt_reaction"], "🚀");
+    }
+
+    #[test]
+    fn null_empty_or_false_disables_a_reaction_and_true_is_refused() {
+        for disabled in [json!(null), json!(""), json!(false)] {
+            // A disabled acknowledgement: the request is admitted without one and earns no
+            // receipt, whatever the receipt setting.
+            let document = config_document_with(&json!({ "ack_reaction": disabled }));
+            let configuration: BridgeConfiguration =
+                serde_json::from_value(document.clone()).expect("decode");
+            assert_eq!(configuration.ack_reaction, ReactionSetting::Disabled);
+            assert_eq!(configuration.ack_emoji(), None);
+            let (acknowledgement, receipt, saved) =
+                admit_and_print("reaction-disable-ack", &document);
+            assert_eq!(acknowledgement, None);
+            assert!(receipt.is_none());
+            assert_eq!(saved["ack_reaction"], Value::Null);
+            assert!(saved
+                .as_object()
+                .expect("object")
+                .contains_key("ack_reaction"));
+            // The receipt still resolves, but none is added without an acknowledgement.
+            assert_eq!(
+                configuration.receipt_emoji(),
+                Some(DEFAULT_RECEIPT_REACTION.emoji)
+            );
+            assert_eq!(configuration.receipt_emoji_in_use(), None);
+
+            // A disabled receipt: the acknowledgement still goes on, and no receipt is saved.
+            let document = config_document_with(&json!({ "receipt_reaction": disabled }));
+            let configuration: BridgeConfiguration =
+                serde_json::from_value(document.clone()).expect("decode");
+            assert_eq!(configuration.receipt_reaction, ReactionSetting::Disabled);
+            assert_eq!(configuration.receipt_emoji(), None);
+            assert_eq!(configuration.receipt_emoji_in_use(), None);
+            let (acknowledgement, receipt, saved) =
+                admit_and_print("reaction-disable-receipt", &document);
+            assert_eq!(acknowledgement.as_deref(), Some(DEFAULT_ACK_REACTION.emoji));
+            assert!(receipt.is_none());
+            assert_eq!(saved["receipt_reaction"], Value::Null);
+            let state_root = temporary("reaction-disable-receipt-status");
+            let state = BridgeState::initialize(&state_root, configuration).expect("initialize");
+            let status = state.status().expect("status");
+            drop(state);
+            fs::remove_dir_all(state_root).expect("cleanup");
+            assert_eq!(status["receipt_reactions"]["reaction"], Value::Null);
+        }
+        for key in ["ack_reaction", "receipt_reaction"] {
+            for refused in [json!(true), json!(7), json!(["👀"])] {
+                let document = config_document_with(&json!({ key: refused }));
+                assert!(
+                    serde_json::from_value::<BridgeConfiguration>(document).is_err(),
+                    "{key}: {refused} is not a reaction"
+                );
+            }
+        }
+        // An inherited setting cannot be written as a value: `null` would mean disabled.
+        assert!(serde_json::to_value(ReactionSetting::Inherit).is_err());
+    }
+
+    #[test]
+    fn a_new_state_refuses_the_same_emoji_for_both_reactions() {
+        let mut configuration = config();
+        configuration.ack_reaction = ReactionSetting::Emoji("🎉".to_owned());
+        configuration.receipt_reaction = ReactionSetting::Emoji("🎉".to_owned());
+        let root = temporary("reaction-same-emoji");
+        let Err(error) = BridgeState::initialize(&root, configuration.clone()) else {
+            panic!("a new state refuses one emoji for both stages");
+        };
+        assert!(
+            error.to_string().contains("ack_reaction cannot be 🎉"),
+            "{error}"
+        );
+        assert!(!root.join("bridge.json").exists());
+        // An acknowledgement override that collides with the inherited receipt is refused too.
+        configuration.receipt_reaction = ReactionSetting::Inherit;
+        configuration.ack_reaction =
+            ReactionSetting::Emoji(DEFAULT_RECEIPT_REACTION.emoji.to_owned());
+        assert!(BridgeState::initialize(&root, configuration.clone()).is_err());
+        // A different receipt makes the same acknowledgement usable.
+        configuration.receipt_reaction = ReactionSetting::Emoji("🚀".to_owned());
+        let state = BridgeState::initialize(&root, configuration).expect("distinct reactions");
+        drop(state);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_outbound_disabled_configuration_may_inherit_but_not_choose_a_receipt() {
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        configuration.ack_reaction = ReactionSetting::Disabled;
+        assert!(configuration.validate().is_ok());
+        configuration.receipt_reaction = ReactionSetting::Disabled;
+        assert!(configuration.validate().is_ok());
+        configuration.receipt_reaction = ReactionSetting::Emoji("🚀".to_owned());
+        assert!(configuration.validate().is_err());
+        // An inherited acknowledgement is a reaction, so it is refused as before.
+        configuration.receipt_reaction = ReactionSetting::Inherit;
+        configuration.ack_reaction = ReactionSetting::Inherit;
+        assert!(configuration.validate().is_err());
+    }
+
+    #[test]
+    fn a_waiting_receipt_keeps_the_emoji_it_was_saved_with() {
+        // A receipt saved under an earlier default or configuration is still read and sent with
+        // its own emoji; only a malformed emoji makes the record inconsistent.
+        let mut record = ReceiptReactionRecord {
+            schema: RECEIPT_REACTION_SCHEMA.to_owned(),
+            key: "a".repeat(64),
+            channel_id: "spaces/example".to_owned(),
+            message_id: "spaces/example/messages/one".to_owned(),
+            emoji: "🎉".to_owned(),
+            request_id: random_operation_uuid().expect("uuid"),
+            error: None,
+            recorded_at_millis: 1,
+            attempted_at_millis: None,
+        };
+        let key = record.key.clone();
+        assert!(record.validate(&key).is_ok());
+        for malformed in ["", " ", "two\nlines", &"x".repeat(65)] {
+            record.emoji = malformed.to_owned();
+            assert!(record.validate(&key).is_err(), "{malformed:?}");
+        }
     }
 
     #[test]
@@ -31074,7 +31447,7 @@ is unknown\n"
         let root = temporary("reply-command-inbound-only");
         let mut configuration = config();
         configuration.outbound_enabled = false;
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         let state = BridgeState::initialize(&root, configuration).expect("initialize state");
         let key = admitted(&state, 1).remove(0);
         let nonce = state.read_request(&key).expect("request").reply_nonce;
@@ -31257,7 +31630,7 @@ fails twice for a reply, print that reply between the two lines at the end of yo
         let root = temporary("reply-command-inbound-prompt");
         let mut configuration = config();
         configuration.outbound_enabled = false;
-        configuration.ack_reaction = None;
+        configuration.ack_reaction = ReactionSetting::Disabled;
         let state = BridgeState::initialize(&root, configuration)
             .expect("initialize state")
             .with_reply_command_offered(true);

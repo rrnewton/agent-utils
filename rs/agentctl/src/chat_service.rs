@@ -929,7 +929,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         transport.set_cancellation(outbound_cancellation.clone());
     }
     let ack_cancellation = OutboundCancellation::new()?;
-    let mut ack_transport = if state.config().ack_reaction.is_some() {
+    let mut ack_transport = if state.config().ack_emoji().is_some() {
         outbound
             .as_ref()
             .map(CommandOutboundTransport::try_clone_generation)
@@ -1657,7 +1657,7 @@ fn process_keys_with_delivery(
             report.more_work = true;
             break;
         }
-        let acknowledgement_enabled = state.config().ack_reaction.is_some();
+        let acknowledgement_enabled = state.config().ack_emoji().is_some();
         let concurrent =
             if async_ack.is_none() && acknowledgement_enabled && control.transport.is_some() {
                 let transport = control
@@ -2614,14 +2614,16 @@ impl TypingWatch<'_> {
         match self.state.save_receipt_reactions(&[message_id.to_owned()]) {
             Ok(saves) => {
                 if saves.losses_began {
+                    // A loss is counted only when a receipt is configured.
+                    let receipt = self.state.config().receipt_emoji().unwrap_or("receipt");
                     self.notes.log_lines.borrow_mut().push(format!(
                         "agentctl: chat receipt reactions: {} are already waiting, so the {} that \
                          request {} earned is lost; later losses are counted in `chat status` and \
                          delivery-alarm.json, and logged again only once a {} has been saved",
                         chat_runtime::MAX_RECEIPT_REACTIONS,
-                        chat_runtime::RECEIPT_REACTION,
+                        receipt,
                         saves.lost.first().map_or("?", String::as_str),
-                        chat_runtime::RECEIPT_REACTION,
+                        receipt,
                     ));
                 }
                 self.notes.receipts_lost.borrow_mut().extend(saves.lost);
@@ -5205,6 +5207,7 @@ fn already_reported_log_line(suppressed_ids: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_runtime::ReactionSetting;
     use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::fs;
@@ -5607,7 +5610,10 @@ mod tests {
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
-                ack_reaction: ack_reaction.map(str::to_owned),
+                ack_reaction: ack_reaction.map_or(ReactionSetting::Disabled, |emoji| {
+                    ReactionSetting::Emoji(emoji.to_owned())
+                }),
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
             },
@@ -6420,7 +6426,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 &mut self,
                 submission: chat_runtime::ReactionSubmission<'_>,
             ) -> Result<chat_runtime::ReactionReceipt, OutboundFailure> {
-                if submission.emoji == chat_runtime::RECEIPT_REACTION {
+                if submission.emoji == chat_subscription::reactions::DEFAULT_RECEIPT_REACTION.emoji
+                {
                     self.receipts
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     return Err(OutboundFailure {
@@ -6965,7 +6972,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
-                ack_reaction: Some("🤖".to_owned()),
+                ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
             },
@@ -7555,7 +7563,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
-                ack_reaction: None,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
                     executable: "/definitely/missing/helper".into(),
@@ -7617,7 +7626,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
-                ack_reaction: None,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
                     executable: helper,
@@ -7992,7 +8002,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: false,
-                ack_reaction: None,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
             },
@@ -9760,7 +9771,8 @@ esac
             agent_name: "coordinator".to_owned(),
             agent_label: "coordinator".to_owned(),
             outbound_enabled: true,
-            ack_reaction: Some("🤖".to_owned()),
+            ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
+            receipt_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
                 executable: "/fixture/outbound-helper".into(),
@@ -10199,7 +10211,8 @@ esac
                 agent_name: "worker".to_owned(),
                 agent_label: "worker".to_owned(),
                 outbound_enabled,
-                ack_reaction: None,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command,
             },
