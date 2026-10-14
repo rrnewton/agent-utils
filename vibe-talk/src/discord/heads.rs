@@ -535,6 +535,10 @@ mod tests {
             Support::Native,
             "Discord reads heads itself"
         );
+        assert!(
+            !mock.client.read_caps(&channels[0]).heads_cover_edits,
+            "and they never vouch for edits or deletes"
+        );
 
         let first = mock.client.channel_heads(&channels).await;
         assert_eq!(
@@ -711,6 +715,10 @@ mod tests {
         let mock = mock(routes, bridge).await;
         let channels = ids(&["spaces/A", "spaces/B", "spaces/C", "spaces/A"]);
         assert_eq!(mock.client.read_caps(&channels[0]).heads, Support::Native);
+        assert!(
+            mock.client.read_caps(&channels[0]).heads_cover_edits,
+            "a bridge's head may say unchanged_since"
+        );
         let answers = mock.client.channel_heads(&channels).await;
         assert_eq!(
             mock.take(),

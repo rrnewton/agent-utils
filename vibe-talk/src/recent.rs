@@ -111,6 +111,18 @@ pub const REUSE_UNFED: Duration = Duration::from_secs(15);
 /// another's reads. A deployment with one provider reads exactly as it did.
 pub const REFRESH_CONCURRENCY: usize = 4;
 
+/// How far apart this server's clock and a provider's may be when a head's `unchanged_since` is
+/// compared with the moment a held window was read: a change up to this long before the read
+/// still sends the channel to be read again. remote-ops-audit W12 `#287 bulk-reads`; two minutes,
+/// the margin `#208 persistent-cache` keeps for a moved head.
+pub const HEAD_CLOCK_MARGIN: Duration = Duration::from_secs(120);
+
+/// How long a catch-up or a warm-up waits for the heads of the channels it might keep, before
+/// reading them as it would have without heads. A head read worth asking is answered from the
+/// provider's memory; one that takes longer must not eat the catch-up's own deadline.
+/// remote-ops-audit W12 `#287 bulk-reads`.
+pub const HEADS_DEADLINE: Duration = Duration::from_secs(1);
+
 /// How many pushes each channel keeps, to apply again to a read that was running when they
 /// arrived. The depth the live hub keeps for a page that attaches late, and far more than one
 /// channel's pushes during one read: a read whose mark has fallen out of it does not replace a
@@ -499,6 +511,74 @@ impl RecentWindows {
             })
     }
 
+    /// Whether `channel` holds a window that reaches as deep as `scan` messages, or the whole
+    /// channel, however old it is.
+    #[must_use]
+    pub fn holds_deep(&self, channel: &ChannelId, scan: u16) -> bool {
+        self.windows()
+            .slots
+            .get(channel)
+            .and_then(|slot| slot.held.as_ref())
+            .is_some_and(|held| held.limit >= scan || held.whole)
+    }
+
+    /// Keep `channel`'s window as current, without reading it again, when `head` proves nothing in
+    /// the channel changed since that window's picture of it. remote-ops-audit W12
+    /// `#287 bulk-reads`. `mark` was taken before the head was asked for. Whether it kept the
+    /// window.
+    ///
+    /// **Only a proof keeps a window.** The head must be the provider's word for now (no
+    /// `as_of`), and must say an instant after which NOTHING in the channel changed
+    /// ([`crate::chat::ChannelHead::unchanged_since_ms`]: no message created, edited or deleted)
+    /// that is at least [`HEAD_CLOCK_MARGIN`] before the window's picture began. A newest id that
+    /// has not moved is not enough, and is not looked at: it says nothing was added, and an edit or
+    /// a delete since would then be hidden. The window must also reach as deep as `scan`, and no
+    /// purge may have come since `mark`.
+    ///
+    /// A kept window counts as read now: its read is "finished" again, so it is current to a
+    /// catch-up and reusable for the reuse period, and an `as_of` it was read with is dropped,
+    /// since the head proves it current. When its picture began is left alone, so the next head
+    /// has to prove the channel unchanged since then too.
+    pub fn keep_on_head(
+        &self,
+        channel: &ChannelId,
+        mark: ReadMark,
+        head: &crate::chat::ChannelHead,
+        scan: u16,
+    ) -> bool {
+        let Some(unchanged_since_ms) = head.unchanged_since_ms.filter(|_| head.is_current()) else {
+            return false;
+        };
+        let mut windows = self.windows();
+        if mark.purges != windows.purges {
+            return false;
+        }
+        let Some(slot) = windows.slots.get_mut(channel) else {
+            return false;
+        };
+        let Some(held) = slot.held.as_mut() else {
+            return false;
+        };
+        if held.limit < scan && !held.whole {
+            return false;
+        }
+        let picture_ms = wall_ms_of(held.read_started);
+        let margin_ms = i64::try_from(HEAD_CLOCK_MARGIN.as_millis()).unwrap_or(i64::MAX);
+        if unchanged_since_ms.saturating_add(margin_ms) > picture_ms {
+            return false;
+        }
+        held.read_finished = Instant::now();
+        held.as_of = None;
+        if slot
+            .failure
+            .as_ref()
+            .is_some_and(|(_, failed)| *failed <= mark.started)
+        {
+            slot.failure = None;
+        }
+        true
+    }
+
     /// Whether `channel`'s window can answer a read of `scan` messages without asking the chat
     /// service: its read finished within `reuse`, and it reaches as deep as asked or holds the
     /// whole channel.
@@ -591,6 +671,13 @@ fn backdated(started: Instant, as_of: Option<&str>) -> Instant {
     Instant::now()
         .checked_sub(Duration::from_millis(lag_ms))
         .map_or(started, |at| at.min(started))
+}
+
+/// The wall-clock instant, in Unix milliseconds, of a moment this process measured with its
+/// monotonic clock: now, less how long ago it was.
+fn wall_ms_of(at: Instant) -> i64 {
+    let ago = i64::try_from(at.elapsed().as_millis()).unwrap_or(i64::MAX);
+    jiff::Timestamp::now().as_millisecond().saturating_sub(ago)
 }
 
 /// Fold one push into a window.
@@ -739,23 +826,109 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
     done
 }
 
+/// Of `channels`, each due to be read again, the ones a head could let this server keep instead,
+/// and the rest. remote-ops-audit W12 `#287 bulk-reads`.
+///
+/// A channel can be kept only when its provider reads heads natively AND its heads can vouch for
+/// edits and deletes ([`crate::chat::ReadCaps::heads_cover_edits`]), and a window deep enough for
+/// `scan` is held to keep. Every other channel is read as it always was, and a provider whose
+/// heads cannot vouch for edits (Discord) or are emulated (Slack, a bridge without `head_reads`)
+/// is never asked for one here.
+#[must_use]
+pub fn head_candidates(
+    state: &AppState,
+    channels: Vec<ChannelId>,
+    scan: u16,
+) -> (Vec<ChannelId>, Vec<ChannelId>) {
+    let recent = state.live.recent();
+    channels.into_iter().partition(|channel| {
+        let caps = state.chat.read_caps(channel);
+        caps.heads == crate::chat::Support::Native
+            && caps.heads_cover_edits
+            && recent.holds_deep(channel, scan)
+    })
+}
+
+/// Ask for the heads of `candidates` (see [`head_candidates`]) in one call, keep each held window
+/// its head proves unchanged ([`RecentWindows::keep_on_head`]), and start a refresh of every other
+/// one, as a catch-up would have without heads. remote-ops-audit W12 `#287 bulk-reads`.
+///
+/// The heads are given [`HEADS_DEADLINE`]; past it, or for a channel whose head failed, the
+/// channel is read. Returns the refreshes started, by channel.
+pub async fn keep_or_refresh(
+    state: &AppState,
+    candidates: &[ChannelId],
+    scan: u16,
+) -> BTreeMap<ChannelId, watch::Receiver<bool>> {
+    let mut started = BTreeMap::new();
+    if candidates.is_empty() {
+        return started;
+    }
+    let recent = state.live.recent();
+    let marks: Vec<ReadMark> = candidates
+        .iter()
+        .map(|channel| recent.mark(channel))
+        .collect();
+    let heads = tokio::time::timeout(HEADS_DEADLINE, state.chat.channel_heads(candidates))
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                channels = candidates.len(),
+                "channel heads did not answer in time; reading those channels instead"
+            );
+            Vec::new()
+        });
+    let mut kept = std::collections::BTreeSet::new();
+    for ((asked, mark), (channel, head)) in candidates.iter().zip(&marks).zip(&heads) {
+        if let (true, Ok(head)) = (asked == channel, head) {
+            if recent.keep_on_head(channel, *mark, head, scan) {
+                kept.insert(channel.clone());
+            }
+        }
+    }
+    for channel in candidates {
+        if !kept.contains(channel) && !started.contains_key(channel) {
+            started.insert(channel.clone(), refresh(state, channel, scan));
+        }
+    }
+    tracing::info!(
+        asked = candidates.len(),
+        kept = kept.len(),
+        "held channel windows kept on their heads; the rest are being read"
+    );
+    started
+}
+
 /// Start reading every listed channel that a catch-up would read again, and return at once with
-/// how many are being read.
+/// how many are being read or checked.
 ///
 /// For the moment a voice call is being set up: the greeting takes five to six seconds before
 /// the agent can ask anything, and that is time for the reads its first catch-up will want.
 /// Single-flight like every refresh, and a window young enough to reuse is left alone, so a burst
 /// of call starts does not stack reads.
+///
+/// A channel whose held window a native head may prove unchanged (remote-ops-audit W12, see
+/// [`head_candidates`]) is checked in the background instead, all of them in one head read, and
+/// read only if its head does not prove it.
 pub fn warm(state: &AppState) -> usize {
     let scan = crate::ops::activity_scan(state, crate::ops::DEFAULT_ACTIVITY_LINES);
     let recent = state.live.recent();
-    let mut reading = 0;
-    for channel in state.all_channels() {
-        if recent.reusable(&channel.id, scan, reuse_for(state, &channel.id)) {
-            continue;
-        }
-        drop(refresh(state, &channel.id, scan));
-        reading += 1;
+    let due: Vec<ChannelId> = state
+        .all_channels()
+        .into_iter()
+        .map(|channel| channel.id)
+        .filter(|channel| !recent.reusable(channel, scan, reuse_for(state, channel)))
+        .collect();
+    let reading = due.len();
+    let (candidates, now) = head_candidates(state, due, scan);
+    for channel in &now {
+        drop(refresh(state, channel, scan));
+    }
+    if !candidates.is_empty() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            drop(keep_or_refresh(&state, &candidates, scan).await);
+        });
     }
     reading
 }
@@ -1207,5 +1380,83 @@ mod tests {
         assert_eq!(after.started(), before.started());
         windows.record(&channel, &[message(id(1), "read")], 50, after);
         assert_eq!(contents(&windows, &channel), ["read"]);
+    }
+
+    /// remote-ops-audit W12 `#287 bulk-reads`: a window is kept on a head only on proof that
+    /// nothing in the channel changed since its picture began, by a margin, from a current head,
+    /// with no purge since the mark, and only when it is deep enough. A kept window counts as read
+    /// now and loses the `as_of` it was read with.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_is_kept_on_a_head_only_on_proof_that_nothing_changed() {
+        let windows = RecentWindows::new();
+        let channel = ChannelId("1".to_owned());
+        let read: Vec<Message> = (1..=20).map(|n| message(id(n), "m")).collect();
+        // Read from a copy five seconds old, so the picture began five seconds before the read.
+        let as_of = crate::clock::iso_from_ms(jiff::Timestamp::now().as_millisecond() - 5_000);
+        windows.record_as_of(&channel, &read, 20, windows.mark(&channel), Some(&as_of));
+        assert!(windows
+            .snapshot(&channel)
+            .held
+            .expect("held")
+            .as_of
+            .is_some());
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        let read_at = jiff::Timestamp::now().as_millisecond() - 605_000;
+        let margin = i64::try_from(HEAD_CLOCK_MARGIN.as_millis()).expect("small");
+        let head =
+            |unchanged_since_ms: Option<i64>, as_of: Option<&str>| crate::chat::ChannelHead {
+                newest_id: Some(MessageId(id(20).to_string())),
+                unchanged_since_ms,
+                as_of: as_of.map(str::to_owned),
+                ..crate::chat::ChannelHead::default()
+            };
+        let proof = head(Some(read_at - margin - 1_000), None);
+        let mark = windows.mark(&channel);
+
+        assert!(
+            !windows.keep_on_head(&channel, mark, &head(None, None), 20),
+            "a newest id that has not moved is not a proof"
+        );
+        assert!(!windows.keep_on_head(
+            &channel,
+            mark,
+            &head(Some(read_at - margin - 1_000), Some("2026-10-13T12:00:00Z")),
+            20
+        ));
+        assert!(
+            !windows.keep_on_head(
+                &channel,
+                mark,
+                &head(Some(read_at - margin + 1_000), None),
+                20
+            ),
+            "a change inside the margin before the read"
+        );
+        assert!(
+            !windows.keep_on_head(&channel, mark, &proof, 50),
+            "a window of 20 cannot stand in for a read of 50"
+        );
+        assert!(
+            !windows.keep_on_head(&ChannelId("2".to_owned()), mark, &proof, 20),
+            "nothing held"
+        );
+        assert!(!windows.reusable(&channel, 20, Duration::from_secs(60)));
+
+        assert!(windows.keep_on_head(&channel, mark, &proof, 20));
+        assert!(
+            windows.reusable(&channel, 20, Duration::from_secs(60)),
+            "read now"
+        );
+        let held = windows.snapshot(&channel).held.expect("held");
+        assert_eq!(held.as_of, None, "proved current");
+        assert_eq!(held.messages.len(), 20);
+
+        let before = windows.mark(&channel);
+        windows.clear();
+        windows.record(&channel, &read, 20, windows.mark(&channel));
+        assert!(
+            !windows.keep_on_head(&channel, before, &proof, 20),
+            "a head asked for before the purge keeps nothing"
+        );
     }
 }

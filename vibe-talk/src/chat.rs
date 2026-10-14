@@ -475,6 +475,12 @@ pub struct ReadCaps {
     /// poller, a catch-up deciding what to read again) asks only when this is native.
     /// remote-ops-audit W12.
     pub heads: Support,
+    /// Whether this provider's heads can vouch for edits and deletes as well as additions: may
+    /// carry [`ChannelHead::unchanged_since_ms`]. Only such heads can let a catch-up keep a held
+    /// copy instead of reading it again, so a catch-up asks for heads only when this is true (and
+    /// `heads` is native). False for Discord, whose head moves only when a message is added.
+    /// remote-ops-audit W12.
+    pub heads_cover_edits: bool,
     /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
     /// 100 unless the provider says otherwise.
     pub page_rows: u16,
@@ -486,6 +492,7 @@ impl Default for ReadCaps {
             range: Support::Emulated,
             by_ids: Support::Emulated,
             heads: Support::Emulated,
+            heads_cover_edits: false,
             page_rows: crate::discord::http::DISCORD_MAX_LIMIT,
         }
     }

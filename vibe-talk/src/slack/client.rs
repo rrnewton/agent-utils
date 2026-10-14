@@ -926,6 +926,7 @@ impl ChatClient for HttpSlackClient {
             range: crate::chat::Support::Native,
             by_ids: crate::chat::Support::Native,
             heads: crate::chat::Support::Emulated,
+            heads_cover_edits: false,
             page_rows: super::range::PAGE_ROWS,
         }
     }

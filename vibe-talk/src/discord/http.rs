@@ -1369,6 +1369,8 @@ impl ChatClient for HttpDiscordClient {
         let caps = crate::chat::ReadCaps {
             by_ids: native_or(discord_itself || self.id_reads),
             heads: native_or(discord_itself || self.head_reads),
+            // A bridge's head may say `unchanged_since`; Discord's `last_message_id` never can.
+            heads_cover_edits: !discord_itself && self.head_reads,
             ..crate::chat::ReadCaps::default()
         };
         if self.range_reads {

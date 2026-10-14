@@ -530,6 +530,7 @@ async fn slack_reads_a_window_newest_first_in_one_call_per_page_it_holds() {
             range: Support::Native,
             by_ids: Support::Native,
             heads: Support::Emulated,
+            heads_cover_edits: false,
             page_rows: 20,
         }
     );

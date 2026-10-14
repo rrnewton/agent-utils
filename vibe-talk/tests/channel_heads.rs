@@ -500,8 +500,16 @@ async fn a_provider_without_a_head_read_gets_todays_answers_at_todays_cost() {
 struct Headed {
     inner: Arc<FakeDiscord>,
     native: bool,
-    /// What every head says about changes; see [`ChannelHead::unchanged_since_ms`].
-    unchanged_since_ms: Mutex<Option<i64>>,
+    /// Whether its heads can vouch for edits and deletes; see
+    /// [`ReadCaps::heads_cover_edits`].
+    covers_edits: bool,
+    /// The moment after which nothing changed in any channel, unless `changed_at` says later; no
+    /// `unchanged_since` at all while `None`. See [`ChannelHead::unchanged_since_ms`].
+    quiet_since: Mutex<Option<tokio::time::Instant>>,
+    /// The moment each channel last changed, when that was after `quiet_since`.
+    changed_at: Mutex<std::collections::HashMap<String, tokio::time::Instant>>,
+    /// How long a head read takes.
+    delay: Mutex<Duration>,
     /// What every head says about its currency; see [`ChannelHead::as_of`].
     as_of: Mutex<Option<String>>,
     asked: Mutex<Vec<Vec<String>>>,
@@ -512,7 +520,10 @@ impl Headed {
         Self {
             inner,
             native,
-            unchanged_since_ms: Mutex::new(None),
+            covers_edits: false,
+            quiet_since: Mutex::new(None),
+            changed_at: Mutex::new(std::collections::HashMap::new()),
+            delay: Mutex::new(Duration::ZERO),
             as_of: Mutex::new(None),
             asked: Mutex::new(Vec::new()),
         }
@@ -520,6 +531,29 @@ impl Headed {
 
     fn asked(&self) -> Vec<Vec<String>> {
         self.asked.lock().expect("log").clone()
+    }
+
+    /// A bridge's kind of head: native, and vouching for edits and deletes, every channel quiet
+    /// since an hour before now.
+    fn covering_edits(mut self) -> Self {
+        self.covers_edits = true;
+        *self.quiet_since.lock().expect("setting") =
+            tokio::time::Instant::now().checked_sub(Duration::from_secs(3_600));
+        self
+    }
+
+    /// Say from now on that `id` changed just now.
+    fn changed(&self, id: &str) {
+        self.changed_at
+            .lock()
+            .expect("setting")
+            .insert(id.to_owned(), tokio::time::Instant::now());
+    }
+
+    /// The wall-clock instant of `at`, measured as the server measures a window's read: now, less
+    /// how long ago it was on the runtime's clock, which a paused test advances.
+    fn wall_ms(at: tokio::time::Instant) -> i64 {
+        vibe_talk::ops::now_ms() - i64::try_from(at.elapsed().as_millis()).expect("small")
     }
 }
 
@@ -532,6 +566,7 @@ impl ChatClient for Headed {
             } else {
                 Support::Emulated
             },
+            heads_cover_edits: self.covers_edits,
             ..ReadCaps::default()
         }
     }
@@ -541,10 +576,20 @@ impl ChatClient for Headed {
             .lock()
             .expect("log")
             .push(channels.iter().map(|c| c.0.clone()).collect());
-        let unchanged_since_ms = *self.unchanged_since_ms.lock().expect("setting");
+        let delay = *self.delay.lock().expect("setting");
+        tokio::time::sleep(delay).await;
+        let quiet_since = *self.quiet_since.lock().expect("setting");
         let as_of = self.as_of.lock().expect("setting").clone();
+        let changed_at = self.changed_at.lock().expect("setting").clone();
         let mut answers = Vec::new();
         for channel in channels {
+            let unchanged_since_ms = quiet_since.map(|quiet| {
+                let last = changed_at
+                    .get(&channel.0)
+                    .copied()
+                    .map_or(quiet, |changed| changed.max(quiet));
+                Self::wall_ms(last)
+            });
             let head = self.inner.fetch_recent(channel, 1).await.map(|messages| {
                 let newest = messages.last();
                 ChannelHead {
@@ -954,4 +999,254 @@ async fn a_failing_channel_is_read_rather_than_skipped_on_its_head() {
         .collect();
     assert_eq!(published, ["will fail to arrive at first"]);
     poller.abort();
+}
+
+/// A server with three channels (two messages in the third) reading through `counting` around
+/// `headed`, and its HTTP router.
+fn catch_up_server(
+    headed: impl FnOnce(Arc<FakeDiscord>) -> Headed,
+) -> (
+    AppState,
+    axum::Router,
+    Arc<FakeDiscord>,
+    Arc<Headed>,
+    Arc<CountingChat>,
+    MessageId,
+    MessageId,
+) {
+    let toml = vibe_talk::testing::config_toml().replace(
+        "[elevenlabs]",
+        &format!(
+            "[[channels]]\nid = \"{THIRD}\"\nlabel = \"night shift\"\nwritable = false\n\n\
+             [elevenlabs]"
+        ),
+    );
+    let (mut state, fake, _elevenlabs) = vibe_talk::testing::state_from_toml(&toml);
+    let now = vibe_talk::ops::now_ms();
+    fake.seed_at(
+        &channel(READ_CHANNEL),
+        "agent",
+        "build is green",
+        now - 60 * MINUTE_MS,
+    );
+    let draft = fake.seed_at(
+        &channel(WRITE_CHANNEL),
+        "agent",
+        "first draft",
+        now - 59 * MINUTE_MS,
+    );
+    fake.seed_at(
+        &channel(THIRD),
+        "agent",
+        "pager is quiet",
+        now - 58 * MINUTE_MS,
+    );
+    let stray = fake.seed_at(
+        &channel(THIRD),
+        "grace",
+        "wrong channel",
+        now - 57 * MINUTE_MS,
+    );
+    let headed = Arc::new(headed(Arc::clone(&fake)));
+    let counting = Arc::new(CountingChat::new(Arc::clone(&headed) as Arc<dyn ChatClient>));
+    state.replace_chat(Arc::clone(&counting) as Arc<dyn ChatClient>);
+    let router = vibe_talk::http::router(state.clone());
+    (state, router, fake, headed, counting, draft, stray)
+}
+
+/// A catch-up's answer, and what it asked of the provider, by method and channel.
+async fn catch_up_once(
+    router: &axum::Router,
+    counting: &CountingChat,
+    seen: &mut usize,
+) -> (Value, Vec<String>) {
+    let (status, body) = get(router, "/api/v1/activity").await;
+    let calls = counting.calls();
+    let asked = calls[*seen..]
+        .iter()
+        .map(|call| match &call.channel {
+            Some(channel) => format!("{} {channel}", call.method),
+            None => call.method.to_owned(),
+        })
+        .collect();
+    *seen = calls.len();
+    (activity(status, &body), asked)
+}
+
+fn all_current(answer: &Value) -> bool {
+    answer["channels"]
+        .as_array()
+        .expect("channels")
+        .iter()
+        .all(|part| part["held_age_seconds"].is_null() && part["error"].is_null())
+}
+
+fn said_in(answer: &Value, id: &str) -> Vec<String> {
+    answer["channels"]
+        .as_array()
+        .expect("channels")
+        .iter()
+        .find(|part| part["id"] == id)
+        .expect("the channel")["said"]
+        .as_array()
+        .expect("said")
+        .iter()
+        .map(|line| line.as_str().expect("text").to_owned())
+        .collect()
+}
+
+/// remote-ops-audit W12, the catch-up's proof: on a provider whose heads vouch for edits and
+/// deletes, a catch-up past the reuse period costs one head read plus a read of each channel that
+/// changed, where it cost a read of every channel; and an edit or a delete, which never moves a
+/// channel's newest message, is still seen, because the head says the channel changed.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_keeps_what_a_head_proves_unchanged_and_still_sees_edits_and_deletes() {
+    let (_state, router, fake, headed, counting, draft, stray) =
+        catch_up_server(|fake| Headed::new(fake, true).covering_edits());
+    let mut seen = 0;
+    let (cold, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(
+        asked.len(),
+        3,
+        "nothing held, so nothing to keep: {asked:?}"
+    );
+    assert!(asked.iter().all(|call| call.starts_with("fetch_recent")));
+
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let (kept, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(
+        asked,
+        ["channel_heads"],
+        "one head read, and no channel read"
+    );
+    assert_eq!(kept, cold, "the same answer");
+    assert!(all_current(&kept), "{kept}");
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    fake.edit(&draft, "second draft, edited");
+    headed.changed(WRITE_CHANNEL);
+    tokio::time::sleep(Duration::from_secs(180)).await;
+    let (edited, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(
+        asked,
+        [
+            "channel_heads".to_owned(),
+            format!("fetch_recent_dated {WRITE_CHANNEL}")
+        ],
+        "the edited channel is read: its newest message did not move, its head says it changed"
+    );
+    assert_eq!(said_in(&edited, WRITE_CHANNEL), ["second draft, edited"]);
+    assert!(all_current(&edited), "{edited}");
+
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let (_, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(
+        asked,
+        ["channel_heads"],
+        "read since the edit, so kept again"
+    );
+
+    fake.delete(&stray);
+    headed.changed(THIRD);
+    tokio::time::sleep(Duration::from_secs(180)).await;
+    let (deleted, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(
+        asked,
+        [
+            "channel_heads".to_owned(),
+            format!("fetch_recent_dated {THIRD}")
+        ]
+    );
+    assert_eq!(
+        said_in(&deleted, THIRD),
+        ["pager is quiet"],
+        "the delete is seen"
+    );
+    assert_eq!(said_in(&deleted, READ_CHANNEL), ["build is green"]);
+}
+
+/// Discord's kind of head moves only when a message is added, so a catch-up never asks for one
+/// and never keeps a window on one: it reads every channel past its reuse period, exactly as
+/// before, and sees the edit.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_never_keeps_a_window_on_a_head_that_cannot_vouch_for_edits() {
+    let (_state, router, fake, headed, counting, draft, _stray) =
+        catch_up_server(|fake| Headed::new(fake, true));
+    let mut seen = 0;
+    catch_up_once(&router, &counting, &mut seen).await;
+    fake.edit(&draft, "second draft, edited");
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let (answer, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    assert!(asked.iter().all(|call| call.starts_with("fetch_recent")));
+    assert!(headed.asked().is_empty(), "never asked for a head");
+    assert_eq!(said_in(&answer, WRITE_CHANNEL), ["second draft, edited"]);
+}
+
+/// A head that cannot prove the channel unchanged sends it to be read: one from an older copy, and
+/// one whose channel changed less than the clock margin before the window was read.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_reads_every_channel_a_head_cannot_prove_unchanged() {
+    let (_state, router, _fake, headed, counting, _draft, _stray) =
+        catch_up_server(|fake| Headed::new(fake, true).covering_edits());
+    let mut seen = 0;
+    headed.changed(READ_CHANNEL);
+    catch_up_once(&router, &counting, &mut seen).await;
+
+    *headed.as_of.lock().expect("setting") = Some("2026-10-13T12:00:00Z".to_owned());
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let (answer, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(asked.len(), 4, "a stale head proves nothing: {asked:?}");
+    assert_eq!(asked[0], "channel_heads");
+    assert!(all_current(&answer));
+
+    *headed.as_of.lock().expect("setting") = None;
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let (_, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(
+        asked,
+        [
+            "channel_heads".to_owned(),
+            format!("fetch_recent_dated {READ_CHANNEL}")
+        ],
+        "a change two minutes or less before the window's read is read again"
+    );
+}
+
+/// A call start's warm-up asks for the heads of the channels it may keep in the background, in
+/// one call, and the catch-up that follows is answered from what it kept without a read.
+#[tokio::test(start_paused = true)]
+async fn a_warm_up_keeps_what_a_head_proves_unchanged_in_one_head_read() {
+    let (state, router, _fake, _headed, counting, _draft, _stray) =
+        catch_up_server(|fake| Headed::new(fake, true).covering_edits());
+    let mut seen = 0;
+    catch_up_once(&router, &counting, &mut seen).await;
+    tokio::time::sleep(Duration::from_secs(61)).await;
+
+    assert_eq!(vibe_talk::recent::warm(&state), 3, "three channels checked");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let calls: Vec<&str> = counting.calls()[seen..].iter().map(|c| c.method).collect();
+    seen += calls.len();
+    assert_eq!(calls, ["channel_heads"]);
+
+    let (answer, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(all_current(&answer), "{answer}");
+}
+
+/// Heads that do not answer within [`vibe_talk::recent::HEADS_DEADLINE`] are given up on, and the
+/// channels are read as they would have been without heads.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_reads_the_channels_when_their_heads_are_late() {
+    let (_state, router, _fake, headed, counting, _draft, _stray) =
+        catch_up_server(|fake| Headed::new(fake, true).covering_edits());
+    let mut seen = 0;
+    catch_up_once(&router, &counting, &mut seen).await;
+    *headed.delay.lock().expect("setting") = Duration::from_secs(30);
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let began = tokio::time::Instant::now();
+    let (answer, asked) = catch_up_once(&router, &counting, &mut seen).await;
+    assert_eq!(began.elapsed(), vibe_talk::recent::HEADS_DEADLINE);
+    assert_eq!(asked.len(), 4, "{asked:?}");
+    assert!(all_current(&answer), "{answer}");
 }

@@ -2289,6 +2289,19 @@ read as before, and so is every channel of a provider whose heads are emulated (
 without `head_reads`): the poller never asks such a provider for heads. A hinted read is never
 gated, since the hint says something changed.
 
+**A voice catch-up, and a call start's warm-up.** A channel whose held window is past its reuse
+period is read again, as before, unless its provider reads heads natively AND its heads can vouch
+for edits and deletes (a bridge with `head_reads`; never Discord, never an emulated provider). For
+those channels, every other read is started first, then one head read asks about all of them,
+within one second, and a channel is kept rather than read when its head is current and its
+`unchanged_since` is at least two minutes (the clock margin) before the held window was read: the
+head then proves nothing in the channel was created, edited or deleted since. A kept window counts
+as read now and is answered as current. A head that is late, failed, stale, or says the channel
+changed later than that sends the channel to be read, so an edit or a delete is seen exactly as
+before. Five quiet bridge channels past their reuse period cost one head request instead of five
+reads, and a catch-up after one channel changed costs one head request and one read. A warm-up
+asks the same question in the background and returns at once.
+
 ### A bridge's channel heads
 
 **The problem.** A bridge is asked for each channel's newest messages one channel at a time, and a
@@ -5885,7 +5898,10 @@ newer messages; one with nothing held says it was not read in time and to ask ag
 A window read within the last 15 seconds — 60 when a live producer feeds it — is used without a
 read at all, and opening a voice session (`GET /api/v1/voice-session`) starts the reads in the
 background, so the greeting covers them. At most four of these reads run at once for each provider
-(remote-ops-audit W12), so one provider's long channel list never holds up another's reads. The access log's `tool` line carries `millis=`, each
+(remote-ops-audit W12), so one provider's long channel list never holds up another's reads. On a
+bridge whose channel heads vouch for edits and deletes, a held window past its reuse period is kept
+without a read when one head request proves its channel unchanged (see
+[Channel heads](#channel-heads)). The access log's `tool` line carries `millis=`, each
 catch-up writes `recent_activity current= held= unread= millis=`, and a call the caller abandoned
 writes `outcome="abandoned"` instead of nothing.
 

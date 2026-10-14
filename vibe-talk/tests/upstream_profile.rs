@@ -434,6 +434,7 @@ impl ChatClient for Recorder {
             range: Support::Native,
             by_ids: Support::Native,
             heads: Support::Native,
+            heads_cover_edits: true,
             page_rows: 7,
         }
     }

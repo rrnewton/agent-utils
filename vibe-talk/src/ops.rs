@@ -998,16 +998,26 @@ pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Acti
     let began = tokio::time::Instant::now();
 
     // Every read starts before any is waited for, so their waits overlap rather than add up.
-    let waits: Vec<_> = channels
+    let due: Vec<ChannelId> = channels
         .iter()
+        .map(|channel| channel.id.clone())
+        .filter(|channel| !recent.reusable(channel, scan, crate::recent::reuse_for(state, channel)))
+        .collect();
+    // remote-ops-audit W12 `#287 bulk-reads`: a held window a native head proves unchanged is kept
+    // rather than read again. Every other read is started first, so the head read never delays it.
+    let (candidates, now) = crate::recent::head_candidates(state, due, scan);
+    let mut waits: std::collections::BTreeMap<ChannelId, _> = now
+        .into_iter()
         .map(|channel| {
-            let reuse = crate::recent::reuse_for(state, &channel.id);
-            (!recent.reusable(&channel.id, scan, reuse))
-                .then(|| crate::recent::refresh(state, &channel.id, scan))
+            let wait = crate::recent::refresh(state, &channel, scan);
+            (channel, wait)
         })
         .collect();
-    for (channel, wait) in channels.iter().zip(waits) {
-        let Some(mut done) = wait else { continue };
+    waits.extend(crate::recent::keep_or_refresh(state, &candidates, scan).await);
+    for channel in &channels {
+        let Some(mut done) = waits.remove(&channel.id) else {
+            continue;
+        };
         let budget = if recent.holds(&channel.id) {
             timing.deadline
         } else {
