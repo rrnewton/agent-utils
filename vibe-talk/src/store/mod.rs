@@ -162,6 +162,14 @@ pub enum Speaker {
     Agent,
     /// The page itself — a seam, a hang-up, an error it wants to keep in the record.
     Note,
+    /// A message the voice agent posted to a channel, written from this server's own copy of the
+    /// send. `#270 voice-transcript-markers`. Its [`Turn::detail`] says where it went and how it
+    /// was approved, and its text is what was posted.
+    Sent,
+    /// A mark in the record that is not anything said: where a conversation started and what it
+    /// was handed, or a draft that was not sent. `#270 voice-transcript-markers`. Its text is
+    /// empty and its [`Turn::detail`] is the whole of it.
+    Marker,
 }
 
 impl Speaker {
@@ -172,7 +180,18 @@ impl Speaker {
             Self::You => "you",
             Self::Agent => "agent",
             Self::Note => "note",
+            Self::Sent => "sent",
+            Self::Marker => "marker",
         }
+    }
+
+    /// Whether this is a record row — a send or a marker — rather than something said or noted.
+    ///
+    /// A page that has not asked for records never sees one of these, because it would draw a
+    /// marker's empty text as a blank line and a send as something the owner said.
+    #[must_use]
+    pub fn is_record(self) -> bool {
+        matches!(self, Self::Sent | Self::Marker)
     }
 
     /// Parse a stored speaker back.
@@ -186,6 +205,8 @@ impl Speaker {
             "you" => Ok(Self::You),
             "agent" => Ok(Self::Agent),
             "note" => Ok(Self::Note),
+            "sent" => Ok(Self::Sent),
+            "marker" => Ok(Self::Marker),
             other => Err(StoreError::Backend(format!(
                 "stored turn has an unknown speaker {other:?}"
             ))),
@@ -203,6 +224,12 @@ pub struct Turn {
     /// When the store recorded it, in milliseconds since the Unix epoch. Server clock; see
     /// [`now_ms`].
     pub at_ms: i64,
+    /// What the row records beyond words. `#270 voice-transcript-markers`.
+    ///
+    /// `None` for an ordinary turn, and for a stored detail this version cannot read: reads are
+    /// tolerant, so one unreadable row costs its detail rather than the whole transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<TurnDetail>,
 }
 
 impl Turn {
@@ -213,7 +240,324 @@ impl Turn {
             speaker,
             text: text.into(),
             at_ms: now_ms(),
+            detail: None,
         }
+    }
+
+    /// A turn carrying a record, stamped with the current server time.
+    #[must_use]
+    pub fn record(speaker: Speaker, text: impl Into<String>, detail: Option<TurnDetail>) -> Self {
+        Self {
+            detail,
+            ..Self::now(speaker, text)
+        }
+    }
+
+    /// This turn as a page that has not asked for records may see it: the same turn without its
+    /// detail, or nothing for a record row. See [`Speaker::is_record`].
+    #[must_use]
+    pub fn without_records(mut self) -> Option<Self> {
+        if self.speaker.is_record() {
+            return None;
+        }
+        self.detail = None;
+        Some(self)
+    }
+}
+
+/// What one transcript row records beyond its words. `#270 voice-transcript-markers`.
+///
+/// Stored as JSON in the row's `detail` column, tagged by `kind`. Only this server writes it — a
+/// `sent` row from its own copy of the send, a marker from a request it validated — and a value
+/// that does not parse reads back as no detail at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnDetail {
+    /// A `sent` row: one message the voice agent posted. Boxed, because it is by far the widest.
+    Sent(Box<SentRecord>),
+    /// A `marker` row at the head of a conversation: what the call was handed, and how the one
+    /// before it ended.
+    ConversationStart(StartRecord),
+    /// A `marker` row for a draft that was not sent, and why.
+    NotSent {
+        /// Why nothing was posted.
+        why: NotSentWhy,
+        /// The proposal's number.
+        serial: u64,
+    },
+    /// On a `you` row only: the owner's spoken answer that the page acted on, sending proposal
+    /// `serial`. The words stay an ordinary turn; this only lets a page draw them into the sent
+    /// card that follows.
+    Answer {
+        /// The proposal the answer sent.
+        serial: u64,
+    },
+}
+
+/// How the owner approved a send. `#270 voice-transcript-markers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SendHow {
+    /// He tapped Send on the card.
+    Tap,
+    /// He said yes to the read-back, and the page sent it.
+    Voice,
+    /// Nobody was asked: "Ask me before the voice agent sends" was off.
+    Direct,
+}
+
+impl SendHow {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tap => "tap",
+            Self::Voice => "voice",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// Which door a send came through. Stored for audit; nothing is drawn from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SendOrigin {
+    /// A confirmed proposal, through the commit route.
+    Commit,
+    /// A direct send from the MCP tool.
+    Mcp,
+    /// A direct send from `POST /api/v1/post-proposals`.
+    Rest,
+}
+
+/// What a send is known to have posted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SendOutcome {
+    /// All of it.
+    Sent,
+    /// Some of its parts, and not the rest.
+    Partial,
+    /// Nobody knows: the chat service's answer was lost, or the request was abandoned on its way.
+    Unconfirmed,
+}
+
+impl SendOutcome {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Partial => "partial",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// One message the voice agent posted, as a `sent` row records it. `#270
+/// voice-transcript-markers`.
+///
+/// Every field comes from this server's own copy of the send, never from a page. The times are
+/// here rather than in the row's `at_ms`, which must stay non-decreasing within a conversation
+/// for [`TranscriptCursor`]; `at_ms` is when the row was recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SentRecord {
+    /// The proposal's number, or the direct send's: the same counter.
+    pub serial: u64,
+    /// Where it stands in the order sends settled, which is the long poll's cursor.
+    pub send_seq: u64,
+    /// The channel it went to.
+    pub channel_id: String,
+    /// That channel's name as the owner knows it, when it was sent.
+    pub channel_name: String,
+    /// The message it answered, kept so a page can open it. Never drawn as an id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// Who wrote the message it answered, when this server had that message to hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_author: Option<String>,
+    /// The first few words of the message it answered, flattened, when this server had it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_excerpt: Option<String>,
+    /// The thread it went to, when not the conversation itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// That thread's name, when this server knows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_name: Option<String>,
+    /// The first part as the chat service accepted it, when one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// How many parts are known to have been posted.
+    pub parts_posted: u32,
+    /// How many parts the message was cut into.
+    pub parts_total: u32,
+    /// The part, counted from 1, that failed in a way that may have posted it anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncertain_part: Option<u32>,
+    /// How many characters were certainly not posted.
+    pub unsent_chars: u32,
+    /// What is known to have been posted.
+    pub outcome: SendOutcome,
+    /// How the owner approved it.
+    pub how: SendHow,
+    /// Which door it came through.
+    pub origin: SendOrigin,
+    /// Whether the row's text is shorter than what was posted: a stored row is capped at
+    /// [`MAX_TURN_CHARS`].
+    pub text_truncated: bool,
+    /// How many characters were posted, whatever the row holds.
+    pub text_chars: u32,
+    /// When the send began, by the server's clock.
+    pub begun_at_ms: i64,
+    /// When the send settled, by the server's clock.
+    pub sent_at_ms: i64,
+}
+
+/// What a conversation was handed when it started, and how the one before it ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StartRecord {
+    /// The recap this call was sent, or why none was.
+    pub recap: Recap,
+    /// How the previous call on the same page ended, when the page saw it end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_end: Option<EndCause>,
+}
+
+/// How a call ended, in the voice page's own words for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EndCause {
+    /// The owner hung up.
+    Ended,
+    /// The voice service closed the connection.
+    Closed,
+    /// The connection failed.
+    Error,
+    /// The call never got going.
+    Failed,
+    /// The page was put away mid-call.
+    Suspended,
+}
+
+/// The recap a call was sent, or why none was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Recap {
+    /// A recap went out. Neither transport acknowledges one, so this says it was sent, not heard.
+    Sent {
+        /// Words of the lines it held.
+        words: u32,
+        /// How many lines it held.
+        lines: u32,
+        /// How many older lines did not fit.
+        dropped: u32,
+        /// How it was handed over.
+        transport: RecapTransport,
+    },
+    /// Nothing was sent.
+    #[serde(rename = "none")]
+    NotSent {
+        /// Why.
+        why: RecapNone,
+        /// How many lines there were that did not fit, when that is why.
+        dropped: u32,
+    },
+}
+
+impl Recap {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent { .. } => "sent",
+            Self::NotSent { why, .. } => why.as_str(),
+        }
+    }
+}
+
+/// How a recap was handed to a new call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecapTransport {
+    /// A `contextual_update` event after the session opened.
+    ContextualUpdate,
+    /// On the session's start request.
+    ClientData,
+}
+
+/// Why a call was sent no recap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecapNone {
+    /// The owner, or the operator, has resuming off.
+    Off,
+    /// There was nothing said to replay.
+    Empty,
+    /// Not even the last line fitted the budget.
+    TooLong,
+    /// The page could not read the conversation to replay.
+    Failed,
+    /// The voice backend has no way to take a recap.
+    Unsupported,
+    /// The voice service replaced the session, and the new one was sent nothing.
+    ReplacedSession,
+}
+
+impl RecapNone {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Empty => "empty",
+            Self::TooLong => "too_long",
+            Self::Failed => "failed",
+            Self::Unsupported => "unsupported",
+            Self::ReplacedSession => "replaced_session",
+        }
+    }
+}
+
+/// Why a draft was not sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotSentWhy {
+    /// He tapped Don't send.
+    Withdrawn,
+    /// He said no to the read-back.
+    Declined,
+    /// It lapsed before anyone sent it.
+    Lapsed,
+    /// He hung up with it still waiting.
+    Ended,
+}
+
+impl NotSentWhy {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Withdrawn => "withdrawn",
+            Self::Declined => "declined",
+            Self::Lapsed => "lapsed",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+impl TurnDetail {
+    /// The detail as stored: compact JSON.
+    #[must_use]
+    pub fn to_stored(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// A stored detail read back. Tolerant: what does not parse is no detail, so one row written
+    /// by another version costs that row its detail and nothing more.
+    #[must_use]
+    pub fn from_stored(raw: Option<&str>) -> Option<Self> {
+        raw.and_then(|raw| serde_json::from_str(raw).ok())
     }
 }
 
@@ -1242,7 +1586,9 @@ pub trait StateStore: Send + Sync {
     /// failure.
     async fn conversations(&self) -> Result<Vec<ConversationSummary>, StoreError>;
 
-    /// One conversation's turns, oldest first.
+    /// One conversation's turns, oldest first, record rows and details included: the replay and
+    /// the claims read the whole of it, and a route serving a page filters what that page did not
+    /// ask for ([`Turn::without_records`]).
     ///
     /// # Errors
     ///
@@ -1269,6 +1615,15 @@ pub trait StateStore: Send + Sync {
     ///
     /// # Errors
     ///
+    /// # Records
+    ///
+    /// With `records` false — what every page before `#270 voice-transcript-markers` asks for —
+    /// the walk holds only what was said or noted: record rows ([`Speaker::is_record`]) are left
+    /// out in the read itself, so a page still gets `limit` rows and the cursor stays continuous,
+    /// and no row carries its [`Turn::detail`]. With it true, everything comes back.
+    ///
+    /// # Errors
+    ///
     /// [`StoreError::BadId`] when `before` names a conversation that is not a usable id;
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
     /// failure. Never [`StoreError::NotFound`] — an empty record is an empty page, because having
@@ -1277,6 +1632,7 @@ pub trait StateStore: Send + Sync {
         &self,
         limit: u16,
         before: Option<&TranscriptCursor>,
+        records: bool,
     ) -> Result<TranscriptPage, StoreError>;
 
     /// Erase one conversation.
@@ -1900,6 +2256,19 @@ pub fn preview_of(text: &str) -> String {
     crate::summary::condense(text, PREVIEW_CHARS)
 }
 
+/// The preview one turn offers a conversation that has none yet: [`preview_of`] its text, or
+/// nothing for a record row. `#270 voice-transcript-markers`: a marker is empty and a send is a
+/// message to a channel, and neither is the first thing said in the call. A conversation's
+/// preview is set by its first turn that offers one.
+#[must_use]
+pub fn preview_for(turn: &Turn) -> String {
+    if turn.speaker.is_record() {
+        String::new()
+    } else {
+        preview_of(&turn.text)
+    }
+}
+
 /// Width of a conversation preview line.
 pub const PREVIEW_CHARS: usize = 120;
 
@@ -2222,7 +2591,13 @@ mod tests {
 
     #[test]
     fn a_speaker_round_trips_and_an_unknown_one_is_refused_rather_than_guessed() {
-        for speaker in [Speaker::You, Speaker::Agent, Speaker::Note] {
+        for speaker in [
+            Speaker::You,
+            Speaker::Agent,
+            Speaker::Note,
+            Speaker::Sent,
+            Speaker::Marker,
+        ] {
             assert_eq!(
                 Speaker::parse(speaker.as_str()).expect("round trip"),
                 speaker
@@ -2230,5 +2605,145 @@ mod tests {
         }
         let error = Speaker::parse("system").expect_err("must refuse");
         assert_eq!(error.code(), "storage_error");
+    }
+
+    /// A `sent` record as a test builds one.
+    pub(crate) fn sent_record(serial: u64) -> SentRecord {
+        SentRecord {
+            serial,
+            send_seq: serial,
+            channel_id: "2222222222".to_owned(),
+            channel_name: "lead team".to_owned(),
+            reply_to: None,
+            reply_to_author: None,
+            reply_to_excerpt: None,
+            thread_id: None,
+            thread_name: None,
+            message_id: Some("9000000000000000001".to_owned()),
+            parts_posted: 1,
+            parts_total: 1,
+            uncertain_part: None,
+            unsent_chars: 0,
+            outcome: SendOutcome::Sent,
+            how: SendHow::Tap,
+            origin: SendOrigin::Commit,
+            text_truncated: false,
+            text_chars: 9,
+            begun_at_ms: 1_700_000_000_000,
+            sent_at_ms: 1_700_000_000_400,
+        }
+    }
+
+    #[test]
+    fn a_detail_is_stored_tagged_by_kind_and_reads_back_whole() {
+        let details = [
+            TurnDetail::Sent(Box::new(sent_record(7))),
+            TurnDetail::ConversationStart(StartRecord {
+                recap: Recap::Sent {
+                    words: 412,
+                    lines: 9,
+                    dropped: 0,
+                    transport: RecapTransport::ContextualUpdate,
+                },
+                previous_end: Some(EndCause::Closed),
+            }),
+            TurnDetail::ConversationStart(StartRecord {
+                recap: Recap::NotSent {
+                    why: RecapNone::Unsupported,
+                    dropped: 0,
+                },
+                previous_end: None,
+            }),
+            TurnDetail::NotSent {
+                why: NotSentWhy::Lapsed,
+                serial: 4,
+            },
+            TurnDetail::Answer { serial: 7 },
+        ];
+        for detail in details {
+            let stored = detail.to_stored();
+            assert_eq!(
+                TurnDetail::from_stored(Some(&stored)),
+                Some(detail.clone()),
+                "{stored}"
+            );
+        }
+        let stored = TurnDetail::NotSent {
+            why: NotSentWhy::Withdrawn,
+            serial: 3,
+        }
+        .to_stored();
+        assert_eq!(
+            stored,
+            r#"{"kind":"not_sent","why":"withdrawn","serial":3}"#
+        );
+        let start = TurnDetail::ConversationStart(StartRecord {
+            recap: Recap::NotSent {
+                why: RecapNone::Off,
+                dropped: 0,
+            },
+            previous_end: None,
+        })
+        .to_stored();
+        assert_eq!(
+            start,
+            r#"{"kind":"conversation_start","recap":{"state":"none","why":"off","dropped":0}}"#
+        );
+    }
+
+    #[test]
+    fn a_detail_that_does_not_parse_reads_as_none_rather_than_failing_the_row() {
+        for raw in [
+            "",
+            "not json",
+            r#"{"kind":"from_the_future","x":1}"#,
+            r#"{"kind":"not_sent","why":"bored","serial":1}"#,
+            r#"[1,2]"#,
+        ] {
+            assert_eq!(TurnDetail::from_stored(Some(raw)), None, "{raw}");
+        }
+        assert_eq!(TurnDetail::from_stored(None), None);
+    }
+
+    #[test]
+    fn a_page_that_did_not_ask_for_records_gets_no_record_row_and_no_detail() {
+        let marker = Turn::record(
+            Speaker::Marker,
+            "",
+            Some(TurnDetail::NotSent {
+                why: NotSentWhy::Ended,
+                serial: 2,
+            }),
+        );
+        assert_eq!(marker.without_records(), None);
+        let sent = Turn::record(
+            Speaker::Sent,
+            "ship it",
+            Some(TurnDetail::Sent(Box::new(sent_record(2)))),
+        );
+        assert_eq!(sent.without_records(), None);
+        let answer = Turn::record(Speaker::You, "yes", Some(TurnDetail::Answer { serial: 2 }));
+        let shown = answer.without_records().expect("a spoken turn stays");
+        assert_eq!(shown.detail, None, "the answer tag reached an old page");
+        assert_eq!(shown.text, "yes");
+        let json = serde_json::to_value(&shown).expect("serialize");
+        assert!(json.get("detail").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_record_row_offers_no_preview() {
+        assert_eq!(preview_for(&Turn::record(Speaker::Marker, "", None)), "");
+        assert_eq!(
+            preview_for(&Turn::record(
+                Speaker::Sent,
+                "ship it",
+                Some(TurnDetail::Sent(Box::new(sent_record(1))))
+            )),
+            ""
+        );
+        assert_eq!(
+            preview_for(&Turn::now(Speaker::You, "what happened?")),
+            "what happened?"
+        );
     }
 }
