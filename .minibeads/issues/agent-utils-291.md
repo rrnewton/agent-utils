@@ -1,13 +1,14 @@
 ---
 title: 'stop-lost-wakeup: make a chat bridge stop wake every waiter, and exit 0 when a stop cancels a Herdr call'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - agentctl
 - chat
 created_at: 2026-10-14T14:48:59.066608955+00:00
-updated_at: 2026-10-14T14:48:59.066608955+00:00
+updated_at: 2026-10-14T16:43:17.695091889+00:00
+closed_at: 2026-10-14T16:43:17.695091759+00:00
 ---
 
 # Description

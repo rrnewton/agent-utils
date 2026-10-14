@@ -9903,6 +9903,11 @@ esac
         // wake no one, and the waiter would sleep its whole duration (#291 stop-lost-wakeup).
         // The test thread stands in for such a waiter: it holds `lock` until well after a stop
         // has started on another thread, and only then waits.
+        //
+        // This fixes the chosen design, a stop that sets the flag and wakes the waiters while it
+        // holds `lock`, rather than the behaviour alone: a stop that set the flag first and only
+        // then took `lock` to wake the waiters would be as correct and would fail this test.
+        // `a_stop_ends_every_wait_however_it_interleaves_with_the_waiter` guards the behaviour.
         let stop = StopState::default();
         let stop = &stop;
         thread::scope(|scope| {
@@ -9931,7 +9936,7 @@ esac
         // `StopState::wait` against a stop started at the same moment on another thread, many
         // times over, so the stop lands at every point of the wait, including between its check
         // of the flag and the start of its sleep (#291 stop-lost-wakeup). Each wait must end at
-        // the stop, never at its own 60 s timeout.
+        // the stop, never at its own 10 s timeout, which a lost wake-up sleeps out in full.
         for round in 0..2_000 {
             let stop = StopState::default();
             let start = std::sync::Barrier::new(2);
@@ -9939,7 +9944,7 @@ esac
                 let waiter = scope.spawn(|| {
                     start.wait();
                     let began = Instant::now();
-                    stop.wait(Duration::from_secs(60));
+                    stop.wait(Duration::from_secs(10));
                     began.elapsed()
                 });
                 start.wait();
@@ -9947,7 +9952,7 @@ esac
                 waiter.join().expect("waiter")
             });
             assert!(
-                waited < Duration::from_secs(30),
+                waited < Duration::from_secs(5),
                 "round {round}: the stop did not end the wait, which slept {waited:?}"
             );
         }
@@ -10341,7 +10346,35 @@ esac
         wake_root: Option<&Path>,
         done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
     ) {
-        run_owner_loop_timed(
+        expect_stopped(owner_loop_with(
+            run_owner_loop,
+            fixture,
+            state,
+            herdr,
+            reconciliation_interval,
+            limit,
+            transport,
+            wake_root,
+            done,
+        ));
+    }
+
+    /// Run `run` for `state`'s agent as [`run_owner_loop_with`] runs the owner loop, and return
+    /// how it ended.
+    #[allow(clippy::too_many_arguments)]
+    fn owner_loop_with(
+        run: OwnerLoop,
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        limit: Duration,
+        transport: Option<CommandOutboundTransport>,
+        wake_root: Option<&Path>,
+        done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+    ) -> Result<(), ChatServiceError> {
+        owner_loop_timed(
+            run,
             fixture,
             state,
             herdr,
@@ -10358,13 +10391,11 @@ esac
             transport,
             wake_root,
             done,
-        );
+        )
     }
 
     /// `run_owner_loop_with`, with `timing` as the loop's delivery timing and `delivery` as the
-    /// options of the passes that type prompts. A stop ends the loop without an error, as it
-    /// ends `chat run`, including when it cancels a Herdr call the loop is making (#291
-    /// stop-lost-wakeup), so any error fails the test.
+    /// options of the passes that type prompts.
     #[allow(clippy::too_many_arguments)]
     fn run_owner_loop_timed(
         fixture: &crate::subagents::tests::Fixture,
@@ -10378,7 +10409,7 @@ esac
         wake_root: Option<&Path>,
         done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
     ) {
-        if let Err(error) = owner_loop_timed(
+        expect_stopped(owner_loop_timed(
             run_owner_loop,
             fixture,
             state,
@@ -10390,7 +10421,14 @@ esac
             transport,
             wake_root,
             done,
-        ) {
+        ));
+    }
+
+    /// Fail the test unless [`run_owner_loop`] ended without an error. A stop ends the loop that
+    /// way, as it ends `chat run`, including when it cancels a Herdr call the loop is making
+    /// (#291 stop-lost-wakeup), so any error is a failure.
+    fn expect_stopped(result: Result<(), ChatServiceError>) {
+        if let Err(error) = result {
             panic!("owner loop failed: {error}");
         }
     }
@@ -10488,8 +10526,8 @@ esac
         result
     }
 
-    /// Run `run` for `state`'s agent as [`run_owner_loop_until`] runs the owner loop, and return
-    /// how it ended.
+    /// Run `run` for `state`'s agent as [`run_owner_loop_until`] runs the owner loop, with no
+    /// reconciliation due within the hour, and return how it ended.
     fn owner_loop_until(
         run: OwnerLoop,
         fixture: &crate::subagents::tests::Fixture,
@@ -10498,22 +10536,28 @@ esac
         limit: Duration,
         mut done: impl FnMut() -> bool + Send,
     ) -> Result<(), ChatServiceError> {
-        owner_loop_timed(
+        owner_loop_with(
             run,
             fixture,
             state,
             herdr,
             Duration::from_secs(3_600),
-            DeliveryTiming {
-                retry_interval: Duration::from_secs(3_600),
-                ..DeliveryTiming::default()
-            },
-            DrainOptions::default(),
             limit,
             None,
             None,
             move |_, _| done(),
         )
+    }
+
+    /// A real Herdr client for a stand-in herdr under `root` that answers no call before the
+    /// control timeout, so that a read through it ends only when its caller cancels it, and
+    /// fails then exactly as a real Herdr call its caller cancels does.
+    fn silent_herdr_client(root: &Path) -> HerdrClient {
+        let executable = root.join("silent-herdr");
+        fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").expect("write silent herdr");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("silent herdr mode");
+        HerdrClient::with_executable("direct", &executable).expect("silent herdr client")
     }
 
     #[test]
@@ -10590,13 +10634,17 @@ esac
     fn a_stop_that_cancels_a_herdr_call_ends_the_owner_loop_without_an_error() {
         // The stop here comes while the loop's first read of the pane is waiting, and cancels it.
         // That ends the loop as the stop, not as a failure, so `chat run`, with no cleanup error
-        // to add, prints `{"stopped": true}` and exits 0 (#291 stop-lost-wakeup).
+        // to add, prints `{"stopped": true}` and exits 0 (#291 stop-lost-wakeup). The read goes
+        // through a real Herdr client, so the whole path from the client's classification of
+        // the cancelled call to the loop's end is the one `chat run` takes.
         let fixture = crate::subagents::tests::Fixture::new();
         fixture.start(None);
         let (_, state) = worker_bridge_state(&fixture, true);
         delivered_worker_request(&state);
         let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
-        *fixture.client.hold_reads.lock().expect("hold reads") = Some(true);
+        *fixture.client.hold_reads.lock().expect("hold reads") = Some(
+            crate::subagents::tests::HeldRead::Herdr(silent_herdr_client(&fixture.root)),
+        );
         let held_reads = &fixture.client.held_reads;
         let result = owner_loop_until(
             run_owner_loop,
@@ -10622,6 +10670,10 @@ esac
         )
         .expect_err("without owner_loop_end the cancelled read is an error");
         assert!(error.is_cancelled_herdr_call(), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "cannot invoke Herdr: control command was cancelled"
+        );
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
     }
@@ -10636,7 +10688,8 @@ esac
         let (_, state) = worker_bridge_state(&fixture, true);
         delivered_worker_request(&state);
         let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
-        *fixture.client.hold_reads.lock().expect("hold reads") = Some(false);
+        *fixture.client.hold_reads.lock().expect("hold reads") =
+            Some(crate::subagents::tests::HeldRead::Fail);
         let held_reads = &fixture.client.held_reads;
         let error = owner_loop_until(
             run_owner_loop,

@@ -10005,13 +10005,22 @@ pub(crate) mod tests {
         printing: Mutex<Vec<(String, String, Option<std::time::Instant>)>>,
         /// Characters a harness drops when it prints a prompt, as Markdown rendering does.
         pub(crate) printed_without: Mutex<Vec<char>>,
-        /// When set, a read through a runtime waits until the runtime is cancelled and then
-        /// fails: with `true`, as a call its caller cancelled, the way herdr's client reports
-        /// one, and with `false`, for another reason. Unset, as by default, such a read is an
-        /// ordinary `read`.
-        pub(crate) hold_reads: Mutex<Option<bool>>,
-        /// Reads that have started to wait under `hold_reads`.
+        /// When set, a read through a runtime is held until the runtime is cancelled and then
+        /// fails as the [`HeldRead`] says. Unset, as by default, such a read is an ordinary
+        /// `read`.
+        pub(crate) hold_reads: Mutex<Option<HeldRead>>,
+        /// Reads that have started under `hold_reads`.
         pub(crate) held_reads: AtomicU64,
+    }
+    /// How a read that [`Fake::hold_reads`] holds ends.
+    #[derive(Clone)]
+    pub(crate) enum HeldRead {
+        /// As a read through this real Herdr client, whose herdr must not answer before the
+        /// runtime is cancelled: the read fails exactly as a real Herdr call that its caller
+        /// cancels does.
+        Herdr(crate::client::HerdrClient),
+        /// For another reason than the cancellation, once the runtime is cancelled.
+        Fail,
     }
     impl Fake {
         fn terminal(&self, pane: &str) -> String {
@@ -10397,19 +10406,22 @@ pub(crate) mod tests {
             lines: Option<usize>,
             runtime: &dyn agent::AgentRuntime,
         ) -> AdapterResult<String> {
-            let hold = *self.hold_reads.lock().unwrap();
-            let Some(cancelled) = hold else {
+            let hold = self.hold_reads.lock().unwrap().clone();
+            let Some(hold) = hold else {
                 return self.read(pane, source, lines);
             };
             self.held_reads.fetch_add(1, Ordering::SeqCst);
-            while !runtime.cancelled() {
-                std::thread::sleep(Duration::from_millis(5));
+            match hold {
+                HeldRead::Herdr(client) => {
+                    client.read_with_cancellation(pane, source, lines, &|| runtime.cancelled())
+                }
+                HeldRead::Fail => {
+                    while !runtime.cancelled() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(AdapterError::unavailable("capture failed"))
+                }
             }
-            Err(if cancelled {
-                AdapterError::cancelled("cannot invoke Herdr: control command was cancelled")
-            } else {
-                AdapterError::unavailable("capture failed")
-            })
         }
     }
     impl ManagedApi for Fake {
