@@ -617,6 +617,9 @@ def test_herdr_free_commands_and_fixture_herdr_invocations_still_run(
       "--claude-bin", "/usr/local/bin/claude"), "claude"),
     (("--herdr-bin", "<HERDR>", "inbox", "watch", "--to", "coord", "--once",
       "--claude-bin=claude"), "claude"),
+    # The Rust `chat run` runs it too, for its reply reminders (rs/agentctl/src/chat_service).
+    (("chat", "run", "--bridge-state", "<ROOT>/chat", "--herdr-bin", "<HERDR>",
+      "--claude-bin", "/usr/local/bin/claude"), "claude"),
 ))
 def test_an_option_that_names_an_outside_executable_is_never_started(
     tmp_path: Path, arguments: tuple[str, ...], program: str

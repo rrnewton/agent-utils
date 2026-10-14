@@ -460,6 +460,17 @@ impl ClaudeSession {
 /// Run a query command in its own process group with a deadline and return its stdout. On the
 /// deadline the whole group is killed, so a grandchild holding stdout open cannot outlive it.
 fn query(program: &Path, arguments: &[&str], timeout: Duration) -> Result<Vec<u8>> {
+    query_cancellable(program, arguments, timeout, &|| false)
+}
+
+/// [`query`], which also kills the group and fails as soon as `cancelled` says so, as when the
+/// service that asks is stopping.
+fn query_cancellable(
+    program: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
     let mut child = super::spawn_retrying(
         Command::new(program)
             .args(arguments)
@@ -490,6 +501,15 @@ fn query(program: &Path, arguments: &[&str], timeout: Duration) -> Result<Vec<u8
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
+            Ok(None) if cancelled() => {
+                kill_group();
+                let _ = child.wait();
+                return Err(InboxError::unavailable(format!(
+                    "{} {} was cancelled",
+                    program.display(),
+                    arguments.join(" ")
+                )));
+            }
             Ok(None) if Instant::now() >= deadline => {
                 kill_group();
                 let _ = child.wait();
@@ -574,7 +594,10 @@ struct Sources<'a> {
 /// Claude sessions keyed by pane; `None` when Claude could not be asked. When two sessions claim
 /// one pane, the lowest process id (normally the parent) wins, so the choice is stable.
 fn claude_sessions(sources: &Sources<'_>) -> Option<BTreeMap<String, ClaudeSession>> {
-    claude_sessions_by_pane(sources.claude, sources.proc_root, sources.timeout).ok()
+    claude_sessions_by_pane(sources.claude, sources.proc_root, sources.timeout, &|| {
+        false
+    })
+    .ok()
 }
 
 /// The Claude Code sessions that `claude agents --json`, run as `claude`, lists, keyed by the
@@ -582,14 +605,15 @@ fn claude_sessions(sources: &Sources<'_>) -> Option<BTreeMap<String, ClaudeSessi
 /// process. A session whose process id is missing or whose environment names no pane is left
 /// out. When two sessions claim one pane, the lowest process id (normally the parent) wins, so
 /// the choice is stable. Fails, saying why, when Claude could not be asked or its answer is not a
-/// JSON list of sessions. `agentctl inbox watch` and the chat bridge's reply reminders both ask
-/// through this one reader.
+/// JSON list of sessions, or as soon as `cancelled` says so, killing the query. `agentctl inbox
+/// watch` and the chat bridge's reply reminders both ask through this one reader.
 pub(crate) fn claude_sessions_by_pane(
     claude: &Path,
     proc_root: &Path,
     timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<BTreeMap<String, ClaudeSession>> {
-    let bytes = query(claude, &["agents", "--json"], timeout)?;
+    let bytes = query_cancellable(claude, &["agents", "--json"], timeout, cancelled)?;
     let sessions = serde_json::from_slice::<Vec<ClaudeSession>>(&bytes).map_err(|error| {
         InboxError::unavailable(format!(
             "cannot parse `{} agents --json`: {error}",
@@ -1877,8 +1901,9 @@ mod tests {
             &directory,
             "echo '[{\"pid\":\"250\",\"sessionId\":\"s-child\",\"status\":\"idle\"},{\"pid\":101,\"sessionId\":\"s-1\",\"status\":\"busy\"},{\"pid\":7,\"status\":\"idle\"},{\"id\":\"bg\",\"state\":\"blocked\"}]'",
         );
-        let sessions = claude_sessions_by_pane(&claude, &proc_root, Duration::from_secs(10))
-            .expect("Claude answers");
+        let sessions =
+            claude_sessions_by_pane(&claude, &proc_root, Duration::from_secs(10), &|| false)
+                .expect("Claude answers");
         let statuses = sessions
             .iter()
             .map(|(pane, session)| (pane.as_str(), session.status.as_deref()))
@@ -1890,17 +1915,19 @@ mod tests {
         );
         let failing = directory.join("failing-claude");
         executable(&failing, "exit 1");
-        let failed = claude_sessions_by_pane(&failing, &proc_root, Duration::from_secs(10))
-            .err()
-            .expect("a failed query is an error")
-            .to_string();
+        let failed =
+            claude_sessions_by_pane(&failing, &proc_root, Duration::from_secs(10), &|| false)
+                .err()
+                .expect("a failed query is an error")
+                .to_string();
         assert!(failed.contains("agents --json exited"), "{failed}");
         let garbling = directory.join("garbling-claude");
         executable(&garbling, "echo not-json");
-        let garbled = claude_sessions_by_pane(&garbling, &proc_root, Duration::from_secs(10))
-            .err()
-            .expect("an unreadable answer is an error")
-            .to_string();
+        let garbled =
+            claude_sessions_by_pane(&garbling, &proc_root, Duration::from_secs(10), &|| false)
+                .err()
+                .expect("an unreadable answer is an error")
+                .to_string();
         assert!(garbled.contains("cannot parse"), "{garbled}");
     }
 
@@ -1964,6 +1991,29 @@ mod tests {
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(10),
             "{elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_cancelled_query_is_killed_at_once_rather_than_at_its_deadline() {
+        let _serial = exclusive();
+        let directory = scratch();
+        let slow = directory.join("slow-claude");
+        let marker = directory.join("descendant-finished");
+        executable(
+            &slow,
+            &format!("(sleep 3; touch {}) &\nwait", marker.display()),
+        );
+        let started = Instant::now();
+        let error = claude_sessions_by_pane(&slow, &directory, Duration::from_secs(30), &|| {
+            started.elapsed() >= Duration::from_millis(200)
+        })
+        .err()
+        .expect("a cancelled query is an error");
+        let elapsed = started.elapsed();
+        assert!(error.to_string().contains("was cancelled"), "{error}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        std::thread::sleep(Duration::from_millis(3_500).saturating_sub(started.elapsed()));
+        assert!(!marker.exists(), "the query's process group was killed");
     }
 
     #[test]

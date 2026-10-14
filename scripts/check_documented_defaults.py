@@ -1176,7 +1176,7 @@ PINS: tuple[Pin, ...] = (
             ),
             Site(
                 "rs/agentctl/src/cli.rs",
-                r'default_value = "(?P<value>\d+)s", value_parser = reply_reminder_idle',
+                r'default_value = "(?P<value>\d+)s", hide_default_value = true, value_parser = reply_reminder_idle',
                 "the `chat run --reply-reminder-idle` default",
             ),
         ),
@@ -1260,6 +1260,101 @@ PINS: tuple[Pin, ...] = (
                 "rs/agentctl/src/embedded_chat_userguide.md",
                 r"It\s+names\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+reply\s+IDs",
                 "the listing bound the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-max-idle-hours",
+        "the longest idle time `chat run --reply-reminder-idle` accepts, in hours",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service/reply_reminders.rs",
+                r"(?m)^pub const MAX_REPLY_REMINDER_IDLE: Duration = Duration::from_secs\((?P<value>[\d_]+) \* 60 \* 60\);$",
+                "the Rust bound, in hours",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"at\s+least\s+`10s`\s+and\s+at\s+most\s+`(?P<value>\d+)h`",
+                "the bound the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"the\s+(?P<value>\d+)\s+hour\s+bound",
+                "the bound the chat guide explains",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"at least 10s and at most (?P<value>\d+)h, and 0 turns reminders off",
+                "the bound `chat run --help` states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-retry-max-minutes",
+        "the longest a reply reminder taken back out of the queue holds off the next while the"
+        " coordinator is not seen working, in minutes",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service/reply_reminders.rs",
+                r"(?m)^pub const MAX_REPLY_REMINDER_RETRY: Duration = Duration::from_secs\((?P<value>[\d_]+) \* 60\);$",
+                "the Rust bound, in minutes",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"doubling,\s+but\s+never\s+more\s+than\s+(?P<value>\d+)\s+minutes",
+                "the bound the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"doubling with each in a row, up to (?P<value>\d+) minutes",
+                "the bound `chat run --help` states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-claude-slow-seconds",
+        "how long a run of `claude agents --json` for a reply reminder may take before it counts"
+        " as slow, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service/reply_reminders.rs",
+                r"(?m)^const CLAUDE_SLOW_ANSWER: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust threshold",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"a\s+run\s+that\s+takes\s+longer\s+than\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+counts",
+                "the threshold the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"or takes longer than (?P<value>\d+) seconds, Claude Code is not asked again",
+                "the threshold `chat run --help` states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-withdraw-grace-seconds",
+        "how long taking a reply reminder back out of the queue waits for its delivery lock, even"
+        " during a stop, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/subagents.rs",
+                r"(?m)^pub\(crate\) const SEND_ONCE_WITHDRAW_GRACE: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust wait",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"that\s+step\s+waits\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+for\s+the\s+queue's",
+                "the wait the chat guide states",
             ),
         ),
     ),

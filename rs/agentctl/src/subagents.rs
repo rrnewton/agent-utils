@@ -49,6 +49,11 @@ const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+/// The longest [`ManagedAgents::send_once_with_runtime`] waits for a queue's delivery lock to take
+/// back a prompt its send left in the inbox, even once its caller has cancelled it. Every managed
+/// drain also holds the agent's lifecycle lock, which the send holds, so normally nothing else
+/// holds the delivery lock then.
+pub(crate) const SEND_ONCE_WITHDRAW_GRACE: Duration = Duration::from_secs(2);
 
 /// The herdr read source of the chat service's reads of its agent's pane: the reads that recover
 /// replies when the service starts, at each reconciliation, when the pane settles idle or done,
@@ -470,6 +475,26 @@ where
 
 /// Result of a managed-agent operation, including durable delivery outcomes.
 pub type Result<T> = std::result::Result<T, AgentError>;
+
+/// What [`ManagedAgents::send_once_with_runtime`] does once its send failed with `error`: take the
+/// prompt `message_id` back out of the inbox of `queue`, waiting at most
+/// [`SEND_ONCE_WITHDRAW_GRACE`] for the delivery lock, whatever cancelled the send. A drain moves a
+/// prompt out of the inbox before it types it, so one still there was never typed, whatever
+/// failed: `Ok(Some(why))`, with `error` as the reason. Otherwise `error`, joined by why the
+/// prompt could not be taken back when that failed.
+fn take_back_unsent(queue: &Path, message_id: &str, error: AgentError) -> Result<Option<String>> {
+    match agent::withdraw(
+        queue,
+        message_id,
+        &agent::GraceRuntime::new(SEND_ONCE_WITHDRAW_GRACE),
+    ) {
+        Ok(true) => Ok(Some(error.to_string())),
+        Ok(false) => Err(error),
+        Err(withdrawal) => Err(fail(format!(
+            "{error}; it could not be taken back out of the queue: {withdrawal}"
+        ))),
+    }
+}
 
 fn fail(message: impl Into<String>) -> AgentError {
     AgentError::Delivery(message.into())
@@ -7787,14 +7812,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
-    /// Send a prompt that must never be left waiting: [`Self::send_identified_with_runtime`], but
-    /// a prompt the agent never accepts is taken back out of its composer, as
-    /// [`agent::AgentRuntime::withdraws_unaccepted`] describes, and a prompt the drain leaves in
-    /// the queue's inbox, as when the agent is not ready in time, is taken back out of the inbox
-    /// before the agent's lifecycle lock is released, so no later sender's drain types it.
-    /// Returns `true` when the prompt was taken back out of the inbox untyped, and `false` when
-    /// the queue typed it. Any other outcome is the send's error, as for
-    /// [`Self::send_identified_with_runtime`].
+    /// Send a prompt that must never be left waiting, such as a chat bridge's reply reminder:
+    /// [`Self::send_identified_with_runtime`], with three differences, all under the agent's
+    /// lifecycle lock, which every managed sender's drain holds too.
+    ///
+    /// * It is not queued at all while the queue's inbox holds another prompt, since the drain
+    ///   would type that one first and then this one, checking only Herdr's status in between.
+    /// * A prompt the agent never accepts is taken back out of its composer, as
+    ///   [`agent::AgentRuntime::withdraws_unaccepted`] describes.
+    /// * A prompt the send leaves in the queue's inbox, as when the agent is not ready in time or
+    ///   the drain fails before typing it, is taken back out of the inbox before the lock is
+    ///   released, so no later sender's drain types it. That step waits at most
+    ///   [`SEND_ONCE_WITHDRAW_GRACE`] for the queue's delivery lock, even after `runtime` is
+    ///   cancelled, so a stop does not leave the prompt behind.
+    ///
+    /// Returns `Ok(None)` when the queue typed the prompt, and `Ok(Some(why))` when it is not in
+    /// the queue and was never typed: it was not queued, or it was taken back out of the inbox.
+    /// Any other outcome is the send's error, as for [`Self::send_identified_with_runtime`]; the
+    /// prompt may then be in flight or failed, or, if it could not be taken back, in the inbox.
     pub(crate) fn send_once_with_runtime(
         &self,
         agent_name: &str,
@@ -7802,11 +7837,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: DrainOptions,
         message_id: &str,
         runtime: &dyn agent::AgentRuntime,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
+        let queued = agent::queued_prompts(&queue)?;
+        if let Some(first) = queued.first() {
+            return Ok(Some(format!(
+                "the agent's queue already holds {} prompt{} not typed yet, such as {first}, which \
+its drain would type first, so it was not queued",
+                queued.len(),
+                if queued.len() == 1 { "" } else { "s" }
+            )));
+        }
         let client = WorkspaceClient {
             client: self.client,
             record: &record,
@@ -7821,7 +7865,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             inner: runtime,
             message_id,
         };
-        match agent::send_identified_managed_with_runtime(
+        let error = match agent::send_identified_managed_with_runtime(
             &client,
             &self.target(&record)?,
             &queue,
@@ -7830,16 +7874,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &withdrawing,
             Some(message_id),
         ) {
-            Ok(_) => Ok(false),
-            Err(error @ AgentError::Pending(_)) => {
-                if agent::withdraw(&queue, message_id, runtime)? {
-                    Ok(true)
-                } else {
-                    Err(error)
-                }
-            }
-            Err(error) => Err(error),
-        }
+            Ok(_) => return Ok(None),
+            Err(error) => error,
+        };
+        take_back_unsent(&queue, message_id, error)
     }
 
     /// Take the prompt `message_id` back out of the agent's queue inbox, untyped, as
@@ -10086,6 +10124,7 @@ pub(crate) mod tests {
                     printed_without: Mutex::new(Vec::new()),
                     hold_reads: Mutex::new(None),
                     held_reads: AtomicU64::new(0),
+                    on_run: Mutex::new(None),
                 },
                 root,
             }
@@ -10174,6 +10213,146 @@ pub(crate) mod tests {
             .expect_err("cancel contended lifecycle lock");
         assert!(error.to_string().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_prompt_sent_once_is_typed_or_left_in_no_queue() {
+        // A chat bridge's reply reminder is sent once: typed into a ready agent, and otherwise
+        // never left in the queue for a later drain to type.
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let queue = fixture.root.join("registry/worker/queue");
+        let runtime = agent::SystemRuntime::default();
+        let options = DrainOptions {
+            ready_timeout: Duration::ZERO,
+            max_attempts: 1,
+            ..DrainOptions::default()
+        };
+        fixture.client.runs.lock().unwrap().clear();
+        let send = |text, id| manager.send_once_with_runtime("worker", text, options, id, &runtime);
+
+        // A ready agent is typed the prompt.
+        assert_eq!(send("first reminder", "chat-reminder-1").unwrap(), None);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), ["first reminder"]);
+        assert_eq!(
+            agent::message_state(&queue, "chat-reminder-1").unwrap(),
+            Some(agent::QueueMessageState::Processed)
+        );
+
+        // An agent that is not ready in time is typed nothing, and the prompt is taken back out
+        // of the inbox under the lifecycle lock, so its identifier is free again.
+        *fixture.client.status.lock().unwrap() = Some("working".to_owned());
+        fixture.client.runs.lock().unwrap().clear();
+        let why = send("second reminder", "chat-reminder-2")
+            .unwrap()
+            .expect("taken back out of the queue");
+        assert!(why.contains("remains pending"), "{why}");
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            agent::message_state(&queue, "chat-reminder-2").unwrap(),
+            None
+        );
+        *fixture.client.status.lock().unwrap() = Some("idle".to_owned());
+        assert_eq!(send("second reminder", "chat-reminder-2").unwrap(), None);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), ["second reminder"]);
+
+        // While the inbox holds another sender's prompt, which the drain would type first, the
+        // prompt is not queued at all, and the other prompt is left as it was.
+        agent::enqueue(
+            &queue,
+            "a leftover prompt from another sender",
+            Some("leftover"),
+        )
+        .unwrap();
+        fixture.client.runs.lock().unwrap().clear();
+        let why = send("third reminder", "chat-reminder-3")
+            .unwrap()
+            .expect("not queued");
+        assert!(
+            why.contains("already holds 1 prompt not typed yet, such as leftover"),
+            "{why}"
+        );
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            agent::message_state(&queue, "chat-reminder-3").unwrap(),
+            None
+        );
+        assert_eq!(
+            agent::message_state(&queue, "leftover").unwrap(),
+            Some(agent::QueueMessageState::Pending)
+        );
+
+        // An agent paused for human input refuses the prompt before anything is queued.
+        agent::withdraw(&queue, "leftover", &runtime).unwrap();
+        manager.pause("worker", true).unwrap();
+        assert!(send("fourth reminder", "chat-reminder-4").is_err());
+        assert_eq!(
+            agent::message_state(&queue, "chat-reminder-4").unwrap(),
+            None
+        );
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_a_failed_send_left_in_the_inbox_is_taken_back_even_after_a_cancellation() {
+        // Whatever failure leaves a prompt sent once in the inbox, such as a wait for the delivery
+        // lock that a stop cancelled, it is taken back out, waiting a moment for the lock with
+        // a wait of its own that no stop cancels.
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-take-back-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cancelled =
+            || fail("cancelled while waiting to lock queue delivery: the queue's .delivery.lock");
+        agent::enqueue(&directory, "a reminder", Some("chat-reminder-1")).unwrap();
+        let lock_path = directory.join(".delivery.lock");
+        let holder = agent::open_private_lock(&lock_path, "held delivery lock").unwrap();
+        holder.lock_exclusive().unwrap();
+        let started = Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            FileExt::unlock(&holder).unwrap();
+        });
+        let why = take_back_unsent(&directory, "chat-reminder-1", cancelled())
+            .unwrap()
+            .expect("taken back out of the inbox");
+        release.join().unwrap();
+        assert!(why.starts_with("cancelled while waiting"), "{why}");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(
+            agent::message_state(&directory, "chat-reminder-1").unwrap(),
+            None
+        );
+
+        // A prompt the queue no longer holds in its inbox is left as it is, with the error.
+        let error = take_back_unsent(&directory, "chat-reminder-1", cancelled()).unwrap_err();
+        assert!(
+            error.to_string().starts_with("cancelled while waiting"),
+            "{error}"
+        );
+
+        // The wait for the lock is bounded: a prompt whose lock stays held stays in the inbox,
+        // and the error says it could not be taken back.
+        agent::enqueue(&directory, "a reminder", Some("chat-reminder-2")).unwrap();
+        let holder = agent::open_private_lock(&lock_path, "held delivery lock").unwrap();
+        holder.lock_exclusive().unwrap();
+        let started = Instant::now();
+        let error = take_back_unsent(&directory, "chat-reminder-2", cancelled()).unwrap_err();
+        assert!(started.elapsed() >= SEND_ONCE_WITHDRAW_GRACE);
+        assert!(
+            error
+                .to_string()
+                .contains("it could not be taken back out of the queue"),
+            "{error}"
+        );
+        assert_eq!(
+            agent::message_state(&directory, "chat-reminder-2").unwrap(),
+            Some(agent::QueueMessageState::Pending)
+        );
+        drop(holder);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -10406,6 +10585,9 @@ pub(crate) mod tests {
         pub(crate) hold_reads: Mutex<Option<HeldRead>>,
         /// Reads that have started under `hold_reads`.
         pub(crate) held_reads: AtomicU64,
+        /// Called with each text written with `run`, just before it is recorded in `runs`.
+        #[allow(clippy::type_complexity)]
+        pub(crate) on_run: Mutex<Option<Box<dyn Fn(&str) + Send>>>,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -10679,6 +10861,9 @@ pub(crate) mod tests {
             .to_owned())
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
+            if let Some(hook) = self.on_run.lock().unwrap().as_ref() {
+                hook(text);
+            }
             self.runs.lock().unwrap().push(text.to_owned());
             if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
                 *self.screen.lock().unwrap() = Some(screen);

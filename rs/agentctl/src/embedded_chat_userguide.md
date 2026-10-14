@@ -1535,10 +1535,14 @@ silence. `chat run` therefore reminds a Claude Code agent, once, of each
 request it has not answered, once the agent has been idle for
 `--reply-reminder-idle DURATION`: 60 seconds by default. DURATION is a whole
 number of seconds (`s`, or no unit), minutes (`m`) or hours (`h`), at least
-`10s` and at most `24h`; `0` turns reminders off. Reminders need
-`outbound_enabled`, since an inbound-only agent is told not to write reply
-blocks; without it `run` logs that reminders are off. At startup `run` logs
-the idle time and the Claude Code executable it asks.
+`10s` and at most `12h`; `0` turns reminders off. A request can be reminded
+only within 24 hours of its prompt, as described below, and only once the agent
+has been idle for DURATION after any work it did, so DURATION and the time the
+agent works after a prompt must together stay under 24 hours; the 12 hour bound
+leaves the other 12 for the work. Reminders need `outbound_enabled`, since an
+inbound-only agent is told not to write reply blocks; without it `run` logs that
+reminders are off. At startup `run` logs the idle time and the Claude Code
+executable it asks.
 
 A request may be reminded when it is not closed, its prompt is recorded as
 typed (its phase is `delivered`), it holds no reply, not even one the post-rate
@@ -1560,18 +1564,25 @@ Code pane that is running a turn as idle. The service asks Claude Code the way
 executable `--claude-bin PATH` names (default `claude`, looked up on `PATH`),
 and takes the session whose process has the pane's ID in `HERDR_PANE_ID` in its
 environment, the lowest process ID if several do. Each run is killed after 10
-seconds. Any state other than `idle`, such as `busy`, counts as working. A pane
-that herdr does not report as running Claude Code, such as a Codex pane, is
-never reminded, and the service logs once that it waits for that reason, as it
-does when Claude Code lists no session in the pane. An idle period begins at
+seconds, or at once when the service is stopped. Any state other than `idle`,
+such as `busy`, counts as working. A pane that herdr does not report as running
+Claude Code, such as a Codex pane, is never reminded, and the service logs once
+that it waits for that reason, as it does when Claude Code lists no session in
+the pane. An idle period begins at
 the first check that finds the agent idle and ends at the first that does not.
 A request is due once the agent has been idle for DURATION both since its idle
 period began and since the request's prompt was typed. Idle time is counted
 from the first check that saw it, so a reminder can come up to two scan
 intervals, about 20 seconds, later than DURATION after the agent went idle.
 Claude Code is asked once in a check, and once more in a check that sends a
-reminder, and only while some request may be reminded, herdr reports the pane
-idle or done, and the service does not count the agent as working.
+reminder, and only while some request may be reminded, no reminder is held off
+as described below, herdr reports the pane idle or done, and the service does
+not count the agent as working. A run that fails, or that lists no session in
+the pane, ends the idle period, and a run that takes longer than 3 seconds
+counts but is slow; after either, the checks do not ask Claude Code their first
+question again until DURATION has passed, and until then they remind no one and
+leave the idle period as it is. Only the question right before a reminder is
+always asked.
 
 The service then reads the pane and captures it as a recovery scan does, so a
 reply on the screen that no capture has stored yet counts, and that request is
@@ -1603,27 +1614,43 @@ request twice, and a reminder that may have been typed is never typed again.
 The reminder goes through the agent's queue, under the message ID
 `chat-reminder-` followed by 64 hex digits, after the same read before typing
 as a routing-error prompt, and with the recipient checks and read-back of any
-prompt. It waits for the
-agent no longer than `--ready-timeout` or 10 seconds, whichever is shorter, and
-is never typed into a working pane, even with `--deliver-while-working`. A
-reminder Claude Code never accepts is taken back out of the composer, as
-`--deliver-while-working` does for a prompt. A reminder the queue has not
-typed by then is taken back out of the queue before the agent's lifecycle lock
-is released, so no later drain by the service, `agentctl send` or
-`agentctl drain` types it after its request may have been answered, and its
-requests are released, so they can be reminded again. The agent is then due no reminder until the service has seen it working,
-by herdr's status or its screen, and idle again; Claude Code is not asked
-meanwhile. A reminder the queue refuses, as for a paused agent, is released
-the same way. A reminder whose typing began and failed may have been typed, so
-its requests stay reminded. If the queue cannot give a reminder back, it stays
-recorded and nothing else is composed; each later check, and the next start of
-`run`, takes it out first. Until then any drain of the queue can type it, one
-for a request's prompt included, even into a working pane with
-`--deliver-while-working`, and so can `chat tick` or another agentctl sender;
-a check then finds it typed and settles it. When `run` starts, before any pass can
-type a prompt, it settles a reminder recorded as waiting: one still in the
+prompt. Under the agent's lifecycle lock, which every drain by the service,
+`agentctl send` and `agentctl drain` also holds, it is not queued at all while
+the queue's inbox holds another prompt, since the drain would type that prompt
+first and the reminder right after it. It waits for the agent no longer than
+`--ready-timeout` or 10 seconds, whichever is shorter, and is never typed into
+a working pane, even with `--deliver-while-working`. A reminder Claude Code
+never accepts is taken back out of the composer, as `--deliver-while-working`
+does for a prompt. A reminder the queue has not typed by then, or that the
+queue left in its inbox after any other failure, is taken back out of the queue
+before the lifecycle lock is released, so no later drain types it after its
+request may have been answered; that step waits up to 2 seconds for the queue's
+delivery lock even when the service is being stopped. Its requests are
+released, so they can be reminded again. A reminder the queue refuses, as for a
+paused agent, or that is not queued, is released the same way.
+
+A reminder taken back out of the queue, or never queued, holds off the next.
+The agent is due no reminder until the service has seen it working, by herdr's
+status or a screen of the pane, and it has then been idle for a whole DURATION
+again; a prompt the service typed is not a sign of work. If the agent is not
+seen working, the hold ends after twice DURATION, then four times DURATION for
+the next reminder held off in a row, and so on, doubling, but never more than
+60 minutes, so an agent that keeps refusing gets a few dozen attempts a day at
+most. Claude Code is not asked during a hold. A reminder that reaches the
+agent, or the agent seen working, starts the doubling over.
+
+A reminder whose typing began and failed may have been typed, so its requests
+stay reminded. If the queue cannot give a reminder back, it stays recorded and
+nothing else is composed; each later check, and the next start of `run`, takes
+it out first. Until then any drain of the queue can type it, one for a
+request's prompt included, even into a working pane with
+`--deliver-while-working`, and so can `chat tick` or another agentctl sender; a
+check then finds it typed and settles it. When `run` starts, before any pass
+can type a prompt, it settles a reminder recorded as waiting: one still in the
 queue is taken out, and one the queue no longer holds, or holds as typed or
-possibly typed, is never typed again.
+possibly typed, is never typed again. If the queue cannot give it back then,
+`run` tries again before its startup recovery pass and at the start of each
+round of its loop until it can.
 
 `reply-reminders.json` holds `schema` (`agentctl-chat-reply-reminders/v1`),
 `started_at_millis`, `reminded` (each request's `key`, `reply_id` and
@@ -1645,19 +1672,23 @@ reminder, as `agentctl: the reply reminder for request KEY (reply ID 001)`
 followed by `reached the coordinator`, `had already reached the coordinator`,
 `may have reached the coordinator and is not sent again: WHY`,
 `was taken back out of the coordinator queue before it was typed, or never
-reached it, and can be sent again once the coordinator next goes idle: WHY`,
-or `waits in the coordinator queue, which could not give it back; a later
-check takes it out: WHY`, which is logged once for each reason. A check that
-cannot read or write the record, read the request records, look the pane up,
-ask Claude Code, or read the pane logs why once, goes on without reminding,
-and logs again once that step works. None of these stops `run`; a fault of the
+reached it, and its request can be reminded again: WHY`, or `waits in the
+coordinator queue, which could not give it back; a later check takes it out:
+WHY`, which is logged once for each reason. A reminder taken back during a
+check is followed by `agentctl: reply reminders: no other reminder is sent until
+the coordinator has been seen working and is idle again, or for Ns if it is not
+seen working`. A check that cannot read or write the record, read the request
+records, look the pane up, ask Claude Code, or read the pane logs why once, goes
+on without reminding, and logs again once that step works. None of these stops `run`; a fault of the
 bridge state during the capture before a reminder stops it as in any other
 capture.
 
-These rules see only what each check sees. A turn that starts and ends between
+These rules see only what the service sees. A turn that starts and ends between
 two checks while herdr's status and the screen show nothing of it is not seen,
-so the idle period it should have ended goes on. Times are taken from the wall
-clock, so a clock that steps can make a reminder early or late.
+so the idle period it should have ended goes on, and a hold it should have ended
+lasts until its retry delay. Idle times and request ages are taken from the wall
+clock, so a clock that steps can make a reminder early or late. `chat status`
+does not report reminders yet; the log and `reply-reminders.json` do.
 
 ## Slack provider
 

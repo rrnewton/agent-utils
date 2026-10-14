@@ -856,9 +856,9 @@ _GLOBAL_VALUE_OPTIONS = (
     "--agentcloud-url", "--from-session",
 )
 # Options whose value an edition executes, with the program each one names. The Rust edition
-# alone has `--agentcloudctl-bin`, `--agentterm-bin` and the `inbox watch` option `--claude-bin`
-# (which runs `claude agents --json`): the Python edition rejects them as unknown, but the Rust
-# edition may already have run the program by then.
+# alone has `--agentcloudctl-bin`, `--agentterm-bin` and `--claude-bin`, which both `inbox watch`
+# and `chat run` take and run as `claude agents --json`: the Python edition rejects them as
+# unknown, but the Rust edition may already have run the program by then.
 EXECUTABLE_OPTIONS = {
     "--herdr-bin": "herdr", "--agentcloudctl-bin": "agentcloudctl", "--agentterm-bin": "agentterm",
     "--claude-bin": "claude",

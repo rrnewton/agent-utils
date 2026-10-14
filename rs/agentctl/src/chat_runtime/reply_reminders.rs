@@ -217,6 +217,13 @@ pub(crate) enum ReminderOutcome {
 }
 
 impl ReminderOutcome {
+    /// Whether the reminder may have reached the coordinator's pane, and so started a turn. Only
+    /// one taken back out of the queue untyped, or never queued, did not. One still waiting in
+    /// the queue counts, since any drain may type it before a check takes it out.
+    pub(crate) fn may_have_typed(&self) -> bool {
+        !matches!(self, Self::Withdrawn(_))
+    }
+
     /// What the log says became of the reminder for each request it named.
     pub(crate) fn describe(&self) -> String {
         match self {
@@ -227,7 +234,7 @@ impl ReminderOutcome {
             }
             Self::Withdrawn(why) => format!(
                 "was taken back out of the coordinator queue before it was typed, or never \
-reached it, and can be sent again once the coordinator next goes idle: {why}"
+reached it, and its request can be reminded again: {why}"
             ),
             Self::Waiting(why) => format!(
                 "waits in the coordinator queue, which could not give it back; a later check \
@@ -469,11 +476,10 @@ pub(crate) fn deliver_reminder(
         &reminder.prompt,
         &reminder.message_id,
         reminder_options(options),
+        &|_| {},
     ) {
-        Ok(false) => ReminderOutcome::Typed,
-        Ok(true) => ReminderOutcome::Withdrawn(
-            "the coordinator was not ready for it in time, or did not accept it".to_owned(),
-        ),
+        Ok(None) => ReminderOutcome::Typed,
+        Ok(Some(why)) => ReminderOutcome::Withdrawn(why),
         Err(why) => match delivery.message_state(agent_name, &reminder.message_id) {
             Ok(Some(QueueMessageState::Processed)) => ReminderOutcome::Typed,
             Ok(Some(QueueMessageState::Inflight | QueueMessageState::Failed)) => {
@@ -701,7 +707,8 @@ mod tests {
             prompt: &str,
             message_id: &str,
             options: DrainOptions,
-        ) -> std::result::Result<bool, String> {
+            _printed: &dyn Fn(&str),
+        ) -> std::result::Result<Option<String>, String> {
             if let Some(root) = self.root.lock().expect("root").as_ref() {
                 *self.record_at_submit.lock().expect("record") =
                     fs::read_to_string(root.join(REPLY_REMINDER_FILE)).ok();
@@ -715,9 +722,9 @@ mod tests {
                         .lock()
                         .expect("typed")
                         .push((message_id.to_owned(), prompt.to_owned()));
-                    Ok(false)
+                    Ok(None)
                 }
-                Queueing::NotReady => Ok(true),
+                Queueing::NotReady => Ok(Some("the coordinator was not ready in time".to_owned())),
                 Queueing::Stuck => {
                     states.insert(message_id.to_owned(), QueueMessageState::Pending);
                     Err("the queue could not take the prompt back out".to_owned())

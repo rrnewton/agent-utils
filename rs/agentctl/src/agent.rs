@@ -632,6 +632,40 @@ impl AgentRuntime for SystemRuntime {
     }
 }
 
+/// A runtime that waits in real time, as [`SystemRuntime`] does, and counts as cancelled once
+/// `limit` has passed since it was made, whatever cancelled its caller: for a short step that
+/// must still run after the caller's own runtime was cancelled, such as taking a prompt back out
+/// of a queue during a stop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GraceRuntime {
+    origin: Instant,
+    limit: Duration,
+}
+
+impl GraceRuntime {
+    /// A runtime whose waits end `limit` from now.
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self {
+            origin: Instant::now(),
+            limit,
+        }
+    }
+}
+
+impl AgentRuntime for GraceRuntime {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.origin.elapsed() >= self.limit
+    }
+}
+
 /// Resolve by stable session when supplied, then revalidate every asserted field.
 pub fn resolve_target<A: AgentApi + ?Sized>(
     client: &A,
@@ -1403,6 +1437,18 @@ pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueM
         }
     }
     Ok(observed)
+}
+
+/// The identifiers of the prompts in the queue's inbox: those the next drain types, in queue
+/// order, before any prompt queued after them. Empty when the queue does not exist yet. A prompt
+/// in flight, processed or failed is not one: a drain never types it, and files one a crash left
+/// in flight as failed.
+pub(crate) fn queued_prompts(root: &Path) -> AgentResult<Vec<String>> {
+    if fs::symlink_metadata(root).is_err() {
+        return Ok(Vec::new());
+    }
+    validate_existing_queue(root)?;
+    identifiers_if_directory(&QueueDirectories::new(root).inbox)
 }
 
 /// Take the prompt `message_id` back out of the queue's inbox, untyped, and say whether it was

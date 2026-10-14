@@ -10,19 +10,24 @@
 //! word alone is not enough: its screen rules can report a working Claude Code pane as idle. An
 //! idle period starts at the first check that finds all three and ends at the first that does
 //! not. A request is due once the coordinator has been idle for the configured time since both
-//! the start of that period and its prompt was typed.
+//! the start of that period and its prompt was typed. After a run of `claude agents --json` that
+//! fails, lists no session in the pane, or is slow, Claude Code is not asked again for one idle
+//! time, except right before a reminder.
 //!
 //! Before reminding, the check reads the pane and captures it as a recovery scan does, so a reply
 //! on screen that no capture stored yet counts, and it reminds no one if that capture may have
 //! typed or left a prompt for the coordinator. Herdr and Claude Code are then asked once more.
 //! The reminder is recorded before it is queued and is typed only through the queue's normal
-//! checks, never into a working pane; one the queue does not type is taken back out of it, and
-//! no other is composed until the coordinator has been busy and idle again.
+//! checks, never into a working pane nor behind another prompt; one the queue does not type is
+//! taken back out of it. That holds off the next reminder until the coordinator has been seen
+//! working, by Herdr's status or a screen, and idle again, or, if it is not seen working, until a
+//! retry delay has passed: twice the idle time after the first such reminder in a row, doubling
+//! with each after it, and at most `MAX_REPLY_REMINDER_RETRY`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::DrainOptions;
 use crate::chat_runtime::{
@@ -43,11 +48,23 @@ use super::{
 pub const DEFAULT_REPLY_REMINDER_IDLE: Duration = Duration::from_secs(60);
 /// The shortest `--reply-reminder-idle` other than 0, which turns reminders off.
 pub const MIN_REPLY_REMINDER_IDLE: Duration = Duration::from_secs(10);
-/// The longest `--reply-reminder-idle`: a request delivered longer ago than this is never
-/// reminded anyway.
-pub const MAX_REPLY_REMINDER_IDLE: Duration = chat_runtime::MAX_REPLY_REMINDER_AGE;
+/// The longest `--reply-reminder-idle`. A request is reminded only while its prompt was typed at
+/// most `chat_runtime::MAX_REPLY_REMINDER_AGE` (24 hours) ago, and only once the coordinator has
+/// been idle for the idle time after any work it did on it, so the idle time and that work must
+/// together stay within that age. Half of it leaves the other half for the work.
+pub const MAX_REPLY_REMINDER_IDLE: Duration = Duration::from_secs(12 * 60 * 60);
+const _: () = assert!(
+    MAX_REPLY_REMINDER_IDLE.as_secs() * 2 <= chat_runtime::MAX_REPLY_REMINDER_AGE.as_secs()
+);
+/// The longest a reminder that was taken back out of the queue, or never queued, holds off the
+/// next while the coordinator is not seen working.
+pub const MAX_REPLY_REMINDER_RETRY: Duration = Duration::from_secs(60 * 60);
 /// How long one `claude agents --json` may run before it is killed and the check gives up.
 const CLAUDE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A run of `claude agents --json` that takes longer than this is slow: its answer counts, but
+/// Claude Code is not asked again for one idle time, except right before a reminder, so a slow
+/// host does not spend most of each scan waiting for it.
+const CLAUDE_SLOW_ANSWER: Duration = Duration::from_secs(3);
 
 /// How `chat run` reminds a Claude Code coordinator of the requests it has not answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,8 +138,12 @@ pub(crate) enum ClaudeState {
 /// Where a check learns whether Claude Code in the coordinator's pane is idle.
 pub(crate) trait ClaudeIdleSource {
     /// The state of the Claude Code session in the pane `info` describes, or why Claude Code
-    /// could not be asked.
-    fn state(&self, info: &AgentPaneInfo) -> Result<ClaudeState, String>;
+    /// could not be asked. Asking gives up as soon as `cancelled` says so.
+    fn state(
+        &self,
+        info: &AgentPaneInfo,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ClaudeState, String>;
 }
 
 /// `claude agents --json`, joined to Herdr panes as `agentctl inbox watch` joins it.
@@ -132,7 +153,11 @@ struct ClaudeAgents {
 }
 
 impl ClaudeIdleSource for ClaudeAgents {
-    fn state(&self, info: &AgentPaneInfo) -> Result<ClaudeState, String> {
+    fn state(
+        &self,
+        info: &AgentPaneInfo,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ClaudeState, String> {
         if info.agent.as_deref() != Some("claude") {
             return Ok(ClaudeState::NotClaude);
         }
@@ -140,6 +165,7 @@ impl ClaudeIdleSource for ClaudeAgents {
             &self.claude,
             &self.proc_root,
             CLAUDE_QUERY_TIMEOUT,
+            cancelled,
         )
         .map_err(|error| error.to_string())?;
         Ok(
@@ -156,11 +182,10 @@ impl ClaudeIdleSource for ClaudeAgents {
 }
 
 /// The idle period a check has followed: when the first check of an unbroken run that found the
-/// coordinator idle saw it so, and whether a reminder was taken back out of the queue during it.
+/// coordinator idle saw it so.
 #[derive(Debug, Default)]
 struct IdlePeriod {
     since_millis: Option<u64>,
-    withdrawn: bool,
 }
 
 impl IdlePeriod {
@@ -173,6 +198,35 @@ impl IdlePeriod {
     fn idle(&mut self, now_millis: u64) -> u64 {
         *self.since_millis.get_or_insert(now_millis)
     }
+}
+
+/// What holds off the next reminder after one was taken back out of the queue, or never queued.
+#[derive(Debug)]
+struct Hold {
+    /// `TurnEvidence::seen_working` when the reminder was taken back: a later value says the
+    /// coordinator has been seen working since.
+    seen_working: u64,
+    /// When the hold ends even though the coordinator was not seen working.
+    until: Instant,
+}
+
+/// Which of a check's questions to Claude Code is being asked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ask {
+    /// The check's first question, which waits after a failed, sessionless or slow answer.
+    First,
+    /// The question right before a reminder, which is always asked.
+    Again,
+}
+
+/// How long a reminder taken back out of the queue, or never queued, holds off the next while
+/// the coordinator is not seen working, when it is the `withdrawals`th such reminder in a row:
+/// `first` for the first, doubling with each after it, and at most `max`.
+pub(crate) fn retry_delay(first: Duration, withdrawals: u32, max: Duration) -> Duration {
+    let factor = 1_u32
+        .checked_shl(withdrawals.saturating_sub(1).min(31))
+        .unwrap_or(u32::MAX);
+    first.saturating_mul(factor).min(max)
 }
 
 /// The candidates of `eligible` due a reminder at `now_millis`, when the coordinator has been
@@ -202,11 +256,33 @@ pub(super) struct ReminderCheck {
     pub(super) snapshot: Option<String>,
 }
 
+/// Where settling a recorded reminder left the record.
+enum Settled {
+    /// No reminder is left waiting in the queue: the record as it now stands.
+    Record(ReplyReminderRecord),
+    /// A reminder is still in the queue, which could not give it back.
+    Waiting,
+    /// The record could not be read or written.
+    Unknown,
+}
+
 /// The reply reminders of one `chat run`.
 pub(crate) struct ReplyReminders {
     idle: Duration,
     source: Box<dyn ClaudeIdleSource>,
     period: IdlePeriod,
+    // What holds off the next reminder, after one was taken back out of the queue.
+    hold: Option<Hold>,
+    // How many reminders in a row were taken back out of the queue, or never queued, with no
+    // reminder typed and the coordinator not seen working in between.
+    withdrawals: u32,
+    // The hold after the first such reminder in a row, which doubles with each after it, and its
+    // bound: twice the idle time and `MAX_REPLY_REMINDER_RETRY`, except in tests.
+    retry_first: Duration,
+    retry_max: Duration,
+    // Until when Claude Code is not asked a check's first question, after a failed, sessionless
+    // or slow answer.
+    claude_wait: Option<Instant>,
     // The problem each step last logged, by step, so each is logged once until it changes or
     // the step works again.
     problems: BTreeMap<&'static str, String>,
@@ -237,12 +313,26 @@ impl ReplyReminders {
             idle,
             source,
             period: IdlePeriod::default(),
+            hold: None,
+            withdrawals: 0,
+            retry_first: idle.saturating_mul(2),
+            retry_max: MAX_REPLY_REMINDER_RETRY,
+            claude_wait: None,
             problems: BTreeMap::new(),
             waiting: None,
             stuck: None,
             #[cfg(test)]
             said: std::sync::Arc::default(),
         }
+    }
+
+    /// These reminders, holding off the next reminder after one taken back out of the queue for
+    /// `first`, doubling with each in a row, and at most `max`, instead of the defaults.
+    #[cfg(test)]
+    pub(super) fn with_retry(mut self, first: Duration, max: Duration) -> Self {
+        self.retry_first = first;
+        self.retry_max = max;
+        self
     }
 
     /// What the service logs at startup about these reminders.
@@ -323,27 +413,31 @@ tells whether it is idle",
     /// Settle a reminder recorded as waiting in the queue, as at startup, before any prompt is
     /// typed: one still in the queue's inbox is taken back out, so that no drain types it after
     /// its request may have been answered. Creates `reply-reminders.json`, with reminders starting
-    /// now, when it does not exist. Returns whether no reminder is left waiting. A reminder taken
-    /// back out during a check holds off the next one until the coordinator has been busy and
-    /// idle again; one an earlier run left does not, since this run has seen no idle period yet.
+    /// now, when it does not exist. Returns whether a reminder is left waiting in the queue,
+    /// which could not give it back; the owner loop then calls this again before its later
+    /// passes until none is. A reminder taken back out here holds off nothing: at startup this
+    /// run has seen no idle period yet.
     pub(super) fn settle<A: ManagedApi + ?Sized>(
         &mut self,
         state: &BridgeState,
         manager: &ManagedAgents<'_, A>,
         stop: &StopState,
     ) -> bool {
-        let settled = self.settle_recorded(state, manager, stop).is_some();
-        self.period.withdrawn = false;
-        settled
+        matches!(
+            self.settle_recorded(state, manager, stop, None),
+            Settled::Waiting
+        )
     }
 
-    /// [`Self::settle`] within a check: the record once no reminder is left waiting, or `None`.
+    /// [`Self::settle`], within a check when `seen_working` is the turn evidence's count, so that
+    /// a reminder taken back out holds off the next.
     fn settle_recorded<A: ManagedApi + ?Sized>(
         &mut self,
         state: &BridgeState,
         manager: &ManagedAgents<'_, A>,
         stop: &StopState,
-    ) -> Option<ReplyReminderRecord> {
+        seen_working: Option<u64>,
+    ) -> Settled {
         let now = chat_runtime::unix_millis();
         let record = match state.update_reply_reminders(now, None, |_| (false, ())) {
             Ok((record, ())) => {
@@ -352,11 +446,11 @@ tells whether it is idle",
             }
             Err(error) => {
                 self.failed("the reminder record", error);
-                return None;
+                return Settled::Unknown;
             }
         };
         let Some(reminder) = record.pending.clone() else {
-            return Some(record);
+            return Settled::Record(record);
         };
         let notes = TypingNotes::default();
         let delivery = TypingWatch {
@@ -369,11 +463,12 @@ tells whether it is idle",
             receipts: stop.ack_queue.as_ref(),
         };
         let outcome = chat_runtime::settle_reminder(state, &delivery, &reminder);
-        self.record(state, &reminder, &outcome, &record, now, None)
+        self.record(state, &reminder, &outcome, &record, now, None, seen_working)
     }
 
-    /// Record and log what became of `reminder`: the record once the reminder has left it, or
-    /// `None` while it waits in the queue or the record cannot be written.
+    /// Record and log what became of `reminder`, and, within a check, when `seen_working` is the
+    /// turn evidence's count, hold off the next reminder after one taken back out of the queue.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         state: &BridgeState,
@@ -382,21 +477,76 @@ tells whether it is idle",
         before: &ReplyReminderRecord,
         now: u64,
         retained: Option<&std::collections::BTreeSet<String>>,
-    ) -> Option<ReplyReminderRecord> {
+        seen_working: Option<u64>,
+    ) -> Settled {
         self.report_outcome(reminder, outcome, before);
-        if matches!(outcome, ReminderOutcome::Withdrawn(_)) {
-            // No reminder is composed again until the coordinator has been busy and idle again.
-            self.period.withdrawn = true;
+        match outcome {
+            ReminderOutcome::Withdrawn(_) => {
+                if let Some(seen_working) = seen_working {
+                    self.hold_off(seen_working);
+                }
+            }
+            ReminderOutcome::Waiting(_) => {}
+            ReminderOutcome::Typed
+            | ReminderOutcome::AlreadyTyped
+            | ReminderOutcome::Uncertain(_) => self.withdrawals = 0,
         }
+        let waiting = matches!(outcome, ReminderOutcome::Waiting(_));
         match chat_runtime::record_reminder_outcome(state, reminder, outcome, now, retained) {
             Ok(record) => {
                 self.worked("the reminder record");
-                (!matches!(outcome, ReminderOutcome::Waiting(_))).then_some(record)
+                if waiting {
+                    Settled::Waiting
+                } else {
+                    Settled::Record(record)
+                }
             }
             Err(error) => {
                 self.failed("the reminder record", error);
-                None
+                if waiting {
+                    Settled::Waiting
+                } else {
+                    Settled::Unknown
+                }
             }
+        }
+    }
+
+    /// A reminder was taken back out of the queue, or never queued, when the turn evidence had
+    /// counted `seen_working`: hold off the next until the coordinator has been seen working, or
+    /// for the retry delay.
+    fn hold_off(&mut self, seen_working: u64) {
+        self.withdrawals = self.withdrawals.saturating_add(1);
+        let delay = retry_delay(self.retry_first, self.withdrawals, self.retry_max);
+        self.hold = Some(Hold {
+            seen_working,
+            until: Instant::now() + delay,
+        });
+        self.say(format_args!(
+            "agentctl: reply reminders: no other reminder is sent until the coordinator has been \
+seen working and is idle again, or for {}s if it is not seen working",
+            delay.as_secs_f64().ceil()
+        ));
+    }
+
+    /// Whether a reminder taken back out of the queue still holds off the next. The hold ends
+    /// once the coordinator has been seen working since, which also ends the idle period, so the
+    /// next reminder waits for a whole idle period after that work; or, if it has not been seen
+    /// working, once the retry delay has passed, and the idle period goes on.
+    fn held(&mut self, turn: &TurnEvidence) -> bool {
+        let Some(hold) = &self.hold else {
+            return false;
+        };
+        if turn.seen_working() != hold.seen_working {
+            self.hold = None;
+            self.withdrawals = 0;
+            self.period.end();
+            false
+        } else if Instant::now() < hold.until {
+            true
+        } else {
+            self.hold = None;
+            false
         }
     }
 
@@ -425,7 +575,9 @@ tells whether it is idle",
         let runtime = StopRuntime::new(stop);
         let agent_name = &state.config().agent_name;
         // A reminder an earlier check could not settle is settled before another is composed.
-        let Some(record) = self.settle_recorded(state, manager, stop) else {
+        let Settled::Record(record) =
+            self.settle_recorded(state, manager, stop, Some(turn.seen_working()))
+        else {
             return Ok(check);
         };
         let now = chat_runtime::unix_millis();
@@ -441,7 +593,10 @@ tells whether it is idle",
         };
         let eligible = candidates.eligible(&record, now);
         if eligible.is_empty() {
+            // Nothing is left to remind, so nothing is held off either.
             self.period.end();
+            self.hold = None;
+            self.withdrawals = 0;
             return Ok(check);
         }
         if prompts_waiting {
@@ -450,13 +605,13 @@ tells whether it is idle",
         let Some(info) = self.lookup(manager, agent_name, &runtime, stop, turn)? else {
             return Ok(check);
         };
-        // A reminder taken back out of the queue during this idle period waits for the next one,
-        // which begins once Herdr or the pane has shown the coordinator working; Claude Code is
-        // not asked again until then.
-        if self.period.withdrawn && self.herdr_idle(&info, turn) {
+        // While a reminder taken back out of the queue holds off the next, Herdr's status still
+        // ends the idle period, but Claude Code is not asked.
+        if self.held(turn) {
+            self.herdr_idle(&info, turn);
             return Ok(check);
         }
-        if !self.idle(&info, turn) {
+        if !self.idle(&info, turn, stop, Ask::First) {
             return Ok(check);
         }
         let idle_since = self.period.idle(now);
@@ -522,7 +677,8 @@ tells whether it is idle",
         let Some(info) = self.lookup(manager, agent_name, &runtime, stop, turn)? else {
             return Ok(check);
         };
-        if !self.idle(&info, turn) || self.period.since_millis != Some(idle_since) {
+        if !self.idle(&info, turn, stop, Ask::Again) || self.period.since_millis != Some(idle_since)
+        {
             return Ok(check);
         }
 
@@ -572,8 +728,11 @@ tells whether it is idle",
             &record,
             chat_runtime::unix_millis(),
             Some(&candidates.retained),
+            Some(turn.seen_working()),
         );
-        check.report.prompt_typed |= notes.typed.get();
+        // Only a reminder that may have reached the pane counts as the start of a turn: one
+        // refused before it was queued, or taken back out untyped, started none.
+        check.report.prompt_typed |= outcome.may_have_typed();
         report_receipt_errors(&notes, &mut check.report);
         Ok(check)
     }
@@ -617,12 +776,28 @@ tells whether it is idle",
     /// Whether the coordinator in the pane `info` describes is idle: Herdr reports it `idle` or
     /// `done`, the loop's own evidence shows no running turn, and Claude Code says its session
     /// is `idle`. Claude Code is asked only when the other two hold. Ends the idle period when
-    /// it is not, or cannot be found, idle.
-    fn idle(&mut self, info: &AgentPaneInfo, turn: &TurnEvidence) -> bool {
+    /// it is not, or cannot be found, idle. After a run of `claude agents --json` that failed,
+    /// listed no session in the pane, or was slow, the check's first question waits for one
+    /// idle time: until then this is `false` and leaves the idle period as it is.
+    fn idle(
+        &mut self,
+        info: &AgentPaneInfo,
+        turn: &TurnEvidence,
+        stop: &StopState,
+        ask: Ask,
+    ) -> bool {
         if !self.herdr_idle(info, turn) {
             return false;
         }
-        match self.source.state(info) {
+        if ask == Ask::First && self.claude_wait.is_some_and(|until| Instant::now() < until) {
+            return false;
+        }
+        let asked = Instant::now();
+        let answer = self.source.state(info, &|| stop.is_stopped());
+        let slow = asked.elapsed() > CLAUDE_SLOW_ANSWER;
+        let wait = Instant::now() + self.idle;
+        self.claude_wait = slow.then_some(wait);
+        match answer {
             Ok(ClaudeState::Idle) => {
                 self.worked("asking Claude Code whether the coordinator is idle");
                 self.wait_because(None);
@@ -648,11 +823,13 @@ tells whether it is idle",
                     "Claude Code lists no session in the coordinator's pane {}",
                     info.pane_id
                 )));
+                self.claude_wait = Some(wait);
                 self.period.end();
                 false
             }
             Err(error) => {
                 self.failed("asking Claude Code whether the coordinator is idle", error);
+                self.claude_wait = Some(wait);
                 self.period.end();
                 false
             }
@@ -668,13 +845,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_idle_time_is_a_duration_of_at_least_ten_seconds_or_zero_for_off() {
+    fn the_idle_time_is_a_duration_of_ten_seconds_to_twelve_hours_or_zero_for_off() {
         for (value, idle) in [
             ("60s", Some(60)),
             ("60", Some(60)),
             ("1m", Some(60)),
             ("10s", Some(10)),
-            ("24h", Some(86_400)),
+            ("12h", Some(43_200)),
+            ("720m", Some(43_200)),
             ("0", None),
             ("0m", None),
         ] {
@@ -684,7 +862,7 @@ mod tests {
                 "{value}"
             );
         }
-        for value in ["9s", "25h", "1d", "-1", "", "1.5m", "m"] {
+        for value in ["9s", "13h", "43201", "24h", "1d", "-1", "", "1.5m", "m"] {
             assert!(parse_idle(value).is_err(), "{value}");
         }
         assert_eq!(DEFAULT_REPLY_REMINDER_IDLE, Duration::from_secs(60));
@@ -727,13 +905,106 @@ mod tests {
             5,
             "the period began at the first idle check"
         );
-        period.withdrawn = true;
         period.end();
-        assert!(
-            !period.withdrawn,
-            "a withdrawal holds only its own idle period"
-        );
         assert_eq!(period.idle(12), 12);
+    }
+
+    #[test]
+    fn the_retry_delay_doubles_with_each_reminder_taken_back_in_a_row_up_to_its_bound() {
+        let idle = Duration::from_secs(60);
+        let first = idle * 2;
+        let delays = (1..=8)
+            .map(|withdrawals| {
+                retry_delay(first, withdrawals, MAX_REPLY_REMINDER_RETRY).as_secs() / 60
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(
+            retry_delay(first, u32::MAX, MAX_REPLY_REMINDER_RETRY),
+            MAX_REPLY_REMINDER_RETRY
+        );
+        assert_eq!(MAX_REPLY_REMINDER_RETRY, Duration::from_secs(3_600));
+        // A long idle time is held off for at most the bound.
+        assert_eq!(
+            retry_delay(MAX_REPLY_REMINDER_IDLE * 2, 1, MAX_REPLY_REMINDER_RETRY),
+            MAX_REPLY_REMINDER_RETRY
+        );
+    }
+
+    #[test]
+    fn a_hold_ends_once_the_coordinator_is_seen_working_or_its_delay_has_passed() {
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(10),
+            Box::new(Answers(std::sync::Mutex::new(Vec::new()))),
+        );
+        let mut turn = TurnEvidence::default();
+        turn.status("idle");
+        assert!(!reminders.held(&turn), "nothing holds at first");
+        reminders.hold_off(turn.seen_working());
+        assert_eq!(reminders.withdrawals, 1);
+        assert!(reminders.held(&turn));
+        // Neither a prompt the loop asked to be typed nor a screen that shows no running turn is
+        // a sign of work.
+        turn.report(&CycleReport {
+            prompt_typed: true,
+            ..CycleReport::default()
+        });
+        turn.read("visible output");
+        turn.status("idle");
+        assert!(reminders.held(&turn));
+        // Herdr reporting the pane working is: the hold, the run of withdrawals and the idle
+        // period all end.
+        reminders.period.idle(1);
+        turn.status("working");
+        assert!(!reminders.held(&turn));
+        assert_eq!(reminders.withdrawals, 0);
+        assert_eq!(reminders.period.since_millis, None);
+        assert!(reminders.hold.is_none());
+
+        // A screen that shows a running turn is a sign of work too.
+        reminders.hold_off(turn.seen_working());
+        assert!(reminders.held(&turn));
+        turn.read("✻ Thinking… (esc to interrupt)\n");
+        assert!(!reminders.held(&turn));
+
+        // Not seen working, a hold lasts its delay, after which the idle period goes on.
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_secs(10),
+            Box::new(Answers(std::sync::Mutex::new(Vec::new()))),
+        )
+        .with_retry(Duration::from_millis(50), Duration::from_secs(1));
+        let turn = TurnEvidence::default();
+        reminders.period.idle(7);
+        reminders.hold_off(turn.seen_working());
+        assert!(reminders.held(&turn));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!reminders.held(&turn));
+        assert_eq!(reminders.period.since_millis, Some(7));
+        assert_eq!(reminders.withdrawals, 1, "the next in a row waits longer");
+        reminders.hold_off(turn.seen_working());
+        assert!(reminders
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.until.saturating_duration_since(Instant::now())
+                > Duration::from_millis(60)));
+    }
+
+    /// A stand-in for Claude Code that gives its answers in turn, the last first, and is idle
+    /// once none is left.
+    struct Answers(std::sync::Mutex<Vec<Result<ClaudeState, String>>>);
+
+    impl ClaudeIdleSource for Answers {
+        fn state(
+            &self,
+            _info: &AgentPaneInfo,
+            _cancelled: &dyn Fn() -> bool,
+        ) -> Result<ClaudeState, String> {
+            self.0
+                .lock()
+                .expect("answers")
+                .pop()
+                .unwrap_or(Ok(ClaudeState::Idle))
+        }
     }
 
     /// A stand-in `claude` that prints `listing`, and a process table in which process 101 runs
@@ -787,19 +1058,19 @@ mod tests {
             r#"[{"pid":101,"sessionId":"s","status":"idle"},{"pid":"202","status":"busy"}]"#,
         );
         assert_eq!(
-            source.state(&pane("claude", "w:coordinator")),
+            source.state(&pane("claude", "w:coordinator"), &|| false),
             Ok(ClaudeState::Idle)
         );
         assert_eq!(
-            source.state(&pane("claude", "w:other")),
+            source.state(&pane("claude", "w:other"), &|| false),
             Ok(ClaudeState::Busy("busy".to_owned()))
         );
         assert_eq!(
-            source.state(&pane("claude", "w:elsewhere")),
+            source.state(&pane("claude", "w:elsewhere"), &|| false),
             Ok(ClaudeState::NoSession)
         );
         assert_eq!(
-            source.state(&pane("codex", "w:coordinator")),
+            source.state(&pane("codex", "w:coordinator"), &|| false),
             Ok(ClaudeState::NotClaude),
             "a pane that does not run Claude Code is never reminded"
         );
@@ -809,14 +1080,14 @@ mod tests {
         let (directory, source) =
             claude_fixture("shell", r#"[{"pid":101,"sessionId":"s","status":"shell"}]"#);
         assert_eq!(
-            source.state(&pane("claude", "w:coordinator")),
+            source.state(&pane("claude", "w:coordinator"), &|| false),
             Ok(ClaudeState::Busy("shell".to_owned()))
         );
         fs::remove_dir_all(directory).expect("cleanup");
 
         let (directory, source) = claude_fixture("garbled", "not json");
         let error = source
-            .state(&pane("claude", "w:coordinator"))
+            .state(&pane("claude", "w:coordinator"), &|| false)
             .expect_err("an unreadable answer is an error");
         assert!(error.contains("cannot parse"), "{error}");
         fs::remove_dir_all(directory).expect("cleanup");

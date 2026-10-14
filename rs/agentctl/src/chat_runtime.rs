@@ -35,6 +35,8 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 
 mod reply_reminders;
 
+#[cfg(test)]
+pub(crate) use reply_reminders::REPLY_REMINDER_FILE;
 pub(crate) use reply_reminders::{
     compose_reminder, deliver_reminder, record_reminder_outcome, settle_reminder, PendingReminder,
     RemindedRequest, ReminderCandidate, ReminderOutcome, ReplyReminderRecord,
@@ -3898,11 +3900,12 @@ pub(crate) trait CoordinatorDelivery {
     /// under the IDs of requests whose prompts have not reached the coordinator: see
     /// [`PromptGate`].
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String>;
-    /// [`Self::submit`] for a prompt that must never be left waiting, as a reply reminder must
-    /// not: one the coordinator never accepts is taken back out of its composer, and one the
-    /// queue does not type is taken back out of its inbox before any other sender can drain it.
-    /// `true` when the prompt was taken back out of the inbox untyped, `false` when the queue
-    /// typed it. See [`ManagedAgents::send_once_with_runtime`]. A delivery that cannot take a
+    /// [`Self::submit_reporting_printed`] for a prompt that must never be left waiting, as a
+    /// reply reminder must not: it is not queued while the queue's inbox holds another prompt,
+    /// one the coordinator never accepts is taken back out of its composer, and one the queue
+    /// does not type is taken back out of its inbox before any other sender can drain it.
+    /// `Ok(None)` when the queue typed it, `Ok(Some(why))` when it is not in the queue and was
+    /// never typed. See [`ManagedAgents::send_once_with_runtime`]. A delivery that cannot take a
     /// prompt back fails without queuing it.
     fn submit_once(
         &self,
@@ -3910,8 +3913,9 @@ pub(crate) trait CoordinatorDelivery {
         prompt: &str,
         message_id: &str,
         options: DrainOptions,
-    ) -> std::result::Result<bool, String> {
-        let _ = (agent_name, prompt, message_id, options);
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<Option<String>, String> {
+        let _ = (agent_name, prompt, message_id, options, printed);
         Err("this delivery cannot take a prompt back out of the coordinator's queue".to_owned())
     }
     /// Take the prompt `message_id` back out of the coordinator's queue inbox, untyped; `true`
@@ -4070,14 +4074,18 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
         prompt: &str,
         message_id: &str,
         options: DrainOptions,
-    ) -> std::result::Result<bool, String> {
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<Option<String>, String> {
         ManagedAgents::send_once_with_runtime(
             self,
             agent_name,
             prompt,
             options,
             message_id,
-            &agent::SystemRuntime::default(),
+            &PrintReporter {
+                runtime: &agent::SystemRuntime::default(),
+                printed,
+            },
         )
         .map_err(|error| error.to_string())
     }
