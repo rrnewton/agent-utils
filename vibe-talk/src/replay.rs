@@ -137,12 +137,13 @@ pub struct Replay {
 ///
 /// [`Speaker::Note`] turns are skipped. They are the page talking to itself about seams and
 /// errors; feeding "the call ended" back to the agent as though it were said out loud is noise
-/// that costs money.
+/// that costs money. Record rows (`#270 voice-transcript-markers`) are skipped for the same
+/// reason: none of them was said.
 #[must_use]
 pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
     let spoken: Vec<&Turn> = turns
         .iter()
-        .filter(|turn| turn.speaker != Speaker::Note)
+        .filter(|turn| matches!(turn.speaker, Speaker::You | Speaker::Agent))
         .collect();
 
     let mut lines: Vec<String> = Vec::new();
@@ -205,11 +206,7 @@ pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
 
 /// One transcript line, with the speaker named and the words neutralized.
 fn render(turn: &Turn) -> String {
-    let who = match turn.speaker {
-        Speaker::You => "you",
-        Speaker::Agent => "agent",
-        Speaker::Note => "note",
-    };
+    let who = turn.speaker.as_str();
     // Neutralized per turn as well as by `fenced` below. Belt and braces on purpose: a turn is the
     // unit a forged fence would be smuggled in, and neutralizing here means a single hostile turn
     // cannot escape its own line even if the joining changes.
@@ -296,6 +293,7 @@ mod tests {
             speaker,
             text: text.to_owned(),
             at_ms: 1_700_000_000_000,
+            detail: None,
         }
     }
 

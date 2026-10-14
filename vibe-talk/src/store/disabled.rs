@@ -59,6 +59,7 @@ impl StateStore for DisabledStore {
         &self,
         _: u16,
         _: Option<&TranscriptCursor>,
+        _: bool,
     ) -> Result<TranscriptPage, StoreError> {
         // A refusal rather than an empty page, which is the whole posture of this module: "you
         // have said nothing yet" and "this server keeps no record of what you say" are different
@@ -313,7 +314,10 @@ mod tests {
                 .expect_err("append"),
             store.conversations().await.expect_err("list"),
             store.turns(&id).await.expect_err("turns"),
-            store.transcript(10, None).await.expect_err("transcript"),
+            store
+                .transcript(10, None, true)
+                .await
+                .expect_err("transcript"),
             store.forget_conversation(&id).await.expect_err("forget"),
             store
                 .forget_all_conversations()

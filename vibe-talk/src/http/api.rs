@@ -2799,7 +2799,15 @@ pub async fn conversation(
     Path(conversation_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = ConversationId::parse(&conversation_id)?;
-    let turns = state.store.turns(&id).await?;
+    // Record rows and details stay out of what a page did not ask for. `#270
+    // voice-transcript-markers`: the store hands back everything, because the replay reads it.
+    let turns = state
+        .store
+        .turns(&id)
+        .await?
+        .into_iter()
+        .filter_map(Turn::without_records)
+        .collect();
     Ok(no_store(Json(ConversationResponse {
         id,
         turns,
@@ -2878,7 +2886,10 @@ pub async fn transcript(
         .limit
         .unwrap_or(crate::store::DEFAULT_TRANSCRIPT_PAGE)
         .clamp(1, crate::store::MAX_TRANSCRIPT_PAGE);
-    let page = state.store.transcript(limit, before.as_ref()).await?;
+    let page = state
+        .store
+        .transcript(limit, before.as_ref(), false)
+        .await?;
     Ok(no_store(Json(TranscriptResponse {
         has_more: page.has_more,
         next_before: page
@@ -2994,6 +3005,14 @@ pub async fn append_turn(
     Json(request): Json<AppendTurnRequest>,
 ) -> Result<Response, ApiError> {
     let id = ConversationId::parse(&conversation_id)?;
+    // A record row is this server's to write, from its own copy, never a page's words.
+    if request.speaker.is_record() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_record",
+            "this server does not take sent or marker rows on this route",
+        ));
+    }
     let turn = Turn::now(request.speaker, request.text);
     state.store.append_turn(&id, &turn).await?;
     Ok(no_store(Json(AppendTurnResponse { id, turn })))
