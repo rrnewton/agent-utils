@@ -46819,6 +46819,73 @@ test("`#298 thread-card-header`: where the clamp cuts the card's text a press on
   assert.equal(headerCard(page).expanded, false, "a card whose text is whole opened");
 });
 
+test("`#298 thread-card-header` x `#281 view-keys`: a card opened at the top of the right column's thread closes when two columns go — Cmd-1, Cmd-2, Cmd-\\, Cmd-3 — and Esc closes only a card on screen, so the next Esc anywhere else does what it does there, never spent on a card out of sight", async () => {
+  // The review's path: two columns, the thread opened from its card, its card opened over the list,
+  // a view key, a thread across the window from the picker, Esc. That Esc is Back to Main.
+  const LEAVES = [
+    ["Cmd-1", (page) => press(page, page.el("side-scroll"), "1", { ctrlKey: true })],
+    ["Cmd-2", (page) => press(page, page.el("side-scroll"), "2", { ctrlKey: true })],
+    ["Cmd-\\", (page) => press(page, page.el("side-scroll"), "\\", { ctrlKey: true })],
+    ["Cmd-3", (page) => press(page, page.el("side-scroll"), "3", { ctrlKey: true })],
+  ];
+  const columnsUp = (page) => page.el("screen-main").getAttribute("data-columns") === "two";
+  const run = async (script, leave) => {
+    const { page, data } = await twoColumnServer(null, script);
+    const [first, second] = data.threads;
+    await openerOf(cardRow(page, first.id)).click();
+    await page.settle();
+    await page.el("side-thread-card-text").click();
+    assert.equal(headerCard(page).expanded, true, "the card did not open, so this proves nothing");
+    await leave(page);
+    await page.settle();
+    assert.equal(columnsUp(page), false, "the key did not leave two columns, so this proves nothing");
+    const left = headerCard(page).expanded;
+    await pickThread(page, `thread:${second.id}`);
+    assert.equal(page.el("thread-heading").hidden, false, "no thread across the window, so this proves nothing");
+    await press(page, page.el("scroll-area"), "Escape");
+    await page.settle();
+    return { page, left, view: page.el("thread-select").value, heading: !page.el("thread-heading").hidden };
+  };
+  for (const [name, leave] of LEAVES) {
+    const { page, left, view, heading } = await run(SCRIPT, leave);
+    assert.equal(left, false, `${name} left the right column's card open out of sight`);
+    assert.equal(heading, false, `${name}, then a thread from the picker: the first Esc was spent on a card nobody could see`);
+    assert.doesNotMatch(view, /^thread:/, `${name}: the first Esc left the reader in the thread`);
+    // Two columns again: the card there is closed, over the thread still selected there.
+    await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
+    await page.settle();
+    assert.equal(columnsUp(page), true, `${name}: Cmd-4 did not come back to two columns`);
+    assert.equal(page.el("side-thread-card").hidden, false, `${name}: two columns came back without the thread`);
+    assert.equal(headerCard(page).expanded, false, `${name}: two columns came back to the card still open`);
+  }
+  // The control: with neither the column taking its card with it nor Esc asking whether a card shows,
+  // the first Esc is spent on the card out of sight and the reader stays in the thread.
+  const findA = "  collapseThreadCard(leftEl(\"side-thread-card\"));\n";
+  const findB = "if (collapseThreadCard(expandedThreadCardOnScreen())) return true;";
+  const blind = brokenScript(findA, "").replace(findB, "if (collapseThreadCard()) return true;");
+  assert.ok(SCRIPT.includes(findB) && blind.includes("if (collapseThreadCard()) return true;"), "the control patched nothing");
+  const spent = await run(blind, LEAVES[0][1]);
+  assert.equal(spent.heading, true, "the negative control left the thread on the first Esc too, so the check above proves nothing");
+
+  // Out of sight with two columns still chosen: Settings over the card. Esc leaves Settings, and the
+  // card, still on screen under it, is as the reader left it.
+  for (const script of [SCRIPT, brokenScript(findB, "if (collapseThreadCard()) return true;")]) {
+    const { page, data } = await twoColumnServer(null, script);
+    await openerOf(cardRow(page, data.threads[0].id)).click();
+    await page.settle();
+    await page.el("side-thread-card-text").click();
+    await press(page, page.el("side-scroll"), ",");
+    assert.equal(page.screen(), "settings");
+    await press(page, page.el("screen-settings"), "Escape");
+    if (script === SCRIPT) {
+      assert.equal(page.screen(), "main", "Esc on Settings was spent on the card under it");
+      assert.equal(headerCard(page).expanded, true, "leaving Settings closed the card the reader had opened");
+    } else {
+      assert.equal(page.screen(), "settings", "the negative control left Settings too, so the check above proves nothing");
+    }
+  }
+});
+
 test("`#298 thread-card-header`: over a thread on the right its one link joins its root on Main to the card at the top, as the selection's — whole, or clipped at Main's edge while the root is off it — and the cards' links come back with the cards", async () => {
   const restore = layColumnsOut();
   try {

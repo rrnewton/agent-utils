@@ -47,6 +47,10 @@ scroll down, but should be the fixed header object") -> the X, Esc and <- each g
 With reduced motion asked for: the card at the top is at its place in every frame from the first, and
 nothing fades, in two columns and from the thread list.
 
+Esc after two columns went (`#281 view-keys`): two columns again (real Ctrl+4) -> the long question's
+card opened over its thread on the right -> real Ctrl+1: one column, the card closed with its column ->
+the picker: a thread across the window -> Esc: back to Main at once, no Esc spent on a card out of sight.
+
 On a 412x915 phone by touch, in the dark scheme and the light: the thread list from the view picker
 -> a card's replies button: the card moves up to the top of the screen and heads the thread, two
 lines of it, its X a thumb's size -> the thread scrolled: the card does not move -> the X: the list.
@@ -252,6 +256,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             if kind == "desk":
                 desk_walk(desk)
                 list_walk(desk)
+                esc_walk(desk)
             elif kind == "reduced":
                 reduced_walk(desk)
             else:
@@ -681,6 +686,45 @@ def list_walk(desk: Desk) -> None:
     back_in_list(desk, "<-")
     desk.notes.append(f"Ctrl+3 then a replies button: the thread across the window under its card, {number(box, 'height'):.0f}px "
                       "and three lines, fixed while the thread scrolled; the X, Esc and <- each went back to the list")
+
+
+# --- Esc after two columns went, the card at the top left open ----------------------------------------------
+
+
+def esc_walk(desk: Desk) -> None:
+    """`#281 view-keys` x `#298`: the right column's card opened over its thread, then real Ctrl+1 and a
+    thread across the window from the picker. The first Esc goes back to Main: the card went with the
+    column, and Esc closes only a card on screen, so no Esc is spent on one nobody can see."""
+    page = desk.page
+    page.keyboard.press("Control+4")
+    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'two'",
+                  "Ctrl+4 did not come back to two columns")
+    desk.settled()
+    if page.is_visible("#side-close"):
+        page.click("#side-close")
+        desk.wait_for("() => !document.getElementById('side-list').hidden", "the X did not go back to the cards")
+    open_card(desk, REPLICA)
+    page.click("#side-thread-card-text")
+    desk.wait_for("() => document.getElementById('side-thread-card').hasAttribute('data-expanded')",
+                  "a click on the clamped text did not open the card")
+    page.keyboard.press("Control+1")
+    desk.wait_for("() => !document.getElementById('screen-main').hasAttribute('data-columns')"
+                  " && document.getElementById('thread-select').value === 'main'", "Ctrl+1 did not show Main in one column")
+    desk.check(not page.evaluate("() => document.getElementById('side-thread-card').hasAttribute('data-expanded')"),
+               "the right column's card was left open after two columns went")
+    page.select_option("#thread-select", f"thread:{RUNNER}")
+    desk.wait_for("() => !document.getElementById('thread-heading').hidden"
+                  f" && document.getElementById('thread-card').getAttribute('data-thread') === '{RUNNER}'",
+                  "the picker did not open the thread across the window")
+    at_rest(desk, "thread-card", "pane-discord")
+    page.focus("#scroll-area")
+    page.keyboard.press("Escape")
+    desk.wait_for("() => document.getElementById('thread-heading').hidden"
+                  " && document.getElementById('thread-select').value === 'main'",
+                  "after Ctrl+1 the first Esc in a thread did not go back to Main: it was spent on a card out of sight",
+                  seconds=3)
+    desk.notes.append("the card at the top of the right column opened, then Ctrl+1 and a thread from the picker: the first "
+                      "Esc went back to Main")
 
 
 # --- reduced motion ----------------------------------------------------------------------------------------

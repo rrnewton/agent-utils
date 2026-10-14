@@ -8517,8 +8517,8 @@ function closeDetailsOn(target) {
  * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
- * holds (`isBarPicker`); then the card at the top of a thread, opened over its list, closes (`#298
- * thread-card-header`); then a highlighted thread card on screen is put out (`#277
+ * holds (`isBarPicker`); then the card at the top of a thread, opened over its list, closes, while it
+ * is on screen (`#298 thread-card-header`); then a highlighted thread card on screen is put out (`#277
  * thread-card-focus`); then Back: out of Settings, Help or Reply, out of the thread list to what it
  * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
  * Returns whether it did anything. With none of those it does nothing:
@@ -8546,8 +8546,8 @@ function onEscape(event, target) {
     return true;
   }
   // `#298 thread-card-header`. The card at the top of a thread opened over its list closes first; the
-  // next Esc goes back out of the thread.
-  if (collapseThreadCard()) return true;
+  // next Esc goes back out of the thread. Only a card on screen: one out of sight is nobody's Esc.
+  if (collapseThreadCard(expandedThreadCardOnScreen())) return true;
   if (putOutLitCard()) return true;
   return goBack();
 }
@@ -31815,6 +31815,10 @@ function leaveColumns(next = "one") {
   // `#262 search-load-older`. The right column's walk for the search ends: its list is put aside, held.
   endSearchWalk(columns.side);
   columnsShown = false;
+  // `#298 thread-card-header`. The card at the top of the right column's thread, opened over its list,
+  // goes with the column: Cmd-1, Cmd-2, Cmd-3, Cmd-\ or a window narrowed under two columns leave
+  // nothing open out of sight, for the next Esc to be spent on. Two columns come back to it closed.
+  collapseThreadCard(leftEl("side-thread-card"));
   if (columns.side.mode === "thread") {
     inColumn(columns.side, () => {
       dropReplyArrowTap();
@@ -32776,6 +32780,20 @@ function collapseThreadCard(card = expandedThreadCard) {
   if (expandedThreadCard === card) expandedThreadCard = null;
   noteThreadCardClamp(card);
   return true;
+}
+
+/**
+ * The opened card at the top of a thread while the reader can see it: the right column's while two
+ * columns show it over its thread, the window's while a thread is across it, on the main screen.
+ * Else null. Esc closes this card and nothing else: a card left open out of sight — Settings or Help
+ * over it, the thread list across the window — would otherwise take an Esc that did nothing the
+ * reader could see, and the next Esc would be the one that did what they asked (`#281 view-keys`).
+ */
+function expandedThreadCardOnScreen() {
+  const card = expandedThreadCard;
+  if (!card || !channelOnScreen() || !drawnOnPage(card)) return null;
+  if (card === leftEl("side-thread-card")) return columnsShown && columns.side.mode === "thread" ? card : null;
+  return threadListShown ? null : card;
 }
 
 /** A press anywhere outside the opened card at the top of a thread closes it, as a press outside a ⋯ menu does. */
