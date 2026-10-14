@@ -1,4 +1,4 @@
-//! The HTTP surface: a small JSON API, plus the phone web app that consumes it.
+//! The HTTP surface: a small JSON API, plus the web app that consumes it.
 //!
 //! Route policy, stated once so it is checkable:
 //!
@@ -148,11 +148,13 @@ fn routes(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(api::healthz))
         // The static web app. One handler, which finds the file by path and decides what a
-        // browser may keep of it: see `assets` for why the shells revalidate and the files they
-        // name are immutable under their hashed URLs.
+        // browser may keep of it: see `assets` for why the shell revalidates and the files it
+        // names are immutable under their hashed URLs.
         .route("/", get(assets::serve))
-        .route("/app.js", get(assets::serve))
-        .route("/voice", get(assets::serve))
+        // `#302 root-is-the-app`. The app's old address, and the same with a trailing slash: a
+        // 302 to `/` keeping the query, so a bookmark or an app installed from there still opens.
+        .route("/voice", get(assets::forward_to_root))
+        .route("/voice/", get(assets::forward_to_root))
         .route("/voice.js", get(assets::serve))
         .route("/contract.js", get(assets::serve))
         .route("/voice.css", get(assets::serve))

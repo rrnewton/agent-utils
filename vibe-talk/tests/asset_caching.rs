@@ -17,16 +17,15 @@ use vibe_talk::http::router;
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const REVALIDATE: &str = "no-cache";
 
-/// The pages and the manifest: revalidated, never content-addressed.
-const DOCUMENTS: [&str; 3] = ["/", "/voice", "/manifest.webmanifest"];
+/// The page and the manifest: revalidated, never content-addressed.
+const DOCUMENTS: [&str; 2] = ["/", "/manifest.webmanifest"];
 
 /// Every static file the router serves by a plain URL, and so every one an older shell may name.
-const FILES: [&str; 9] = [
+const FILES: [&str; 8] = [
     "/voice.js",
     "/contract.js",
     "/voice.css",
     "/style.css",
-    "/app.js",
     "/icons/icon.svg",
     "/icons/icon-192.png",
     "/icons/icon-512.png",
@@ -116,28 +115,17 @@ fn file_references(page: &str) -> Vec<String> {
 #[tokio::test]
 async fn every_file_a_shell_names_is_immutable_under_a_url_carrying_the_hash_of_its_bytes() {
     let app = app();
-    for (shell, expected) in [
-        (
-            "/voice",
-            &[
-                "/style.css",
-                "/voice.css",
-                "/contract.js",
-                "/voice.js",
-                "/icons/icon-192.png",
-                "/icons/icon.svg",
-            ][..],
-        ),
-        (
-            "/",
-            &[
-                "/style.css",
-                "/app.js",
-                "/icons/icon-192.png",
-                "/icons/icon.svg",
-            ][..],
-        ),
-    ] {
+    for (shell, expected) in [(
+        "/",
+        &[
+            "/style.css",
+            "/voice.css",
+            "/contract.js",
+            "/voice.js",
+            "/icons/icon-192.png",
+            "/icons/icon.svg",
+        ][..],
+    )] {
         let (status, _, page) = fetch(&app, shell, &[]).await;
         assert_eq!(status, StatusCode::OK, "{shell}");
         let page = String::from_utf8(page).expect("utf-8");

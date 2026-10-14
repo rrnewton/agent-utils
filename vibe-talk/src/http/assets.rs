@@ -1,4 +1,4 @@
-//! The phone web app's static files, and what a browser is told it may keep.
+//! The web app's static files, what a browser is told it may keep, and where its old address goes.
 //!
 //! `#223 asset-caching`. Every one of these used to be answered `Cache-Control: no-store`, so each
 //! launch of the installed app downloaded the whole page again — the page script alone is 262 KB
@@ -8,10 +8,10 @@
 //!   SHA-256 of its bytes (128 bits of it, in hex), `/voice.js?v=<hash>`, and under that URL it is
 //!   answered `public, max-age=31536000, immutable`: a browser never asks for it again, and does
 //!   not need to, because different bytes would have a different URL.
-//! * **The HTML shells (`/` and `/voice`) are generated, not edited.** At startup each page's
-//!   `src="…"` and `href="…"` references to those files are rewritten to the hashed URLs, so no
-//!   hash is ever written into a file by hand and none can go stale.
-//! * **The shells and the install manifest are revalidated on every load**: `no-cache`, with an
+//! * **The HTML shell, the app at `/`, is generated, not edited.** At startup the page's `src="…"`
+//!   and `href="…"` references to those files are rewritten to the hashed URLs, so no hash is ever
+//!   written into a file by hand and none can go stale.
+//! * **The shell and the install manifest are revalidated on every load**: `no-cache`, with an
 //!   ETag that is the hash of the generated body, and `If-None-Match` answered `304`. A deploy
 //!   that changed any file changes the shell that names it, so the next launch gets the new shell
 //!   in one small request and then downloads only the files whose hashes moved.
@@ -51,7 +51,7 @@
 //! # Why there is still no service worker
 //!
 //! HTTP caching is enough for launch speed. Launching the installed app is a navigation to the
-//! manifest's `start_url`, `/voice`: the browser revalidates the shell (a `304` of a few hundred
+//! manifest's `start_url`, `/`: the browser revalidates the shell (a `304` of a few hundred
 //! bytes when nothing was deployed) and takes every file it names from its own HTTP cache without
 //! asking. A service worker could remove that one round trip and let the app open with no network
 //! at all, and it is deliberately not used: CacheStorage outlives sign-out and is served by
@@ -66,6 +66,35 @@
 //! by its periodic update check rather than on each launch, and an icon URL that changed with
 //! every edit to the artwork would make each such edit an identity change for every installed
 //! copy. The plain icon URLs revalidate like any other plain URL.
+//!
+//! # `/` is the app, and `/voice` forwards to it
+//!
+//! `#302 root-is-the-app`. The app used to live at `/voice`, while `/` served an older, smaller
+//! page that duplicated part of it. That page is gone and the app is served at `/`. `/voice` and
+//! `/voice/` answer [`forward_to_root`]: a `302 Found` to `/`, with the request's query string
+//! kept. The fragment needs no help: a browser never sends it, and RFC 9110 §10.2.2 has it carry
+//! the original fragment over to a `Location` that has none, so `/voice?x=1#y` lands on
+//! `/?x=1#y`. The page reads nothing from its path, query or fragment, so those two spellings are
+//! every link to it there ever was; nothing was ever served below `/voice/`.
+//!
+//! **Why 302 and not 301.** Both keep a bookmark and an installed app working; what differs is
+//! how long a browser remembers the answer. A 301 is cacheable by default (RFC 9111 §4.2.2), and
+//! browsers keep it indefinitely, so it would outlive the deploy that made it: after a rollback to
+//! a version where `/voice` is the app, every browser that had seen the 301 would go on skipping
+//! `/voice`. And the pointer is meant to be temporary, which a permanent redirect held in caches
+//! nobody can reach would pre-empt. A 302 sent `no-cache` is asked for again on every use, so the
+//! server stays the only authority on where `/voice` goes. The cost is one small round trip per
+//! launch for an app installed before this change, until the browser's manifest update moves its
+//! `start_url` to `/`.
+//!
+//! **The installed app keeps its identity.** The manifest's `id` stays `/voice` while its
+//! `start_url` becomes `/`. Chromium identifies an installed web app by that `id`, resolved against
+//! the origin, and falls back to `start_url` only when there is none; so the manifest served now is
+//! an UPDATE of the app installed from `/voice`, not a second app, and an installation made before
+//! this change takes the new `start_url` at its next update check. Until then it launches `/voice`,
+//! is forwarded to `/`, and stays in the app window, because the manifest's `scope` is `/` and a
+//! same-origin navigation inside the scope never leaves it. `tests/pwa_installability.py` asks
+//! Chromium itself for each of these against the real server.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -77,16 +106,13 @@ use bytes::Bytes;
 
 use super::api;
 
-/// The phone web app's page.
-const INDEX_HTML: &str = include_str!("../../web/index.html");
-/// The minimal page that starts an authenticated conversation.
+/// The app's page, served at `/`. Its files keep the `voice` names they had when it lived at
+/// `/voice`, so a shell cached before the move still names files that exist.
 const VOICE_HTML: &str = include_str!("../../web/voice.html");
-/// The `/voice` page's script.
+/// The app's script.
 pub(crate) const VOICE_JS: &str = include_str!("../../web/voice.js");
 const CONTRACT_JS: &str = include_str!("../../web/contract.js");
 const VOICE_CSS: &str = include_str!("../../web/voice.css");
-/// The phone web app's script.
-pub(crate) const APP_JS: &str = include_str!("../../web/app.js");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
 const MANIFEST: &str = include_str!("../../web/manifest.webmanifest");
 
@@ -137,25 +163,23 @@ const fn source(
 /// Everything static the router serves. A path here needs a route in [`super::router`] too; a
 /// route without an entry here answers 404.
 const SOURCES: &[Source] = &[
-    source("/", HTML, INDEX_HTML.as_bytes(), Role::Shell),
-    source("/voice", HTML, VOICE_HTML.as_bytes(), Role::Shell),
+    source("/", HTML, VOICE_HTML.as_bytes(), Role::Shell),
     source(
         "/manifest.webmanifest",
         "application/manifest+json; charset=utf-8",
         MANIFEST.as_bytes(),
         Role::Manifest,
     ),
-    source("/app.js", JAVASCRIPT, APP_JS.as_bytes(), Role::File),
     source("/voice.js", JAVASCRIPT, VOICE_JS.as_bytes(), Role::File),
-    // The generated wire-contract validators `/voice` loads before its script.
+    // The generated wire-contract validators the page loads before its script.
     source(
         "/contract.js",
         JAVASCRIPT,
         CONTRACT_JS.as_bytes(),
         Role::File,
     ),
-    // Held apart from `style.css` on purpose: it turns the document into a fixed application frame
-    // (`100dvh`, no page scroll), and `/` is an ordinary scrolling page that must not inherit that.
+    // The page's two stylesheets: `style.css` its colours and components, `voice.css` the fixed
+    // application frame (`100dvh`, no page scroll) and everything else on it.
     source("/voice.css", CSS, VOICE_CSS.as_bytes(), Role::File),
     source("/style.css", CSS, STYLE_CSS.as_bytes(), Role::File),
     // Embedded artwork, available before the app is authenticated.
@@ -204,13 +228,40 @@ struct Site {
 /// them can change while it runs.
 static SITE: LazyLock<Site> = LazyLock::new(|| Site::new(SOURCES));
 
-/// `GET` any static path: the shells, the manifest, the scripts and stylesheets, and the icons.
+/// `GET` any static path: the shell, the manifest, the scripts and stylesheets, and the icons.
 ///
 /// See the module documentation for what each is told about caching, and why.
 pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
     match SITE.answer(&uri, &headers) {
         Some(response) => response,
         None => api::not_found().await.into_response(),
+    }
+}
+
+/// `GET /voice`: the app's old address, forwarded to `/` with its query string.
+///
+/// A `302`, revalidated, rather than a `301`; see "`/` is the app" in the module documentation for
+/// why, and for how the fragment survives without the server ever seeing it.
+pub async fn forward_to_root(uri: Uri) -> Response {
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, root_keeping_query(&uri)),
+            (header::CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+        ],
+    )
+        .into_response()
+}
+
+/// `/`, with `uri`'s query string when it has a non-empty one.
+///
+/// The query is copied exactly as it arrived, still percent-encoded: it is already a valid URI
+/// query, so it is already a valid header value, and decoding it here could only change it.
+fn root_keeping_query(uri: &Uri) -> HeaderValue {
+    match uri.query().filter(|query| !query.is_empty()) {
+        Some(query) => HeaderValue::try_from(format!("/?{query}"))
+            .unwrap_or_else(|_| HeaderValue::from_static("/")),
+        None => HeaderValue::from_static("/"),
     }
 }
 
@@ -293,7 +344,7 @@ impl Entry {
 /// Rewrite a page's `src="/x"` and `href="/x"` references to the hashed URL of `/x`.
 ///
 /// Only those exact attribute forms, quoted, are touched: a quoted path elsewhere in the page —
-/// prose, an inline script — is not a reference, and a bare `/voice` link is not `/voice.js`.
+/// prose, an inline script — is not a reference, and a bare `/a` link is not `/a.js`.
 fn link(template: &str, versions: &BTreeMap<&'static str, String>) -> String {
     let mut page = template.to_owned();
     for (path, version) in versions {

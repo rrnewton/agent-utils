@@ -585,7 +585,7 @@ async fn fetched(
 #[tokio::test]
 async fn the_page_its_script_and_its_json_travel_compressed_when_the_browser_offers() {
     let (router, _) = seeded();
-    for uri in ["/voice", "/voice.js", "/voice.css", "/contract.js"] {
+    for uri in ["/", "/voice.js", "/voice.css", "/contract.js"] {
         let (plain, none, _) = fetched(&router, uri, None, None).await;
         assert_eq!(
             none, None,

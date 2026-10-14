@@ -427,7 +427,7 @@ async fn the_install_manifest_selects_standalone_without_removing_the_browser_fa
         "Chrome must see an installable display mode before the compatibility fallback"
     );
     assert_eq!(manifest["display"], "browser");
-    assert_eq!(manifest["start_url"], "/voice");
+    assert_eq!(manifest["start_url"], "/");
     assert_eq!(manifest["scope"], "/");
     assert!(
         manifest["icons"].as_array().is_some_and(|icons| icons
@@ -4394,9 +4394,7 @@ async fn the_page_and_its_json_go_out_compressed_and_a_live_stream_does_not() {
         Some("br")
     );
     assert_eq!(
-        encoding_of(&harness, "/voice", "gzip", None)
-            .await
-            .as_deref(),
+        encoding_of(&harness, "/", "gzip", None).await.as_deref(),
         Some("gzip")
     );
     assert_eq!(

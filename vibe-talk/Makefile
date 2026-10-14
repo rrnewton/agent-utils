@@ -85,16 +85,16 @@ contract-check:
 typecheck:
 	contract/node_modules/.bin/tsc -p tsconfig.json
 
-# `cargo test` runs BOTH served pages' suites through `node --test` as well as the Rust tests, so
-# this is not only the Rust half. Those suites FAIL rather than skip when node is missing, which is
-# what stops a page regression from passing silently on a machine without a node toolchain.
+# `cargo test` runs the page's suites through `node --test` as well as the Rust tests, so this is
+# not only the Rust half. Those suites FAIL rather than skip when node is missing, which is what
+# stops a page regression from passing silently on a machine without a node toolchain.
 test:
 	cargo test --locked
 
 # The page suites on their own, for the edit-run loop. Seconds rather than a full cargo test.
 #
-# EVERY suite, by glob, not a named file: this page serves two -- `/` and `/voice` -- and naming one
-# of them is how the second comes to exist without ever being run.
+# EVERY suite, by glob, not a named file: the page's own suite and the contract's validators are
+# two, and naming one of them is how a third comes to exist without ever being run.
 page:
 	node --test tests/js/*.test.mjs
 

@@ -3,7 +3,7 @@
   "name": "vibe-talk",
   "short_name": "vibe-talk",
   "description": "Read, hear, and reply to your chat messages.",
-  "start_url": "/voice",
+  "start_url": "/",
   "scope": "/",
   "display_override": ["standalone"],
   "display": "browser",

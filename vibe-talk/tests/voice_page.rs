@@ -1,4 +1,4 @@
-//! Runs the `/voice` page's own test suite as part of `cargo test`.
+//! Runs the app page's own test suite (the page served at `/`) as part of `cargo test`.
 //!
 //! The page is plain browser JavaScript with no build step, so its behaviour cannot be asserted
 //! from Rust directly — but it is also the surface the owner touches, and it had a real bug
@@ -54,14 +54,14 @@ fn the_voice_page_suite_passes() {
 
     assert!(
         output.status.success(),
-        "the /voice page suite failed:\n{text}"
+        "the app page suite failed:\n{text}"
     );
-    assert_eq!(failed, 0, "the /voice page suite failed:\n{text}");
+    assert_eq!(failed, 0, "the app page suite failed:\n{text}");
     // Raise this with the suite. It is a floor against a suite that stopped COLLECTING, so it has
     // to track the real count; left behind, it would keep passing while half the file went missing.
     assert!(
         passed >= 294,
-        "the /voice page suite ran only {passed} tests, so something stopped collecting them:\n\
+        "the app page suite ran only {passed} tests, so something stopped collecting them:\n\
          {text}"
     );
 }

@@ -85,8 +85,9 @@ fn inventory() -> Vec<Route> {
     vec![
         route("GET", "/healthz", Public, Nothing),
         route("GET", "/", Public, Nothing),
-        route("GET", "/app.js", Public, Nothing),
+        // `#302 root-is-the-app`: the app's old address, forwarded to `/`.
         route("GET", "/voice", Public, Nothing),
+        route("GET", "/voice/", Public, Nothing),
         route("GET", "/voice.js", Public, Nothing),
         route("GET", "/contract.js", Public, Nothing),
         route("GET", "/voice.css", Public, Nothing),

@@ -323,7 +323,7 @@ async fn the_provider_neutral_route_preserves_auth_and_describes_the_wire() {
 async fn the_voice_page_is_public_code_and_carries_no_credential() {
     let harness = harness();
     for (path, needle) in [
-        ("/voice", "<title>vibe-talk — voice</title>"),
+        ("/", "<title>vibe-talk</title>"),
         ("/voice.js", "/api/v1/voice-session"),
         // Loaded before voice.js, which decodes every server answer with it; without the route the
         // page would fail on its first `VibeTalkContract` reference.

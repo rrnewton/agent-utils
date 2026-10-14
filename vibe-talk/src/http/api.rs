@@ -2350,14 +2350,14 @@ pub async fn stream(
 
 #[cfg(test)]
 mod tests {
-    use crate::http::assets::{APP_JS, VOICE_JS};
+    use crate::http::assets::VOICE_JS;
 
     #[test]
     fn the_voice_page_pluralizes_and_prefers_the_operators_own_clock() {
-        // Both defects were fixed in web/app.js first and never carried across, and this guard
-        // only covered app.js — so the page the owner actually uses kept printing "message(s)"
-        // and UTC while the suite stayed green. Guarding one of two assets that render the same
-        // two fields is not a guard; it is a coin flip about which file someone edits next.
+        // Both defects were fixed first on the older page that used to be served at `/` and never
+        // carried across, and this guard only covered that page — so the page the owner actually
+        // uses kept printing "message(s)" and UTC while the suite stayed green. That page is gone
+        // (`#302 root-is-the-app`); the guard is over the one page there is.
         assert!(
             !VOICE_JS.contains("(s)"),
             "web/voice.js still renders a parenthesised plural"
@@ -2414,8 +2414,8 @@ mod tests {
     ///
     /// `async function` counts as the next one. It did not used to, and the consequence was that
     /// a body ran on through every `async` declaration after it until the next synchronous one —
-    /// so an assertion about one function was quietly an assertion about three. web/app.js is
-    /// mostly `async`, which is where that first mattered.
+    /// so an assertion about one function was quietly an assertion about three. The older page that
+    /// used to be served at `/` was mostly `async`, which is where that first mattered.
     fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source
             .find(signature)
@@ -2451,7 +2451,7 @@ mod tests {
             assert!(
                 function_body(VOICE_JS, renderer).contains("foldable("),
                 "`{renderer}` in web/voice.js no longer folds long messages, so the two message \
-                 lists on /voice disagree about what a long message looks like"
+                 lists on the page disagree about what a long message looks like"
             );
         }
         // Which only means anything while both places that put a turn on screen go through it:
@@ -2541,84 +2541,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_phone_app_pluralizes_and_never_prints_the_placeholder_form() {
-        // `#62 message-count-accuracy`. `message(s)` is the shape of the defect: it is what a
-        // renderer writes when it has not decided whether it knows the number. The bytes asserted
-        // on here are exactly the bytes `GET /app.js` serves.
-        assert!(
-            !APP_JS.contains("(s)"),
-            "web/app.js still renders a parenthesised plural"
-        );
-        assert!(
-            APP_JS.contains("function messageCount("),
-            "the count helper is what keeps the two call sites honest and identical"
-        );
-        assert!(
-            APP_JS.contains("complete !== true"),
-            "a server too old to send `complete` must be treated as unknown, not as complete"
-        );
-    }
-
-    #[test]
-    fn the_phone_app_shows_the_time_the_server_already_converted() {
-        // `#52 operator-timezone`. The phone and the voice agent must say the same thing about
-        // when a message arrived; the only way to guarantee that is for both to render the one
-        // string the server computed, rather than each slicing the ISO value their own way.
-        assert!(
-            APP_JS.contains("message.spoken_time ||"),
-            "web/app.js must prefer the server-converted time, with the ISO slice as fallback"
-        );
-        assert!(
-            APP_JS.contains("spoken_time: entry.spoken_time"),
-            "a digest entry carries the converted time too; dropping it here would make the \
-             digest list silently fall back to UTC while the scrollback shows local time"
-        );
-    }
-
-    /// Every place either served page names a channel, and the one function that decides the name.
+    /// Every place the page names a channel, and the one function that decides the name.
     ///
-    /// The list is the point. `#52 operator-timezone` and `#62 message-count-accuracy` were each
-    /// fixed on one of these two files and carried across afterwards, at the cost of a round trip
-    /// both times, and `#39 channel-alias` walked into it a third time: the alias reached
-    /// /voice and the voice agent while `/` went on printing the configured label, so one
-    /// deployment showed two names for one channel.
-    const NAMES_A_CHANNEL: [(&str, &str, &[&str]); 2] = [
-        (
-            "web/app.js",
-            APP_JS,
-            // Both pickers are filled by one function; the header is written on both read paths.
-            &[
-                "function fillChannelSelects(",
-                "function loadDigest(",
-                "function loadScrollback(",
-            ],
-        ),
-        (
-            "web/voice.js",
-            VOICE_JS,
-            // Both pickers again, the head of the channel on each of its three writers, and the
-            // head of the to-do list. The older-page writer is `loadOlderPage`: `loadOlder` only
-            // hands out the step in flight since `#204 reply-arrow`. The newest page is drawn by
-            // `drawChannelPage`, for `loadDiscord` and for the late answer of a read it gave up on
-            // (`remote-ops-audit` W7).
-            &[
-                "function fillChannelSelect(",
-                "function drawChannelPage(",
-                "function loadOlderPage(",
-                "function restateChannelSeam(",
-                "function todoSummary(",
-            ],
-        ),
-    ];
+    /// The list is the point. `#39 channel-alias` reached the voice agent and this page while the
+    /// older page then served at `/` went on printing the configured label, so one deployment
+    /// showed two names for one channel; a renderer added beside these and written against the
+    /// label directly would do the same within one page.
+    const NAMES_A_CHANNEL: [(&str, &str, &[&str]); 1] = [(
+        "web/voice.js",
+        VOICE_JS,
+        // Both pickers, the head of the channel on each of its three writers, and the head of the
+        // to-do list. The older-page writer is `loadOlderPage`: `loadOlder` only hands out the
+        // step in flight since `#204 reply-arrow`. The newest page is drawn by `drawChannelPage`,
+        // for `loadDiscord` and for the late answer of a read it gave up on (`remote-ops-audit`
+        // W7).
+        &[
+            "function fillChannelSelect(",
+            "function drawChannelPage(",
+            "function loadOlderPage(",
+            "function restateChannelSeam(",
+            "function todoSummary(",
+        ],
+    )];
 
     #[test]
-    fn both_served_pages_call_a_channel_what_the_operator_called_it() {
+    fn the_page_calls_a_channel_what_the_operator_called_it() {
         // `#39 channel-alias`. `ChannelInfo::display_name` is the rule on this side of the wire;
-        // `channelName` is the same rule in the browser, and it exists twice because two served
-        // assets with no build step between them cannot share a module. That is exactly the
-        // arrangement the guards above were written for, so it gets the same treatment: the RULE
-        // is asserted over the bytes of BOTH files, and so is every call site of it.
+        // `channelName` is the same rule in the browser. The RULE is asserted over the bytes the
+        // page is served, and so is every call site of it.
         for (name, source, renderers) in NAMES_A_CHANNEL {
             let rule = function_body(source, "function channelName(");
             assert!(
@@ -2648,18 +2598,12 @@ mod tests {
     }
 
     #[test]
-    fn no_served_page_grows_a_second_opinion_about_a_channels_name() {
+    fn the_page_grows_no_second_opinion_about_a_channels_name() {
         // The other half, and the half that keeps the list above honest: a call site added later
         // is not covered by a list written today. `.label` is the shape of the defect, so it is
         // allowed in exactly two places — the fallback inside `channelName`, and the alias editor
-        // on /voice, which names the configured label deliberately so the owner can see what
+        // in Settings, which names the configured label deliberately so the owner can see what
         // clearing would go back to.
-        assert_eq!(
-            APP_JS.matches(".label").count(),
-            1,
-            "web/app.js reads a channel's configured label somewhere other than the fallback \
-             inside channelName"
-        );
         assert_eq!(
             channel_label_reads_in_voice_page(VOICE_JS),
             3,
@@ -2671,7 +2615,7 @@ mod tests {
                 .matches(".label")
                 .count(),
             2,
-            "the alias editor on /voice must be where the other two readings of the configured \
+            "the alias editor in Settings must be where the other two readings of the configured \
              label are; if they moved, this count is guarding the wrong thing"
         );
     }
@@ -2701,7 +2645,7 @@ mod tests {
     }
 }
 
-// --- durable state: the /voice transcript, and this server's own inbox ------------------------
+// --- durable state: the conversation transcript, and this server's own inbox ----------------
 //
 // These five conversation routes are the only handlers on this server that do not consult
 // `ops::allowed`, because a conversation is not a channel: it is the owner's own session with
@@ -2710,8 +2654,8 @@ mod tests {
 //
 // ALL OF THEM REQUIRE THE WRITE SCOPE, including the reads. A transcript is the owner's own
 // speech plus whatever channel text the agent read aloud to him, which is strictly more sensitive
-// than a digest of a channel he already allowlisted — and /voice, the only thing that uses these,
-// already holds the write token. A read-scope token deliberately gets 403 here, and a test
+// than a digest of a channel he already allowlisted — and the web app, the only thing that uses
+// these, already holds the write token. A read-scope token deliberately gets 403 here, and a test
 // asserts that rather than assuming it.
 //
 // NONE OF THEM IS AN MCP TOOL, and a test in tests/mcp.rs holds that line. The model does not
