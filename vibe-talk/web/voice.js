@@ -32775,7 +32775,13 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail, facts = nul
         const kept = foldLiveMessage(placed, !facts, replayed);
         // `#278 page-live-reads`. Kept from a read on the wire that was cut before it.
         if (!replayed) noteLiveArrival(kept, !facts, facts);
-        if (facts && !replayed && applyThreadFacts(facts)) liveChangedHidden = true;
+        // ...and drawn on coming back as a visible arrival is (`drawLiveChange`): what its facts
+        // changed, and a reply, which `foldLiveMessage` has already counted on its root, its card
+        // and the heading over its thread, so that its facts may find nothing left to change.
+        const counted = facts !== null && !replayed && applyThreadFacts(facts);
+        const thread = threadOf(kept);
+        const reply = thread !== null && kept.thread.is_root !== true && thread !== channelCanon.scope;
+        if (counted || (reply && !replayed)) liveChangedHidden = true;
         liveArrivedHidden = true;
         if (owed) {
           liveReadOwedHidden = true;

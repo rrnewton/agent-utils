@@ -3096,6 +3096,8 @@ A view this page holds while another is shown — a thread left for Main, Main l
 right column's thread left for another — is drawn again from the store when it is shown again: what
 its rows say, not only which rows there are. An edit the stream delivered meanwhile is there, with no
 read; so are the words a read of that view brought if it landed after the reader came back to it.
+On a page that was hidden, a reply that arrived meanwhile is drawn on coming back with its count, on
+its root, its card and the heading over its thread.
 
 While an adapter's pushed stream is attached the poll waits fifteen minutes instead of forty-five
 seconds, since the stream carries every creation, edit and removal. It goes back to forty-five

@@ -52281,7 +52281,8 @@ test("`#278 page-live-reads`: a placed reply removed while a read sent before it
 // Google Chat bridge's today, behind its pushed stream — was taken as answering the read a reply
 // the stream did not place had owed, when it carries no reply and no root whose count moved. A view
 // this page held while another was shown came back with the words from before an edit the stream
-// had delivered, since only its ids were compared. Each test below fails on 8eb312bc's page; those
+// had delivered, since only its ids were compared. And the heading over an open thread missed a
+// placed reply delivered while the page was hidden. Each test below fails on 8eb312bc's page; those
 // named PROBE are the reviewer's probes, and the others reach the same gaps another way.
 
 /**
@@ -52448,6 +52449,37 @@ test("`#278 page-live-reads`: in two columns, an edit delivered while the right 
   assert.match(page.el("side-log").text(), /edited while the right column showed the other thread/,
     "the right column came back to the thread with the words from before the edit");
   assert.doesNotMatch(page.el("side-log").text(), /first thread answer/);
+});
+
+test("`#278 page-live-reads`: the heading over an open thread takes the count of a placed reply delivered while the page was hidden (PROBE-HH)", async () => {
+  /** The heading over the thread 90 s after coming back, whether the reply is drawn, and the reads since. */
+  const run = async (script) => {
+    const { page, server } = await pushedPage({}, script);
+    await pickThread(page, `thread:${page.threads[0].id}`);
+    await page.settle();
+    const facts = () => page.el("thread-facts").textContent;
+    assert.match(facts(), / · 1$/, `the heading does not count one reply, so this proves nothing: ${facts()}`);
+    await page.setVisibility("hidden");
+    const root = page.messages.find((m) => m.id === "201");
+    const reply = server.post(message({ id: "597", content: "a placed reply while the page was hidden",
+      thread: { ...root.thread, is_root: false } }));
+    await deliver(page, page.stream(), sseMessage(reply, { thread_facts: placedFacts(reply, 2) }));
+    await page.settle();
+    const reads = server.reads.length;
+    await page.setVisibility("visible");
+    await page.settle();
+    await healthyWalk(page, 90000);
+    return { facts: facts(), drawn: shownIds(page).includes("597"), reads: server.reads.slice(reads) };
+  };
+  const { facts, drawn, reads } = await run(SCRIPT);
+  assert.ok(drawn, "the placed reply was not drawn on coming back");
+  assert.match(facts, / · 2$/, `the heading over the thread did not take the reply: ${facts}`);
+  assert.deepStrictEqual(reads, [], "a placed reply was read for");
+  // THE CONTROL: only what the reply's facts changed is drawn on coming back.
+  const control = await run(brokenScript(
+    "        if (counted || (reply && !replayed)) liveChangedHidden = true;",
+    "        if (counted) liveChangedHidden = true;"));
+  assert.match(control.facts, / · 1$/, "the control's heading took the reply anyway, so this test cannot see it missed");
 });
 
 test("`#278 page-live-reads`: a thread the reader leaves and comes back to while its read is out shows the words that read brings when it lands", async () => {
