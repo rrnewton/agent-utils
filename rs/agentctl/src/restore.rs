@@ -657,15 +657,19 @@ fn registered_names(registry: &Path) -> Result<Vec<String>> {
 }
 
 /// Every boot id the registry's anchors were pinned under.
+///
+/// Only running records count, and only the process each pinned (a native harness, or a custom
+/// pane's process), so a stale or stopped record cannot make an ordinary run look like a restart.
 fn anchored_boots(registry: &Path, names: &[String]) -> Vec<String> {
     let mut boots = names
         .iter()
         .filter_map(|name| {
             let bytes = fs::read(registry.join(name).join("agent.json")).ok()?;
             let record: Value = serde_json::from_slice(&bytes).ok()?;
-            record["harness_identity"]["boot_id"]
-                .as_str()
-                .map(str::to_owned)
+            (record["lifecycle"] == "running").then_some(())?;
+            ["harness_identity", "custom_process_identity"]
+                .iter()
+                .find_map(|key| record[*key]["boot_id"].as_str().map(str::to_owned))
         })
         .collect::<Vec<_>>();
     boots.sort();
@@ -728,14 +732,22 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             )
         })
         .collect::<Vec<_>>();
-    let lines = [
-        format!(
-            "[agentctl restore] The host restarted: boot {}{}.",
-            report["boot_id"].as_str().unwrap_or("?"),
-            boot_time.map_or_else(String::new, |time| format!(
-                ", kernel boot at Unix time {time}"
-            ))
-        ),
+    let restarted = report["restart_detected"] == true;
+    let mut lines = vec![
+        if restarted {
+            format!(
+                "[agentctl restore] The host restarted: boot {}{}.",
+                report["boot_id"].as_str().unwrap_or("?"),
+                boot_time.map_or_else(String::new, |time| format!(
+                    ", kernel boot at Unix time {time}"
+                ))
+            )
+        } else {
+            format!(
+                "[agentctl restore] Restore on the current boot {}; no restart detected (every running agent was pinned on this boot).",
+                report["boot_id"].as_str().unwrap_or("?")
+            )
+        },
         format!("Revived: {}.", list("revived", &pane)),
         format!("Promoted: {}.", list("promoted", &pane)),
         format!("Refused: {}.", list("refused", &reason)),
@@ -767,10 +779,14 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             "Slot images: {} {mounted} remounted, {warnings} not mounted.",
             images["action"].as_str().unwrap_or("?")
         ),
-        "Session crons and background shells did not survive; re-create them from your notes."
-            .to_owned(),
-        format!("Report: {}", path.display()),
     ];
+    if restarted {
+        lines.push(
+            "Session crons and background shells did not survive; re-create them from your notes."
+                .to_owned(),
+        );
+    }
+    lines.push(format!("Report: {}", path.display()));
     lines.join("\n")
 }
 
@@ -819,6 +835,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
         "boot_id": boot_id,
         "boot_time": host.boot_time(),
         "previous_boots": boots.iter().filter(|boot| **boot != boot_id).collect::<Vec<_>>(),
+        "restart_detected": boots.iter().any(|boot| *boot != boot_id),
         "started_at": host.now(),
         "dry_run": options.dry_run,
         "report": path,

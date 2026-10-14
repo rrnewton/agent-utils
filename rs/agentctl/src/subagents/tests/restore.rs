@@ -11,6 +11,7 @@ const BOOT: &str = "11111111-2222-3333-4444-555555555555";
 
 /// A host whose commands answer from a script and whose clock only moves when it sleeps.
 struct ScriptedHost {
+    boot: String,
     now: Cell<f64>,
     boot_time: u64,
     calls: RefCell<Vec<Vec<String>>>,
@@ -20,6 +21,7 @@ struct ScriptedHost {
 impl ScriptedHost {
     fn new() -> Self {
         Self {
+            boot: BOOT.to_owned(),
             now: Cell::new(2_000_000_000.0),
             boot_time: 2_000_000_000 - 3600,
             calls: RefCell::new(Vec::new()),
@@ -51,7 +53,7 @@ impl ScriptedHost {
 
 impl Host for ScriptedHost {
     fn boot_id(&self) -> crate::subagents::Result<String> {
-        Ok(BOOT.to_owned())
+        Ok(self.boot.clone())
     }
     fn boot_time(&self) -> Option<u64> {
         Some(self.boot_time)
@@ -486,6 +488,11 @@ fn restore_revives_the_coordinator_first_re_registers_it_and_queues_one_notice()
         "{text}"
     );
     assert!(text.contains("Revived: coordinator ->"), "{text}");
+    assert!(
+        text.contains("Session crons and background shells did not survive"),
+        "{text}"
+    );
+    assert_eq!(report["restart_detected"], true);
 }
 
 #[test]
@@ -622,4 +629,45 @@ fn restore_leaves_excluded_records_alone_and_never_excludes_the_coordinator() {
     )
     .unwrap();
     assert!(RestoreConfig::load(&registry).is_err());
+}
+
+#[test]
+fn a_restore_on_the_boot_its_agents_were_pinned_on_says_no_restart_and_keeps_crons() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    // The fake pins every harness under this boot id.
+    let host = ScriptedHost {
+        boot: "22222222-3333-4444-5555-666666666666".to_owned(),
+        ..ScriptedHost::new()
+    };
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, Some("coordinator")),
+        &options(None),
+    )
+    .unwrap();
+    assert_eq!(report["restart_detected"], false);
+    assert_eq!(report["coordinator"]["action"], "skipped");
+    let text = fixture.client.runs.lock().unwrap().join("\n");
+    assert!(
+        text.contains(
+            "Restore on the current boot 22222222-3333-4444-5555-666666666666; no restart detected"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("did not survive"), "{text}");
+    assert!(!text.contains("The host restarted"), "{text}");
 }

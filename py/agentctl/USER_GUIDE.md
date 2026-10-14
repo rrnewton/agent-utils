@@ -595,8 +595,11 @@ schema:
 }
 ```
 
-Session-scoped crons and background shells do not survive a restart; the notice
-says so, and the coordinator re-creates them.
+The report's `restart_detected` is true when a running agent's pinned process
+belongs to an earlier boot. Only then does the notice say the host restarted and
+warn that session-scoped crons and background shells did not survive; a run on
+the boot the agents were pinned on says "no restart detected" instead, so a
+coordinator does not rebuild crons that are still running.
 
 `agentctl install-units --dest ~/.config/systemd/user` writes the units that run
 this at boot, rendering absolute paths for this executable (`--agentctl`), Herdr
