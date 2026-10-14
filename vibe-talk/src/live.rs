@@ -240,6 +240,10 @@ pub struct LiveHub {
     /// Here for the reason `upstream_clear` is: both producers reach the hub, and only the hub,
     /// so this is the one place a change cannot bypass. See [`crate::recent`].
     recent: std::sync::Arc<crate::recent::RecentWindows>,
+    /// The server's message-cache handle, offered every change under the feed lock. `#208
+    /// persistent-cache`; see [`crate::cache::sink`]. Attached once, by whoever builds the server
+    /// ([`LiveHub::attach_cache`]); a hub with none attached offers nothing.
+    cache: std::sync::OnceLock<std::sync::Arc<crate::cache::Sink>>,
 }
 
 impl Default for LiveHub {
@@ -267,7 +271,22 @@ impl LiveHub {
             hint_generation,
             upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
             recent,
+            cache: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Offer every change this hub publishes to `sink` from now on. `#208 persistent-cache`.
+    ///
+    /// Once per hub: a second sink is ignored, so nothing can swap the cache a running hub feeds.
+    /// The server attaches its one sink before anything is published.
+    pub fn attach_cache(&self, sink: std::sync::Arc<crate::cache::Sink>) {
+        let _ = self.cache.set(sink);
+    }
+
+    /// The message-cache handle this hub offers its changes to, if one is attached.
+    #[must_use]
+    pub fn message_cache(&self) -> Option<&std::sync::Arc<crate::cache::Sink>> {
+        self.cache.get()
     }
 
     /// Each channel's held window. `#210 voice-catchup-speed`.
@@ -424,6 +443,17 @@ impl LiveHub {
             }
         }
         self.recent.merge(channel, &live);
+        // `#208 persistent-cache`. Queued for the message cache here, under the feed lock and
+        // before the send below, so every change a subscriber can have seen is already in the
+        // cache's queue by the time it could read the cache. Never waits; see `Sink::offer_push`.
+        if let Some(sink) = self.cache.get() {
+            let producer = if deduplicate {
+                crate::cache::ServerFill::Ingest
+            } else {
+                crate::cache::ServerFill::Poller
+            };
+            sink.offer_push(channel, &live, producer);
+        }
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {
             feed.tail.pop_front();

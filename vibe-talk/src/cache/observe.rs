@@ -25,8 +25,9 @@
 //!
 //! Everything else gives rows only: a page a caller stepped `before` to (nothing joins it to the
 //! page above it), a page carrying a `notice` (the provider says it left something out), a delta
-//! (it lists changes, not a span; a complete one's deletions are offered as such), and an empty
-//! read. Rows only still tells the cache what each message says and where it belongs.
+//! (it lists changes, not a span; a complete one's deletions are offered as such), a change pushed
+//! by the live feed, a message this server posted, and an empty read. Rows only still tells the
+//! cache what each message says and where it belongs.
 //!
 //! # Scopes, per provider
 //!
@@ -57,9 +58,10 @@
 
 use super::coverage::Source;
 use super::rows::created_ms;
-use super::{Incoming, ListEnd, ListStart, Listing, Observation, Proof, Scope, ThreadRecord};
+use super::{Incoming, ListEnd, ListStart, Listing, Observation, Proof, Push, Scope, ThreadRecord};
 use crate::chat::RecentRead;
 use crate::config::{ProviderConfig, ProviderKind};
+use crate::live::{LiveKind, LiveMessage};
 use crate::model::Message;
 use crate::threads::{ThreadApi, TimelinePage, TimelineRequest, TimelineView};
 
@@ -328,6 +330,53 @@ pub fn single(
     .collect()
 }
 
+/// What one change from the live feed tells the cache: a creation or an edit carries the message,
+/// at its home by the provider's shape; a deletion carries its id. A push is never a claim about
+/// any scope, and a creation of a message the cache does not hold is kept as possibly a snippet
+/// until a read replaces it (the writer's rule, not this one's).
+#[must_use]
+pub fn pushed(shape: Shape, live: &LiveMessage, observed_ms: i64) -> Observation {
+    let push = match live.kind {
+        LiveKind::Create | LiveKind::Update => Push::Upsert {
+            message: Box::new(Incoming::new(
+                live.message.clone(),
+                home(shape, &live.message, None),
+            )),
+            update: live.kind == LiveKind::Update,
+            partial: false,
+        },
+        LiveKind::Delete => Push::Delete {
+            id: live.message.id.clone(),
+            created_ms: None,
+        },
+    };
+    Observation::Push { push, observed_ms }
+}
+
+/// What a message this server posted tells the cache: that row, at its home, listed in the thread
+/// it was posted into, if any. A post proves nothing about the rest of the channel.
+#[must_use]
+pub fn posted(
+    shape: Shape,
+    message: &Message,
+    thread_id: Option<&str>,
+    observed_ms: i64,
+) -> Vec<Observation> {
+    let listed_in = match (shape, thread_id) {
+        (Shape::SlackThread, _) | (_, None) => None,
+        (_, Some(thread)) => Some(Scope::Thread(thread.to_owned())),
+    };
+    rows(
+        shape,
+        std::slice::from_ref(message),
+        thread_id,
+        listed_in,
+        observed_ms,
+    )
+    .into_iter()
+    .collect()
+}
+
 /// The scope a row belongs to by nature. `thread_view` is the thread a Thread view read, when the
 /// read was one.
 fn home(shape: Shape, message: &Message, thread_view: Option<&str>) -> Scope {
@@ -580,7 +629,21 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
-                Observation::Push { .. } => "push".to_owned(),
+                Observation::Push { push, .. } => match push {
+                    Push::Upsert {
+                        message,
+                        update,
+                        partial,
+                    } => format!(
+                        "push {} {}={} partial={partial}",
+                        if *update { "update" } else { "create" },
+                        message.message.id.as_str(),
+                        message.home.key()
+                    ),
+                    Push::Delete { id, created_ms } => {
+                        format!("push delete {} created={created_ms:?}", id.as_str())
+                    }
+                },
             })
             .collect()
     }
@@ -914,6 +977,56 @@ mod tests {
             describe(&single(Shape::SlackThread, &one, "m200", OBSERVED)),
             ["rows in=- m210=main"]
         );
+    }
+
+    fn live(kind: LiveKind, message: Message) -> LiveMessage {
+        LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind,
+            historical: false,
+            message,
+            self_posted: false,
+        }
+    }
+
+    #[test]
+    fn a_push_is_the_message_at_its_home_or_the_id_it_deletes_and_never_a_claim() {
+        let one = reply("m210", "m200", "in it", T);
+        #[rustfmt::skip]
+        let cases: Vec<(Shape, LiveKind, Message, &str)> = vec![
+            (Shape::Slack, LiveKind::Create, root("m100", T, 0), "push create m100=main partial=false"),
+            (Shape::Slack, LiveKind::Update, one.clone(), "push update m210=thread:m200 partial=false"),
+            (Shape::DiscordNative, LiveKind::Create, one.clone(), "push create m210=thread:m200 partial=false"),
+            (Shape::SlackThread, LiveKind::Create, one.clone(), "push create m210=main partial=false"),
+            (Shape::Bridge, LiveKind::Update, one.clone(), "push update m210=flat partial=false"),
+            (Shape::Bridge, LiveKind::Delete, one.clone(), "push delete m210 created=None"),
+            (Shape::Slack, LiveKind::Delete, root("m100", T, 0), "push delete m100 created=None"),
+        ];
+        for (shape, kind, message, expected) in cases {
+            let got = [pushed(shape, &live(kind, message), OBSERVED)];
+            assert_eq!(describe(&got), [expected], "{shape:?} {kind:?}");
+            every_observation_is_at(&got, OBSERVED);
+        }
+    }
+
+    #[test]
+    fn a_post_is_its_own_row_listed_in_the_thread_it_went_to() {
+        let top = message("m100", "a", "posted", T);
+        let into = reply("m210", "m200", "posted in a thread", T);
+        #[rustfmt::skip]
+        let cases: Vec<(Shape, &Message, Option<&str>, &str)> = vec![
+            (Shape::Slack, &top, None, "rows in=- m100=main"),
+            (Shape::Slack, &into, Some("m200"), "rows in=thread:m200 m210=thread:m200"),
+            (Shape::Slack, &top, Some("m200"), "rows in=thread:m200 m100=thread:m200"),
+            (Shape::DiscordNative, &top, None, "rows in=- m100=main"),
+            (Shape::Bridge, &into, Some("m200"), "rows in=thread:m200 m210=flat"),
+            (Shape::SlackThread, &into, Some("m200"), "rows in=- m210=main"),
+        ];
+        for (shape, message, thread, expected) in cases {
+            let got = posted(shape, message, thread, OBSERVED);
+            assert_eq!(describe(&got), [expected], "{shape:?} {thread:?}");
+            every_observation_is_at(&got, OBSERVED);
+        }
     }
 
     #[test]

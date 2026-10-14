@@ -628,6 +628,10 @@ async fn main() -> anyhow::Result<()> {
     // publishes to is indistinguishable from a quiet channel, and the setting that causes it is
     // one line in a file the operator is not looking at.
     let live = Arc::new(vibe_talk::live::LiveHub::new());
+    // `#208 persistent-cache`. The message cache's handle exists before anything can publish, and
+    // the hub offers it every change it publishes; with no cache behind it, that costs nothing.
+    let message_cache = Arc::new(vibe_talk::cache::Sink::off());
+    live.attach_cache(Arc::clone(&message_cache));
     if config.ingest.enabled() {
         tracing::info!(
             events_route = "/api/v1/live/events",
@@ -726,7 +730,7 @@ async fn main() -> anyhow::Result<()> {
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
-        message_cache: Arc::new(vibe_talk::cache::Sink::off()),
+        message_cache,
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),

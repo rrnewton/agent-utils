@@ -2405,6 +2405,15 @@ async fn post_parts(
         let parent = if index == 0 { reply_to.as_ref() } else { None };
         let key = keys.as_ref().map(|keys| keys[index].as_str());
         let into = thread_id.or(continuation.as_deref());
+        // `#208 persistent-cache`. What this server posted is offered to the message cache under
+        // the server's own grant, begun before the provider call like any read's.
+        let fill = state
+            .message_cache
+            .begin(
+                &crate::cache::FillGrant::server(crate::cache::ServerFill::OwnPost),
+                &info.id,
+            )
+            .map(|fill| (fill, into.map(str::to_owned)));
         let sent = match into {
             Some(thread) => {
                 state
@@ -2439,6 +2448,9 @@ async fn post_parts(
                             reply_count_exact: false,
                         });
                     }
+                }
+                if let Some((fill, into)) = fill {
+                    fill.offer_posted(&one, into.as_deref());
                 }
                 posted.push(one);
             }

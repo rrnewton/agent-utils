@@ -251,6 +251,11 @@ fn state_pieces_with(
         &config.providers[0].namespace(),
         config.providers[0].live_poll_seconds,
     ));
+    // As `main` builds them: the message cache's handle first, attached to the hub before anything
+    // can publish. `#208 persistent-cache`.
+    let message_cache = Arc::new(crate::cache::Sink::off());
+    let live = Arc::new(crate::live::LiveHub::new());
+    live.attach_cache(Arc::clone(&message_cache));
     let state = AppState {
         config: Arc::new(config),
         chat: providers.clone(),
@@ -275,12 +280,12 @@ fn state_pieces_with(
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
-        message_cache: Arc::new(crate::cache::Sink::off()),
+        message_cache,
         post_gate: Arc::new(crate::post_gate::PostGate::new()),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
-        live: Arc::new(crate::live::LiveHub::new()),
+        live,
         summarizer: Arc::clone(&summarizer),
         // Taken from the summariser rather than named here, exactly as `main` takes it, so a test
         // that substitutes a different backend gets that backend's cache key rather than one this
@@ -447,6 +452,23 @@ pub struct TimelineChat {
     inner: Arc<FakeDiscord>,
     as_of: Mutex<Option<String>>,
     delta: Mutex<crate::threads::TimelineDelta>,
+    hold: Mutex<Option<HoldGate>>,
+}
+
+/// The provider's side of a [`HeldRead`].
+struct HoldGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// One `/timeline` read held at the provider, from [`TimelineChat::hold_next_timeline`]: it has
+/// taken its answer from the channel as it stood and waits before handing it back, so a test can
+/// change the world underneath a read that is in flight.
+pub struct HeldRead {
+    /// Answers once the read has taken its answer and is waiting.
+    pub entered: tokio::sync::oneshot::Receiver<()>,
+    /// Send to it, or drop it, to let the read hand its answer back.
+    pub release: tokio::sync::oneshot::Sender<()>,
 }
 
 impl TimelineChat {
@@ -457,6 +479,29 @@ impl TimelineChat {
             inner,
             as_of: Mutex::new(None),
             delta: Mutex::new(crate::threads::TimelineDelta::default()),
+            hold: Mutex::new(None),
+        }
+    }
+
+    /// Hold the next `/timeline` read once it has taken its answer, until the returned
+    /// [`HeldRead::release`] is sent to or dropped.
+    #[must_use]
+    pub fn hold_next_timeline(&self) -> HeldRead {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *lock(&self.hold) = Some(HoldGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        HeldRead { entered, release }
+    }
+
+    /// Wait here if a test asked for this read to be held.
+    async fn held(&self) {
+        let gate = lock(&self.hold).take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
         }
     }
 
@@ -574,6 +619,7 @@ impl crate::chat::ChatClient for TimelineChat {
         if has_more {
             messages.drain(..messages.len() - limit);
         }
+        self.held().await;
         Ok(TimelinePage {
             next_before: has_more
                 .then(|| messages.first().map(|m| m.id.as_str().to_owned()))
@@ -1257,12 +1303,15 @@ impl crate::chat::ChatClient for CountingChat {
 }
 
 /// `state` with its channel windows kept to `timing` rather than the production durations.
-/// `#210 voice-catchup-speed`. A fresh hub, so call it before anything is published.
+/// `#210 voice-catchup-speed`. A fresh hub, so call it before anything is published. The fresh hub
+/// offers its changes to the state's own message-cache handle, as the one it replaces did.
 #[must_use]
 pub fn with_recent_timing(mut state: AppState, timing: crate::recent::Timing) -> AppState {
-    state.live = Arc::new(crate::live::LiveHub::with_recent(Arc::new(
+    let live = crate::live::LiveHub::with_recent(Arc::new(
         crate::recent::RecentWindows::with_timing(timing),
-    )));
+    ));
+    live.attach_cache(Arc::clone(&state.message_cache));
+    state.live = Arc::new(live);
     state
 }
 

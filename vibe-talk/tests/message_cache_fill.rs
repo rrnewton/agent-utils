@@ -30,6 +30,9 @@ const WAIT: Duration = Duration::from_secs(20);
 /// The provider key a single-provider test deployment names its provider by.
 const LEGACY: &str = vibe_talk::config::LEGACY_DISCORD_PROVIDER_KEY;
 
+/// The credential an adapter pushes live changes with.
+const INGEST_TOKEN: &str = "test-ingest-token-0000000000";
+
 fn id(channel: &str) -> ChannelId {
     ChannelId(channel.to_owned())
 }
@@ -323,6 +326,8 @@ fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment 
     } else {
         testing::config_toml()
     };
+    // An adapter may push changes for the channels, as the bridge's does.
+    let text = format!("{text}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n");
     let (mut state, fake, _store) = testing::state_with_store_from_toml(&text);
     let ids = (0..count)
         .map(|n| {
@@ -871,4 +876,243 @@ async fn an_unarmed_cache_is_filled_by_nothing() {
     assert!(cache.quiesce_blocking(WAIT));
     assert_eq!(cache.applied_seq(), 0, "nothing reached the writer");
     assert_eq!(held(&cache), 0);
+}
+
+// ---- changes from the live feed, and posts ------------------------------------------------------
+
+use vibe_talk::testing::HeldRead;
+
+fn flat_page() -> String {
+    format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=flat&limit=50")
+}
+
+/// Push one change through the adapter route, as a bridge's adapter does.
+async fn ingest(state: &AppState, event: Value) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/live/events")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {INGEST_TOKEN}"))
+        .body(Body::from(event.to_string()))
+        .expect("request");
+    vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+fn pushed(event_id: &str, kind: &str, message: &Message) -> Value {
+    serde_json::json!({
+        "event_id": event_id,
+        "historical": false,
+        "kind": kind,
+        "message": message,
+    })
+}
+
+fn pushed_deletion(event_id: &str, message: &MessageId) -> Value {
+    serde_json::json!({
+        "event_id": event_id,
+        "historical": false,
+        "kind": "delete",
+        "channel_id": READ_CHANNEL,
+        "message_id": message,
+    })
+}
+
+/// `message` as the fake holds it, with `content` instead of its own.
+fn saying(d: &Deployment, message: &MessageId, content: &str) -> Message {
+    Message {
+        content: content.to_owned(),
+        ..d.fake.message(message).expect("the fake holds it")
+    }
+}
+
+fn cached(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    message: &MessageId,
+) -> vibe_talk::cache::CachedMessage {
+    assert!(cache.quiesce_blocking(WAIT));
+    cache
+        .message(chan, message)
+        .served()
+        .flatten()
+        .expect("the cache holds it")
+}
+
+#[tokio::test]
+async fn a_pushed_edit_and_a_pushed_deletion_reach_the_cache() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 5, &clock);
+    get(&d.state, &flat_page()).await;
+    assert_eq!(held(&d.cache), 5);
+
+    clock.advance(MINUTE);
+    let (edited, gone) = (d.ids[3].clone(), d.ids[1].clone());
+    let edit = saying(&d, &edited, "message 3, edited upstream");
+    assert_eq!(
+        ingest(&d.state, pushed("e1", "update", &edit)).await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        ingest(&d.state, pushed_deletion("e2", &gone)).await,
+        StatusCode::ACCEPTED
+    );
+    let now = cached(&d.cache, &read_chan(), &edited);
+    assert_eq!(now.message.content, "message 3, edited upstream");
+    assert_eq!(now.observed_ms, clock.now(), "observed when it was pushed");
+    assert!(tombstoned(&d.cache, &read_chan(), &gone));
+    assert!(!holds(&d.cache, &read_chan(), &gone));
+    assert_eq!(held(&d.cache), 4);
+    // Neither claimed anything: the coverage is the read's.
+    assert_eq!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Flat)[0].listed_ms,
+        T0 + HOUR
+    );
+}
+
+#[tokio::test]
+async fn a_deletion_pushed_while_a_read_is_in_flight_is_not_undone_by_that_read() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 5, &clock);
+    get(&d.state, &flat_page()).await;
+    let gone = d.ids[2].clone();
+    assert!(holds(&d.cache, &read_chan(), &gone));
+
+    // A read begins, and takes the channel as it stands, the message still in it...
+    clock.advance(MINUTE);
+    let HeldRead { entered, release } = d.chat.hold_next_timeline();
+    let reader = d.state.clone();
+    let read = tokio::spawn(async move { get(&reader, &flat_page()).await });
+    entered.await.expect("the read reached the provider");
+    // ...and while it is on its way back, the deletion is pushed.
+    clock.advance(MINUTE);
+    assert_eq!(
+        ingest(&d.state, pushed_deletion("e1", &gone)).await,
+        StatusCode::ACCEPTED
+    );
+    assert!(tombstoned(&d.cache, &read_chan(), &gone));
+    drop(release);
+    let page = read.await.expect("the read finished");
+    assert!(
+        page["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|m| m["id"] == gone.as_str()),
+        "the read's answer still carried the message: {page}"
+    );
+    assert!(
+        tombstoned(&d.cache, &read_chan(), &gone),
+        "a read that began before the deletion does not bring the message back"
+    );
+    assert!(!holds(&d.cache, &read_chan(), &gone));
+}
+
+#[tokio::test]
+async fn a_stale_bridge_snapshot_does_not_revert_a_later_push() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 5, &clock);
+    get(&d.state, &flat_page()).await;
+
+    clock.advance(10 * MINUTE);
+    let (edited, gone) = (d.ids[3].clone(), d.ids[1].clone());
+    let pushed_at = clock.now();
+    let edit = saying(&d, &edited, "message 3, edited upstream");
+    assert_eq!(
+        ingest(&d.state, pushed("e1", "update", &edit)).await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        ingest(&d.state, pushed_deletion("e2", &gone)).await,
+        StatusCode::ACCEPTED
+    );
+
+    // A read that starts after both pushes, answered from a copy the bridge took before them.
+    clock.advance(MINUTE);
+    d.chat
+        .set_as_of(Some(vibe_talk::clock::iso_from_ms(pushed_at - 5 * MINUTE)));
+    let page = get(&d.state, &flat_page()).await;
+    assert_eq!(page["messages"].as_array().expect("messages").len(), 5);
+    assert_eq!(
+        cached(&d.cache, &read_chan(), &edited).message.content,
+        "message 3, edited upstream",
+        "the older copy's text does not come back"
+    );
+    assert!(
+        tombstoned(&d.cache, &read_chan(), &gone),
+        "nor does the deleted message"
+    );
+    assert!(!holds(&d.cache, &read_chan(), &gone));
+}
+
+#[tokio::test]
+async fn a_pushed_creation_is_a_possible_snippet_until_a_read_and_a_pushed_snippet_never_overwrites_one(
+) {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 5, &clock);
+
+    // Written upstream with a long body; the live event carries only the start of it.
+    let full = "a long body that the live event cut short";
+    let created = d
+        .fake
+        .seed_at(&id(READ_CHANNEL), "Ada", full, T0 + 5 * MINUTE);
+    let snippet = saying(&d, &created, "a long body…");
+    assert_eq!(
+        ingest(&d.state, pushed("e1", "create", &snippet)).await,
+        StatusCode::ACCEPTED
+    );
+    let first = cached(&d.cache, &read_chan(), &created);
+    assert_eq!(first.message.content, "a long body…");
+    assert!(first.content_partial, "a pushed creation may be a snippet");
+
+    // A read lists it: its text replaces the snippet, even though it started no later.
+    get(&d.state, &flat_page()).await;
+    let listed = cached(&d.cache, &read_chan(), &created);
+    assert_eq!(listed.message.content, full);
+    assert!(!listed.content_partial);
+
+    // A pushed edit that is only the start of the text a read brought changes nothing.
+    clock.advance(MINUTE);
+    let cut = saying(&d, &d.ids[2], "message…");
+    assert_eq!(
+        ingest(&d.state, pushed("e2", "update", &cut)).await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        cached(&d.cache, &read_chan(), &d.ids[2]).message.content,
+        "message 2"
+    );
+}
+
+#[tokio::test]
+async fn a_message_this_server_posts_is_written_to_the_cache() {
+    // The fake mints the first message posted to it the id below, from 2022: the cache's clock is
+    // put an hour after it, so the post is inside the cache's age limit.
+    let posted_at = MessageId("1000000000000000001".to_owned())
+        .created_at_ms()
+        .expect("a snowflake");
+    let clock = ManualClock::at(posted_at + HOUR);
+    let d = deployment(false, 0, &clock);
+    let (_channel, first, parts) =
+        vibe_talk::ops::reply(&d.state, WRITE_CHANNEL, "posted by this server", None)
+            .await
+            .expect("posted");
+    assert_eq!(parts.len(), 1);
+    assert_eq!(first.id.as_str(), "1000000000000000001");
+    let chan = ChanKey::new(LEGACY, WRITE_CHANNEL);
+    let post = cached(&d.cache, &chan, &first.id);
+    assert_eq!(post.message.content, "posted by this server");
+    assert!(
+        !post.content_partial,
+        "what a provider answers a post with is the whole message"
+    );
+    assert_eq!(
+        d.cache.memberships(&chan, &first.id),
+        Read::Served(vec![CacheScope::Main])
+    );
+    // A post proves nothing about the rest of the channel.
+    assert!(coverage(&d.cache, &chan, &CacheScope::Main).is_empty());
 }

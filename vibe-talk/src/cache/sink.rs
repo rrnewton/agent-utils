@@ -30,17 +30,27 @@
 //! after the provider's copy was taken, is never undone by it. The rows offered are the provider's
 //! own, before anything prepares them for a reader.
 //!
+//! # Changes from the live feed, and posts
+//!
+//! The live hub offers every change it publishes ([`Sink::offer_push`]) under the server's own
+//! grant, while it holds the channel's feed lock and before any subscriber is sent it: a page that
+//! saw a deletion and then reads the cache can never find the message still there for want of the
+//! deletion being queued. The lock order is the feed lock, then the cache's sequencer, and nothing
+//! here waits. A message this server posts is offered as it comes back from the provider
+//! ([`Fill::offer_posted`]), also under the server's own grant.
+//!
 //! In this build nothing installs a cache outside the tests, so the slot stays empty and every
 //! fill is refused.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use super::grant::FillGrant;
+use super::grant::{FillGrant, ServerFill};
 use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::{ChanKey, MessageCache, Observation, RouteSnapshot, Stamp};
 use crate::chat::RecentRead;
 use crate::config::{Config, ProviderKind, RecentView};
+use crate::live::LiveMessage;
 use crate::model::{ChannelId, ChannelInfo, Message};
 use crate::providers::ChatRouter;
 use crate::threads::{TimelinePage, TimelineRequest};
@@ -183,6 +193,18 @@ impl Fill {
     /// Offer one message read by id from the thread `thread_id`.
     pub fn offer_single(self, message: &Message, thread_id: &str) {
         let observations = observe::single(self.shape, message, thread_id, self.observed_ms);
+        self.offer(observations);
+    }
+
+    /// Offer one change from the live feed, observed when the fill began.
+    pub fn offer_push(self, live: &LiveMessage) {
+        let observation = observe::pushed(self.shape, live, self.observed_ms);
+        self.offer(vec![observation]);
+    }
+
+    /// Offer one message this server posted, into the thread `thread_id` when it went to one.
+    pub fn offer_posted(self, message: &Message, thread_id: Option<&str>) {
+        let observations = observe::posted(self.shape, message, thread_id, self.observed_ms);
         self.offer(observations);
     }
 
@@ -334,6 +356,21 @@ impl Sink {
         FillGrant::for_caller(caller).and_then(|grant| self.begin(&grant, channel))
     }
 
+    /// Offer one change the live hub is publishing to `channel`, from `producer`: the poller, or
+    /// an adapter's pushed event.
+    ///
+    /// Called by [`crate::live::LiveHub`] while it holds the channel's feed lock and BEFORE any
+    /// subscriber is sent the change, so a change a subscriber could have seen is already queued,
+    /// with a sequence number, by the time anyone who saw it reads the cache. So it must never
+    /// wait and never call back into the hub: the lock order is the feed lock, then the cache's
+    /// sequencer. It takes the sink's own locks and the sequencer briefly and returns; a full
+    /// queue drops the offer and marks the channel suspect, and the publish goes on regardless.
+    pub(crate) fn offer_push(&self, channel: &ChannelId, live: &LiveMessage, producer: ServerFill) {
+        if let Some(fill) = self.begin(&FillGrant::server(producer), channel) {
+            fill.offer_push(live);
+        }
+    }
+
     fn routes(&self) -> std::sync::MutexGuard<'_, Routes> {
         self.routes.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -405,6 +442,81 @@ mod tests {
             sink.begin_for(Caller::Write, &ChannelId("999".to_owned()))
                 .is_none(),
             "a channel the server does not answer for"
+        );
+    }
+
+    /// 2026-08-18T12:00:00Z.
+    const T: i64 = 1_787_054_400_000;
+
+    fn big_message(channel: &ChannelId, n: i64, body: &str) -> Message {
+        let at = T + n * 1_000;
+        Message {
+            edited_timestamp: None,
+            mentions: Vec::new(),
+            thread: None,
+            id: crate::model::MessageId::at_time_ms(at),
+            channel_id: channel.clone(),
+            author: "Ada".to_owned(),
+            author_id: crate::model::UserId("7".to_owned()),
+            author_is_bot: false,
+            timestamp: crate::clock::iso_from_ms(at),
+            spoken_time: String::new(),
+            reply_to: None,
+            content: body.to_owned(),
+            spoken_content: String::new(),
+            content_html: String::new(),
+            noise: false,
+            reactions: None,
+            heading: None,
+        }
+    }
+
+    #[test]
+    fn a_publish_with_a_full_queue_never_waits_it_drops_the_offer_and_marks_the_channel_suspect() {
+        let dir = crate::testing::TempDir::new("sink-full-queue");
+        let (state, _fake) = crate::testing::state();
+        let clock = crate::testing::ManualClock::at(T + 60 * 60 * 1_000);
+        let state = crate::testing::with_message_cache(state, dir.path(), clock);
+        let cache = state.message_cache.cache().expect("installed");
+        assert!(cache.quiesce_blocking(Duration::from_secs(10)));
+        let channel = ChannelId(crate::testing::READ_CHANNEL.to_owned());
+        let chan = ChanKey::new(crate::config::LEGACY_DISCORD_PROVIDER_KEY, channel.as_str());
+
+        // The writer stands still, so nothing leaves the queue, and every publish offers a few
+        // megabytes: the queue's byte budget runs out after a handful.
+        let resume = cache.pause_writer();
+        let body = "x".repeat(3 * 1024 * 1024);
+        let mut published = 0;
+        while !cache.is_suspect(&chan) {
+            assert!(published < 40, "the hub never offered the cache anything");
+            let started = std::time::Instant::now();
+            state
+                .live
+                .publish(&channel, big_message(&channel, published, &body));
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a publish waited on the cache"
+            );
+            published += 1;
+        }
+        assert!(published > 1, "some offers fitted before one was dropped");
+        let stats = cache.stats();
+        assert_eq!(
+            stats.ops_dropped, 1,
+            "the offer that did not fit was dropped"
+        );
+        // The publish itself went on: every message is in the channel's feed.
+        assert_eq!(
+            state.live.subscribe(&channel, None).replay.len(),
+            usize::try_from(published).expect("small")
+        );
+
+        drop(resume);
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        assert_eq!(
+            cache.counts().served().expect("counts").messages,
+            u64::try_from(published - 1).expect("small"),
+            "everything queued was applied, and the dropped offer was not"
         );
     }
 
