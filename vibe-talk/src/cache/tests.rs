@@ -458,6 +458,36 @@ fn listing_an_unchanged_row_again_writes_nothing() {
     assert_eq!(after.rows_unchanged, 3);
 }
 
+#[test]
+fn every_batch_is_counted_in_the_duration_histogram_the_stats_carry() {
+    let fx = Fixture::new("cache-batch-histogram");
+    assert_eq!(fx.cache.stats().batch_us.count(), 0);
+    assert_eq!(fx.cache.stats().batch_us.quantile_us(0.99), 0, "none yet");
+    for i in 1..=5 {
+        fx.list(vec![m(i)], T0 + i, None);
+    }
+    let stats = fx.cache.stats();
+    assert!(stats.batches >= 1);
+    assert_eq!(
+        stats.batch_us.count(),
+        stats.batches,
+        "one duration per batch"
+    );
+    let (p50, p99) = (
+        stats.batch_us.quantile_us(0.5),
+        stats.batch_us.quantile_us(0.99),
+    );
+    assert!(
+        p50 <= p99 && p99 <= stats.batch_max_us,
+        "{p50} {p99} {}",
+        stats.batch_max_us
+    );
+    let json = serde_json::to_value(&stats).expect("numbers serialize");
+    assert_eq!(json["batch_us"]["count"], stats.batches);
+    assert_eq!(json["batch_us"]["p99_us"], p99);
+    assert!(json["batch_us"]["octaves_us"].is_array());
+}
+
 // ---- the merge rules ---------------------------------------------------------------------------
 
 #[test]

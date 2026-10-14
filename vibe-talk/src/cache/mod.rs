@@ -591,8 +591,65 @@ pub struct EraseReport {
     pub reopened: bool,
 }
 
+/// Powers of two above one microsecond that [`BatchDurations`] spans: 2^27 µs, about 134 s.
+const BATCH_OCTAVES: u32 = 27;
+
+/// How long the writer's batches took, each from its first observation to its commit, in
+/// microseconds: counts in powers of two from one microsecond, each split into equal steps as the
+/// upstream profile's are ([`crate::upstream_profile::Histogram`]), so a percentile read off it is
+/// within about 6 % of the true value. Numbers only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchDurations(crate::upstream_profile::Histogram);
+
+impl Default for BatchDurations {
+    fn default() -> Self {
+        Self(crate::upstream_profile::Histogram::new(1, BATCH_OCTAVES))
+    }
+}
+
+impl BatchDurations {
+    /// How many batches were counted.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        self.0.count()
+    }
+
+    /// The duration, in microseconds, below which a fraction `q` of the batches fall. 0 when none
+    /// has been counted.
+    #[must_use]
+    pub fn quantile_us(&self, q: f64) -> u64 {
+        // A histogram's quantile is a non-negative bucket midpoint, kept within what was seen.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let us = self.0.quantile(q).round() as u64;
+        us
+    }
+
+    /// The histogram itself.
+    #[must_use]
+    pub fn histogram(&self) -> &crate::upstream_profile::Histogram {
+        &self.0
+    }
+
+    pub(crate) fn record(&mut self, us: u64) {
+        self.0.record(us);
+    }
+}
+
+impl serde::Serialize for BatchDurations {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut out = serializer.serialize_struct("BatchDurations", 5)?;
+        out.serialize_field("count", &self.count())?;
+        out.serialize_field("p50_us", &self.quantile_us(0.5))?;
+        out.serialize_field("p99_us", &self.quantile_us(0.99))?;
+        out.serialize_field("max_us", &self.0.max())?;
+        out.serialize_field("octaves_us", &self.0.octaves())?;
+        out.end()
+    }
+}
+
 /// Numbers only: what the writer has done since the handle opened.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CacheStats {
     /// Observations and control operations applied.
     pub ops_applied: u64,
@@ -660,15 +717,25 @@ pub struct CacheStats {
     pub orphans_sent: u64,
     /// [`WriterEvent`]s dropped because their subscriber's queue was full or gone.
     pub orphans_dropped: u64,
+    /// How long each batch took, as [`CacheStats::batch_max_us`] measures it: its p50 and p99.
+    pub batch_us: BatchDurations,
 }
 
 macro_rules! counters {
     ($($name:ident),* $(,)?) => {
         #[derive(Debug, Default)]
-        pub(crate) struct Stats { $(pub(crate) $name: AtomicU64,)* }
+        pub(crate) struct Stats {
+            $(pub(crate) $name: AtomicU64,)*
+            /// Every batch's duration, in microseconds. Locked by the writer once per batch, and
+            /// by whoever reads the stats.
+            pub(crate) batch_us: Mutex<BatchDurations>,
+        }
         impl Stats {
             fn snapshot(&self) -> CacheStats {
-                CacheStats { $($name: self.$name.load(Ordering::Relaxed),)* }
+                CacheStats {
+                    $($name: self.$name.load(Ordering::Relaxed),)*
+                    batch_us: lock(&self.batch_us).clone(),
+                }
             }
         }
     };
@@ -716,6 +783,13 @@ impl Stats {
 
     pub(crate) fn max(counter: &AtomicU64, value: u64) {
         counter.fetch_max(value, Ordering::Relaxed);
+    }
+
+    /// Count one committed batch that took `us` microseconds.
+    pub(crate) fn batch(&self, us: u64) {
+        Self::add(&self.batches, 1);
+        Self::max(&self.batch_max_us, us);
+        lock(&self.batch_us).record(us);
     }
 }
 

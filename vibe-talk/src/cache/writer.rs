@@ -804,8 +804,7 @@ impl Writer<'_> {
         // Sent before the applied mark moves, so a barrier that saw this batch applied sees its
         // events sent too.
         self.announce();
-        Stats::add(&self.shared.stats.batches, 1);
-        Stats::max(&self.shared.stats.batch_max_us, micros(started.elapsed()));
+        self.shared.stats.batch(micros(started.elapsed()));
         self.work.merge = true;
         self.backfill_armed = true;
         self.last_batch = Instant::now();
