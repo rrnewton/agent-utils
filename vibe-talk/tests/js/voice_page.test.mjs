@@ -1443,6 +1443,29 @@ function voicePostPrefixView(fields = {}) {
 }
 
 /**
+ * `#208 persistent-cache`. What client-config says about the server's saved messages, as
+ * `contract::MessageCacheStatus`: an open cache holding something, unless a test says otherwise.
+ * Absent fields are absent, as the server omits `reason` and `oldest_covered` when there is none.
+ */
+function messageCacheStatus(fields = {}) {
+  const status = {
+    available: true,
+    enabled: true,
+    bytes: 3 * 1024 * 1024 + 400 * 1024,
+    messages: 1200,
+    channels: 3,
+    oldest_covered: "2026-08-10T12:00:00Z",
+    max_days: 14,
+    max_megabytes: 256,
+    ...fields,
+  };
+  for (const key of Object.keys(status)) {
+    if (status[key] === undefined) delete status[key];
+  }
+  return status;
+}
+
+/**
  * Stand-in for `vibe_talk::replay::PREAMBLE`.
  *
  * Deliberately not the real text: the page must not depend on the WORDS of a payload the server
@@ -1723,6 +1746,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         voice_prompt: page.voicePrompt,
         // `#303 voice-post-prefix`. Absent when a test sets it to `undefined`.
         voice_post_prefix: page.voicePostPrefix,
+        // `#208 persistent-cache`. Absent unless a test sets it, as a server with no [message_cache]
+        // table sends none — and as any server does to a read token.
+        message_cache: page.messageCache,
         // `#199 removable-config-channels`. Absent when nothing is hidden, as the server omits it.
         hidden_channels: page.hiddenChannels.length
           ? page.hiddenChannels.map((channel) => ({ alias: null, added: false, ...channel }))
@@ -2119,6 +2145,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     voicePostPrefixCalls: [],
     /** Set to a status to make the prefix route refuse, the way a store-less server does. */
     voicePostPrefixStatus: null,
+    /**
+     * `#208 persistent-cache`: the server's saved messages, as client-config reports them, and as
+     * the switch route keeps them. `undefined` sends nothing, as a server without the table does.
+     */
+    messageCache: undefined,
+    /** Every request the page made to the switch route, as `METHOD` or `METHOD body`, in order. */
+    messageCacheCalls: [],
+    /** Set to `{status, error, detail}` to make the switch route refuse that way. */
+    messageCacheFailure: null,
     /** How many times the page has read the to-do list. */
     todoReads: 0,
     /**
@@ -2963,6 +2998,36 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           page.voicePostPrefix = voicePostPrefixView({ prefix: oneLine.trim() ? oneLine : "", custom: true });
         }
         return json(200, page.voicePostPrefix);
+      }
+      // `#208 persistent-cache`. The owner's switch for the server's saved messages, as a small model
+      // of `cache::lifecycle`: off erases and stays off; on opens an empty file, and is refused where
+      // the configuration turns the cache off; erase empties an open file and stays on. Each answers
+      // the status it left, as the server does.
+      if (String(path) === "/api/v1/message-cache") {
+        const method = (options && options.method) || "GET";
+        const body = options && options.body !== undefined ? JSON.parse(options.body) : null;
+        page.messageCacheCalls.push(body === null ? method : `${method} ${JSON.stringify(body)}`);
+        if (page.messageCacheFailure) {
+          const { status, error, detail } = page.messageCacheFailure;
+          return json(status, { error, detail });
+        }
+        const now = page.messageCache || messageCacheStatus();
+        const empty = { bytes: 0, messages: 0, channels: 0, oldest_covered: undefined };
+        if (method === "PUT" && body.enabled === false) {
+          const reason = now.reason === "config_disabled" ? "config_disabled" : "switched_off";
+          page.messageCache = messageCacheStatus({ ...now, ...empty, available: false, enabled: false, reason });
+        } else if (method === "PUT") {
+          if (now.reason === "config_disabled") {
+            return json(409, {
+              error: "message_cache_not_enabled",
+              detail: "the server's configuration turns the message cache off; only the operator can turn it on",
+            });
+          }
+          page.messageCache = messageCacheStatus({ ...now, ...empty, available: true, enabled: true, reason: undefined });
+        } else if (method === "DELETE" && now.available) {
+          page.messageCache = messageCacheStatus({ ...now, ...empty });
+        }
+        return json(200, page.messageCache || now);
       }
       if (/\/not-noise$/.test(String(path))) {
         const body = JSON.parse((options && options.body) || "null");
