@@ -239,6 +239,7 @@ struct Hot<'c> {
     tomb_select: Statement<'c>,
     tomb_upsert: Statement<'c>,
     tomb_delete: Statement<'c>,
+    claim_select: Statement<'c>,
     thread_upsert: Statement<'c>,
     fts_flush: Statement<'c>,
     fts_config: Statement<'c>,
@@ -290,6 +291,13 @@ impl<'c> Hot<'c> {
             )?,
             tomb_delete: conn
                 .prepare("DELETE FROM tombstone WHERE chan = ?1 AND message_id = ?2")?,
+            // The claim of one scope that starts at or before an instant: the one that holds it,
+            // if any does.
+            claim_select: conn.prepare(
+                "SELECT t1_ms, listed_ms FROM coverage
+                 WHERE chan = ?1 AND scope_key = ?2 AND t0_ms <= ?3
+                 ORDER BY t0_ms DESC LIMIT 1",
+            )?,
             // A record derived from a reply carries no count, and changes the stored one only
             // when it moves the activity forward or names the root: re-listing a thread's
             // replies writes nothing.
@@ -1302,6 +1310,31 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Rule 4 for a message the file does not hold, created at `created`: when a claim of its home
+    /// scope `home_key` holds that instant and was listed by a read that began after `observed_ms`,
+    /// that read listed the stretch without it, and the message was gone by then. The time that
+    /// read began, if one did. Claims never enter a scope's unsettled band.
+    fn listed_without(
+        &mut self,
+        chan_id: i64,
+        home_key: &str,
+        created: i64,
+        observed_ms: i64,
+    ) -> rusqlite::Result<Option<i64>> {
+        let claim = self
+            .hot
+            .claim_select
+            .query_row(params![chan_id, home_key, created], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        Ok(claim
+            .filter(|&(t1_ms, listed_ms)| {
+                merge::absent_is_deleted(observed_ms, listed_ms, created, t1_ms)
+            })
+            .map(|(_, listed_ms)| listed_ms))
+    }
+
     /// Delete a row, because the message was deleted upstream, and leave a tombstone of ids and
     /// times only.
     fn tombstone(
@@ -1409,6 +1442,21 @@ impl Writer<'_> {
             .row_select
             .query_row(params![chan_id, id], Row::from_sql)
             .optional()?;
+        if held.is_none() {
+            if let Some(listed_ms) =
+                self.listed_without(chan_id, &incoming.home.key(), created, observed_ms)?
+            {
+                // Rule 4, applied on arrival: a listing of its home scope that began after this
+                // copy was seen proved the stretch it was written in without it. Had the file
+                // held it then, that listing would have tombstoned it; it does so now.
+                self.hot
+                    .tomb_upsert
+                    .execute(params![chan_id, id, created, listed_ms])?;
+                self.orphan(chan, id, None);
+                Stats::add(&self.shared.stats.rows_held_by_tombstone, 1);
+                return Ok(());
+            }
+        }
         let (row_id, created) = match held {
             None => {
                 let partial = merge::new_row_partial(arrival, offered_partial);

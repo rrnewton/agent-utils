@@ -669,6 +669,54 @@ fn absence_from_an_exhaustive_home_listing_spares_the_band_and_rows_pushed_meanw
 }
 
 #[test]
+fn a_message_never_held_is_absent_on_arrival_when_a_later_listing_proved_its_stretch_without_it() {
+    let fx = Fixture::new("cache-absent-on-arrival");
+    let rows = |rows: Vec<Message>, observed_ms: i64| Observation::Rows {
+        rows: rows
+            .into_iter()
+            .map(|m| Incoming::new(m, Scope::Main))
+            .collect(),
+        scope: None,
+        observed_ms,
+    };
+    // A read that started at 200 proves main from its start without m2 and m4.
+    let proof = newest_proof(ListStart::ScopeStart);
+    fx.list(vec![m(1), m(3), m(10)], T0 + 200, Some(proof));
+    // A read that started at 150, before it, lands only now: m2 was gone by 200.
+    fx.offer(&fx.chan, rows(vec![m(2)], T0 + 150));
+    assert_eq!(content(&fx, "m2"), None, "a deleted message put back");
+    assert!(fx
+        .cache
+        .tombstoned(&fx.chan, &mid("m2"))
+        .served()
+        .expect("served"));
+    // So was m4, which the live feed saw at 190 and the poller publishes late.
+    push(&fx, m(4), false, T0 + 190);
+    assert_eq!(content(&fx, "m4"), None);
+    assert_eq!(fx.cache.stats().rows_held_by_tombstone, 2);
+    // A read that began after the listing says it exists again.
+    fx.offer(&fx.chan, rows(vec![m(4)], T0 + 250));
+    assert!(content(&fx, "m4").is_some());
+    // The unsettled band proves nothing: a row seen before the listing, inside it, is held.
+    let late = message("late", "ada", "late", T0 + 10 * STEP - 60_000);
+    push(&fx, late, false, T0 + 150);
+    assert!(content(&fx, "late").is_some());
+    // Nor does a listing of main say anything of a reply, whose home is its thread.
+    fx.offer(
+        &fx.chan,
+        Observation::Rows {
+            rows: vec![Incoming::new(
+                reply("r1", "m1", "a reply", T0 + 2 * STEP),
+                Scope::Thread("m1".to_owned()),
+            )],
+            scope: None,
+            observed_ms: T0 + 150,
+        },
+    );
+    assert!(content(&fx, "r1").is_some());
+}
+
+#[test]
 fn a_push_of_the_text_already_held_protects_the_row_from_an_older_listings_absence() {
     let fx = Fixture::new("cache-push-refresh");
     let proof = newest_proof(ListStart::At(T0));

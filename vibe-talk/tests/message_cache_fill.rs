@@ -2075,3 +2075,176 @@ async fn the_sweep_forgets_a_channel_off_the_list_but_not_one_still_listed_under
         }
     }
 }
+
+// ---- a read that began before a deletion, landing after a read that began after it -------------
+
+/// A request with `token`, for the reads a test makes only to see what the shadow counts.
+async fn call_as(state: &AppState, uri: &str, token: &str) -> StatusCode {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+/// What the shadow has counted for one consumer, once every evaluation is counted.
+async fn shadow_of(state: &AppState, consumer: &str) -> vibe_talk::cache::shadow::ConsumerCounts {
+    assert!(state.message_cache.shadow_settled(WAIT).await);
+    state
+        .message_cache
+        .shadow_counts()
+        .into_iter()
+        .find(|counts| counts.consumer == consumer)
+        .expect("a consumer the shadow counts")
+}
+
+/// Whether some complete claim of the read channel's `main` holds the instant `at_ms`.
+fn proven(cache: &MessageCache, at_ms: i64) -> bool {
+    coverage(cache, &read_chan(), &CacheScope::Main)
+        .iter()
+        .any(|claim| claim.complete && claim.t0_ms <= at_ms && at_ms < claim.t1_ms)
+}
+
+/// On a cache that never held the message (a fresh one, as after an erase), a `/messages` read that
+/// began before an older message was deleted lands after a `/timeline` read that began after the
+/// deletion and proved that stretch of the channel without it. The earlier read must not put the
+/// message back: its absence from the later listing is a deletion, whether or not the file held it.
+#[tokio::test]
+async fn a_read_that_began_before_a_deletion_never_puts_back_a_message_a_later_listing_proved_gone()
+{
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(false, 20, &clock).await;
+    let HeldRead { entered, release } = d.chat.hold_next_recent();
+    let slow = {
+        let state = d.state.clone();
+        tokio::spawn(async move {
+            call(
+                &state,
+                "GET",
+                &format!("/api/v1/channels/{READ_CHANNEL}/messages?limit=50"),
+            )
+            .await
+            .0
+        })
+    };
+    entered.await.expect("the slow read took its answer");
+
+    clock.advance(MINUTE);
+    let gone = d.ids[5].clone();
+    d.fake.delete(&gone);
+    get(
+        &d.state,
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
+    )
+    .await;
+    assert!(!holds(&d.cache, &read_chan(), &gone));
+    assert!(
+        proven(&d.cache, T0 + 5 * MINUTE),
+        "the later read proved the stretch"
+    );
+
+    clock.advance(MINUTE);
+    drop(release);
+    assert_eq!(slow.await.expect("joined"), StatusCode::OK);
+    assert!(
+        !holds(&d.cache, &read_chan(), &gone),
+        "a message deleted before the later read began is in the file again"
+    );
+    assert!(
+        tombstoned(&d.cache, &read_chan(), &gone),
+        "its absence is a deletion"
+    );
+    assert!(
+        holds(&d.cache, &read_chan(), &d.ids[6]),
+        "the rest of the slow read landed"
+    );
+}
+
+/// The same race through the live poller: its walk forward takes a burst that includes a message,
+/// the message is deleted and a write-scope read lists the channel without it, and only then does
+/// the walk publish what it read. The cache must not hold the deleted message, nor count it as one
+/// it would serve by id.
+#[tokio::test]
+async fn a_pollers_publish_never_inserts_a_message_a_later_listing_proved_gone() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(false, 5, &clock).await;
+    let mut cursor = None;
+    poll_once(
+        d.state.chat.as_ref(),
+        &d.state.live,
+        &id(READ_CHANNEL),
+        50,
+        &mut cursor,
+    )
+    .await
+    .expect("the first read seeds the cursor");
+
+    // A burst: one message that will be deleted, then more, past the unsettled band.
+    let doomed = d
+        .fake
+        .seed_at(&id(READ_CHANNEL), "Ada", "doomed words", T0 + 5 * MINUTE);
+    for n in 6..20 {
+        d.fake.seed_at(
+            &id(READ_CHANNEL),
+            "Ada",
+            &format!("message {n}"),
+            T0 + n * MINUTE,
+        );
+    }
+    clock.advance(MINUTE);
+    let (walk, HeldRead { entered, release }) = HeldWalk::holding(&d.fake);
+    let hub = Arc::clone(&d.state.live);
+    let poll = tokio::spawn(async move {
+        poll_once(walk.as_ref(), &hub, &id(READ_CHANNEL), 50, &mut cursor)
+            .await
+            .map(|tick| tick.published)
+    });
+    entered.await.expect("the walk took its page");
+
+    // While the walk's page is on its way back, the message is deleted and a read lists without it.
+    clock.advance(MINUTE);
+    d.fake.delete(&doomed);
+    get(
+        &d.state,
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
+    )
+    .await;
+    assert!(!holds(&d.cache, &read_chan(), &doomed));
+    assert!(
+        proven(&d.cache, T0 + 5 * MINUTE),
+        "the read proved the stretch"
+    );
+
+    clock.advance(MINUTE);
+    drop(release);
+    assert_eq!(poll.await.expect("joined").expect("polled"), 15);
+    assert!(
+        !holds(&d.cache, &read_chan(), &doomed),
+        "the poller's publish put a message a later listing proved gone into the file"
+    );
+
+    // Upstream no longer has it, and the cache must not count it as one it would serve.
+    clock.advance(5_000);
+    let status = call_as(
+        &d.state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            doomed.as_str()
+        ),
+        testing::READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let counted = shadow_of(&d.state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.extra_rows),
+        (0, 0),
+        "{counted:?}"
+    );
+}

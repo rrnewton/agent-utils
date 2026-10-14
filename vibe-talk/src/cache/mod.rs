@@ -720,7 +720,9 @@ pub struct CacheStats {
     pub rows_unchanged: u64,
     /// Message rows refused for being older than the age limit.
     pub rows_too_old: u64,
-    /// Message rows refused because a later deletion's tombstone holds the id.
+    /// Message rows refused because a later deletion holds the id: its tombstone, or, for a
+    /// message the file does not hold, its absence from a listing of its scope that began after
+    /// the copy was seen (which leaves a tombstone too).
     pub rows_held_by_tombstone: u64,
     /// Messages deleted and tombstoned.
     pub tombstoned: u64,

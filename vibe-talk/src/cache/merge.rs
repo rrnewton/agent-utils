@@ -15,7 +15,11 @@
 //!    events racing, a poller's publish of what it read before) is of a message already gone.
 //! 4. **Absence from an exhaustive listing** of a row's HOME scope deletes it, if it was observed
 //!    before the listing started and lies below the scope's unsettled band. Absence from a listing
-//!    of another scope only removes that membership.
+//!    of another scope only removes that membership. A message the cache does not hold yet is held
+//!    to the same rule when it arrives: a copy observed before a listing of its home scope that
+//!    proved, without it, the stretch it was written in is of a message gone by then, and leaves a
+//!    tombstone instead of a row. So a read that began before a deletion never brings the message
+//!    back by landing after a read that began after it, whether or not the cache held it before.
 //! 5. **Snippets never overwrite listing text.** A bridge falls back to a short snippet when a live
 //!    event has no body, so a pushed update that is a strict prefix of the held text (a trailing
 //!    `…` ignored) changes nothing, and a pushed create of an unknown id is held as partial until
@@ -154,6 +158,8 @@ pub fn revives(arrival: Arrival, deleted_ms: i64, observed_ms: i64) -> bool {
 
 /// Rule 4: whether a home-scope row missing from an exhaustive listing is gone. Only a row the
 /// listing could have seen: observed before the listing started, and below the unsettled band.
+/// The same test decides a copy of a message the cache does not hold, against the claim that holds
+/// its creation time: `settled_below_ms` is then that claim's end, which never enters the band.
 #[must_use]
 pub fn absent_is_deleted(
     row_observed_ms: i64,

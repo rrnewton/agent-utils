@@ -3666,11 +3666,14 @@ which still takes its message out.
 **Deletions and edits.** The server learns that a message was deleted upstream from a pushed
 deletion, from a delta that reports it, or from the message's absence from a listing that proves
 complete the stretch it was in. It then deletes the message from the file and leaves a tombstone.
-Only a read that began after the deletion brings the message back; a pushed change never does. An
-edit replaces the text, unless what the cache holds was seen later. A message the live poller
-publishes counts as seen when the poller's read began, not when it published it. In both cases a summary of the old text is deleted from the store once
-the change is written. Turning the cache off never deletes a summary. A message the server does
-not re-check is deleted within seven days anyway.
+Only a read that began after the deletion brings the message back; a pushed change never does.
+That holds for a message the file never held as well: a read that began before a later listing
+proved a stretch without the message, and lands after it, leaves a tombstone where the message
+would have gone. An edit replaces the text, unless what the cache holds was seen later. A message
+the live poller publishes counts as seen when the poller's read began, not when it published it.
+In both cases a summary of the old text is deleted from the store once the change is written.
+Turning the cache off never deletes a summary. A message the server does not re-check is deleted
+within seven days anyway.
 
 A deletion is applied whatever is known of the provider's account: while it is being checked,
 while its credential is refused, and before the startup sweep. It writes nothing an account could
