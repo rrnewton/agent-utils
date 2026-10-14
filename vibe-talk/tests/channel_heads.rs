@@ -1378,3 +1378,184 @@ async fn the_head_check_asks_each_native_provider_once_and_no_other() {
         "the emulated provider was not asked"
     );
 }
+
+/// What a loopback bridge with `head_reads` says in each channel head.
+#[derive(Clone, Copy, Debug)]
+enum HeadShape {
+    /// `{"channel", "newest_id"}`, the id the channel's newest message really has.
+    Truthful,
+    /// `{"channel"}` alone: a head that does not say the channel's newest message.
+    WithoutNewestId,
+}
+
+/// A loopback bridge serving `READ_CHANNEL`'s `messages` (by instant, in Unix milliseconds) on
+/// `/channels/{id}/messages`, with `after=`, and on `/heads` in `shape`; every other path is an
+/// empty list. Returns its base URL and every request it was sent, in order.
+async fn heads_bridge(
+    messages: Arc<Mutex<Vec<(i64, String)>>>,
+    shape: HeadShape,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let messages = Arc::clone(&messages);
+        async move {
+            let asked = uri.to_string();
+            log.lock().expect("log").push(asked.clone());
+            let held = messages.lock().expect("messages").clone();
+            let query: Vec<(String, String)> = uri
+                .query()
+                .map(|query| {
+                    query
+                        .split('&')
+                        .filter_map(|pair| pair.split_once('='))
+                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if uri.path() == "/heads" {
+                let heads: Vec<Value> = query
+                    .iter()
+                    .filter(|(key, _)| key == "channels")
+                    .map(|(_, asked)| {
+                        let newest = (asked == READ_CHANNEL)
+                            .then(|| held.last().map(|(ms, _)| MessageId::at_time_ms(*ms).0))
+                            .flatten();
+                        match shape {
+                            HeadShape::Truthful => json!({"channel": asked, "newest_id": newest}),
+                            HeadShape::WithoutNewestId => json!({"channel": asked}),
+                        }
+                    })
+                    .collect();
+                return axum::Json(json!({ "heads": heads }));
+            }
+            if uri.path() == format!("/channels/{READ_CHANNEL}/messages") {
+                let after = query
+                    .iter()
+                    .find(|(key, _)| key == "after")
+                    .and_then(|(_, after)| after.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let list: Vec<Value> = held
+                    .iter()
+                    .filter(|(ms, _)| {
+                        MessageId::at_time_ms(*ms).numeric().expect("a snowflake") > after
+                    })
+                    .rev()
+                    .map(|(ms, content)| {
+                        json!({
+                            "id": MessageId::at_time_ms(*ms).as_str(),
+                            "channel_id": READ_CHANNEL,
+                            "content": content,
+                            "timestamp": vibe_talk::clock::iso_from_ms(*ms),
+                            "author": {"id": "7", "username": "bridge", "bot": false}
+                        })
+                    })
+                    .collect();
+                return axum::Json(Value::Array(list));
+            }
+            axum::Json(json!([]))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server");
+    });
+    (base, seen)
+}
+
+/// Run the live poller against a loopback bridge configured with `extra` that answers heads in
+/// `shape`; once it has seeded `READ_CHANNEL`, add a message there, and wait (at most ten
+/// seconds) for it to be published. Returns what was published, and every request the bridge was
+/// sent after the addition.
+async fn poll_a_bridge_through_an_addition(
+    extra: &str,
+    shape: HeadShape,
+) -> (Vec<String>, Vec<String>) {
+    const BASE_MS: i64 = 1_787_000_000_000;
+    let messages = Arc::new(Mutex::new(vec![(BASE_MS, "already there".to_owned())]));
+    let (base, seen) = heads_bridge(Arc::clone(&messages), shape).await;
+    let text = vibe_talk::testing::config_toml().replace(
+        "[discord]",
+        &format!("[discord]\nthread_api = \"bridge\"\napi_base = \"{base}\"\n{extra}"),
+    );
+    let (mut state, _discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let poller = tokio::spawn(vibe_talk::live::poll_forever(
+        state.clone(),
+        None,
+        Arc::clone(&state.providers.entries()[0].client),
+        state.config.chat.default_fetch_limit,
+        Duration::from_millis(100),
+    ));
+    let read_path = format!("/channels/{READ_CHANNEL}/messages");
+    let published = |state: &AppState| -> Vec<String> {
+        state
+            .live
+            .subscribe(&channel(READ_CHANNEL), None)
+            .replay
+            .into_iter()
+            .map(|live| live.message.content)
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Seeded, and at least one request after the seed: the seed's answer was made without the
+    // addition, so the addition is news to the poller.
+    let added_at = loop {
+        let asked = seen.lock().expect("log").clone();
+        if let Some(seed) = asked.iter().position(|a| a.starts_with(&read_path)) {
+            if asked.len() > seed + 1 {
+                break asked.len();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the poller never seeded: {asked:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    messages
+        .lock()
+        .expect("messages")
+        .push((BASE_MS + MINUTE_MS, "something new".to_owned()));
+    while published(&state).is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    poller.abort();
+    let after = seen.lock().expect("log")[added_at..].to_vec();
+    (published(&state), after)
+}
+
+/// Round 3 of remote-ops-audit W12 `#287 bulk-reads`: a bridge's head that leaves `newest_id` out
+/// says nothing about the channel's newest message, so it never lets the live poller skip the
+/// channel's page. Before, it was read as "the channel has no messages", the page was skipped on
+/// every full pass, and an addition there was never published. A truthful head, and heads off, are
+/// the controls.
+#[tokio::test]
+async fn a_poller_pages_a_channel_whose_bridge_head_does_not_say_its_newest_id() {
+    let (off, _) = poll_a_bridge_through_an_addition("", HeadShape::WithoutNewestId).await;
+    assert_eq!(off, ["something new"], "heads off");
+    let (truthful, _) =
+        poll_a_bridge_through_an_addition("head_reads = true", HeadShape::Truthful).await;
+    assert_eq!(truthful, ["something new"], "a truthful head");
+    let (unsaid, asked) =
+        poll_a_bridge_through_an_addition("head_reads = true", HeadShape::WithoutNewestId).await;
+    let first = &asked[..asked.len().min(4)];
+    assert!(
+        asked.iter().any(
+            |a| a.starts_with(&format!("/channels/{READ_CHANNEL}/messages?"))
+                && a.contains("after=")
+        ),
+        "the channel's page was read after the addition; {} requests, the first {first:?}",
+        asked.len()
+    );
+    assert_eq!(
+        unsaid,
+        ["something new"],
+        "a head without newest_id hid an addition"
+    );
+}

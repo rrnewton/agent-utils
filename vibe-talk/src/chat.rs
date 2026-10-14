@@ -561,6 +561,11 @@ pub struct ChannelHead {
     /// when it has none. It may name a message deleted since (Discord's `last_message_id` does),
     /// so all it says is that nothing NEWER was added: a message created after it would have
     /// taken its place.
+    ///
+    /// `None` is a claim, and the live poller skips a channel's page on it, so a provider that
+    /// cannot say which message is newest answers no head for that channel
+    /// ([`ChatError::Refused`]), never one with `None`. Fix round 3 of remote-ops-audit W12
+    /// `#287 bulk-reads`.
     pub newest_id: Option<MessageId>,
     /// When that message was created, in Unix milliseconds, where the provider says.
     pub newest_at_ms: Option<i64>,

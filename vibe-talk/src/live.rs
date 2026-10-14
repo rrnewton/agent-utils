@@ -1107,7 +1107,10 @@ async fn poll_loop_with_channels(
 /// than the cursor, never an edit or a delete, and a head whose newest message is not newer than
 /// the cursor proves nothing newer was added: a message created after it would have taken its
 /// place. A head that cannot prove that is read as before: one that failed, one from a copy older
-/// than now (`as_of`), and one whose id this loop cannot compare (not a snowflake).
+/// than now (`as_of`), and one whose id this loop cannot compare (not a snowflake). A head that
+/// does not say the channel's newest message at all never gets here: the provider refuses that
+/// channel's head instead (fix round 3 of remote-ops-audit W12 `#287 bulk-reads`), so `None` is
+/// only ever the provider's word that the channel has no messages.
 async fn quiet_channels(
     chat: &dyn ChatClient,
     channels: &[ChannelId],

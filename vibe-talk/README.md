@@ -2257,7 +2257,7 @@ the other endpoints use:
 |---|---|---|---|---|
 | `range_reads` | `/channels/{id}/messages?since=&until=&order=oldest\|newest&limit=&cursor=` (RFC 3339 instants, `until` absent for now, `limit` 1 to 200) | `{"messages", "next", "exhausted", "as_of"}` | `exhausted: true` only when the bridge KNOWS the window holds nothing more in that direction, and never beside a `next`; a short answer is not exhaustion | present: `/page` and `/count` make the read they made without the setting |
 | `id_reads` | `/channels/{id}/messages?ids=…&ids=…&thread=` (at most 50 ids) | `{"messages", "missing", "as_of"}` | `missing` only for ids the service SAID do not exist; an id neither found nor missing is looked up on its own | present: vibe-talk trusts none of the answer and looks every id up on its own |
-| `head_reads` | `/heads?channels=…&channels=…` (at most 50) | `{"heads": [{"channel", "newest_id", "newest_at", "activity_at", "unchanged_since", "as_of"}]}` | `unchanged_since` only while the bridge's own feed has seen every creation, edit and delete since that instant; a channel left out is read as before | present: nothing is done on that head |
+| `head_reads` | `/heads?channels=…&channels=…` (at most 50) | `{"heads": [{"channel", "newest_id", "newest_at", "activity_at", "unchanged_since", "as_of"}]}` | `newest_id` required, `null` only for a channel with no messages; `unchanged_since` only while the bridge's own feed has seen every creation, edit and delete since that instant; a channel left out, or a head without `newest_id`, is read as before | present: nothing is done on that head |
 | `recent_many_reads` | `/recent?channels=…&limit=&since=` (at most 50 channels, `limit` 1 to 100) | `{"recent": [{"channel", "messages", "exhausted", "as_of"}]}` | never fewer messages than `/messages?limit=` would answer now; `exhausted` only when they reach back to the channel's first message; a channel left out is read as before | present: that channel is read again on its own |
 | `thread_reads` | `/channels/{id}/threads?ids=…&ids=…&limit=` (at most 50) | `{"threads": [{"thread_id", "page"}]}` | each `page` exactly what the thread view of that thread would answer now; a thread left out is read on its own | a page with one: that thread is read on its own |
 
@@ -2422,10 +2422,12 @@ for the heads of every channel it has already seeded and that is neither failing
 page ceiling, in one call, and skips the page of a channel whose newest message is not newer than
 its cursor. A tick reads only what is newer than the cursor, so a skip hides nothing the tick would
 have seen. Ten quiet channels on Discord cost one request per server a tick instead of ten pages. A
-head that failed, came from an older copy (`as_of`), or names an id the poller cannot compare is
-read as before, and so is every channel of a provider whose heads are emulated (Slack, a bridge
-without `head_reads`): the poller never asks such a provider for heads. A hinted read is never
-gated, since the hint says something changed.
+head that failed, came from an older copy (`as_of`), names an id the poller cannot compare, or does
+not say the channel's newest message at all (a bridge head without `newest_id`, a Discord channel
+object without `last_message_id`) is read as before, since only an explicit `null` says a channel
+has no messages. Every channel of a provider whose heads are emulated (Slack, a bridge without
+`head_reads`) is read as before too: the poller never asks such a provider for heads. A hinted
+read is never gated, since the hint says something changed.
 
 **The startup probe and diagnostics.** A head cannot stand in for the probe's one-message read:
 it does not show that the bot may read the channel's history, nor that messages arrive with their
@@ -2479,8 +2481,13 @@ it would have without heads.
 
 * One head per channel the bridge can answer for, in any order, each channel asked about and
   answered once. A channel the bridge leaves out is fine: vibe-talk reads that one as before.
-* `newest_id`: the id of the channel's newest message, as `GET /channels/{id}/messages` lists it
-  (the list `after=` walks forward), or `null` when it has none.
+* `newest_id` (required): the id of the channel's newest message, as `GET /channels/{id}/messages`
+  lists it (the list `after=` walks forward), or `null` only when the channel has no messages. A
+  bridge that cannot say which message is newest (one that answers heads from a list of spaces
+  that gives only their last activity, say) leaves the channel out, or gives a head without
+  `newest_id`: either way, that head gates nothing, and the channel is read as before. A
+  missing `newest_id` is never read as `null`, because `null` lets the live poller skip the
+  channel's page.
 * `newest_at` (optional): when that message was created, RFC 3339.
 * `activity_at` (optional): the latest activity in the channel, thread replies included.
 * `unchanged_since` (optional): an instant after which the bridge KNOWS nothing in the channel
@@ -2492,8 +2499,10 @@ it would have without heads.
 * `as_of` (optional): present only when the head came from a copy the bridge could not bring up to
   date; vibe-talk then acts on nothing in it. Absent means now.
 
-Every field but `channel` may be absent or `null`; an unknown field is ignored; anything else that
-cannot be read fails the request, and vibe-talk reads its channels as before.
+Every field but `channel` and `newest_id` may be absent or `null`; an unknown field is ignored. A
+head without `newest_id` is no head: nothing else it says (`unchanged_since` included) is acted
+on, and its channel is read as before, while the other heads of the answer stand. Anything else
+that cannot be read fails the request, and vibe-talk reads its channels as before.
 
 ### Recent reads of several channels
 

@@ -18,6 +18,11 @@
 //! ([`heads_request`]), from whatever it keeps of its channels; the README's "A bridge's channel
 //! heads" is the contract. Such a bridge may also say [`ChannelHead::unchanged_since_ms`], when
 //! its own live feed has seen every change since.
+//!
+//! Either way, only an explicit `null` (`last_message_id`, a bridge's `newest_id`) says a channel
+//! has no messages. A channel object or a bridge head that leaves the field out says nothing about
+//! the channel's newest message, so that channel's head is refused and it is read as it would be
+//! without heads. Fix round 3 of remote-ops-audit W12 `#287 bulk-reads`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -87,13 +92,19 @@ fn get(api_base: &str, path: &[&str]) -> Result<PreparedRequest, ChatError> {
     })
 }
 
+/// Why a Discord channel object that leaves `last_message_id` out is no head.
+const UNSAID_LAST_MESSAGE: &str = "Discord did not say this channel's last message \
+    (last_message_id), so its head proves nothing and the channel is read as it would be without \
+    heads";
+
 /// Read a Discord channel object as `expected`'s head, and where its head lives.
 ///
 /// # Errors
 ///
 /// [`ChatError::Shape`] for an object of another channel, or one whose `type` or
 /// `last_message_id` cannot be read; [`ChatError::Refused`] for a channel with no message list of
-/// its own (a forum, say), whose `last_message_id` is not the poller's to compare.
+/// its own (a forum, say), whose `last_message_id` is not the poller's to compare, and for one
+/// that leaves `last_message_id` out, which says nothing about its newest message.
 fn native_head(value: &Value, expected: &str) -> Result<(ChannelHead, Home), ChatError> {
     if value.get("id").and_then(Value::as_str) != Some(expected) {
         return Err(shape("Discord answered for a different channel"));
@@ -113,8 +124,12 @@ fn native_head(value: &Value, expected: &str) -> Result<(ChannelHead, Home), Cha
             "this channel has no message list of its own to take the newest message of".to_owned(),
         ));
     }
+    // Discord documents the field as optional as well as nullable: only `null` says the channel
+    // has no messages, and an object that leaves it out says nothing. Fix round 3 of
+    // remote-ops-audit W12 `#287 bulk-reads`.
     let newest_id = match value.get("last_message_id") {
-        None | Some(Value::Null) => None,
+        None => return Err(ChatError::Refused(UNSAID_LAST_MESSAGE.to_owned())),
+        Some(Value::Null) => None,
         Some(Value::String(id)) if is_snowflake(id) => Some(MessageId(id.clone())),
         Some(_) => return Err(shape("last_message_id is not a snowflake")),
     };
@@ -164,14 +179,19 @@ pub fn heads_request(api_base: &str, channels: &[ChannelId]) -> Result<PreparedR
 /// channel answered twice, or a field that cannot be read. A channel the bridge does not mention
 /// is left out, for the caller to answer as unread.
 ///
+/// `newest_id` is required: `null` says the channel has no messages, and a head that leaves the
+/// field out says nothing about its newest message. Such a head is no head: its channel is
+/// answered [`ChatError::Refused`] in its own place, so every caller reads it as it would have
+/// without heads, and nothing else the head says is acted on. Fix round 3 of remote-ops-audit
+/// W12 `#287 bulk-reads`: it used to be read as `null`, and the live poller then skipped the page
+/// of a channel that may well have moved.
+///
 /// # Errors
 ///
 /// [`ChatError::Shape`] for anything but `{heads: [{channel, newest_id, newest_at, activity_at,
-/// unchanged_since, as_of}]}`, every field but `channel` optional or null, read as above.
-pub fn parse_heads(
-    value: &Value,
-    asked: &[ChannelId],
-) -> Result<Vec<(ChannelId, ChannelHead)>, ChatError> {
+/// unchanged_since, as_of}]}`, every field but `channel` and `newest_id` optional or null, read as
+/// above.
+pub fn parse_heads(value: &Value, asked: &[ChannelId]) -> Result<HeadAnswers, ChatError> {
     let shape = |detail: &str| ChatError::Shape(format!("channel heads answer: {detail}"));
     let heads = value
         .as_object()
@@ -200,10 +220,14 @@ pub fn parse_heads(
         if !answered.insert(channel.to_owned()) {
             return Err(shape("a channel answered twice"));
         }
-        let newest_id = match entry.get("newest_id") {
-            None | Some(Value::Null) => None,
+        // What the head says of the channel's newest message, `None` when it says nothing: left
+        // out is not `null`, and only `null` says the channel has none. Fix round 3 of
+        // remote-ops-audit W12 `#287 bulk-reads`.
+        let said_newest = match entry.get("newest_id") {
+            None => None,
+            Some(Value::Null) => Some(None),
             Some(Value::String(id)) if !id.is_empty() && id.len() <= MAX_BRIDGE_ID_LEN => {
-                Some(MessageId(id.clone()))
+                Some(Some(MessageId(id.clone())))
             }
             Some(_) => {
                 return Err(shape(
@@ -225,16 +249,22 @@ pub fn parse_heads(
             Some(Value::String(as_of)) => Some(as_of.clone()),
             Some(_) => return Err(shape("as_of must be a string")),
         };
-        out.push((
-            ChannelId(channel.to_owned()),
-            ChannelHead {
-                newest_id,
-                newest_at_ms: instant("newest_at")?,
-                activity_ms: instant("activity_at")?,
-                unchanged_since_ms: instant("unchanged_since")?,
-                as_of,
-            },
-        ));
+        let head = ChannelHead {
+            newest_id: None,
+            newest_at_ms: instant("newest_at")?,
+            activity_ms: instant("activity_at")?,
+            unchanged_since_ms: instant("unchanged_since")?,
+            as_of,
+        };
+        let answer = match said_newest {
+            Some(newest_id) => Ok(ChannelHead { newest_id, ..head }),
+            None => Err(ChatError::Refused(
+                "the bridge's head for this channel did not say its newest message (newest_id), \
+                 so it proves nothing and the channel is read as it would be without heads"
+                    .to_owned(),
+            )),
+        };
+        out.push((ChannelId(channel.to_owned()), answer));
     }
     Ok(out)
 }
@@ -265,7 +295,7 @@ impl HttpDiscordClient {
             match read {
                 Ok(heads) => {
                     for (channel, head) in heads {
-                        answers.insert(channel.0, Ok(head));
+                        answers.insert(channel.0, head);
                     }
                 }
                 Err(error) => {
@@ -865,14 +895,15 @@ mod tests {
     fn a_bridge_head_answer_is_read_strictly() {
         let asked = ids(&["a", "b"]);
         let good = parse_heads(
-            &json!({"heads": [{"channel": "a"}, {"channel": "b", "newest_id": null,
+            &json!({"heads": [{"channel": "b", "newest_id": null,
                 "newest_at": null, "activity_at": null, "unchanged_since": null, "as_of": null,
                 "something_new": true}]}),
             &asked,
         )
-        .expect("an empty channel, and one with nothing said");
-        assert_eq!(good.len(), 2);
-        assert!(good.iter().all(|(_, head)| *head == ChannelHead::default()));
+        .expect("an empty channel");
+        assert_eq!(good.len(), 1);
+        assert_eq!(good[0].0.as_str(), "b");
+        assert_eq!(good[0].1.as_ref().ok(), Some(&ChannelHead::default()));
         for broken in [
             json!([{"channel": "a"}]),
             json!({"heads": {"channel": "a"}}),
@@ -893,6 +924,79 @@ mod tests {
                 "{broken} was accepted"
             );
         }
+    }
+
+    /// Fix round 3 of remote-ops-audit W12 `#287 bulk-reads`: only `newest_id: null` says a channel
+    /// has no messages. A head that leaves `newest_id` out says nothing about its newest message,
+    /// so it is no head at all: that channel is refused in its own place, whatever else the head
+    /// says, and the others of the answer stand.
+    #[test]
+    fn a_bridge_head_without_newest_id_is_no_head() {
+        let asked = ids(&["a", "b", "c"]);
+        let answers = parse_heads(
+            &json!({"heads": [
+                {"channel": "a"},
+                {"channel": "b", "newest_id": null},
+                {"channel": "c", "newest_at": "2026-10-13T11:59:00Z",
+                 "activity_at": "2026-10-13T12:00:00Z", "unchanged_since": "2026-10-13T12:00:00Z"},
+            ]}),
+            &asked,
+        )
+        .expect("the answer can be read");
+        assert_eq!(answers.len(), 3);
+        for at in [0, 2] {
+            assert!(
+                matches!(&answers[at].1, Err(ChatError::Refused(why)) if why.contains("newest_id")),
+                "{}: a head that does not say its newest id proves nothing: {:?}",
+                answers[at].0,
+                answers[at].1
+            );
+        }
+        assert_eq!(
+            answers[1].1.as_ref().ok(),
+            Some(&ChannelHead::default()),
+            "null says the channel has no messages"
+        );
+    }
+
+    /// The same for Discord's own channel object: `last_message_id: null` is a channel with no
+    /// messages, and an object that leaves the field out says nothing about them.
+    #[test]
+    fn a_discord_channel_without_last_message_id_is_no_head() {
+        let refused = native_head(&json!({"id": "101", "type": 0, "guild_id": "9"}), "101");
+        assert!(
+            matches!(&refused, Err(ChatError::Refused(why)) if why.contains("last_message_id")),
+            "{refused:?}"
+        );
+        let (empty, _) = native_head(
+            &json!({"id": "101", "type": 0, "guild_id": "9", "last_message_id": null}),
+            "101",
+        )
+        .expect("a channel with no messages");
+        assert_eq!(empty.newest_id, None);
+    }
+
+    /// A bridge's head that does not say its newest id reaches the caller as a refusal of that
+    /// channel alone, never as a head that says the channel is empty.
+    #[tokio::test]
+    async fn a_bridge_head_without_newest_id_reaches_the_caller_as_unread() {
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/heads?channels=a&channels=b",
+            json!({"heads": [{"channel": "a"}, {"channel": "b", "newest_id": "b-1"}]}),
+        );
+        let mock = mock(routes, bridge).await;
+        let answers = mock.client.channel_heads(&ids(&["a", "b"])).await;
+        assert!(
+            matches!(
+                answers[0].1.as_ref().map_err(ChatError::cause),
+                Err(ChatError::Refused(_))
+            ),
+            "{:?}",
+            answers[0].1
+        );
+        assert_eq!(newest(&answers), [None, Some("b-1".into())]);
     }
 
     #[tokio::test]
