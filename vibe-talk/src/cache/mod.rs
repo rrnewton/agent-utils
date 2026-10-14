@@ -39,8 +39,10 @@
 //!   sequence order and the applied sequence is always contiguous.
 //! - The queue is bounded by BYTES (32 MB), not by count. An offer that does not fit is dropped,
 //!   counted, and marks its channel suspect ([`MessageCache::mark_suspect`]); no producer ever
-//!   waits on the cache. What a drop leaves in doubt is kept in the file, per channel, and lifted
-//!   row by row and head by head as reads that began after it see them again.
+//!   waits on the cache. An offer queued whose write then fails is left out just as surely, and
+//!   the writer records it as a drop the same way. What a drop leaves in doubt is kept in the
+//!   file, per channel (written again, once the file takes writes, if that write failed too), and
+//!   lifted row by row and head by head as reads that began after it see them again.
 //! - The writer commits after about 25 ms of work, or at once when a reader raises the flush flag.
 //!   A read that must be current notes the sequence, raises the flag and waits (the barrier).
 //! - Readers use two read-only connections. Each re-checks the file generation and the channel's

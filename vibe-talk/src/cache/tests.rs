@@ -1514,6 +1514,136 @@ fn an_offer_too_big_for_the_queue_is_dropped_and_marks_the_channel_suspect() {
     assert!(!fx.cache.is_suspect(&fx.chan));
 }
 
+/// Another connection holds the cache file's write lock until the returned sender is dropped or
+/// sent to, as a full disk, an I/O error or an operator's own session would make every write fail.
+fn hold_write_lock(cache: &MessageCache) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let path = cache.path().to_owned();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let locker = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        connection.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        locked_tx.send(()).expect("tell");
+        let _ = release_rx.recv();
+        connection.execute_batch("ROLLBACK").expect("unlock");
+    });
+    locked_rx.recv().expect("locked");
+    (release_tx, locker)
+}
+
+/// Wait until `done` says so, for at most thirty seconds.
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(30), "{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Writes that fail, past the writer's busy timeout, leave out what they carried as a full queue's
+/// drop does. A drop whose own record cannot be written stays in memory and reaches the file once
+/// it takes writes again; an edit whose write fails is a drop, in memory at once, and reaches the
+/// file the same way. Each next start remembers them.
+#[test]
+fn a_write_that_fails_is_a_drop_and_the_file_records_it_once_it_takes_writes() {
+    let dir = crate::testing::TempDir::new("cache-failed-write");
+    let clock = Arc::new(ManualClock(AtomicI64::new(T0 + 7 * STEP)));
+    let edited = ChanKey::new("p", "C1");
+    let marked = ChanKey::new("p", "C2");
+    let open = || {
+        let cache = fixtures::open(&dir, &clock, Limits::default());
+        cache.retain_only(RouteSnapshot::new(
+            [edited.clone(), marked.clone()],
+            ["p".to_owned()],
+        ));
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        cache
+    };
+    {
+        let cache = open();
+        for chan in [&edited, &marked] {
+            let stamp = cache.stamp(chan);
+            cache.offer(
+                chan.clone(),
+                stamp,
+                Observation::Listing(Listing {
+                    scope: Scope::Main,
+                    rows: (1..=6).map(|i| Incoming::new(m(i), Scope::Main)).collect(),
+                    observed_ms: T0 + 7 * STEP,
+                    proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+                }),
+            );
+        }
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        assert!(!cache.is_suspect(&edited) && !cache.is_suspect(&marked));
+        // A drop, whose record the file cannot take.
+        let (release, locker) = hold_write_lock(&cache);
+        clock.set(T0 + 7 * STEP + 10);
+        let applied = cache.stats().ops_applied;
+        cache.mark_suspect(&marked);
+        wait_for("the drop record was tried", || {
+            cache.stats().ops_applied > applied
+        });
+        release.send(()).expect("release");
+        locker.join().expect("locker");
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        assert!(cache.is_suspect(&marked));
+    }
+    {
+        let cache = open();
+        assert!(
+            cache.is_suspect(&marked),
+            "the next start forgot the drop whose record failed"
+        );
+        assert!(!cache.is_suspect(&edited));
+        // An edit, whose write fails.
+        let (release, locker) = hold_write_lock(&cache);
+        clock.set(T0 + 7 * STEP + 20);
+        let stamp = cache.stamp(&edited);
+        cache.offer(
+            edited.clone(),
+            stamp,
+            Observation::Push {
+                push: Push::Upsert {
+                    message: Box::new(Incoming::new(
+                        Message {
+                            content: "edited upstream".to_owned(),
+                            ..m(2)
+                        },
+                        Scope::Main,
+                    )),
+                    update: true,
+                    partial: false,
+                },
+                observed_ms: T0 + 7 * STEP + 20,
+            },
+        );
+        wait_for("the write failed", || cache.stats().ops_failed > 0);
+        assert_eq!(
+            cache.last_drop_ms(&edited),
+            Some(T0 + 7 * STEP + 20),
+            "the failed write is a drop, in memory at once"
+        );
+        release.send(()).expect("release");
+        locker.join().expect("locker");
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        assert!(cache.is_suspect(&edited));
+        let text = cache
+            .message(&edited, &mid("m2"))
+            .served()
+            .expect("served")
+            .expect("held")
+            .message
+            .content;
+        assert_eq!(text, "body number 2", "the edit never reached the file");
+    }
+    let cache = open();
+    assert!(
+        cache.is_suspect(&edited),
+        "the next start forgot the failed write"
+    );
+}
+
 #[test]
 fn a_barrier_with_nothing_to_wait_for_leaves_the_flush_flag_down() {
     let fx = Fixture::new("cache-flush-flag");

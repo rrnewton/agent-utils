@@ -8,7 +8,9 @@
 //!   FTS5 writes its pending terms out as a new index segment at every savepoint, so one per
 //!   observation would leave a segment per message. When an observation fails, the batch is
 //!   rolled back and its observations are applied again one transaction each, so only the
-//!   failing one is lost.
+//!   failing one is lost; and that one is recorded as a drop of its channel, in memory at once and
+//!   in the file as soon as it takes writes, since what it carried (an edit, a deletion) is left
+//!   out exactly as a dropped offer's is.
 //! - **Control operations** (an erase, a sweep, maintenance) run alone, after the batch before
 //!   them has committed and been published, and are published themselves as soon as their own
 //!   short transaction commits. An erase detaches the channel's rows from its name (no read can
@@ -60,9 +62,9 @@ use super::rows::{self, Extra};
 use super::schema::sqlite_code;
 use super::structure;
 use super::{
-    file, lock, CacheError, ChanKey, Envelope, Erasing, Incoming, ListEnd, ListStart, Listing,
-    Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp, Stats, ThreadRecord,
-    WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP, TOMBSTONE_KEEP_MS,
+    file, lock, CacheError, ChanKey, DropRecord, Envelope, Erasing, Incoming, ListEnd, ListStart,
+    Listing, Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp, Stats,
+    ThreadRecord, WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP, TOMBSTONE_KEEP_MS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -502,6 +504,9 @@ struct Work {
     weekly_pages: i64,
     /// The hourly integrity check is waiting for a quiet moment, since this instant.
     integrity_since: Option<Instant>,
+    /// A drop the process remembers may be missing from the file: its own write, or the write of
+    /// an observation it stands for, failed ([`Writer::drops_step`]).
+    drops: bool,
     /// Deleted text may still be in the write-ahead log.
     checkpoint: bool,
     /// Not before this: the last `TRUNCATE` found a reader.
@@ -518,6 +523,7 @@ struct Work {
 /// One kind of background step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Task {
+    Drops,
     Erase,
     Tombstones,
     Expire,
@@ -533,6 +539,7 @@ enum Task {
 impl Task {
     fn name(self) -> &'static str {
         match self {
+            Self::Drops => "drop record",
             Self::Erase => "erase",
             Self::Tombstones => "tombstones",
             Self::Expire => "age limit",
@@ -623,6 +630,7 @@ impl Writer<'_> {
     fn pending(&self) -> bool {
         let w = &self.work;
         w.erase
+            || w.drops
             || w.tombstones.is_some()
             || w.expire.is_some()
             || w.evict.is_some()
@@ -801,6 +809,9 @@ impl Writer<'_> {
                 match result {
                     Ok(outcome) => entry.3 = outcome,
                     Err(error) => {
+                        // Left out of the file as surely as a full queue's drop: the channel is
+                        // in doubt from now on, before anyone can count the failure.
+                        self.lost(chan);
                         Stats::add(&self.shared.stats.ops_failed, 1);
                         tracing::warn!(code = %sqlite_code(&error), "a message cache write was rolled back");
                         entry.3 = Outcome::Failed;
@@ -839,6 +850,12 @@ impl Writer<'_> {
     fn control(&mut self, envelope: Envelope) -> Option<mpsc::Sender<()>> {
         let Envelope { seq, op, .. } = envelope;
         if let Op::Close { ack } = op {
+            // A drop the file still owes is written first, if the file takes it: the next start
+            // knows only what the file says.
+            if self.work.drops && !self.stale() {
+                let result = self.drops_step();
+                self.report("drop record", result);
+            }
             return Some(ack);
         }
         // Queued before a file erase: discarded, as the erase protocol says.
@@ -911,6 +928,11 @@ impl Writer<'_> {
             }
             Op::Dropped { chan } => {
                 let result = self.transaction(|w| w.record_drop(&chan));
+                if result.is_err() {
+                    // The time stays in memory; a step of its own writes it once the file takes
+                    // writes again.
+                    self.work.drops = true;
+                }
                 self.report("drop record", result);
             }
             Op::Maintain { kind } => self.maintain(kind),
@@ -1075,12 +1097,54 @@ impl Writer<'_> {
             record.queued = false;
             record.at_ms
         };
+        self.write_drop(chan, at_ms)
+    }
+
+    /// Write a drop at `at_ms` into the channel's row, if the file holds one whose record is older.
+    fn write_drop(&mut self, chan: &ChanKey, at_ms: i64) -> rusqlite::Result<()> {
         if let Some(chan_id) = self.find_chan(chan)? {
             self.conn.execute(
-                "UPDATE channel SET dropped_ms = MAX(COALESCE(dropped_ms, ?2), ?2) WHERE chan = ?1",
+                "UPDATE channel SET dropped_ms = ?2
+                 WHERE chan = ?1 AND (dropped_ms IS NULL OR dropped_ms < ?2)",
                 params![chan_id, at_ms],
             )?;
         }
+        Ok(())
+    }
+
+    /// An observation of `chan` was queued and its write failed (a full disk, an I/O error, a lock
+    /// another process held too long, a constraint one row broke): whatever it said, an edit, a
+    /// deletion or a creation, the file lacks it, exactly as if a full queue had dropped it. So it
+    /// is recorded as a drop: in memory at once, where every read judges by it, and in the file by
+    /// a step of its own as soon as the file takes writes again ([`Writer::drops_step`]).
+    fn lost(&mut self, chan: &ChanKey) {
+        let now = self.now();
+        lock(&self.shared.drops)
+            .entry(chan.clone())
+            .and_modify(|record| record.at_ms = record.at_ms.max(now))
+            .or_insert(DropRecord {
+                at_ms: now,
+                queued: false,
+            });
+        self.work.drops = true;
+    }
+
+    /// Write every drop the process remembers into the file, where the file's record is older:
+    /// one a failed write left ([`Writer::lost`]), or one whose own [`Op::Dropped`] failed. A
+    /// failure leaves the work owed, and it is tried again after the backoff, never given up: a
+    /// drop the file forgets is one the next start would not know of.
+    fn drops_step(&mut self) -> rusqlite::Result<()> {
+        let records: Vec<(ChanKey, i64)> = lock(&self.shared.drops)
+            .iter()
+            .map(|(chan, record)| (chan.clone(), record.at_ms))
+            .collect();
+        self.transaction(|w| {
+            for (chan, at_ms) in &records {
+                w.write_drop(chan, *at_ms)?;
+            }
+            Ok(())
+        })?;
+        self.work.drops = false;
         Ok(())
     }
 
@@ -2062,7 +2126,9 @@ impl Writer<'_> {
             && (caught_up
                 || w.truncate_since
                     .is_some_and(|since| now >= since + TRUNCATE_PATIENCE));
-        if log_due || truncate_due {
+        if w.drops {
+            Some(Task::Drops)
+        } else if log_due || truncate_due {
             Some(Task::Checkpoint)
         } else if merging_due {
             Some(Task::Merge)
@@ -2112,6 +2178,7 @@ impl Writer<'_> {
         let deadline = started + STEP;
         self.unflushed = 0;
         let result = match task {
+            Task::Drops => self.drops_step(),
             Task::Erase => self.erase_step(deadline),
             Task::Tombstones => self.tombstone_step(),
             Task::Expire => self.expire_step(deadline),
@@ -2162,10 +2229,10 @@ impl Writer<'_> {
 
     /// Give up a step that failed. What the owner asked to forget is never given up: an erase, a
     /// compaction owed by markers, and a rebuild are retried after the backoff, the compaction
-    /// from its start.
+    /// from its start; and nor is a drop the file must remember.
     fn abandon(&mut self, task: Task) {
         match task {
-            Task::Erase | Task::Rebuild => {}
+            Task::Drops | Task::Erase | Task::Rebuild => {}
             Task::Tombstones => self.work.tombstones = None,
             Task::Expire => self.work.expire = None,
             Task::Evict => self.work.evict = None,

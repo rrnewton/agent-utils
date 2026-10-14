@@ -3691,6 +3691,10 @@ channel seen before is trusted until a read that began afterwards has seen it ag
 newest messages until a read of that view's newest end that began afterwards has landed. A read
 lifts the doubt about what it saw and nothing else: a thread's page says nothing about the
 channel's other messages, and a page of the newest two says nothing about the messages below them.
+The same holds for a change the server could not keep up with (its queue to the file was full) and
+for one whose write to the file failed (a full disk, an I/O error, another program holding the
+file): either marks the channel suspect at once, and the file records it as soon as it takes
+writes again.
 
 ### Whose reads fill it
 

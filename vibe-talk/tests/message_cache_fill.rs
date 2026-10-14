@@ -2593,3 +2593,88 @@ async fn a_deletion_made_while_the_server_was_down_is_never_vouched_for() {
         "seen since this start, on a live feed that carries deletions: {counted:?}"
     );
 }
+
+// ---- a write that fails ------------------------------------------------------------------------
+
+/// A live-fed bridge. An adapter's edit of an older message is queued, but its write fails: here
+/// another connection holds the file's write lock past the writer's busy timeout, as a full disk,
+/// an I/O error or an operator's own session would make any write fail. The edit is then left out
+/// of the file exactly as a full queue's drop would leave it, so the channel is suspect at once and
+/// the cache never vouches for the old text; a read that began afterwards takes the edit in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pushed_edit_whose_write_failed_is_never_vouched_for() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 8, &clock).await;
+    get(&d.state, &flat_page()).await;
+    assert_eq!(held(&d.cache), 8);
+    assert!(!d.cache.is_suspect(&read_chan()));
+
+    let path = d.cache.path().to_owned();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let locker = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        connection.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        locked_tx.send(()).expect("tell");
+        let _ = release_rx.recv();
+        connection.execute_batch("ROLLBACK").expect("unlock");
+    });
+    locked_rx.recv().expect("locked");
+    clock.advance(MINUTE);
+    let edit = said(&d.fake, &d.ids[1], "message 1, edited upstream");
+    d.fake.edit(&d.ids[1], "message 1, edited upstream");
+    assert_eq!(
+        ingest(&d.state, pushed("write-fails", "update", &edit)).await,
+        StatusCode::ACCEPTED
+    );
+    // The batch, and the edit's write alone, each wait out the busy timeout, and fail.
+    let failing = std::time::Instant::now();
+    while d.cache.stats().ops_failed == 0 {
+        assert!(failing.elapsed() < WAIT, "the write never failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        d.cache.last_drop_ms(&read_chan()).is_some(),
+        "the failed write is a drop, in memory at once"
+    );
+    release_tx.send(()).expect("release");
+    locker.join().expect("locker");
+    assert!(d.cache.quiesce_blocking(WAIT));
+    assert_eq!(
+        cached(&d.cache, &read_chan(), &d.ids[1]).message.content,
+        "message 1",
+        "the edit never reached the file"
+    );
+    assert!(d.cache.is_suspect(&read_chan()));
+
+    clock.advance(1_000);
+    let status = call_as(
+        &d.state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            d.ids[1].as_str()
+        ),
+        testing::READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let counted = shadow_of(&d.state, "message_by_id").await;
+    assert_eq!(
+        (
+            counted.would_serve,
+            counted.content_differs,
+            counted.misses.suspect
+        ),
+        (0, 0, 1),
+        "the old text vouched for after its edit's write failed: {counted:?}"
+    );
+
+    // A read of the whole channel that began afterwards takes the edit in, and lifts the doubt.
+    clock.advance(MINUTE);
+    get(&d.state, &flat_page()).await;
+    assert_eq!(
+        cached(&d.cache, &read_chan(), &d.ids[1]).message.content,
+        "message 1, edited upstream"
+    );
+    assert!(!d.cache.is_suspect(&read_chan()));
+}
