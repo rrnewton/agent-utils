@@ -27,12 +27,16 @@
 //!
 //! * at most one naming read per channel per `summaries.thread_naming_interval_seconds`
 //!   ([`DEFAULT_NAMING_INTERVAL_SECONDS`] by default). Due threads wait in that channel's queue,
-//!   at most [`MAX_QUEUED_PER_CHANNEL`] of them and [`MAX_QUEUED`] in all, and the one with the
-//!   newest activity is taken first. A thread waits at most [`MAX_QUEUED_WAIT`]; a later read
-//!   that still finds it due queues it again.
+//!   at most [`MAX_QUEUED_PER_CHANNEL`] of them and [`MAX_QUEUED`] in all, and are taken in this
+//!   order: a thread with no name yet before one due only a fresh sentence, then the newest
+//!   activity a write-scope page has shown, then the first queued — except that a thread that
+//!   has waited [`OVERDUE_TURNS`] intervals goes ahead of every thread that has not, the earliest
+//!   queued first. So however fast threads fall due, once a thread has waited that long no
+//!   thread queued after it is read before it. A thread waits at most [`MAX_QUEUED_WAIT`]; a
+//!   later read that still finds it due queues it again.
 //! * A thread is named ONLY from the read made at its turn. A thread already waiting keeps its
-//!   place when a later page shows it changed; that page's copy is never named from, and the read
-//!   at its turn sees the change.
+//!   time in the queue when a later page shows it changed (newer activity moves it up); that
+//!   page's copy is never named from, and the read at its turn sees the change.
 //! * The copy of the thread a forward delta then carries with the name is the one the read at its
 //!   turn returned, or, when that read says it is behind (`as_of`), the newer of it and what pages
 //!   showed while the thread waited; after it, each later page that shows the thread. An answer
@@ -75,6 +79,7 @@
 //! party wrote inside [`crate::untrusted::fenced`]. A name and a sentence are still third-party
 //! text when they come back, and the name is held to a strict shape before it is accepted.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -130,9 +135,17 @@ pub const CHANNEL_PAUSE: Duration = Duration::from_secs(10 * 60);
 /// The longest one naming read may take before it counts as a timeout, and pauses its channel. A
 /// backstop: a provider client's own request timeout normally answers first.
 pub const NAMING_READ_TIMEOUT: Duration = Duration::from_secs(300);
-/// The most threads waiting in one channel's queue. Past it, a thread whose activity is newer than
-/// the oldest waiting one takes that one's place; any other is left for a later read to queue.
+/// The most threads waiting in one channel's queue. Past it, a thread that would be read before the
+/// one that would be read last takes that one's place; any other is left for a later read to
+/// queue. A thread that has waited [`OVERDUE_TURNS`] intervals is never the one replaced.
 pub const MAX_QUEUED_PER_CHANNEL: usize = 32;
+/// How many of its channel's naming intervals a thread may wait before it is taken ahead of every
+/// thread that has waited less, the earliest queued first. Without it, threads falling due faster
+/// than the budget reads could keep an older or quieter one waiting for ever: newer activity, or
+/// a thread with no name, would always go first. With an interval of zero every waiting thread is
+/// past it at once, and the queue is first come first served (threads one page read queued
+/// together, in the usual order among themselves).
+pub const OVERDUE_TURNS: u32 = 4;
 /// The most threads waiting in every channel's queue together. Past it, a thread is left for a
 /// later read to queue.
 pub const MAX_QUEUED: usize = 256;
@@ -506,17 +519,56 @@ struct Waiting {
     deps: ThreadDeps,
     snapshot: ThreadSummary,
     prior: Option<ThreadRecord>,
-    /// The thread's activity when it was queued; newest is taken first.
+    /// The newest activity a WRITE-scope page has shown for the thread; newest is taken first. A
+    /// read token's page refreshes the snapshot and moves nothing in the queue.
     activity: jiff::Timestamp,
     queued_at: Instant,
     sequence: u64,
 }
 
 impl Waiting {
-    /// The order threads are taken in, greatest first: newest activity, then first queued.
-    fn order(&self) -> (jiff::Timestamp, std::cmp::Reverse<u64>) {
-        (self.activity, std::cmp::Reverse(self.sequence))
+    /// Where this thread stands in its channel's queue: the greatest [`Rank`] is read next.
+    fn rank(&self, overdue_after: Duration) -> Rank {
+        let unnamed = self.prior.is_none();
+        let first = Reverse(self.sequence);
+        if self.queued_at.elapsed() >= overdue_after {
+            Rank::Overdue {
+                since: Reverse(self.queued_at),
+                unnamed,
+                activity: self.activity,
+                first,
+            }
+        } else {
+            Rank::Waiting {
+                unnamed,
+                activity: self.activity,
+                first,
+            }
+        }
     }
+}
+
+/// Where a waiting thread stands in its channel's queue; the greatest is read next. Variants are
+/// compared first, in the order declared, then their fields in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// Waited less than [`OVERDUE_TURNS`] intervals: a thread with no name at all before one due
+    /// only a fresh sentence, then the newest activity, then the first queued.
+    Waiting {
+        unnamed: bool,
+        activity: jiff::Timestamp,
+        first: Reverse<u64>,
+    },
+    /// Waited [`OVERDUE_TURNS`] intervals or more: ahead of every thread that has not, the one
+    /// queued earliest first; threads one page read queued together, in the order above. That
+    /// bounds every wait however fast threads fall due: no thread queued later is ever ahead of
+    /// an overdue one, at most [`MAX_QUEUED_PER_CHANNEL`] can be, and one is read per interval.
+    Overdue {
+        since: Reverse<Instant>,
+        unnamed: bool,
+        activity: jiff::Timestamp,
+        first: Reverse<u64>,
+    },
 }
 
 /// A thread taken from its queue and not yet settled.
@@ -536,6 +588,7 @@ impl std::fmt::Debug for Waiting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Waiting")
             .field("thread", &self.snapshot.id)
+            .field("unnamed", &self.prior.is_none())
             .field("activity", &self.activity)
             .field("queued_at", &self.queued_at)
             .finish_non_exhaustive()
@@ -592,13 +645,17 @@ impl NamesState {
         )
     }
 
-    /// Take `channel`'s waiting thread with the newest activity, and start its read budget now.
-    fn take_newest(&mut self, channel: &ChannelId) -> Option<(String, Waiting)> {
+    /// Take `channel`'s waiting thread of greatest [`Rank`], and start its read budget now.
+    fn take_next(
+        &mut self,
+        channel: &ChannelId,
+        overdue_after: Duration,
+    ) -> Option<(String, Waiting)> {
         let queue = self.channels.get_mut(channel)?;
         let thread = queue
             .waiting
             .iter()
-            .max_by_key(|(_, waiting)| waiting.order())
+            .max_by_key(|(_, waiting)| waiting.rank(overdue_after))
             .map(|(thread, _)| thread.clone())?;
         let waiting = queue.waiting.remove(&thread)?;
         queue.last_read = Some(Instant::now());
@@ -717,6 +774,11 @@ impl ThreadNames {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// How long a thread waits before it is taken ahead of every thread that has waited less.
+    fn overdue_after(&self) -> Duration {
+        self.interval.saturating_mul(OVERDUE_TURNS)
+    }
+
     /// How many threads are queued or being named right now, in every channel.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -793,6 +855,9 @@ impl ThreadNames {
         if !deps.summarizer.names_threads() {
             return;
         }
+        // Every thread this answer queues is queued at the same moment, so an overdue queue still
+        // takes them in their order among themselves (see `Rank`).
+        let read_at = Instant::now();
         let mut answered = HashSet::new();
         for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
             answered.insert(summary.id.clone());
@@ -809,7 +874,7 @@ impl ThreadNames {
                         continue;
                     }
                     if due(summary, record.as_ref()) {
-                        self.enqueue(deps, channel, summary.clone(), record);
+                        self.enqueue(deps, channel, summary.clone(), record, read_at);
                     } else if let Some(record) = record {
                         if needs_touch(summary, &record, now_seconds()) {
                             self.touch(deps, channel, &summary.id, record);
@@ -978,15 +1043,16 @@ impl ThreadNames {
 
     /// Queue a due thread in its channel, and start the channel's worker if none is serving it.
     ///
-    /// A thread already waiting keeps its place: its record and the copy it waits with are brought
-    /// up to date, a copy only by one not older. A thread being named now, or one whose naming
-    /// failed recently, is not queued.
+    /// A thread already waiting keeps its time in the queue; newer activity than it was queued with
+    /// moves it up, and its record and copy are brought up to date (a copy only by one not older).
+    /// A thread being named now, or one whose naming failed recently, is not queued.
     fn enqueue(
         self: &Arc<Self>,
         deps: &ThreadDeps,
         channel: &ChannelId,
         snapshot: ThreadSummary,
         prior: Option<ThreadRecord>,
+        queued_at: Instant,
     ) {
         let key = (channel.clone(), snapshot.id.clone());
         let mut state = self.lock();
@@ -1005,10 +1071,12 @@ impl ThreadNames {
         let sequence = state.sequence;
         state.tokens += 1;
         let token = state.tokens;
+        let overdue_after = self.overdue_after();
         let queue = state.channels.entry(channel.clone()).or_default();
         if let Some(waiting) = queue.waiting.get_mut(&key.1) {
-            // An answer that lands after a newer one can be older, and does not take the copy
-            // back.
+            // An answer that lands after a newer one can be older: neither its activity nor its
+            // copy is taken back.
+            waiting.activity = waiting.activity.max(activity_of(&snapshot));
             if not_older(&snapshot, &waiting.snapshot) {
                 waiting.snapshot = snapshot;
             }
@@ -1021,19 +1089,21 @@ impl ThreadNames {
             activity: activity_of(&snapshot),
             snapshot,
             prior,
-            queued_at: Instant::now(),
+            queued_at,
             sequence,
         };
         if queue.waiting.len() >= MAX_QUEUED_PER_CHANNEL {
             // Full: the newcomer takes the place of the thread that would be read last, if it
-            // would be read before that one; otherwise a later read queues it again.
+            // would be read before that one; otherwise a later read queues it again. An overdue
+            // thread is read before any newcomer, so it is never the one replaced.
             let last = queue
                 .waiting
                 .iter()
-                .min_by_key(|(_, waiting)| waiting.order())
-                .map(|(thread, waiting)| (thread.clone(), waiting.order()));
+                .map(|(thread, waiting)| (waiting.rank(overdue_after), thread))
+                .min()
+                .map(|(rank, thread)| (thread.clone(), rank));
             match last {
-                Some((thread, order)) if entry.order() > order => {
+                Some((thread, rank)) if entry.rank(overdue_after) > rank => {
                     queue.waiting.remove(&thread);
                 }
                 _ => return,
@@ -1055,8 +1125,8 @@ impl ThreadNames {
     }
 
     /// Serve `channel`'s queue until it is empty or the worker is replaced: wait for the channel's
-    /// read budget and any pause, take the turn, take the waiting thread with the newest activity,
-    /// and name it from a read made then.
+    /// read budget and any pause, take the turn, take the waiting thread of greatest [`Rank`], and
+    /// name it from a read made then.
     async fn work(self: Arc<Self>, channel: ChannelId, token: u64) {
         let _release = WorkerRelease {
             names: Arc::clone(&self),
@@ -1077,7 +1147,7 @@ impl ThreadNames {
                 match state.ready_at(&channel, token, self.interval) {
                     None => return,
                     Some(at) if at > Instant::now() => None,
-                    Some(_) => state.take_newest(&channel),
+                    Some(_) => state.take_next(&channel, self.overdue_after()),
                 }
             };
             let Some((thread, waiting)) = taken else {

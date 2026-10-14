@@ -1,10 +1,11 @@
 //! remote-ops-audit W5 (naming-budget): how often naming a thread reads the chat provider.
 //!
 //! A thread is named only from a read of it made at its turn. These tests are about WHEN and HOW
-//! OFTEN those reads happen: at most one per channel per thirty seconds by default, newest activity
-//! first, none in a channel for ten minutes after a provider failure there, none from a read token,
-//! and no queue that grows without bound, waits for ever, or outlives its channel; and about the
-//! copy of a thread a forward delta carries once it is named.
+//! OFTEN those reads happen: at most one per channel per thirty seconds by default, a thread with
+//! no name first and then newest activity, none kept waiting for ever by threads falling due
+//! faster than that, none in a channel for ten minutes after a provider failure there, none from a
+//! read token, and no queue that grows without bound, waits for ever, or outlives its channel; and
+//! about the copy of a thread a forward delta carries once it is named.
 //!
 //! Every test runs on a paused clock, through the HTTP routes, with every upstream call counted by
 //! [`CountingChat`]. Nothing here reaches a model provider or a chat service.
@@ -24,8 +25,9 @@ use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::state::AppState;
 use vibe_talk::summarize::fake::FakeSummarizer;
 use vibe_talk::summarize::threads::{
-    name_key, ThreadDeps, ThreadNames, ThreadRequest, CHANNEL_PAUSE, MAX_QUEUED,
-    MAX_QUEUED_PER_CHANNEL, MAX_QUEUED_WAIT, NAMING_READ_TIMEOUT,
+    name_key, ThreadDeps, ThreadNames, ThreadRequest, CHANNEL_PAUSE,
+    DEFAULT_NAMING_INTERVAL_SECONDS, MAX_QUEUED, MAX_QUEUED_PER_CHANNEL, MAX_QUEUED_WAIT,
+    NAMING_READ_TIMEOUT, OVERDUE_TURNS,
 };
 use vibe_talk::testing::{
     self, CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN,
@@ -1159,5 +1161,163 @@ async fn a_read_at_the_turn_that_says_it_is_behind_does_not_take_back_a_newer_co
         (carried.reply_count, carried.updated_at.as_str()),
         (Some(3), "2026-10-13T08:10:00Z"),
         "a read that said it was behind took back a newer copy"
+    );
+}
+
+// --- the order threads are read in --------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_thread_a_later_page_shows_active_again_is_read_by_that_activity() {
+    // The queue is read newest activity first, and a thread's activity is the newest a write-scope
+    // page has shown, not the one it was first queued with.
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 3);
+    h.poll(WRITE_CHANNEL, true).await;
+    h.at(1).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), [ids[2].clone()]);
+
+    h.at(10).await;
+    reply_at(&h, &ids[0], 30 * 60);
+    h.poll(WRITE_CHANNEL, true).await;
+    h.at(31).await;
+    assert_eq!(
+        h.named_reads(WRITE_CHANNEL),
+        [ids[2].clone(), ids[0].clone()],
+        "the thread with the newest activity was not read next"
+    );
+}
+
+/// The paced run behind the next tests: from second `from` for `minutes`, `hot` threads each get a
+/// reply every `every` seconds, `each_second` changes anything else, and a write-scope page polls
+/// the list every second. Returns, per thread, the seconds at which it was read in that time.
+async fn under_load(
+    h: &Harness,
+    hot: &[String],
+    every: u64,
+    (from, minutes): (u64, u64),
+    mut each_second: impl FnMut(&Harness, u64),
+) -> HashMap<String, Vec<u64>> {
+    let mut reads: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut seen = h.named_reads(WRITE_CHANNEL).len();
+    for second in from..=from + minutes * 60 {
+        h.at(second).await;
+        if second > 0 && second % every == 0 {
+            for thread in hot {
+                reply_at(h, thread, 3_600 + u32::try_from(second).unwrap());
+            }
+        }
+        each_second(h, second);
+        h.poll(WRITE_CHANNEL, true).await;
+        tokio::task::yield_now().await;
+        let all = h.named_reads(WRITE_CHANNEL);
+        for thread in &all[seen..] {
+            reads.entry(thread.clone()).or_default().push(second);
+        }
+        seen = all.len();
+    }
+    reads
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_old_unnamed_thread_is_read_within_a_bound_while_hot_threads_stay_due() {
+    // More due threads than the budget reads, for ever: hot threads replied to every few seconds,
+    // each due a fresh sentence again within a minute or so. Before, the old thread was never read
+    // in an hour. A thread with no name at all is read ahead of any that has one and is due only
+    // a fresh sentence, so the only threads read before it are the hot ones queued with it, which
+    // have no name yet either and newer activity: it is read at the turn after theirs.
+    for (hot, every) in [(2, 5), (2, 6), (3, 5), (4, 12), (6, 5)] {
+        let h = harness();
+        let old = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+        let hot_ids = h.upstream.add(WRITE_CHANNEL, hot);
+        let reads = under_load(&h, &hot_ids, every, (0, 20), |_, _| {}).await;
+        let first = reads.get(&old).and_then(|at| at.first().copied());
+        let bound = hot as u64 * DEFAULT_NAMING_INTERVAL_SECONDS;
+        assert!(
+            first.is_some_and(|at| at <= bound),
+            "{hot} threads replied to every {every}s: the old thread was first read at {first:?}, \
+             not within {bound}s"
+        );
+        assert_eq!(reads[&old].len(), 1, "it is not due again");
+        for thread in &hot_ids {
+            assert!(
+                reads.get(thread).is_some_and(|at| at.len() >= 4),
+                "{hot} threads replied to every {every}s: {thread} was read {:?}",
+                reads.get(thread)
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn threads_equally_active_each_get_their_turn_when_they_fall_due_faster_than_the_budget() {
+    // Three threads replied to every five seconds fall due a fresh sentence about every fifty
+    // seconds each: more than the two reads a minute the channel is allowed. None is left out,
+    // and none waits more than the overdue limit and one more turn between falling due and being
+    // read, plus the time it takes to fall due again.
+    let h = harness();
+    let hot_ids = h.upstream.add(WRITE_CHANNEL, 3);
+    let reads = under_load(&h, &hot_ids, 5, (0, 60), |_, _| {}).await;
+    let counts: Vec<usize> = hot_ids
+        .iter()
+        .map(|thread| reads.get(thread).map_or(0, Vec::len))
+        .collect();
+    let total: usize = counts.iter().sum();
+    assert!(total >= 115, "the budget went unused: {counts:?}");
+    for (thread, count) in hot_ids.iter().zip(&counts) {
+        assert!(
+            *count >= total / 3 - 3,
+            "{thread} had {count} of {total} reads: {counts:?}"
+        );
+        let at = &reads[thread];
+        let longest = at
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest <= 4 * 60,
+            "{thread} went {longest}s between two reads: {at:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_due_only_a_fresh_sentence_is_read_within_the_overdue_limit_behind_new_threads() {
+    // A new unnamed thread every ten seconds, three times what the channel's budget reads: each
+    // goes ahead of a thread that already has a name. That thread, due a fresh sentence, is still
+    // read once it has waited OVERDUE_TURNS intervals, at the next turn.
+    let h = harness();
+    let named = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+    h.poll(WRITE_CHANNEL, true).await;
+    h.at(1).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), std::slice::from_ref(&named));
+
+    // From 30 seconds a new thread every ten seconds, each newer than every thread before it; the
+    // first is read at once. At 31 seconds two more replies, four messages after three: due a fresh
+    // sentence (1, 2, 4, 8...), and the earliest queued of all that wait from then on.
+    let reads = under_load(&h, &[], 3_600, (1, 10), |h, second| {
+        if second >= 30 && second % 10 == 0 {
+            let new = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+            h.upstream.change(&new, |thread| {
+                thread.active_second = 3_600 + u32::try_from(second).unwrap();
+            });
+        }
+        if second == 31 {
+            reply_at(h, &named, 3_600 + 30);
+            reply_at(h, &named, 3_600 + 31);
+        }
+    })
+    .await;
+    let queued_at = 31;
+    let bound = queued_at + (OVERDUE_TURNS as u64 + 1) * DEFAULT_NAMING_INTERVAL_SECONDS;
+    let again = reads.get(&named).and_then(|at| at.first().copied());
+    assert!(
+        again.is_some_and(|at| at <= bound),
+        "the named thread due a fresh sentence was read again at {again:?}, not by {bound}s"
+    );
+    assert!(
+        reads.len() >= 15,
+        "the new threads were read too: {} threads",
+        reads.len()
     );
 }
