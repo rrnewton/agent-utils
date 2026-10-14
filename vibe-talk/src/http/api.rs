@@ -3014,6 +3014,26 @@ pub async fn forget_conversations(
     )))
 }
 
+/// What `DELETE /api/v1/storage` erases, by name: every table the store's purge empties, as a
+/// reader of the answer knows them, and the message cache file. `tests/message_cache_switch.rs`
+/// checks it against the tables the store's purge deletes from.
+pub const PURGED: &[&str] = &[
+    "conversations",
+    "read_marks",
+    "summaries",
+    "dismissals",
+    "upstream_clear",
+    "aliases",
+    "noise_rules",
+    "noise_exemptions",
+    "pins",
+    "bookmarks",
+    "voice_settings",
+    "voice_prompt",
+    "voice_post_prefix",
+    "message_cache",
+];
+
 /// `DELETE /api/v1/storage` — erase EVERYTHING this server holds in its store.
 ///
 /// The operator's erase, and the only complete one of the store there is over HTTP. It is not a
@@ -3055,6 +3075,12 @@ pub async fn forget_conversations(
 /// * smaller records, such as the paren tags [`crate::heading::HeadingTags`] has seen.
 ///
 /// Only a restart clears every copy held in memory.
+///
+/// `#208 persistent-cache`. It erases the message cache file too, which is not in the store: the
+/// open one is erased and, while the cache is on, reopened empty, and any other cache file this
+/// server made goes with it. The owner's switch for the cache lives beside the store rather than in
+/// it, so a purge neither turns the cache back on nor off. The answer's `purged` names every table
+/// the store's purge empties, and `message_cache`.
 pub async fn purge_storage(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -3068,6 +3094,16 @@ pub async fn purge_storage(
     state.read_ahead.clear();
     state.live.recent().clear();
     state.recent_view_shadow.clear();
+    // `#208 persistent-cache`. The message cache file is not in the store, and is erased with it:
+    // reopened empty while the cache is on, and the owner's switch, which lives beside the store
+    // rather than in it, left as it is.
+    if let Some(lifecycle) = state.message_cache.lifecycle() {
+        let bytes = lifecycle.purge(&state.message_cache).await;
+        tracing::info!(
+            bytes,
+            "the store was erased, and every message cache file this server made with it"
+        );
+    }
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,
@@ -3076,7 +3112,7 @@ pub async fn purge_storage(
         );
     }
     Ok(no_store(Json(serde_json::json!({
-        "purged": ["conversations", "read_marks", "summaries", "dismissals", "upstream_clear"],
+        "purged": PURGED,
         "detail": "every durable record this server holds has been erased; the store is still \
                    open and usable",
     }))))

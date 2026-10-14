@@ -29,6 +29,10 @@
 //! - **erase** erases the open file and opens a fresh one in its place, and the accounts are
 //!   checked again. With no cache open it erases nothing.
 //!
+//! The purge of the store (`DELETE /api/v1/storage`) erases the file as **erase** does, and every
+//! other cache file this server made, and leaves the switch and the marker as they are
+//! ([`Lifecycle::purge`]).
+//!
 //! One switch runs at a time. Each answers the [`MessageCacheStatus`] it left, which is also what
 //! client-config carries: measured on the blocking pool, and kept for [`STATUS_FRESH_FOR`] in
 //! between, since counting the file's rows costs a scan.
@@ -402,6 +406,37 @@ impl Lifecycle {
             }
         }
         Ok(self.switched(sink, table).await)
+    }
+
+    /// The purge's part (`DELETE /api/v1/storage`): erase the open file, and open a fresh one in
+    /// its place while the cache is on; and erase every other cache file this server made, such as
+    /// one left from an earlier configuration. The owner's switch and the marker are not the
+    /// store's, and are left exactly as they are: a purge never turns the cache back on, nor off.
+    /// Returns the bytes erased.
+    pub async fn purge(&self, sink: &Sink) -> u64 {
+        let _serial = self.serial.lock().await;
+        let mut bytes = 0;
+        let cache = sink.cache();
+        let held = cache.as_ref().map(|cache| cache.path().to_owned());
+        if let Some(cache) = cache {
+            bytes += self.erase_and_reopen(sink, cache).await.unwrap_or(0);
+        }
+        if let Some(files) = self.files.clone() {
+            bytes += tokio::task::spawn_blocking(move || {
+                // A registry that cannot be read names nothing; the store's directory is still
+                // searched.
+                let registry = marker::load(&files.sidecar).unwrap_or_default();
+                marker::erase_registered_except(
+                    &registry,
+                    files.default_dir.as_deref(),
+                    held.as_deref(),
+                )
+            })
+            .await
+            .unwrap_or(0);
+        }
+        self.forget_status();
+        bytes
     }
 
     /// Erase the cache behind the sink and open a fresh file in its place, then check every

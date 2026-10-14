@@ -1554,8 +1554,8 @@ async fn a_read_says_why_it_was_made_and_a_reason_the_page_does_not_send_is_othe
 
 #[tokio::test]
 async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held() {
-    // `#208 persistent-cache`. Opening the cache, turning it off and on, and erasing it are each
-    // logged at INFO — and none of those lines may carry a channel id, a message id or a word of
+    // `#208 persistent-cache`. Opening the cache, turning it off and on, erasing it, and the purge
+    // erasing it are each logged at INFO — and none of those lines may carry a channel id, a message id or a word of
     // what the file held.
     use vibe_talk::cache::{ChanKey, Incoming, Observation, Scope};
     use vibe_talk::model::{Message, MessageId, UserId};
@@ -1619,18 +1619,28 @@ async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held
         router: router(state.clone()),
         discord,
     };
-    for (method, body) in [
-        ("DELETE", None),
-        ("PUT", Some(json!({ "enabled": false }))),
-        ("PUT", Some(json!({ "enabled": true }))),
+    for (method, uri, body) in [
+        ("DELETE", "/api/v1/message-cache", None),
+        ("DELETE", "/api/v1/storage", None),
+        (
+            "PUT",
+            "/api/v1/message-cache",
+            Some(json!({ "enabled": false })),
+        ),
+        (
+            "PUT",
+            "/api/v1/message-cache",
+            Some(json!({ "enabled": true })),
+        ),
     ] {
-        let (status, answer) = json_call(&harness, method, "/api/v1/message-cache", body).await;
-        assert_eq!(status, StatusCode::OK, "{method}: {answer}");
+        let (status, answer) = json_call(&harness, method, uri, body).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {answer}");
     }
     let text = capture.text();
     assert!(
         text.contains("the message cache is open")
             && text.contains("erased the message cache")
+            && text.contains("every message cache file this server made with it")
             && text.contains("turned the message cache off")
             && text.contains("turned the message cache on"),
         "the switches were not logged, so the absences below prove nothing: {text}"

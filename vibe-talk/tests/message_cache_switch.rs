@@ -576,3 +576,119 @@ async fn no_tool_reaches_the_switch_whatever_the_credential() {
     assert!(state.message_cache.cache().is_some_and(|c| c.is_open()));
     assert!(!marker::load(&sidecar(dir)).expect("load").off);
 }
+
+async fn purge(state: &AppState) -> Value {
+    let (status, body) = send(state, "DELETE", "/api/v1/storage", WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn the_purge_erases_the_file_and_keeps_the_cache_on() {
+    let scratch = TempDir::new("cache-switch-purge");
+    let dir = scratch.path();
+    let (state, _clock) = filled_server(dir, 6).await;
+    // A file an earlier configuration left in the store's directory goes too.
+    let earlier = dir
+        .join("state")
+        .join("store.message-cache-earlier.sqlite3");
+    leave_a_cache_at(&earlier);
+    let before = state.message_cache.cache().expect("open");
+
+    let body = purge(&state).await;
+    assert!(
+        body["purged"]
+            .as_array()
+            .is_some_and(|names| names.contains(&json!("message_cache"))),
+        "{body}"
+    );
+    let after = state.message_cache.cache().expect("still behind the sink");
+    assert!(
+        Arc::ptr_eq(&before, &after) && after.is_open(),
+        "the purge turned it off"
+    );
+    assert_eq!(held(&after), 0, "the purge left rows in the file");
+    assert!(!earlier.exists(), "the purge left an earlier cache file");
+    assert!(!marker::load(&sidecar(dir)).expect("load").off);
+    assert!(state.message_cache.identities_verified(WAIT).await);
+    let (status, body) = erase(&state).await;
+    assert_eq!(
+        (status, body["available"].clone()),
+        (StatusCode::OK, json!(true))
+    );
+}
+
+#[tokio::test]
+async fn the_off_switch_survives_the_purge_and_the_restart_after_it() {
+    let scratch = TempDir::new("cache-switch-purge-off");
+    let dir = scratch.path();
+    let (state, clock) = filled_server(dir, 4).await;
+    let (status, body) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    purge(&state).await;
+    assert!(
+        marker::load(&sidecar(dir)).expect("load").off,
+        "the purge turned the cache back on"
+    );
+    assert!(
+        state.message_cache.cache().is_none(),
+        "the purge opened a cache"
+    );
+    assert!(!default_cache(dir).exists());
+    stop(state);
+
+    let (state, started) = server(dir, Some(ON), &clock).await;
+    assert!(matches!(started, Started::Erased { .. }), "{started:?}");
+    assert!(state.message_cache.cache().is_none(), "a restart opened it");
+    assert!(!default_cache(dir).exists());
+}
+
+#[tokio::test]
+async fn the_purge_names_every_table_the_store_empties_and_the_message_cache() {
+    // Read from the store's own purge, so a table added there without a name here fails.
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/sqlite.rs"))
+            .expect("the store's source");
+    let body = source
+        .split_once("async fn purge_everything(")
+        .expect("the store has a purge")
+        .1;
+    let body = &body[..body.find("\n    }\n").expect("the purge ends")];
+    let mut emptied: Vec<String> = body
+        .split("DELETE FROM ")
+        .skip(1)
+        .map(|rest| {
+            let table: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            // As a reader of the answer knows them: a pin's revision counter is part of the pins.
+            match table.as_str() {
+                "channel_aliases" => "aliases".to_owned(),
+                "pin_revisions" => "pins".to_owned(),
+                _ => table,
+            }
+        })
+        .collect();
+    emptied.push("message_cache".to_owned());
+    emptied.sort();
+    emptied.dedup();
+    assert!(emptied.len() > 10, "{emptied:?}");
+    let mut named: Vec<String> = vibe_talk::http::api::PURGED
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    named.sort();
+    assert_eq!(
+        named, emptied,
+        "the purge's answer and what it empties differ"
+    );
+
+    let scratch = TempDir::new("cache-switch-purge-names");
+    let clock = ManualClock::at(T0);
+    let (state, _) = server(scratch.path(), None, &clock).await;
+    assert_eq!(
+        purge(&state).await["purged"],
+        json!(vibe_talk::http::api::PURGED)
+    );
+}

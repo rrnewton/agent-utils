@@ -1844,7 +1844,16 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
             "read_marks",
             "summaries",
             "dismissals",
-            "upstream_clear"
+            "upstream_clear",
+            "aliases",
+            "noise_rules",
+            "noise_exemptions",
+            "pins",
+            "bookmarks",
+            "voice_settings",
+            "voice_prompt",
+            "voice_post_prefix",
+            "message_cache"
         ]),
         "the answer has to name what it erased: {payload}"
     );

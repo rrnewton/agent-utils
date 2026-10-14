@@ -3259,7 +3259,8 @@ clear-unread setting (back to off, in the running server too) alike:
    the copies of channel text held in memory — read-aloud's recent messages, the voice catch-up's
    channel windows with their pushed changes, and the reads a bridge's `recent_view_shadow` holds
    waiting for their check — and a read already running keeps nothing of what it brings back. It
-   does **not** empty the other copies in memory, listed below;
+   erases the message cache file too, which is beside the store rather than in it (`#208
+   persistent-cache`). It does **not** empty the other copies in memory, listed below;
 2. delete the file (`rm ~/.local/share/vibe-talk/vibe-talk.sqlite3`) — with the server stopped; or
 3. delete the mounted directory, which is also what `scripts/run.sh --status` prints.
 
@@ -3568,7 +3569,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/bookmark` | read | the channel's reading bookmark, `{revision, anchor}`, `anchor` null when none is set; every channel read carries it too. See "The reading bookmark" |
 | PUT | `/api/v1/channels/{id}/bookmark` | **write** | `{message_id, timestamp, place?:"above"\|"below", thread_id?, if_revision?}` — put it next to that message; a stale `if_revision` is `409` with where it is now; idempotent |
 | DELETE | `/api/v1/channels/{id}/bookmark?if_revision=` | **write** | take it away; `if_revision` as for PUT; idempotent |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, bookmarks, the voice send setting and instructions, and every channel's clear-unread setting (back to off) |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins, bookmarks, the voice send setting, instructions and post tag, every channel's clear-unread setting (back to off), and the message cache file (reopened empty while it is on; its on/off switch is kept). `purged` names each |
 | PUT | `/api/v1/message-cache` | **write** | `{enabled: bool}` — the owner's switch for the message cache. `false` writes the off marker beside the store first, then erases every cache file this server made (a marker that cannot be written erases nothing: `500 message_cache_switch_unsaved`); `true` clears it and opens a fresh, empty file, `409 message_cache_not_enabled` while `[message_cache] enabled` is not `true`. Answers `{available, enabled, reason?, bytes, messages, channels, oldest_covered?, max_days, max_megabytes}`; `409 message_cache_not_configured` with no `[message_cache]` table. No MCP tool reaches it |
 | DELETE | `/api/v1/message-cache` | **write** | erase the message cache and keep it on, with a fresh, empty file; nothing is erased while it is off. Answers as PUT does. No MCP tool reaches it |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
