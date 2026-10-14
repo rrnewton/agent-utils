@@ -1233,7 +1233,7 @@ async fn a_claim_the_store_refuses_leaves_the_send_free_for_the_next_claim() {
         StatusCode::OK,
         "the failed claim kept the send: {body}"
     );
-    assert_eq!(body["turn"]["text"], "on my way");
+    assert_eq!(body["turn"]["text"], tagged("on my way"));
 }
 
 #[tokio::test]
@@ -1441,15 +1441,20 @@ async fn a_resumed_call_is_not_told_that_an_unconfirmed_or_partial_send_was_post
         .filter(|line| !line.starts_with(' ') && !line.contains("Lines that begin"))
         .collect();
     assert_eq!(lines.len(), 2, "{text}");
+    // Quoted as the sends went, the owner's tag in front (`#303 voice-post-prefix`).
     assert_eq!(
-        lines[0], "may have been sent to lead team (NOT confirmed): ship it",
+        lines[0],
+        format!(
+            "may have been sent to lead team (NOT confirmed): {}",
+            tagged("ship it")
+        ),
         "the recap said an unconfirmed send was posted: {text}"
     );
     assert!(
-        lines[1].starts_with(
-            "partly sent to lead team (only these words were posted; the rest was NOT posted): \
-             alpha"
-        ),
+        lines[1].starts_with(&format!(
+            "partly sent to lead team (only these words were posted; the rest was NOT posted): {}",
+            tagged("alpha")
+        )),
         "the recap quoted the parts that went as the whole message: {text}"
     );
     assert!(!lines[1].contains("charlie"), "{text}");
