@@ -222,7 +222,9 @@ pub struct Turn {
     /// What was said. UNTRUSTED text when the agent is reading a channel aloud.
     pub text: String,
     /// When the store recorded it, in milliseconds since the Unix epoch. Server clock; see
-    /// [`now_ms`].
+    /// [`now_ms`]. A record row filed in a conversation that another has been written to since is
+    /// the exception: it carries its own conversation's last time, so that it stays inside that
+    /// conversation's span ([`filed_at`]). A `sent` row's detail still says when the message went.
     pub at_ms: i64,
     /// What the row records beyond words. `#270 voice-transcript-markers`.
     ///
@@ -1565,7 +1567,11 @@ pub trait StateStore: Send + Sync {
     /// [`StoreError::Backend`] when the store is there and cannot be written to, naming why.
     async fn check_writable(&self) -> Result<String, StoreError>;
 
-    /// Record one turn, creating the conversation if this is its first.
+    /// Record one turn, creating the conversation if this is its first, and return the time it
+    /// was filed under: the turn's own [`Turn::at_ms`], or for a record row filed in a
+    /// conversation another has been written to since, that conversation's last time
+    /// ([`filed_at`]). Decided in the same write that files the row, so no other write can come
+    /// between the reading of the two conversations' times and the row they place.
     ///
     /// # Errors
     ///
@@ -1576,7 +1582,7 @@ pub trait StateStore: Send + Sync {
         &self,
         conversation: &ConversationId,
         turn: &Turn,
-    ) -> Result<(), StoreError>;
+    ) -> Result<i64, StoreError>;
 
     /// Every stored conversation, most recently active first.
     ///
@@ -2266,6 +2272,36 @@ pub fn preview_for(turn: &Turn) -> String {
         String::new()
     } else {
         preview_of(&turn.text)
+    }
+}
+
+/// The time `turn` is filed under in a conversation last written at `own_last` — `None` for a
+/// conversation this turn starts — while the latest write to any OTHER conversation was at
+/// `newest_other`. Shared by every backend. `#270 voice-transcript-markers`.
+///
+/// The turn's own time, with one exception: a record row filed in a conversation that another has
+/// been written to since, as late or later, is stamped at its own conversation's last time instead
+/// (never later than its own). The voice page files some rows in the conversation a draft was
+/// shown in rather than the one under way: Send, Don't send or a lapse on a card kept through a
+/// dropped call and answered during the next one, and a send that settles after the next call
+/// began. Stamped with the time it arrived, such a row would be read back by the walk, which goes
+/// in `(at_ms, conversation_id, seq)` order, in the middle of the newer conversation, splitting it
+/// in two under a line saying its later half had ended; and it would move its conversation to the
+/// head of the listing, which is the conversation the next call resumes from. Stamped at its
+/// conversation's last time, it is read back right after that conversation's last row, where the
+/// live page drew it, and the listing keeps its order.
+///
+/// At the same millisecond the two conversations cannot be told apart, and the row keeps the order
+/// the listing already has. An ordinary turn is never moved: it is said in the conversation under
+/// way, and a conversation carried on later is rightly the newest. Nor is a row that starts a
+/// conversation, which has no span to stay inside.
+#[must_use]
+pub fn filed_at(turn: &Turn, own_last: Option<i64>, newest_other: Option<i64>) -> i64 {
+    match (own_last, newest_other) {
+        (Some(last), Some(other)) if turn.speaker.is_record() && other >= last => {
+            turn.at_ms.min(last)
+        }
+        _ => turn.at_ms,
     }
 }
 

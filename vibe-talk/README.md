@@ -3458,7 +3458,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
 | GET | `/api/v1/conversations/{id}?records=` | **write** | one stored transcript, oldest turn first; `records=1` adds the record rows (`sent`, `marker`) and each row's `detail` (`#270 voice-transcript-markers`), which a read without it never sees |
 | DELETE | `/api/v1/conversations/{id}` | **write** | erase one stored transcript |
-| POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn, `{speaker, text}`; a `you` turn may carry `answer` (the proposal a spoken yes sent). Also the voice page's records: `{speaker: "sent", send}` files the send memory's own copy of send `send` (`404 send_unknown` once forgotten, `409 send_recorded` the second time), and `{speaker: "marker", marker}` a conversation's start or a draft not sent; both carry no text, and anything else is `400 bad_record` |
+| POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn, `{speaker, text}`; a `you` turn may carry `answer` (the proposal a spoken yes sent). Also the voice page's records: `{speaker: "sent", send}` files the send memory's own copy of send `send` (`404 send_unknown` once forgotten, `409 send_recorded` the second time), and `{speaker: "marker", marker}` a conversation's start or a draft not sent; both carry no text, and anything else is `400 bad_record`. Answers `{id, turn}`, the turn as stored: a record filed in a conversation another has been written to since carries that conversation's last time as its `at_ms`, so it stays inside that conversation and does not move it up the listing |
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call, with `words`, how many words of what was said or sent it holds — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
@@ -6919,6 +6919,13 @@ and that the page stopped offering it, which stays true if a reloaded page sends
 lapses: its sent card then follows the line. A draft a newer one replaced, or one somebody else
 settled, leaves none. On a server that keeps records the line is kept as a `not_sent` marker in the
 draft's conversation, so a reload draws it in the same words.
+
+**What is filed in an earlier call stays in that call.** Send, Don't send or a lapse on a card
+answered during the next call, and a send whose answer arrives after the next call began, are filed
+in the call the draft was made in, and drawn just above the line that ended it. The server stamps
+such a row with that call's last time rather than the moment it arrived (a sent card still shows
+when the message went), so a reload draws it in the same place, the newer call stays one
+conversation, and the next call still resumes from the call the owner was in.
 
 **A spoken yes, judged by the page.** The agent's tool result hands it one sentence to say,
 `To {channel}: {text}. Send it?` (`ops::read_back`), and its prompt tells it to say exactly that,

@@ -2196,8 +2196,8 @@ pub async fn record_turn(
                 Some(serial) => Some(TurnDetail::Answer { serial }),
                 None => None,
             };
-            let turn = Turn::record(speaker, text, detail);
-            state.store.append_turn(conversation, &turn).await?;
+            let mut turn = Turn::record(speaker, text, detail);
+            turn.at_ms = state.store.append_turn(conversation, &turn).await?;
             if let Some(TurnDetail::Answer { serial }) = &turn.detail {
                 crate::access::transcript_record("answer", Some(*serial), None, None, None);
             }
@@ -2221,15 +2221,20 @@ pub async fn record_turn(
                 })?;
             let serial = send.record.serial;
             let how = send.record.how;
-            let turn = Turn::record(
+            let mut turn = Turn::record(
                 Speaker::Sent,
                 send.text,
                 Some(TurnDetail::Sent(Box::new(send.record))),
             );
-            if let Err(error) = state.store.append_turn(conversation, &turn).await {
-                // Not in the transcript, so not claimed: a later claim, here or elsewhere, may.
-                state.post_gate.unclaim_send(send_seq);
-                return Err(error.into());
+            // Filed, perhaps, in the conversation the draft was shown in rather than the newest:
+            // the store says what time it was filed under (`crate::store::filed_at`).
+            match state.store.append_turn(conversation, &turn).await {
+                Ok(at_ms) => turn.at_ms = at_ms,
+                Err(error) => {
+                    // Not in the transcript, so not claimed: a later claim, here or elsewhere, may.
+                    state.post_gate.unclaim_send(send_seq);
+                    return Err(error.into());
+                }
             }
             crate::access::transcript_record("sent", Some(serial), Some(how.as_str()), None, None);
             Ok(turn)
@@ -2242,8 +2247,8 @@ pub async fn record_turn(
                 return bad("a marker row carries a marker");
             };
             let detail = parse_marker(marker).map_err(RecordError::Bad)?;
-            let turn = Turn::record(Speaker::Marker, String::new(), Some(detail));
-            state.store.append_turn(conversation, &turn).await?;
+            let mut turn = Turn::record(Speaker::Marker, String::new(), Some(detail));
+            turn.at_ms = state.store.append_turn(conversation, &turn).await?;
             match &turn.detail {
                 Some(TurnDetail::ConversationStart(start)) => crate::access::transcript_record(
                     "conversation_start",

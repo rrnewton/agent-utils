@@ -864,7 +864,7 @@ impl StateStore for SqliteStore {
         &self,
         conversation: &ConversationId,
         turn: &Turn,
-    ) -> Result<(), StoreError> {
+    ) -> Result<i64, StoreError> {
         if turn.text.chars().count() > MAX_TURN_CHARS {
             return Err(StoreError::TooLarge(format!(
                 "one turn may be at most {MAX_TURN_CHARS} characters"
@@ -888,6 +888,23 @@ impl StateStore for SqliteStore {
                     retention.max_turns_per_conversation
                 )));
             }
+            // `#270 voice-transcript-markers`. A record row filed in a conversation another has
+            // been written to since stays inside its own conversation's span
+            // (`super::filed_at`). Read in this transaction, so nothing lands between the read
+            // and the row it places. An ordinary turn never needs it, and never pays for it.
+            let at_ms = if turn.speaker.is_record() {
+                let (own_last, newest_other): (Option<i64>, Option<i64>) = transaction
+                    .query_row(
+                        "SELECT (SELECT last_at_ms FROM conversations WHERE id = ?1),
+                                (SELECT MAX(last_at_ms) FROM conversations WHERE id <> ?1)",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(backend)?;
+                super::filed_at(&turn, own_last, newest_other)
+            } else {
+                turn.at_ms
+            };
             // The preview is the first turn that offers one: a record row offers none
             // (`super::preview_for`), so a conversation that starts with a marker takes its
             // preview from the first thing said in it.
@@ -898,7 +915,7 @@ impl StateStore for SqliteStore {
                      ON CONFLICT(id) DO UPDATE SET
                         last_at_ms = ?2,
                         preview = CASE WHEN preview = '' THEN ?3 ELSE preview END",
-                    rusqlite::params![&id, turn.at_ms, super::preview_for(&turn)],
+                    rusqlite::params![&id, at_ms, super::preview_for(&turn)],
                 )
                 .map_err(backend)?;
             let detail = turn.detail.as_ref().map(super::TurnDetail::to_stored);
@@ -910,11 +927,12 @@ impl StateStore for SqliteStore {
                         (SELECT IFNULL(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?1),
                         ?2, ?3, ?4, ?5
                      )",
-                    rusqlite::params![&id, turn.speaker.as_str(), &turn.text, turn.at_ms, detail],
+                    rusqlite::params![&id, turn.speaker.as_str(), &turn.text, at_ms, detail],
                 )
                 .map_err(backend)?;
             prune(&transaction, retention)?;
-            transaction.commit().map_err(backend)
+            transaction.commit().map_err(backend)?;
+            Ok(at_ms)
         })
         .await
     }
@@ -5750,6 +5768,140 @@ mod tests {
         let said = newest_rows_are_records(&real).await;
         assert_eq!(said, ["ship it", "ship it"]);
         assert_eq!(said, newest_rows_are_records(&fake).await);
+    }
+
+    /// Rows filed late into an older conversation, as the voice page files them: a send and a lapse
+    /// on a card kept through a dropped call, answered during the next one. Every row at a rising
+    /// instant, as the server stamps them, because at one shared instant the walk's order is the
+    /// conversation ids' and hides what this is about.
+    async fn late_records_script(store: &dyn StateStore) -> Vec<String> {
+        let base = now_ms() - 60_000;
+        let at = |row: Turn, at_ms: i64| Turn { at_ms, ..row };
+        let filed = [
+            ("conv_one", said(Speaker::You, "how is the runner", base)),
+            (
+                "conv_one",
+                said(
+                    Speaker::Agent,
+                    "To lead team: ship it. Send it?",
+                    base + 1_000,
+                ),
+            ),
+            ("conv_two", at(marker(start(RecapNone::Off)), base + 5_000)),
+            (
+                "conv_two",
+                said(Speaker::You, "and the nightly?", base + 6_000),
+            ),
+            ("conv_two", said(Speaker::Agent, "it passed", base + 7_000)),
+            // Late: the card from conv_one, tapped during conv_two; then one lapsing.
+            ("conv_one", at(sent(7, "ship it"), base + 8_000)),
+            (
+                "conv_one",
+                at(
+                    marker(TurnDetail::NotSent {
+                        why: NotSentWhy::Lapsed,
+                        serial: 8,
+                    }),
+                    base + 9_000,
+                ),
+            ),
+            ("conv_two", said(Speaker::You, "thanks", base + 10_000)),
+            // A record in the conversation under way keeps its own time.
+            ("conv_two", at(sent(9, "on it"), base + 11_000)),
+        ];
+        let mut stamped = Vec::new();
+        for (conversation, row) in &filed {
+            let at_ms = store
+                .append_turn(&id(conversation), row)
+                .await
+                .expect("append");
+            stamped.push(at_ms - base);
+        }
+        assert_eq!(
+            stamped,
+            [0, 1_000, 5_000, 6_000, 7_000, 1_000, 1_000, 10_000, 11_000],
+            "a late record left its conversation's span, or a row on time was moved"
+        );
+        let page = store.transcript(50, None, true).await.expect("page");
+        let walk: Vec<String> = page
+            .turns
+            .iter()
+            .rev()
+            .map(|entry| {
+                format!(
+                    "{} {}",
+                    entry.conversation.as_str(),
+                    entry.turn.speaker.as_str()
+                )
+            })
+            .collect();
+        assert_eq!(
+            walk,
+            [
+                "conv_one you",
+                "conv_one agent",
+                "conv_one sent",
+                "conv_one marker",
+                "conv_two marker",
+                "conv_two you",
+                "conv_two agent",
+                "conv_two you",
+                "conv_two sent",
+            ],
+            "a late record was read back inside the newer conversation"
+        );
+        let listed = store.conversations().await.expect("list");
+        let order: Vec<&str> = listed.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            order,
+            ["conv_two", "conv_one"],
+            "a late record moved its conversation to the head of the listing"
+        );
+        assert_eq!(listed[1].last_at_ms - base, 1_000);
+
+        // At one shared millisecond the two cannot be told apart: the listing keeps its order.
+        let tied = base + 20_000;
+        store
+            .append_turn(&id("conv_x"), &said(Speaker::You, "x", tied))
+            .await
+            .expect("append");
+        store
+            .append_turn(&id("conv_y"), &said(Speaker::You, "y", tied))
+            .await
+            .expect("append");
+        let late = store
+            .append_turn(&id("conv_x"), &at(sent(10, "tied"), tied + 5))
+            .await
+            .expect("append");
+        assert_eq!(late, tied, "a tie was broken by a late record");
+        let listed = store.conversations().await.expect("list");
+        assert_eq!(listed[0].id.as_str(), "conv_y");
+
+        // Something SAID in an older conversation is never moved: carried on, it is the newest.
+        let carried = store
+            .append_turn(
+                &id("conv_one"),
+                &said(Speaker::You, "back to it", base + 30_000),
+            )
+            .await
+            .expect("append");
+        assert_eq!(carried - base, 30_000);
+        let listed = store.conversations().await.expect("list");
+        assert_eq!(listed[0].id.as_str(), "conv_one");
+        let mut seen = walk;
+        seen.extend(stamped.iter().map(i64::to_string));
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_record_filed_late_into_an_older_conversation_stays_inside_its_span() {
+        let dir = TempDir::new("sqlite-late-records");
+        let real = store(&dir, Retention::default());
+        let fake = crate::store::fake::FakeStore::new();
+        assert_eq!(
+            late_records_script(&real).await,
+            late_records_script(&fake).await
+        );
     }
 
     #[tokio::test]

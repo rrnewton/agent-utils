@@ -1433,3 +1433,102 @@ async fn a_resumed_call_is_not_told_that_an_unconfirmed_or_partial_send_was_post
         "{text}"
     );
 }
+
+/// The voice page files a draft's send, or its "Not sent" line, in the conversation the draft was
+/// shown in — even when the owner answers the card during the NEXT call. Through the real routes,
+/// with a pause between rows so the server's stamps rise as they do on a phone: such a row must be
+/// read back inside its own conversation, not in the middle of the newer one, and must not move
+/// its conversation to the head of the listing, which is what the next call resumes from.
+#[tokio::test]
+async fn a_send_filed_late_into_an_older_conversation_stays_inside_it() {
+    let harness = store_harness();
+    let pause = || tokio::time::sleep(Duration::from_millis(3));
+    let say = |conversation: &'static str, text: &'static str| {
+        let harness = &harness;
+        async move {
+            let (status, body) = record(
+                harness,
+                conversation,
+                json!({ "speaker": "you", "text": text }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["turn"]["at_ms"].as_i64().expect("at_ms")
+        }
+    };
+    let proposal = propose(&harness, "ship it").await;
+    let drafted_at = say("conv_a", "tell lead team to ship it").await;
+    pause().await;
+    say("conv_b", "and the nightly?").await;
+    pause().await;
+    say("conv_b", "is it green").await;
+    pause().await;
+    let (status, committed) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let (status, filed) = record(
+        &harness,
+        "conv_a",
+        json!({ "speaker": "sent", "send": committed["send_seq"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filed}");
+    assert_eq!(
+        filed["turn"]["at_ms"].as_i64(),
+        Some(drafted_at),
+        "the answer does not give the time the row was filed under: {filed}"
+    );
+    assert!(
+        filed["turn"]["detail"]["sent_at_ms"].as_i64() > Some(drafted_at),
+        "the card lost the time the message went: {filed}"
+    );
+    pause().await;
+    let (status, body) = record(
+        &harness,
+        "conv_a",
+        json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 9 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    pause().await;
+    say("conv_b", "thanks").await;
+
+    let (status, page) = send(
+        &harness,
+        "GET",
+        "/api/v1/transcript?records=1",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let walk: Vec<String> = page["turns"]
+        .as_array()
+        .expect("turns")
+        .iter()
+        .rev()
+        .map(|row| {
+            format!(
+                "{} {}",
+                row["conversation_id"].as_str().unwrap_or("?"),
+                row["speaker"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    assert_eq!(
+        walk,
+        [
+            "conv_a you",
+            "conv_a sent",
+            "conv_a marker",
+            "conv_b you",
+            "conv_b you",
+            "conv_b you",
+        ],
+        "a late row was read back inside the newer conversation: {page}"
+    );
+    let (_, listed) = send(&harness, "GET", "/api/v1/conversations", WRITE_TOKEN, None).await;
+    assert_eq!(
+        listed["conversations"][0]["id"], "conv_b",
+        "a late row made the next call resume from the older conversation: {listed}"
+    );
+}
