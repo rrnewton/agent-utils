@@ -190,8 +190,10 @@ send-order-browser:
 # open at the foot of the left column (`#277 reply-in-column`), its Send outlined beside a reply in
 # either column; and on the three phones, the line above a hosted call sent a 412-word recap saying
 # so (`#270`), and the card coming and going on the channel leaving a reader up the list on their row
-# and one at the foot there (`#280 scroll-stability`). Pass WEB_ROOT=dir for another copy of the page,
-# SCREENSHOTS=dir to keep a PNG of each placement.
+# and one at the foot there (`#280 scroll-stability`); and at 393x852 and 1280x800 docked under the
+# thread list, through Cmd/Ctrl+3 and +4 pressed on its own buttons, which post nothing (`#281
+# view-keys`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
+# placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
