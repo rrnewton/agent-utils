@@ -18,7 +18,7 @@ use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::providers::{ChatRouter, ProviderEntry};
 use vibe_talk::state::AppState;
 use vibe_talk::store::fake::FakeStore;
-use vibe_talk::store::StateStore as _;
+use vibe_talk::store::{StateStore as _, SummaryKey};
 use vibe_talk::testing::{self, ManualClock, TempDir, READ_CHANNEL, WRITE_CHANNEL, WRITE_TOKEN};
 
 /// 2026-08-18T12:00:00Z: where the fixtures' messages are written.
@@ -133,6 +133,28 @@ fn config_without_the_write_channel() -> String {
 /// A deployment of one Discord-protocol provider under `key`, routed through a router that really
 /// names it so, and the fake behind it.
 fn keyed_deployment(key: &str) -> (AppState, Arc<vibe_talk::discord::fake::FakeDiscord>) {
+    let (state, fake, _store) = keyed_deployment_of(key, true);
+    (state, fake)
+}
+
+/// [`keyed_deployment`], with the writable channel on its list only when `write_channel`, and its
+/// store.
+fn keyed_deployment_of(
+    key: &str,
+    write_channel: bool,
+) -> (
+    AppState,
+    Arc<vibe_talk::discord::fake::FakeDiscord>,
+    Arc<FakeStore>,
+) {
+    let write = if write_channel {
+        format!(
+            "[[channels]]\nid = \"{WRITE_CHANNEL}\"\nlabel = \"lead team\"\nwritable = true\n\
+             provider = \"{key}\"\n"
+        )
+    } else {
+        String::new()
+    };
     let text = format!(
         r#"
 [auth]
@@ -149,15 +171,10 @@ id = "{READ_CHANNEL}"
 label = "build noise"
 provider = "{key}"
 
-[[channels]]
-id = "{WRITE_CHANNEL}"
-label = "lead team"
-writable = true
-provider = "{key}"
-"#,
+{write}"#,
         read = testing::READ_TOKEN,
     );
-    let (mut state, fake, _voice) = testing::state_from_toml(&text);
+    let (mut state, fake, store) = testing::state_with_store_from_toml(&text);
     let router = ChatRouter::new(
         vec![ProviderEntry {
             key: key.to_owned(),
@@ -168,19 +185,71 @@ provider = "{key}"
         None,
     );
     state.replace_providers(Arc::new(router));
-    (state, fake)
+    (state, fake, store)
+}
+
+// ---- the store's summaries ----------------------------------------------------------------------
+
+/// The key of a summary of `text`, said by `message` in `channel`, under `state`'s policy.
+fn summary(state: &AppState, channel: &str, message: &str, text: &str) -> SummaryKey {
+    SummaryKey {
+        channel: id(channel),
+        message: MessageId(message.to_owned()),
+        content_hash: vibe_talk::summarize::content_hash(text),
+        version: state.summary_version.to_string(),
+    }
+}
+
+/// The key of a thread's display name in `channel`: kept whatever happens to the channel's
+/// summaries.
+fn thread_name(channel: &str) -> SummaryKey {
+    SummaryKey {
+        channel: id(channel),
+        message: MessageId("thread-name:1000".to_owned()),
+        content_hash: 0,
+        version: vibe_talk::store::KEPT_VERSION.to_owned(),
+    }
+}
+
+async fn file_summaries(store: &FakeStore, keys: &[&SummaryKey]) {
+    for key in keys {
+        store
+            .cache_summary(key, "a summary", None)
+            .await
+            .expect("filed");
+    }
+}
+
+async fn kept(store: &FakeStore, key: &SummaryKey) -> bool {
+    store.cached_summary(key).await.expect("read").is_some()
+}
+
+/// Wait for the cache behind `state`, if any, and then for the task that keeps the store's
+/// summaries in step with it.
+async fn settled(state: &AppState) {
+    if let Some(cache) = state.message_cache.cache() {
+        assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+    }
+    assert!(
+        state.message_cache.orphans_settled(WAIT).await,
+        "the summaries task caught up"
+    );
 }
 
 #[tokio::test]
 async fn a_channel_the_owner_hides_is_swept_out_of_the_cache() {
     let dir = TempDir::new("cache-sweep-hidden");
     let clock = ManualClock::at(T0 + HOUR);
-    let (state, _fake, _store) = testing::state_with_store();
+    let (state, _fake, store) = testing::state_with_store();
     let state = testing::with_message_cache(state, dir.path(), clock.clone());
     let cache = state.message_cache.cache().expect("installed");
     offer_rows(&cache, LEGACY, READ_CHANNEL, 3, clock.now());
     offer_rows(&cache, LEGACY, WRITE_CHANNEL, 4, clock.now());
     assert_eq!(held(&cache), 7);
+    let listed = summary(&state, READ_CHANNEL, "1000000000000000001", "row 1");
+    let hidden = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
+    let name = thread_name(WRITE_CHANNEL);
+    file_summaries(&store, &[&listed, &hidden, &name]).await;
 
     let (status, body) = call(
         &state,
@@ -194,6 +263,10 @@ async fn a_channel_the_owner_hides_is_swept_out_of_the_cache() {
         3,
         "only the channel still on the list is held"
     );
+    settled(&state).await;
+    assert!(!kept(&store, &hidden).await, "its summaries go with it");
+    assert!(kept(&store, &name).await, "its thread names stay");
+    assert!(kept(&store, &listed).await);
 }
 
 #[tokio::test]
@@ -209,7 +282,12 @@ async fn a_channel_taken_out_of_the_configuration_is_swept_at_the_next_start() {
         assert_eq!(held(&cache), 7);
         close(&state, cache);
     }
-    let (state, _fake, _voice) = testing::state_from_toml(&config_without_the_write_channel());
+    let (state, _fake, store) =
+        testing::state_with_store_from_toml(&config_without_the_write_channel());
+    let listed = summary(&state, READ_CHANNEL, "1000000000000000001", "row 1");
+    let removed = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
+    let name = thread_name(WRITE_CHANNEL);
+    file_summaries(&store, &[&listed, &removed, &name]).await;
     let state = testing::with_message_cache(state, dir.path(), clock.clone());
     let cache = state.message_cache.cache().expect("installed");
     assert_eq!(
@@ -217,6 +295,10 @@ async fn a_channel_taken_out_of_the_configuration_is_swept_at_the_next_start() {
         3,
         "the channel the file no longer names is gone"
     );
+    settled(&state).await;
+    assert!(!kept(&store, &removed).await, "and so are its summaries");
+    assert!(kept(&store, &name).await, "but not its thread names");
+    assert!(kept(&store, &listed).await);
 }
 
 #[tokio::test]
@@ -232,13 +314,21 @@ async fn a_renamed_provider_key_leaves_nothing_behind_under_the_old_one() {
         assert_eq!(held(&cache), 7);
         close(&state, cache);
     }
-    let (state, _fake) = keyed_deployment("second");
+    let (state, _fake, store) = keyed_deployment_of("second", true);
+    let read = summary(&state, READ_CHANNEL, "1000000000000000001", "row 1");
+    let write = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
+    file_summaries(&store, &[&read, &write]).await;
     let state = testing::with_message_cache(state, dir.path(), clock.clone());
     let cache = state.message_cache.cache().expect("installed");
     assert_eq!(
         held(&cache),
         0,
         "the same channels under a provider key the configuration no longer has are gone"
+    );
+    settled(&state).await;
+    assert!(
+        kept(&store, &read).await && kept(&store, &write).await,
+        "the store keys summaries by channel alone, and both channels are still listed"
     );
 }
 
@@ -252,9 +342,11 @@ async fn nothing_is_swept_or_filled_when_the_store_did_not_give_back_the_added_c
         .add_channel(&added, "added in the app", false, None, 1)
         .await
         .expect("stored");
-    {
+    let added_summary = {
         let (state, fake) = testing::state_with(store.clone());
         fake.register_channel(&added);
+        let added_summary = summary(&state, added.as_str(), "1000000000000000001", "row 1");
+        file_summaries(&store, &[&added_summary]).await;
         let cache = testing::install_message_cache(&state, dir.path(), clock.clone());
         let (from_store, hidden) = state.restore_channel_lists().await;
         assert_eq!(from_store.expect("added channels"), 1);
@@ -264,7 +356,8 @@ async fn nothing_is_swept_or_filled_when_the_store_did_not_give_back_the_added_c
         offer_rows(&cache, LEGACY, READ_CHANNEL, 3, clock.now());
         assert_eq!(held(&cache), 8);
         close(&state, cache);
-    }
+        added_summary
+    };
 
     // The next start, at which the store fails to answer for the channels added in the app.
     let (state, _fake) = testing::state_with(store.clone());
@@ -282,6 +375,11 @@ async fn nothing_is_swept_or_filled_when_the_store_did_not_give_back_the_added_c
     state.refresh_routes();
     assert_eq!(held(&cache), 8, "nothing was swept");
     assert_eq!(cache.applied_seq(), 0, "nothing was asked of the writer");
+    settled(&state).await;
+    assert!(
+        kept(&store, &added_summary).await,
+        "nor were the added channel's summaries"
+    );
     assert!(
         state
             .message_cache
@@ -311,13 +409,22 @@ struct Deployment {
     state: AppState,
     fake: Arc<FakeDiscord>,
     chat: Arc<TimelineChat>,
+    store: Arc<FakeStore>,
     cache: Arc<MessageCache>,
     ids: Vec<MessageId>,
     _dir: TempDir,
 }
 
-fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment {
-    let dir = TempDir::new("cache-fill");
+/// What a [`Deployment`] reads, before any cache is put behind it.
+struct Upstream {
+    state: AppState,
+    fake: Arc<FakeDiscord>,
+    chat: Arc<TimelineChat>,
+    store: Arc<FakeStore>,
+    ids: Vec<MessageId>,
+}
+
+fn upstream(bridge: bool, count: i64) -> Upstream {
     let text = if bridge {
         testing::config_toml().replace(
             "[discord]",
@@ -328,7 +435,7 @@ fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment 
     };
     // An adapter may push changes for the channels, as the bridge's does.
     let text = format!("{text}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n");
-    let (mut state, fake, _store) = testing::state_with_store_from_toml(&text);
+    let (mut state, fake, store) = testing::state_with_store_from_toml(&text);
     let ids = (0..count)
         .map(|n| {
             fake.seed_at(
@@ -341,6 +448,24 @@ fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment 
         .collect();
     let chat = Arc::new(TimelineChat::new(fake.clone()));
     state.replace_chat(chat.clone());
+    Upstream {
+        state,
+        fake,
+        chat,
+        store,
+        ids,
+    }
+}
+
+fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment {
+    let dir = TempDir::new("cache-fill");
+    let Upstream {
+        state,
+        fake,
+        chat,
+        store,
+        ids,
+    } = upstream(bridge, count);
     let state = testing::with_message_cache(state, dir.path(), clock.clone());
     let cache = state.message_cache.cache().expect("installed");
     assert!(cache.quiesce_blocking(WAIT), "the first sweep landed");
@@ -348,6 +473,7 @@ fn deployment(bridge: bool, count: i64, clock: &Arc<ManualClock>) -> Deployment 
         state,
         fake,
         chat,
+        store,
         cache,
         ids,
         _dir: dir,
@@ -923,9 +1049,13 @@ fn pushed_deletion(event_id: &str, message: &MessageId) -> Value {
 
 /// `message` as the fake holds it, with `content` instead of its own.
 fn saying(d: &Deployment, message: &MessageId, content: &str) -> Message {
+    said(&d.fake, message, content)
+}
+
+fn said(fake: &FakeDiscord, message: &MessageId, content: &str) -> Message {
     Message {
         content: content.to_owned(),
-        ..d.fake.message(message).expect("the fake holds it")
+        ..fake.message(message).expect("the fake holds it")
     }
 }
 
@@ -1255,4 +1385,203 @@ async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_
             }
         ]
     );
+}
+
+// ---- the store's summaries follow what the cache learns -----------------------------------------
+
+/// The summaries of a test of edits and deletions, all of messages in the read-only channel.
+struct Filed {
+    /// The edited message's summary of its old text, of its new text, and of its old text under
+    /// an older policy.
+    edited_old: SummaryKey,
+    edited_new: SummaryKey,
+    edited_older_policy: SummaryKey,
+    /// The thread sentence of the edited message's thread: filed under a key of its own.
+    sentence: SummaryKey,
+    /// Two summaries of the message deleted by a push, and one of the message whose absence from
+    /// a later read deletes it.
+    deleted: [SummaryKey; 2],
+    absent: SummaryKey,
+    /// A message nothing happens to.
+    untouched: SummaryKey,
+}
+
+async fn file_for(state: &AppState, store: &FakeStore, ids: &[MessageId]) -> Filed {
+    let key = |n: usize, text: &str| summary(state, READ_CHANNEL, ids[n].as_str(), text);
+    let filed = Filed {
+        edited_old: key(3, "message 3"),
+        edited_new: key(3, "message 3, edited upstream"),
+        edited_older_policy: SummaryKey {
+            version: "v2-an-older-policy".to_owned(),
+            ..key(3, "message 3")
+        },
+        sentence: SummaryKey {
+            message: MessageId(format!("thread-sentence:{}", ids[3].as_str())),
+            content_hash: 0,
+            ..key(3, "")
+        },
+        deleted: [key(1, "message 1"), key(1, "message 1, as it was once")],
+        absent: key(4, "message 4"),
+        untouched: key(5, "message 5"),
+    };
+    file_summaries(
+        store,
+        &[
+            &filed.edited_old,
+            &filed.edited_new,
+            &filed.edited_older_policy,
+            &filed.sentence,
+            &filed.deleted[0],
+            &filed.deleted[1],
+            &filed.absent,
+            &filed.untouched,
+        ],
+    )
+    .await;
+    filed
+}
+
+/// Upstream, message 3 is edited, message 1 deleted (and the adapter pushes both), and message 4
+/// deleted silently; then the channel is read again, late enough to settle what it lacks.
+async fn edit_and_delete(
+    state: &AppState,
+    fake: &FakeDiscord,
+    ids: &[MessageId],
+    clock: &ManualClock,
+) {
+    clock.advance(MINUTE);
+    fake.edit(&ids[3], "message 3, edited upstream");
+    let edit = said(fake, &ids[3], "message 3, edited upstream");
+    assert_eq!(
+        ingest(state, pushed("e1", "update", &edit)).await,
+        StatusCode::ACCEPTED
+    );
+    fake.delete(&ids[1]);
+    assert_eq!(
+        ingest(state, pushed_deletion("e2", &ids[1])).await,
+        StatusCode::ACCEPTED
+    );
+    fake.delete(&ids[4]);
+    clock.advance(15 * MINUTE);
+    get(state, &flat_page()).await;
+}
+
+#[tokio::test]
+async fn an_edit_or_a_deletion_forgets_only_that_messages_summaries_of_other_text() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 10, &clock);
+    get(&d.state, &flat_page()).await;
+    let filed = file_for(&d.state, &d.store, &d.ids).await;
+
+    edit_and_delete(&d.state, &d.fake, &d.ids, &clock).await;
+    assert!(
+        tombstoned(&d.cache, &read_chan(), &d.ids[4]),
+        "the read saw it gone"
+    );
+    settled(&d.state).await;
+
+    assert!(
+        !kept(&d.store, &filed.edited_old).await,
+        "a summary of words it no longer says"
+    );
+    assert!(
+        kept(&d.store, &filed.edited_new).await,
+        "a summary of what it says now"
+    );
+    assert!(
+        kept(&d.store, &filed.edited_older_policy).await,
+        "another policy's entries are the startup sweep's"
+    );
+    assert!(
+        kept(&d.store, &filed.sentence).await,
+        "a thread sentence is not the message's"
+    );
+    for key in &filed.deleted {
+        assert!(
+            !kept(&d.store, key).await,
+            "every summary of a deleted message"
+        );
+    }
+    assert!(
+        !kept(&d.store, &filed.absent).await,
+        "deleted, as a read found"
+    );
+    assert!(kept(&d.store, &filed.untouched).await);
+}
+
+#[tokio::test]
+async fn with_the_cache_off_no_summary_is_deleted() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let up = upstream(true, 10);
+    assert!(
+        up.state.message_cache.cache().is_none(),
+        "no cache, as a server ships"
+    );
+    get(&up.state, &flat_page()).await;
+    let filed = file_for(&up.state, &up.store, &up.ids).await;
+
+    edit_and_delete(&up.state, &up.fake, &up.ids, &clock).await;
+    settled(&up.state).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for key in [
+        &filed.edited_old,
+        &filed.edited_new,
+        &filed.edited_older_policy,
+        &filed.sentence,
+        &filed.deleted[0],
+        &filed.deleted[1],
+        &filed.absent,
+        &filed.untouched,
+    ] {
+        assert!(kept(&up.store, key).await, "{key:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_sweep_forgets_a_channel_off_the_list_but_not_one_still_listed_under_another_key() {
+    let clock = ManualClock::at(T0 + HOUR);
+    for cache_on in [true, false] {
+        let dir = TempDir::new("cache-sweep-summaries");
+        {
+            let (state, _fake) = keyed_deployment("first");
+            let state = testing::with_message_cache(state, dir.path(), clock.clone());
+            let cache = state.message_cache.cache().expect("installed");
+            offer_rows(&cache, "first", READ_CHANNEL, 3, clock.now());
+            offer_rows(&cache, "first", WRITE_CHANNEL, 4, clock.now());
+            close(&state, cache);
+        }
+        // The next start: the provider key renamed, and the writable channel gone from the file.
+        let (state, _fake, store) = keyed_deployment_of("second", false);
+        let renamed = summary(&state, READ_CHANNEL, "1000000000000000001", "row 1");
+        let removed = summary(&state, WRITE_CHANNEL, "1000000000000000002", "row 2");
+        let name = thread_name(WRITE_CHANNEL);
+        file_summaries(&store, &[&renamed, &removed, &name]).await;
+        let state = if cache_on {
+            testing::with_message_cache(state, dir.path(), clock.clone())
+        } else {
+            // A server with the cache off starts as `main` does, and opens none.
+            let (added, hidden) = state.restore_channel_lists().await;
+            assert!(added.is_ok() && hidden.is_ok());
+            state.refresh_routes();
+            state
+        };
+        settled(&state).await;
+        assert!(
+            kept(&store, &renamed).await,
+            "cache {cache_on}: the same channel, still listed under the new key"
+        );
+        assert_eq!(
+            kept(&store, &removed).await,
+            !cache_on,
+            "cache {cache_on}: a channel off the list is forgotten only by the cache's sweep"
+        );
+        assert!(
+            kept(&store, &name).await,
+            "cache {cache_on}: thread names stay"
+        );
+        if let Some(cache) = state.message_cache.cache() {
+            assert_eq!(held(&cache), 0);
+        }
+    }
 }

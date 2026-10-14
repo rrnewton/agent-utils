@@ -90,6 +90,7 @@ pub mod grant;
 pub mod marker;
 pub mod merge;
 pub mod observe;
+pub mod orphans;
 mod reader;
 pub mod rows;
 pub mod schema;

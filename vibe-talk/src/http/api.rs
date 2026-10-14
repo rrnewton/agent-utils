@@ -4895,7 +4895,12 @@ pub async fn remove_channel(
             hidden.insert(configured.id.clone());
         }
         state.refresh_routes();
-        let summaries_deleted = forget_channel_summaries(&state, &configured.id).await;
+        let summaries_deleted = ops::forget_channel_summaries(
+            state.store.as_ref(),
+            &state.thread_names,
+            &configured.id,
+        )
+        .await;
         tracing::info!(
             channel = %channel_id,
             summaries_deleted,
@@ -4940,7 +4945,12 @@ pub async fn remove_channel(
         added.retain(|channel| channel.channel != added_channel.channel);
     }
     state.refresh_routes();
-    let summaries_deleted = forget_channel_summaries(&state, &added_channel.channel).await;
+    let summaries_deleted = ops::forget_channel_summaries(
+        state.store.as_ref(),
+        &state.thread_names,
+        &added_channel.channel,
+    )
+    .await;
     tracing::info!(channel = %channel_id, summaries_deleted, "channel removed in the app");
     Ok(channel_list_answer(
         &state,
@@ -4954,25 +4964,6 @@ pub async fn remove_channel(
         },
     )
     .await)
-}
-
-/// Delete a channel's cached summaries and thread sentences, keeping its thread names, and answer
-/// how many went: the count is all that is logged. `#208 persistent-cache`.
-///
-/// The sentences this server remembers go too, so a channel shown again in the same process is not
-/// shown from memory what was just deleted from the store.
-async fn forget_channel_summaries(state: &AppState, channel: &crate::model::ChannelId) -> u64 {
-    // Nothing more is read there to name a thread either (remote-ops-audit W5).
-    state.thread_names.forget_channel_queue(channel);
-    state.thread_names.forget_channel_sentences(channel);
-    match state.store.forget_channel_summaries(channel).await {
-        Ok(deleted) => deleted,
-        Err(crate::store::StoreError::Unavailable(_)) => 0,
-        Err(error) => {
-            tracing::warn!(%error, "a channel taken off the list kept its cached summaries");
-            0
-        }
-    }
 }
 
 /// `DELETE /api/v1/channels/{channel_id}/hidden` — show a hidden configured channel again.

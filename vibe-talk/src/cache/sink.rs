@@ -39,14 +39,24 @@
 //! here waits. A message this server posts is offered as it comes back from the provider
 //! ([`Fill::offer_posted`]), also under the server's own grant.
 //!
+//! # The store's summaries
+//!
+//! A cache put behind the sink ([`Sink::install`]) is followed by a task that deletes the store's
+//! summaries of messages the cache learns were edited or deleted, and of channels it erases that
+//! are on the server's list under no provider at all ([`super::orphans`]). With no cache, there is
+//! no task, and no summary is ever deleted on the cache's account.
+//!
 //! In this build nothing installs a cache outside the tests, so the slot stays empty and every
 //! fill is refused.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::Duration;
 
 use super::grant::{FillGrant, ServerFill};
 use super::observe::{self, PageRead, Shape, TimelineRead};
+use super::orphans::{self, Summaries};
 use super::{ChanKey, MessageCache, Observation, RouteSnapshot, Stamp};
 use crate::chat::RecentRead;
 use crate::config::{Config, ProviderKind, RecentView};
@@ -62,6 +72,21 @@ pub struct Sink {
     slot: RwLock<Option<Arc<MessageCache>>>,
     /// Taken before the slot whenever both are held, never the other way round.
     routes: Mutex<Routes>,
+    /// Every channel id on the server's list, under whatever provider: what the task that keeps
+    /// the store's summaries in step asks before it forgets an erased channel's.
+    listed: Arc<RwLock<HashSet<ChannelId>>>,
+    /// The server's summaries, for that task. Attached once; with none attached, no task runs.
+    summaries: OnceLock<Summaries>,
+    /// How far that task has got with the cache installed now.
+    orphans: Mutex<OrphanProgress>,
+}
+
+/// How many of the writer's events the summaries task has followed, against the count the cache
+/// had sent when the task began.
+#[derive(Debug, Default)]
+struct OrphanProgress {
+    handled: Arc<AtomicU64>,
+    sent_before: u64,
 }
 
 /// What the sink knows about the channels the server answers for.
@@ -246,9 +271,34 @@ impl Sink {
         Self::default()
     }
 
+    /// Have the store's summaries kept in step with every cache installed from now on: see
+    /// [`super::orphans`]. Once per sink; the server attaches its own before it installs a cache.
+    pub fn attach_summaries(&self, summaries: Summaries) {
+        let _ = self.summaries.set(summaries);
+    }
+
     /// Put `cache` behind the sink. If the sink is armed, the latest route snapshot is sent to it
     /// at once: the cache serves and accepts nothing until it has one.
+    ///
+    /// When the server's summaries are attached and a runtime is running, this first starts the
+    /// task that deletes the store's summaries the cache learns are stale ([`super::orphans`]),
+    /// so it hears of the very first sweep. It ends when the cache does.
     pub fn install(&self, cache: Arc<MessageCache>) {
+        if let (Some(summaries), Ok(runtime)) =
+            (self.summaries.get(), tokio::runtime::Handle::try_current())
+        {
+            let handled = Arc::new(AtomicU64::new(0));
+            *self.orphans.lock().unwrap_or_else(PoisonError::into_inner) = OrphanProgress {
+                handled: Arc::clone(&handled),
+                sent_before: cache.stats().orphans_sent,
+            };
+            runtime.spawn(orphans::run(
+                cache.subscribe_events(orphans::EVENT_QUEUE),
+                summaries.clone(),
+                Arc::clone(&self.listed),
+                handled,
+            ));
+        }
         let routes = self.routes();
         *self.slot.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&cache));
         if routes.armed {
@@ -326,6 +376,8 @@ impl Sink {
             chans,
             router.entries().iter().map(|entry| entry.key.clone()),
         );
+        *self.listed.write().unwrap_or_else(PoisonError::into_inner) =
+            channels.iter().map(|channel| channel.id.clone()).collect();
         let mut routes = self.routes();
         routes.fills = fills;
         routes.snapshot = Some(snapshot.clone());
@@ -382,6 +434,36 @@ impl Sink {
     pub(crate) fn offer_push(&self, channel: &ChannelId, live: &LiveMessage, producer: ServerFill) {
         if let Some(fill) = self.begin(&FillGrant::server(producer), channel) {
             fill.offer_push(live);
+        }
+    }
+
+    /// Wait, up to `timeout`, until the summaries task has followed every event the cache behind
+    /// the sink has sent so far. `true` at once with no cache, or no task. For tests, after the
+    /// cache has been waited for ([`MessageCache::quiesce_blocking`]): a summary deleted, or
+    /// rightly kept, is only known to be so once the task has had its turn.
+    pub async fn orphans_settled(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let Some(cache) = self.cache() else {
+                return true;
+            };
+            if self.summaries.get().is_none() {
+                return true;
+            }
+            let (handled, sent_before) = {
+                let progress = self.orphans.lock().unwrap_or_else(PoisonError::into_inner);
+                (
+                    progress.handled.load(Ordering::SeqCst),
+                    progress.sent_before,
+                )
+            };
+            if sent_before.saturating_add(handled) >= cache.stats().orphans_sent {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 

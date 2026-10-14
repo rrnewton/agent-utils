@@ -298,6 +298,9 @@ fn state_pieces_with(
         summary_counters: Arc::new(crate::summarize::counters::SummaryCounters::new()),
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
     };
+    state
+        .message_cache
+        .attach_summaries(crate::cache::orphans::Summaries::of(&state));
     (state, fake, elevenlabs, store)
 }
 
@@ -1379,6 +1382,10 @@ pub fn install_message_cache(
         })
         .expect("a message cache opens in a test directory"),
     );
+    // As `main` does, for a state built field by field; a no-op for one this module built.
+    state
+        .message_cache
+        .attach_summaries(crate::cache::orphans::Summaries::of(state));
     state.message_cache.install(Arc::clone(&cache));
     cache
 }

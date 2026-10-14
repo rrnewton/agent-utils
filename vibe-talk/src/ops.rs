@@ -3539,6 +3539,31 @@ fn summary_key(
     }
 }
 
+/// Delete a channel's cached summaries and thread sentences, keeping its thread names, and answer
+/// how many went: the count is all that is logged. `#208 persistent-cache`.
+///
+/// The sentences this server remembers go too, so a channel shown again in the same process is not
+/// shown from memory what was just deleted from the store, and the threads waiting to be named
+/// there are dropped. Called when the owner takes a channel off the list, and when the message
+/// cache erases a channel that is no longer listed under any provider ([`crate::cache::orphans`]).
+pub async fn forget_channel_summaries(
+    store: &dyn crate::store::StateStore,
+    thread_names: &crate::summarize::threads::ThreadNames,
+    channel: &ChannelId,
+) -> u64 {
+    // Nothing more is read there to name a thread either (remote-ops-audit W5).
+    thread_names.forget_channel_queue(channel);
+    thread_names.forget_channel_sentences(channel);
+    match store.forget_channel_summaries(channel).await {
+        Ok(deleted) => deleted,
+        Err(crate::store::StoreError::Unavailable(_)) => 0,
+        Err(error) => {
+            tracing::warn!(%error, "a channel taken off the list kept its cached summaries");
+            0
+        }
+    }
+}
+
 /// What the store has for one key, from this caller's point of view.
 enum Stored {
     /// Serve this, already cut for serving. `below_cap` when the stored answer was cut shorter

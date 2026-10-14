@@ -740,6 +740,12 @@ async fn main() -> anyhow::Result<()> {
         summary_counters: Arc::new(vibe_talk::summarize::counters::SummaryCounters::new()),
         thread_names,
     };
+    // `#208 persistent-cache`. A cache installed behind the sink keeps the store's summaries in
+    // step with what it learns: a summary of an edited or deleted message, or of an erased
+    // channel's, is deleted.
+    state
+        .message_cache
+        .attach_summaries(vibe_talk::cache::orphans::Summaries::of(&state));
     // CHANNELS THE OWNER ADDED FROM INSIDE THE APP, brought back into the allowlist before the
     // server answers anything. They were probed when they were added; they are not probed again
     // here, because a channel the bot has since been removed from should fail the request that
