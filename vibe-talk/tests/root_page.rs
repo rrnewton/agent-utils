@@ -6,6 +6,9 @@
 //!
 //! What only a browser can show — that the fragment survives the redirect, and that Chromium still
 //! finds the page installable and in scope from either address — is `tests/pwa_installability.py`.
+//!
+//! The last three tests read the guides instead of the router: they tell a reader how to open and
+//! sign in to the page at `/`, so they must describe the app and not the page that is gone.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -174,4 +177,134 @@ async fn the_manifest_starts_at_the_root_and_keeps_the_installed_apps_identity()
     // installed app to a manifest by `id`, so changing it would make this a different app and
     // strand those copies on the old `start_url` for good. See `src/http/assets.rs`.
     assert_eq!(manifest["id"], "/voice");
+}
+
+const README: &str = include_str!("../README.md");
+
+/// The text between `start` and the next `end` in `haystack`, or a failure naming what was missing.
+fn between<'a>(haystack: &'a str, start: &str, end: &str, what: &str) -> &'a str {
+    let from = haystack
+        .find(start)
+        .unwrap_or_else(|| panic!("{what}: {start:?} not found"))
+        + start.len();
+    let to = haystack[from..]
+        .find(end)
+        .unwrap_or_else(|| panic!("{what}: no {end:?} after {start:?}"));
+    &haystack[from..from + to]
+}
+
+#[test]
+fn the_readme_signs_in_with_the_apps_own_controls() {
+    // The walkthrough's first sign-in once sent the reader to the old page's Settings tab and its
+    // "vibe-talk API token" field. It must name the controls the app's sign-in screen has, read
+    // out of the shell rather than copied, so relabelling either side alone fails here.
+    let shell = include_str!("../web/voice.html");
+    let field = between(
+        shell,
+        "<label for=\"api-token\">",
+        "</label>",
+        "the sign-in field's label",
+    );
+    let button = between(
+        shell,
+        "<button id=\"save-token\" type=\"button\">",
+        "</button>",
+        "the sign-in button",
+    );
+    let signin = README
+        .split("\n\n")
+        .find(|paragraph| paragraph.starts_with("Then open `http://<host>:8080/`"))
+        .expect("the README's first sign-in paragraph");
+    for control in [field, button] {
+        assert!(
+            signin.contains(&format!("**{control}**")),
+            "the README's first sign-in does not name the app's {control:?}:\n{signin}"
+        );
+    }
+}
+
+#[test]
+fn the_readme_describes_nothing_of_the_old_page() {
+    // Features and controls only the deleted page had: its Text tab, its find form, its token
+    // field's label, its Talk tab's buttons and the route to its Settings tab. The app has none of
+    // them, so a guide naming one is describing a page that is not there.
+    let readme = README.to_lowercase();
+    for marker in [
+        "text tab",
+        "find-a-message",
+        "vibe-talk api token",
+        "go to **settings**, paste",
+        "catch me up",
+        "read the digest aloud",
+    ] {
+        assert!(
+            !readme.contains(marker),
+            "the README still describes the old page: {marker:?}"
+        );
+    }
+}
+
+/// Each URL with a host on `line` that names the old address `/voice`, with or without a trailing
+/// slash, query or fragment. A URL runs from its authority to the first character that cannot be
+/// part of a pasted URL, without trailing punctuation.
+fn old_addresses(line: &str) -> Vec<&str> {
+    line.match_indices("://")
+        .map(|(at, separator)| {
+            let rest = &line[at + separator.len()..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || "`\"'()[]".contains(c))
+                .unwrap_or(rest.len());
+            rest[..end].trim_end_matches(['>', '.', ',', ';', ':'])
+        })
+        .filter(|url| {
+            let path = url.find('/').map_or("", |slash| &url[slash..]);
+            let path = path.split(['?', '#']).next().unwrap_or_default();
+            path.trim_end_matches('/') == "/voice"
+        })
+        .collect()
+}
+
+#[test]
+fn no_guide_links_to_the_old_address() {
+    // `/voice` only forwards to the app now. An example or a link that names it still works, but
+    // it is the old address taught as the current one; the README says what `/voice` does in
+    // prose, with no host, and that is the only place it belongs.
+    let guides = [
+        ("README.md", README),
+        ("QUICKSTART.md", include_str!("../QUICKSTART.md")),
+        (
+            "vibe-talk.example.toml",
+            include_str!("../vibe-talk.example.toml"),
+        ),
+        (
+            "vibe-talk.env.example",
+            include_str!("../vibe-talk.env.example"),
+        ),
+    ];
+    let mut old = Vec::new();
+    for (name, text) in guides {
+        for (index, line) in text.lines().enumerate() {
+            for url in old_addresses(line) {
+                old.push(format!("{name}:{}: {url}", index + 1));
+            }
+        }
+    }
+    assert!(
+        old.is_empty(),
+        "links to the old address:\n{}",
+        old.join("\n")
+    );
+    // Not vacuous: the scan finds the address in the shapes a guide writes it, and only there.
+    for (line, found) in [
+        ("  --url https://vibe-talk.example.invalid/voice \\", 1),
+        ("open <https://h.example/voice?x=1#y>.", 1),
+        ("see [the app](http://<host>:8080/voice/)", 1),
+        (
+            "open `http://<host>:8080/`, or https://h.example/voice.js",
+            0,
+        ),
+        ("`/voice` forwards to `/`", 0),
+    ] {
+        assert_eq!(old_addresses(line).len(), found, "{line}");
+    }
 }

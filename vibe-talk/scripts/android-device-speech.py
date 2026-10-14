@@ -18,7 +18,7 @@ deployment detail in this reusable repository.
 Typical use:
 
     VIBE_TALK_WRITE_TOKEN=... scripts/android-device-speech.py \
-      --url https://vibe-talk.example.invalid/voice \
+      --url https://vibe-talk.example.invalid/ \
       --serial DEVICE --transcriber /path/to/stt-adapter
 
 By default Android's ``screenrecord`` captures playback.  Devices that do not expose playback
@@ -665,6 +665,13 @@ def self_test() -> int:
     check(same_page("https://h.example/?x=1", "https://h.example/voice"), "an old /voice URL finds no tab")
     check(same_page("https://h.example/", "https://h.example"), "the app at / is not its own page")
     check(not same_page("https://h.example/api/v1/channels", "https://h.example/"), "another path passed")
+    # The usage example above is what gets pasted, so it names the app at / as --url's help does,
+    # not the old /voice address that only forwards there (#302 root-is-the-app).
+    example_urls = re.findall(r"--url\s+(\S+)", __doc__ or "")
+    check(
+        bool(example_urls) and all(urlparse(url).path in ("", "/") for url in example_urls),
+        "the usage example's --url is not the app at /",
+    )
     try:
         joined = subprocess.run(
             [
@@ -691,7 +698,7 @@ def self_test() -> int:
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return EXIT_SELF_TEST
-    print("android device-speech self-test: 15 controls passed")
+    print("android device-speech self-test: 16 controls passed")
     return EXIT_OK
 
 

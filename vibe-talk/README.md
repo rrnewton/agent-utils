@@ -539,7 +539,7 @@ the reusable source tree.
 ```sh
 cd vibe-talk
 VIBE_TALK_WRITE_TOKEN=... scripts/android-device-speech.py \
-  --url https://vibe-talk.example.invalid/voice \
+  --url https://vibe-talk.example.invalid/ \
   --serial ANDROID_SERIAL \
   --transcriber /path/to/stt-adapter
 ```
@@ -632,7 +632,6 @@ Two things are worth knowing before you begin, because they shape everything els
 | **Per-message summaries and thread names, from one Messages API call** (`[summaries.llm]`) | **written, tested against a local mock Messages API only; never yet run against a live model provider.** One plain HTTP request per summary or thread name, with no agent harness and no tools, in the Anthropic API's dialect or Google Vertex's. See [Summaries](#summaries). |
 | Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is what runs when `[summaries.llm]` is absent.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
-| Web app: text tab, digest, find-a-message, local speech | **works** |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
 | Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, eight tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
@@ -853,9 +852,11 @@ a regression:
 cargo run -- --config vibe-talk.toml
 ```
 
-Then open `http://<host>:8080/`, go to **Settings**, paste one of **this deployment's own** two
-tokens into **vibe-talk API token**, and press Save. Not the bot token and not the ElevenLabs key:
-neither is ever entered into the page. `VIBE_TALK_READ_TOKEN` is enough to read, search and
+Then open `http://<host>:8080/`. The app opens on its sign-in screen: paste one of **this
+deployment's own** two tokens into **Write token** and press **Save token**. The field is named for
+the write token because replying and talking to the agent need it, but it takes either; Settings'
+**Forget token and sign out** is how you change it later. Not the bot token and not the ElevenLabs
+key: neither is ever entered into the page. `VIBE_TALK_READ_TOKEN` is enough to read, search and
 listen; `VIBE_TALK_WRITE_TOKEN` is what replying from the page needs, and what the app needs to
 start a conversation at all. `/api/v1/client-config` accepts both, so a read token loads the whole
 interface and then fails at the first write, which is why both refusals now name the scope. Its
