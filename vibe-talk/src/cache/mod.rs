@@ -538,8 +538,9 @@ pub enum Read<T> {
     Off,
     /// An erase happened while the read ran: nothing it found may be served.
     Moved,
-    /// The channel may not be read from the cache: it is off the route snapshot, or an erase of
-    /// it is waiting to be applied.
+    /// The channel (or the scope) may not be read from the cache: it is off the route snapshot,
+    /// an erase of it is waiting to be applied, access to it is in doubt, or its provider is
+    /// suspended.
     Blocked,
     /// SQLite failed; a result code.
     Failed(String),
@@ -551,6 +552,17 @@ impl<T> Read<T> {
         match self {
             Self::Served(value) => Some(value),
             _ => None,
+        }
+    }
+
+    /// The same answer, with a served value turned into another.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Read<U> {
+        match self {
+            Self::Served(value) => Read::Served(f(value)),
+            Self::Off => Read::Off,
+            Self::Moved => Read::Moved,
+            Self::Blocked => Read::Blocked,
+            Self::Failed(code) => Read::Failed(code),
         }
     }
 }
@@ -906,12 +918,24 @@ pub(crate) struct Shared {
     /// Erases the writer could not carry out. What they cover stays blocked until the file is
     /// erased: a cache that cannot forget a channel must not serve it either.
     pub(crate) erase_failed: Mutex<HashSet<Erasing>>,
+    /// What may not be served while access to it is in doubt: see [`MessageCache::block_channel`].
+    pub(crate) blocks: Mutex<Blocks>,
     /// Where the writer sends its [`WriterEvent`]s, once something has subscribed. Bounded, and
     /// only ever `try_send`: the writer never waits on it.
     pub(crate) events: Mutex<Option<tokio::sync::mpsc::Sender<WriterEvent>>>,
     /// A test's hook into [`MessageCache::read`], run at each [`ReadPoint`].
     #[cfg(test)]
     pub(crate) read_hook: Mutex<Option<ReadHook>>,
+}
+
+/// Channels, scopes and providers whose rows are kept but not served: access to them is in
+/// doubt. In memory only.
+#[derive(Debug, Default)]
+pub(crate) struct Blocks {
+    channels: HashSet<ChanKey>,
+    /// By channel and `scope_key`.
+    scopes: HashSet<(ChanKey, String)>,
+    providers: HashSet<String>,
 }
 
 /// What an erase waiting to be applied covers.
@@ -973,6 +997,10 @@ pub(crate) enum Op {
     },
     EraseProvider {
         provider_key: String,
+    },
+    EraseScope {
+        chan: ChanKey,
+        scope_key: String,
     },
     RetainOnly {
         routes: Arc<RouteSnapshot>,
@@ -1144,6 +1172,7 @@ impl MessageCache {
             erasing: Mutex::new(HashMap::new()),
             sweep: Mutex::new(None),
             erase_failed: Mutex::new(HashSet::new()),
+            blocks: Mutex::new(Blocks::default()),
             events: Mutex::new(None),
             #[cfg(test)]
             read_hook: Mutex::new(None),
@@ -1362,6 +1391,73 @@ impl MessageCache {
         lock(&self.shared.erasing).insert(key, seq.unwrap_or(u64::MAX));
     }
 
+    /// Erase one scope of a channel, such as a thread whose access is lost: each message whose
+    /// home is the scope is deleted as a deletion upstream would delete it (a tombstone stays, and
+    /// the store's summaries of it follow), and the scope's memberships, coverage, head and thread
+    /// record are dropped. The channel's other scopes keep what they hold.
+    ///
+    /// The channel is blocked for reads until the writer has applied it, and its epoch moves, so a
+    /// fill of the channel already running is dropped.
+    pub fn erase_scope(&self, chan: &ChanKey, scope: &Scope) {
+        let key = Erasing::Channel(chan.clone());
+        lock(&self.shared.erasing).insert(key.clone(), u64::MAX);
+        self.shared.epochs.bump_channel(chan);
+        let seq = self.control(Op::EraseScope {
+            chan: chan.clone(),
+            scope_key: scope.key(),
+        });
+        lock(&self.shared.erasing).insert(key, seq.unwrap_or(u64::MAX));
+    }
+
+    /// Serve nothing of `chan` until [`MessageCache::unblock`]: access to it is in doubt. Its rows
+    /// are kept, and observations of it are still applied: a successful read of it is what lifts
+    /// a doubt. In memory only.
+    pub fn block_channel(&self, chan: &ChanKey) {
+        lock(&self.shared.blocks).channels.insert(chan.clone());
+    }
+
+    /// Serve nothing of one scope of `chan`, such as a thread, until [`MessageCache::unblock`];
+    /// its other scopes are served as before. As [`MessageCache::block_channel`] otherwise.
+    pub fn block_scope(&self, chan: &ChanKey, scope: &Scope) {
+        lock(&self.shared.blocks)
+            .scopes
+            .insert((chan.clone(), scope.key()));
+    }
+
+    /// Lift a block: of the whole channel when `scope` is `None`, or of that one scope.
+    pub fn unblock(&self, chan: &ChanKey, scope: Option<&Scope>) {
+        let mut blocks = lock(&self.shared.blocks);
+        match scope {
+            None => {
+                blocks.channels.remove(chan);
+            }
+            Some(scope) => {
+                blocks.scopes.remove(&(chan.clone(), scope.key()));
+            }
+        }
+    }
+
+    /// Serve nothing of any of `provider_key`'s channels until [`MessageCache::resume_provider`]:
+    /// the provider refused the credential. In memory only.
+    pub fn suspend_provider(&self, provider_key: &str) {
+        lock(&self.shared.blocks)
+            .providers
+            .insert(provider_key.to_owned());
+    }
+
+    /// Serve `provider_key`'s channels again, blocks of single channels and scopes aside.
+    pub fn resume_provider(&self, provider_key: &str) {
+        lock(&self.shared.blocks).providers.remove(provider_key);
+    }
+
+    /// Whether a scope of `chan` is blocked on its own. The channel's own blocks are
+    /// [`MessageCache::blocked`]'s.
+    fn scope_blocked(&self, chan: &ChanKey, scope_key: &str) -> bool {
+        lock(&self.shared.blocks)
+            .scopes
+            .contains(&(chan.clone(), scope_key.to_owned()))
+    }
+
     /// Record that `provider_key`'s rows are read as the account `account_id`, in `workspace_id`
     /// where the provider has workspaces. A control operation, so a full queue never drops it; the
     /// writer applies it only while the route snapshot names the provider, as it does rows. The
@@ -1421,8 +1517,15 @@ impl MessageCache {
 
     /// Whether reads of a channel are blocked: it is off the route snapshot (or there is none
     /// yet); a sweep that may erase it is pending; an erase of it or its provider has been asked
-    /// for and not yet applied; or one failed.
+    /// for and not yet applied; or one failed; or access to it is in doubt, or its provider is
+    /// suspended.
     fn blocked(&self, chan: &ChanKey) -> bool {
+        {
+            let blocks = lock(&self.shared.blocks);
+            if blocks.channels.contains(chan) || blocks.providers.contains(&chan.provider_key) {
+                return true;
+            }
+        }
         let routed = self
             .shared
             .routes
@@ -1688,21 +1791,45 @@ impl MessageCache {
         }
     }
 
+    /// [`MessageCache::read`] of one scope of `chan`, blocked as well while that scope is, before
+    /// the SQL and after it.
+    fn read_scope<T>(
+        &self,
+        chan: &ChanKey,
+        scope_key: &str,
+        work: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Read<T> {
+        if self.scope_blocked(chan, scope_key) {
+            return Read::Blocked;
+        }
+        let read = self.read(Some(chan), work);
+        if self.scope_blocked(chan, scope_key) {
+            return Read::Blocked;
+        }
+        read
+    }
+
     /// A scope's newest `limit` messages, oldest first.
     #[must_use]
     pub fn newest(&self, chan: &ChanKey, scope: &Scope, limit: usize) -> Read<Vec<CachedMessage>> {
         let scope_key = scope.key();
-        self.read(Some(chan), |connection| {
+        self.read_scope(chan, &scope_key, |connection| {
             reader::newest(connection, chan, &scope_key, limit)
         })
     }
 
-    /// One message, if the cache holds it.
+    /// One message, if the cache holds it. Blocked while the scope it belongs to is.
     #[must_use]
     pub fn message(&self, chan: &ChanKey, id: &MessageId) -> Read<Option<CachedMessage>> {
-        self.read(Some(chan), |connection| {
-            reader::message(connection, chan, id)
-        })
+        let read = self.read(Some(chan), |connection| {
+            reader::message_and_home(connection, chan, id)
+        });
+        if let Read::Served(Some((_, home))) = &read {
+            if self.scope_blocked(chan, home) {
+                return Read::Blocked;
+            }
+        }
+        read.map(|found| found.map(|(message, _)| message))
     }
 
     /// Whether the cache holds a tombstone for a message.
@@ -1717,7 +1844,7 @@ impl MessageCache {
     #[must_use]
     pub fn coverage(&self, chan: &ChanKey, scope: &Scope) -> Read<Vec<coverage::Interval>> {
         let scope_key = scope.key();
-        self.read(Some(chan), |connection| {
+        self.read_scope(chan, &scope_key, |connection| {
             reader::coverage(connection, chan, &scope_key)
         })
     }
@@ -1726,23 +1853,33 @@ impl MessageCache {
     #[must_use]
     pub fn head(&self, chan: &ChanKey, scope: &Scope) -> Read<Option<coverage::Head>> {
         let scope_key = scope.key();
-        self.read(Some(chan), |connection| {
+        self.read_scope(chan, &scope_key, |connection| {
             reader::head(connection, chan, &scope_key)
         })
     }
 
-    /// The scopes a message is listed in.
+    /// The scopes a message is listed in. Blocked while any of them is.
     #[must_use]
     pub fn memberships(&self, chan: &ChanKey, id: &MessageId) -> Read<Vec<Scope>> {
-        self.read(Some(chan), |connection| {
+        let read = self.read(Some(chan), |connection| {
             reader::memberships(connection, chan, id)
-        })
+        });
+        if let Read::Served(scopes) = &read {
+            if scopes
+                .iter()
+                .any(|scope| self.scope_blocked(chan, &scope.key()))
+            {
+                return Read::Blocked;
+            }
+        }
+        read
     }
 
-    /// A thread record.
+    /// A thread record. Blocked while the thread's scope is.
     #[must_use]
     pub fn thread(&self, chan: &ChanKey, thread_id: &str) -> Read<Option<ThreadRecord>> {
-        self.read(Some(chan), |connection| {
+        let scope_key = Scope::Thread(thread_id.to_owned()).key();
+        self.read_scope(chan, &scope_key, |connection| {
             reader::thread(connection, chan, thread_id)
         })
     }

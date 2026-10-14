@@ -135,21 +135,32 @@ pub(crate) fn newest(
     Ok(rows)
 }
 
-pub(crate) fn message(
+/// One message, and the `scope_key` of its home scope.
+pub(crate) fn message_and_home(
     connection: &Connection,
     chan: &ChanKey,
     id: &MessageId,
-) -> rusqlite::Result<Option<CachedMessage>> {
+) -> rusqlite::Result<Option<(CachedMessage, String)>> {
     let Some(chan_id) = chan_id(connection, chan)? else {
         return Ok(None);
     };
     connection
         .query_row(
             &format!(
-                "SELECT {MESSAGE_COLUMNS} FROM message m WHERE m.chan = ?1 AND m.message_id = ?2"
+                "SELECT {MESSAGE_COLUMNS}, m.home_scope, m.thread_id FROM message m
+                 WHERE m.chan = ?1 AND m.message_id = ?2"
             ),
             params![chan_id, id.as_str()],
-            |row| cached(&chan.channel_id, row),
+            |row| {
+                let home = match row.get::<_, String>(10)?.as_str() {
+                    "thread" => {
+                        Scope::Thread(row.get::<_, Option<String>>(11)?.unwrap_or_default())
+                    }
+                    "flat" => Scope::Flat,
+                    _ => Scope::Main,
+                };
+                Ok((cached(&chan.channel_id, row)?, home.key()))
+            },
         )
         .optional()
 }

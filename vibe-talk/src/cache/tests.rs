@@ -1718,6 +1718,182 @@ fn retain_only_sweeps_every_channel_and_provider_off_the_list() {
     assert_eq!(fx.cache.counts().served().expect("counts").messages, 0);
 }
 
+// ---- access in doubt ---------------------------------------------------------------------------
+
+/// Channel `C1` holding main rows `m1`..`m3`, `m1` the root of thread `m1` with replies `r1` and
+/// `r2` listed with a proof, and `C2` holding `m10`.
+fn with_a_thread(tag: &str) -> (Fixture, ChanKey, Scope) {
+    let fx = Fixture::new(tag);
+    let other = ChanKey::new("p", "C2");
+    let mut root = m(1);
+    root.thread = Some(MessageThread {
+        id: "m1".to_owned(),
+        root_message_id: Some(mid("m1")),
+        is_root: true,
+        reply_count: Some(2),
+        reply_count_exact: true,
+    });
+    fx.list(
+        vec![root.clone(), m(2), m(3)],
+        T0 + 3 * STEP,
+        Some(newest_proof(ListStart::ScopeStart)),
+    );
+    let thread = Scope::Thread("m1".to_owned());
+    fx.offer(
+        &fx.chan,
+        Observation::Listing(Listing {
+            scope: thread.clone(),
+            rows: vec![
+                Incoming::new(root, Scope::Main),
+                Incoming::new(reply("r1", "m1", "one", T0 + STEP + 1), thread.clone()),
+                Incoming::new(reply("r2", "m1", "two", T0 + STEP + 2), thread.clone()),
+            ],
+            observed_ms: T0 + 3 * STEP,
+            proof: Some(newest_proof(ListStart::ScopeStart)),
+        }),
+    );
+    fx.offer(
+        &other,
+        Observation::Rows {
+            rows: vec![Incoming::new(m(10), Scope::Main)],
+            scope: None,
+            observed_ms: T0,
+        },
+    );
+    (fx, other, thread)
+}
+
+#[test]
+fn a_blocked_channel_scope_or_provider_serves_nothing_until_unblocked_and_keeps_its_rows() {
+    let (fx, other, thread) = with_a_thread("cache-blocks");
+    let counts = fx.cache.counts().served().expect("counts");
+    let served = |chan: &ChanKey, scope: &Scope| fx.cache.newest(chan, scope, 10) != Read::Blocked;
+
+    fx.cache.block_channel(&fx.chan);
+    assert_eq!(fx.cache.newest(&fx.chan, &Scope::Main, 10), Read::Blocked);
+    assert_eq!(fx.cache.newest(&fx.chan, &thread, 10), Read::Blocked);
+    assert_eq!(fx.cache.message(&fx.chan, &mid("m2")), Read::Blocked);
+    assert_eq!(fx.cache.coverage(&fx.chan, &Scope::Main), Read::Blocked);
+    assert!(served(&other, &Scope::Main), "another channel is served");
+    // Observations are still applied: a read that succeeds is what lifts the doubt.
+    fx.list(vec![m(4)], T0 + 4 * STEP, None);
+    fx.cache.unblock(&fx.chan, None);
+    assert_eq!(fx.ids(&Scope::Main), ids(&["m1", "m2", "m3", "m4"]));
+
+    // One thread blocked: its scope, its record and its replies are not served; the channel's
+    // main scope, and the root that lives there, are.
+    fx.cache.block_scope(&fx.chan, &thread);
+    assert_eq!(fx.cache.newest(&fx.chan, &thread, 10), Read::Blocked);
+    assert_eq!(fx.cache.coverage(&fx.chan, &thread), Read::Blocked);
+    assert_eq!(fx.cache.head(&fx.chan, &thread), Read::Blocked);
+    assert_eq!(fx.cache.thread(&fx.chan, "m1"), Read::Blocked);
+    assert_eq!(fx.cache.message(&fx.chan, &mid("r1")), Read::Blocked);
+    assert_eq!(fx.cache.memberships(&fx.chan, &mid("m1")), Read::Blocked);
+    assert!(served(&fx.chan, &Scope::Main));
+    assert!(content(&fx, "m1").is_some(), "the root lives in main");
+    fx.cache.unblock(&fx.chan, Some(&thread));
+    assert_eq!(content(&fx, "r1").as_deref(), Some("one"));
+    assert!(fx.cache.thread(&fx.chan, "m1").served().flatten().is_some());
+
+    // A provider suspended: none of its channels is served.
+    fx.cache.suspend_provider("p");
+    assert_eq!(fx.cache.newest(&fx.chan, &Scope::Main, 10), Read::Blocked);
+    assert_eq!(fx.cache.newest(&other, &Scope::Main, 10), Read::Blocked);
+    fx.cache.resume_provider("p");
+    assert!(served(&fx.chan, &Scope::Main) && served(&other, &Scope::Main));
+
+    // Nothing was deleted by any of it.
+    let after = fx.cache.counts().served().expect("counts");
+    assert_eq!(after.messages, counts.messages + 1, "only m4 was added");
+    assert_eq!(after.tombstones, counts.tombstones);
+}
+
+#[test]
+fn erasing_a_thread_deletes_its_replies_as_deletions_and_leaves_the_rest_of_the_channel() {
+    let (fx, other, thread) = with_a_thread("cache-erase-scope");
+    let mut events = fx.cache.subscribe_events(64);
+    fx.clock.set(T0 + 5 * STEP);
+    fx.cache.erase_scope(&fx.chan, &thread);
+    fx.settle();
+
+    assert_eq!(content(&fx, "r1"), None);
+    assert_eq!(content(&fx, "r2"), None);
+    assert!(fx
+        .cache
+        .tombstoned(&fx.chan, &mid("r1"))
+        .served()
+        .expect("read"));
+    assert_eq!(fx.ids(&thread), Vec::<String>::new());
+    assert!(
+        intervals(&fx, &thread).is_empty(),
+        "no coverage claimed for it"
+    );
+    assert_eq!(fx.cache.head(&fx.chan, &thread), Read::Served(None));
+    assert_eq!(fx.cache.thread(&fx.chan, "m1"), Read::Served(None));
+    // The root lives in main, and main keeps everything it held, coverage included.
+    assert_eq!(fx.ids(&Scope::Main), ids(&["m1", "m2", "m3"]));
+    assert_eq!(
+        fx.cache.memberships(&fx.chan, &mid("m1")),
+        Read::Served(vec![Scope::Main])
+    );
+    assert_eq!(intervals(&fx, &Scope::Main).len(), 1);
+    assert_eq!(
+        fx.cache
+            .newest(&other, &Scope::Main, 10)
+            .served()
+            .expect("served")
+            .len(),
+        1
+    );
+    // Each reply is told to the store as a deletion; nothing says the channel went.
+    let mut told = drain(&mut events);
+    told.sort_by_key(|event| format!("{event:?}"));
+    assert_eq!(told, [orphan("C1", "r1", None), orphan("C1", "r2", None)]);
+
+    // A read that started before the erase cannot bring a reply back; one after it can.
+    fx.list_scope(
+        thread.clone(),
+        vec![reply("r1", "m1", "one", T0 + STEP + 1)],
+        T0 + 4 * STEP,
+        None,
+    );
+    assert_eq!(content(&fx, "r1"), None);
+    fx.list_scope(
+        thread,
+        vec![reply("r1", "m1", "one", T0 + STEP + 1)],
+        T0 + 6 * STEP,
+        None,
+    );
+    assert_eq!(content(&fx, "r1").as_deref(), Some("one"));
+}
+
+#[test]
+fn a_scope_erase_blocks_its_channel_until_applied_and_drops_fills_already_running() {
+    let (fx, _other, thread) = with_a_thread("cache-erase-scope-race");
+    let stamp = fx.cache.stamp(&fx.chan);
+    let resume = fx.cache.pause_writer();
+    fx.cache.erase_scope(&fx.chan, &thread);
+    assert_eq!(fx.cache.newest(&fx.chan, &Scope::Main, 10), Read::Blocked);
+    drop(resume);
+    fx.settle();
+    // A read of the thread that started before the erase lands after it: dropped.
+    fx.cache.offer(
+        fx.chan.clone(),
+        stamp,
+        Observation::Rows {
+            rows: vec![Incoming::new(
+                reply("r3", "m1", "three", T0 + STEP + 3),
+                thread.clone(),
+            )],
+            scope: None,
+            observed_ms: T0 + 6 * STEP,
+        },
+    );
+    fx.settle();
+    assert_eq!(content(&fx, "r3"), None);
+    assert_eq!(fx.ids(&Scope::Main), ids(&["m1", "m2", "m3"]));
+}
+
 // ---- accounts ----------------------------------------------------------------------------------
 
 #[test]

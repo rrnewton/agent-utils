@@ -853,6 +853,13 @@ impl Writer<'_> {
                 }
                 self.report("provider erase", result);
             }
+            Op::EraseScope { chan, scope_key } => {
+                let result = self.transaction(|w| w.erase_scope(&chan, &scope_key));
+                if result.is_err() {
+                    lock(&self.shared.erase_failed).insert(Erasing::Channel(chan));
+                }
+                self.report("scope erase", result);
+            }
             Op::RetainOnly { routes } => {
                 let result = self.transaction(|w| w.retain_only(&routes));
                 if result.is_err() {
@@ -1726,6 +1733,61 @@ impl Writer<'_> {
                     .execute("DELETE FROM channel WHERE chan = ?1", [id])?;
             }
             Stats::add(&self.shared.stats.erased_channels, 1);
+        }
+        Ok(())
+    }
+
+    /// Erase one scope of a channel: every message whose home it is goes as a deletion upstream
+    /// would (a tombstone stays, and the store is told), and its memberships, coverage, head and
+    /// thread record are dropped.
+    fn erase_scope(&mut self, chan: &ChanKey, scope_key: &str) -> rusqlite::Result<()> {
+        let Some(chan_id) = self.find_chan(chan)? else {
+            return Ok(());
+        };
+        let Some(scope) = Scope::parse(scope_key) else {
+            return Ok(());
+        };
+        let homes = {
+            let (sql, home): (&str, &str) = match &scope {
+                Scope::Thread(id) => (
+                    "SELECT row_id, message_id, created_ms FROM message
+                     WHERE chan = ?1 AND home_scope = 'thread' AND thread_id = ?2",
+                    id.as_str(),
+                ),
+                Scope::Main | Scope::Flat => (
+                    "SELECT row_id, message_id, created_ms FROM message
+                     WHERE chan = ?1 AND home_scope = ?2",
+                    scope.kind(),
+                ),
+            };
+            let mut statement = self.conn.prepare(sql)?;
+            let rows = statement
+                .query_map(params![chan_id, home], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let now = self.now();
+        for (row_id, message_id, created_ms) in homes {
+            self.tombstone(chan, chan_id, row_id, &message_id, created_ms, now)?;
+        }
+        self.flush_deletes()?;
+        for table in ["message_scope", "coverage", "scope_head"] {
+            self.conn.execute(
+                &format!("DELETE FROM {table} WHERE chan = ?1 AND scope_key = ?2"),
+                params![chan_id, scope_key],
+            )?;
+        }
+        if let Scope::Thread(id) = &scope {
+            self.conn.execute(
+                "DELETE FROM thread WHERE chan = ?1 AND thread_id = ?2",
+                params![chan_id, id],
+            )?;
         }
         Ok(())
     }
