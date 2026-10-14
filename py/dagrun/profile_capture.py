@@ -1122,9 +1122,16 @@ class _PerfWindowController:
         buffered = b""
         while True:
             # `finish` can race with this controller after perf has written its acknowledgement
-            # but before this thread is scheduled to consume it. Make one nonblocking read on every
-            # pass before honouring either cancellation or the deadline, so a completed handshake
-            # survives without extending any wait when no acknowledgement is ready.
+            # but before this thread is scheduled to consume it. Sample both stop conditions
+            # *before* the nonblocking read and honour them only after it: an acknowledgement
+            # written before finish or the deadline became observable is then always read,
+            # because the read that follows the observation comes after the write. Checking after
+            # the read instead leaves a window (the read finds nothing, perf writes, finish is
+            # set, the check sees finish) that drops a completed handshake; here that window
+            # includes taking the GIL back after select returns. Once stopped there is exactly
+            # one read and no wait.
+            finished = self._finished.is_set()
+            remaining = deadline - time.monotonic()
             chunk: bytes | None = None
             readable, _, _ = select.select([ack_fd], [], [], 0)
             if readable:
@@ -1132,19 +1139,21 @@ class _PerfWindowController:
                     chunk = os.read(ack_fd, 4096)
                 except BlockingIOError:
                     chunk = None
+                except OSError:
+                    # A read error is never an acknowledgement. As in the Rust edition, it is
+                    # reported as a missing acknowledgement rather than a failed FIFO control.
+                    return False
             if chunk:
                 buffered += chunk
                 if b"\n" in buffered:
                     return buffered.splitlines()[0].strip() == b"ack"
-            if self._finished.is_set():
-                return False
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
+            if finished or remaining <= 0.0:
                 return False
             if chunk is None:
                 select.select([ack_fd], [], [], min(0.05, remaining))
             elif not chunk:
-                # EOF: perf holds no writer yet, so select would report the FIFO readable at once.
+                # EOF: perf has closed its writer, so select would report the FIFO readable at
+                # once; back off instead of spinning.
                 time.sleep(0.005)
 
     def _command(self, control_fd: int, ack_fd: int, command: bytes) -> bool:

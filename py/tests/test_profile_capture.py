@@ -263,6 +263,37 @@ def test_perf_ack_written_before_finish_is_still_read(
     assert controller._ack(read_fd)
 
 
+def test_perf_ack_landing_between_an_empty_poll_and_finish_is_still_read(
+    tmp_path: Path, ack_pipe: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_fd, write_fd = ack_pipe
+    controller = _perf_controller(tmp_path, ack_timeout_s=10.0)
+    real_select = select.select
+    timeouts: list[float] = []
+
+    def ack_lands_during_first_poll(
+        readers: list[int], writers: list[int], errors: list[int], timeout: float
+    ) -> tuple[list[int], list[int], list[int]]:
+        result = real_select(readers, writers, errors, timeout)
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            # The interleaving a stop check made after the read loses: this poll found nothing,
+            # then perf writes its acknowledgement and the step finishes, both before the
+            # controller's stop check runs. Sampling the stop conditions before the poll means
+            # this pass still waits, and the next pass reads the acknowledgement.
+            assert result == ([], [], [])
+            os.write(write_fd, b"ack\n")
+            controller._finished.set()
+        return result
+
+    monkeypatch.setattr(
+        capture, "select", types.SimpleNamespace(select=ack_lands_during_first_poll)
+    )
+
+    assert controller._ack(read_fd)
+    assert timeouts[0] == 0 and timeouts[-1] == 0, timeouts
+
+
 def test_perf_ack_ready_at_the_deadline_is_still_read(
     tmp_path: Path, ack_pipe: tuple[int, int]
 ) -> None:
@@ -306,13 +337,14 @@ def test_perf_finish_permits_exactly_one_nonblocking_poll(
 
 def test_perf_ack_read_error_is_never_an_acknowledgement(tmp_path: Path) -> None:
     controller = _perf_controller(tmp_path, ack_timeout_s=1.0)
-    controller._finished.set()
-    # A directory descriptor polls readable and then fails the read: a planted read error. The
-    # controller thread records it as a failed perf FIFO control rather than an acknowledgement.
+    # A directory descriptor polls readable and then fails the read: a planted read error. As in
+    # the Rust edition, it is refused as a missing acknowledgement, whether or not the step has
+    # finished, so both editions report "perf did not acknowledge ...".
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with pytest.raises(OSError):
-            controller._ack(directory_fd)
+        assert not controller._ack(directory_fd)
+        controller._finished.set()
+        assert not controller._ack(directory_fd)
     finally:
         os.close(directory_fd)
 
@@ -328,6 +360,8 @@ def test_perf_ack_wait_without_finish_remains_deadline_bounded(
     assert not controller._ack(read_fd)
 
     assert time.monotonic() - started < 5.0
+    # The deadline bound alone cannot tell a read-before-wait loop from a wait-first one; the
+    # zero-timeout first poll is what shows each pass reads before it waits.
     assert timeouts and timeouts[0] == 0, "every pass starts with a nonblocking poll"
     assert all(timeout <= 0.01 for timeout in timeouts), "no wait outlives the deadline"
 

@@ -1707,9 +1707,13 @@ fn send_perf_command(
     let mut chunk = [0u8; 256];
     loop {
         // `finish` can race with this controller after perf has written its acknowledgement but
-        // before this thread is scheduled to consume it. The production acknowledgement file is
-        // nonblocking, so make one final read before honoring either cancellation or the deadline.
-        // This preserves a completed handshake without waiting when no acknowledgement is ready.
+        // before this thread is scheduled to consume it. Sample both stop conditions *before*
+        // the nonblocking read and honour them only after it: any acknowledgement written before
+        // finish or the deadline became observable is then always read, because the read that
+        // follows the observation comes after the write. Checking after the read instead leaves a
+        // window (read sees nothing, perf writes, finish is set, the check sees finish) in which a
+        // completed handshake is dropped. Once stopped there is exactly one read and no wait.
+        let stop = finished.load(Ordering::Acquire) || Instant::now() >= deadline;
         match ack.read(&mut chunk) {
             Ok(0) => {}
             Ok(count) => {
@@ -1725,7 +1729,7 @@ fn send_perf_command(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return false,
         }
-        if finished.load(Ordering::Acquire) || Instant::now() >= deadline {
+        if stop {
             return false;
         }
         thread::sleep(Duration::from_millis(5));
@@ -2968,6 +2972,29 @@ mod tests {
         }
     }
 
+    /// An acknowledgement FIFO whose first read finds nothing, and during which perf writes its
+    /// acknowledgement and then the step finishes. Every later read returns what was written.
+    struct AckLandsDuringFirstRead<'a> {
+        finished: &'a AtomicBool,
+        queued: Vec<u8>,
+        reads: usize,
+    }
+
+    impl Read for AckLandsDuringFirstRead<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                self.queued.extend_from_slice(b"ack\n");
+                self.finished.store(true, Ordering::Release);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let count = self.queued.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.queued[..count]);
+            self.queued.drain(..count);
+            Ok(count)
+        }
+    }
+
     struct BrokenAck;
 
     impl Read for BrokenAck {
@@ -3045,6 +3072,34 @@ mod tests {
         );
         child.join().expect("acknowledgement writer must be reaped");
         assert!(acknowledged);
+        assert_eq!(control, b"disable\n");
+    }
+
+    #[test]
+    fn perf_command_reads_an_ack_that_lands_between_an_empty_read_and_finish() {
+        // The interleaving a stop check made after the read loses: the read finds nothing, perf
+        // writes its acknowledgement, the step finishes, and only then does the check run. The
+        // stop conditions are sampled before the read, so this pass still waits and the next
+        // pass reads the acknowledgement before honouring finish.
+        let finished = AtomicBool::new(false);
+        let mut ack = AckLandsDuringFirstRead {
+            finished: &finished,
+            queued: Vec::new(),
+            reads: 0,
+        };
+        let mut control = Vec::new();
+        let acknowledged = send_perf_command(
+            &mut control,
+            &mut ack,
+            b"disable\n",
+            Duration::from_secs(10),
+            &finished,
+        );
+        assert!(acknowledged);
+        assert_eq!(
+            ack.reads, 2,
+            "one empty read, then the read that finds the ack"
+        );
         assert_eq!(control, b"disable\n");
     }
 
