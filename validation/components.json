@@ -16,6 +16,7 @@
         "rs/bin/herdr-agent",
         "rs/chat-subscription-fake/",
         "rs/chat-subscription-plugin/",
+        "rs/chat-subscription-slack/",
         "rs/chat-subscription/",
         "skills/agentctl/",
         "skills/herdr-agent/"

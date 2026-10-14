@@ -8,6 +8,7 @@ version, license, README, and embedded user guide.
 |---|---|---|
 | `chat-subscription` | library | Model ordered inbound events, replay gaps, and durable acknowledgement boundaries. |
 | `chat-subscription-plugin` | library | Carry the subscription contract over a bounded, versioned process protocol. |
+| `chat-subscription-slack` | `agentctl-slack-plugin`, `agentctl-slack-outbound` | Slack subscription plugin and bot-identity reply helper for `agentctl chat`. |
 | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |

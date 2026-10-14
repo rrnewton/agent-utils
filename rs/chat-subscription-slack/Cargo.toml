@@ -1,0 +1,31 @@
+[package]
+name = "chat-subscription-slack"
+version = "0.1.0"
+description = "Slack subscription plugin and bot-identity outbound helper for the agentctl chat bridge"
+readme = "README.md"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
+chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
+libc = "0.2"
+serde_json = "1"
+
+[dev-dependencies]
+agentctl = { path = "../agentctl" }
+
+[[bin]]
+name = "agentctl-slack-plugin"
+path = "src/bin/agentctl-slack-plugin.rs"
+
+[[bin]]
+name = "agentctl-slack-outbound"
+path = "src/bin/agentctl-slack-outbound.rs"
+
+[lints]
+workspace = true

@@ -67,6 +67,19 @@ steps:
     cpu_timeout: 1200
     hint: *rust_test_hint
 
+  - group: chat-subscription
+    job: slack
+    desc: chat-subscription Slack provider Rust tests
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-slack ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
   - group: dagrun
     job: test
     desc: dagrun Rust tests, including boxed integration tests

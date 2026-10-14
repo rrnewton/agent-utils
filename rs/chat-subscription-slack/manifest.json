@@ -1,0 +1,19 @@
+{
+  "schema": "agentctl-plugin-manifest/v1alpha1",
+  "name": "slack",
+  "capability": "slack.events.cli",
+  "executable": "agentctl-slack-plugin",
+  "protocol": {
+    "name": "agentctl-chat-subscription",
+    "min": 1,
+    "max": 1
+  },
+  "process_phase_timeouts": {
+    "hello_seconds": 10,
+    "start_seconds": 30,
+    "commit_seconds": 30,
+    "close_seconds": 10,
+    "shutdown_grace_seconds": 5
+  },
+  "implementation": "implemented"
+}

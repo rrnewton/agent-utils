@@ -1140,6 +1140,11 @@ plugin callback receipt. Explicitly closed, fully delivered requests outside
 the current inclusive cursor are retired through a bounded fsynced audit and
 replay-guard ring rather than exhausting the 2,048 active-request cap.
 
+The Rust edition also has a Slack provider: a subscription plugin
+(`agentctl-slack-plugin`) and an outbound helper (`agentctl-slack-outbound`)
+that posts and reacts only as a registered Slack app. `chat userguide` documents its configuration and how
+to run a separate bridge instance for one test agent.
+
 One `run` or `tick` process owns each Chat state directory. Stop `run` before
 using `tick` for manual recovery. In the polling edition, explicit `chat reply`
 submissions remain available while `run` owns the state; a private local

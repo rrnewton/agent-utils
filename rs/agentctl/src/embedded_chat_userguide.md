@@ -1525,6 +1525,189 @@ when it is not a regular file. `chat status` reports `receipt_reactions`, with `
 those failed at their last attempt or cannot be read; and the `lost`,
 `oldest_lost_key`, `refused`, `oldest_refused_key` and `last_refusal` above.
 
+## Slack provider
+
+The Slack provider is a subscription plugin and a matching outbound helper,
+built from their own source package, with the same
+request/reply contract as any other provider: durable cursor, reply IDs,
+per-thread replies, the 🤖 admission ACK and the ✅ delivery reaction.
+
+* `agentctl-slack-plugin` is the subscription plugin (manifest name `slack`,
+  capability `slack.events.cli`). It runs the installed Slack
+  command-line client's `slack.conversation tail` for the configured channel and
+  turns each `message.created` event into one batch.
+* `agentctl-slack-outbound` is the `outbound_command`. It posts replies with
+  `slack.message send` and adds reactions with `slack.reaction add`, always
+  with `--as=<APP_ID>`, so every post and reaction comes from the registered
+  Slack app's bot identity. Without `--app-id` it refuses every request as
+  `app_identity_required` (not applied, retryable) and runs nothing. A user ID
+  is not accepted as the app id.
+
+The transport sits behind a small interface. The command-line transport is the
+only implemented one; `transport: "web_api"` (plugin) or `--transport=web-api`
+(helper) selects a placeholder that refuses every operation.
+
+Resource names. The channel is the Slack conversation ID (`C…`). A message is
+`C…/messages/<ts>`, a thread is `C…/threads/<root ts>`, and a reaction receipt
+is `C…/messages/<ts>/reactions/<name>`. A sender is the Slack user ID (`U…`), so
+`allowed_senders` lists user IDs. A top-level message starts its own thread; a
+reply in a thread routes to the thread root, and the agent's answer is posted
+into that thread.
+
+Inbound filtering. Only messages in `channel_ids`, from `allowed_senders`, with
+no bot or app author, and with no subtype other than `thread_broadcast`,
+`file_share` or `me_message` become requests. Every other event commits as a
+checkpoint so the cursor still advances. Slack's `&amp;`, `&lt;` and `&gt;`
+escapes are undone.
+
+Cursor and recovery. The cursor is `slack1:seq:<n>`, the event stream's
+sequence number, or `slack1:since:<unix ms>` before the first event. A restart
+resumes the tail with `--catchup=<n>` (or `--since=<seconds>`) and skips events at
+or before the saved sequence; a replayed event yields the identical batch. A new
+state directory first commits a checkpoint at the start instant (minus
+`initial_backfill_seconds`); older messages are never delivered. A tail `GAP`
+record, or a saved position the stream can no longer replay, is reported as a
+`Gap`, which stops `run` for operator review as described above. The tail
+exiting is a retryable failure, and the host reconnects from the saved cursor.
+
+Reaction names. Slack names reactions by shortcode. The helper maps 🤖 to
+`robot_face`, ✅ to `white_check_mark`, and a few other common emoji; a
+shortcode such as `eyes` or `:eyes:` passes through. An unmapped emoji is
+refused as not applied rather than guessed.
+
+Idempotent replies. Slack has no idempotency key for posts. The helper keeps one
+small file per operation UUID in `--ledger`: an intent before the post and the
+message `ts` after it. Retrying a finished UUID returns the recorded message.
+After an uncertain outcome, a retry lists the thread for a message from the app
+created after the intent whose text matches, and adopts it. If none is listed,
+the outcome stays unknown until `--uncertain-repost-after-seconds` (default
+120) have passed, and then the helper posts again. Bodies longer than
+`--max-chunk-bytes` (default 11,000; Slack's limit is 12,000) are posted as
+consecutive messages in the same thread.
+
+### Plugin settings (`backend_configuration`, schema `agentctl.slack.v1`)
+
+Unknown keys are refused.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `cli_path` | required | Absolute path of the Slack command-line client. |
+| `transport` | `cli` | `cli`, or `web_api` (refuses; not implemented). |
+| `cli_environment` | `{}` | Extra non-secret `NAME: value` pairs set on the client. |
+| `cli_timeout_seconds` | 60 | Deadline for one non-streaming client call. |
+| `device_id`, `caller`, `subscriber_app_id`, `subscription_mode` | unset | Passed to the tail as `--device-id`, `--caller`, `--app-id`, `--mode`. |
+| `tail_heartbeat_seconds`, `tail_stall_timeout_seconds` | unset | Passed as `--heartbeat-interval` and `--stall-timeout`. |
+| `heartbeat_interval_seconds` | 30 | Idle heartbeat period towards the host. |
+| `initial_backfill_seconds` | 0 | A new state directory also delivers messages this many seconds old. |
+| `ignore_text_prefixes` | `[]` | Messages starting with one of these are never delivered. |
+| `diagnostics_log` | stderr | Private diagnostics file (identifiers and codes only, never message text). |
+
+The host clears the plugin environment except `HOME`, `USER`, `LOGNAME`, `PATH`,
+`LANG`, `LC_ALL`, `TMPDIR` and `XDG_RUNTIME_DIR`. If the client needs another
+variable, name it in `subscription_environment` (values stay in the service
+environment) or, for non-secret values, set it in `cli_environment`.
+
+### Helper arguments
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `--cli=PATH` | required | Absolute path of the Slack command-line client. |
+| `--app-id=A…` | none | The posting app. Without it every request is refused. |
+| `--channel=C…` | required, repeatable | Conversations the helper may write to. |
+| `--ledger=DIR` | required | Private operation ledger directory. |
+| `--format=markdown\|text` | `markdown` | Body flag: `--markdown=file://-` or `--text=file://-`. |
+| `--bot-user-id=U…\|B…` | none | Extra author IDs that identify the app's posts during reconciliation. |
+| `--uncertain-repost-after-seconds=N` | 120 | 30–86400. |
+| `--timeout-ms=N` | 25000 | 1000–29000, per client call; keep below `timeout_millis`. |
+| `--max-chunk-bytes=N` | 11000 | 1000–12000. |
+| `--cli-env=NAME=VALUE` | none | Extra non-secret client environment, repeatable. |
+| `--diagnostics-log=PATH` | stderr | Private diagnostics file. |
+| `--transport=cli\|web-api` | `cli` | `web-api` refuses every request. |
+
+The Slack app must be invited to the channel and needs permission to post and
+react (`chat:write`, `reactions:write`) and, for reconciling uncertain posts,
+to read the channel's history (`groups:history` for a private channel). Without
+history access an uncertain post is simply re-posted after the window.
+
+### A second bridge for one test agent
+
+Run the Slack bridge as its own process with its own plugin home, registry,
+state directory and agent. It shares nothing with an existing bridge service:
+do not reuse that service's state directory, registry, plugin home or unit.
+The paths below are examples under one private root.
+
+```sh
+ROOT="$HOME/.local/state/agentctl-slack-test"
+CLIENT=/path/to/slack-client          # the installed Slack command-line client
+AGENTCTL=/path/to/agentctl            # a pinned agentctl build
+install -m 0700 -d "$ROOT" "$ROOT/home" "$ROOT/home/plugins" \
+  "$ROOT/home/plugins/slack" "$ROOT/registry" "$ROOT/ledger" "$ROOT/logs"
+
+# Install both executables and the plugin manifest from the provider's build.
+BUILD=/path/to/provider/build         # holds the two executables and manifest.json
+install -m 0500 "$BUILD/agentctl-slack-plugin" "$ROOT/home/plugins/slack/"
+install -m 0400 "$BUILD/manifest.json" "$ROOT/home/plugins/slack/"
+HELPER_DIR="$HOME/.local/libexec/agentctl-slack-outbound-$(sha256sum \
+  "$BUILD/agentctl-slack-outbound" | cut -c1-12)"
+install -m 0700 -d "$HELPER_DIR"
+install -m 0500 "$BUILD/agentctl-slack-outbound" "$HELPER_DIR/"
+
+# Start the one test agent in its own Herdr tab, registered only in this registry.
+"$AGENTCTL" --registry "$ROOT/registry" start slack-test --harness claude --cwd /work/scratch
+```
+
+Write `$ROOT/chat.json` (mode `0600`), replacing the placeholders:
+
+```json
+{
+  "subscription_plugin": "slack",
+  "channel_ids": ["C0123456789"],
+  "allowed_senders": ["U0OWNER0000"],
+  "agent_name": "slack-test",
+  "agent_label": "slack-test",
+  "outbound_enabled": true,
+  "ack_reaction": "🤖",
+  "backend_configuration": {
+    "schema": "agentctl.slack.v1",
+    "data": {
+      "cli_path": "/path/to/slack-client",
+      "diagnostics_log": "/home/USER/.local/state/agentctl-slack-test/logs/plugin.log"
+    }
+  },
+  "outbound_command": {
+    "executable": "/home/USER/.local/libexec/agentctl-slack-outbound-HASH/agentctl-slack-outbound",
+    "arguments": [
+      "--cli=/path/to/slack-client",
+      "--app-id=A0APPID0000",
+      "--channel=C0123456789",
+      "--ledger=/home/USER/.local/state/agentctl-slack-test/ledger",
+      "--diagnostics-log=/home/USER/.local/state/agentctl-slack-test/logs/helper.log"
+    ],
+    "environment": ["HOME", "USER", "LOGNAME", "PATH"],
+    "timeout_millis": 30000
+  }
+}
+```
+
+Then initialize and run the bridge, with `AGENTCTL_HOME` pointing at the private
+plugin home:
+
+```sh
+chmod 600 "$ROOT/chat.json"
+AGENTCTL_HOME="$ROOT/home" "$AGENTCTL" --registry "$ROOT/registry" \
+  chat init --config "$ROOT/chat.json" --bridge-state "$ROOT/bridge"
+AGENTCTL_HOME="$ROOT/home" "$AGENTCTL" --registry "$ROOT/registry" \
+  chat run --bridge-state "$ROOT/bridge" 2>>"$ROOT/logs/bridge.log"
+```
+
+Run `chat run` in its own terminal or as its own user unit. Post a message in the
+channel as an allowed sender: the bridge reacts with 🤖 once the request is
+admitted, types the prompt into the `slack-test` pane and adds ✅ once that
+delivery is verified, and posts the agent's reply into the message's thread as
+the app. `chat status --bridge-state "$ROOT/bridge"` and the two diagnostics
+logs show each step. To stop the test, stop `chat run`, then the agent; delete
+`$ROOT` only after both have exited.
+
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.
