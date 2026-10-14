@@ -32,6 +32,8 @@ use sha2::{Digest as _, Sha256};
 
 mod watch;
 
+pub(crate) use watch::claude_sessions_by_pane;
+
 /// Most notices one coordinator's queue holds; further posts are refused as busy.
 pub(crate) const DEFAULT_MAX_LIVE: usize = 200;
 /// Default byte budget for one rendered batch, header and trailer included.

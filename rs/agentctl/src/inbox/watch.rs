@@ -450,6 +450,13 @@ pub(crate) struct ClaudeSession {
     status: Option<String>,
 }
 
+impl ClaudeSession {
+    /// The session's state as Claude Code reports it, such as `idle` or `busy`.
+    pub(crate) fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+}
+
 /// Run a query command in its own process group with a deadline and return its stdout. On the
 /// deadline the whole group is killed, so a grandchild holding stdout open cannot outlive it.
 fn query(program: &Path, arguments: &[&str], timeout: Duration) -> Result<Vec<u8>> {

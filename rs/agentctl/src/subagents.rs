@@ -7787,6 +7787,75 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
+    /// Send a prompt that must never be left waiting: [`Self::send_identified_with_runtime`], but
+    /// a prompt the agent never accepts is taken back out of its composer, as
+    /// [`agent::AgentRuntime::withdraws_unaccepted`] describes, and a prompt the drain leaves in
+    /// the queue's inbox, as when the agent is not ready in time, is taken back out of the inbox
+    /// before the agent's lifecycle lock is released, so no later sender's drain types it.
+    /// Returns `true` when the prompt was taken back out of the inbox untyped, and `false` when
+    /// the queue typed it. Any other outcome is the send's error, as for
+    /// [`Self::send_identified_with_runtime`].
+    pub(crate) fn send_once_with_runtime(
+        &self,
+        agent_name: &str,
+        text: &str,
+        options: DrainOptions,
+        message_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<bool> {
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        let queue = self.queue(&record.name)?;
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+            expected_workspace: self.project_workspace()?,
+            readback: None,
+        };
+        let withdrawing = agent::WithdrawUnacceptedRuntime {
+            inner: runtime,
+            message_id,
+        };
+        match agent::send_identified_managed_with_runtime(
+            &client,
+            &self.target(&record)?,
+            &queue,
+            text,
+            options,
+            &withdrawing,
+            Some(message_id),
+        ) {
+            Ok(_) => Ok(false),
+            Err(error @ AgentError::Pending(_)) => {
+                if agent::withdraw(&queue, message_id, runtime)? {
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Take the prompt `message_id` back out of the agent's queue inbox, untyped, as
+    /// [`agent::withdraw`] does, under the agent's lifecycle lock; `true` when it was there.
+    pub(crate) fn withdraw_with_runtime(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<bool> {
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        agent::withdraw(&self.queue(agent_name)?, message_id, runtime)
+    }
+
     /// Reconcile one caller-selected durable delivery identifier by exact path lookup.
     pub fn message_state(
         &self,

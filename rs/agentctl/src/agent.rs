@@ -524,12 +524,58 @@ pub trait AgentRuntime {
     fn withdraw_unaccepted_prompt(&self) -> bool {
         false
     }
+    /// Whether a queue drain types the queued prompt `message_id` as one to take back out of the
+    /// composer if the agent never accepts it, as [`Self::withdraw_unaccepted_prompt`] describes,
+    /// whatever the pane's status. A sender that must never leave its prompt staged in the
+    /// composer, such as a chat bridge's reply reminder, asks for this for its own prompt only:
+    /// see [`WithdrawUnacceptedRuntime`]. The default is `false`.
+    fn withdraws_unaccepted(&self, message_id: &str) -> bool {
+        let _ = message_id;
+        false
+    }
 }
 
 /// A runtime that behaves as `inner` and asks a verified submission to withdraw a prompt the
 /// agent never accepts: see [`AgentRuntime::withdraw_unaccepted_prompt`].
 struct WithdrawingRuntime<'a> {
     inner: &'a dyn AgentRuntime,
+}
+
+/// A runtime that behaves as `inner` and asks a queue drain to take the prompt `message_id` back
+/// out of the composer if the agent never accepts it: see [`AgentRuntime::withdraws_unaccepted`].
+pub(crate) struct WithdrawUnacceptedRuntime<'a> {
+    pub(crate) inner: &'a dyn AgentRuntime,
+    pub(crate) message_id: &'a str,
+}
+
+impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        self.inner.delivery_wait_chunk()
+    }
+
+    fn prompt_printed(&self, message_id: &str) {
+        self.inner.prompt_printed(message_id);
+    }
+
+    fn withdraw_unaccepted_prompt(&self) -> bool {
+        self.inner.withdraw_unaccepted_prompt()
+    }
+
+    fn withdraws_unaccepted(&self, message_id: &str) -> bool {
+        message_id == self.message_id || self.inner.withdraws_unaccepted(message_id)
+    }
 }
 
 impl AgentRuntime for WithdrawingRuntime<'_> {
@@ -555,6 +601,10 @@ impl AgentRuntime for WithdrawingRuntime<'_> {
 
     fn withdraw_unaccepted_prompt(&self) -> bool {
         true
+    }
+
+    fn withdraws_unaccepted(&self, message_id: &str) -> bool {
+        self.inner.withdraws_unaccepted(message_id)
     }
 }
 
@@ -928,9 +978,12 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             atomic_json(&inflight_path, &Value::Object(document.clone()))?;
 
             // Typing into a working pane relies on the agent to queue the prompt; one it never
-            // accepts is taken back out of the composer so that it stays safely pending.
+            // accepts is taken back out of the composer so that it stays safely pending. So is a
+            // prompt whose sender asked for that, wherever it is typed.
             let withdrawing = WithdrawingRuntime { inner: runtime };
-            let delivery_runtime: &dyn AgentRuntime = if accept_working && info.status == "working"
+            let delivery_runtime: &dyn AgentRuntime = if (accept_working
+                && info.status == "working")
+                || runtime.withdraws_unaccepted(&identifier)
             {
                 &withdrawing
             } else {
@@ -1350,6 +1403,51 @@ pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueM
         }
     }
     Ok(observed)
+}
+
+/// Take the prompt `message_id` back out of the queue's inbox, untyped, and say whether it was
+/// there to take. It holds the queue's delivery lock, which a drain holds while it types, so a
+/// prompt is either taken out or typed, never both. A prompt in any other phase is left as it is:
+/// one in flight, processed or failed may have been typed. The prompt's file is removed, so its
+/// identifier can be queued again. Waiting for the lock ends when `runtime` is cancelled.
+pub(crate) fn withdraw(
+    root: &Path,
+    message_id: &str,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<bool> {
+    validate_message_id(message_id)?;
+    if fs::symlink_metadata(root).is_err() {
+        return Ok(false);
+    }
+    validate_existing_queue(root)?;
+    let directory_identity = queue_directory_identity(root)?;
+    let lock_path = root.join(".delivery.lock");
+    let lock = open_private_lock(&lock_path, "queue delivery lock")?;
+    lock_exclusive_with_runtime(&lock, &lock_path, "queue delivery", runtime)?;
+    verify_queue_lock(
+        root,
+        directory_identity,
+        &lock_path,
+        &lock,
+        "queue delivery lock",
+    )?;
+    let inbox = QueueDirectories::new(root).inbox;
+    let path = inbox.join(format!("{message_id}.json"));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("inspect queue message", &path, error)),
+    }
+    let document = load_message(&path)?;
+    if document.get("id").and_then(Value::as_str) != Some(message_id) {
+        return Err(AgentError::delivery(format!(
+            "queue artifact {} contains a different message id",
+            path.display()
+        )));
+    }
+    fs::remove_file(&path).map_err(|error| io_error("withdraw queued message", &path, error))?;
+    sync_directory(&inbox)?;
+    Ok(true)
 }
 
 /// Read recent terminal output from a validated interactive-agent target.
@@ -4814,6 +4912,148 @@ mod tests {
         assert_eq!(
             message_state(directory.path(), "chat-request-1").unwrap(),
             Some(QueueMessageState::Processed)
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_prompt_is_never_typed_and_its_identifier_can_be_queued_again() {
+        let directory = TestDirectory::new("withdraw");
+        let runtime = FakeRuntime::default();
+        assert!(
+            !withdraw(directory.path(), "reminder-1", &runtime).unwrap(),
+            "a queue that does not exist yet holds nothing to take back"
+        );
+        enqueue(directory.path(), "take me back", Some("reminder-1")).unwrap();
+        assert!(withdraw(directory.path(), "reminder-1", &runtime).unwrap());
+        assert_eq!(message_state(directory.path(), "reminder-1").unwrap(), None);
+        assert!(!withdraw(directory.path(), "reminder-1", &runtime).unwrap());
+        let fake = FakeAgent::new(&["idle"]);
+        let drained = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert!(drained.delivered.is_empty(), "{drained:?}");
+        assert!(fake.state.lock().unwrap().runs.is_empty(), "nothing typed");
+
+        // The identifier is free again, and a prompt the queue has typed is left as it is.
+        let fake = FakeAgent::new(&["idle"]);
+        send_identified_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "queued again",
+            DrainOptions::default(),
+            &runtime,
+            Some("reminder-1"),
+        )
+        .unwrap();
+        assert!(!withdraw(directory.path(), "reminder-1", &runtime).unwrap());
+        assert_eq!(
+            message_state(directory.path(), "reminder-1").unwrap(),
+            Some(QueueMessageState::Processed)
+        );
+        assert_eq!(fake.state.lock().unwrap().runs, ["queued again"]);
+    }
+
+    #[test]
+    fn a_withdrawal_waits_while_a_drain_holds_the_delivery_lock_and_ends_when_cancelled() {
+        let directory = TestDirectory::new("withdraw-locked");
+        enqueue(directory.path(), "take me back", Some("reminder-2")).unwrap();
+        let lock_path = directory.path().join(".delivery.lock");
+        let holder = open_private_lock(&lock_path, "test delivery lock").unwrap();
+        FileExt::lock_exclusive(&holder).unwrap();
+        let error = withdraw(directory.path(), "reminder-2", &CancelRuntime::new(0)).unwrap_err();
+        assert!(
+            error.to_string().contains("cancelled while waiting"),
+            "{error}"
+        );
+        assert_eq!(
+            message_state(directory.path(), "reminder-2").unwrap(),
+            Some(QueueMessageState::Pending),
+            "a withdrawal that gave up left the prompt where it was"
+        );
+        let started = Instant::now();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            FileExt::unlock(&holder).unwrap();
+        });
+        assert!(withdraw(directory.path(), "reminder-2", &SystemRuntime::default()).unwrap());
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the withdrawal waited for the lock"
+        );
+        release.join().unwrap();
+        assert_eq!(message_state(directory.path(), "reminder-2").unwrap(), None);
+    }
+
+    /// A Claude Code pane that Herdr reports `idle`, drawn by `screen`, and its target.
+    fn idle_claude(screen: crate::submission::fake::FakeScreen) -> (FakeAgent, Target) {
+        let (fake, target) = working_claude(screen);
+        fake.state.lock().expect("fake state").last_state = "idle".to_owned();
+        (fake, target)
+    }
+
+    #[test]
+    fn a_prompt_an_idle_agent_never_accepts_is_taken_back_only_when_its_sender_asks() {
+        let options = DrainOptions {
+            ready_timeout: Duration::ZERO,
+            max_attempts: 1,
+            ..DrainOptions::default()
+        };
+        let directory = TestDirectory::new("idle-unaccepted");
+        let screen = crate::submission::fake::FakeScreen::new("claude", false);
+        screen.state().drop_submit_keys = true;
+        let (fake, target) = idle_claude(screen);
+        let runtime = FakeRuntime::default();
+        let asking = WithdrawUnacceptedRuntime {
+            inner: &runtime,
+            message_id: "reminder-3",
+        };
+        let error = send_identified_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            "never accepted",
+            options,
+            &asking,
+            Some("reminder-3"),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75, "{error}");
+        assert!(
+            error.to_string().contains("taken back out of the composer"),
+            "{error}"
+        );
+        assert_eq!(
+            message_state(directory.path(), "reminder-3").unwrap(),
+            Some(QueueMessageState::Pending)
+        );
+        assert!(fake.screen.as_ref().unwrap().state().composer.is_empty());
+
+        // Another prompt typed through the same runtime is left staged, as without it.
+        let directory = TestDirectory::new("idle-unaccepted-other");
+        let screen = crate::submission::fake::FakeScreen::new("claude", false);
+        screen.state().drop_submit_keys = true;
+        let (fake, target) = idle_claude(screen);
+        let error = send_identified_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            "someone else's prompt",
+            options,
+            &asking,
+            Some("request-1"),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 76, "{error}");
+        assert!(error.to_string().contains("NOT submitted"), "{error}");
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().composer,
+            "someone else's prompt"
         );
     }
 

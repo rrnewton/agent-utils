@@ -39,6 +39,14 @@ use crate::error::AdapterErrorKind;
 use crate::stale_composer::{HerdrComposerPane, StaleComposer};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
+mod reply_reminders;
+
+use reply_reminders::ReplyReminders;
+pub use reply_reminders::{
+    parse_idle as parse_reply_reminder_idle, ReplyReminderSettings, DEFAULT_REPLY_REMINDER_IDLE,
+    MAX_REPLY_REMINDER_IDLE, MIN_REPLY_REMINDER_IDLE,
+};
+
 // The lines of context each output subscription asks for: the rows the service's own reads of
 // the pane ask for.
 const SNAPSHOT_LINES_U32: u32 = 4_000;
@@ -876,6 +884,11 @@ pub struct RunSettings {
     /// unchanged this long, as [`crate::stale_composer`] describes; `None`, the default, never
     /// clears one.
     pub stale_composer_clear_after: Option<Duration>,
+    /// Remind a Claude Code coordinator, once, of each delivered request it has not answered,
+    /// once it has been idle this long: see [`ReplyReminderSettings`]. `None`, the default here,
+    /// sends no reminder; `chat run` reminds after [`DEFAULT_REPLY_REMINDER_IDLE`] unless told
+    /// otherwise. Reminders need `outbound_enabled`.
+    pub reply_reminders: Option<ReplyReminderSettings>,
 }
 
 /// Run with process-local settings; the saved configuration remains unchanged.
@@ -894,6 +907,20 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     validate_service_outbound(state.config())?;
     let stale_composer = match settings.stale_composer_clear_after {
         Some(window) => Some(stale_composer_guard(state_root, state.config(), window)?),
+        None => None,
+    };
+    let reminders = match &settings.reply_reminders {
+        Some(reminders) if state.config().outbound_enabled => {
+            service_log(ReplyReminders::describe(reminders));
+            Some(ReplyReminders::new(reminders))
+        }
+        Some(_) => {
+            service_log(
+                "agentctl: reply reminders are off: outbound chat is off for this bridge, so the \
+                 coordinator is told not to write reply blocks",
+            );
+            None
+        }
         None => None,
     };
     let outbound_cancellation = OutboundCancellation::new()?;
@@ -1036,6 +1063,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         &reply_wakes,
         &mut outbound,
         stale_composer,
+        reminders,
     );
 
     begin_service_stop(
@@ -2518,6 +2546,27 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
             .peek_capture_with_runtime(agent_name, SNAPSHOT_LINES, &self.runtime)
             .map_err(|error| error.to_string())
     }
+
+    fn submit_once(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<bool, String> {
+        if self.runtime.cancelled() {
+            return Err("chat delivery was cancelled before prompt submission".to_owned());
+        }
+        self.manager
+            .send_once_with_runtime(agent_name, prompt, options, message_id, &self.runtime)
+            .map_err(|error| error.to_string())
+    }
+
+    fn withdraw(&self, agent_name: &str, message_id: &str) -> std::result::Result<bool, String> {
+        self.manager
+            .withdraw_with_runtime(agent_name, message_id, &self.runtime)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// What a pass's deliveries did in the pane, as `TypingWatch` notes it.
@@ -2644,6 +2693,22 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
 
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
         self.delivery.screen(agent_name)
+    }
+
+    fn submit_once(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<bool, String> {
+        self.notes.typed.set(true);
+        self.delivery
+            .submit_once(agent_name, prompt, message_id, options)
+    }
+
+    fn withdraw(&self, agent_name: &str, message_id: &str) -> std::result::Result<bool, String> {
+        self.delivery.withdraw(agent_name, message_id)
     }
 }
 
@@ -3564,6 +3629,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
     stale_composer: Option<StaleComposer>,
+    reminders: Option<ReplyReminders>,
 ) -> Result<(), ChatServiceError> {
     owner_loop_end(
         stop,
@@ -3580,6 +3646,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             reply_wakes,
             transport,
             stale_composer,
+            reminders,
         ),
     )
 }
@@ -3614,8 +3681,14 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
     stale_composer: Option<StaleComposer>,
+    mut reminders: Option<ReplyReminders>,
 ) -> Result<(), ChatServiceError> {
     let owner_runtime = StopRuntime::new(stop);
+    // A reply reminder an earlier run left in the coordinator's queue is taken back out before
+    // any pass can type it, after its request may have been answered.
+    if let Some(reminders) = reminders.as_mut() {
+        reminders.settle(state, manager, stop);
+    }
     let mut stale_composer = stale_composer.map(|guard| StaleComposerRun {
         guard,
         last_held: None,
@@ -3848,6 +3921,24 @@ fn owner_loop<A: ManagedApi + ?Sized>(
             ) {
                 // The composer is empty again: try the waiting prompts at once.
                 watch.next_scan = Instant::now();
+            }
+        }
+        if let Some(reminders) = reminders.as_mut().filter(|_| scanned) {
+            let check = reminders.check(
+                state,
+                manager,
+                stop,
+                options.delivery,
+                &mut routes,
+                &mut control,
+                &mut turn,
+                !watch.retry_keys.is_empty(),
+            )?;
+            enqueue_report_backlog(&mut direct_keys, &check.report, overflowed);
+            notes.log(&check.report);
+            turn.report(&check.report);
+            if let Some(snapshot) = &check.snapshot {
+                poll_at = next_saturated_poll(&routes, snapshot);
             }
         }
 
@@ -10390,6 +10481,7 @@ esac
             limit,
             transport,
             wake_root,
+            None,
             done,
         )
     }
@@ -10420,6 +10512,7 @@ esac
             limit,
             transport,
             wake_root,
+            None,
             done,
         ));
     }
@@ -10448,6 +10541,7 @@ esac
         &mpsc::Receiver<String>,
         &mut Option<CommandOutboundTransport>,
         Option<StaleComposer>,
+        Option<ReplyReminders>,
     ) -> Result<(), ChatServiceError>;
 
     /// Run `run` for `state`'s agent as [`run_owner_loop_timed`] runs the owner loop: until
@@ -10465,6 +10559,7 @@ esac
         limit: Duration,
         transport: Option<CommandOutboundTransport>,
         wake_root: Option<&Path>,
+        reminders: Option<ReplyReminders>,
         mut done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
     ) -> Result<(), ChatServiceError> {
         let manager = fixture.manager();
@@ -10516,6 +10611,7 @@ esac
                 &reply_wakes,
                 &mut transport,
                 None,
+                reminders,
             )
         });
         if let Some(listener) = listener {
@@ -14602,5 +14698,379 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
         assert!(!alarmed());
         let prompts = fixture.client.runs.lock().expect("runs").clone();
         assert!(prompts.is_empty(), "{prompts:#?}");
+    }
+
+    /// A stand-in for Claude Code's word on whether the coordinator is idle: idle while `idle`
+    /// is set, busy otherwise. `asked` counts the questions.
+    struct FakeClaude {
+        idle: Arc<AtomicBool>,
+        asked: Arc<AtomicU64>,
+    }
+
+    impl reply_reminders::ClaudeIdleSource for FakeClaude {
+        fn state(
+            &self,
+            _info: &crate::client::AgentPaneInfo,
+        ) -> Result<reply_reminders::ClaudeState, String> {
+            self.asked.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if self.idle.load(AtomicOrdering::SeqCst) {
+                reply_reminders::ClaudeState::Idle
+            } else {
+                reply_reminders::ClaudeState::Busy("busy".to_owned())
+            })
+        }
+    }
+
+    /// A worker whose pane keeps no scrollback, a bridge state for it whose reply reminders
+    /// started before any request, and reminders after 100 ms of idle time that ask a
+    /// [`FakeClaude`] whether it is idle, starting with `idle`. Returns the fixture, the state,
+    /// the reminders, Claude Code's idle flag, and its question count.
+    fn reminding_worker(
+        idle: bool,
+    ) -> (
+        crate::subagents::tests::Fixture,
+        BridgeState,
+        ReplyReminders,
+        Arc<AtomicBool>,
+        Arc<AtomicU64>,
+    ) {
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        state
+            .update_reply_reminders(1, None, |_| (false, ()))
+            .expect("start reminders");
+        let idle = Arc::new(AtomicBool::new(idle));
+        let asked = Arc::new(AtomicU64::new(0));
+        let reminders = ReplyReminders::with_source(
+            Duration::from_millis(100),
+            Box::new(FakeClaude {
+                idle: Arc::clone(&idle),
+                asked: Arc::clone(&asked),
+            }),
+        );
+        (fixture, state, reminders, idle, asked)
+    }
+
+    /// Scans of the request records, and so reminder checks, every 20 ms.
+    const REMINDER_TIMING: DeliveryTiming = DeliveryTiming {
+        retry_interval: Duration::from_millis(20),
+        stall_after: Duration::from_secs(3_600),
+        stall_repeat: Duration::from_secs(3_600),
+    };
+
+    /// The reminders the fixture's agent was typed.
+    fn reminders_typed(fixture: &crate::subagents::tests::Fixture) -> Vec<String> {
+        fixture
+            .client
+            .runs
+            .lock()
+            .expect("runs")
+            .iter()
+            .filter(|prompt| prompt.starts_with("Chat reply reminder"))
+            .cloned()
+            .collect()
+    }
+
+    fn request_delivered(state: &BridgeState, key: &str) -> bool {
+        state
+            .delivery_entries()
+            .expect("delivery entries")
+            .iter()
+            .any(|entry| entry.key == key && entry.phase == RequestPhase::Delivered)
+    }
+
+    #[test]
+    fn the_owner_loop_reminds_an_idle_coordinator_once_and_a_busy_one_never() {
+        // The request's prompt was typed after reminders started. While Claude Code says the
+        // coordinator is busy, though Herdr reports its pane idle, no reminder is sent however
+        // many checks run. Once Claude Code says it is idle, exactly one reminder follows, naming
+        // the request's reply ID, and no later check sends another.
+        let (fixture, state, reminders, idle, asked) = reminding_worker(false);
+        let said = Arc::clone(&reminders.said);
+        let (key, _) = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let mut phase = 0;
+        let mut typed_while_busy = None;
+        let mut reminded_at: Option<Instant> = None;
+        expect_stopped(owner_loop_timed(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            REMINDER_TIMING,
+            chat_run_delivery(),
+            Duration::from_secs(20),
+            None,
+            None,
+            Some(reminders),
+            |_, _| match phase {
+                0 => {
+                    if request_delivered(&state, &key) && asked.load(AtomicOrdering::SeqCst) >= 15 {
+                        typed_while_busy = Some(reminders_typed(&fixture).len());
+                        idle.store(true, AtomicOrdering::SeqCst);
+                        phase = 1;
+                    }
+                    false
+                }
+                1 => {
+                    if !reminders_typed(&fixture).is_empty() {
+                        reminded_at = Some(Instant::now());
+                        phase = 2;
+                    }
+                    false
+                }
+                _ => reminded_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)),
+            },
+        ));
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        assert_eq!(
+            typed_while_busy,
+            Some(0),
+            "no reminder while Claude Code is busy"
+        );
+        let typed = reminders_typed(&fixture);
+        assert_eq!(typed.len(), 1, "{typed:#?}");
+        assert!(typed[0].contains("reply ID 001"), "{}", typed[0]);
+        assert!(typed[0].contains("agentctl chat reply"), "{}", typed[0]);
+        let record = state
+            .update_reply_reminders(chat_runtime::unix_millis(), None, |_| (false, ()))
+            .expect("record")
+            .0;
+        assert!(record.reminded(&key));
+        assert_eq!(record.pending, None);
+        let said = said.lock().expect("log").clone();
+        assert!(
+            said.contains(&format!(
+                "agentctl: the reply reminder for request {key} (reply ID 001) reached the coordinator"
+            )),
+            "{said:#?}"
+        );
+    }
+
+    #[test]
+    fn a_reminder_the_queue_does_not_type_waits_until_the_coordinator_is_busy_and_idle_again() {
+        // The agent is paused for human input after its request's prompt was typed, so the queue
+        // refuses the reminder. It is released, and for as long as Herdr keeps reporting the pane
+        // idle, no other is composed and Claude Code is not asked again, though the agent is no
+        // longer paused. Once Herdr has reported the agent working and then idle, the next idle
+        // period brings one reminder.
+        let (fixture, state, reminders, _idle, asked) = reminding_worker(true);
+        let said = Arc::clone(&reminders.said);
+        let (key, _) = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let manager = fixture.manager();
+        manager.pause("worker", true).expect("pause");
+        let withdrawn = format!(
+            "agentctl: the reply reminder for request {key} (reply ID 001) was taken back out"
+        );
+        let mut phase = 0;
+        let mut at = Instant::now();
+        let mut asked_when_held = 0;
+        let mut held = None;
+        let mut reminded_at: Option<Instant> = None;
+        expect_stopped(owner_loop_timed(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            REMINDER_TIMING,
+            chat_run_delivery(),
+            Duration::from_secs(30),
+            None,
+            None,
+            Some(reminders),
+            |_, _| {
+                match phase {
+                    0 | 1
+                        if said
+                            .lock()
+                            .expect("log")
+                            .iter()
+                            .any(|line| line.starts_with(&withdrawn)) =>
+                    {
+                        manager.pause("worker", false).expect("resume");
+                        asked_when_held = asked.load(AtomicOrdering::SeqCst);
+                        at = Instant::now();
+                        phase = 2;
+                    }
+                    2 if at.elapsed() >= Duration::from_secs(1) => {
+                        held = Some((
+                            reminders_typed(&fixture).len(),
+                            asked.load(AtomicOrdering::SeqCst) - asked_when_held,
+                        ));
+                        *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+                        at = Instant::now();
+                        phase = 3;
+                    }
+                    3 if at.elapsed() >= Duration::from_millis(200) => {
+                        *fixture.client.status.lock().expect("status") = Some("idle".to_owned());
+                        phase = 4;
+                    }
+                    4 if !reminders_typed(&fixture).is_empty() => {
+                        reminded_at = Some(Instant::now());
+                        phase = 5;
+                    }
+                    _ => {}
+                }
+                reminded_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
+            },
+        ));
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        assert_eq!(
+            held,
+            Some((0, 0)),
+            "while held, nothing was typed and Claude Code was not asked"
+        );
+        let typed = reminders_typed(&fixture);
+        assert_eq!(typed.len(), 1, "{typed:#?}");
+        let record = state
+            .update_reply_reminders(chat_runtime::unix_millis(), None, |_| (false, ()))
+            .expect("record")
+            .0;
+        assert!(record.reminded(&key));
+        let said = said.lock().expect("log").clone();
+        assert!(
+            said.iter()
+                .position(|line| line.starts_with(&withdrawn))
+                .is_some_and(|withdrawal| said[withdrawal..].iter().any(|line| line
+                    == &format!(
+                        "agentctl: the reply reminder for request {key} (reply ID 001) reached the coordinator"
+                    ))),
+            "{said:#?}"
+        );
+    }
+
+    #[test]
+    fn the_read_before_a_reminder_stores_a_reply_on_screen_instead_of_reminding() {
+        // The agent's reply appears on the screen only once Claude Code says it is idle, when no
+        // other read of the pane is due, so only the read before the reminder can store it. It
+        // does, and no reminder is typed.
+        let (fixture, state, reminders, idle, asked) = reminding_worker(false);
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        let (key, _) = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let mut phase = 0;
+        let mut at = Instant::now();
+        expect_stopped(owner_loop_timed(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            REMINDER_TIMING,
+            chat_run_delivery(),
+            Duration::from_secs(20),
+            None,
+            None,
+            Some(reminders),
+            |_, _| match phase {
+                0 => {
+                    if request_delivered(&state, &key) && asked.load(AtomicOrdering::SeqCst) >= 5 {
+                        *fixture.client.screen.lock().expect("screen") =
+                            Some(claude_turn_screen(true, 4));
+                        idle.store(true, AtomicOrdering::SeqCst);
+                        at = Instant::now();
+                        phase = 1;
+                    }
+                    false
+                }
+                _ => at.elapsed() >= Duration::from_secs(1),
+            },
+        ));
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        assert!(reminders_typed(&fixture).is_empty());
+        let replies = state.sent_replies(Some(&key), 10, true).expect("replies");
+        assert!(replies.contains("first answer"), "{replies}");
+        assert!(state
+            .reply_reminder_candidates()
+            .expect("candidates")
+            .candidates
+            .is_empty());
+    }
+
+    #[test]
+    fn a_reminder_an_earlier_run_left_in_the_queue_is_taken_out_before_anything_is_typed() {
+        // An earlier run recorded a reminder and left it in the agent's queue. A new request
+        // waits too, and the pass at startup types its prompt with a drain that would type every
+        // prompt in the queue. The reminder is taken back out first, so only the request's
+        // prompt is typed, and the request the reminder named is released.
+        let (fixture, state, reminders, _idle, _asked) = reminding_worker(false);
+        let said = Arc::clone(&reminders.said);
+        let (reminded, _) = delivered_worker_request(&state);
+        let message_id = format!("chat-reminder-{}", "e".repeat(64));
+        let reminder = chat_runtime::PendingReminder {
+            message_id: message_id.clone(),
+            keys: vec![reminded.clone()],
+            prompt: "Chat reply reminder: a stale one".to_owned(),
+        };
+        state
+            .update_reply_reminders(chat_runtime::unix_millis(), None, |record| {
+                record.reminded.push(chat_runtime::RemindedRequest {
+                    key: reminded.clone(),
+                    reply_id: "001".to_owned(),
+                    at_millis: chat_runtime::unix_millis(),
+                });
+                record.pending = Some(reminder.clone());
+                (true, ())
+            })
+            .expect("record the stale reminder");
+        crate::agent::enqueue(
+            &fixture.root.join("registry/worker/queue"),
+            &reminder.prompt,
+            Some(&message_id),
+        )
+        .expect("leave the reminder in the queue");
+        let waiting = admitted_worker_message(&state, 2, "two");
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        expect_stopped(owner_loop_timed(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            REMINDER_TIMING,
+            chat_run_delivery(),
+            Duration::from_secs(20),
+            None,
+            None,
+            Some(reminders),
+            |_, _| request_delivered(&state, &waiting),
+        ));
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        let prompts = fixture.client.runs.lock().expect("runs").clone();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            !prompts[0].starts_with("Chat reply reminder"),
+            "{}",
+            prompts[0]
+        );
+        let record = state
+            .update_reply_reminders(chat_runtime::unix_millis(), None, |_| (false, ()))
+            .expect("record")
+            .0;
+        assert_eq!(record.pending, None);
+        assert!(
+            !record.reminded(&reminded),
+            "the stale reminder's request is released"
+        );
+        assert!(
+            said.lock().expect("log").iter().any(|line| line.starts_with(&format!(
+                "agentctl: the reply reminder for request {reminded} (reply ID 001) was taken back out"
+            ))),
+            "{:#?}",
+            said.lock().expect("log")
+        );
     }
 }

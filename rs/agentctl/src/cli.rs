@@ -875,6 +875,12 @@ struct ChatRun {
     /// Clear text left unsubmitted in the coordinator's composer once it has blocked a request and stayed unchanged for DURATION, such as 30m (default: off). Units: s, m or h; a bare number is seconds; at least 1m. The text is first saved with mode 0600 under the state directory's composer-backups/, then deleted with editing keys and the composer proved empty, and then posted once to the first configured channel through the outbound helper with a "[chat-bridge WARNING]" notice; delivery then resumes. Any change to the text restarts the wait, nothing is cleared while the agent works, and a failed clear leaves the text and posts nothing. Requires an outbound helper; applies only to this run.
     #[arg(long, value_name = "DURATION", value_parser = stale_composer_duration)]
     stale_composer_clear_after: Option<Duration>,
+    /// Remind a Claude Code coordinator, once, of each chat request whose prompt was typed and that it has not answered, once it has been idle for DURATION since that prompt was typed (default: 60s). Units: s, m or h; a bare number is seconds; at least 10s and at most 24h, and 0 turns reminders off. Idle means Herdr reports the pane idle or done, the pane shows no running turn, and `claude agents --json` reports the pane's session idle. The reminder names the reply IDs it has received no reply for, says that a reply written only in thinking is not delivered, and mentions `agentctl chat reply`; it is recorded in reply-reminders.json before it is queued, is typed only into an idle pane, never through --deliver-while-working, and is taken back out of the queue if it is not typed within 10 seconds (or --ready-timeout if shorter). Requests delivered before reminders first started for the state directory, or more than 24 hours ago, are never reminded. Needs outbound_enabled; applies only to this run.
+    #[arg(long, value_name = "DURATION", default_value = "60s", value_parser = reply_reminder_idle)]
+    reply_reminder_idle: ReplyReminderIdle,
+    /// Claude Code executable that `--reply-reminder-idle` runs as `PATH agents --json` to tell whether the coordinator is idle (default: claude, looked up on PATH). Each run is killed after 10 seconds; a failed run sends no reminder and is logged.
+    #[arg(long, value_name = "PATH", default_value = "claude")]
+    claude_bin: PathBuf,
 }
 
 #[derive(Args)]
@@ -972,6 +978,12 @@ fn environment_value(value: &str) -> Result<String, String> {
 }
 fn stale_composer_duration(value: &str) -> Result<Duration, String> {
     crate::stale_composer::parse_duration(value)
+}
+/// `chat run --reply-reminder-idle`: the idle time, or `None` when reminders are off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplyReminderIdle(Option<Duration>);
+fn reply_reminder_idle(value: &str) -> Result<ReplyReminderIdle, String> {
+    crate::chat_service::parse_reply_reminder_idle(value).map(ReplyReminderIdle)
 }
 fn chat_ignored_text_prefix(value: &str) -> Result<String, String> {
     crate::chat_runtime::validate_ignored_text_prefix(value)
@@ -1864,6 +1876,12 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     ignored_text_prefixes: value.ignored_text_prefixes,
                     offer_reply_command: value.offer_reply_command,
                     stale_composer_clear_after: value.stale_composer_clear_after,
+                    reply_reminders: value.reply_reminder_idle.0.map(|idle| {
+                        crate::chat_service::ReplyReminderSettings {
+                            idle,
+                            claude_bin: value.claude_bin.clone(),
+                        }
+                    }),
                 },
             )
             .map_err(Failure::Chat)?;
@@ -2725,6 +2743,70 @@ mod tests {
             "--deliver-while-working",
             "--stale-composer-clear-after=30m",
         ] {
+            assert!(Cli::try_parse_from([
+                "agentctl",
+                "chat",
+                "tick",
+                "--bridge-state",
+                "/tmp/chat-state",
+                flag,
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn chat_run_reminds_after_sixty_idle_seconds_unless_told_otherwise() {
+        let run = |extra: &[&str]| {
+            let parsed = Cli::try_parse_from(
+                [
+                    "agentctl",
+                    "chat",
+                    "run",
+                    "--bridge-state",
+                    "/tmp/chat-state",
+                ]
+                .iter()
+                .chain(extra),
+            )?;
+            let Some(Commands::Chat(Chat {
+                command: ChatCommand::Run(run),
+            })) = parsed.command
+            else {
+                panic!("expected chat run");
+            };
+            Ok::<_, clap::Error>(run)
+        };
+        let defaults = run(&[]).unwrap();
+        assert_eq!(
+            defaults.reply_reminder_idle.0,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(defaults.claude_bin, std::path::Path::new("claude"));
+        let set = run(&[
+            "--reply-reminder-idle",
+            "2m",
+            "--claude-bin",
+            "/opt/claude/bin/claude",
+        ])
+        .unwrap();
+        assert_eq!(set.reply_reminder_idle.0, Some(Duration::from_secs(120)));
+        assert_eq!(
+            set.claude_bin,
+            std::path::Path::new("/opt/claude/bin/claude")
+        );
+        assert_eq!(
+            run(&["--reply-reminder-idle", "0"])
+                .unwrap()
+                .reply_reminder_idle
+                .0,
+            None,
+            "0 turns reminders off"
+        );
+        for bad in ["5s", "25h", "1d", "soon"] {
+            assert!(run(&["--reply-reminder-idle", bad]).is_err(), "{bad}");
+        }
+        for flag in ["--reply-reminder-idle=60s", "--claude-bin=claude"] {
             assert!(Cli::try_parse_from([
                 "agentctl",
                 "chat",
