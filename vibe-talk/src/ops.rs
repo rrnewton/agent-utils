@@ -1140,9 +1140,12 @@ pub const MAX_PAGE: u16 = crate::discord::http::DISCORD_MAX_LIMIT - 1;
 /// Most range reads one step of a walk through a span makes on a provider that reads by time
 /// itself ([`crate::chat::ReadCaps::range`]): the first, and the provider's own continuations of a
 /// step that came back empty without being exhausted. Past that, the step is the read `/page`
-/// always made. So a bridge that keeps answering empty steps costs at most this many requests more
-/// than that read, and a step that is not the end never answers `has_more: false`. Fix round 2 of
-/// remote-ops-audit W10 `#287 bulk-reads`.
+/// always made, answered as that read always answered it. So a bridge that keeps answering empty
+/// steps costs at most this many requests more than that read, and a range read never ends a walk
+/// on a step the provider did not say ends it. That read may: on Slack, a run of system events
+/// longer than its page budget leaves it an empty page, answered `has_more: false`, as it always
+/// was, and asking for the same step again moves forward, since it remembers how far it proved the
+/// span empty. Fix rounds 2 and 3 of remote-ops-audit W10 `#287 bulk-reads`.
 pub const MAX_SPAN_STEPS: usize = 3;
 
 /// What a caller wants one step of a walk to cover.
@@ -1214,8 +1217,12 @@ pub struct Page {
     /// provider could not prove the span ends after this page: the next step may come back empty,
     /// which is better than a walk that silently stops short. remote-ops-audit W10
     /// `#287 bulk-reads`. Such a provider's step that came back empty is continued on its own
-    /// cursor, or answered by the read this route always made, never by `false`
-    /// ([`MAX_SPAN_STEPS`]).
+    /// cursor, up to [`MAX_SPAN_STEPS`] range reads; one still empty after them, or one that leaves
+    /// no message to resume after, is answered by the read this route made before range reads, as
+    /// that read always answered it. That read may say `false` for an empty step that is not the
+    /// span's end (on Slack, one stopped by a run of system events longer than its page budget), as
+    /// it always could; asking for the same step again moves forward. Fix round 3 of
+    /// remote-ops-audit W10 `#287 bulk-reads`.
     pub has_more: bool,
     /// The `before` cursor for the next step back. Set only when [`Page::has_more`].
     pub next_before: Option<MessageId>,
@@ -1366,8 +1373,9 @@ pub async fn page(
             };
             // A native step that is not exhausted and still gives this route no message to resume
             // after would answer `has_more: false`, and end the walk on a short step. Fix round 2
-            // of remote-ops-audit W10 `#287 bulk-reads`: never; the read this route always made is
-            // made instead, as for an older copy below.
+            // of remote-ops-audit W10 `#287 bulk-reads`: never on the range read's word; the read
+            // this route always made is made instead, as for an older copy below, and answered as
+            // that read always was, an empty page with `false` included (fix round 3).
             let stranded = native
                 && !read.exhausted
                 && read.messages.len() <= usize::from(limit)

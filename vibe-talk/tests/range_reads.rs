@@ -1860,3 +1860,89 @@ async fn a_repeated_slack_span_step_moves_past_a_run_of_system_events_no_step_ca
         "repeats move forward to the first message after the run, skipping none: {answers:?}"
     );
 }
+
+/// The `///` lines just above `item` in `source`, joined into one line of prose.
+fn doc_above(source: &str, item: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim() == item)
+        .unwrap_or_else(|| panic!("{item} is in the source"));
+    let mut doc: Vec<&str> = lines[..at]
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .take_while(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches('/').trim())
+        .collect();
+    doc.reverse();
+    doc.join(" ")
+}
+
+/// Fix round 3 of remote-ops-audit W10 `#287 bulk-reads`: what the README and the rustdoc promise
+/// of a Slack span step that `MAX_SPAN_STEPS` range reads cannot carry past a run of system events.
+/// That step is answered by the read `/page` made before range reads, and that read answers an
+/// empty page with `has_more: false` and no `next_since`, as it always has (the base gives the
+/// same answer). Both places said a span step "never" answers `false` there, which is exactly the
+/// completeness promise a caller would rely on to keep walking; they now say what it answers, and
+/// that asking again moves forward (see the test above this one).
+#[tokio::test]
+async fn the_docs_say_what_a_slack_span_step_answers_when_no_range_read_can_cross_a_run() {
+    let mut state = FakeState::default();
+    let mut list: Vec<Value> = (0..5)
+        .map(|i| profiled(&ts(i, 0), "UADA00001", "Ada", &format!("old {i}")))
+        .collect();
+    list.extend((0..300).map(|i| system(&ts(10_000 + i, 0), "channel_join")));
+    list.extend(
+        (0..3).map(|i| profiled(&ts(10_300 + i, 0), "UADA00001", "Ada", &format!("in {i}"))),
+    );
+    state.history.insert(SLACK_CH.to_owned(), list);
+    let fake = Fake::start(state, 2).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let query = format!(
+        "/api/v1/channels/{SLACK_CH}/page?since={}&limit=5",
+        iso(slack_ms(10_000))
+    );
+    let (status, body) = get(&router, &query).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["messages"], &body["has_more"], &body["next_since"]),
+        (&json!([]), &json!(false), &Value::Null),
+        "the case the docs describe: the read /page made before range reads, answered as it was"
+    );
+
+    let readme = include_str!("../README.md");
+    let bullet = readme
+        .split("* **Reads by time.**")
+        .nth(1)
+        .and_then(|rest| rest.split("\n* **").next())
+        .expect("the Slack section has a Reads by time bullet")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !bullet.contains("never stops short"),
+        "the README promises a walk never stops short: {bullet}"
+    );
+    assert!(
+        bullet.contains("may answer an empty page with `has_more: false`")
+            && bullet.contains("Asking for the same step again moves forward"),
+        "the README says what such a step answers, and how to move past it: {bullet}"
+    );
+
+    let ops = include_str!("../src/ops.rs");
+    for item in [
+        "pub has_more: bool,",
+        "pub const MAX_SPAN_STEPS: usize = 3;",
+    ] {
+        let doc = doc_above(ops, item);
+        assert!(
+            !doc.contains("never by `false`") && !doc.contains("never answers `has_more: false`"),
+            "{item} promises a span step never answers false: {doc}"
+        );
+        assert!(
+            doc.contains("as that read always"),
+            "{item} says such a step is answered as the read before range reads answered it: {doc}"
+        );
+    }
+}

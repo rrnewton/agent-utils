@@ -1118,8 +1118,15 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   is exact only when Slack answers `has_more: false`; the cap still stops it, and then says "at
   least". `/page` with `since` and `until` reads that span and nothing after it. A span with no
   end runs to now: a step forward from `since` still reads from there to now, as it always did,
-  and when that is more than ten pages it narrows by time to the messages next to `since`; such a
-  step answers `has_more: true` unless Slack proved the span ends, so a walk never stops short.
+  and when that is more than ten pages it narrows by time to the messages next to `since`; a step
+  that returns messages answers `has_more: true` unless Slack proved the span ends. A step that
+  comes back empty without that proof is carried on, up to three range reads in all. One that
+  three range reads cannot carry past a run of system events (joins, say, which Slack lists and
+  this server does not show) is answered by the read `/page` made before range reads, exactly as
+  that read always answered it: it may answer an empty page with `has_more: false` and no
+  `next_since`, so an empty step is not proof that the span is over. Asking for the same step
+  again moves forward, because that read remembers how far it proved the span empty, until it
+  reaches the first message after the run.
 * **Lookups by id.** A message's id is its `ts`, so the messages speech preparation, a thread
   summary or a lookup of one message asks for are read a run of timestamps a call:
   `conversations.replies` (in a thread) or `conversations.history`, with `oldest` and `latest` a
@@ -2331,8 +2338,9 @@ not asked for a range read again for ten minutes.
   answer that is `exhausted` and still gives a `next` is refused. A step of `/page` that comes back
   empty and not exhausted is continued on its `next`, up to three range reads in all; one that
   still leaves no message to resume after (no `next`, the third read empty too, or a newest message
-  whose instant cannot be read) is the read `/page` makes without `range_reads`, so a walk never
-  ends on a step the bridge did not say ends it.
+  whose instant cannot be read) is the read `/page` makes without `range_reads`, answered exactly
+  as that read always answered it. So a range read never ends a walk on a step the bridge did not
+  say ends it; that read, as before, ends it on an empty page of `/messages?after=`.
 * `as_of` (optional): as on a timeline read, the instant up to which the bridge knows its answer is
   complete when it could not bring its copy up to date. Absent means now. vibe-talk never answers
   from such a window: `/page` and `/count` then make the read they made without `range_reads`, so
