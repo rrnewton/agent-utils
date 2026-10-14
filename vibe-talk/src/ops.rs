@@ -2462,7 +2462,7 @@ pub async fn inbox(state: &AppState) -> Result<Vec<InboxEntry>, OpError> {
 ///
 /// **Write scope, and the reason is not that it touches Discord** — it does not, and cannot. It
 /// mutates durable server state that another device will read back, which is a strictly larger
-/// capability than any of the reads on this server, and the `/voice` page already holds the write
+/// capability than any of the reads on this server, and the app already holds the write
 /// token.
 ///
 /// Goes through [`allowed`] like every other channel operation, so a snowflake outside the

@@ -6,7 +6,7 @@ compatible HTTP bridge. Messages can be read with the phone's speech engine or E
 voice conversations use ElevenLabs by default or a deployment-managed WebSocket provider.
 
 It is a **bridge, not an agent host**. It holds the chat backend's credential, answers questions about
-channels over an authenticated HTTP API, and serves a phone web app. It is deliberately **not**
+channels over an authenticated HTTP API, and serves a phone web app at `/`. It is deliberately **not**
 co-located with the coding agents: it needs no access to any development workspace, and nothing in
 it is tied to the machine it currently runs on. It starts in Podman on a laptop and is expected to
 move to a small cloud host unchanged.
@@ -361,9 +361,21 @@ unsent rest is retried into the same thread (`#263 post-split-per-provider`).
 
 ## Installing the reader
 
-Serve vibe-talk over HTTPS, open `/voice` in Chrome on Android, and choose **Install app** from the
-browser menu. The installed app uses vibe-talk's speech-bubble icon and opens in a standalone
-window. If an older shortcut still has a blank or generic icon, remove it and install again.
+Serve vibe-talk over HTTPS, open it (the app is the page at `/`) in Chrome on Android, and choose
+**Install app** from the browser menu. The installed app uses vibe-talk's speech-bubble icon and
+opens in a standalone window. If an older shortcut still has a blank or generic icon, remove it and
+install again.
+
+**`/voice` forwards to `/`.** The app lived at `/voice` until `#302 root-is-the-app`, while `/`
+served an older, smaller page that is now gone. `/voice` and `/voice/` answer `302 Found` to `/`
+with the query string kept, and the browser carries the fragment over, so a bookmark such as
+`/voice?x=1#y` lands on `/?x=1#y`. It is a 302 rather than a 301 because a browser keeps a 301
+indefinitely: it would outlive a rollback and the day the pointer is removed, where a 302 sent
+`no-cache` is asked for again each time. An app installed from `/voice` keeps working and keeps its
+identity: the manifest's `id` is still `/voice` while its `start_url` is now `/`, and Chromium
+matches an installed app to its manifest by `id`, so the next manifest update moves that app's
+`start_url` to `/`. Until then it launches `/voice`, is forwarded, and stays in its window, because
+both addresses are inside the manifest's `scope`, `/`.
 
 The manifest asks browsers that support `display_override` (including Chrome Android) for
 `standalone`, while retaining `display: browser` as the standards-defined fallback. Safari on iOS
@@ -374,7 +386,7 @@ permission fallback instead of risking repeated prompts after app switches.
 Installation does not add offline access, and there is no service worker. What makes a launch
 fast is the browser's ordinary HTTP cache, holding only the page's public files. Every script,
 stylesheet and icon the page names carries the hash of its own bytes (`/voice.js?v=<hash>`) and is
-`immutable` under that URL, so the browser never asks for it again. The two pages and the manifest
+`immutable` under that URL, so the browser never asks for it again. The page and the manifest
 are revalidated on every load (`no-cache` with an ETag, answered `304` when unchanged). Launching
 the installed app therefore costs one small request for the page when nothing was deployed, and
 after a deploy only the files that changed. The plain URLs (`/voice.js`) still work, revalidated,
@@ -383,21 +395,25 @@ for an app installed before this. The server applies `Cache-Control: no-store` c
 are never placed in Cache Storage or any other browser-managed HTTP cache. The installed app still
 requires the server to be reachable to load at all.
 
-To ask Chrome's own installability engine about the checked-out page, run:
+To ask Chrome's own installability engine about the checked-out server, run:
 
 ```sh
 make -C vibe-talk pwa-installability
 ```
 
-The check uses Playwright's Chromium by default and prints its version. Set
-`VIBE_TALK_CHROMIUM=/path/to/chrome` to use a particular Chrome build, or run
-`python3 vibe-talk/tests/pwa_installability.py --url https://your-host/voice` to inspect a deployed
-origin. A green result means CDP reports no manifest or installability errors under an Android
-viewport; it is not proof that a physical phone displayed the menu item or launched the app.
+It builds the release binary, starts it on a loopback port and asks Chromium, at an Android
+viewport, about the app at `/` and about `/voice`: no manifest or installability errors at either,
+Chromium's own resolved manifest saying `start_url` `/`, `scope` `/` and `id` `/voice`, the 302 from
+`/voice?x=1#y` landing on `/?x=1#y`, and every one of those addresses inside the scope. It uses
+Playwright's Chromium by default and prints its version. Set `VIBE_TALK_CHROMIUM=/path/to/chrome`
+to use a particular Chrome build, or run
+`python3 vibe-talk/tests/pwa_installability.py --url https://your-host/` to inspect a deployed
+origin. A green result is Chromium's verdict; it is not proof that a physical phone displayed the
+menu item or launched the app.
 
 ### Saved messages on this device
 
-Opening the channel view used to mean a blank list until the server answered. `/voice` now keeps a
+Opening the channel view used to mean a blank list until the server answered. The app now keeps a
 bounded snapshot of the channel rows it has already shown, in `localStorage` under
 `vibe-talk.voice.message-cache`, and draws it immediately on the next visit:
 
@@ -431,7 +447,7 @@ app-shell service worker the page itself cannot load with no network, only keep 
 ### Reopening where you left off
 
 A phone closes an installed app whenever it needs the memory, and reopening it used to land on the
-call view, in Main, at the newest message. `/voice` now keeps one small record in `localStorage`
+call view, in Main, at the newest message. The app now keeps one small record in `localStorage`
 under `vibe-talk.voice.ui-state` and reopens on it:
 
 - **The call or the channel**, whichever was up. Settings, Help and Reply are not reopened; a
@@ -509,7 +525,7 @@ the opt-in physical-device check below verifies the audible output itself.
 ### Checking the audio an Android device actually emits
 
 `scripts/android-device-speech.py` closes the gap between a JavaScript call to `speak()` and sound
-that can be understood. It drives the real served `/voice` page in Android Chrome over ADB, selects
+that can be understood. It drives the real served app in Android Chrome over ADB, selects
 device speech, records Android's rendered playback, converts it to mono PCM, rejects silence and
 clipping, and passes the recording to an STT adapter. The run fails if the detected language does
 not match Chrome's language or if the recognised words do not match the selected message.
@@ -621,7 +637,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, eight tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
-| **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
+| **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and the app at `/` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
 | TLS | **not here.** Terminate in front, with whatever you already use — Caddy, nginx, any tunnel, a cloud load balancer — or do not expose it at all. One worked example is below; it is an example, not a requirement. |
 | Agent smoke test (`scripts/smoke-agent.py`, `run.sh --smoke-agent`) | **works, and it goes red on the real failure.** Holds a real conversation and fails unless a tool invocation appears in this server's own access log. Manual and opt-in: it costs vendor minutes, so it is in no suite and no CI. |
@@ -840,7 +856,7 @@ cargo run -- --config vibe-talk.toml
 Then open `http://<host>:8080/`, go to **Settings**, paste one of **this deployment's own** two
 tokens into **vibe-talk API token**, and press Save. Not the bot token and not the ElevenLabs key:
 neither is ever entered into the page. `VIBE_TALK_READ_TOKEN` is enough to read, search and
-listen; `VIBE_TALK_WRITE_TOKEN` is what replying from the page needs, and what `/voice` needs to
+listen; `VIBE_TALK_WRITE_TOKEN` is what replying from the page needs, and what the app needs to
 start a conversation at all. `/api/v1/client-config` accepts both, so a read token loads the whole
 interface and then fails at the first write, which is why both refusals now name the scope. Its
 `token_scope` field (`read` or `write`) names the scope of the token that asked — nothing the caller
@@ -2016,7 +2032,7 @@ next catch-up reads every channel afresh. These two are not the only channel tex
 and the purge does not clear the others; "How an operator purges it" lists them. There is exactly
 one store, `src/store/`, and it holds these:
 
-* the `/voice` **conversation transcript** — what you said and what the agent said back;
+* the app's **conversation transcript** — what you said and what the agent said back;
 * **read marks** — how far you have been shown each channel;
 * **"dealt with" marks** — which individual messages you have finished with, which is the
   overlay `#50 todo-view` is built on. Two snowflakes and an instant per row, and **no message
@@ -3049,7 +3065,7 @@ The consequence is worth stating plainly rather than leaving to be found: **with
 `[summaries.llm]`, the ElevenLabs credentials are load-bearing for summaries.** Without either there
 is no summariser at all. The
 server still starts and says so; `/summary` then answers `503 summarizer_not_configured`, and
-`/voice` states the reason once above the list and turns the rows it asked about red. It does not
+the app states the reason once above the list and turns the rows it asked about red. It does not
 fall back to truncation, because a silent fallback is indistinguishable from the agent answering
 badly. Regeneration also now costs vendor calls where it previously cost nothing.
 
@@ -3251,7 +3267,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once; posted whole, its `reply_to` is then marked Done, and read at the provider where it can be (`#300 reply-marks-read`) |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
-| GET | `/api/v1/conversations` | **write** | stored `/voice` transcripts, most recent first |
+| GET | `/api/v1/conversations` | **write** | stored conversation transcripts, most recent first |
 | DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
 | GET | `/api/v1/conversations/{id}` | **write** | one stored transcript, oldest turn first |
 | DELETE | `/api/v1/conversations/{id}` | **write** | erase one stored transcript |
@@ -3287,7 +3303,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 
 **The transcript routes require the write scope even to READ.** A stored transcript is your
 own speech plus whatever channel text the assistant read out to you, which is a different
-and more sensitive thing than a digest of a channel you already allowlisted — and `/voice`, the
+and more sensitive thing than a digest of a channel you already allowlisted — and the app, the
 only thing that uses them, already holds the write token. The read token gets `403`, and a test
 asserts it. **None of them is an MCP tool**, and a test holds that line too: text a tool can
 return is text that enters a model's context.
@@ -3407,7 +3423,7 @@ that guesses is worse than one that says it did not find anything.
 
 ### The wire contract
 
-The JSON the server and `/voice` exchange is defined once, as Rust types in `src/contract.rs`
+The JSON the server and the app exchange is defined once, as Rust types in `src/contract.rs`
 (plus the model types they carry). Everything else is generated from them and checked in:
 
 | File | Generated by | Used for |
@@ -3518,7 +3534,7 @@ scripts/run.sh --smoke-agent --replay-check
 ```
 
 Three conversations, so three times the cost. A states a nonce and its turns are recorded through
-this server's own transcript API, exactly as `/voice` records them; B opens WITH that record and
+this server's own transcript API, exactly as the app records them; B opens WITH that record and
 must return the nonce; **C is the control** — same question, no record — and must NOT be able to
 answer, or the run proved the agent is fluent rather than that it remembers. All three outcomes
 are reported separately, and "the vendor did not honour it" has an exit code of its own (21)
@@ -3538,7 +3554,7 @@ keeps the variable on the initiation so nothing configured at the vendor goes mi
 ## Live push
 
 Everything else here is pulled: a question arrives, a channel is read, an answer goes back. This
-is the exception, and it exists for two things — the channel view on `/voice` should update as
+is the exception, and it exists for two things — the app's channel view should update as
 messages arrive rather than when something happens to poll, and a reply that lands mid-conversation
 should be able to reach the voice agent on its own instead of waiting to be asked about.
 
@@ -3735,7 +3751,7 @@ is in the car, and would put third-party channel text on a vendor socket no huma
 
 **The cost of that decision, stated plainly: contextual updates reach the agent only while the
 page is open.** Close the tab and the channel keeps moving, this server keeps ingesting, and the
-agent hears nothing until somebody opens `/voice` again and asks.
+agent hears nothing until somebody opens the app again and asks.
 
 ### The stream
 
@@ -3771,7 +3787,7 @@ are indistinguishable forever.
 
 ### What the page does with it
 
-`/voice` reads the stream with `fetch` and a reader over the response body, **not** `EventSource`:
+The app reads the stream with `fetch` and a reader over the response body, **not** `EventSource`:
 `EventSource` cannot carry an `Authorization` header, and the usual workaround puts a bearer
 credential in a query string — in every proxy log and in the browser's own history, which is the
 exact thing `/api/v1/signed-url`'s `no-store` and the page's `redact()` exist to prevent.
@@ -4192,13 +4208,13 @@ completing — a trickle of hypotheses of background speech, a bridge that never
 Turning on **Enable Authentication** on an ElevenLabs agent closes the public `talk-to` link. From
 then on a conversation can only be started from a **signed URL**, minted from ElevenLabs' API with
 an account key and good for about fifteen minutes. `GET /api/v1/signed-url` does that minting, and
-`/voice` is a plain page — no build step, no CDN, no vendor bundle — that fetches one and opens the
+the app is a plain page — no build step, no CDN, no vendor bundle — that fetches one and opens the
 conversation over a WebSocket.
 
 **Failures are shown in the page, not in the console.** This route answers with a real taxonomy —
 `503 elevenlabs_not_configured` names the exact setting that is unset, `502 elevenlabs_error`
 carries the vendor's status and message, including things only the vendor knows, such as an API
-key that lacks the `convai_write` permission — and `/voice` renders that sentence verbatim in an
+key that lacks the `convai_write` permission — and the app renders that sentence verbatim in an
 alert panel. Nobody should have to open dev tools to learn a key is missing a scope. The page
 redacts its own stored token before displaying anything, so an error body that echoes the request
 back cannot put a credential on screen; `tests/js/voice_page.test.mjs` asserts both. Saving the
@@ -4244,7 +4260,7 @@ different fixes:
 **The answer is `no-store`.** The minted URL is itself a bearer credential for the next fifteen
 minutes.
 
-The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16000` is the
+The app expects the agent's output audio format to be **PCM** (`pcm_16000` is the
 default). It reads the format out of the conversation's initiation metadata and says so plainly if
 it is something it cannot decode, rather than playing noise.
 
@@ -5087,22 +5103,20 @@ wherever the configured label showed; the label is the fallback, and clearing th
 it. `ChannelInfo::display_name` is the one place that rule lives, so the picker, the head of the
 channel and the digest header cannot come to disagree.
 
-**Both served pages, not just the one with the editor.** The alias is set from `/voice` Settings,
-but it is shown at `/` too — both channel pickers there and the channel-name header — because two
-pages of one deployment showing two names for one channel is precisely the disagreement
-`display_name` exists to prevent. In the browser the rule is a function called `channelName`, and
-it exists twice: `/` and `/voice` are separate assets with no build step between them, so they
-cannot share a module. What holds them together is a test in `src/http/api.rs` over the bytes of
-**both** files, asserting that each defines the rule and that every place either one names a
-channel goes through it. That guard is not new — it was widened after `#52 operator-timezone` and
-`#62 message-count-accuracy` were each fixed on one page and carried across afterwards — and
-`#39` is the third time the same trap was walked into. `tests/js/app_page.test.mjs` is the
-behavioural half for `/`, alongside the long-standing suite for `/voice`.
+**Everywhere the page names a channel, not just the editor.** In the browser the rule is a function
+called `channelName`, and a test in `src/http/api.rs` over the bytes of `web/voice.js` asserts that
+it consults the alias with the label as its fallback, and that every place the page names a
+channel goes through it rather than reading the label. When `#39` landed, an older page at `/`
+still printed the configured label while the app and the voice agent used the alias — one
+deployment showing two names for one channel, the disagreement `display_name` exists to prevent,
+and the third time a fix had reached one page and not the other after `#52 operator-timezone` and
+`#62 message-count-accuracy`. That page is gone (`#302 root-is-the-app`); the guard keeps the one
+page there is from growing a second opinion.
 
 **It is ours, and it is local.** It lives in the `#64 storage-backend` store beside the read
 state, exactly as `#50 todo-view`'s "dealt with" marks do — the same posture, and for the same
 reason. It is never sent to Discord, renames nothing there, and nobody outside this deployment
-sees it. Every answer that sets or clears one carries a standing statement saying so, and `/voice`
+sees it. Every answer that sets or clears one carries a standing statement saying so, and the app
 shows *that* sentence rather than one of its own.
 
 **The voice agent hears it too.** `list_channels`, the digest header and the tool manifest all
@@ -6105,7 +6119,7 @@ says which:
 ### Typing is the other way to say something, on the same conversation
 
 Speaking is not always available — a quiet room, a commit hash the transcriber keeps mangling, a
-name it will never get right — so `/voice` has a text composer, and it is deliberately **not** a
+name it will never get right — so the app has a text composer, and it is deliberately **not** a
 second mode or a second connection. `{"type": "user_message", "text": "…"}` is a client event on
 the conversation socket that is already open, documented by the vendor as processed exactly like
 speech. A typed turn and a spoken turn are therefore the same thing to the conversation, they land
@@ -7162,7 +7176,7 @@ cargo run -- --config vibe-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-315 Rust tests plus a 159-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 159-test suite for the app's page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -7201,7 +7215,7 @@ write-scope fence in the MCP dispatcher (1). All four were reverted; the suite i
 ### Looking at the page
 
 Every test above drives behaviour. **Not one of them lays anything out**, so not one of them can
-tell you the page looks right — the `/voice` suite says so about itself. That gap is not
+tell you the page looks right — the page's own suite says so about itself. That gap is not
 theoretical: a single photograph of a real phone showed three defects the whole suite had
 passed over, because a clipped paragraph and a control that reads as active on a dead call are
 layout facts and a fixture with no layout engine has no opinion about them.
@@ -7210,7 +7224,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirty-six states that look different — signed out, idle, live
+Photographs the app in the thirty-six states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -7347,11 +7361,11 @@ src/summarize/        the Summarizer trait, the ElevenLabs agent summariser, the
                       the cache key
 src/agent_backend.rs  the slow-path seam
 src/http/             router, handlers, and the access-log middleware
-web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
-tests/js/             the /voice page's own suite, run from cargo test via tests/voice_page.rs
+web/                  the app, served at / (plain HTML/CSS/JS, no framework, no build step)
+tests/js/             the page's own suite, run from cargo test via tests/voice_page.rs
 scripts/verify-deployment.sh   the one-command deployment check, local or public
 scripts/smoke-agent.py         the manual, billed check that the AGENT really calls us
-scripts/screenshots.py         photographs /voice in every state, so an agent can SEE the page
+scripts/screenshots.py         photographs the app in every state, so an agent can SEE the page
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
 
@@ -7447,7 +7461,7 @@ Beyond the security list above:
   it has never been run against a live agent. That is why `replay.enabled` defaults to false.
 * **The replay budget is a guess.** 6000 characters and 40 turns were chosen, not measured. The
   payload is billed per call.
-* **A contextual update reaches the agent only while `/voice` is open.** The conversation socket
+* **A contextual update reaches the agent only while the app is open.** The conversation socket
   belongs to the browser, not to this server (see "Live push"), so closing the tab ends the relay
   even though the server keeps ingesting.
 * The web app has no service worker and no offline mode. It keeps a bounded snapshot of recent
@@ -7465,14 +7479,14 @@ Beyond the security list above:
   response shape come from the vendor's current documentation; everything below that is tested
   against an in-memory ElevenLabs that can refuse, and against a loopback HTTP server that proves
   the key is sent as a header. The first live call will still be the first live call.
-* The `/voice` page decodes PCM only. If an agent is configured to emit µ-law or MP3, the page says
+* The app decodes PCM only. If an agent is configured to emit µ-law or MP3, the page says
   so and stops rather than playing noise — it does not transcode.
 * **Press-and-hold on the talk control does not offer hang-up**, and `#43 typed-input` asks for it
   as a possibility rather than a requirement: it is worth doing only if a true *pause* exists, and
   whether one does is still open — see `#40`. Mute is what stands in for a pause today, and hang-up
   is its own control in the pane. Deferred deliberately, not dropped.
 * **Whether a typed `user_message` is echoed back as a `user_transcript` has never been observed.**
-  The `/voice` page assumes it may be and suppresses a matching transcript for ten seconds; one
+  The app assumes it may be and suppresses a matching transcript for ten seconds; one
   billed `--smoke-agent` run would settle it, and that run has not been made.
 * **Whether ElevenLabs implements `contextual_update` at all has never been observed**, and two
   features now depend on it: `#46 conversation-replay`'s default transport, and `#73
@@ -7481,7 +7495,7 @@ Beyond the security list above:
   about the contract, written where a test can state it, and not evidence of anything. Whether a
   real agent accepts the frame, and whether reading it actually stops it asking "are you there?",
   takes one billed `--smoke-agent` run that has not been made.
-* The `/voice` page captures the microphone through a `ScriptProcessorNode`, which is deprecated
+* The app captures the microphone through a `ScriptProcessorNode`, which is deprecated
   (though universally supported). Moving it to an `AudioWorklet` would mean a second asset for no
   behavioural gain today.
 * The legacy HTTP+SSE MCP transport is not implemented. A client that cannot do Streamable HTTP

@@ -23,7 +23,8 @@
 //   three words on a separator; the sentences live one tap inside it. The majority of the space
 //   belongs to the transcript and the controls.
 
-const TOKEN_KEY = "vibe-talk.token"; // shared with the main app on purpose.
+// The older page at / shared this key, so a browser signed in to either one holds its token here.
+const TOKEN_KEY = "vibe-talk.token";
 // The key this page used before the service was renamed. It is READ and never written: a browser
 // that signed in to the old name still holds the token under here, on the same origin, and the
 // rename is why the page is suddenly asking for it again. Without this the first load after a
@@ -25160,7 +25161,8 @@ function copyThroughTextarea(value) {
   return copied;
 }
 
-// `#62 message-count-accuracy`, carried across from web/app.js where it was fixed first.
+// `#62 message-count-accuracy`, carried across from the older page at `/` (gone since `#302
+// root-is-the-app`), where it was fixed first.
 //
 // The length of what the server returned is the FETCH WINDOW, not a channel total. Discord gives a
 // bot no message count for a guild text channel, so the number is the channel's own only when the

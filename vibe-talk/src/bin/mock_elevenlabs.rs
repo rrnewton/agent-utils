@@ -2,7 +2,7 @@
 //!
 //! The cargo suite spawns [`vibe_talk::elevenlabs::mock`] in-process; this binary is the same
 //! mock for everything that cannot do that — a browser under Playwright, the smoke script, or a
-//! person who wants to click through `/voice` without spending vendor minutes.
+//! person who wants to click through the app without spending vendor minutes.
 //!
 //! It refuses to bind anything but loopback. It hands out conversations for an agent nobody owns,
 //! on a key it invented, so being reachable off this machine is not a configuration choice.

@@ -783,7 +783,7 @@ async fn the_bridge_the_mock_was_pointed_at_is_the_one_it_calls() {
 
 // --- the mute announcement, offline ------------------------------------------------------------
 //
-// `#73 mute-is-invisible`. `/voice`'s mute withholds audio and nothing else, which is byte-identical
+// `#73 mute-is-invisible`. The app's mute withholds audio and nothing else, which is byte-identical
 // to the reader going quiet — and going quiet is what makes an agent start asking whether anyone is
 // there. So the page now says it, as a `contextual_update` client event on the conversation socket.
 //
@@ -810,7 +810,7 @@ const VOICE_JS: &str = include_str!("../web/voice.js");
 ///
 /// Reading the real sentence is the point. A test that invented its own wording would prove that
 /// the mock accepts *some* contextual update, which nobody was in doubt about; what is worth
-/// pinning is that the bytes `/voice` actually puts on the socket are accepted. It is deliberately
+/// pinning is that the bytes the app actually puts on the socket are accepted. It is deliberately
 /// strict: a constant it cannot parse is a failure, never a quietly empty string.
 fn page_notice(name: &str) -> String {
     let anchor = format!("const {name} =");

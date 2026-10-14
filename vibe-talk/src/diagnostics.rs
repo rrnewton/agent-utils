@@ -589,7 +589,7 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Di
 /// time would spend a request to learn the same thing. What this row adds is the CONSEQUENCE,
 /// which neither of those rows states: there is exactly one summariser and it is the ElevenLabs
 /// agent, so a deployment without credentials does not get shorter summaries, it gets none, and
-/// every long row on `/voice` shows as failed. Before the extractive backend was removed the
+/// every long row in the app shows as failed. Before the extractive backend was removed the
 /// honest answer here was "summaries still work, without a model", and a reader who remembers
 /// that needs to be told it changed.
 ///

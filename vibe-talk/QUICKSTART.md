@@ -21,10 +21,10 @@ See [device speech](README.md#reading-messages-with-a-device-voice) for setup,
 offline-voice considerations, browser limitations, and the opt-in rendered-audio regression check.
 Existing deployments keep ElevenLabs read-aloud unless they select this backend.
 
-To install the reader on Android, serve it over HTTPS, open `/voice` in Chrome, then choose
-**Install app** from the browser menu. Chrome opens the installed app in its own window. On iOS,
-Safari's **Add to Home Screen** remains a browser-mode shortcut so microphone handling retains the
-safer browser fallback. The app has no service worker or offline cache; private API responses are
+To install the reader on Android, serve it over HTTPS, open the server's root URL (the app is the
+page at `/`; an old `/voice` link forwards there) in Chrome, then choose **Install app** from the
+browser menu. Chrome opens the installed app in its own window. On iOS, Safari's **Add to Home
+Screen** remains a browser-mode shortcut so microphone handling retains the safer browser fallback. The app has no service worker or offline cache; private API responses are
 `Cache-Control: no-store`. Only the page's own public files are cached, its scripts, styles and
 icons by content hash, so a relaunch downloads only what a deploy changed. The channel view keeps a
 bounded snapshot of recent rows in `localStorage`, cleared on sign-out or a token change, so a

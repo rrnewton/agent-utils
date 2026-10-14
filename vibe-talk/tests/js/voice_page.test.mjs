@@ -1,4 +1,4 @@
-// Tests for the /voice page, run against the REAL web/voice.js, web/voice.html and web/voice.css.
+// Tests for the app (the page at /), run against the REAL web/voice.js, web/voice.html and web/voice.css.
 //
 // Why this exists at all: the page's job in a failure is to SAY what went wrong, and the bug it
 // was written for was that it said nothing visible — a 502 naming a missing ElevenLabs permission

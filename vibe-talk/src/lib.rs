@@ -27,7 +27,7 @@
 //! the purge came. They are not the only channel text in memory, though, and the purge does not
 //! empty the rest: the live stream's replay tail, read-aloud tickets and the thread names already
 //! read among them, as `http::api::purge_storage` lists. [`store`] is the single thing kept
-//! at rest, and it holds three things — the `/voice` transcript,
+//! at rest, and it holds three things — the app's conversation transcript,
 //! how far the owner has read, and one short cached SUMMARY per long message. The first two are
 //! what this server itself authored; the third is derived from somebody else's message — a
 //! model's paraphrase of one, which carries its content as surely as a quotation would — so it is

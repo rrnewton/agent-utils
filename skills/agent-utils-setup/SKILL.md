@@ -452,8 +452,8 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
     microphone and the installable app), listening on the address family the host is reachable
     on (some hosts are IPv6-only, where `0.0.0.0` is unreachable);
   - user services for the app and the TLS front end, enabled by the owner.
-  Hand the owner `<URL>/voice` and the path of the token file, never the token itself; they paste
-  the write token into the page once per browser. A host-specific guide, if the owner's
+  Hand the owner `<URL>/` (the app; an old `/voice` link forwards there) and the path of the token
+  file, never the token itself; they paste the write token into the page once per browser. A host-specific guide, if the owner's
   environment has one, takes precedence over these generic steps.
 - **pr-landing-planner**: advisory only; `pr-landing-planner quickstart`. Pair it with the
   `pr-landing-operations` skill only where the primary repository's rules authorize landings.

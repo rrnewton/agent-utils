@@ -96,7 +96,7 @@
 //!
 //! **The cost of that decision, said out loud: an arriving message reaches the agent only while
 //! the page is open.** Close the tab and the channel keeps moving, this server keeps ingesting,
-//! and the agent hears nothing until somebody opens `/voice` again and asks. That is a real
+//! and the agent hears nothing until somebody opens the app again and asks. That is a real
 //! limitation, and the page says so rather than implying a relay that is not running.
 //!
 //! # Self-posted messages

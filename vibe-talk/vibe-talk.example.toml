@@ -104,7 +104,7 @@ max_fetch_limit = 100
 max_count_scan = 500
 
 # LIVE INGESTION: how often, in seconds, each allowlisted channel is read for messages nobody
-# asked for. `0` — the default — turns it OFF, and off means the /voice page's live stream
+# asked for. `0` — the default — turns it OFF, and off means the app's live stream
 # attaches and receives nothing until you set this.
 #
 # Off by default on purpose. Every tick is ONE Discord request PER CHANNEL, forever, whether or
@@ -216,7 +216,7 @@ backend = "elevenlabs"
 enabled = true
 
 [elevenlabs]
-# Optional: the Discord half of this server works without them. Set BOTH to use /voice and
+# Optional: the Discord half of this server works without them. Set BOTH to use the app's calls and
 # GET /api/v1/signed-url, which is how you talk to an agent that has "Enable Authentication"
 # turned on: that setting closes the public talk-to link, and a conversation can then only be
 # started from a short-lived signed URL minted with the account API key.
@@ -260,7 +260,7 @@ enabled = true
 # api_base = "https://api.elevenlabs.io/v1"
 
 [conversation]
-# The live voice provider used by /voice. `elevenlabs` is the default and keeps the existing
+# The live voice provider the app's calls use. `elevenlabs` is the default and keeps the existing
 # signed-URL flow. `websocket` selects a deployment-managed endpoint that speaks the public
 # vibe-talk-v1 protocol: JSON prompt/transcript control frames and 16-bit little-endian mono PCM
 # binary frames. Provider endpoints belong in deployment configuration, never in source.
@@ -280,7 +280,7 @@ enabled = true
 # ask_before_send = true
 
 [storage]
-# Durable state: the /voice conversation transcript, how far you have read in each channel,
+# Durable state: the app's conversation transcript, how far you have read in each channel,
 # and the cached summaries below. Everything else this server does is stateless — a channel is
 # never cached as a channel. A cached SUMMARY is: it is a model's paraphrase of somebody else's
 # message, written from that message, so it is a second at-rest copy of third-party text and is
@@ -356,7 +356,7 @@ enabled = true
 # asked in TEXT over its own WebSocket with audio generation suppressed. That makes
 # elevenlabs.agent_id and elevenlabs.api_key load-bearing for summaries: WITHOUT THEM AND WITHOUT
 # [summaries.llm] THERE IS NO SUMMARISER AT ALL. The
-# server still starts, and says so; every summary request then refuses by name, and the /voice page
+# server still starts, and says so; every summary request then refuses by name, and the app
 # draws those rows RED. It does not fall back to truncation, because a silent fallback is
 # indistinguishable from the agent working badly.
 #
@@ -443,7 +443,7 @@ enabled = true
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so
 # what this does instead is hand the NEW call a written record of the earlier one: a
-# reconstruction, not a continuation, and the /voice page says which of the two you got.
+# reconstruction, not a continuation, and the app says which of the two you got.
 #
 # Only the ElevenLabs backend can carry a replay. With conversation.backend = "websocket" there is
 # no frame for it, so the page is told replay is off and the server warns at startup.

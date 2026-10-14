@@ -557,14 +557,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(
                 %error,
                 "the [summaries.llm] summariser cannot work as configured, so EVERY summary will \
-                 fail and /voice will draw those rows as failed, and no thread will be named. Fix \
+                 fail and the app will draw those rows as failed, and no thread will be named. Fix \
                  the setting named here; nothing else needs to change."
             );
         } else {
             tracing::warn!(
                 %error,
                 "this deployment has NO summariser it can use: no [summaries.llm] section and no \
-                 ElevenLabs credentials. EVERY summary will fail and /voice will draw those rows \
+                 ElevenLabs credentials. EVERY summary will fail and the app will draw those rows \
                  as failed. Configure [summaries.llm] (see the README's Summaries section), or set \
                  elevenlabs.api_key and elevenlabs.agent_id."
             );

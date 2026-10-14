@@ -4,7 +4,7 @@
 //! computed, nothing is kept. This module is the exception, and it is deliberately the *only*
 //! exception. Two things need to outlive a process:
 //!
-//! * the **conversation transcript** the `/voice` page builds while the owner is talking, which
+//! * the **conversation transcript** the app builds while the owner is talking, which
 //!   today evaporates on a reload; and
 //! * the **inbox state** — how far the owner has read in each channel, and which individual
 //!   messages he has dealt with.
@@ -97,7 +97,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Identifier of one conversation held on the `/voice` page.
+/// Identifier of one conversation held on the app's page.
 ///
 /// It arrives from the vendor (ElevenLabs' `conversation_id`) or from the browser, so it is
 /// caller-controlled text that is about to become part of a lookup key. It is validated on the
