@@ -1,10 +1,11 @@
 ---
 title: 'approval-card-inline: the send card sits at the foot of the voice transcript as a tentative next message, and a spoken yes leaves no turn'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-13T11:49:51.279818948+00:00
-updated_at: 2026-10-13T11:49:51.279818948+00:00
+updated_at: 2026-10-14T03:37:04.118184191+00:00
+closed_at: 2026-10-14T03:37:04.118184071+00:00
 ---
 
 # Description
