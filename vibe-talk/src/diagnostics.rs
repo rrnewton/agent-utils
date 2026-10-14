@@ -154,7 +154,9 @@ pub struct DiagnosticsReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_view_shadow: Vec<crate::recent_view::ChannelTally>,
     /// How long each provider's operations and Web API calls have taken since the process
-    /// started, and how big the messages read were. Numbers only: no channel, message or text.
+    /// started, how many upstream requests each operation sent, how big the messages read were,
+    /// and which bulk reads each provider answers itself. Numbers and names only: no channel,
+    /// message or text.
     /// Not a check, and never a failure. `#208 persistent-cache`; see [`crate::upstream_profile`].
     pub upstream: crate::upstream_profile::UpstreamReport,
 }
@@ -353,8 +355,26 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         summaries: state.summary_counters.snapshot(),
         recent_view_shadow: crate::recent_view::report(state),
         // Read after the checks, so the calls this report just made are counted too.
-        upstream: state.providers.profile().report(),
+        upstream: upstream(state),
     }
+}
+
+/// The `upstream` section: each provider's timings, with which bulk reads it answers itself, as
+/// its client says for its first channel (the clients answer the same for every channel). From
+/// memory: no provider is asked anything. remote-ops-audit §4.1 `#287 bulk-reads`.
+fn upstream(state: &AppState) -> crate::upstream_profile::UpstreamReport {
+    let mut report = state.providers.profile().report();
+    let channels = state.all_channels();
+    for provider in &mut report.providers {
+        let Some(entry) = state.providers.entry(&provider.provider) else {
+            continue;
+        };
+        provider.reads = channels
+            .iter()
+            .find(|channel| state.providers.key_for(&channel.id).as_deref() == Some(&entry.key))
+            .map(|channel| entry.client.read_caps(&channel.id).into());
+    }
+    report
 }
 
 /// Identify the selected playback path without claiming that audio played on the device.

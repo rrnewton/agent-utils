@@ -549,6 +549,7 @@ impl ProviderProfile {
                 .collect(),
             reasons: ReasonCount::rows(&tallies.reasons, 0),
             content_bytes: SizeReport::of(&tallies.content_total),
+            reads: None,
         }
     }
 
@@ -769,6 +770,55 @@ pub struct ProviderReport {
     pub reasons: Vec<ReasonCount>,
     /// Bytes of `content` per message read.
     pub content_bytes: SizeReport,
+    /// Which bulk reads this provider answers itself, filled in by `GET /api/v1/diagnostics` from
+    /// the provider's capabilities for its first channel. Absent from a profile's own report, and
+    /// for a provider with no channel. remote-ops-audit §4.1 `#287 bulk-reads`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reads: Option<ReadsReport>,
+}
+
+/// Which bulk reads a provider answers itself (`native`) and which the trait's default answers
+/// with the single reads it is made of (`emulated`), keyed by the operation each is timed as, so
+/// a reader can tell which operation rows are native answers. remote-ops-audit §4.1
+/// `#287 bulk-reads`.
+///
+/// An emulated read never shows under its own name: `fetch_range` is timed as the `fetch_page` it
+/// is made of, `fetch_messages` as its `fetch_thread_message` reads or its `fetch_recent_dated`
+/// window, `channel_heads` as one `fetch_recent` per channel, `fetch_recent_many` as one
+/// `fetch_recent_dated` per channel, and `fetch_threads` as one thread view `fetch_timeline` per
+/// thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ReadsReport {
+    /// A read of a channel by time ([`crate::chat::ReadCaps::range`]).
+    pub fetch_range: crate::chat::Support,
+    /// A lookup of several messages by id ([`crate::chat::ReadCaps::by_ids`]).
+    pub fetch_messages: crate::chat::Support,
+    /// The newest message of several channels ([`crate::chat::ReadCaps::heads`]).
+    pub channel_heads: crate::chat::Support,
+    /// Whether those heads vouch for edits and deletes as well as additions
+    /// ([`crate::chat::ReadCaps::heads_cover_edits`]).
+    pub heads_cover_edits: bool,
+    /// The newest messages of several channels ([`crate::chat::ReadCaps::many_channels`]).
+    pub fetch_recent_many: crate::chat::Support,
+    /// The newest messages of several threads of a channel
+    /// ([`crate::chat::ReadCaps::many_threads`]).
+    pub fetch_threads: crate::chat::Support,
+    /// The most rows one upstream call returns ([`crate::chat::ReadCaps::page_rows`]).
+    pub page_rows: u16,
+}
+
+impl From<crate::chat::ReadCaps> for ReadsReport {
+    fn from(caps: crate::chat::ReadCaps) -> Self {
+        Self {
+            fetch_range: caps.range,
+            fetch_messages: caps.by_ids,
+            channel_heads: caps.heads,
+            heads_cover_edits: caps.heads_cover_edits,
+            fetch_recent_many: caps.many_channels,
+            fetch_threads: caps.many_threads,
+            page_rows: caps.page_rows,
+        }
+    }
 }
 
 /// How many read operations were asked for one reason. `remote-ops-audit`.

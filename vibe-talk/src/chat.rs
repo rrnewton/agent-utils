@@ -451,7 +451,11 @@ pub struct RangeRead {
 
 /// Whether a provider answers a bulk read itself, or the trait's default answers it with
 /// single-channel reads that cost what they always did. remote-ops-audit W10 `#287 bulk-reads`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Diagnostics write it as `"emulated"` or `"native"`
+/// ([`crate::upstream_profile::ReadsReport`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Support {
     /// The trait's default body: correct, and no cheaper than the reads it is made of. A caller
     /// that would use the read only because it is cheap must not use it.

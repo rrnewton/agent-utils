@@ -1411,7 +1411,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
         { "name": "fetch_timeline", "reason": "naming", "count": 12 }
       ],
       "content_bytes": { "messages": 2050, "total": 553500, "mean": 270, "p50": 140,
-                         "p90": 610, "p99": 2900, "max": 11800, "octaves": [[0, 12], [1, 3]] }
+                         "p90": 610, "p99": 2900, "max": 11800, "octaves": [[0, 12], [1, 3]] },
+      "reads": { "fetch_range": "native", "fetch_messages": "native",   // which bulk reads it
+                 "channel_heads": "emulated", "heads_cover_edits": false, // answers itself
+                 "fetch_recent_many": "emulated", "fetch_threads": "native", "page_rows": 20 }
     }
   ]
 }
@@ -1448,6 +1451,14 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   operations of a call or more each (ten `fetch_recent`, `count: 10, calls: 10`). An operation the
   caller abandoned keeps the calls it had already sent. A request a provider's client sends
   outside every operation is on no row (Slack's shim calls still list it).
+* **`reads`** says which of the bulk reads above the provider answers itself, `native`, and which the trait's default answers with the reads it
+  is made of, `emulated`, keyed by the operation a native one is timed as; `heads_cover_edits`
+  says whether its heads vouch for edits and deletes as well as additions, and `page_rows` how many
+  rows one of its upstream calls returns. An emulated read never shows under its own name: its
+  reads are timed as themselves (an emulated `fetch_range` is a `fetch_page`, an emulated
+  `channel_heads` a `fetch_recent` per channel, and so on, as above). It is the provider's answer
+  for its first channel, from memory, so working it out asks nothing upstream; it is absent for a
+  provider with no channel.
 * **Shim calls** are the HTTP requests the Slack client sends, by Web API method. One operation can
   be several: a flat read is about eleven, and each author lookup is one more. A request answered
   with a 429 and then sent again counts twice, as the far end's own log counts it (a compatible

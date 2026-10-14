@@ -1544,3 +1544,89 @@ async fn each_slack_request_is_counted_against_the_operation_that_sent_it() {
         slack.operations
     );
 }
+
+/// remote-ops-audit §4.1 `#287 bulk-reads`: diagnostics say, per provider, which bulk reads it
+/// answers itself, under the names their operations are timed as, so a reader can tell which rows
+/// are native answers. A provider with no bulk read of its own says every one is emulated; one that
+/// reads heads natively says that one is native; the two are told apart in one deployment.
+#[tokio::test]
+async fn diagnostics_say_which_bulk_reads_each_provider_answers_itself() {
+    const OTHER: &str = "C0OTHER001";
+    let toml = format!(
+        "[[providers]]\nkey = \"headed\"\nkind = \"slack\"\ntoken = \"xoxb-test\"\n\n\
+         [[channels]]\nid = \"{OTHER}\"\nlabel = \"other\"\nwritable = false\n\
+         provider = \"headed\"\n\n{}",
+        vibe_talk::testing::config_toml()
+    );
+    let (mut state, discord, _elevenlabs) = vibe_talk::testing::state_from_toml(&toml);
+    let headed = Arc::new(FakeDiscord::new());
+    headed.seed(&ChannelId(OTHER.to_owned()), "ada", "words");
+    let entries = vec![
+        vibe_talk::providers::ProviderEntry {
+            key: "discord".to_owned(),
+            namespace: state.config.providers[0].namespace(),
+            client: Arc::clone(&discord) as Arc<dyn ChatClient>,
+            live_poll_seconds: 0,
+        },
+        vibe_talk::providers::ProviderEntry {
+            key: "headed".to_owned(),
+            namespace: state.config.providers[1].namespace(),
+            client: Arc::new(Billed {
+                fake: headed,
+                native_heads: true,
+            }),
+            live_poll_seconds: 0,
+        },
+    ];
+    let router = ChatRouter::new(entries, state.config.default_provider_key());
+    state.replace_providers(Arc::new(router));
+    let (status, report) = get(&vibe_talk::http::router(state), "/api/v1/diagnostics").await;
+    assert_eq!(status, StatusCode::OK);
+    let reads = |key: &str| -> Value {
+        report["upstream"]["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["provider"] == key)
+            .map(|provider| provider["reads"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(
+        reads("discord"),
+        serde_json::json!({
+            "fetch_range": "emulated", "fetch_messages": "emulated",
+            "channel_heads": "emulated", "heads_cover_edits": false,
+            "fetch_recent_many": "emulated", "fetch_threads": "emulated", "page_rows": 100
+        }),
+        "{report:#}"
+    );
+    assert_eq!(
+        reads("headed"),
+        serde_json::json!({
+            "fetch_range": "emulated", "fetch_messages": "emulated",
+            "channel_heads": "native", "heads_cover_edits": false,
+            "fetch_recent_many": "emulated", "fetch_threads": "emulated", "page_rows": 100
+        }),
+        "{report:#}"
+    );
+}
+
+/// The Slack client, built from configuration as `main` builds it, says in diagnostics what it
+/// reads itself: a channel by time, messages by id and several threads, twenty rows a call; never
+/// heads or several channels.
+#[tokio::test]
+async fn diagnostics_say_what_the_slack_client_reads_itself() {
+    let fake = Fake::start(FakeState::default(), 20).await;
+    let state = slack_deployment(&fake).await;
+    let (status, report) = get(&vibe_talk::http::router(state), "/api/v1/diagnostics").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        report["upstream"]["providers"][0]["reads"],
+        serde_json::json!({
+            "fetch_range": "native", "fetch_messages": "native",
+            "channel_heads": "emulated", "heads_cover_edits": false,
+            "fetch_recent_many": "emulated", "fetch_threads": "native", "page_rows": 20
+        }),
+        "{report:#}"
+    );
+}
