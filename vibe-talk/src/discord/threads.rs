@@ -1265,6 +1265,136 @@ impl HttpDiscordClient {
             .collect())
     }
 
+    /// [`crate::chat::ChatClient::fetch_threads`] against Discord itself (`thread_api = "native"`).
+    /// remote-ops-audit W14 `#287 bulk-reads`.
+    ///
+    /// Discord has no read of several threads, so each thread is still read on its own,
+    /// [`crate::chat::THREADS_IN_FLIGHT`] at a time, and checked against the channel
+    /// (`GET /channels/{thread}`), as every thread read is. What a read of several saves is what
+    /// the thread view repeats per thread, and what a `newer_than` ask makes unnecessary:
+    ///
+    /// * The parent channel's kind, which says where a thread's root lives, is read once for all
+    ///   of them, and only when some root is to be read.
+    /// * An ask without `newer_than_ms` is answered exactly as the thread view's newest page is:
+    ///   the newest `limit` messages, the root among them where it falls, the summary with its
+    ///   root, and the forward cursor. Three requests a thread rather than the view's four.
+    /// * An ask with it reads nothing more when the thread's `last_message_id` is not newer than
+    ///   the instant (a message added since would have moved it), and otherwise the messages
+    ///   after the instant (`after=` its snowflake), at most `limit`, the oldest first, with
+    ///   `delta.more` when there were more. Its root is read only when the root itself is newer
+    ///   than the instant: an older root is not news, and the summary then leaves it out. So a
+    ///   quiet thread costs one request and a moved one two.
+    ///
+    /// A thread that cannot be read, or does not belong to the channel, is an error in its own
+    /// place.
+    pub(super) async fn native_threads(
+        &self,
+        channel: &ChannelId,
+        asks: &[crate::chat::ThreadAsk],
+    ) -> crate::chat::ThreadAnswers {
+        let parent_kind = tokio::sync::OnceCell::new();
+        let reads: Vec<_> = asks
+            .iter()
+            .map(|ask| self.native_thread_answer(channel, ask, &parent_kind))
+            .collect();
+        let answers: Vec<_> = stream::iter(reads)
+            .buffered(crate::chat::THREADS_IN_FLIGHT)
+            .collect()
+            .await;
+        asks.iter()
+            .zip(answers)
+            .map(|(ask, answer)| {
+                (
+                    ask.id.clone(),
+                    answer.map_err(|error| error.with_provider(&self.provider_name)),
+                )
+            })
+            .collect()
+    }
+
+    /// One thread of [`Self::native_threads`]; `parent_kind` is the parent channel's kind, read at
+    /// most once for every thread of the call.
+    async fn native_thread_answer(
+        &self,
+        channel: &ChannelId,
+        ask: &crate::chat::ThreadAsk,
+        parent_kind: &tokio::sync::OnceCell<u64>,
+    ) -> Result<TimelinePage, ChatError> {
+        let request = ask.request();
+        validate_request(&request)?;
+        let limit = usize::from(request.limit.clamp(1, 99));
+        let thread = self.verified_thread(channel, &ask.id).await?;
+        let kind = || async {
+            parent_kind
+                .get_or_try_init(|| async {
+                    let parent = self
+                        .read_thread_json(&["channels", channel.as_str()], &[])
+                        .await?;
+                    parent
+                        .get("type")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| shape("channel response has no type"))
+                })
+                .await
+                .copied()
+        };
+        let mut summary = thread.summary()?;
+        let Some(newer_than_ms) = ask.newer_than_ms else {
+            // The thread view's newest page, as `native_backward` and `native_timeline` make it.
+            let mut messages = self
+                .native_messages(channel, Some(&thread), None, None, (limit + 1) as u16)
+                .await?;
+            summary.root = self.thread_root(channel, &thread, kind().await?).await?;
+            if let Some(root) = &summary.root {
+                messages.push(root.clone());
+            }
+            let mut page = message_page(messages, channel, &request, None, limit)?;
+            page.has_threads = true;
+            page.thread = Some(summary);
+            page.next_after = Some(forward_from(channel, &request, &page, &thread.id)?);
+            return Ok(page);
+        };
+        // The newest snowflake of `newer_than_ms`: everything after it was created later.
+        let last_at =
+            MessageId::at_time_ms(newer_than_ms).numeric().unwrap_or(0) | ((1_u64 << 22) - 1);
+        let mut messages = if thread.last_message > last_at {
+            let ask = u16::try_from(limit + 1).unwrap_or(super::DISCORD_MAX_LIMIT);
+            self.native_messages(
+                channel,
+                Some(&thread),
+                None,
+                Some(&last_at.to_string()),
+                ask,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        if native_id(&thread.id)? > last_at {
+            summary.root = self.thread_root(channel, &thread, kind().await?).await?;
+            if let Some(root) = &summary.root {
+                messages.push(root.clone());
+            }
+        }
+        messages.retain(|message| message.id.numeric().unwrap_or(0) > last_at);
+        messages.sort_by_key(|message| message.id.numeric().unwrap_or(0));
+        messages.dedup_by(|later, earlier| later.id == earlier.id);
+        let more = messages.len() > limit;
+        messages.truncate(limit);
+        Ok(TimelinePage {
+            messages,
+            thread: Some(summary),
+            has_threads: true,
+            delta: Some(TimelineDelta {
+                more,
+                complete: false,
+                deleted: Vec::new(),
+                removed_threads: Vec::new(),
+            }),
+            ..TimelinePage::default()
+        })
+    }
+
     /// [`crate::chat::ChatClient::fetch_messages`] against a bridge configured with `id_reads`.
     /// remote-ops-audit W11 `#287 bulk-reads`.
     ///
@@ -3443,5 +3573,209 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["unseen", "unseen"]
         );
+    }
+
+    fn taken(mock: &Mock) -> Vec<String> {
+        std::mem::take(&mut *mock.seen.lock().expect("seen"))
+    }
+
+    /// remote-ops-audit W14: several threads of a native channel are each read as the thread
+    /// view's newest page is, answer for answer, but the parent is read once for all of them, so
+    /// two threads cost seven requests where two thread view reads cost eight.
+    #[tokio::test]
+    async fn native_thread_reads_share_the_parent_and_answer_as_the_thread_view_does() {
+        let mut routes = inventory_routes();
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=3",
+            json!([
+                message("201", "901", "new reply"),
+                message("201", "701", "old reply"),
+            ]),
+        );
+        ok(
+            &mut routes,
+            "/channels/301/messages?limit=3",
+            json!([message("301", "801", "only reply")]),
+        );
+        ok(&mut routes, "/channels/999", thread("999", "9999", "9990"));
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        assert_eq!(
+            mock.client.read_caps(&channel).many_threads,
+            crate::chat::Support::Native
+        );
+        let asks = [
+            crate::chat::ThreadAsk::newest("201", 2),
+            crate::chat::ThreadAsk::newest("301", 2),
+            crate::chat::ThreadAsk::newest("999", 2),
+        ];
+        let answers = mock.client.fetch_threads(&channel, &asks).await;
+        let mut requests = taken(&mock);
+        requests.sort();
+        assert_eq!(
+            requests,
+            [
+                "GET /channels/100",
+                "GET /channels/100/messages/201",
+                "GET /channels/100/messages/301",
+                "GET /channels/201",
+                "GET /channels/201/messages?limit=3",
+                "GET /channels/301",
+                "GET /channels/301/messages?limit=3",
+                "GET /channels/999",
+            ],
+            "the parent once; each thread checked, its page and its root; nothing more of a \
+             thread that is not the channel's"
+        );
+        assert!(
+            matches!(answers[2].1, Err(ref error) if matches!(error.cause(), ChatError::Refused(_))),
+            "a thread of another channel is refused in its own place: {:?}",
+            answers[2].1
+        );
+        for (at, id) in [(0, "201"), (1, "301")] {
+            let request = TimelineRequest {
+                view: TimelineView::Thread,
+                thread_id: Some(id.into()),
+                limit: 2,
+                ..TimelineRequest::default()
+            };
+            let viewed = mock
+                .client
+                .fetch_timeline(&channel, &request)
+                .await
+                .expect("the thread view");
+            assert_eq!(
+                answers[at].1.as_ref().expect("a page"),
+                &viewed,
+                "{id}: exactly the thread view's newest page"
+            );
+            assert_eq!(answers[at].0, id);
+        }
+        assert_eq!(
+            taken(&mock).len(),
+            8,
+            "the two thread view reads it replaces cost four requests each"
+        );
+    }
+
+    /// remote-ops-audit W14: asked for what is newer than an instant, a thread whose
+    /// `last_message_id` has not moved past it costs its membership check alone; one that moved is
+    /// read `after=` the instant's snowflake; a root is read only when it is itself newer. Every
+    /// answer is a delta of additions, never a whole thread.
+    #[tokio::test]
+    async fn native_thread_reads_after_an_instant_read_only_the_threads_that_moved() {
+        const BASE_MS: i64 = 1_787_000_000_000;
+        let at = |ms: i64| MessageId::at_time_ms(ms).numeric().expect("a snowflake");
+        let id = |ms: i64| at(ms).to_string();
+        let newer_than_ms = BASE_MS + 10_000;
+        let last_at = at(newer_than_ms) | ((1 << 22) - 1);
+        let (quiet, moved, fresh) = (id(BASE_MS), id(BASE_MS + 1_000), id(BASE_MS + 12_000));
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            &format!("/channels/{quiet}"),
+            thread(&quiet, &id(BASE_MS + 5_000), "100"),
+        );
+        ok(
+            &mut routes,
+            &format!("/channels/{moved}"),
+            thread(&moved, &id(BASE_MS + 20_000), "100"),
+        );
+        ok(
+            &mut routes,
+            &format!("/channels/{fresh}"),
+            thread(&fresh, &id(BASE_MS + 13_000), "100"),
+        );
+        ok(
+            &mut routes,
+            &format!("/channels/{moved}/messages?limit=51&after={last_at}"),
+            json!([
+                message(&moved, &id(BASE_MS + 20_000), "newest"),
+                message(&moved, &id(BASE_MS + 15_000), "newer"),
+            ]),
+        );
+        let root = message("100", &fresh, "a root newer than the instant");
+        let mut starter = message(&fresh, &fresh, "");
+        starter["type"] = json!(21);
+        starter["referenced_message"] = root.clone();
+        ok(
+            &mut routes,
+            &format!("/channels/{fresh}/messages?limit=51&after={last_at}"),
+            json!([
+                message(&fresh, &id(BASE_MS + 13_000), "first reply"),
+                starter
+            ]),
+        );
+        ok(
+            &mut routes,
+            "/channels/100",
+            json!({"id":"100","type":0,"guild_id":"9"}),
+        );
+        ok(
+            &mut routes,
+            &format!("/channels/100/messages/{fresh}"),
+            root,
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        let ask = |thread: &str| crate::chat::ThreadAsk {
+            id: thread.to_owned(),
+            newer_than_ms: Some(newer_than_ms),
+            limit: 50,
+        };
+        let answers = mock
+            .client
+            .fetch_threads(&channel, &[ask(&quiet), ask(&moved), ask(&fresh)])
+            .await;
+        let mut requests = taken(&mock);
+        requests.sort();
+        let mut expected = vec![
+            format!("GET /channels/{quiet}"),
+            format!("GET /channels/{moved}"),
+            format!("GET /channels/{moved}/messages?limit=51&after={last_at}"),
+            format!("GET /channels/{fresh}"),
+            format!("GET /channels/{fresh}/messages?limit=51&after={last_at}"),
+            "GET /channels/100".to_owned(),
+            format!("GET /channels/100/messages/{fresh}"),
+        ];
+        expected.sort();
+        assert_eq!(requests, expected, "the quiet thread costs one request");
+        let contents = |at: usize| -> Vec<String> {
+            answers[at]
+                .1
+                .as_ref()
+                .expect("a page")
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect()
+        };
+        assert!(contents(0).is_empty());
+        assert_eq!(contents(1), ["newer", "newest"]);
+        assert_eq!(
+            contents(2),
+            ["a root newer than the instant", "first reply"]
+        );
+        for (at, root) in [(0, false), (1, false), (2, true)] {
+            let page = answers[at].1.as_ref().expect("a page");
+            assert_eq!(
+                page.delta,
+                Some(TimelineDelta {
+                    more: false,
+                    complete: false,
+                    deleted: Vec::new(),
+                    removed_threads: Vec::new(),
+                }),
+                "{at}: additions only"
+            );
+            assert!(!page.has_more && page.next_before.is_none() && page.next_after.is_none());
+            let summary = page.thread.as_ref().expect("a summary");
+            assert_eq!(
+                summary.root.is_some(),
+                root,
+                "{at}: a root only when it is news"
+            );
+        }
     }
 }

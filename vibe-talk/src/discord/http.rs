@@ -1378,7 +1378,9 @@ impl ChatClient for HttpDiscordClient {
     /// for all of them at once ([`recent_request`], W13). Discord itself has no such request.
     ///
     /// A read of several threads of a channel is native for a bridge with `thread_reads`, which
-    /// asks for all of them at once ([`threads_request`], W14).
+    /// asks for all of them at once ([`threads_request`], W14), and against Discord itself, which
+    /// checks the parent once for all of them and reads only the threads that moved after a
+    /// `newer_than` (see `native_threads`).
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
         let native_or = |on: bool| {
             if on {
@@ -1394,7 +1396,7 @@ impl ChatClient for HttpDiscordClient {
             // A bridge's head may say `unchanged_since`; Discord's `last_message_id` never can.
             heads_cover_edits: !discord_itself && self.head_reads,
             many_channels: native_or(self.recent_many_reads),
-            many_threads: native_or(self.thread_reads),
+            many_threads: native_or(discord_itself || self.thread_reads),
             ..crate::chat::ReadCaps::default()
         };
         if self.range_reads {
@@ -1472,14 +1474,17 @@ impl ChatClient for HttpDiscordClient {
         }
     }
 
-    /// A bridge with `thread_reads` reads several threads of a channel itself (remote-ops-audit
-    /// W14, see `thread_reads`); anything else is the trait's default, a thread view read of each.
+    /// Discord itself reads several threads its own way, and a bridge with `thread_reads` reads
+    /// them itself (remote-ops-audit W14, see `native_threads` and `thread_reads`); anything else
+    /// is the trait's default, a thread view read of each.
     async fn fetch_threads(
         &self,
         channel: &ChannelId,
         asks: &[crate::chat::ThreadAsk],
     ) -> crate::chat::ThreadAnswers {
-        if self.thread_reads {
+        if self.thread_api == crate::threads::ThreadApi::Native {
+            self.native_threads(channel, asks).await
+        } else if self.thread_reads {
             self.bridge_threads(channel, asks).await
         } else {
             crate::chat::emulated_threads(self, channel, asks).await

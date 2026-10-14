@@ -2468,12 +2468,18 @@ instant cannot be read is kept), and it is a delta of additions, never a whole t
 as it says, never deleted; an edit or a delete of an older message is not in it; and it carries no
 cursor and no `has_more`. Nothing may prune, stamp as complete or tombstone on such an answer.
 `delta.more` is true when more than `limit` messages may be newer than the instant and the answer
-does not hold them all. One answer per thread, in the order asked, a failure in its own place; the
+does not hold them all. Its thread summary may leave the root out when the root is not newer than
+the instant. One answer per thread, in the order asked, a failure in its own place; the
 router asks the channel's own provider.
 
 **Who answers it natively.** A bridge configured with `thread_reads`, one request for every thread
-(see [A bridge's reads of several threads](#a-bridges-reads-of-several-threads)). Every other
-provider answers with the trait's default, one thread view read per thread, at most two in flight,
+(see [A bridge's reads of several threads](#a-bridges-reads-of-several-threads)). Discord itself
+(`thread_api = "native"`), which has no read of several threads but reads each thread for less:
+every thread is still checked against the channel and read on its own, two at a time, but the
+parent channel is read once for all of them rather than once per thread (three requests a thread
+instead of the thread view's four), and after an instant a thread whose `last_message_id` has not
+moved costs that check alone, one that moved one `after=` read more, and a root is read only when
+it is itself newer than the instant. Every other provider answers with the trait's default, one thread view read per thread, at most two in flight,
 which costs exactly what reading each thread did, and says so (`ReadCaps::many_threads` is
 emulated). A caller that would gather its thread reads into one only to save calls gathers them
 only for a provider that reads them natively.

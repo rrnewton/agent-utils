@@ -1022,7 +1022,9 @@ pub trait ChatClient: Send + Sync {
     /// never deleted, and an edit or a delete of an older message is not in it. Such an answer is
     /// never exhaustive below `newer_than_ms`, so nothing may stamp, prune or tombstone on it; and
     /// `delta.more` says when it is not exhaustive above it either, because more than `limit`
-    /// messages were newer. It carries no cursors.
+    /// messages were newer. It carries no cursors. Its thread summary may leave the root out when
+    /// the root is not newer than the instant, since it is not news; a caller that needs the root
+    /// asks without `newer_than_ms`.
     ///
     /// A native read ([`ReadCaps::many_threads`]) costs fewer upstream calls than a thread view
     /// read of each (a bridge's is one request for all of them, and Slack does not read a thread
