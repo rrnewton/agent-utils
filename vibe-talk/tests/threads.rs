@@ -98,6 +98,7 @@ impl ChatClient for ThreadBackend {
         Ok(ChatIdentity {
             id: "7".to_owned(),
             username: "Reader".to_owned(),
+            workspace: None,
         })
     }
 
@@ -539,6 +540,7 @@ impl ChatClient for Journal {
         Ok(ChatIdentity {
             id: "7".to_owned(),
             username: "Reader".to_owned(),
+            workspace: None,
         })
     }
     async fn fetch_page(

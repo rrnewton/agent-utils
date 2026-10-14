@@ -142,6 +142,7 @@ impl ChatClient for SlowChat {
         Ok(ChatIdentity {
             id: "7".to_owned(),
             username: "Reader".to_owned(),
+            workspace: None,
         })
     }
 

@@ -8,7 +8,9 @@ mod slack_fake;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use slack_fake::{plain, profiled, system, thread, ts, Fake, FakeState, METHODS, SELF_USER, TOKEN};
+use slack_fake::{
+    plain, profiled, system, thread, ts, Fake, FakeState, METHODS, SELF_USER, TEAM, TOKEN,
+};
 use vibe_talk::chat::{ChatClient, ChatError};
 use vibe_talk::directory::DirectoryRequest;
 use vibe_talk::live::{poll_once, LiveHub};
@@ -1163,6 +1165,39 @@ async fn identity_comes_from_auth_test_and_is_remembered() {
     assert_eq!(client.self_author_id().as_deref(), Some(SELF_USER));
     assert_eq!(client.owner_author_id().as_deref(), Some("UOWNER001"));
     assert_eq!(client.provider_name(), "Slack");
+}
+
+/// `#208 persistent-cache`: the message cache takes an account to be the same one only when its
+/// workspace matches too, so the workspace is `auth.test`'s `team_id`, and a missing or blank one
+/// is no workspace rather than an empty name.
+#[tokio::test]
+async fn identity_carries_the_workspace_auth_test_names_and_no_blank_one() {
+    let (state, _) = linear(1);
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    assert_eq!(
+        client
+            .identity()
+            .await
+            .expect("identity")
+            .workspace
+            .as_deref(),
+        Some(TEAM)
+    );
+    fake.with(|state| state.team = Some("T0000OTHER".to_owned()));
+    assert_eq!(
+        client
+            .identity()
+            .await
+            .expect("identity")
+            .workspace
+            .as_deref(),
+        Some("T0000OTHER")
+    );
+    fake.with(|state| state.team = Some(String::new()));
+    assert_eq!(client.identity().await.expect("identity").workspace, None);
+    fake.with(|state| state.team = Some("   ".to_owned()));
+    assert_eq!(client.identity().await.expect("identity").workspace, None);
 }
 
 #[tokio::test]

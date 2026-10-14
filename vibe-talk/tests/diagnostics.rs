@@ -391,6 +391,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
             Ok(ChatIdentity {
                 id: "3000000000000000009".to_owned(),
                 username: "blank-content-bot".to_owned(),
+                workspace: None,
             })
         }
         async fn fetch_page(

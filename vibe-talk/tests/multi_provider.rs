@@ -438,6 +438,7 @@ impl ChatClient for Forwardable {
         Ok(ChatIdentity {
             id: "7".to_owned(),
             username: self.name.to_owned(),
+            workspace: None,
         })
     }
     async fn fetch_page(

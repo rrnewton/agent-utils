@@ -1006,6 +1006,14 @@ impl ChatClient for HttpSlackClient {
             Ok::<_, ChatError>(ChatIdentity {
                 id: id.to_owned(),
                 username,
+                // A blank team id is no workspace at all: one user id can then not be told
+                // apart across workspaces, and saying `Some("")` would pretend it could.
+                workspace: value
+                    .get("team_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|team| !team.is_empty())
+                    .map(str::to_owned),
             })
         }
         .await

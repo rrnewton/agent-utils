@@ -193,6 +193,12 @@ pub struct ChatIdentity {
     pub id: String,
     /// Human-readable account name.
     pub username: String,
+    /// The workspace the account belongs to, where the provider has workspaces: Slack's team id,
+    /// from `auth.test`. `None` for a provider whose accounts are not scoped to one.
+    ///
+    /// `#208 persistent-cache`: one user id can be a member of several workspaces, so the message
+    /// cache takes an account to be the same one only when both of these match.
+    pub workspace: Option<String>,
 }
 
 /// A channel created or resolved by a provider-side registration bridge.

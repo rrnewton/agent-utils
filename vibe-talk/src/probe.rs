@@ -1017,6 +1017,7 @@ mod tests {
                 Ok(crate::chat::ChatIdentity {
                     id: "3000000000000000002".to_owned(),
                     username: "blank-content-bot".to_owned(),
+                    workspace: None,
                 })
             }
             async fn fetch_page(

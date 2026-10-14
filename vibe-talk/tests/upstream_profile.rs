@@ -389,6 +389,7 @@ impl ChatClient for Recorder {
         Ok(ChatIdentity {
             id: "U1".to_owned(),
             username: "recorder".to_owned(),
+            workspace: None,
         })
     }
     async fn fetch_page(

@@ -322,6 +322,7 @@ impl ChatClient for Native {
         Ok(ChatIdentity {
             id: "1".to_owned(),
             username: "native".to_owned(),
+            workspace: None,
         })
     }
 

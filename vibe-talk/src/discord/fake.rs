@@ -765,6 +765,7 @@ impl ChatClient for FakeDiscord {
                     ChatIdentity {
                         id: FAKE_BOT_USER_ID.to_owned(),
                         username: FAKE_BOT_USERNAME.to_owned(),
+                        workspace: None,
                     },
                     self.success_headers(),
                 ))

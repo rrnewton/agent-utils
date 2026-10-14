@@ -25,6 +25,8 @@ use vibe_talk::slack::{HttpSlackClient, SlackConfig};
 pub const TOKEN: &str = "xoxb-fake-token-0123456789-abcdefghij";
 /// The account the fake's `auth.test` reports.
 pub const SELF_USER: &str = "UBOTSELF1";
+/// The workspace the fake's `auth.test` reports, unless [`FakeState::team`] says another.
+pub const TEAM: &str = "T0000TEAM";
 /// The first instant the fixtures use: 2023-11-14T22:13:20Z.
 pub const BASE_SECS: i64 = 1_700_000_000;
 
@@ -98,6 +100,8 @@ pub struct FakeState {
     /// The handle `auth.test` reports for the token's account; `vibe-bot` when unset.
     /// `#325 provider-diagnostics-ids`.
     pub auth_user: Option<String>,
+    /// The `team_id` `auth.test` reports instead of [`TEAM`]; an empty one reports none at all.
+    pub team: Option<String>,
 }
 
 /// A `conversations.replies` request answered late, so a test can act while a read is in flight.
@@ -518,11 +522,17 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
     let cap = state.page_cap;
     let channel = params.get("channel").cloned().unwrap_or_default();
     match method.as_str() {
-        "auth.test" => ok(
-            json!({"user_id": SELF_USER, "user": state.auth_user.as_deref().unwrap_or("vibe-bot"),
-            "team_id": "T0000TEAM", "team": "Example", "url": "https://example.slack.com/",
-            "bot_id": "BBOTSELF1"}),
-        ),
+        "auth.test" => {
+            let mut answer = json!({"user_id": SELF_USER,
+                "user": state.auth_user.as_deref().unwrap_or("vibe-bot"), "team_id": TEAM,
+                "team": "Example", "url": "https://example.slack.com/", "bot_id": "BBOTSELF1"});
+            match state.team.as_deref() {
+                Some("") => drop(answer.as_object_mut().expect("object").remove("team_id")),
+                Some(team) => answer["team_id"] = json!(team),
+                None => {}
+            }
+            ok(answer)
+        }
         "conversations.info" => {
             if state.history.contains_key(&channel) {
                 let name = state

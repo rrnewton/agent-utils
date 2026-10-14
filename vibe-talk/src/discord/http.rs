@@ -717,6 +717,7 @@ pub fn parse_identity(value: &serde_json::Value) -> Result<ChatIdentity, ChatErr
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(no username)")
             .to_owned(),
+        workspace: None,
     })
 }
 

@@ -250,6 +250,7 @@ impl ChatClient for Plain {
         Ok(ChatIdentity {
             id: "7".to_owned(),
             username: "reader".to_owned(),
+            workspace: None,
         })
     }
 
