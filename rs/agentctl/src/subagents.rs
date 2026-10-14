@@ -9693,6 +9693,8 @@ pub(crate) mod tests {
                     print_after: Mutex::new(None),
                     printing: Mutex::new(Vec::new()),
                     printed_without: Mutex::new(Vec::new()),
+                    hold_reads: Mutex::new(None),
+                    held_reads: AtomicU64::new(0),
                 },
                 root,
             }
@@ -10003,6 +10005,13 @@ pub(crate) mod tests {
         printing: Mutex<Vec<(String, String, Option<std::time::Instant>)>>,
         /// Characters a harness drops when it prints a prompt, as Markdown rendering does.
         pub(crate) printed_without: Mutex<Vec<char>>,
+        /// When set, a read through a runtime waits until the runtime is cancelled and then
+        /// fails: with `true`, as a call its caller cancelled, the way herdr's client reports
+        /// one, and with `false`, for another reason. Unset, as by default, such a read is an
+        /// ordinary `read`.
+        pub(crate) hold_reads: Mutex<Option<bool>>,
+        /// Reads that have started to wait under `hold_reads`.
+        pub(crate) held_reads: AtomicU64,
     }
     impl Fake {
         fn terminal(&self, pane: &str) -> String {
@@ -10380,6 +10389,27 @@ pub(crate) mod tests {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "visible output".to_owned()))
+        }
+        fn read_with_runtime(
+            &self,
+            pane: &str,
+            source: &str,
+            lines: Option<usize>,
+            runtime: &dyn agent::AgentRuntime,
+        ) -> AdapterResult<String> {
+            let hold = *self.hold_reads.lock().unwrap();
+            let Some(cancelled) = hold else {
+                return self.read(pane, source, lines);
+            };
+            self.held_reads.fetch_add(1, Ordering::SeqCst);
+            while !runtime.cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(if cancelled {
+                AdapterError::cancelled("cannot invoke Herdr: control command was cancelled")
+            } else {
+                AdapterError::unavailable("capture failed")
+            })
         }
     }
     impl ManagedApi for Fake {

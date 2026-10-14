@@ -35,6 +35,7 @@ use crate::chat_runtime::{
     RootMessageTransport, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
+use crate::error::AdapterErrorKind;
 use crate::stale_composer::{HerdrComposerPane, StaleComposer};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
@@ -116,6 +117,16 @@ impl fmt::Display for ChatServiceError {
 }
 
 impl std::error::Error for ChatServiceError {}
+
+impl ChatServiceError {
+    /// Whether this is a Herdr call that its caller cancelled, as a stop of the service does.
+    fn is_cancelled_herdr_call(&self) -> bool {
+        matches!(
+            self,
+            Self::Agent(AgentError::Client(error)) if error.kind() == AdapterErrorKind::Cancelled
+        )
+    }
+}
 
 impl From<ChatRuntimeError> for ChatServiceError {
     fn from(error: ChatRuntimeError) -> Self {
@@ -3103,9 +3114,7 @@ fn end_provider_worker(
     if panic.is_some() {
         // Record the panic and stop before closing the channel, so an owner loop that finds the
         // channel closed also finds the service stopping, and `chat run` does not also report
-        // that the worker stopped unexpectedly. Its error can still start with that of a Herdr
-        // call the stop cancelled, when the owner loop was woken just before making one
-        // (https://github.com/rrnewton/agent-utils/issues/186).
+        // that the worker stopped unexpectedly.
         stop.record_cleanup_error("chat provider worker panicked; no chat events arrive after it");
         stop.stop();
     }
@@ -3539,8 +3548,60 @@ impl TurnEvidence {
     }
 }
 
+/// Run the owner loop, as `chat run` does, and take a Herdr call that a stop cancelled for the
+/// stop: see [`owner_loop_end`].
 #[allow(clippy::too_many_arguments)]
 fn run_owner_loop<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    client: &HerdrClient,
+    manager: &ManagedAgents<'_, A>,
+    options: ServiceOptions,
+    stop: &StopState,
+    cancellation: &SharedCancellation,
+    output_wake: &SharedWake,
+    overflowed: &AtomicBool,
+    notices: &mpsc::Receiver<ProviderNotice>,
+    reply_wakes: &mpsc::Receiver<String>,
+    transport: &mut Option<CommandOutboundTransport>,
+    stale_composer: Option<StaleComposer>,
+) -> Result<(), ChatServiceError> {
+    owner_loop_end(
+        stop,
+        owner_loop(
+            state,
+            client,
+            manager,
+            options,
+            stop,
+            cancellation,
+            output_wake,
+            overflowed,
+            notices,
+            reply_wakes,
+            transport,
+            stale_composer,
+        ),
+    )
+}
+
+/// How the owner loop ended, as `chat run` takes it. A stop cancels the Herdr call the loop is
+/// making, which then fails: that is how the stop ends the loop, not a failure, so `chat run`
+/// exits 0 for it (#291 stop-lost-wakeup). A failure that stops the service is recorded as a
+/// cleanup error before the stop, so `chat run` still reports it. Every other result, including
+/// a cancelled call with no stop requested and any other failure during a stop, is returned
+/// unchanged.
+fn owner_loop_end(
+    stop: &StopState,
+    result: Result<(), ChatServiceError>,
+) -> Result<(), ChatServiceError> {
+    match result {
+        Err(error) if stop.is_stopped() && error.is_cancelled_herdr_call() => Ok(()),
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn owner_loop<A: ManagedApi + ?Sized>(
     state: &BridgeState,
     client: &HerdrClient,
     manager: &ManagedAgents<'_, A>,
@@ -3892,7 +3953,14 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             } else {
                 Duration::ZERO
             };
-            match active.wait(timeout) {
+            let waited = active.wait(timeout);
+            // A stop wakes this wait, and every Herdr call made after it fails as cancelled, so
+            // the loop leaves here, where a stop seen at the top of a pass leaves it, instead of
+            // in the next call (#291 stop-lost-wakeup).
+            if stop.is_stopped() {
+                break;
+            }
+            match waited {
                 Ok(events) => {
                     let info = match manager
                         .pane_info_with_runtime(&state.config().agent_name, &owner_runtime)
@@ -10294,7 +10362,9 @@ esac
     }
 
     /// `run_owner_loop_with`, with `timing` as the loop's delivery timing and `delivery` as the
-    /// options of the passes that type prompts.
+    /// options of the passes that type prompts. A stop ends the loop without an error, as it
+    /// ends `chat run`, including when it cancels a Herdr call the loop is making (#291
+    /// stop-lost-wakeup), so any error fails the test.
     #[allow(clippy::too_many_arguments)]
     fn run_owner_loop_timed(
         fixture: &crate::subagents::tests::Fixture,
@@ -10306,8 +10376,59 @@ esac
         limit: Duration,
         transport: Option<CommandOutboundTransport>,
         wake_root: Option<&Path>,
-        mut done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+        done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
     ) {
+        if let Err(error) = owner_loop_timed(
+            run_owner_loop,
+            fixture,
+            state,
+            herdr,
+            reconciliation_interval,
+            timing,
+            delivery,
+            limit,
+            transport,
+            wake_root,
+            done,
+        ) {
+            panic!("owner loop failed: {error}");
+        }
+    }
+
+    /// The owner loop as a test runs it: [`run_owner_loop`], as `chat run` runs it, or the
+    /// [`owner_loop`] within it, which reports a Herdr call that a stop cancelled as a failure.
+    type OwnerLoop = fn(
+        &BridgeState,
+        &HerdrClient,
+        &ManagedAgents<'_, crate::subagents::tests::Fake>,
+        ServiceOptions,
+        &StopState,
+        &SharedCancellation,
+        &SharedWake,
+        &AtomicBool,
+        &mpsc::Receiver<ProviderNotice>,
+        &mpsc::Receiver<String>,
+        &mut Option<CommandOutboundTransport>,
+        Option<StaleComposer>,
+    ) -> Result<(), ChatServiceError>;
+
+    /// Run `run` for `state`'s agent as [`run_owner_loop_timed`] runs the owner loop: until
+    /// `done`, called every 5 ms from another thread, returns true or `limit` has passed, then on
+    /// for 300 ms, then stopped. Return how it ended.
+    #[allow(clippy::too_many_arguments)]
+    fn owner_loop_timed(
+        run: OwnerLoop,
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        timing: DeliveryTiming,
+        delivery: DrainOptions,
+        limit: Duration,
+        transport: Option<CommandOutboundTransport>,
+        wake_root: Option<&Path>,
+        mut done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+    ) -> Result<(), ChatServiceError> {
         let manager = fixture.manager();
         let stop = StopState::default();
         let cancellation: SharedCancellation = Arc::default();
@@ -10325,7 +10446,7 @@ esac
             .expect("listen for reply wakes")
         });
         let mut transport = transport;
-        thread::scope(|scope| {
+        let result = thread::scope(|scope| {
             scope.spawn(|| {
                 let notify = |notice| send_notice(&notices, notice, &output_wake, &overflowed);
                 let overflow = || {
@@ -10340,7 +10461,7 @@ esac
                 stop.stop();
                 wake_output(&output_wake);
             });
-            let result = run_owner_loop(
+            run(
                 state,
                 &herdr.client,
                 &manager,
@@ -10357,21 +10478,179 @@ esac
                 &reply_wakes,
                 &mut transport,
                 None,
-            );
-            // The loop ends at its next check of the stop, or with a cancelled Herdr call when
-            // the stop interrupts one, as it does in `chat run`.
-            if let Err(error) = result {
-                assert!(
-                    stop.is_stopped() && error.to_string().contains("cancelled"),
-                    "owner loop failed: {error}"
-                );
-            }
+            )
         });
         if let Some(listener) = listener {
             listener
                 .stop(Instant::now() + Duration::from_secs(5))
                 .expect("stop the reply wake listener");
         }
+        result
+    }
+
+    /// Run `run` for `state`'s agent as [`run_owner_loop_until`] runs the owner loop, and return
+    /// how it ended.
+    fn owner_loop_until(
+        run: OwnerLoop,
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        limit: Duration,
+        mut done: impl FnMut() -> bool + Send,
+    ) -> Result<(), ChatServiceError> {
+        owner_loop_timed(
+            run,
+            fixture,
+            state,
+            herdr,
+            Duration::from_secs(3_600),
+            DeliveryTiming {
+                retry_interval: Duration::from_secs(3_600),
+                ..DeliveryTiming::default()
+            },
+            DrainOptions::default(),
+            limit,
+            None,
+            None,
+            move |_, _| done(),
+        )
+    }
+
+    #[test]
+    fn only_a_herdr_call_cancelled_during_a_stop_ends_the_owner_loop_as_the_stop() {
+        // A stop ends the owner loop by cancelling the Herdr call it is making, and `chat run`
+        // takes that call's failure for the stop. A call cancelled with no stop requested, which
+        // no runtime the loop gives its calls makes today, and any other failure during a stop
+        // stay failures (#291 stop-lost-wakeup).
+        let cancelled = || {
+            Err(ChatServiceError::Agent(AgentError::Client(
+                crate::error::AdapterError::cancelled(
+                    "cannot invoke Herdr: control command was cancelled",
+                ),
+            )))
+        };
+        let failed = || {
+            Err(ChatServiceError::Agent(AgentError::Client(
+                crate::error::AdapterError::unavailable("capture failed"),
+            )))
+        };
+        let stop = StopState::default();
+        let error = owner_loop_end(&stop, cancelled()).expect_err("a call cancelled before a stop");
+        assert!(error.is_cancelled_herdr_call(), "{error}");
+        let error = owner_loop_end(&stop, failed()).expect_err("a failure before a stop");
+        assert!(!error.is_cancelled_herdr_call(), "{error}");
+        assert!(owner_loop_end(&stop, Ok(())).is_ok());
+
+        stop.stop();
+        if let Err(error) = owner_loop_end(&stop, cancelled()) {
+            panic!("a call the stop cancelled ended the loop with an error: {error}");
+        }
+        let error = owner_loop_end(&stop, failed()).expect_err("a failure during a stop");
+        assert_eq!(error.to_string(), "capture failed");
+        let error = owner_loop_end(
+            &stop,
+            Err(ChatServiceError::Generation("generation failed".to_owned())),
+        )
+        .expect_err("another kind of failure during a stop");
+        assert_eq!(error.to_string(), "generation failed");
+        assert!(owner_loop_end(&stop, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn a_stop_that_wakes_the_event_wait_ends_the_owner_loop_before_another_herdr_call() {
+        // A stop wakes the owner loop's wait for pane output, and every Herdr call made after it
+        // fails as cancelled, so the loop must end at the wake instead of in a call that fails
+        // (#291 stop-lost-wakeup). This runs the loop without `owner_loop_end`, which takes a
+        // call the stop cancelled for the stop, so the lookup of the pane that used to follow
+        // the wake, which the fixture's client fails as cancelled after a stop, fails the test.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        // One open request gives the loop a reply route to subscribe for, so it waits for output.
+        delivered_worker_request(&state);
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let subscriptions = &herdr.subscriptions;
+        let result = owner_loop_until(
+            owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(10),
+            || subscriptions.load(AtomicOrdering::SeqCst) >= 1,
+        );
+        if let Err(error) = result {
+            panic!("owner loop failed: {error}");
+        }
+        assert_eq!(subscriptions.load(AtomicOrdering::SeqCst), 1);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_stop_that_cancels_a_herdr_call_ends_the_owner_loop_without_an_error() {
+        // The stop here comes while the loop's first read of the pane is waiting, and cancels it.
+        // That ends the loop as the stop, not as a failure, so `chat run`, with no cleanup error
+        // to add, prints `{"stopped": true}` and exits 0 (#291 stop-lost-wakeup).
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        delivered_worker_request(&state);
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        *fixture.client.hold_reads.lock().expect("hold reads") = Some(true);
+        let held_reads = &fixture.client.held_reads;
+        let result = owner_loop_until(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(10),
+            || held_reads.load(AtomicOrdering::SeqCst) >= 1,
+        );
+        assert_eq!(held_reads.load(AtomicOrdering::SeqCst), 1);
+        match service_outcome(result, Vec::new()) {
+            Ok(outcome) => assert_eq!(outcome, json!({"stopped": true})),
+            Err(error) => panic!("a stop during a Herdr call failed `chat run`: {error}"),
+        }
+        // The same stop reaches the loop within as that read's cancellation.
+        let error = owner_loop_until(
+            owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(10),
+            || held_reads.load(AtomicOrdering::SeqCst) >= 2,
+        )
+        .expect_err("without owner_loop_end the cancelled read is an error");
+        assert!(error.is_cancelled_herdr_call(), "{error}");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_failure_during_a_stop_that_is_not_a_cancellation_still_ends_the_owner_loop_with_it() {
+        // Only a call that the stop cancelled is taken for the stop. Here the loop's first read
+        // of the pane fails for another reason while the service is stopping, and the loop still
+        // reports that failure (#291 stop-lost-wakeup).
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        delivered_worker_request(&state);
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        *fixture.client.hold_reads.lock().expect("hold reads") = Some(false);
+        let held_reads = &fixture.client.held_reads;
+        let error = owner_loop_until(
+            run_owner_loop,
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(10),
+            || held_reads.load(AtomicOrdering::SeqCst) >= 1,
+        )
+        .expect_err("the failed read ends the loop with an error");
+        assert_eq!(held_reads.load(AtomicOrdering::SeqCst), 1);
+        assert!(error.to_string().contains("capture failed"), "{error}");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
     }
 
     #[test]
