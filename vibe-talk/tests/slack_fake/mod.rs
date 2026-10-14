@@ -59,6 +59,9 @@ pub struct FakeState {
     pub requests: Vec<(String, HashMap<String, String>)>,
     /// Method → Slack `error` answered with `ok:false`, every time.
     pub fail: HashMap<String, String>,
+    /// Thread root `ts` → HTTP status answered to every `conversations.replies` request for that
+    /// thread, as a bridge answers when its command fails on one thread's content.
+    pub fail_threads: HashMap<String, u16>,
     /// One 429 for this method, with this `Retry-After` in seconds.
     pub rate_limit_once: Option<(String, u64)>,
     /// Answer every request with HTTP 500 and a body that echoes the token.
@@ -455,6 +458,15 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
             answer["provided"] = json!("chat:write");
         }
         return axum::Json(answer).into_response();
+    }
+    if method == "conversations.replies" {
+        if let Some(status) = params
+            .get("ts")
+            .and_then(|thread| state.fail_threads.get(thread))
+        {
+            let status = StatusCode::from_u16(*status).expect("an HTTP status");
+            return (status, "the bridge could not read this thread").into_response();
+        }
     }
     let cap = state.page_cap;
     let channel = params.get("channel").cloned().unwrap_or_default();

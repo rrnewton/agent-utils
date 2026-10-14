@@ -20,7 +20,9 @@ use vibe_talk::live::{poll_once, LiveHub, LiveMessage, Tick};
 use vibe_talk::mcp::protocol::{dispatch, Outcome};
 use vibe_talk::model::ChannelId;
 use vibe_talk::providers::ChatRouter;
-use vibe_talk::slack::{message_id_from_ts, ts_from_message_id, LIVE_FAILED_READS};
+use vibe_talk::slack::{
+    message_id_from_ts, ts_from_message_id, LIVE_FAILED_READS, LIVE_TRANSIENT_FAILED_READS,
+};
 use vibe_talk::state::AppState;
 use vibe_talk::testing::WRITE_TOKEN;
 use vibe_talk::threads::MessageThread;
@@ -587,6 +589,179 @@ async fn a_thread_whose_replies_reads_keep_answering_404_is_given_up_after_a_bou
         state.fail.remove("conversations.replies");
         add_reply(state, CH, &root, &ts(120, 0), "later");
     });
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(poll.texts(), ["later"]);
+    assert_eq!(poll.replies.len(), 1);
+    assert_eq!(poll.replies[0]["oldest"], ts(110, 0));
+}
+
+/// The roots, by `ts`, that a poll's replies calls read, in order.
+fn read_roots(poll: &Poll) -> Vec<String> {
+    poll.replies.iter().map(|r| r["ts"].clone()).collect()
+}
+
+/// A failure that reads as a moment (a 5xx, a 408) never counts towards `LIVE_FAILED_READS`, and a
+/// bridge whose command fails on one thread's content answers so on every read of it. Such a
+/// thread waits behind every thread whose last read did not fail, so the others are read, and
+/// their replies published, while it keeps failing.
+#[tokio::test]
+async fn a_thread_whose_replies_reads_keep_failing_for_a_moment_holds_up_no_other_thread() {
+    for status in [500, 502, 503, 408] {
+        let (state, roots) = six_threads();
+        let fake = Fake::start(state, PAGE_CAP).await;
+        let client = fake.client();
+        let mut poller = Poller::new();
+        poller.poll(&fake, &client).await;
+
+        // Two threads move in the same interval, and the first one's reads fail every time.
+        fake.with(|state| {
+            add_reply(state, CH, &roots[0], &ts(200, 0), "in the broken thread");
+            add_reply(state, CH, &roots[3], &ts(205, 0), "in a healthy thread");
+            state.fail_threads.insert(roots[0].clone(), status);
+        });
+        let first = poller.poll(&fake, &client).await;
+        assert_eq!(
+            read_roots(&first),
+            [roots[0].clone()],
+            "{status}: the read stops at the failure, so an outage costs one call a poll"
+        );
+        assert!(first.published.is_empty(), "{status}");
+        assert!(first.tick.replies_behind, "{status}");
+
+        let second = poller.poll(&fake, &client).await;
+        assert_eq!(
+            second.texts(),
+            ["in a healthy thread"],
+            "{status}: the thread behind the failing one is read"
+        );
+        assert_eq!(
+            read_roots(&second),
+            [roots[3].clone(), roots[0].clone()],
+            "{status}: the failing thread is read after it"
+        );
+        assert!(second.tick.replies_behind, "{status}");
+
+        // A thread that moves while the broken one waits is read first, in the poll after its
+        // reply.
+        fake.with(|state| add_reply(state, CH, &roots[4], &ts(210, 0), "later, elsewhere"));
+        let third = poller.poll(&fake, &client).await;
+        assert_eq!(third.texts(), ["later, elsewhere"], "{status}");
+        assert_eq!(
+            read_roots(&third),
+            [roots[4].clone(), roots[0].clone()],
+            "{status}"
+        );
+
+        // Once its reads succeed again, the broken thread's reply arrives, read from where the
+        // poller stood in it.
+        fake.with(|state| state.fail_threads.clear());
+        let healed = poller.poll(&fake, &client).await;
+        assert_eq!(healed.texts(), ["in the broken thread"], "{status}");
+        assert_eq!(read_roots(&healed), [roots[0].clone()], "{status}");
+        assert_eq!(healed.replies[0]["oldest"], ts(1, 0), "{status}");
+        assert!(!healed.tick.replies_behind, "{status}");
+    }
+}
+
+/// While every read of a thread fails for a moment, as during an outage of `conversations.replies`
+/// alone, a poll costs one replies call, and the waiting threads take turns at it.
+#[tokio::test]
+async fn while_every_replies_read_fails_for_a_moment_the_waiting_threads_take_turns() {
+    let (state, roots) = six_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    fake.with(|state| {
+        for (n, root) in roots.iter().enumerate().take(3) {
+            let n = i64::try_from(n).expect("small");
+            add_reply(state, CH, root, &ts(200 + n, 0), &format!("reply {n}"));
+            state.fail_threads.insert(root.clone(), 502);
+        }
+    });
+    let mut calls = Vec::new();
+    for _ in 0..6 {
+        let poll = poller.poll(&fake, &client).await;
+        assert!(poll.published.is_empty());
+        assert!(poll.tick.replies_behind);
+        calls.push(read_roots(&poll));
+    }
+    let turns: Vec<Vec<String>> = roots[..3]
+        .iter()
+        .chain(&roots[..3])
+        .map(|root| vec![root.clone()])
+        .collect();
+    assert_eq!(calls, turns, "one call a poll, each thread in turn");
+
+    fake.with(|state| state.fail_threads.clear());
+    let healed = poller.poll(&fake, &client).await;
+    assert_eq!(healed.texts(), ["reply 0", "reply 1", "reply 2"]);
+    assert!(!healed.tick.replies_behind);
+}
+
+/// A thread whose reads fail for a moment on every read is given up, with a warning, after
+/// `LIVE_TRANSIENT_FAILED_READS` failed reads in a row, so it does not cost a call on every poll
+/// with no end; a read that succeeds in between starts the count again.
+#[tokio::test]
+async fn a_thread_whose_replies_reads_keep_failing_for_a_moment_is_given_up_after_a_longer_run() {
+    let (state, root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+    let failing = |on: bool| {
+        fake.with(|state| {
+            if on {
+                state.fail_threads.insert(root.clone(), 502);
+            } else {
+                state.fail_threads.clear();
+            }
+        });
+    };
+
+    // One failed read short of the bound, then a read that succeeds: delivered.
+    fake.with(|state| add_reply(state, CH, &root, &ts(100, 0), "first"));
+    failing(true);
+    for n in 1..LIVE_TRANSIENT_FAILED_READS {
+        let poll = poller.poll(&fake, &client).await;
+        assert_eq!(poll.replies.len(), 1, "read {n} is made");
+        assert!(poll.published.is_empty());
+        assert!(
+            poll.tick.replies_behind,
+            "read {n} leaves the thread waiting"
+        );
+    }
+    failing(false);
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(poll.texts(), ["first"]);
+    assert!(!poll.tick.replies_behind);
+
+    // The count started again: it takes the whole bound to give the thread up.
+    fake.with(|state| add_reply(state, CH, &root, &ts(110, 0), "missed by the live stream"));
+    failing(true);
+    let mut calls = Vec::new();
+    for n in 1..=LIVE_TRANSIENT_FAILED_READS + 3 {
+        let poll = poller.poll(&fake, &client).await;
+        assert!(poll.published.is_empty(), "poll {n} publishes nothing");
+        assert_eq!(
+            poll.tick.replies_behind,
+            n < LIVE_TRANSIENT_FAILED_READS,
+            "poll {n}: waiting until the last read"
+        );
+        calls.push(poll.replies.len());
+    }
+    let bound = usize::try_from(LIVE_TRANSIENT_FAILED_READS).expect("a small bound");
+    let mut expected = vec![1; bound];
+    expected.resize(bound + 3, 0);
+    assert_eq!(
+        calls, expected,
+        "one replies call a poll up to the bound, then none while the root stays as it was"
+    );
+
+    // A later reply in it reaches the stream once reads succeed again, after what was given up.
+    failing(false);
+    fake.with(|state| add_reply(state, CH, &root, &ts(120, 0), "later"));
     let poll = poller.poll(&fake, &client).await;
     assert_eq!(poll.texts(), ["later"]);
     assert_eq!(poll.replies.len(), 1);

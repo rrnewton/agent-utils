@@ -26,17 +26,24 @@
 //!
 //! # A read that fails
 //!
-//! A thread whose read fails waits for the next read, with every thread behind it, and is read
-//! again from the same place, so a failure loses no reply and repeats none. Slack answers a failure
-//! on its side (`internal_error`, `request_timeout`, `service_unavailable`, ...) as HTTP 200 with
-//! `ok: false`, as it answers a refusal, and a bridge answers a command that failed or timed out the
-//! same way, so any failure is retried. A thread that reads as gone (`404`: `thread_not_found`,
-//! `channel_not_found`, `message_not_found`) is no exception, since a bridge may answer so for a
-//! command that failed for another reason; forgetting its place would read it again from the
-//! seeding read and report every reply since then a second time. Only a thread whose reads fail
-//! [`LIVE_FAILED_READS`] times in a row, other than for a moment (a lost connection, a rate limit,
-//! a 5xx), is given up: taken as read to what its root said, its replies left to the thread's and
-//! Flat's own reads.
+//! A thread whose read fails waits for the next read and is read again from the same place, so a
+//! failure loses no reply and repeats none. The read stops at the failure, leaving every thread it
+//! has not read yet for the next read too, so an outage costs one call a read, not one a thread.
+//! A thread whose last read failed then waits behind every thread whose last read did not, so one
+//! thread that keeps failing holds up no other: the rest are read, and their replies reported,
+//! before it is tried again, and threads that all keep failing take turns.
+//!
+//! Slack answers a failure on its side (`internal_error`, `request_timeout`,
+//! `service_unavailable`, ...) as HTTP 200 with `ok: false`, as it answers a refusal, and a bridge
+//! answers a command that failed or timed out the same way, so any failure is retried. A thread
+//! that reads as gone (`404`: `thread_not_found`, `channel_not_found`, `message_not_found`) is no
+//! exception, since a bridge may answer so for a command that failed for another reason; forgetting
+//! its place would read it again from the seeding read and report every reply since then a second
+//! time. A thread is given up, with a warning, only when its reads fail [`LIVE_FAILED_READS`] times
+//! in a row other than for a moment (a lost connection, a rate limit, a 5xx), or
+//! [`LIVE_TRANSIENT_FAILED_READS`] times in a row for any reason (a bridge whose command fails on
+//! one thread's content may answer every read of it with a 5xx): it is taken as read to what its
+//! root said, its replies left to the thread's and Flat's own reads.
 //!
 //! # What it does not report
 //!
@@ -70,8 +77,14 @@ pub const LIVE_THREAD_READS: usize = 4;
 /// is given up.
 pub const LIVE_LAG_READS: u32 = 3;
 /// Reads of a thread in a row that fail, other than for a moment, before its new replies are given
-/// up. A failure that reads as a moment (a lost connection, a rate limit, a 5xx) never counts.
+/// up. A failure that reads as a moment (a lost connection, a rate limit, a 5xx) counts only
+/// towards [`LIVE_TRANSIENT_FAILED_READS`].
 pub const LIVE_FAILED_READS: u32 = 3;
+/// Reads of a thread in a row that fail for any reason, a moment's failure included, before its
+/// new replies are given up. A bridge whose command fails on one thread's content answers every
+/// read of it with a 5xx; without this bound that thread would cost a call on every read with no
+/// end. An outage seldom reaches it: a read whose newest page of history fails reads no thread.
+pub const LIVE_TRANSIENT_FAILED_READS: u32 = 20;
 /// Most threads whose place is remembered in one conversation; the oldest roots go first.
 const LIVE_REMEMBERED_ROOTS: usize = 1024;
 /// Most conversations whose places are remembered; past it every conversation is seeded again.
@@ -88,8 +101,23 @@ struct Place {
     count: u64,
     /// Reads in a row that reached the end of the thread without its root's `latest_reply`.
     misses: u32,
-    /// Reads in a row that failed with a failure that does not read as a moment.
+    /// Reads in a row that failed, for any reason.
+    failed: u32,
+    /// Of those, the reads that failed with a failure that does not read as a moment.
     failures: u32,
+}
+
+impl Place {
+    /// A place at `through`, the root then counting `count` replies, with no read behind it.
+    fn at(through: i64, count: u64) -> Self {
+        Self {
+            through,
+            count,
+            misses: 0,
+            failed: 0,
+            failures: 0,
+        }
+    }
 }
 
 /// A thread whose root moved, and whose new replies have not all been read yet.
@@ -111,7 +139,8 @@ pub(super) struct LiveThreads {
     floor: i64,
     /// Its place in each thread, by root `ts`.
     places: HashMap<String, Place>,
-    /// Threads waiting to be read, the longest waiting first.
+    /// Threads waiting to be read, the longest waiting first; a read takes those whose last read
+    /// failed after the rest.
     moved: Vec<Moved>,
 }
 
@@ -127,15 +156,10 @@ impl LiveThreads {
         let places = roots
             .iter()
             .map(|root| {
-                let place = Place {
-                    // Its latest reply, the newest the root says it has; a root that names none
-                    // stands at the newest instant seen, which nothing in its thread is newer than.
-                    through: root.latest_reply_micros().unwrap_or(floor),
-                    count: root.reply_count(),
-                    misses: 0,
-                    failures: 0,
-                };
-                (root.ts.clone(), place)
+                // Its latest reply, the newest the root says it has; a root that names none stands
+                // at the newest instant seen, which nothing in its thread is newer than.
+                let through = root.latest_reply_micros().unwrap_or(floor);
+                (root.ts.clone(), Place::at(through, root.reply_count()))
             })
             .collect();
         Self {
@@ -156,12 +180,10 @@ impl LiveThreads {
                 continue;
             }
             let known = self.places.contains_key(&root.ts);
-            let place = self.places.entry(root.ts.clone()).or_insert(Place {
-                through: self.floor.max(root.micros),
-                count: 0,
-                misses: 0,
-                failures: 0,
-            });
+            let place = self
+                .places
+                .entry(root.ts.clone())
+                .or_insert(Place::at(self.floor.max(root.micros), 0));
             let news = match root_says_replies_after(root, place.through) {
                 Some(news) => news,
                 None => !known || place.count != root.reply_count(),
@@ -188,6 +210,7 @@ impl LiveThreads {
             }
             place.count = thread.count;
             place.misses = 0;
+            place.failed = 0;
             place.failures = 0;
         }
     }
@@ -301,15 +324,23 @@ impl HttpSlackClient {
     }
 
     /// Read the new replies of the threads waiting in `held`, at most [`LIVE_THREAD_READS`] of
-    /// them, one call each. Returns the replies to report, oldest first, and whether any thread is
-    /// still waiting.
+    /// them, one call each, and none after a read that fails. Returns the replies to report,
+    /// oldest first, and whether any thread is still waiting.
     async fn read_moved(&self, conversation: &str, held: &mut LiveThreads) -> (Vec<Raw>, bool) {
-        let waiting = std::mem::take(&mut held.moved);
+        let mut waiting = std::mem::take(&mut held.moved);
+        // A thread whose last read failed waits behind every thread whose last read did not, in
+        // the order they were waiting, so one that keeps failing holds up no other.
+        waiting.sort_by_key(|thread| {
+            held.places
+                .get(&thread.root)
+                .is_some_and(|place| place.failed > 0)
+        });
         let mut found: Vec<Raw> = Vec::new();
         let mut reads = 0;
-        let mut paused = false;
+        // The thread whose read failed, which goes behind every other thread still waiting.
+        let mut failing = None;
         for thread in waiting {
-            if paused || reads == LIVE_THREAD_READS {
+            if failing.is_some() || reads == LIVE_THREAD_READS {
                 held.moved.push(thread);
                 continue;
             }
@@ -317,12 +348,7 @@ impl HttpSlackClient {
             let through = held
                 .places
                 .entry(thread.root.clone())
-                .or_insert(Place {
-                    through: floor,
-                    count: 0,
-                    misses: 0,
-                    failures: 0,
-                })
+                .or_insert(Place::at(floor, 0))
                 .through;
             reads += 1;
             let page = self
@@ -347,6 +373,7 @@ impl HttpSlackClient {
                         .places
                         .get_mut(&thread.root)
                         .expect("a place was made for every thread read");
+                    place.failed = 0;
                     place.failures = 0;
                     if let Some(newest) = fresh.iter().map(|raw| raw.micros).max() {
                         place.through = newest;
@@ -377,29 +404,34 @@ impl HttpSlackClient {
                     // A `404` is no proof either: a bridge may answer `thread_not_found` for a
                     // command that failed for another reason. The thread waits for the next read
                     // either way, keeping its place, so no reply is reported twice; only one that
-                    // keeps failing so is given up.
+                    // keeps failing is given up. Nothing more is read now, so an outage costs one
+                    // call a read.
                     let place = held
                         .places
                         .get_mut(&thread.root)
                         .expect("a place was made for every thread read");
+                    place.failed += 1;
                     if !error.is_transient() {
                         place.failures += 1;
                     }
-                    if place.failures < LIVE_FAILED_READS {
+                    if place.failures < LIVE_FAILED_READS
+                        && place.failed < LIVE_TRANSIENT_FAILED_READS
+                    {
                         tracing::debug!(
                             conversation,
                             thread = %thread.root,
                             %error,
+                            failed = place.failed,
                             failures = place.failures,
                             "the new replies of a Slack thread are left for the next live read"
                         );
-                        held.moved.push(thread);
-                        paused = true;
+                        failing = Some(thread);
                     } else {
                         tracing::warn!(
                             conversation,
                             thread = %thread.root,
                             %error,
+                            failed = place.failed,
                             failures = place.failures,
                             "the new replies of a Slack thread could not be read for the live \
                              stream; they show when the thread or the flat view is read"
@@ -409,6 +441,7 @@ impl HttpSlackClient {
                 }
             }
         }
+        held.moved.extend(failing);
         found.sort_by_key(|raw| raw.micros);
         found.dedup_by_key(|raw| raw.micros);
         (found, !held.moved.is_empty())

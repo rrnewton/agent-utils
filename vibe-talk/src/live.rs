@@ -1096,8 +1096,9 @@ async fn poll_loop_with_channels(
                         tracing::info!(
                             channel = %channel,
                             "live ingestion left thread replies in this channel for the next tick: \
-                             more threads moved than one tick reads, or a read of one failed for a \
-                             moment. Nothing is skipped; they are published by a later tick."
+                             more threads moved than one tick reads, or a read of one failed. They \
+                             are published by a later tick; a thread whose reads keep failing is \
+                             given up with a warning of its own."
                         );
                     } else if !tick.replies_behind && *replies_were_behind {
                         tracing::info!(

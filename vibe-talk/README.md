@@ -1235,13 +1235,17 @@ delivered, as before, so it costs that call as well. Every thread root on that p
   even after their root has left the newest page. A page the server cut short is never taken for
   the end of a thread: only `has_more: false` with the root's latest reply among what came back is.
   Running behind on replies, and catching up, is logged once each at INFO.
-* **A read of a thread that fails is made again on the next poll**, from the same place, and the
-  threads behind it wait with it, so a failure loses no reply. Slack answers a failure on its side
-  (`internal_error`, `request_timeout`, ...) as HTTP 200 with `ok: false`, exactly as it answers a
-  refusal, and a bridge answers a command that failed or timed out the same way, so every failure is
-  retried. Only a thread whose reads fail three times in a row, other than for a moment (a lost
-  connection, a rate limit, a 5xx), is given up, with a warning, and the replies those reads missed
-  show when the thread or the flat view is read. An answer that the thread is gone (`404`,
+* **A read of a thread that fails is made again on a later poll**, from the same place, so a
+  failure loses no reply. The poll reads no further thread after it, so an outage costs one call a
+  poll, and a thread whose last read failed waits behind every thread whose last read did not, so
+  one thread that keeps failing holds up no other: theirs are read first, and threads that all keep
+  failing take turns. Slack answers a failure on its side (`internal_error`, `request_timeout`, ...)
+  as HTTP 200 with `ok: false`, exactly as it answers a refusal, and a bridge answers a command that
+  failed or timed out the same way, so every failure is retried. A thread is given up, with a
+  warning, only when its reads fail three times in a row other than for a moment (a lost
+  connection, a rate limit, a 5xx), or twenty times in a row for any reason (a bridge whose command
+  fails on one thread's content may answer every read of it with a 5xx); the replies those reads
+  missed show when the thread or the flat view is read. An answer that the thread is gone (`404`,
   `thread_not_found`) is treated the same way, since a bridge may give it for a command that failed
   for another reason: the thread keeps its place, so no reply already delivered goes out again.
 
