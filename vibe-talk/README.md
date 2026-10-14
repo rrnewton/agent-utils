@@ -3543,6 +3543,9 @@ It is **not encrypted**. Anyone who can read this account's files can read it, a
 
 ### Turning it on for a host
 
+**The cache stays off until #297 cache-coverage-races is closed.** Enabling it before then only
+fills the file and measures what it would have served: nothing is answered from it.
+
 1. **Deploy this build first, without the table, and let it run.** A build from before
    `summary-keep` refuses to start with a `[message_cache]` table at all (an unknown section). The
    lines must never reach a host before a build that reads them.
