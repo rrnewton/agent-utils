@@ -91,7 +91,7 @@ not screens, so choosing among them (the picker, Ctrl+1, Ctrl+2, Ctrl+4) adds no
 through; the thread list is one thing more. The call's view, the search, a message's details sheet,
 a highlighted card and the agent's proposal to post are not screens either, and the gesture never
 answers a proposal. The page keeps one browser history entry for each thing open, all at the page's
-own address — the URL never changes, so a reload, and `/` beside `/voice`, are as before. The
+own address, `/` — the URL never changes, so a reload opens the app just as before. The
 on-screen ways out still close at once, and then go back through their entry with `history.back()`,
 so the next gesture never lands on a stale one. A menu has an entry too, in every browser, rather
 than a close watcher: Chrome's close watchers hear Esc and the phone's gesture, but not the

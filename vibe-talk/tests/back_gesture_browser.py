@@ -20,7 +20,7 @@ leaving the app.
 
   sign in and open the channel in All, scrolled to a reader's place mid-list -> a thread root's tag:
   the thread, and one history entry more, at the same address -> the browser's Back: the thread
-  closes, the app is not navigated away from (the same document, at /voice), and All is back at the
+  closes, the app is not navigated away from (the same document, at /), and All is back at the
   reader's place, its first row and that row's offset within a pixel -> the thread list from the
   view picker: one entry -> a card's replies: its thread across the window, one more -> history.back():
   the thread list again -> the browser's Back: All, at the reader's place, with no entry of the
@@ -36,7 +36,7 @@ browser's Back: the thread alone closes, back to the list -> the browser's Back:
 Back: the app is left, in one press.
 
 Then the same in an installed app's own window, whose history starts at the app (DevTools'
-`Page.resetNavigationHistory` after loading /voice, so /voice is the tab's first entry): reloaded in a
+`Page.resetNavigationHistory` after loading /, so the app is the tab's first entry): reloaded in a
 thread opened from the thread list, two Backs close the thread and the list and leave the browser on
 the tab's first entry, so the next Back is the system's, with no press spent on an entry the earlier
 load left -> Settings, and the page reloaded on its entry: Settings is not reopened, and the page goes
@@ -182,8 +182,8 @@ def desk_context(chromium: BrowserType, args: argparse.Namespace, profile: str) 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, steps: Callable[[Desk], None],
          home: bool = True, desk: bool = False) -> str:
     """One reader, against a fresh fake API and a fresh browser profile. With `home`, a plain page is
-    opened before the app, as the home screen it was launched from; without, /voice is made the tab's
-    first entry, as in an installed app's own window. With `desk`, at a desk rather than a phone."""
+    opened before the app, as the home screen it was launched from; without, the app at / is made the
+    tab's first entry, as in an installed app's own window. With `desk`, at a desk rather than a phone."""
     api = ColumnsApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
@@ -200,14 +200,14 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, steps: Cal
             reader = Desk(page, args.screenshots, label, width, height)
             if home:
                 page.goto(HOME, wait_until="load")
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             if not home:
                 cdp = page.context.new_cdp_session(page)
                 try:
                     cdp.send("Page.resetNavigationHistory")
                 finally:
                     cdp.detach()
-                check(navigation(page) == (0, 1), f"{label}: fixture: /voice is not the tab's only entry: {navigation(page)}")
+                check(navigation(page) == (0, 1), f"{label}: fixture: the app is not the tab's only entry: {navigation(page)}")
             steps(reader)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
@@ -265,7 +265,7 @@ def at_entry(desk: Desk, depth: int, tag: str, why: str) -> Json:
     desk.wait_for(f"() => {{ const f = history.state && history.state.vibeTalkBack;"
                   f" return !!f && f.depth === {depth} && f.tag === '{tag}'; }}", why)
     found = state(desk.page)
-    desk.check(found["path"] == "/voice", f"the address changed to {found['url']}")
+    desk.check(found["path"] == "/", f"the address changed to {found['url']}")
     desk.check(found["marker"] == "this document", f"{why}: the app was navigated away from, or reloaded")
     return found
 
@@ -357,7 +357,7 @@ def gesture_walk(desk: Desk) -> None:
     desk.check(opened["depth"] == 1 and opened["tag"] == "thread",
                f"the thread opened is not one entry above the page's base: {opened}")
     desk.check(opened["session"] == top["session"], "the thread's entry is another page load's")
-    desk.check(opened["path"] == "/voice", f"the thread's entry changed the address to {opened['url']}")
+    desk.check(opened["path"] == "/", f"the thread's entry changed the address to {opened['url']}")
     desk.check(opened_index == base_index + 1, "the thread did not add exactly one entry to the tab's history")
     back = at_entry(desk, 0, "top", "the browser's Back in the thread did not land on the page's base")
     desk.check(back["picker"] == "flat", f"the browser's Back did not go back to All: {back['picker']}")
@@ -554,7 +554,7 @@ def installed_walk(desk: Desk) -> None:
                f"{navigation(page)}, and each is a press that changes nothing")
     desk.check(navigation(page)[1] == 3, f"the reload, or the touch, changed how many entries the tab has: {navigation(page)}")
     stood_on_earlier(desk, before, reopened)
-    desk.notes.append("with /voice the tab's first entry, a reload in a thread from the thread list, a touch, and two "
+    desk.notes.append("with the app the tab's first entry, a reload in a thread from the thread list, a touch, and two "
                       "Backs closed the thread and the list and left the browser on the first entry: the next is the system's")
 
     # Settings, then a reload on its entry: Settings is not reopened, so the page goes back through its
@@ -630,7 +630,7 @@ def at_entry_unmarked(desk: Desk, depth: int, tag: str) -> Json:
                   f" return !!f && f.depth === {depth} && f.tag === '{tag}'; }}",
                   f"the page is not on its entry {depth} deep for {tag}")
     found = state(desk.page)
-    desk.check(found["path"] == "/voice", f"the address changed to {found['url']}")
+    desk.check(found["path"] == "/", f"the address changed to {found['url']}")
     return found
 
 

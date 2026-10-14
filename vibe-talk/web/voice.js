@@ -563,9 +563,9 @@ function refusalSentence(error) {
 //
 // THE HISTORY MIRRORS WHAT IS OPEN. `backLevels` reads from the page's own state what a Back would
 // close, the first-opened first, and the page keeps one history entry above its own for each: at the
-// page's own URL, so the address never changes and a reload, `/` beside `/voice` (`#302`) and the
-// browser's Back on a desk are all as they were; each tagged with what it stands for, how deep it is,
-// and this page load's own name (`BACK_SESSION`). `syncBackStack` puts the history in step after
+// page's own URL, `/`, so the address never changes and a reload and the browser's Back on a desk
+// are as they were; each tagged with what it stands for, how deep it is, and this page load's own
+// name (`BACK_SESSION`). `syncBackStack` puts the history in step after
 // anything opens or closes: an entry pushed for each thing opened, the top entry replaced where one
 // thing gives way to another at the same depth (another thread, the thread list over a thread), and
 // entries gone back through where things closed by other means. A view switch at the top pushes
@@ -597,7 +597,7 @@ function refusalSentence(error) {
 // than there are entries, the page goes back through the rest at once, as for anything closed, down to
 // the earlier load's own base where nothing was. That base is where this load's begins, so there is
 // never an entry left under it to spend a press on: in an installed app, whose window starts its
-// history at `/voice`, the Back after the last thing closes is the system's. The page never asks to go
+// history at the app, the Back after the last thing closes is the system's. The page never asks to go
 // back further than the browser says there are entries of its own under it (`historyIndex`). Where more
 // was reopened than there are entries, the rest are pushed — at the reader's first touch, as Chromium's
 // back button skips an entry a page pushed before it was touched, against pages that trap the button
@@ -687,7 +687,7 @@ function standingBackEntry(state) {
 /**
  * Where the browser is in the tab's history, by the Navigation API where it has one; null elsewhere.
  * Counted from the first of the run of this origin's entries the browser is in, so in an installed app,
- * whose window starts at `/voice`, it is how many entries of the app's own there are under this one.
+ * whose window starts at the app, it is how many entries of the app's own there are under this one.
  */
 function historyIndex() {
   const navigation = typeof window === "object" && window ? window.navigation : null;
