@@ -351,11 +351,16 @@ steps:
   # column (`#277 reply-in-column`). On the three phones a hosted call sent a 412-word recap says so
   # on the line above it, on one line at 393 and with nothing off the screen at 360 (`#270`), and on
   # the channel the card arriving, Send and the box taking back its room leave a reader up the list on
-  # their row within a pixel and one at the foot there (`#280 scroll-stability`).
-  # Measured on 2026-10-13: about 120s wall, before the recap line and the channel's stillness.
+  # their row within a pixel and one at the foot there (`#280 scroll-stability`). At 393x852 and
+  # 1280x800 the thread list (`#281 view-keys`): Cmd/Ctrl+3 and +4 pressed on the card's own buttons
+  # post and withdraw nothing, the card docked under the cards, which stay at their foot above it, whole
+  # on screen with Send at a thumb's reach, back at the foot of Main in two columns, and a draft arriving
+  # there moving neither a reader at the cards' foot nor one up them.
+  # Measured on 2026-10-13: about 170s wall and 15s CPU, with the thread list; its limits stay 300s
+  # wall and 200s CPU.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, and beside a reply open in a column at 1280x800
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys at 393x852 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
@@ -363,7 +368,7 @@ steps:
     cpu_timeout: 200
     hint:
       resources: {browser: 1}
-      est_duration_s: 120
+      est_duration_s: 170
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
