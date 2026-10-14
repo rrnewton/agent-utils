@@ -4068,7 +4068,10 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   list and two columns. The cards are placed once the view picker says the new view: it is as wide as
   what it says, and "Thread list" wrapped a desk's dock onto a second row after the cards had been put at
   their foot, which left the list 43px above it. In the thread list, as on the right, a reader at the foot
-  of the cards stays there as they change size.
+  of the cards stays there as they change size, and as the dock grows under them whenever it does: there
+  the dock is only as wide as the reading column, and on a reload in the thread list its last button came
+  in about 30 ms after the cards were placed and wrapped it, which left the list 43px above its foot for
+  good. The same keeps the cards beside Main at their foot when a channel's longer name wraps the dock.
 
 `tests/scroll_stability_browser.py` (DAG step `scroll-stability-browser`) measures them in Chromium at
 1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
@@ -4077,7 +4080,8 @@ moves, and at the desk, sampled at every frame for 2.5 s, the mouse crossing the
 the top bar, ] on its own, and the mouse going on from a card it highlighted over another card to the
 dock; a reader on the newest line following; the threads and their list opening at the foot; and the view
 keys, each held 2.5 s: the thread list at its foot from two columns, Main and All, Main coming back where
-the reader left it, a thread opened from the list at its foot, and nothing moving after any of them.
+the reader left it, a thread opened from the list at its foot, a reload in the list at its foot with the
+desk's dock on two rows, and nothing moving after any of them.
 
 ### A filter keeps your place
 

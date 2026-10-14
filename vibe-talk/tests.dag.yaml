@@ -462,10 +462,11 @@ steps:
   # coming in keep the row at the head; after a reload the read behind the saved rows leaves the
   # reader where they scrolled; `#281 view-keys`: the view keys show each view where it is read and
   # nothing moves it for 2.5 s after, the thread list opening at its foot from two columns, Main and All,
-  # Main coming back from it where the reader left it, and a thread opened from it opening at its foot;
-  # and, last, a card highlighted by a click with the mouse going on over another card to the dock moves
-  # nothing, while the mouse resting on it glides its root on screen (`#277 thread-card-focus`). Measured
-  # on 2026-10-13: about 104s wall, most of it the 2.5 s holds, and about 10s CPU.
+  # Main coming back from it where the reader left it, a thread opened from it opening at its foot, and a
+  # reload in it opening it at its foot with the desk's dock on two rows; and, last, a card highlighted by
+  # a click with the mouse going on over another card to the dock moves nothing, while the mouse resting
+  # on it glides its root on screen (`#277 thread-card-focus`). Measured on 2026-10-13: about 110s wall,
+  # most of it the 2.5 s holds, and about 10s CPU.
   - group: check
     job: scroll-stability-browser
     desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915
@@ -476,7 +477,7 @@ steps:
     cpu_timeout: 120
     hint:
       resources: {browser: 1}
-      est_duration_s: 104
+      est_duration_s: 110
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

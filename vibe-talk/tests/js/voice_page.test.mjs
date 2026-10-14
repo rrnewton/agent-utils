@@ -52734,14 +52734,89 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
 
   // THE CONTROLS. The cards placed before the picker says the thread list, as before: from Main, whose left
   // column has no view to change and so draws no picker before the cards are placed, the dock's second row
-  // leaves the thread list above its foot, and nothing takes it the rest of the way. (From All the left
-  // column goes to Main behind the list first, which draws the picker before the cards are placed.)
+  // leaves the thread list above its foot as the key draws it. Once the browser reports the sizes, the right
+  // column's dock-growth keeper takes it the rest of the way (the next test), so what the placement after
+  // the picker spares is the list drawn off its foot and then moved. (From All the left column goes to Main
+  // behind the list first, which draws the picker before the cards are placed.)
   const placedEarly = await run(brokenScript("  renderThreadSelect();\n  placeCardAnchor(place);\n", "  renderThreadSelect();\n"));
-  assert.deepStrictEqual(placedEarly, { ...real, listFoot: false, listFootAfter: false, cardGrewFoot: false });
+  assert.deepStrictEqual(placedEarly, { ...real, listFoot: false });
   // The right column's reader kept on its foot in two columns only: a card growing under a reader at the
   // foot of the thread list leaves them above it.
   const twoOnly = await run(brokenScript(
     "if (!sideColumnUp() || currentScreen !== \"main\" || currentView !== \"discord\") return false;",
     "if (!columnsShown || currentScreen !== \"main\" || currentView !== \"discord\") return false;"));
   assert.deepStrictEqual(twoOnly, { ...real, cardGrewFoot: false });
+});
+
+test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the cards after they were placed — its last button coming in after a reload, a channel's longer name — keeps a reader at their foot on it, in the thread list and beside Main, and moves nobody else", async () => {
+  // In Chromium (tests/scroll_stability_browser.py) a reload in the thread list at a desk put the cards at
+  // their foot, and about 30 ms later the dock's last button came in. In the thread list the dock is only as
+  // wide as the reading column, so that wrapped it onto a second row, 42px taken from the foot of the cards,
+  // and the list stayed 43px above its foot: the right column's dock-growth keeper (`#229`) kept a thread on
+  // the right and returned for the cards, and the cards' own foot keeper is for their content, not the
+  // column. The fixture lays nothing out, so the test does what the browser did: the dock is the new height,
+  // the cards' column has lost that much, and whatever watches it is told, with nothing redrawn.
+  const GROWTH = 42;
+  const run = async (script) => {
+    const { page } = await manyThreadColumns(16, (p) => p.enableResizeObserver(), script);
+    const dock = page.el("dock");
+    const side = page.el("side-scroll");
+    const grow = (by) => {
+      dock.offsetHeight += by;
+      side.clientHeight -= by;
+      page.resized(side);
+    };
+    const scrollSide = async (top) => {
+      side.scrollTop = top;
+      await side.dispatch("scroll");
+    };
+    const footGap = () => side.scrollHeight - side.clientHeight - side.scrollTop;
+    dock.offsetHeight = 50;
+    side.clientHeight = SCROLL_VIEWPORT_PX;
+    await press(page, focused(page) || page.el("scroll-area"), "3", { ctrlKey: true });
+    await page.settle();
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Ctrl+3 did not show the thread list");
+    // The first report has nothing before it: the dock and the column as the page has them.
+    page.resized(side);
+    assert.ok(sideAtFoot(page), "the premise: the thread list opened at its foot");
+    assert.ok(side.scrollHeight > side.clientHeight + 200, "the premise: the cards run past the column's foot");
+    grow(GROWTH);
+    const listFoot = sideAtFoot(page);
+    // Within the slack of the foot, the dock growing again: taken the rest of the way.
+    await scrollSide(side.scrollHeight - side.clientHeight - (BOTTOM_SLACK_PX - 10));
+    grow(20);
+    const nearFoot = sideAtFoot(page);
+    // Up the cards: the reader stays on the card they were reading.
+    await scrollSide(100);
+    grow(20);
+    const upHeld = side.scrollTop === 100;
+    // A WINDOW losing height is not the dock growing, and leaves a reader at the foot where they are (`#207`).
+    await scrollSide(side.scrollHeight);
+    side.clientHeight -= GROWTH;
+    page.resized(side);
+    const windowLeft = footGap() === GROWTH;
+    // Beside Main the same: a channel's longer name wrapping the dock under a reader at the foot of the cards.
+    await press(page, focused(page) || page.el("scroll-area"), "4", { ctrlKey: true });
+    await page.settle();
+    assert.ok(inTwoColumns(page), "Ctrl+4 did not bring two columns");
+    page.resized(side);
+    await scrollSide(side.scrollHeight);
+    assert.ok(sideAtFoot(page), "the premise: the cards beside Main are at their foot");
+    grow(GROWTH);
+    const twoFoot = sideAtFoot(page);
+    return { listFoot, nearFoot, upHeld, windowLeft, twoFoot };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { listFoot: true, nearFoot: true, upHeld: true, windowLeft: true, twoFoot: true });
+
+  // THE CONTROL: the keeper for a thread on the right only, as before. The dock growing leaves the cards
+  // above their foot, in the thread list and beside Main — further than the slack, so this is the defect and
+  // not a rounding — and the reader up the cards and the window losing height come out the same.
+  const threadOnly = await run(brokenScript(
+    "    if (sideColumnUp() && currentView === \"discord\" && columns.side.mode === \"list\") {\n" +
+    "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;\n" +
+    "      return;\n    }\n",
+    ""));
+  assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
+  assert.deepStrictEqual(threadOnly, { ...real, listFoot: false, nearFoot: false, twoFoot: false });
 });

@@ -48,10 +48,12 @@ and then, at each size:
   Main scrolled up, the thread list opens at its foot, Main comes back from it on the row and offset the
   reader left it at, All shows and holds, the thread list opens at its foot from All too, and at the desk
   the long thread opened from it by its card's replies button opens across the window at its foot and
-  holds, Esc comes back to the list at its foot, and Ctrl+4 brings two columns with the cards at their
-  foot. Without the cards placed after the view picker
-  says the thread list, whose wider name wraps the desk's dock, the list opened 86px above its foot from
-  two columns, and 43px from Main.
+  holds, Esc comes back to the list at its foot, the page reloaded in the thread list opens it at its foot
+  and holds, and Ctrl+4 brings two columns with the cards at their foot. Without the cards placed after the
+  view picker says the thread list, whose wider name wraps the desk's dock, the list opened 86px above its
+  foot from two columns, and 43px from Main. Without the right column's dock-growth keeper taking the cards
+  too, the reload left it 43px above its foot for good: in the thread list the dock is only as wide as the
+  reading column, and its last button wrapped it about 30 ms after the cards were placed.
 
 and last, at the desk, sampled at every frame for 2.5 s: a card highlighted by a click, whose root is a
 screen off Main, and the mouse going on over another card to the dock leaves Main still; coming back to
@@ -968,6 +970,33 @@ def main_held(reader: Reader, why: str) -> None:
     reader.held(before, why)
 
 
+def reload_in_thread_list(reader: Reader) -> None:
+    """At the desk, the page reloaded in the thread list, which each window reloads into: the list opens at its
+    foot and holds there once the channel has been read. In the thread list the dock is only as wide as the
+    reading column, and its last button comes in about 30 ms after the cards are placed, wrapping it onto a
+    second row: before the right column's dock-growth keeper took the cards too, that left the list 43px above
+    its foot for good."""
+    page, api = reader.page, reader.api
+    size = page.viewport_size
+    assert size is not None
+    page.mouse.move(5, size["height"] - 5)
+    reads = api.timeline_requests()
+    page.reload(wait_until="load")
+    reader.wait_for("() => document.getElementById('thread-select').value === 'threads'"
+                    " && document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
+                    " && document.querySelectorAll('#side-cards > li[data-id]').length > 0",
+                    "the reload did not come back to the thread list")
+    deadline = time.monotonic() + 10
+    while api.timeline_requests() <= reads and time.monotonic() < deadline:
+        page.wait_for_timeout(25)
+    reader.check(api.timeline_requests() > reads, "the reload never read the channel")
+    reader.quiet(800)
+    reader.check(float(page.evaluate("() => document.getElementById('dock').getBoundingClientRect().height")) > 60,
+                 "the dock is one row in the thread list, so the reload proves nothing")
+    list_at_foot(reader, "a reload in the thread list")
+    reader.notes.append("a reload in the thread list, its dock on two rows, opened the list at its foot and held it")
+
+
 def view_keys_walk(reader: Reader) -> None:
     """`#281 view-keys` x `#280 scroll-stability`: the view keys show each view at once where it is to be read
     -- at its newest, or where the reader left it -- and nothing moves it after, for the glide's wait and
@@ -1036,6 +1065,7 @@ def view_keys_walk(reader: Reader) -> None:
     list_at_foot(reader, "Esc back to the thread list")
     reader.notes.append("a thread opened from the thread list opened at its foot and held it, and Esc came back to "
                         "the list at its foot")
+    reload_in_thread_list(reader)
     view_key(reader, 4, "columns", "two")
     gap = reader.gap("side-scroll")
     reader.check(gap <= 1, f"Ctrl+4 from the thread list left the cards {gap:.0f}px above their foot")

@@ -30090,7 +30090,9 @@ function renderColumns() {
  * again once the picker says the new layout: where the reader was in them (`cards`, read by
  * `renderColumns` before the layout changed) between the thread list and two columns, which keep them;
  * else where they were just opened, their foot unless a thread was selected from them up the list
- * (`placeOpenedCards`).
+ * (`placeOpenedCards`). The dock growing later than that, by something no placement here can wait for —
+ * its last button coming in after a reload — is for the right column's dock-growth keeper (`#229`), which
+ * takes a reader at the foot of the cards back to it.
  *
  * @param {"one" | "list" | "two"} now
  * @param {"one" | "list" | "two"} next
@@ -35537,12 +35539,23 @@ if (typeof window.ResizeObserver === "function") {
     }
   }).observe(el("scroll-area"));
   // `#229 desktop-two-column`. The same for the right column's reader, under the same dock.
+  //
+  // `#281 view-keys` x `#280 scroll-stability`. And for the cards, beside Main or across the window as the
+  // thread list. There the dock is only as wide as the reading column, so at a desk it wraps where two
+  // columns' dock spans the window and does not: on a reload in the thread list the cards were put at
+  // their foot and the dock's last button came about 30 ms later, a second row that left the list 43px
+  // above its foot for good, since nothing after the placement took it the rest of the way. This does,
+  // whatever grew the dock and whenever: a reload, a view key, a channel's longer name.
   let seenSide = null;
   new window.ResizeObserver(() => {
     const area = leftEl("side-scroll");
     const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
     const grew = seenSide !== null && seenSide.list > 0 && currentScreen === "main" ? now.dock - seenSide.dock : 0;
     seenSide = now;
+    if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {
+      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
+      return;
+    }
     if (!sideShowing()) return;
     inColumn(columns.side, () => {
       if (entryLandingHolds()) {
