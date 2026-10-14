@@ -463,6 +463,87 @@ async fn a_rendered_body_an_adapter_sends_never_reaches_the_hub_or_the_page() {
 }
 
 #[tokio::test]
+async fn a_pushed_thread_record_reaches_the_page_exactly_as_it_was_sent() {
+    // `#308 live-reply-in-main`. An adapter for a provider with threads says which thread a message
+    // is in by `message.thread`, the record its reads carry. The page places a live message by that
+    // record alone: a copy without one is drawn on Main until a read of All places it, which behind a
+    // slow chat service can be most of a minute. So the hub and the stream carry the record exactly,
+    // and invent none for a copy that came without one.
+    let (app, live) = enabled();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut subscription = live.subscribe(&channel, None);
+    let stream = open_stream(&app, None).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    let mut body = stream.into_body();
+
+    let thread = json!({
+        "id": "thread-one",
+        "root_message_id": "10",
+        "is_root": false,
+        "reply_count": 2,
+        "reply_count_exact": true,
+    });
+    for (event_id, id, record) in [
+        ("event-threaded-create", "11", Some(&thread)),
+        ("event-unthreaded-create", "12", None),
+    ] {
+        let mut event = create(event_id, id, false);
+        if let Some(record) = record {
+            event["message"]["thread"] = record.clone();
+        }
+        assert_eq!(
+            post(&app, Some(INGEST_TOKEN), event).await.0,
+            StatusCode::ACCEPTED
+        );
+        let held = subscription
+            .receiver
+            .try_recv()
+            .expect("create broadcast")
+            .message;
+        assert_eq!(
+            held.thread
+                .as_ref()
+                .map(|kept| serde_json::to_value(kept).expect("serializes")),
+            record.cloned(),
+            "the hub did not keep the thread record {event_id} was pushed with"
+        );
+        let text = read_events(&mut body, 1).await;
+        let payload: Value = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .map(|json| serde_json::from_str(json.trim()).expect("json"))
+            .expect("a data line");
+        assert_eq!(payload["message"]["id"], id);
+        assert_eq!(
+            payload["message"].get("thread"),
+            record,
+            "the page was not sent the thread record {event_id} was pushed with"
+        );
+    }
+
+    // ...and an edit carries it too.
+    let mut update = json!({
+        "event_id": "event-threaded-update",
+        "historical": false,
+        "kind": "update",
+        "message": message("11", "edited in its thread"),
+    });
+    update["message"]["thread"] = thread.clone();
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), update).await.0,
+        StatusCode::ACCEPTED
+    );
+    let text = read_events(&mut body, 1).await;
+    assert!(text.contains("event: message_update"), "{text}");
+    let payload: Value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .map(|json| serde_json::from_str(json.trim()).expect("json"))
+        .expect("a data line");
+    assert_eq!(payload["message"]["thread"], thread);
+}
+
+#[tokio::test]
 async fn uid_endings_are_stable_across_two_pushed_messages() {
     // The same compact UID form is used for independent live arrivals.
     let (app, live) = enabled();
