@@ -294,7 +294,8 @@ impl AppState {
     pub fn refresh_routes(&self) {
         let channels = self.all_channels();
         self.providers.replace_routes(&channels);
-        self.message_cache.set_routes(&channels, &self.providers);
+        self.message_cache
+            .set_routes(&channels, &self.providers, &self.config);
     }
 
     /// Restore both lists the store keeps, [`AppState::restore_added_channels`] and then

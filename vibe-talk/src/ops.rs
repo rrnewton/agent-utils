@@ -387,10 +387,12 @@ impl Window {
 
 /// Recent messages of one channel, oldest first. Read scope.
 ///
-/// `_caller` is the scope of whoever asked, which decides whether what this read sees may be
+/// `caller` is the scope of whoever asked, which decides whether what this read sees may be
 /// written to the message cache: never at read scope ([`crate::cache::grant`]). Every operation
-/// here that reads takes one and passes it on. Nothing fills the cache yet, so the reads it
-/// reaches do not use it.
+/// here that reads takes one and passes it on, and each that reads a channel itself begins a fill
+/// under it before the read and offers the provider's raw answer after (`#208
+/// persistent-cache`, [`crate::cache::sink`]). With no cache behind the sink nothing is begun, and
+/// nothing is copied.
 ///
 /// # Errors
 ///
@@ -398,7 +400,7 @@ impl Window {
 /// fetch fails.
 pub async fn messages(
     state: &AppState,
-    _caller: crate::auth::Scope,
+    caller: crate::auth::Scope,
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
@@ -412,7 +414,11 @@ pub async fn messages(
     // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
     // while it ran applied again on top. See `crate::recent`.
     let mark = state.live.recent().mark(&channel.id);
+    let fill = state.message_cache.begin_for(caller, &channel.id);
     let read = crate::recent_view::read(state, &channel.id, limit).await?;
+    if let Some(fill) = fill {
+        fill.offer_recent_dated(&read);
+    }
     state.live.recent().record_as_of(
         &channel.id,
         &read.messages,
@@ -620,10 +626,14 @@ async fn message_in_thread(
             .ok_or(OpError::UnknownMessage)?;
         return Ok((channel, message));
     }
+    let fill = state.message_cache.begin_for(caller, &channel.id);
     let mut message = state
         .chat
         .fetch_thread_message(&channel.id, thread_id, &MessageId(message_id.to_owned()))
         .await?;
+    if let Some(fill) = fill {
+        fill.offer_single(&message, thread_id);
+    }
     stamp(state, std::slice::from_mut(&mut message));
     crate::noise::filter_for(state, &channel.id)
         .await
@@ -767,7 +777,7 @@ pub async fn lookup_messages(
 /// with a fresh envelope in `next_after`. A `before` page leaves without one: it says nothing about
 /// the newest end. `#203 incremental-refresh`.
 ///
-/// `_caller` is the scope of whoever asked, as for [`messages`].
+/// `caller` is the scope of whoever asked, as for [`messages`].
 ///
 /// # Errors
 ///
@@ -776,7 +786,7 @@ pub async fn lookup_messages(
 /// [`ChatError::CursorExpired`] for one the backend can no longer answer for.
 pub async fn timeline(
     state: &AppState,
-    _caller: crate::auth::Scope,
+    caller: crate::auth::Scope,
     channel_id: &str,
     request: &crate::threads::TimelineRequest,
 ) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
@@ -793,6 +803,14 @@ pub async fn timeline(
     let mut backend = request.clone();
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
+    let timeline_read = if request.before.is_some() {
+        crate::cache::observe::TimelineRead::Before
+    } else if resumed.is_some() {
+        crate::cache::observe::TimelineRead::Forward
+    } else {
+        crate::cache::observe::TimelineRead::Newest
+    };
+    let fill = state.message_cache.begin_for(caller, &channel.id);
     let (mut page, position) = match resumed {
         Some(Forward::Native(own)) => {
             backend.after = Some(own);
@@ -811,6 +829,9 @@ pub async fn timeline(
         }
         None => (state.chat.fetch_timeline(&channel.id, request).await?, None),
     };
+    if let Some(fill) = fill {
+        fill.offer_timeline(request, timeline_read, &page);
+    }
     page.next_after = if request.before.is_some() {
         None
     } else {
@@ -1463,7 +1484,7 @@ fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
 
 /// One step of a walk: a page that knows it is a page. Read scope.
 ///
-/// `_caller` is the scope of whoever asked, as for [`messages`].
+/// `caller` is the scope of whoever asked, as for [`messages`].
 ///
 /// # Errors
 ///
@@ -1472,7 +1493,7 @@ fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
 /// or [`OpError::HoursWithSpan`] for an unusable relative window, or [`OpError::Chat`].
 pub async fn page(
     state: &AppState,
-    _caller: crate::auth::Scope,
+    caller: crate::auth::Scope,
     channel_id: &str,
     request: PageRequest<'_>,
 ) -> Result<Page, OpError> {
@@ -1518,6 +1539,19 @@ pub async fn page(
 
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
+    // `#208 persistent-cache`. A step that resumes after a message (`Page::next_since`) leaves
+    // out the messages of its first millisecond the step before returned, so what it lists
+    // whole starts at the millisecond after: a message of that millisecond it did not list is
+    // not missing from the channel.
+    let page_read = match (start, &before) {
+        (Some(SpanStart { ms, after }), _) => crate::cache::observe::PageRead::Since {
+            since_ms: if after.is_some() { ms + 1 } else { ms },
+            until_ms: until,
+        },
+        (None, Some(_)) => crate::cache::observe::PageRead::Before,
+        (None, None) => crate::cache::observe::PageRead::Newest,
+    };
+    let fill = state.message_cache.begin_for(caller, &channel.id);
     let (mut messages, forward, unproven, beyond) = match start {
         Some(SpanStart { ms: from, after }) => {
             // One step of a range read, oldest first: remote-ops-audit W10 `#287 bulk-reads`. A
@@ -1659,6 +1693,11 @@ pub async fn page(
 
     let has_more = messages.len() > usize::from(limit)
         || (unproven && messages.last().is_some_and(|m| message_ms(m).is_some()));
+    if let Some(fill) = fill {
+        // A provider's own range read that did not prove it reached the span's end proves
+        // nothing whole, whatever it returned: rows only (`#208 persistent-cache`).
+        fill.offer_page(page_read, &messages, has_more || unproven);
+    }
     if has_more {
         if forward {
             // Walking forward, the extra one is the NEWEST; drop it from that end.
@@ -1761,7 +1800,8 @@ pub async fn count(
 /// [`count`], optionally over the last `hours` on this server's clock instead of since an instant.
 /// Read scope. `#190 voice-agent-tools`.
 ///
-/// `_caller` is the scope of whoever asked, as for [`messages`].
+/// `caller` is the scope of whoever asked, as for [`messages`]. Every page the walk read is
+/// offered once, together, when it ends.
 ///
 /// # Errors
 ///
@@ -1769,7 +1809,7 @@ pub async fn count(
 /// [`OpError::HoursWithSpan`] when both `hours` and `since` are given.
 pub async fn count_within(
     state: &AppState,
-    _caller: crate::auth::Scope,
+    caller: crate::auth::Scope,
     channel_id: &str,
     since: Option<&str>,
     hours: Option<u64>,
@@ -1799,6 +1839,8 @@ pub async fn count_within(
     let mut newest_seen: Option<MessageId> = None;
     let mut before: Option<MessageId> = None;
     let mut noise: usize = 0;
+    let fill = state.message_cache.begin_for(caller, &channel.id);
+    let mut walked: Vec<Message> = Vec::new();
 
     loop {
         let batch = state
@@ -1807,6 +1849,9 @@ pub async fn count_within(
             .await?;
         if batch.is_empty() {
             break;
+        }
+        if fill.is_some() {
+            walked.extend_from_slice(&batch);
         }
         if newest_seen.is_none() {
             newest_seen = batch.last().map(|m| m.id.clone());
@@ -1839,6 +1884,9 @@ pub async fn count_within(
             break;
         }
         before = Some(oldest.id);
+    }
+    if let Some(fill) = fill {
+        fill.offer_walk(&walked);
     }
 
     Ok(MessageCount {
@@ -1939,14 +1987,14 @@ async fn count_range(
 /// Semantic random access: describe a message, get that message. Read scope.
 ///
 /// Returns the resolution and how many messages were searched, so a caller can honestly say "I
-/// only looked at the last twenty". `_caller` is the scope of whoever asked, as for [`messages`].
+/// only looked at the last twenty". `caller` is the scope of whoever asked, as for [`messages`].
 ///
 /// # Errors
 ///
 /// [`OpError::EmptyQuery`] for a blank query, plus the errors of [`messages`].
 pub async fn resolve(
     state: &AppState,
-    _caller: crate::auth::Scope,
+    caller: crate::auth::Scope,
     channel_id: &str,
     query: &str,
     limit: Option<u16>,
@@ -1960,7 +2008,11 @@ pub async fn resolve(
     // This path does NOT go through `messages` above — it fetches directly — so it needs its own
     // stamping call. `run_find` renders a timestamp for the best match and every alternative, and
     // without this those lines would be the only ones still speaking raw UTC.
+    let fill = state.message_cache.begin_for(caller, &info.id);
     let mut messages = state.chat.fetch_recent(&info.id, limit).await?;
+    if let Some(fill) = fill {
+        fill.offer_recent(&messages);
+    }
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. A placeholder is never the message somebody is describing, and one
     // that happened to share a word with the description would be a confident wrong answer.

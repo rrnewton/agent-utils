@@ -1,8 +1,9 @@
 //! The message cache: a disposable on-disk copy of channel messages. `#208 persistent-cache`.
 //!
-//! **Not wired.** This milestone (`cache-store`) is the library alone: nothing on the request path
-//! opens a cache, offers it a message or reads one back, and a server behaves exactly as it did
-//! before it existed. The next milestone fills it from reads and pushes; later ones serve from it.
+//! **Not opened yet.** The read sites offer what write-scope and server-owned reads see to the
+//! server's [`Sink`] (milestone `cache-fill`, under way), but nothing outside the tests installs a
+//! cache behind it, nothing reads one back, and a server behaves exactly as it did before the cache
+//! existed. Later milestones open it and serve from it.
 //!
 //! # A separate file, never tables in the store
 //!

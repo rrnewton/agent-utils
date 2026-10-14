@@ -631,7 +631,7 @@ impl RecentWindows {
             channel: channel.clone(),
             number,
             done: Some(done),
-            _grant: grant,
+            grant,
         };
         (running, Some(claim))
     }
@@ -660,8 +660,8 @@ struct Claim {
     done: Option<watch::Sender<bool>>,
     /// The grant of whoever claimed the read: what it reads may be written to the message cache
     /// under this and nothing else, so a write-scope caller who joins a read claimed at read scope
-    /// adds no authority to it. Carried, not yet read: nothing fills the cache.
-    _grant: Option<FillGrant>,
+    /// adds no authority to it.
+    grant: Option<FillGrant>,
 }
 
 impl Drop for Claim {
@@ -818,8 +818,13 @@ pub fn refresh(
 /// its failure, and end the refresh.
 async fn read_alone(state: AppState, claim: Claim, limit: u16) {
     // Begun when asked for, not when a permit came free: the window is no newer than that, and
-    // every push from then on is applied to it again. See the module documentation.
+    // every push from then on is applied to it again. See the module documentation. The message
+    // cache's fill is begun then too, under the claimant's grant (`#208 persistent-cache`): what
+    // the read saw is no newer than that either.
     let mark = claim.windows.mark(&claim.channel);
+    let fill = claim
+        .grant
+        .and_then(|grant| state.message_cache.begin(&grant, &claim.channel));
     let started = mark.started();
     let permits = claim
         .windows
@@ -833,6 +838,9 @@ async fn read_alone(state: AppState, claim: Claim, limit: u16) {
         }
         Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
     };
+    if let (Some(fill), Ok(read)) = (fill, &read) {
+        fill.offer_recent_dated(read);
+    }
     keep(&claim, mark, limit, read, started.elapsed().as_millis());
     drop(claim);
 }

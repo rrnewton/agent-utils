@@ -433,6 +433,185 @@ impl crate::chat::ChatClient for SlowChat {
     }
 }
 
+/// A Discord-protocol provider with timelines, answered from the [`FakeDiscord`] it wraps. `#208
+/// persistent-cache`: what a test of the message cache reads `/timeline` through, as Discord's own
+/// API or as a bridge, by the deployment's `thread_api`.
+///
+/// Every view's newest page is the channel's newest messages and a `before` page the ones older
+/// than the cursor, with `has_more` saying whether older ones exist: the over-fetch a real
+/// provider does. A thread is the message it is named after and the messages that reply to it,
+/// out of a channel of fewer than a hundred messages.
+/// A forward read answers the messages after the cursor, as the delta [`TimelineChat::delta`]
+/// says, and every newest page or delta hands back its newest id as its own forward cursor.
+pub struct TimelineChat {
+    inner: Arc<FakeDiscord>,
+    as_of: Mutex<Option<String>>,
+    delta: Mutex<crate::threads::TimelineDelta>,
+}
+
+impl TimelineChat {
+    /// Answer from `inner`.
+    #[must_use]
+    pub fn new(inner: Arc<FakeDiscord>) -> Self {
+        Self {
+            inner,
+            as_of: Mutex::new(None),
+            delta: Mutex::new(crate::threads::TimelineDelta::default()),
+        }
+    }
+
+    /// Date every page and recent read `as_of` from now on, or stop dating them.
+    pub fn set_as_of(&self, as_of: Option<String>) {
+        *lock(&self.as_of) = as_of;
+    }
+
+    /// What every forward read says about the changes it carries from now on: whether it is
+    /// complete, and what it reports deleted.
+    pub fn set_delta(&self, delta: crate::threads::TimelineDelta) {
+        *lock(&self.delta) = delta;
+    }
+
+    fn cursor(raw: &str) -> Result<crate::model::MessageId, crate::chat::ChatError> {
+        let id = crate::model::MessageId(raw.to_owned());
+        id.numeric()
+            .map(|_| id.clone())
+            .ok_or_else(|| crate::chat::ChatError::Refused("not this provider's cursor".to_owned()))
+    }
+
+    fn in_thread(message: &crate::model::Message, thread: &str) -> bool {
+        message.id.as_str() == thread
+            || message
+                .reply_to
+                .as_ref()
+                .is_some_and(|parent| parent.as_str() == thread)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::chat::ChatClient for TimelineChat {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    async fn identity(&self) -> Result<crate::chat::ChatIdentity, crate::chat::ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+        before: Option<&crate::model::MessageId>,
+        after: Option<&crate::model::MessageId>,
+    ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_recent_dated(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+    ) -> Result<crate::chat::RecentRead, crate::chat::ChatError> {
+        Ok(crate::chat::RecentRead {
+            messages: self.inner.fetch_recent(channel, limit).await?,
+            as_of: lock(&self.as_of).clone(),
+            exhausted: false,
+            notice: None,
+        })
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &crate::model::ChannelId,
+        request: &crate::threads::TimelineRequest,
+    ) -> Result<crate::threads::TimelinePage, crate::chat::ChatError> {
+        use crate::threads::{TimelinePage, TimelineView};
+        request.one_direction()?;
+        if request.view == TimelineView::Threads {
+            return Ok(TimelinePage::default());
+        }
+        let limit = usize::from(request.limit.clamp(1, 99));
+        let thread = request.thread_id.as_deref();
+        // A thread is picked out of the channel's newest hundred: a test channel holds fewer.
+        let ask = if thread.is_some() {
+            100
+        } else {
+            u16::try_from(limit + 1).unwrap_or(100)
+        };
+        let keep = |messages: Vec<crate::model::Message>| -> Vec<crate::model::Message> {
+            messages
+                .into_iter()
+                .filter(|m| thread.is_none_or(|thread| Self::in_thread(m, thread)))
+                .collect()
+        };
+        if let Some(after) = &request.after {
+            let after = Self::cursor(after)?;
+            let messages = keep(
+                self.inner
+                    .fetch_page(channel, ask, None, Some(&after))
+                    .await?,
+            );
+            let newest = messages.last().map_or(after, |m| m.id.clone());
+            return Ok(TimelinePage {
+                messages,
+                next_after: Some(newest.as_str().to_owned()),
+                delta: Some(lock(&self.delta).clone()),
+                as_of: lock(&self.as_of).clone(),
+                ..TimelinePage::default()
+            });
+        }
+        let before = request.before.as_deref().map(Self::cursor).transpose()?;
+        let mut messages = keep(
+            self.inner
+                .fetch_page(channel, ask, before.as_ref(), None)
+                .await?,
+        );
+        let has_more = messages.len() > limit;
+        if has_more {
+            messages.drain(..messages.len() - limit);
+        }
+        Ok(TimelinePage {
+            next_before: has_more
+                .then(|| messages.first().map(|m| m.id.as_str().to_owned()))
+                .flatten(),
+            next_after: request
+                .before
+                .is_none()
+                .then(|| messages.last().map(|m| m.id.as_str().to_owned()))
+                .flatten(),
+            messages,
+            has_more,
+            as_of: lock(&self.as_of).clone(),
+            ..TimelinePage::default()
+        })
+    }
+
+    async fn fetch_thread_message(
+        &self,
+        _channel: &crate::model::ChannelId,
+        thread_id: &str,
+        message_id: &crate::model::MessageId,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.inner
+            .message(message_id)
+            .filter(|m| Self::in_thread(m, thread_id))
+            .ok_or_else(|| crate::chat::ChatError::Refused("not in that thread".to_owned()))
+    }
+
+    async fn post_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
 /// One call [`CountingChat`] passed on, or answered with a scripted failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CountedCall {
