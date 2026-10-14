@@ -14497,6 +14497,16 @@ function saveCacheChannels() {
 // that shape — so a copy without a thread record is not evidence that the message is on the main
 // channel. `unplaced` holds the ids that arrived that way and that no page has carried since: a
 // reply to one of them waits for a read rather than guessing the main channel.
+//
+// SUCH A COPY IS DRAWN ON MAIN ONLY UNTIL A READ PLACES IT. `#308 live-reply-in-main`. Most of what
+// arrives that way was posted to the channel itself, and drawing it nowhere until a read lands would
+// hold every one of those back for as long as the read takes. But a thread reply arrives that way too,
+// and the read behind it is of the view on screen: Main's carries no thread reply, so the reply stayed
+// in Main and out of its thread until a reload. So the page reads All for every message the stream
+// left unplaced that the read behind it did not place (`placeUnplaced`), and the moment any later copy
+// — that read, a delta, a page of any view, another live copy — names the message's thread, it leaves
+// Main for its thread in every column, the counts and cards with it, and the reader stays where they
+// are reading (`followPlacement`).
 
 /** The selected channel's store. `views` maps a view key to how far back that view is covered. */
 let channelCanon = emptyCanon();
@@ -14505,6 +14515,10 @@ function emptyCanon(channel = "") {
   return {
     channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false,
     scope: null, unplaced: new Set(),
+    // `#308 live-reply-in-main`. By unplaced id, `unplacedArrivals` as its arrival made it — absent for
+    // one saved before a reload — and the unplaced ids a read of All sent after they arrived has
+    // answered for, carried or not (`placeUnplaced`).
+    unplacedSince: new Map(), unplacedAnswered: new Set(),
     // `#203 incremental-refresh`. Whether this channel's forward reads carry edits and deletions:
     // null until one has landed. The backend's property rather than a view's, so it outlives a
     // view's cover being reset by an explicit refresh.
@@ -14866,7 +14880,11 @@ function foldLiveMessage(message, live = false, replayed = false) {
   channelCanon.messages = inTimeOrder(
     [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
   if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
-  else if (!held) channelCanon.unplaced.add(id);
+  else if (!held) {
+    channelCanon.unplaced.add(id);
+    channelCanon.unplacedSince.set(id, ++unplacedArrivals);
+    channelCanon.unplacedAnswered.delete(id);
+  }
   const thread = threadOf(kept);
   const fresh = !held && !replayed && thread !== null && kept.thread.is_root !== true && thread !== channelCanon.scope;
   /** @param {any} record a summary or a root's thread record: its count with this reply, or null */
@@ -18349,11 +18367,14 @@ async function readAllForCounts(channel) {
   countsAllReadAt.set(channel, now);
   countsAllReadInFlight = channel;
   const read = { context: JSON.stringify([channel, "flat", null]), channel, view: "flat", thread: null, canon: channelCanon };
+  const seen = unplacedArrivals;
   try {
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
       { signal }));
     countsAllReadFor.set(channel, outrun);
+    // All's newest page answers for what the stream had left unplaced, as any does. `#308`.
+    if (channelCanon === read.canon) answerUnplaced(read.canon, seen);
     // Not over a newest page of All that landed while this was on the wire — the reader switched to
     // All, or tapped N replies, and that read answered first: this answer is the older, and folded
     // over it would take out as deleted what arrived in between.
@@ -19001,6 +19022,8 @@ async function loadTimeline(options) {
   try {
     for (;;) {
       const path = timelinePath(null, sent, readReasonOf(options));
+      // What the stream had left unplaced when this went out, which a newest page of All answers for.
+      const seenArrivals = unplacedArrivals;
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
@@ -19037,6 +19060,9 @@ async function loadTimeline(options) {
           return;
         }
         landed.push(payload);
+        // `#308 live-reply-in-main`. All's changes, to the last of them, say where every message
+        // they carry is, and that one they do not carry is not new in All.
+        if (view === "flat" && !payload.delta.more) answerUnplaced(canon, seenArrivals);
         if (!current) {
           // Read for a view the reader has since left, or overtaken by a read queued behind it:
           // the store has it, so that view is current from its next showing.
@@ -19075,6 +19101,9 @@ async function loadTimeline(options) {
         return;
       }
       landed.push(payload);
+      // `#308 live-reply-in-main`. All's newest page has said where every message it carries is, and
+      // that one it does not carry is not there to be placed.
+      if (view === "flat" && sameStore()) answerUnplaced(canon, seenArrivals);
       // Under rows drawn from the store, a reader off the newest line keeps their message: the view
       // is walked back to it before anything is drawn, so the list changes once, under them. The
       // message they are on NOW, which the wait for this page gave them time to change. `#277`.
@@ -19633,6 +19662,206 @@ async function placeReplyTarget(entry) {
 function answeredThread(message) {
   const thread = threadOf(message);
   return thread && message.thread.is_root !== true ? thread : null;
+}
+
+// --- placing what the stream left unplaced -------------------------------------------------------
+//
+// `#308 live-reply-in-main`. The owner, 2026-10-14: in a space where a bridge answers him in threads,
+// its threaded answer appeared live in MAIN, opening the thread did not show it, and a reload put it
+// inside the thread. The stream had carried the reply without its thread record, which drew it as a
+// Main row (`unplaced`), and the read behind the arrival was of Main, which never carries a thread
+// reply: a delta of Main left the row where it was, and a newest page of Main took it out of the store
+// without putting it anywhere. Only a read of the thread or of All could place it, and with the chat
+// service slow, none did until the reload read the thread in full.
+//
+// So once the channel's reads go quiet, the messages the stream left unplaced that those reads did not
+// place are placed by ONE read of All, which carries every message with its thread record: what
+// changed in All since its last read where it can be, else its newest page. Folded as a read of All
+// is, it moves each into its thread in every column (`followPlacement`). Not for a channel that is one
+// thread, whose Main holds every message in it, nor while the page is hidden, nor while another read
+// of the channel is on the wire: the read ending asks again. One at a time. A read that fails is asked
+// again when the next read of the channel ends, the poll's at the latest — but not, once one has been
+// given up on, while the server may still be reading for it (`SERVER_READ_BOUND_MS`, `remote-ops-audit`
+// W7), unless a live event since says the service is answering. A read of All that lands — this one,
+// or the reader's own — answers for every unplaced message that arrived before it was sent, carried or
+// not: one it does not carry has nothing there to place it by, and asking again would bring the same
+// answer.
+
+/** How many messages the stream has left unplaced in this page, in any channel: the clock `unplacedSince` reads. */
+let unplacedArrivals = 0;
+/** The channel whose placing read is on the wire, or null. */
+let placingReadInFlight = null;
+/**
+ * The placing read last given up on: its channel, until when the server may still be reading for it,
+ * and `liveNewsSeen` for the channel when it was sent. Null when none holds.
+ *
+ * @type {{channel: string, until: number, news: number} | null}
+ */
+let placingHold = null;
+
+/** The ids the selected channel's stream left unplaced that no read of All has answered for. */
+function unplacedToAsk() {
+  return [...channelCanon.unplaced].filter((id) => !channelCanon.unplacedAnswered.has(id));
+}
+
+/**
+ * A read of All — its newest page, or its changes to the last of them — sent when `unplacedArrivals`
+ * stood at `seen`, landed in store `canon`: it answers for every message left unplaced there that had
+ * arrived by then, whether it carried it or not. What has been placed since is forgotten here.
+ *
+ * @param {any} canon
+ * @param {number} seen
+ */
+function answerUnplaced(canon, seen) {
+  for (const id of [...canon.unplacedSince.keys(), ...canon.unplacedAnswered]) {
+    if (!canon.unplaced.has(id)) {
+      canon.unplacedSince.delete(id);
+      canon.unplacedAnswered.delete(id);
+    }
+  }
+  for (const id of canon.unplaced) {
+    if ((canon.unplacedSince.get(id) || 0) <= seen) canon.unplacedAnswered.add(id);
+  }
+}
+
+/** Whether a placing read given up on in `channel` may still be running at the server, with no live news since. */
+function placingHeld(channel) {
+  if (!placingHold || placingHold.channel !== channel) return false;
+  if (Date.now() >= placingHold.until || (liveNewsSeen.get(channel) || 0) !== placingHold.news) {
+    placingHold = null;
+    return false;
+  }
+  return true;
+}
+
+/** `placeUnplaced`, once the read ending now has drawn what it brought. */
+function queuePlaceUnplaced() {
+  if (!threadingSupported || channelCanon.unplaced.size === 0) return;
+  Promise.resolve().then(placeUnplaced).catch(() => {});
+}
+
+/**
+ * Read All to place what the stream left unplaced and no read has placed since: see above. What changed
+ * in All since its last read, when All has a position this page read recently enough to continue from
+ * (`#203 incremental-refresh`) — behind a bridge that is the cheap read, where All's newest page can be
+ * a scan of the space — and otherwise, or when the server can no longer continue from it, the newest
+ * page. A delta that says more follows is not followed: the newest page is read instead, as a refresh
+ * does past its last delta page. One that no longer continues All's cover — a read of All landed while
+ * it was out — is dropped, and the read that landed has answered for what it carried. A newest page
+ * that lands after the stream has delivered anything since it was sent is dropped too, and asked
+ * again: as the newest page of All it would take that message out of the store as deleted upstream.
+ */
+async function placeUnplaced() {
+  const channel = String(el("discord-channel").value);
+  if (!threadingSupported || !channel || channelCanon.channel !== channel || channelCanon.scope ||
+      placingReadInFlight !== null || discordFetchInFlight || document.visibilityState === "hidden" ||
+      placingHeld(channel)) return;
+  if (unplacedToAsk().length === 0) return;
+  placingReadInFlight = channel;
+  const canon = channelCanon;
+  const all = canon.views.get(viewKey("flat"));
+  let sent = all && all.live && all.newest && Date.now() - (all.fullAt || 0) < TIMELINE_RECONCILE_MS
+    ? all.newest : null;
+  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`;
+  let sentAt = Date.now();
+  let news = liveNewsSeen.get(channel) || 0;
+  let again = false;
+  try {
+    for (;;) {
+      sentAt = Date.now();
+      news = liveNewsSeen.get(channel) || 0;
+      const live = liveEventsSeen.get(channel) || 0;
+      const seen = unplacedArrivals;
+      const path = `${base}${sent ? `&after=${encodeURIComponent(sent)}` : ""}&reason=place`;
+      /** @type {VibeTalk.TimelineResponse} */
+      let payload;
+      try {
+        payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
+      } catch (error) {
+        if (sent && isCursorRefusal(error)) {
+          sent = null;
+          continue;
+        }
+        throw error;
+      }
+      if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return;
+      if (sent && payload.delta) {
+        if (payload.delta.more) {
+          sent = null;
+          continue;
+        }
+        if (!foldTimelineDelta(payload, sent, "flat", null)) return;
+      } else {
+        if ((liveEventsSeen.get(channel) || 0) !== live) {
+          again = true;
+          return;
+        }
+        // Not over a newest page of All that landed while this was on the wire: that answer is the
+        // newer, and it placed whatever it carried.
+        const cover = canon.views.get(viewKey("flat"));
+        if (!(cover && cover.fullAt > sentAt)) foldTimelinePage(payload, false, "flat", null);
+      }
+      answerUnplaced(canon, seen);
+      if (inColumn(columns.main, () => channelView === "flat")) {
+        // On All: what the page says is read is what All's rows show, as for All's own read.
+        noteArchived(payload, false);
+      } else {
+        // Behind another view: All is as current as this read from its next showing.
+        canon.views.get(viewKey("flat")).landedHidden = true;
+      }
+      followPlacement();
+      return;
+    }
+  } catch (error) {
+    // Asked again when the next read of the channel ends: once the server has stopped reading for
+    // this one, when it was given up on.
+    if (error && /** @type {any} */ (error).timedOut) placingHold = { channel, until: sentAt + SERVER_READ_BOUND_MS, news };
+  } finally {
+    placingReadInFlight = null;
+    if (again) queuePlaceUnplaced();
+  }
+}
+
+/**
+ * Draw each column showing the channel's messages from the store again where the store no longer
+ * holds what it shows: a message moved into its thread (`#308 live-reply-in-main`), or a read of All
+ * behind it corrected a row. As a refresh that keeps the reader's place draws (`#280 scroll-stability`):
+ * the reader stays on the message they are reading, or on the newest line, and the jump to the newest
+ * is offered only for a message newer than any the column showed — a message leaving Main for its
+ * thread is not news there. Main's counts, the thread picker, the cards and an open Reply follow.
+ */
+function followPlacement() {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  eachColumn(() => {
+    const projected = channelView === "threads" ? null : projectView();
+    if (!projected) return;
+    const drawn = timelineMessages;
+    if (projected.length === drawn.length && projected.every((message, at) => message === drawn[at])) {
+      syncUnreadReplies();
+      return;
+    }
+    const area = el("scroll-area");
+    const position = channelReadPosition(area);
+    const newestAt = timeOf(drawn[drawn.length - 1], "timestamp");
+    timelineMessages = projected;
+    renderCachedTimeline();
+    const keeps = readFilterKeeps();
+    const shown = timelineMessages.filter((message) => !hidingRead() || keeps(message));
+    const newestNow = timeOf(shown[shown.length - 1], "timestamp");
+    const newer = newestNow > newestAt;
+    settleAfterRead(shown, { keepPosition: true, area, ...position, ownAct: !newer });
+    // What left from under the newest line was counted on the jump as it arrived: it is not there now.
+    const kept = new Set(projected.map((message) => String(message.id)));
+    const gone = drawn.filter((message) => !kept.has(String(message.id)) &&
+      !(timeOf(message, "timestamp") <= newestNow)).length;
+    const counted = jumpNewestWanted.discord;
+    if (!newer && gone > 0 && typeof counted === "number") {
+      jumpNewestWanted.discord = counted > gone ? counted - gone : false;
+      renderScrollTools();
+    }
+  });
+  inColumn(columns.main, renderChannelNavigation);
+  saveChannelScope();
 }
 
 /**
@@ -34481,6 +34710,9 @@ async function finishDiscordLoad(column = activeColumn) {
     return;
   }
   inColumn(column, () => renderChannelLoading(false));
+  // The channel's reads have gone quiet: what the stream left unplaced and they did not place is
+  // read for now. `#308 live-reply-in-main`.
+  queuePlaceUnplaced();
 }
 
 /** Whether a completed read still describes the channel and mode currently selected. */
@@ -35341,6 +35573,12 @@ function onStreamFrame(frame) {
     noteLiveEvent(about, payload.from_tail === true);
   }
   if (frame.event === "message_update" || frame.event === "message_delete") {
+    // `#308 live-reply-in-main`. An edit is a copy too: one that names the thread of a message the
+    // store holds without one places it at once, whatever the read below brings.
+    if (threadingSupported && frame.event === "message_update" && VibeTalkContract.is("LiveMessageEvent", payload) &&
+        placesHeld(payload.message)) {
+      placeFromEdit(payload.message);
+    }
     // An edit or removal out of the replay tail is on every page read begun after the attach, so
     // it waits for such a read rather than making its own. The page's copy of the message says
     // nothing about which edit it has seen, so no page can answer for it sooner.
@@ -35447,10 +35685,13 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // make every message look already held. A held message is already in the view drawn from the
     // store, or deliberately not when the to-do filter hides it, so it is not appended again.
     const held = replayed ? heldMessage(message.id) : null;
+    // `#308 live-reply-in-main`. A copy naming the thread of a message the store holds without one
+    // places it, replayed or not: it leaves Main for its thread now, not at the next read that can say.
+    const places = placesHeld(message);
     if (document.hidden) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
-      if (!held) {
+      if (!held || places) {
         foldLiveMessage(message, true, replayed);
         liveArrivedHidden = true;
         followReplyStore();
@@ -35472,7 +35713,10 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
       appendToColumns(message, true, replayed);
       followLiveArrival(pinned);
       followReplyStore();
+    } else if (places) {
+      foldLiveMessage(message, true, replayed);
     }
+    if (places) followPlacement();
     renderOutgoingEverywhere();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
@@ -35561,6 +35805,32 @@ function heldMessage(id) {
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
   return channelCanon.messages.find((held) => String(held.id) === String(id)) || null;
+}
+
+/**
+ * Whether `message`, a copy from the stream, names the thread of a message the selected channel's
+ * store holds without one: the copy that places it. `#308 live-reply-in-main`.
+ */
+function placesHeld(message) {
+  if (!threadOf(message) || String(message.channel_id) !== String(el("discord-channel").value)) return false;
+  const held = heldMessage(message.id);
+  return held !== null && !threadOf(held);
+}
+
+/**
+ * An edit from the stream whose copy names the thread of a message the store holds without one: that
+ * record is the store's from now on, and the message moves into its thread (`followPlacement`). Only
+ * the record. What the message says is still the read's to bring, as for every edit. `#308`.
+ *
+ * @param {any} message
+ */
+function placeFromEdit(message) {
+  const id = String(message.id);
+  channelCanon.messages = channelCanon.messages.map((held) =>
+    String(held.id) === id ? { ...held, thread: message.thread } : held);
+  channelCanon.unplaced.delete(id);
+  if (document.hidden) liveArrivedHidden = true;
+  else followPlacement();
 }
 
 /**
