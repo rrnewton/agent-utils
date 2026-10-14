@@ -60,9 +60,8 @@ struct Inventory {
 struct NativePage {
     /// The page as [`HttpDiscordClient::native_messages`] answers it.
     messages: Vec<Message>,
-    /// How many rows Discord answered, a starter whose root is gone included.
-    rows: usize,
-    /// The newest snowflake among those rows.
+    /// The newest snowflake among the rows Discord answered, a starter whose root is gone
+    /// included.
     newest: Option<u64>,
 }
 
@@ -653,8 +652,8 @@ impl HttpDiscordClient {
             .messages)
     }
 
-    /// [`Self::native_messages`], with what Discord itself answered: how many rows, and the
-    /// newest snowflake among them, before a starter whose root is gone was left out.
+    /// [`Self::native_messages`], with the newest snowflake Discord itself answered, read before a
+    /// starter whose root is gone was left out.
     async fn native_page(
         &self,
         channel: &ChannelId,
@@ -727,11 +726,7 @@ impl HttpDiscordClient {
             }
             messages.push(message);
         }
-        Ok(NativePage {
-            messages,
-            rows: raw.len(),
-            newest,
-        })
+        Ok(NativePage { messages, newest })
     }
 
     pub(super) async fn native_probe(
@@ -1154,9 +1149,11 @@ impl HttpDiscordClient {
     ///
     /// Snowflakes order as messages were sent, so ids near each other are one page: `after` the
     /// snowflake before the oldest asked, up to 100. That page holds every message from the oldest
-    /// asked up to the newest it returned, and every later one too when it came back short of a
-    /// full page, so an id in that stretch is on it or proved absent. Any other id is one
-    /// `GET .../messages/{id}`, and absent only when Discord answers Unknown Message (code 10008).
+    /// asked up to the newest row it returned, so an id in that stretch is on it or proved absent.
+    /// A page short of 100 proves nothing past its newest row: Discord answers an empty history
+    /// to a bot without Read Message History, where the same id asked alone is refused. Any other
+    /// id is one `GET .../messages/{id}`, and absent only when Discord answers Unknown Message
+    /// (code 10008), so an id past the page costs a request of its own only when it was not on it.
     /// A thread is checked against the channel once, for every id; its root, which may live in
     /// the parent channel, is never proved absent by the page and is looked up on its own when the
     /// page did not have it. One id is one request (two in a thread), as a lookup of one always was.
@@ -1184,17 +1181,15 @@ impl HttpDiscordClient {
         if let [first, _, ..] = numbers.as_slice() {
             let after = first.saturating_sub(1).to_string();
             let limit = super::DISCORD_MAX_LIMIT;
+            // `reached` is the newest row Discord answered, and never more, however short the
+            // page: Discord answers an empty history to a bot without Read Message History, so a
+            // short page proves nothing about what lies past its newest row.
             let (messages, reached) = match &verified {
                 Some(thread) => {
                     let page = self
                         .native_page(channel, Some(thread), None, Some(&after), limit)
                         .await?;
-                    let reached = if page.rows < usize::from(limit) {
-                        u64::MAX
-                    } else {
-                        page.newest.unwrap_or(0)
-                    };
-                    (page.messages, reached)
+                    (page.messages, page.newest.unwrap_or(0))
                 }
                 None => {
                     let value = self
@@ -1213,15 +1208,11 @@ impl HttpDiscordClient {
                     {
                         return Err(shape("message history returned a different channel"));
                     }
-                    let reached = if messages.len() < usize::from(limit) {
-                        u64::MAX
-                    } else {
-                        messages
-                            .iter()
-                            .filter_map(|message| message.id.as_str().parse::<u64>().ok())
-                            .max()
-                            .unwrap_or(0)
-                    };
+                    let reached = messages
+                        .iter()
+                        .filter_map(|message| message.id.as_str().parse::<u64>().ok())
+                        .max()
+                        .unwrap_or(0);
                     (messages, reached)
                 }
             };
@@ -3221,14 +3212,14 @@ mod tests {
             .fetch_messages(
                 &channel,
                 Some("201"),
-                &lookup_ids(&["904", "902", "909", "904"]),
+                &lookup_ids(&["904", "902", "903", "904"]),
             )
             .await
             .expect("lookup");
         assert_eq!(
             answers.iter().map(outcome).collect::<Vec<_>>(),
-            ["found 904", "found 902", "absent", "found 904"],
-            "a page short of 100 holds everything after the oldest asked"
+            ["found 904", "found 902", "found 903", "found 904"],
+            "the page holds everything from the oldest asked up to its newest row"
         );
         let crate::chat::Lookup::Found(found) = &answers[0] else {
             unreachable!()
@@ -3245,8 +3236,114 @@ mod tests {
                 "GET /channels/201",
                 "GET /channels/201/messages?limit=100&after=901"
             ],
-            "the thread checked once and one page, where one at a time was six requests"
+            "the thread checked once and one page, where one at a time was eight requests"
         );
+    }
+
+    /// Fix round 1 of remote-ops-audit W11 `#287 bulk-reads`: a page short of 100 is not the end of
+    /// the thread. An id past its newest row is asked on its own, and is found when Discord has
+    /// it, as it was when looked up alone.
+    #[tokio::test]
+    async fn native_lookups_ask_for_an_id_past_a_short_page_on_its_own() {
+        let mut routes = Replies::new();
+        ok(&mut routes, "/channels/201", thread("201", "909", "100"));
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=100&after=901",
+            json!([message("201", "902", "b")]),
+        );
+        ok(
+            &mut routes,
+            "/channels/201/messages/909",
+            message("201", "909", "exists"),
+        );
+        routes.insert(
+            "GET /channels/201/messages/911".into(),
+            unknown_message_reply(),
+        );
+        let paged = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        let answers = paged
+            .client
+            .fetch_messages(&channel, Some("201"), &lookup_ids(&["902", "909", "911"]))
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found 902", "found 909", "absent"],
+            "only Unknown Message proves an id past the page's newest row absent"
+        );
+        assert_eq!(
+            *paged.seen.lock().expect("seen"),
+            [
+                "GET /channels/201",
+                "GET /channels/201/messages?limit=100&after=901",
+                "GET /channels/201/messages/909",
+                "GET /channels/201/messages/911"
+            ]
+        );
+
+        // The channel's own messages read the same way.
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/channels/100/messages?limit=100&after=849",
+            json!([message("100", "850", "one")]),
+        );
+        ok(
+            &mut routes,
+            "/channels/100/messages/860",
+            message("100", "860", "exists"),
+        );
+        let main = mock(routes, ThreadApi::Native).await;
+        let answers = main
+            .client
+            .fetch_messages(&channel, None, &lookup_ids(&["850", "860"]))
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found 850", "found 860"]
+        );
+    }
+
+    /// Fix round 1 of remote-ops-audit W11 `#287 bulk-reads`: Discord answers an empty history to a
+    /// bot without Read Message History. That proves no id absent: two ids fail with Discord's
+    /// refusal exactly as one id alone does, rather than come back absent.
+    #[tokio::test]
+    async fn an_empty_history_proves_no_id_absent() {
+        for thread_id in [Some("201"), None] {
+            let physical = thread_id.unwrap_or("100");
+            let mut routes = Replies::new();
+            ok(&mut routes, "/channels/201", thread("201", "903", "100"));
+            ok(
+                &mut routes,
+                &format!("/channels/{physical}/messages?limit=100&after=901"),
+                json!([]),
+            );
+            for id in ["902", "903"] {
+                routes.insert(
+                    format!("GET /channels/{physical}/messages/{id}"),
+                    (
+                        StatusCode::FORBIDDEN,
+                        json!({"message": "Missing Access", "code": 50001}),
+                    ),
+                );
+            }
+            let discord = mock(routes, ThreadApi::Native).await;
+            let channel = ChannelId("100".into());
+            for asked in [vec!["902"], vec!["902", "903"]] {
+                let error = discord
+                    .client
+                    .fetch_messages(&channel, thread_id, &lookup_ids(&asked))
+                    .await
+                    .expect_err("an empty history proves nothing");
+                assert!(
+                    matches!(error.cause(), ChatError::Status { status: 403, .. }),
+                    "{asked:?} in {thread_id:?}: {error}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

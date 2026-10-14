@@ -2113,10 +2113,12 @@ views show thread roots; open a thread to post in these thread-only containers.
 The native backend looks several messages up by id itself (speech preparation of a thread, a
 thread summary's parts, a message by id): ids near each other are one `after=` page from the
 oldest asked, and the thread is checked once for all of them, so eight replies of a thread cost two
-requests rather than sixteen. An id past that page is one request of its own; a message is reported
-gone only when it falls inside the page's stretch or Discord answers Unknown Message (code 10008),
-and a thread's root, which may live in the parent channel, is never reported gone by a page of its
-replies.
+requests rather than sixteen. The page's stretch runs from the oldest id asked to the newest row
+the page returned, however short the page: Discord answers an empty history to a bot without Read
+Message History, so a short page is never taken for the end of the thread. An id past that stretch
+is one request of its own; a message is reported gone only when it falls inside the stretch or
+Discord answers Unknown Message (code 10008), and a thread's root, which may live in the parent
+channel, is never reported gone by a page of its replies.
 
 It also reads the newest message of several channels at once from Discord's own channel lists
 (`ChatClient::channel_heads`, remote-ops-audit W12): a channel's `last_message_id`, from
