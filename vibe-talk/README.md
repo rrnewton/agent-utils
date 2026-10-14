@@ -7255,6 +7255,10 @@ post the agent makes — **`(Voice-agent relayed, from user) `** by default, tra
   Send or a spoken yes — restates it and posts exactly it. A commit does not pass through
   `voice_post`, so it is never tagged twice.
 * **A direct send** with confirmation off posts the tagged text, and `SENT.` quotes it.
+* **The record of a send** is the tagged text too: the post gate's send memory files the text that
+  went, so the frozen card a send leaves in the transcript, the `sent` row kept for it and the
+  recap a resumed call is handed all quote the tag with the words (`#270 voice-transcript-markers`).
+  A partial send's record is its parts that went, the tag at the start of the first.
 * **A reply** carries it, whichever way the provider threads replies.
 * **A long post** is cut after tagging, so the tag counts toward the provider's `max_post_bytes` /
   `max_post_chars` and goes on the first part only (`#263 post-split-per-provider`).
