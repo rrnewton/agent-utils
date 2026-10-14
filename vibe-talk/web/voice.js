@@ -15878,8 +15878,11 @@ async function refreshThreadDirectory() {
   const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
   // `#203 incremental-refresh`. With the thread list's forward cursor, only the threads that moved,
   // under the same rule as the poll's: a list a complete delta keeps current needs no full read.
+  // `#278 page-live-reads`: and where the adapter pushes, a list owed a read is read in full unless
+  // its deltas are complete, as every view is (`forwardCursor`).
   const cover = channelCanon.channel === channel ? channelCanon.views.get(viewKey("threads")) : null;
-  let sent = cover && cover.live && cover.newest && channelCanon.complete !== false &&
+  const owedInFull = channelCanon.complete !== true && liveDelivery === "push" && liveOwes(viewKey("threads"));
+  let sent = cover && cover.live && cover.newest && channelCanon.complete !== false && !owedInFull &&
     Date.now() - (cover.fullAt || 0) < TIMELINE_RECONCILE_MS ? cover.newest : null;
   try {
     let payload;
@@ -17388,6 +17391,18 @@ const isMutationKey = (key) => key.startsWith("message_update:") || key.startsWi
  * deltas carry: an edit or deletion needs a complete one. A queued read standing for several
  * triggers carries all their reasons, and is a delta only if every one of them could be.
  *
+ * NOR, WHERE THE ADAPTER PUSHES, A VIEW OWED A READ (`liveOwes`) ON A CHANNEL WHOSE DELTAS ARE NOT
+ * COMPLETE. What the stream left unsaid is a reply it did not place, or a count it did not give, and
+ * an additions-only delta carries neither: of Main, only the main-channel rows created since, never a
+ * reply or a root whose count moved. Taken as the owed read, it left a bridge reply drawn on Main and
+ * uncounted until the fifteen-minute reconcile. Such a delta answers nothing now (`noteViewAnswered`),
+ * so the poll would come at forty-five seconds for it, in full, as it came before `#278
+ * page-live-reads`; the owed read is made in full instead, which places the reply at once and spares
+ * that poll — and a generic delta costs the server a newest read anyway (`generic_since`). Attached
+ * or not: coming back to a page hidden long enough to let the stream go reads before the stream is
+ * back. Where the server polls its provider the page polls at forty-five seconds anyway, and a live
+ * arrival reads what changed, as it did before.
+ *
  * @param {string | (string | undefined)[] | undefined} reason
  * @returns {string | null}
  */
@@ -17402,6 +17417,7 @@ function forwardCursor(reason) {
   if (!cover || !cover.live || !cover.newest) return null;
   if (Date.now() - (cover.fullAt || 0) >= TIMELINE_RECONCILE_MS) return null;
   const complete = channelCanon.complete;
+  if (complete !== true && liveDelivery === "push" && liveOwes()) return null;
   if (reason === "mutation") return complete === true ? cover.newest : null;
   if (reason === "replay") return complete === true || !mutationAwaitsRead() ? cover.newest : null;
   if (complete === false && reason !== "live" && reason !== "visible") return null;
@@ -32090,10 +32106,17 @@ function readColumnsAfterGap(reason) {
  * A read of a view landed and was folded into its cover: what the stream left unsaid before that
  * read was sent is answered. A read with no send count recorded (`liveSentEpochs`) answers nothing.
  *
+ * NOR DOES A DELTA THAT IS NOT COMPLETE. What it carries are the rows created in the view since its
+ * cursor; a reply the stream did not place, in a thread the view does not show, and its root's count
+ * are not among them. Only a newest page, or a delta carrying every change, answers. A view owed a
+ * read is read in full on such a channel (`forwardCursor`); this is for one that was not owed when
+ * its read went out, and a mark that came after it with an older epoch (a replay from the tail).
+ *
  * @param {any} cover
- * @param {object} payload
+ * @param {any} payload
  */
 function noteViewAnswered(cover, payload) {
+  if (payload.delta && payload.delta.complete !== true) return;
   const sent = liveSentEpochs.get(payload);
   if (typeof sent === "number" && sent > (cover.seen || 0)) cover.seen = sent;
 }

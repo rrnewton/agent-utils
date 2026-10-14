@@ -3084,6 +3084,14 @@ adapter's catch-up, owes every view it may have changed, since the page takes it
 did to its thread's counts; an edit or removal from that tail owes every view, since it does not
 say which thread its message is in.
 
+Only a newest page, or a delta that carries every change, answers such a read. Where a channel's
+deltas carry additions only — every backend without a change record, the Google Chat bridge's
+today — a delta of Main brings the main-channel messages created since, never a reply in a thread
+or a root whose count moved, so behind a pushed stream an owed read is made in full: a reply the
+stream did not place is placed and counted by that one read, which costs the server what the delta
+would have (it reads the newest page either way). A delta that went out before the view was owed
+answers nothing, and the forty-five-second poll reads the view in full.
+
 While an adapter's pushed stream is attached the poll waits fifteen minutes instead of forty-five
 seconds, since the stream carries every creation, edit and removal. It goes back to forty-five
 seconds when the stream drops; when the last read of either column failed, whether or not any rows

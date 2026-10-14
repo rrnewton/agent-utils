@@ -52273,3 +52273,134 @@ test("`#278 page-live-reads`: a placed reply removed while a read sent before it
   assert.equal(threadBadge(rowWithId(page, "201")).textContent, "Thread(1)",
     `Main's root says ${threadBadge(rowWithId(page, "201")).textContent}: the read cut before the removal had the last word`);
 });
+
+// --- `#278 page-live-reads`, fourth review: what the stream changed is shown where the page before
+// #278 showed it within forty-five seconds
+//
+// Gaps the fifteen-minute poll left. A delta of a channel whose deltas carry additions only — the
+// Google Chat bridge's today, behind its pushed stream — was taken as answering the read a reply
+// the stream did not place had owed, when it carries no reply and no root whose count moved. Each
+// test below fails on 8eb312bc's page; those named PROBE are the reviewer's probes, and the others
+// reach the same gaps another way.
+
+/**
+ * A reply into the first thread (root 201) as the server comes to hold it — its root and its
+ * thread's summary counting it, its thread's activity moved — returned to be delivered as the test
+ * chooses: whole, or as the bridge's stream carries it today (`bareOf`).
+ */
+function postReplyInFirst(page, server, id, content = `bridge reply ${id}`) {
+  const root = page.messages.find((m) => m.id === "201");
+  const reply = server.post(message({ id, content, thread: { ...root.thread, is_root: false } }));
+  root.thread.reply_count += 1;
+  server.edit("201", {});
+  page.threads = page.threads.map((t) => (t.id === root.thread.id
+    ? { ...t, reply_count: root.thread.reply_count, updated_at: reply.timestamp } : t));
+  server.threadChanged.set(root.thread.id, ++server.revision);
+  return reply;
+}
+
+/** The count on Main's first root, and whether reply `id` is drawn on Main as if it were a message there. */
+const mainShows = (page, id) => `${threadBadge(rowWithId(page, "201")).textContent}:${shownIds(page).includes(id) ? "onMain" : "placed"}`;
+
+test("`#278 page-live-reads`: on a channel whose deltas carry additions only, a reply the stream does not place is placed and counted on Main by the one read it owes, in full (PROBE-G1b)", async () => {
+  /** Main as the reply's read lands, and a minute on; and which reads it cost, delta or full. */
+  const run = async (script) => {
+    const { page, server } = await pushedPage({ complete: false }, script);
+    const reply = postReplyInFirst(page, server, "600");
+    const reads = server.reads.length;
+    await deliver(page, page.stream(), sseMessage(bareOf(reply)));
+    await page.settle();
+    await page.settle();
+    const atOnce = mainShows(page, "600");
+    await healthyWalk(page, 60000);
+    return { atOnce, minute: mainShows(page, "600"), kinds: forwardReadKinds(server, reads) };
+  };
+  const { atOnce, minute, kinds } = await run(SCRIPT);
+  assert.equal(minute, "Thread(2):placed",
+    `a minute after the reply Main shows ${minute}: an additions-only delta was taken as placing it`);
+  assert.equal(atOnce, "Thread(2):placed", `the read the reply owed left Main showing ${atOnce}`);
+  assert.deepStrictEqual(kinds, [false], "the reply was not read once, in full");
+  // THE CONTROL: the owed read made as what changed. It places nothing, and answers nothing, so the
+  // poll comes at forty-five seconds and reads in full: placed, a read later.
+  const control = await run(brokenScript("  if (complete !== true && liveDelivery === \"push\" && liveOwes()) return null;\n", ""));
+  assert.equal(control.atOnce, "Thread(1):onMain", "the control placed the reply at once, so this test cannot tell");
+  assert.deepStrictEqual(control.kinds, [true, false], "the control's poll did not read in full behind its delta");
+  assert.equal(control.minute, "Thread(2):placed", "the control's poll did not place the reply");
+});
+
+test("`#278 page-live-reads`: on a channel whose deltas carry additions only, a reply the stream does not place while the page is hidden is placed and counted by the read coming back makes (PROBE-G5)", async () => {
+  // Away twenty seconds, and long enough for the page to let the stream go: either way, the read on
+  // coming back is in full and places the reply, and nothing is read for it after that.
+  for (const away of [20000, sourceConstant("LIVE_HIDDEN_CLOSE_MS") + 30000]) {
+    const { page, server } = await pushedPage({ complete: false });
+    await page.setVisibility("hidden");
+    const reply = postReplyInFirst(page, server, "601");
+    await deliver(page, page.stream(), sseMessage(bareOf(reply)));
+    await page.settle();
+    await passTime(page, away);
+    assert.equal(page.pure("liveAttached"), away < sourceConstant("LIVE_HIDDEN_CLOSE_MS"),
+      `away ${away / 1000} s: the stream is ${page.pure("liveAttached") ? "still" : "not"} attached, so this proves nothing`);
+    const reads = server.reads.length;
+    await page.setVisibility("visible");
+    await page.settle();
+    await page.settle();
+    await page.settle();
+    assert.equal(mainShows(page, "601"), "Thread(2):placed",
+      `away ${away / 1000} s: coming back left Main showing ${mainShows(page, "601")} (reads ${JSON.stringify(server.reads.slice(reads))})`);
+    await healthyWalk(page, 120000);
+    assert.equal(mainShows(page, "601"), "Thread(2):placed", `away ${away / 1000} s: two minutes on, Main shows ${mainShows(page, "601")}`);
+    assert.deepStrictEqual(forwardReadKinds(server, reads), [false], `away ${away / 1000} s: the reply was not read once, in full`);
+  }
+});
+
+test("`#278 page-live-reads`: on a channel whose deltas carry additions only, every reply the stream does not place is counted on Main, in two columns with another thread open on the right (PROBE-G7)", async () => {
+  const { page, server } = await twoColumnServer((p) => {
+    p.liveDelivery = "push";
+    p.livePollSeconds = 0;
+  });
+  server.complete = false;
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "the second thread is not open on the right");
+  const first = postReplyInFirst(page, server, "610");
+  await deliver(page, page.stream(), sseMessage(bareOf(first)));
+  await page.settle();
+  await healthyWalk(page, 90000);
+  assert.equal(mainShows(page, "610"), "Thread(2):placed", "the first reply was not placed and counted on Main");
+  const second = postReplyInFirst(page, server, "611");
+  const calls = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseMessage(bareOf(second)));
+  await page.settle();
+  await healthyWalk(page, 90000);
+  assert.equal(mainShows(page, "611"), "Thread(3):placed",
+    `90 s after the second reply Main shows ${mainShows(page, "611")}, read ${page.timelineCalls.slice(calls).map((path) => path.replace(/^.*\?/, ""))}`);
+  assert.deepStrictEqual(sideIds(page), ["203", "204"], "a reply into the first thread was drawn in the second");
+});
+
+test("`#278 page-live-reads`: an additions-only delta sent before a reply replayed from the tail does not answer for it: the poll reads Main in full and places it", async () => {
+  /** Main once a reconnect's delta has landed and a reply the stream never placed is replayed from its tail. */
+  const run = async (script) => {
+    const { page, server } = await pushedPage({ complete: false }, script);
+    // An event the stream will resume from: placed, so it costs no read.
+    const said = server.post(message({ id: "620", content: "said before the drop" }));
+    await deliver(page, page.stream(), sseMessage(said, { thread_facts: placedFacts(said) }));
+    await page.settle();
+    page.stream().drop();
+    await page.settle();
+    const reply = postReplyInFirst(page, server, "621");
+    const reads = server.reads.length;
+    page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+    await page.settle();
+    await page.settle();
+    assert.equal(page.streamOpens.at(-1).lastEventId, "620", "the reconnect did not resume, so this proves nothing");
+    assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "the reconnect's poll was not a delta, so this proves nothing");
+    await deliver(page, page.stream(), sseMessage(bareOf(reply), { replayed: true, from_tail: true }));
+    await page.settle();
+    await healthyWalk(page, 60000);
+    return mainShows(page, "621");
+  };
+  assert.equal(await run(SCRIPT), "Thread(2):placed", "an additions-only delta was taken as placing a reply it does not carry");
+  // THE CONTROL: any delta answers, as on 8eb312bc.
+  assert.equal(await run(brokenScript("  if (payload.delta && payload.delta.complete !== true) return;\n", "")), "Thread(1):onMain",
+    "the control placed the reply anyway, so this test cannot see it left");
+});
