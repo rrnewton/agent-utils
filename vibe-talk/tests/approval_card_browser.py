@@ -125,6 +125,10 @@ if TYPE_CHECKING:
 TOKEN = "write-token-browser-approval-card-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
            "added": False}
+# What a server since `#303 voice-post-prefix` puts in front of every draft the voice agent proposes,
+# by default. Every draft here carries it, as a real one does: the card shows it, Send restates it,
+# and the frozen card keeps it, because it is part of what is posted.
+POST_PREFIX = "(Voice-agent relayed, from user) "
 SHORT_DRAFT = "on it, back in ten"
 LONG_DRAFT = ("The release notes for this week, as agreed: the runner fix landed, the cache keys are "
               "versioned, and the nightly is green on every target. ") * 11
@@ -198,7 +202,6 @@ class FakeApi:
             "read_aloud": {"backend": "browser", "label": "Browser voice", "playback": "browser",
                            "local_only": True},
             "token_scope": "write",
-            "elevenlabs_agent_id": None,
             "conversational_voice": {"name": "Test voice provider"},
             "replay_enabled": self.replay,
             "self_author_id": None,
@@ -463,6 +466,9 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 proposal = api.settle()
                 if proposal is None or body.get("handle") != proposal["handle"]:
                     self.json(409, {"error": "proposal_used", "detail": "already settled"})
+                elif body.get("text") != proposal["text"]:
+                    # As the server's gate refuses it: the words confirmed are not the words proposed.
+                    self.json(409, {"error": "proposal_mismatch", "detail": "the text differs"})
                 else:
                     message = channel_message(99, "bot", str(proposal["text"]))
                     if api.deliver_posts:
@@ -487,8 +493,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(204, {})
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (web_root / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (web_root / relative).resolve()
             if web_root not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -652,8 +658,10 @@ def open_call(page: Page, url: str, voice: FakeVoice, api: FakeApi, rows: int, b
 
 
 def propose(page: Page, api: FakeApi, serial: int, text: str) -> None:
+    """The voice agent proposes `text`, which the server holds tagged (`#303 voice-post-prefix`)."""
     api.propose({"serial": serial, "handle": f"hAnDlE-browser-check-{serial:04d}", "channel_id": CHANNEL["id"],
-                 "channel_name": "lead team", "text": text, "reply_to": None, "expires_in_ms": 120_000})
+                 "channel_name": "lead team", "text": POST_PREFIX + text, "prefix": POST_PREFIX,
+                 "reply_to": None, "expires_in_ms": 120_000})
     page.locator("#post-confirm").wait_for(state="visible", timeout=10_000)
 
 
@@ -949,7 +957,7 @@ def frozen_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tupl
     check(api.log == ["commit", f"claim {api.sends_through}"],
           f"{where}: the server saw {api.log}, not the commit and then the claim of its send")
     text = str(frozen["text"])
-    for said in ("Sent to lead team", "approved by tap", SHORT_DRAFT):
+    for said in ("Sent to lead team", "approved by tap", POST_PREFIX + SHORT_DRAFT):
         check(said in text, f"{where}: the frozen card does not say {said!r}: {text!r}")
     for side in ("left", "right"):
         check(abs(rect(frozen["card"], side) - rect(frozen["mine"], side)) <= 1,
@@ -2053,7 +2061,7 @@ def main() -> int:
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     try:
         with sync_playwright() as playwright:
             lines = [walk(playwright.chromium, args, url, api, size) for size in PHONES]

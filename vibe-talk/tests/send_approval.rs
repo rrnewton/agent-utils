@@ -784,7 +784,8 @@ async fn a_direct_send_is_published_in_the_send_memory_with_the_door_it_came_thr
     assert_eq!(status, StatusCode::OK, "{polled}");
     let sends = polled["sends"].as_array().expect("sends");
     assert_eq!(sends.len(), 2, "{polled}");
-    assert_eq!(sends[0]["text"], "rebase onto main");
+    // The text that went, the owner's tag in front. `#303 voice-post-prefix`.
+    assert_eq!(sends[0]["text"], format!("{TAG}rebase onto main"));
     assert_eq!(sends[0]["detail"]["how"], "direct");
     assert_eq!(sends[0]["detail"]["origin"], "mcp");
     assert_eq!(sends[1]["detail"]["origin"], "rest");
