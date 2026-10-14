@@ -10673,7 +10673,18 @@ function markCardBesideReply() {
  */
 const POST_ROOM_KEEP_MS = 1000;
 
-/** Make room for the card on the main screen while one is up, and keep it a moment after. */
+/**
+ * Make room for the card on the main screen while one is up, and keep it a moment after.
+ *
+ * `#280 scroll-stability`. The room given back is the box at the foot of the list growing — in Chromium
+ * the channel's from 90px to 192px — and the reader is held through it as through any other change the
+ * page makes to the list (`holdingReader`): one on the newest line stays on it, and anyone else on the
+ * row they are reading. Left to the browser, a reader at the foot of Main or All was left 142px above it
+ * with the jump up, and no longer followed the channel, whenever the list was redrawn in the second
+ * before: the message the card sent arriving by the live feed, a re-read, the poll. Chromium's own scroll
+ * anchoring is what held them otherwise, and with it turned off (`overflow-anchor: none`), as in a browser
+ * that has none, they were left there every time the card went.
+ */
 function holdDraftRoom(shown) {
   const main = leftEl("screen-main");
   if (postWatch.roomTimer !== null) {
@@ -10685,7 +10696,7 @@ function holdDraftRoom(shown) {
   } else if (main.hasAttribute("data-draft")) {
     postWatch.roomTimer = setTimeout(() => {
       postWatch.roomTimer = null;
-      if (postWatch.shown === null) main.toggleAttribute("data-draft", false);
+      if (postWatch.shown === null) holdingReader(() => main.toggleAttribute("data-draft", false));
     }, POST_ROOM_KEEP_MS);
   }
 }
@@ -10694,6 +10705,12 @@ function holdDraftRoom(shown) {
  * The card went with the focus inside it. A reader on a touch screen gets it on the list, never on
  * the message box: focusing a text field from a tap opens the phone's keyboard over half the screen.
  * One using the keys or a mouse gets the box of the list on screen, where typing goes on.
+ *
+ * `#280 scroll-stability`. The box opens to its typing height as it takes the focus, while the room
+ * made for the card is still kept (`holdDraftRoom`): in Chromium 42px more at the foot of the list.
+ * The reader is held through that as through the room given back. Left to the browser, a reader at the
+ * foot with the focus on More was left 42px above it, and then 142px once the room came back, wherever
+ * its scroll anchoring could not hold them: turned off, or with the screen showing only the card.
  */
 function parkFocusOffCard() {
   // The card froze into a row of the transcript: the focus goes with it. `#270`.
@@ -10716,7 +10733,7 @@ function parkFocusOffCard() {
   const target = drawnBy()
     ? leftEl(currentView === "discord" ? "channel-compose-text" : "compose-text")
     : leftEl("scroll-area");
-  target.focus({ preventScroll: true });
+  holdingReader(() => target.focus({ preventScroll: true }));
 }
 
 /** Whether the card is up in the list on screen and below what it shows. */
@@ -18291,6 +18308,14 @@ function rememberChannelContext() {
  * The channel rows on screen, top to bottom — each one's message ids and the height its row stands
  * at — and whether the reader is on the newest line: the place a switch between Main and All keeps.
  * `#220 view-switch-instant`.
+ *
+ * `#269 approval-card-inline` x `#280 scroll-stability`. And, where the screen shows no row at all but
+ * the send card at the foot of the channel's list, the height the card stands at (`card`, else null):
+ * that reader's place. A long draft opened by More is taller than a phone's list — in Chromium 907px in
+ * a list 739px tall — and a reader 40px up its foot, Send on screen and nothing else, was read as
+ * nowhere: Cmd+3 and Esc brought them back 995px above the foot, the card 919px lower and Send off
+ * screen, and one 200px up was taken to the foot. Only there: a reader who can see a row is on that row,
+ * as before, card or no card.
  */
 function readerPlace() {
   const area = el("scroll-area");
@@ -18302,13 +18327,32 @@ function readerPlace() {
     .map((row) => ({ row, box: row.getBoundingClientRect() }))
     .filter(({ box }) => box.bottom > top && box.top < bottom)
     .map(({ row, box }) => ({ ids: idsOf(row), top: box.top }));
-  return { pinned: currentView === "discord" && atBottom(area), seen };
+  const card = seen.length === 0 ? channelCard() : null;
+  const box = card ? card.getBoundingClientRect() : null;
+  return {
+    pinned: currentView === "discord" && atBottom(area),
+    seen,
+    card: box && box.bottom > top && box.top < bottom ? box.top : null,
+  };
+}
+
+/**
+ * The send card where it is the next message of the channel's list in the column being worked on, else
+ * null. `#269 approval-card-inline`. Only ever the left column's: the card never ends the right one.
+ */
+function channelCard() {
+  const card = leftEl("post-confirm");
+  return !sideActive && currentView === "discord" && !card.hidden && card.getAttribute("data-place") === "channel"
+    ? card : null;
 }
 
 /**
  * Put the reader on the first message of `place` that the list now on screen also shows, at the
  * height it stood at — or on the newest line, when that is where they were. False, moving nothing,
  * when this list shows none of the messages they could see.
+ *
+ * ...or, where their screen showed only the send card, on the card, at the height it stood at, where it
+ * ends this list too (`readerPlace`). `#269 approval-card-inline` x `#280 scroll-stability`.
  */
 function keepReaderPlace(place) {
   if (place.pinned) {
@@ -18321,6 +18365,12 @@ function keepReaderPlace(place) {
     const row = shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id))));
     if (!row) continue;
     el("scroll-area").scrollTop += row.getBoundingClientRect().top - seen.top;
+    renderJumpNewest();
+    return true;
+  }
+  const card = typeof place.card === "number" ? channelCard() : null;
+  if (card) {
+    el("scroll-area").scrollTop += card.getBoundingClientRect().top - place.card;
     renderJumpNewest();
     return true;
   }
