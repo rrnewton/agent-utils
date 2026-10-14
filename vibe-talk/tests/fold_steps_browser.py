@@ -32,7 +32,9 @@ At 1280x800, with the keys:
   selected message instead, as a press from the list is, the box went below the screen.
 
   in two columns, the thread opened on the right by its card's replies button, ] to the right column, End
-  to its foot and k twice, to its first read reply: ; -> the right column's thread all open, Main
+  to its foot and k twice, to its first read reply, then the column scrolled back to its foot, the thread's
+  card at its top (`#298 thread-card-header`) leaving too little room to show that reply whole there and
+  each "at its foot" below the same: ; -> the right column's thread all open, Main
   untouched, the selected reply within a pixel and the column no longer at its foot; ; again -> its unread
   open and its read folded; End and k twice again, at its foot on the first read reply, everything above
   it open and it and the two under it folded, and : back to Expanded all -> only what is under the reader
@@ -540,6 +542,16 @@ def two_columns(desk: Desk) -> None:
             page.wait_for_timeout(200)
         page.wait_for_timeout(300)
         check(desk.selected("side-log")[0] == first_read, f"{desk.label} {what}: the keys did not select the first read reply")
+        # The thread's card heads the right column (`#298 thread-card-header`), and at 1280x800 that leaves
+        # room above the thread's message box for two of the folded read replies whole, not three: k
+        # showed the first read reply whole by taking the column 26px up from its foot, outside the 24px
+        # its keeper counts as there. The reader scrolls back down to the foot, as a wheel would, the
+        # first read reply still selected and its head under the card, so the steps below start where
+        # that keeper would take a reader down.
+        page.evaluate("() => { const area = document.getElementById('side-scroll'); area.scrollTop = area.scrollHeight; }")
+        page.wait_for_timeout(300)
+        check(desk.selected("side-log")[0] == first_read,
+              f"{desk.label} {what}: going back to the foot moved the selection off the first read reply")
         _top, gap = desk.scroll("side-scroll")
         check(gap <= 24, f"{desk.label} {what}: the right column is not at its foot ({gap}px above it)")
 

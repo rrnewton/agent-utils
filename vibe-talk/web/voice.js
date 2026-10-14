@@ -166,7 +166,8 @@ let sideActive = false;
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
  *   | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
- *   | "side-more-threads" | "side-older" | "side-send" | "side-unread-only" | "speaker" | "summarise" | "talk"
+ *   | "side-more-threads" | "side-older" | "side-send" | "side-thread-card-text" | "side-unread-only" | "speaker"
+ *   | "summarise" | "talk"
  *   | "thread-back"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
  *   | "upstream-clear-save" | "view-switch"} id
@@ -6547,6 +6548,9 @@ function paneFor(node) {
     // the right column while it is not drawn, as when a card has just opened its thread. `#281 view-keys`.
     if (pane === channelPane ? threadListOnScreen() : !sideColumnUp()) continue;
     if (node && nodeWithin(pane.scroller(), node)) return pane;
+    // `#298 thread-card-header`. The right column's heading, and the card at the top of its thread in
+    // it, are that column's: a key pressed there acts there, whichever column the keys moved last.
+    if (pane === sidePane && node && nodeWithin(leftEl("side-heading"), node)) return pane;
   }
   // `#277 reply-in-column`. A reply open at the foot of a column is that column's: Escape out of its
   // box goes to that list, and the page keys there move it.
@@ -6902,6 +6906,13 @@ function onPointerMove(event) {
   // A button held is a drag (text being selected, a scrollbar dragged), not a message being chosen.
   if (event.buttons) return;
   if (currentScreen !== "main") return;
+  // `#298 thread-card-header`. The card at the top of the right column's thread is what its link joins
+  // to its root, and the mouse resting on it glides Main to that root, as on a card in the list.
+  const header = leftEl("side-thread-card");
+  if (nodeWithin(header, event.target)) {
+    dwellColumnGlide(sidePane, header);
+    return;
+  }
   const pane = KEY_PANES.find((each) => nodeWithin(each.scroller(), event.target) && each.list() !== null);
   const row = pane ? rowOf(pane, event.target) : null;
   if (pane && row && rowShown(row)) pointRow(pane, row);
@@ -6916,6 +6927,8 @@ function onPointerDown(event) {
   const kind = String((event && event.pointerType) || "");
   if (kind === "mouse") mouseInUse();
   else if (kind) touchInUse();
+  // `#298 thread-card-header`. A press outside the opened card at the top of a thread closes it.
+  collapseThreadCardOutside(event);
   const target = event && event.target;
   if (currentScreen !== "main" || !target) return;
   const pane = KEY_PANES.find((each) => { const list = each.list(); return list !== null && nodeWithin(list, target); });
@@ -8002,7 +8015,8 @@ function closeDetailsOn(target) {
  * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
- * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
+ * holds (`isBarPicker`); then the card at the top of a thread, opened over its list, closes (`#298
+ * thread-card-header`); then a highlighted thread card on screen is put out (`#277
  * thread-card-focus`); then Back: out of Settings, Help or Reply, out of the thread list to what it
  * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
  * Returns whether it did anything. With none of those it does nothing:
@@ -8037,6 +8051,9 @@ function onEscape(event, target) {
     focusList(paneFor(target));
     return true;
   }
+  // `#298 thread-card-header`. The card at the top of a thread opened over its list closes first; the
+  // next Esc goes back out of the thread.
+  if (collapseThreadCard()) return true;
   if (putOutLitCard()) return true;
   return goBack();
 }
@@ -8139,7 +8156,8 @@ const KEYS_WRITING = "Writing";
 const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
-    does: "Back: closes a menu, the search or a sheet, takes the highlight off a thread card, leaves Settings, " +
+    does: "Back: closes a menu, the search, a sheet or a thread's card opened at the top of the thread, takes " +
+      "the highlight off a thread card, leaves Settings, " +
       "Help, Reply or a thread — one opened from the thread list goes back to it — and leaves the thread list for " +
       "the view it was chosen from. In a message box with text in it, leaves the box first and keeps the draft; " +
       "on the channel or view picker, back to the messages",
@@ -16364,12 +16382,22 @@ function threadChoices() {
  */
 function openThreadChoice() {
   if (channelView !== "thread" || !selectedThreadId) return null;
-  const id = String(selectedThreadId);
+  return knownThreadChoice(String(selectedThreadId), selectedThread);
+}
+
+/**
+ * Thread `id` as the store knows it, or — a thread in no list of threads, as one nobody has answered
+ * is — by `summary` and its root message, when the store holds that.
+ *
+ * @param {string} id
+ * @param {any} summary
+ */
+function knownThreadChoice(id, summary) {
   const listed = threadIndex().get(id);
   if (listed) return listed;
   const root = channelCanon.channel === String(el("discord-channel").value)
     ? channelCanon.messages.find((message) => threadOf(message) === id && message.thread.is_root === true) : null;
-  return threadChoice(id, selectedThread, root || null);
+  return threadChoice(id, summary, root || null);
 }
 
 /** What the seam over an open thread calls it: the selector's name, until there is none to give. */
@@ -20701,6 +20729,9 @@ function renderChannelRows() {
   // `#240 reading-bookmark`. After the runs, which decide which rows are shown: the line goes above
   // the first row shown at or after its message.
   placeBookmarkLine();
+  // `#298 thread-card-header`. The card at the top of the right column's thread counts its replies and
+  // unread as the rows' chips do, so it follows the same arrivals, reads and Done, in either column.
+  paintSideThreadCard(tally);
 }
 
 /**
@@ -31158,12 +31189,22 @@ function renderSideMode() {
   if (leftEl("side-list").hidden === !thread) leftEl("side-list").hidden = thread;
   if (leftEl("side-pane").hidden === thread) leftEl("side-pane").hidden = !thread;
   if (leftEl("side-close").hidden === thread) leftEl("side-close").hidden = !thread;
+  // `#298 thread-card-header`. Over a thread, the heading is the thread's card, and the words "Thread
+  // list" go. Shown here, before the thread is drawn (`selectSideThread` lands it after this returns),
+  // so the list under it is already the height the landing measures; the card is a fixed height, so
+  // nothing it is filled with later changes that.
+  const card = leftEl("side-thread-card");
+  if (card.hidden === thread) card.hidden = !thread;
+  if (leftEl("side-title").hidden !== thread) leftEl("side-title").hidden = thread;
+  if (!thread) collapseThreadCard(card);
   // The jump to a thread's newest message is the thread's: over the cards it would jump in a list that
   // is not on screen. A thread selected again decides it afresh (`renderJumpNewest`).
   if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
   renderSideUnreadToggle();
   renderSideColumn();
-  scheduleColumnLinks();
+  // What the links join, and what the glide follows, is the card at the top over a thread and the
+  // cards in the list otherwise: a change of what the column shows is a new selection for both.
+  noteLinkedSelection();
 }
 
 /**
@@ -31172,6 +31213,9 @@ function renderSideMode() {
  * `#231 two-column-polish`. The scroller is the column's one named region, and its name is the
  * heading's: "Thread list" (`#281 view-keys`: what the picker and the keys call it), or "Thread: " and
  * the thread's name, so a screen reader landing in it says which thread it is in, once.
+ *
+ * `#298 thread-card-header`. Over a thread the heading is the thread's card (`paintThreadCard`), saying
+ * what its card in the list said; the region keeps the thread's name, in the picker's words.
  */
 function renderSideColumn() {
   if (!sideColumnUp()) return;
@@ -31179,21 +31223,29 @@ function renderSideColumn() {
     renderSideFreshness();
     setTextIfChanged(leftEl("side-title"), "Thread list");
     nameSideRegion("Thread list");
-    const facts = leftEl("side-facts");
-    if (!facts.hidden) facts.hidden = true;
     renderSideCards();
     return;
   }
   inColumn(columns.side, () => {
     renderSideFreshness();
-    const open = openThreadChoice();
+    const open = sideThreadChoice();
     const name = open ? threadName(open, Infinity) : "Thread";
-    setTextIfChanged(leftEl("side-title"), name);
     nameSideRegion(open ? `Thread: ${name}` : "Thread");
-    const said = open ? threadFacts(open) : "";
-    const facts = leftEl("side-facts");
-    setTextIfChanged(facts, said);
-    if (facts.hidden !== (said === "")) facts.hidden = said === "";
+    paintThreadCard(leftEl("side-thread-card"), open, replyTally());
+  });
+}
+
+/**
+ * The thread the right column shows, as the store names it: the one selected there (`sideThreads`),
+ * whether or not its rows are drawn yet — `renderSideMode` asks before `selectSideThread` draws them —
+ * else the one its rows are of. Null with neither.
+ */
+function sideThreadChoice() {
+  const chosen = sideThreads.get(String(el("discord-channel").value));
+  return inColumn(columns.side, () => {
+    if (!chosen) return openThreadChoice();
+    const drawn = channelView === "thread" && String(selectedThreadId) === chosen.id;
+    return knownThreadChoice(chosen.id, drawn && selectedThread ? selectedThread : chosen.summary);
   });
 }
 
@@ -31731,21 +31783,7 @@ function cardOpener(prefix, replies, unread, open) {
   const button = document.createElement("button");
   button.className = `${prefix}-open`;
   button.setAttribute("type", "button");
-  const parts = [];
-  if (replies || !unread) {
-    const count = document.createElement("span");
-    count.className = `${prefix}-replies`;
-    count.textContent = replies || "Open thread";
-    parts.push(count);
-  }
-  if (unread) {
-    const fresh = document.createElement("span");
-    fresh.className = `${prefix}-unread`;
-    fresh.textContent = unread;
-    if (parts.length) parts.push(document.createTextNode(" · "));
-    parts.push(fresh);
-  }
-  button.append(...parts);
+  button.append(...cardCountParts(prefix, replies, unread, "Open thread"));
   const said = [replies, unread].filter(Boolean).join(" · ");
   button.setAttribute("aria-label", said ? `Open this thread, ${said}` : "Open thread");
   button.setAttribute("title", "Open this thread");
@@ -31755,10 +31793,47 @@ function cardOpener(prefix, replies, unread, open) {
 }
 
 /**
+ * What a card says of its thread's replies, "3 replies · 2 unread", as the parts it is drawn in: the
+ * count, and the unread in the accent (`${prefix}-replies`, `${prefix}-unread`). The one place those
+ * words and that accent are made, for the button into a card's thread (`cardOpener`) and for the card
+ * at the top of an open thread (`paintThreadCard`, `#298 thread-card-header`). With neither, `empty`
+ * alone, or nothing for "".
+ *
+ * @param {string} prefix
+ * @param {string} replies "3 replies", "about 3 replies", or "".
+ * @param {string} unread "2 unread", "2+ unread", "1 new", or "".
+ * @param {string} [empty]
+ * @returns {Node[]}
+ */
+function cardCountParts(prefix, replies, unread, empty = "") {
+  /** @type {Node[]} */
+  const parts = [];
+  if (replies || (!unread && empty)) {
+    const count = document.createElement("span");
+    count.className = `${prefix}-replies`;
+    count.textContent = replies || empty;
+    parts.push(count);
+  }
+  if (unread) {
+    const fresh = document.createElement("span");
+    fresh.className = `${prefix}-unread`;
+    fresh.textContent = unread;
+    if (parts.length) parts.push(document.createTextNode(" · "));
+    parts.push(fresh);
+  }
+  return parts;
+}
+
+/**
  * Into the thread of card `row`, by its replies button or →. In two columns on the right, noted as
  * entered from the cards so that ← goes back out to them (`threadOutFromKeyboard`); in one column as
  * any thread opens, its Back the way to the Threads list. From the thread list, across the window, its
  * Back, Esc and ← the way back to the list (`openThreadFromList`, `#281 view-keys`).
+ *
+ * `#298 thread-card-header`. On the right the keys go into the thread with it, from a click as from →:
+ * the button pressed was in the cards, which have just gone, and a browser drops the focus of a control
+ * that goes on the page's body, where the next key and the next redraw of Main would not find the
+ * right column (`#284 redraw-keeps-pane`).
  *
  * @param {string} id
  * @param {any} summary
@@ -31769,6 +31844,7 @@ function enterCard(id, summary, row) {
   if (threadListShown) return openThreadFromList(id, summary);
   const opened = selectSideThread(id, summary);
   columns.side.fromCards = true;
+  if (sideShowing()) focusList(sidePane);
   return opened;
 }
 
@@ -31780,7 +31856,7 @@ function cardRowOnRight(/** @type {string | null} */ id) {
 
 /** The thread whose card is highlighted while that card shows on the right beside Main, which the links follow; else null. */
 function litCardOnRight() {
-  if (!columnLinksShown()) return null;
+  if (!columnLinksShown() || columns.side.mode !== "list") return null;
   const row = cardRowOnRight(litCard());
   return row && rowShown(row) ? String(row.getAttribute("data-id")) : null;
 }
@@ -31831,6 +31907,191 @@ function putOutLitCard() {
   if (!row || lit === null) return false;
   toggleLitCard(lit, row);
   return true;
+}
+
+// --- the card at the top of an open thread --------------------------------------------------------
+//
+// `#298 thread-card-header`. The owner, 2026-10-14: "I quite like the visual style of the thread cards
+// with their summaries and their slugs and their designated colors. When I drill into a given thread
+// card to see the messages inside it, I would like to KEEP that same style. I.e. in lieu of the header
+// at the top ... I would like to see the SAME colorful card move up to the top of the screen and KEEP
+// its connector linkage over to the main channel message on the left column. So it just moves up and
+// disgorges its internal messages underneath while keeping the visual object of the thread card. We can
+// still sneak in an X button somewhere for a mouse-only exit back to all-threads view."
+//
+//   * ONE CARD, THE LIST'S. The heading over an open thread is a card drawn by the list card's rules and
+//     in its words (`sideCardText`, `briefAge`, `sideCardReplies`, `sideCardUnread`, `cardCountParts`):
+//     what the thread is about, three lines of it, edged and ringed in its thread's colour and tinted as
+//     a highlighted card is, then how long since it moved, its replies and how many are unread, and the
+//     X. A thread nobody has answered spends no colour (`#252 thread-button-state`): it is grey until its
+//     first reply. The markup is the card's skeleton, one per column, and `paintThreadCard` fills
+//     whichever it is handed, so a column with a card at its top has this one.
+//   * PINNED BY WHERE IT STANDS. It is in the column's heading, outside the scroller, so it cannot scroll
+//     away and adds nothing inside the scroller for the reader's place (`#280 scroll-stability`) to
+//     allow for; and its height is fixed, the text clamped as a card's is, so a name or a summary that
+//     arrives after the thread opened moves nothing under the reader.
+//   * THE WHOLE TEXT IS ONE PRESS AWAY. Where the clamp cuts it, a click on the text — or Enter or Space
+//     on it — opens the card downward OVER the list, which neither moves nor shrinks: the heading keeps
+//     its height while the card overflows it. A second press, Esc, a press outside it, or the thread
+//     going puts it back. Its button's name, and its tooltip, are the whole text whatever is drawn.
+//   * IT IS JOINED TO ITS ROOT. In two columns the line from the thread's first message on Main goes to
+//     it (`columnLinkPairs`), as it went to its card in the list.
+
+/**
+ * By the id of each card at the top of a thread, what it was last drawn from, so a pass that changes
+ * nothing writes nothing to it.
+ *
+ * @type {Map<string, string>}
+ */
+const threadCardsDrawn = new Map();
+
+/** The card at the top of a thread that is open over its list, or null. */
+let expandedThreadCard = /** @type {HTMLElement | null} */ (null);
+
+/**
+ * Whether thread `choice` is one nobody has answered, by the rule its grey Thread tag is drawn by
+ * (`unansweredRoot`): no colour is spent on it.
+ *
+ * @param {ReturnType<typeof threadChoice>} choice
+ * @param {ReplyTally} tally
+ */
+function threadUnanswered(choice, tally) {
+  const root = choice.root;
+  if (!root || !root.thread) return false;
+  const entry = tally.threads.get(choice.id);
+  return unansweredRoot(root, threadReplyCount(choice.id, root), entry ? entry.held : 0,
+    exactReplyCount(choice.id, root, tally));
+}
+
+/**
+ * Draw `card`, the card at the top of a thread, for thread `choice`, from `tally`: what the thread is
+ * about, how long since it moved, its replies and unread, and its colour — or grey, for a thread nobody
+ * has answered. Its parts are the elements whose ids are the card's and `-text`, `-age` and `-count`.
+ * Written only when what it would draw has changed; a thread that changes puts an opened card back.
+ *
+ * @param {HTMLElement} card
+ * @param {ReturnType<typeof threadChoice> | null} choice
+ * @param {ReplyTally} tally
+ */
+function paintThreadCard(card, choice, tally) {
+  if (!choice) return;
+  const text = sideCardText(choice);
+  const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
+  const replies = sideCardReplies(choice, tally);
+  const unread = sideCardUnread(choice, tally);
+  const unanswered = threadUnanswered(choice, tally);
+  const signature = JSON.stringify([choice.id, text, age, replies, unread, unanswered]);
+  if (threadCardsDrawn.get(card.id) === signature) return;
+  threadCardsDrawn.set(card.id, signature);
+  if (card.getAttribute("data-thread") !== choice.id) {
+    collapseThreadCard(card);
+    card.setAttribute("data-thread", choice.id);
+  }
+  const state = unanswered ? "start" : "open";
+  if (card.getAttribute("data-thread-state") !== state) card.setAttribute("data-thread-state", state);
+  const hue = String(threadHue(choice.id));
+  if (unanswered) card.style.removeProperty("--thread-hue");
+  else if (card.style.getPropertyValue("--thread-hue") !== hue) card.style.setProperty("--thread-hue", hue);
+  const button = leftEl(`${card.id}-text`);
+  let words = childByClass(button, "side-card-text");
+  if (!words) {
+    words = document.createElement("span");
+    words.className = "side-card-text";
+    button.append(words);
+  }
+  setTextIfChanged(words, text);
+  if (button.getAttribute("title") !== text) button.setAttribute("title", text);
+  setTextIfChanged(leftEl(`${card.id}-age`), age);
+  // A span, not the list card's button: the thread is open already. Never "Open thread".
+  const count = leftEl(`${card.id}-count`);
+  count.replaceChildren(...cardCountParts("side-card", replies, unread));
+  if (count.hidden !== (!replies && !unread)) count.hidden = !replies && !unread;
+  noteThreadCardClamp(card);
+  // The link to the card goes, or comes, with the thread's first reply.
+  scheduleColumnLinks();
+}
+
+/**
+ * Whether the clamp cuts `card`'s text, which only a closed card can say: what its text holds runs
+ * past what it shows.
+ *
+ * @param {HTMLElement} card
+ */
+function threadCardClamped(card) {
+  const words = childByClass(leftEl(`${card.id}-text`), "side-card-text");
+  return Boolean(words) && !card.hidden && !card.hasAttribute("data-expanded") &&
+    Number(words.scrollHeight) > Number(words.clientHeight) + 1;
+}
+
+/**
+ * Say on `card` whether its text can be opened, at the next frame, once the text drawn is laid out:
+ * `data-clamped` on the card, which the stylesheet gives the pointer, and its button's `aria-expanded`,
+ * which a card whose text is whole does not carry. An opened card is measured again when it closes.
+ *
+ * @param {HTMLElement} card
+ */
+function noteThreadCardClamp(card) {
+  const measure = () => {
+    if (card.hasAttribute("data-expanded")) return;
+    const clamped = threadCardClamped(card);
+    const button = leftEl(`${card.id}-text`);
+    if (card.hasAttribute("data-clamped") !== clamped) {
+      if (clamped) card.setAttribute("data-clamped", "");
+      else card.removeAttribute("data-clamped");
+    }
+    if (!clamped) button.removeAttribute("aria-expanded");
+    else if (button.getAttribute("aria-expanded") !== "false") button.setAttribute("aria-expanded", "false");
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(measure);
+  else measure();
+}
+
+/**
+ * A press on the card's text: an opened card closes, and a card whose text the clamp cuts opens over
+ * the list below. A card whose text is whole does nothing. Measured at the press, so a column that has
+ * been widened or narrowed since the card was drawn is asked as it is now.
+ *
+ * @param {HTMLElement} card
+ */
+function toggleThreadCard(card) {
+  if (collapseThreadCard(card)) return;
+  if (!threadCardClamped(card)) return;
+  // The heading keeps the height it has, and the card grows out of it over the list: neither the list
+  // nor anything in it moves (`#280 scroll-stability`).
+  const slot = /** @type {HTMLElement} */ (card.parentNode);
+  slot.style.height = `${slot.getBoundingClientRect().height}px`;
+  card.setAttribute("data-expanded", "");
+  card.setAttribute("data-clamped", "");
+  leftEl(`${card.id}-text`).setAttribute("aria-expanded", "true");
+  expandedThreadCard = card;
+}
+
+/**
+ * Close the opened card at the top of a thread — `card`, or whichever is open — its text clamped again
+ * and its heading its own height. Whether one was open: Esc closes it before it does anything else.
+ *
+ * @param {HTMLElement | null} [card]
+ */
+function collapseThreadCard(card = expandedThreadCard) {
+  if (!card || !card.hasAttribute("data-expanded")) return false;
+  card.removeAttribute("data-expanded");
+  /** @type {HTMLElement} */ (card.parentNode).style.height = "";
+  leftEl(`${card.id}-text`).setAttribute("aria-expanded", "false");
+  if (expandedThreadCard === card) expandedThreadCard = null;
+  noteThreadCardClamp(card);
+  return true;
+}
+
+/** A press anywhere outside the opened card at the top of a thread closes it, as a press outside a ⋯ menu does. */
+function collapseThreadCardOutside(event) {
+  const target = event && event.target;
+  if (expandedThreadCard && target && !nodeWithin(expandedThreadCard, target)) collapseThreadCard();
+}
+
+/** The right column's card at the top of its thread, as the rows now stand, after a pass over either column's rows. */
+function paintSideThreadCard(tally = replyTally()) {
+  if (!sideShowing()) return;
+  paintThreadCard(leftEl("side-thread-card"), sideThreadChoice(), tally);
 }
 
 /** The right column with no thread selected: its cards, and the thread list read behind them. */
@@ -32024,13 +32285,21 @@ function inSideThread(message) {
 //     Main arms nothing. A selection or a highlight made any other way — ] or [ handing the keys to a
 //     column, j or k, Tab, Enter on a card, a redraw handing it on — never glides: moving the focus
 //     scrolls no list but the one the focus is in, and that only to show it.
+//   * OVER A THREAD ON THE RIGHT (`#298 thread-card-header`), its card is at the top of the column, and
+//     its one link is drawn, from its first message on Main to that card, always as the selection's:
+//     clipped at Main's edge, pointing the way, while the root is above or below what Main shows; to
+//     the line of the collapsed run the root is in; up from Main's top while the root is older than
+//     every row Main has drawn; and not at all where the root is drawn nowhere else — hidden among
+//     Main's rows by a filter — nor for a thread nobody has answered, which has no colour to draw it
+//     in. The mouse resting on the card glides Main to the root, by the rules above, once each time
+//     the thread is opened.
 //
-// WHAT IT COSTS (`#226 page-energy-profile`). Nothing in one column, on a phone, over a thread on the
-// right, or while the page is hidden. Otherwise one pass per animation frame at most, asked for by a
-// scroll of either column (passive listeners), a resize, a redraw of either list or a new selection:
-// every rectangle it needs is read before anything is written, and only what changed is written, so a
-// frame in which nothing moved writes nothing. Nothing is measured outside that pass but the one read
-// a glide makes when its wait is up.
+// WHAT IT COSTS (`#226 page-energy-profile`). Nothing in one column, on a phone, or while the page is
+// hidden. Otherwise one pass per animation frame at most, asked for by a scroll of either column
+// (passive listeners), a resize, a redraw of either list or a new selection: every rectangle it needs
+// is read before anything is written, and only what changed is written, so a frame in which nothing
+// moved writes nothing. Over a thread on the right that pass measures one link, its root's and its
+// card's. Nothing is measured outside that pass but the one read a glide makes when its wait is up.
 
 /** How long a selection stays with its other end off screen before that column scrolls to it, in ms. */
 const COLUMN_GLIDE_MS = 1500;
@@ -32057,10 +32326,17 @@ const LINK_GLIDE_MARGIN_PX = 24;
  */
 const GLIDE_REST_PX = 8;
 
-/** Whether the links have a place: two columns, the cards on the right, the channel on the main screen. */
+/**
+ * Whether the links have a place: two columns, the channel on the main screen, and on the right the
+ * cards, or a thread with its card at the top (`#298 thread-card-header`).
+ */
 function columnLinksShown() {
-  return columnsShown && columns.side.mode === "list" && currentScreen === "main" && currentView === "discord";
+  return columnsShown && currentScreen === "main" && currentView === "discord" &&
+    (columns.side.mode === "list" || threadCardLinked());
 }
+
+/** Whether the right column shows a thread under its card, which the thread's one link goes to. `#298 thread-card-header`. */
+const threadCardLinked = () => columns.side.mode === "thread" && !leftEl("side-thread-card").hidden;
 
 /** The thread whose root `row` draws on Main as itself, or null: not a row of a collapsed run. */
 function linkedRootThread(row) {
@@ -32070,12 +32346,21 @@ function linkedRootThread(row) {
 }
 
 /**
- * Every root drawn on Main whose thread has a card shown on the right, with that card, in Main's order.
- * Read from the lists alone: nothing is laid out.
+ * A root on Main and the card its link goes to. `row` is null for a root older than every row Main has
+ * drawn, whose link points up from Main's top (`#298 thread-card-header`).
  *
- * @returns {{thread: string, row: HTMLElement, card: HTMLElement}[]}
+ * @typedef {{thread: string, row: HTMLElement | null, card: HTMLElement}} LinkPair
+ */
+
+/**
+ * Every root drawn on Main whose thread has a card shown on the right, with that card, in Main's order.
+ * Read from the lists alone: nothing is laid out. Over a thread on the right, its one pair: its root
+ * and the card at the top of the column (`threadCardPair`).
+ *
+ * @returns {LinkPair[]}
  */
 function columnLinkPairs() {
+  if (columns.side.mode === "thread") return threadCardPair();
   /** @type {Map<string, HTMLElement>} */
   const cards = new Map();
   for (const card of /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])) {
@@ -32093,9 +32378,60 @@ function columnLinkPairs() {
 }
 
 /**
+ * The link over a thread on the right, `#298 thread-card-header`: from its root on Main to the card at
+ * the top of the column, as a list of none or one. None for a thread nobody has answered, drawn in no
+ * colour, nor where Main draws its root nowhere: hidden among its rows by a filter or a read mode.
+ *
+ * @returns {LinkPair[]}
+ */
+function threadCardPair() {
+  const card = leftEl("side-thread-card");
+  const thread = card.getAttribute("data-thread");
+  if (!thread || card.hidden || card.getAttribute("data-thread-state") !== "open") return [];
+  const row = rootRowOnMain(thread);
+  if (row) return [{ thread, row, card }];
+  return rootBeforeMain(thread) ? [{ thread, row: null, card }] : [];
+}
+
+/**
+ * The row on Main standing for thread `thread`'s root: the root's own row, or the line of the collapsed
+ * run it is in (`#221 read-modes`). Null where it is not drawn, or drawn but hidden.
+ *
+ * @param {string} thread
+ */
+function rootRowOnMain(thread) {
+  const list = channelPane.list();
+  if (!list) return null;
+  for (const row of /** @type {HTMLElement[]} */ ([...list.children])) {
+    const first = rowMessages(row)[0];
+    if (!first || !first.thread || first.thread.is_root !== true || threadOf(first) !== thread) continue;
+    const shown = shownRowFor(row);
+    return shown && rowShown(shown) ? shown : null;
+  }
+  return null;
+}
+
+/**
+ * Whether thread `thread`'s root is older than every row Main has drawn, so that it is above them all,
+ * not loaded: by the time it was posted against that of Main's first row. False where either is not
+ * known.
+ *
+ * @param {string} thread
+ */
+function rootBeforeMain(thread) {
+  const list = channelPane.list();
+  const first = list ? /** @type {HTMLElement[]} */ ([...list.children]).map((row) => rowMessages(row)[0]).find(Boolean) : null;
+  const open = sideThreadChoice();
+  const root = open && open.id === thread ? open.root : null;
+  const rootAt = root ? timeOf(root, "timestamp") : NaN;
+  const firstAt = first ? timeOf(first, "timestamp") : NaN;
+  return Number.isFinite(rootAt) && Number.isFinite(firstAt) && rootAt < firstAt;
+}
+
+/**
  * The pair whose end is the selection drawn on the page — a root on Main, or a card — or null.
  *
- * @param {{thread: string, row: HTMLElement, card: HTMLElement}[]} pairs
+ * @param {LinkPair[]} pairs
  */
 function selectedLinkPair(pairs) {
   const pane = activePane();
@@ -32106,11 +32442,13 @@ function selectedLinkPair(pairs) {
 
 /**
  * The pair whose link is drawn heavy and over the rest: the highlighted card's while it shows, whatever
- * is selected (`#277 thread-card-focus`), else the selection's. Null when that end has no pair.
+ * is selected (`#277 thread-card-focus`), else the selection's. Null when that end has no pair. Over a
+ * thread on the right, its one pair, whatever is selected (`#298 thread-card-header`).
  *
- * @param {{thread: string, row: HTMLElement, card: HTMLElement}[]} pairs
+ * @param {LinkPair[]} pairs
  */
 function chosenLinkPair(pairs) {
+  if (columns.side.mode === "thread") return pairs[0] || null;
   const lit = litCardOnRight();
   return lit !== null ? pairs.find((pair) => pair.thread === lit) || null : selectedLinkPair(pairs);
 }
@@ -32142,7 +32480,11 @@ function rowLinkY(row, box) {
  * list starts higher, under the pill and the search glass floating over its head, so a root up there
  * is under them too.
  *
- * @param {{thread: string, row: HTMLElement, card: HTMLElement}[]} pairs
+ * `#298 thread-card-header`. Over a thread on the right the card is IN the heading, so there the right
+ * column starts at the card's top, which keeps the card on screen, and Main at its own list's. A root
+ * older than every row Main has drawn has no row: its end is taken to be above Main's top.
+ *
+ * @param {LinkPair[]} pairs
  */
 function measureColumnLinks(pairs) {
   const corner = leftEl("column-links").getBoundingClientRect();
@@ -32150,18 +32492,19 @@ function measureColumnLinks(pairs) {
   const rightArea = leftEl("side-scroll");
   const leftTop = leftArea.getBoundingClientRect().top;
   const rightTop = rightArea.getBoundingClientRect().top;
+  const header = columns.side.mode === "thread" ? leftEl("side-thread-card").getBoundingClientRect() : null;
   const top = Math.max(leftTop, rightTop);
-  const left = { top, bottom: leftTop + (leftArea.clientHeight || 0) };
-  const right = { top, bottom: rightTop + (rightArea.clientHeight || 0) };
+  const left = { top: header ? leftTop : top, bottom: leftTop + (leftArea.clientHeight || 0) };
+  const right = { top: header ? header.top : top, bottom: rightTop + (rightArea.clientHeight || 0) };
   const list = channelPane.list();
   const gap = {
     from: list ? list.getBoundingClientRect().right : 0,
-    to: leftEl("side-cards").getBoundingClientRect().left,
+    to: header ? header.left : leftEl("side-cards").getBoundingClientRect().left,
   };
   const ends = pairs.map((pair) => {
-    const row = pair.row.getBoundingClientRect();
+    const row = pair.row ? pair.row.getBoundingClientRect() : null;
     const card = pair.card.getBoundingClientRect();
-    const from = { x: row.right, y: rowLinkY(pair.row, row) };
+    const from = pair.row && row ? { x: row.right, y: rowLinkY(pair.row, row) } : { x: gap.from, y: left.top - LINK_HEAD_PX };
     const to = { x: card.left, y: (card.top + card.bottom) / 2 };
     return {
       pair,
@@ -32201,7 +32544,7 @@ const linkAt = (value, origin) => Math.round((value - origin) * 2) / 2;
  * link is `dimmed`, drawn grey, so the highlighted card's stands out.
  *
  * @param {ReturnType<typeof measureColumnLinks>} measured
- * @param {{thread: string, row: HTMLElement, card: HTMLElement} | null} chosen
+ * @param {LinkPair | null} chosen
  * @param {string | null} [lit]
  */
 function planColumnLinks(measured, chosen, lit = null) {
@@ -32382,16 +32725,27 @@ let columnGlideSpent = "";
  * moving 1.5 s later was "something updating underneath".
  */
 function noteLinkedSelection() {
+  const header = linkedThreadCard();
   const card = litCardOnRight();
   const pane = activePane();
   const lit = pane ? pane.lit : null;
-  const key = card !== null ? `card:${card}` : pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
+  const key = header !== null ? `header:${header}` : card !== null ? `card:${card}`
+    : pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
   if (key !== linkedSelection) {
     linkedSelection = key;
     columnGlideSpent = "";
     dropColumnGlide();
   }
   scheduleColumnLinks();
+}
+
+/**
+ * The thread whose card stands at the top of the right column beside Main, which its link and the glide
+ * follow there whatever is selected (`#298 thread-card-header`); else null.
+ */
+function linkedThreadCard() {
+  if (!columnLinksShown() || columns.side.mode !== "thread") return null;
+  return leftEl("side-thread-card").getAttribute("data-thread");
 }
 
 /** Drop the wait before a glide, if one is armed. */
@@ -32402,12 +32756,15 @@ function dropColumnGlide() {
 }
 
 /**
- * What the glide follows, and its column: the highlighted card while it shows on the right beside Main
- * (`#277 thread-card-focus`), whatever is selected; else the selection drawn. Null with neither.
+ * What the glide follows, and its column: the card at the top of the right column's thread beside Main
+ * (`#298 thread-card-header`); else the highlighted card while it shows on the right beside Main (`#277
+ * thread-card-focus`), whatever is selected; else the selection drawn. Null with none of them.
  *
  * @returns {{pane: KeyPane, row: HTMLElement} | null}
  */
 function glideFollows() {
+  // `#298 thread-card-header`. Over a thread on the right, the card at its top.
+  if (linkedThreadCard() !== null) return { pane: sidePane, row: leftEl("side-thread-card") };
   const card = litCardOnRight();
   if (card !== null) {
     const row = cardRowOnRight(card);
@@ -32440,7 +32797,8 @@ function dwellColumnGlide(pane, row) {
   }
   if (linkedSelection === "" || columnGlideSpent === linkedSelection) return;
   if (!on || !columnLinksShown()) return;
-  const linked = pane === sidePane ? row.hasAttribute("data-card") : linkedRootThread(row) !== null;
+  const linked = pane === sidePane ? row.hasAttribute("data-card") || row === leftEl("side-thread-card")
+    : linkedRootThread(row) !== null;
   if (!linked) return;
   const other = leftEl(pane === sidePane ? "scroll-area" : "side-scroll");
   columnGlide = { key: linkedSelection, other, at: other.scrollTop, rest: here,
@@ -32502,7 +32860,8 @@ function glideToCounterpart() {
   if (!glide || glide.key !== linkedSelection || document.hidden || !columnLinksShown()) return;
   const pairs = columnLinkPairs();
   const chosen = chosenLinkPair(pairs);
-  if (!chosen) return;
+  // A root Main has not drawn has no place to be brought to. `#298 thread-card-header`.
+  if (!chosen || !chosen.row) return;
   // `#280 scroll-stability`. Only a dwell: a mouse that has moved on glides nothing, and coming back to
   // the selection waits again.
   if (!pointerStays(glide)) return;
@@ -36002,6 +36361,9 @@ el("side-close").addEventListener("click", () => {
   // The X has gone with the thread: the keys go to the cards.
   if (document.activeElement === el("side-close") || focusLost()) focusList(sidePane);
 });
+// `#298 thread-card-header`. The text of the card at the top of the right column's thread opens it over
+// the list where the clamp cuts it, and closes it again.
+leftEl("side-thread-card-text").addEventListener("click", () => toggleThreadCard(leftEl("side-thread-card")));
 // `#281 view-keys`. The next page of older threads, read where the cards are.
 el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
