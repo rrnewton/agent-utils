@@ -1235,6 +1235,13 @@ delivered, as before, so it costs that call as well. Every thread root on that p
   even after their root has left the newest page. A page the server cut short is never taken for
   the end of a thread: only `has_more: false` with the root's latest reply among what came back is.
   Running behind on replies, and catching up, is logged once each at INFO.
+* **A read of a thread that fails is made again on the next poll**, from the same place, and the
+  threads behind it wait with it, so a failure loses no reply. Slack answers a failure on its side
+  (`internal_error`, `request_timeout`, ...) as HTTP 200 with `ok: false`, exactly as it answers a
+  refusal, and a bridge answers a command that failed or timed out the same way, so every failure is
+  retried. Only a thread whose reads fail three times in a row, other than for a moment (a lost
+  connection, a rate limit, a 5xx), is given up, with a warning, and the replies those reads missed
+  show when the thread or the flat view is read. A thread that is gone is forgotten.
 
 So a quiet poll costs one call, as before, and a poll after replies in N threads costs
 1 + min(N, 4). The first poll after a start notes where each thread stands and delivers nothing, as

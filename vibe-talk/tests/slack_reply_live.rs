@@ -20,7 +20,7 @@ use vibe_talk::live::{poll_once, LiveHub, LiveMessage, Tick};
 use vibe_talk::mcp::protocol::{dispatch, Outcome};
 use vibe_talk::model::ChannelId;
 use vibe_talk::providers::ChatRouter;
-use vibe_talk::slack::{message_id_from_ts, ts_from_message_id};
+use vibe_talk::slack::{message_id_from_ts, ts_from_message_id, LIVE_FAILED_READS};
 use vibe_talk::state::AppState;
 use vibe_talk::testing::WRITE_TOKEN;
 use vibe_talk::threads::MessageThread;
@@ -371,6 +371,124 @@ async fn a_reply_also_sent_to_the_channel_is_published_once() {
     });
     let poll = poller.poll(&fake, &client).await;
     assert_eq!(poll.texts(), ["sent to the channel too"]);
+}
+
+/// Slack answers a failure on its side as HTTP 200 with `ok: false` and a code such as
+/// `internal_error`, and a bridge in front of it answers a command that failed or timed out the
+/// same way. The client cannot tell such an answer from a refusal, so a thread whose replies read
+/// fails so is read again on the next poll, from where the failed read started.
+#[tokio::test]
+async fn a_replies_read_that_fails_once_leaves_its_replies_for_the_next_poll() {
+    for code in [
+        "internal_error",
+        "fatal_error",
+        "request_timeout",
+        "service_unavailable",
+    ] {
+        let (state, root) = one_thread();
+        let fake = Fake::start(state, PAGE_CAP).await;
+        let client = fake.client();
+        let mut poller = Poller::new();
+        poller.poll(&fake, &client).await;
+
+        fake.with(|state| {
+            add_reply(state, CH, &root, &ts(100, 0), "a new reply");
+            state
+                .fail
+                .insert("conversations.replies".to_owned(), code.to_owned());
+        });
+        let failed = poller.poll(&fake, &client).await;
+        assert!(failed.published.is_empty(), "{code}");
+        assert_eq!(failed.replies.len(), 1, "{code}: the read was made");
+        assert!(
+            failed.tick.replies_behind,
+            "{code}: the thread waits for the next poll, and the tick says so"
+        );
+
+        fake.with(|state| state.fail.remove("conversations.replies"));
+        let next = poller.poll(&fake, &client).await;
+        assert_eq!(next.texts(), ["a new reply"], "{code}");
+        assert_eq!(next.replies.len(), 1, "{code}");
+        assert_eq!(
+            next.replies[0]["oldest"],
+            ts(32, 0),
+            "{code}: read again from where the failed read started"
+        );
+        assert!(!next.tick.replies_behind, "{code}");
+
+        let quiet = poller.poll(&fake, &client).await;
+        assert!(quiet.published.is_empty(), "{code}: published once");
+        assert!(quiet.replies.is_empty(), "{code}: and read once");
+    }
+}
+
+/// A thread whose reads keep failing, other than for a moment, is given up after
+/// `LIVE_FAILED_READS` failed reads in a row, so a refusal costs a bounded number of calls; a read
+/// that succeeds in between starts the count again.
+#[tokio::test]
+async fn a_thread_whose_replies_reads_keep_failing_is_given_up_after_a_bounded_run() {
+    let (state, root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+    let failing = |on: bool| {
+        fake.with(|state| {
+            if on {
+                state.fail.insert(
+                    "conversations.replies".to_owned(),
+                    "invalid_arguments".to_owned(),
+                );
+            } else {
+                state.fail.remove("conversations.replies");
+            }
+        });
+    };
+
+    // One failed read short of the bound, then a read that succeeds: delivered.
+    fake.with(|state| add_reply(state, CH, &root, &ts(100, 0), "first"));
+    failing(true);
+    for n in 1..LIVE_FAILED_READS {
+        let poll = poller.poll(&fake, &client).await;
+        assert_eq!(poll.replies.len(), 1, "read {n} is made");
+        assert!(poll.published.is_empty());
+        assert!(
+            poll.tick.replies_behind,
+            "read {n} leaves the thread waiting"
+        );
+    }
+    failing(false);
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(poll.texts(), ["first"]);
+    assert!(!poll.tick.replies_behind);
+
+    // The count started again: it takes the whole bound to give the thread up.
+    fake.with(|state| add_reply(state, CH, &root, &ts(110, 0), "missed by the live stream"));
+    failing(true);
+    for n in 1..=LIVE_FAILED_READS {
+        let poll = poller.poll(&fake, &client).await;
+        assert_eq!(poll.replies.len(), 1, "read {n} is made");
+        assert!(poll.published.is_empty());
+        assert_eq!(
+            poll.tick.replies_behind,
+            n < LIVE_FAILED_READS,
+            "read {n}: waiting until the last"
+        );
+    }
+    let after = poller.poll(&fake, &client).await;
+    assert!(
+        after.replies.is_empty(),
+        "a thread given up costs no further call"
+    );
+    assert!(!after.tick.replies_behind);
+
+    // A later reply in it reaches the stream once reads succeed again, after what was given up.
+    failing(false);
+    fake.with(|state| add_reply(state, CH, &root, &ts(120, 0), "later"));
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(poll.texts(), ["later"]);
+    assert_eq!(poll.replies.len(), 1);
+    assert_eq!(poll.replies[0]["oldest"], ts(110, 0));
 }
 
 /// A Slack deployment of one channel, whose messages are minutes old, so a catch-up of the last

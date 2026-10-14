@@ -24,6 +24,17 @@
 //! any page. A thread whose latest reply does not come back (a feed that lags its root, or a reply
 //! deleted since) is read again on the next read, and given up after [`LIVE_LAG_READS`] reads.
 //!
+//! # A read that fails
+//!
+//! A thread whose read fails waits for the next read, with every thread behind it, and is read
+//! again from the same place, so a failure loses no reply. A thread that is gone (`404`) is
+//! forgotten. Slack answers a failure on its side (`internal_error`, `request_timeout`,
+//! `service_unavailable`, ...) as HTTP 200 with `ok: false`, as it answers a refusal, and a bridge
+//! answers a command that failed or timed out the same way, so any failure is retried. Only a
+//! thread whose reads fail [`LIVE_FAILED_READS`] times in a row, other than for a moment (a lost
+//! connection, a rate limit, a 5xx), is given up: taken as read to what its root said, its replies
+//! left to the thread's and Flat's own reads.
+//!
 //! # What it does not report
 //!
 //! * **Edits and deletions.** A changed or deleted reply moves nothing on its root. They reach the
@@ -55,6 +66,9 @@ pub const LIVE_THREAD_READS: usize = 4;
 /// Reads of a thread in a row that reach its end without its root's latest reply before that reply
 /// is given up.
 pub const LIVE_LAG_READS: u32 = 3;
+/// Reads of a thread in a row that fail, other than for a moment, before its new replies are given
+/// up. A failure that reads as a moment (a lost connection, a rate limit, a 5xx) never counts.
+pub const LIVE_FAILED_READS: u32 = 3;
 /// Most threads whose place is remembered in one conversation; the oldest roots go first.
 const LIVE_REMEMBERED_ROOTS: usize = 1024;
 /// Most conversations whose places are remembered; past it every conversation is seeded again.
@@ -71,6 +85,8 @@ struct Place {
     count: u64,
     /// Reads in a row that reached the end of the thread without its root's `latest_reply`.
     misses: u32,
+    /// Reads in a row that failed with a failure that does not read as a moment.
+    failures: u32,
 }
 
 /// A thread whose root moved, and whose new replies have not all been read yet.
@@ -114,6 +130,7 @@ impl LiveThreads {
                     through: root.latest_reply_micros().unwrap_or(floor),
                     count: root.reply_count(),
                     misses: 0,
+                    failures: 0,
                 };
                 (root.ts.clone(), place)
             })
@@ -140,6 +157,7 @@ impl LiveThreads {
                 through: self.floor.max(root.micros),
                 count: 0,
                 misses: 0,
+                failures: 0,
             });
             let news = match root_says_replies_after(root, place.through) {
                 Some(news) => news,
@@ -167,6 +185,7 @@ impl LiveThreads {
             }
             place.count = thread.count;
             place.misses = 0;
+            place.failures = 0;
         }
     }
 
@@ -299,6 +318,7 @@ impl HttpSlackClient {
                     through: floor,
                     count: 0,
                     misses: 0,
+                    failures: 0,
                 })
                 .through;
             reads += 1;
@@ -324,6 +344,7 @@ impl HttpSlackClient {
                         .places
                         .get_mut(&thread.root)
                         .expect("a place was made for every thread read");
+                    place.failures = 0;
                     if let Some(newest) = fresh.iter().map(|raw| raw.micros).max() {
                         place.through = newest;
                     }
@@ -350,25 +371,40 @@ impl HttpSlackClient {
                     // The thread is gone: there is nothing more to read in it.
                     held.places.remove(&thread.root);
                 }
-                Err(error) if !error.is_transient() => {
-                    tracing::warn!(
-                        conversation,
-                        thread = %thread.root,
-                        %error,
-                        "the new replies of a Slack thread could not be read for the live stream; \
-                         they show when the thread or the flat view is read"
-                    );
-                    held.settle(&thread);
-                }
                 Err(error) => {
-                    tracing::debug!(
-                        conversation,
-                        thread = %thread.root,
-                        %error,
-                        "the new replies of a Slack thread are left for the next live read"
-                    );
-                    held.moved.push(thread);
-                    paused = true;
+                    // Slack answers a failure on its side (`internal_error`, `request_timeout`,
+                    // ...) as HTTP 200 with `ok: false`, and so does a bridge for a command that
+                    // failed or timed out, so a failure that does not read as a moment may be one.
+                    // The thread waits for the next read either way; only one that keeps failing
+                    // so is given up.
+                    let place = held
+                        .places
+                        .get_mut(&thread.root)
+                        .expect("a place was made for every thread read");
+                    if !error.is_transient() {
+                        place.failures += 1;
+                    }
+                    if place.failures < LIVE_FAILED_READS {
+                        tracing::debug!(
+                            conversation,
+                            thread = %thread.root,
+                            %error,
+                            failures = place.failures,
+                            "the new replies of a Slack thread are left for the next live read"
+                        );
+                        held.moved.push(thread);
+                        paused = true;
+                    } else {
+                        tracing::warn!(
+                            conversation,
+                            thread = %thread.root,
+                            %error,
+                            failures = place.failures,
+                            "the new replies of a Slack thread could not be read for the live \
+                             stream; they show when the thread or the flat view is read"
+                        );
+                        held.settle(&thread);
+                    }
                 }
             }
         }

@@ -401,8 +401,8 @@ pub struct LiveRead {
     /// each thread, so the poller publishes every one, whatever its cursor says.
     pub replies: Vec<Message>,
     /// Whether the provider left replies for its next read: more threads moved than one read
-    /// reads, a thread had more new replies than one call returns, or a read of one failed for a
-    /// moment. Not a gap: they are reported by a later read.
+    /// reads, a thread had more new replies than one call returns, or a read of one failed. Not a
+    /// gap: they are reported by a later read.
     pub replies_behind: bool,
 }
 
@@ -985,7 +985,8 @@ pub trait ChatClient: Send + Sync {
     ///
     /// The errors of the read of the channel's own messages. A read of a thread that fails leaves
     /// that thread's replies for the next read ([`LiveRead::replies_behind`]) rather than failing
-    /// the channel's own messages.
+    /// the channel's own messages, until reads of it have failed a bounded number of times in a
+    /// row; a provider then leaves them to the thread's own reads.
     async fn fetch_live(
         &self,
         channel: &ChannelId,

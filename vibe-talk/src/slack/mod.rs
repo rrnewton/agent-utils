@@ -60,7 +60,7 @@ mod timeline;
 
 pub use client::{HttpSlackClient, SLACK_MAX_TEXT_CHARS};
 pub use ids::{message_id_from_ts, parse_source, ts_from_message_id};
-pub use live::{LIVE_LAG_READS, LIVE_THREAD_READS};
+pub use live::{LIVE_FAILED_READS, LIVE_LAG_READS, LIVE_THREAD_READS};
 
 /// The Slack Web API base used when a deployment does not name a bridge.
 pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
