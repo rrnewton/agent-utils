@@ -382,7 +382,7 @@ def _launch_specs(harness: Harness, report: Report) -> None:
         for root in (configured.python_root, configured.rust_root):
             directory = root / ".agentctl"
             directory.mkdir(mode=0o700, exist_ok=True)
-            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            init_case_repository(root)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
             config = directory / "profiles.json"
             config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "wrkslots": value, "profiles": {}}),
