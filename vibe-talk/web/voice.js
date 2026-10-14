@@ -30926,9 +30926,12 @@ function serviceMarkNotAsked(outcome) {
 }
 
 /**
- * The chat service's half of marking message `id` of `channel` read, asked only once its Done here
- * has been saved: by a confirmed send (`markSentRead`) and by Shift+E (`readAndCollapse`), so the
- * two marks are one act. `#300 reply-marks-read`, `#295 shift-e-read-collapse`.
+ * The chat service's half of marking message `id` of `channel` read, asked after its Done here, so
+ * the two marks are one act: by Shift+E (`readAndCollapse`) and by a confirmed send (`markSentRead`).
+ * `#300 reply-marks-read`, `#295 shift-e-read-collapse`. Only Shift+E waits for that Done to be
+ * saved (`doneSaved`). `markSentRead` does not yet: where the message is already drawn Done, by a
+ * Done still on its way, it asks without waiting for that write, so a Done that then fails can leave
+ * the service's marker moved (`#311 sent-read-waits-for-done`).
  *
  * Where the channel's provider lets the server move its own read marker (what offers the "⋯" menu's
  * "In <service> only"), that marker moved through the message, asked `after_reply` so the server

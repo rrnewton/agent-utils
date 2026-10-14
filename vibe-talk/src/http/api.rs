@@ -3087,10 +3087,11 @@ pub struct UpstreamReadRequest {
     pub message_id: String,
     /// Selected thread, when the message came from a thread timeline: checked to hold it.
     pub thread_id: Option<String>,
-    /// The page asks because a reply it sent answered this message, not because the owner pressed
-    /// **Mark read in**. `#300 reply-marks-read`: such a mark is not asked of the provider again for
-    /// a message this server has marked through already, nor for one before it. See
-    /// [`crate::reply_read`].
+    /// The page asks because a reply it sent answered this message (`#300 reply-marks-read`), or
+    /// because the owner pressed Shift+E on it to read and collapse it (`#295
+    /// shift-e-read-collapse`), not because the owner pressed **Mark read in**. Such a mark is not
+    /// asked of the provider again for a message this server has marked through already, nor for
+    /// one before it. See [`crate::reply_read`].
     #[serde(default)]
     pub after_reply: bool,
 }
