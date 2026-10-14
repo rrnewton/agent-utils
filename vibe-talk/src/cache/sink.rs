@@ -1790,6 +1790,97 @@ mod tests {
         );
     }
 
+    /// What one kind of read offers: `message` as the only thing it saw.
+    type OfferOne = fn(Fill, &Message);
+
+    #[tokio::test]
+    async fn every_offer_is_observed_when_its_fill_began_not_when_it_is_offered() {
+        let dir = crate::testing::TempDir::new("sink-observed");
+        let (state, _fake) = crate::testing::state();
+        let clock = crate::testing::ManualClock::at(T + 60 * 60 * 1_000);
+        let state = crate::testing::with_message_cache(state, dir.path(), clock.clone()).await;
+        let cache = state.message_cache.cache().expect("installed");
+        assert!(cache.quiesce_blocking(Duration::from_secs(10)));
+        let channel = ChannelId(crate::testing::READ_CHANNEL.to_owned());
+        let chan = ChanKey::new(crate::config::LEGACY_DISCORD_PROVIDER_KEY, channel.as_str());
+        let live = |kind, message: &Message| LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind,
+            historical: false,
+            message: message.clone(),
+            self_posted: false,
+        };
+        // Each kind of read, offering one message it saw. A page with more behind it, so no read
+        // here claims the channel's start and none takes away what an earlier one wrote.
+        let offers: Vec<(&str, OfferOne)> = vec![
+            ("timeline", |fill, message| {
+                let page = TimelinePage {
+                    messages: vec![message.clone()],
+                    has_more: true,
+                    ..TimelinePage::default()
+                };
+                fill.offer_timeline(&TimelineRequest::default(), TimelineRead::Newest, &page);
+            }),
+            ("recent", |fill, message| {
+                fill.offer_recent_dated(&RecentRead {
+                    messages: vec![message.clone()],
+                    ..RecentRead::default()
+                });
+            }),
+            ("page", |fill, message| {
+                fill.offer_page(PageRead::Newest, std::slice::from_ref(message), false);
+            }),
+            ("walk", |fill, message| {
+                fill.offer_walk(std::slice::from_ref(message));
+            }),
+            ("single", |fill, message| fill.offer_single(message, "1")),
+            ("forward", |fill, message| {
+                fill.offer_forward(std::slice::from_ref(message), T, false);
+            }),
+            ("posted", |fill, message| fill.offer_posted(message, None)),
+        ];
+        let mut n = 0;
+        for (kind, offer) in offers {
+            n += 1;
+            let message = big_message(&channel, n, kind);
+            let fill = state
+                .message_cache
+                .begin_for(crate::auth::Scope::Write, &channel)
+                .expect("a fill begins");
+            let began = clock.now();
+            // The read takes its time.
+            clock.advance(60_000);
+            offer(fill, &message);
+            assert!(cache.quiesce_blocking(Duration::from_secs(10)));
+            let held = cache
+                .message(&chan, &message.id)
+                .served()
+                .flatten()
+                .unwrap_or_else(|| panic!("{kind}: offered"));
+            assert_eq!(held.observed_ms, began, "{kind}: observed when it began");
+        }
+        // A change from the live feed, offered through a fill of its own.
+        n += 1;
+        let message = big_message(&channel, n, "pushed");
+        let fill = state
+            .message_cache
+            .begin(&FillGrant::server(ServerFill::Ingest), &channel)
+            .expect("a fill begins");
+        let began = clock.now();
+        clock.advance(60_000);
+        fill.offer_push(&live(crate::live::LiveKind::Create, &message));
+        assert!(cache.quiesce_blocking(Duration::from_secs(10)));
+        assert_eq!(
+            cache
+                .message(&chan, &message.id)
+                .served()
+                .flatten()
+                .expect("offered")
+                .observed_ms,
+            began
+        );
+    }
+
     #[test]
     fn a_cache_installed_after_arming_gets_the_latest_snapshot_at_once() {
         let dir = crate::testing::TempDir::new("sink-install");

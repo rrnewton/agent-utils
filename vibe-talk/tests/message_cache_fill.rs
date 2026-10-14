@@ -1130,6 +1130,10 @@ async fn a_deletion_pushed_while_a_read_is_in_flight_is_not_undone_by_that_read(
         StatusCode::ACCEPTED
     );
     assert!(tombstoned(&d.cache, &read_chan(), &gone));
+    // Time passes before the read hands its answer back, as it does on a real server: a fill that
+    // took its time when the read returned, rather than when it began, would now be later than
+    // the deletion, and bring the message back.
+    clock.advance(MINUTE);
     drop(release);
     let page = read.await.expect("the read finished");
     assert!(
