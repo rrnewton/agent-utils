@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import stat
 import subprocess
 import threading
 import time
+import types
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -202,6 +205,131 @@ def test_perf_capture_uses_acknowledged_fifo_window_and_never_models_trial(
     assert payload["machine_id"] == "test-machine"
     assert payload["container_class"] == "test-container"
     assert payload["trials"][0]["included_in_model"] is False
+
+
+def _perf_controller(tmp_path: Path, ack_timeout_s: float) -> capture._PerfWindowController:
+    """A perf controller whose acknowledgement reader is driven directly, without its thread."""
+
+    return capture._PerfWindowController(
+        tmp_path / "control.fifo",
+        tmp_path / "ack.fifo",
+        centered_window(0.12, 0.02),
+        capture.GuestLaunchSignal(),
+        ack_timeout_s,
+    )
+
+
+@pytest.fixture
+def ack_pipe() -> Iterator[tuple[int, int]]:
+    """A pipe standing in for perf's acknowledgement FIFO, nonblocking on the read side."""
+
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    try:
+        yield read_fd, write_fd
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def _counting_select(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the timeout of every select the controller makes, without changing its result."""
+
+    timeouts: list[float] = []
+    real_select = select.select
+
+    def counting(
+        readers: list[int], writers: list[int], errors: list[int], timeout: float
+    ) -> tuple[list[int], list[int], list[int]]:
+        timeouts.append(timeout)
+        return real_select(readers, writers, errors, timeout)
+
+    monkeypatch.setattr(capture, "select", types.SimpleNamespace(select=counting))
+    return timeouts
+
+
+def test_perf_ack_written_before_finish_is_still_read(
+    tmp_path: Path, ack_pipe: tuple[int, int]
+) -> None:
+    read_fd, write_fd = ack_pipe
+    controller = _perf_controller(tmp_path, ack_timeout_s=1.0)
+
+    # The order is exact: perf's acknowledgement is already in the FIFO, then finish becomes
+    # observable, and only then may the controller consume it. Checking `_finished` before
+    # reading discarded this completed disable handshake and recorded a failed capture.
+    os.write(write_fd, b"ack\n")
+    controller._finished.set()
+
+    assert controller._ack(read_fd)
+
+
+def test_perf_ack_ready_at_the_deadline_is_still_read(
+    tmp_path: Path, ack_pipe: tuple[int, int]
+) -> None:
+    read_fd, write_fd = ack_pipe
+    controller = _perf_controller(tmp_path, ack_timeout_s=0.0)
+    os.write(write_fd, b"ack\n")
+
+    assert controller._ack(read_fd)
+
+
+def test_perf_final_read_still_refuses_eof_and_a_malformed_ack(
+    tmp_path: Path, ack_pipe: tuple[int, int]
+) -> None:
+    read_fd, write_fd = ack_pipe
+    controller = _perf_controller(tmp_path, ack_timeout_s=1.0)
+    controller._finished.set()
+
+    os.write(write_fd, b"not-an-ack\n")
+    assert not controller._ack(read_fd)
+
+    eof_read_fd, eof_write_fd = os.pipe()
+    os.set_blocking(eof_read_fd, False)
+    os.close(eof_write_fd)
+    try:
+        assert not controller._ack(eof_read_fd), "EOF is not an acknowledgement"
+    finally:
+        os.close(eof_read_fd)
+
+
+def test_perf_finish_permits_exactly_one_nonblocking_poll(
+    tmp_path: Path, ack_pipe: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_fd, _write_fd = ack_pipe
+    controller = _perf_controller(tmp_path, ack_timeout_s=1.0)
+    controller._finished.set()
+    timeouts = _counting_select(monkeypatch)
+
+    assert not controller._ack(read_fd)
+    assert timeouts == [0], "finish permits exactly one nonblocking poll and no wait"
+
+
+def test_perf_ack_read_error_is_never_an_acknowledgement(tmp_path: Path) -> None:
+    controller = _perf_controller(tmp_path, ack_timeout_s=1.0)
+    controller._finished.set()
+    # A directory descriptor polls readable and then fails the read: a planted read error. The
+    # controller thread records it as a failed perf FIFO control rather than an acknowledgement.
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            controller._ack(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def test_perf_ack_wait_without_finish_remains_deadline_bounded(
+    tmp_path: Path, ack_pipe: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_fd, _write_fd = ack_pipe
+    controller = _perf_controller(tmp_path, ack_timeout_s=0.01)
+    timeouts = _counting_select(monkeypatch)
+
+    started = time.monotonic()
+    assert not controller._ack(read_fd)
+
+    assert time.monotonic() - started < 5.0
+    assert timeouts and timeouts[0] == 0, "every pass starts with a nonblocking poll"
+    assert all(timeout <= 0.01 for timeout in timeouts), "no wait outlives the deadline"
 
 
 def _fake_wprof(

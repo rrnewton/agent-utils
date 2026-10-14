@@ -1120,18 +1120,32 @@ class _PerfWindowController:
     def _ack(self, ack_fd: int) -> bool:
         deadline = time.monotonic() + self.ack_timeout_s
         buffered = b""
-        while time.monotonic() < deadline and not self._finished.is_set():
-            readable, _, _ = select.select([ack_fd], [], [], min(0.05, deadline - time.monotonic()))
-            if not readable:
-                continue
-            chunk = os.read(ack_fd, 4096)
-            if not chunk:
+        while True:
+            # `finish` can race with this controller after perf has written its acknowledgement
+            # but before this thread is scheduled to consume it. Make one nonblocking read on every
+            # pass before honouring either cancellation or the deadline, so a completed handshake
+            # survives without extending any wait when no acknowledgement is ready.
+            chunk: bytes | None = None
+            readable, _, _ = select.select([ack_fd], [], [], 0)
+            if readable:
+                try:
+                    chunk = os.read(ack_fd, 4096)
+                except BlockingIOError:
+                    chunk = None
+            if chunk:
+                buffered += chunk
+                if b"\n" in buffered:
+                    return buffered.splitlines()[0].strip() == b"ack"
+            if self._finished.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            if chunk is None:
+                select.select([ack_fd], [], [], min(0.05, remaining))
+            elif not chunk:
+                # EOF: perf holds no writer yet, so select would report the FIFO readable at once.
                 time.sleep(0.005)
-                continue
-            buffered += chunk
-            if b"\n" in buffered:
-                return buffered.splitlines()[0].strip() == b"ack"
-        return False
 
     def _command(self, control_fd: int, ack_fd: int, command: bytes) -> bool:
         os.write(control_fd, command + b"\n")
