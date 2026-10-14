@@ -449,6 +449,30 @@ steps:
       resources: {browser: 1}
       est_duration_s: 5
 
+  # `#289 thread-card-header` in the browser engine, at 1280x800 with a mouse, in the dark scheme and the
+  # light: a card's replies button opens its thread on the right under its card at the top of the column,
+  # saying what the card said, at the card's place and height, above the list and not in it, the X on it,
+  # edged, ringed and tinted in the thread's colour by computed colour and by pixels; one line, the
+  # selection's, from the root's right edge level with its Thread(N) to the card's left edge, in its
+  # colour; the card unmoved as the thread scrolls; the root above Main, the line clipped at Main's top;
+  # the mouse crossing the card moving nothing for 2.5 s and resting on it gliding Main to the root; a long
+  # question's card three lines and the same height, opened over the list with the list unmoved to the
+  # pixel, Esc closing it and then the thread. Measured on 2026-10-14: about 15s wall, most of it the
+  # glide's waits.
+  - group: check
+    job: thread-card-header-browser
+    desc: a thread on the right under its card at the top, in the card's words, place, height and colour, joined to its root by one line that a resting mouse glides Main along, and its long text opened over the list with nothing moving, in current Chromium at 1280x800 in both schemes
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
   # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
   # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message

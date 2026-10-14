@@ -165,6 +165,8 @@
      other card's edge and every other link between the columns. Half `--muted` and half `--edge`, so
      it is plainly grey, quieter than any thread's colour, and still a line on the panel. */
   --thread-grey: #626975;
+  /* `#289 thread-card-header`. Under the card at the top of a thread opened over its list. */
+  --card-shadow: 0 6px 18px rgb(0 0 0 / 0.28);
 }
 
 @media (prefers-color-scheme: light) {
@@ -198,6 +200,7 @@
     --read-ring: #7f8896;
     /* Half the light scheme's `--muted` and half its `--edge`. */
     --thread-grey: #9ba1ac;
+    --card-shadow: 0 6px 18px rgb(0 0 0 / 0.14);
   }
 }
 
@@ -6877,6 +6880,12 @@ textarea {
     margin-inline-start: 1.25rem;
   }
 
+  /* `#289 thread-card-header`. ...and so does the card at the top of a thread, level with them: the
+     line from its root arrives at its left edge where it arrived at its card's. */
+  #screen-main[data-columns="two"] .thread-card-header {
+    margin-inline-start: 1.25rem;
+  }
+
   /*
    * `#277 reply-in-column`. A reply opened in either column is written at that column's foot, under
    * its list, in the reply screen's own box (#reply-compose, moved here while it is open): the owner,
@@ -6920,7 +6929,8 @@ textarea {
  * width. Outside both, #side-column is not drawn, and none of this shows.
  */
 
-/* The heading names the thread as the picker does — "13h · 16 · its name" — and holds the X. */
+/* The heading says "Thread list" over the cards, beside Unread only; over a thread it is the thread's
+   card, with the X (`#289 thread-card-header`, below). */
 #side-heading {
   grid-row: 1;
   display: flex;
@@ -6935,16 +6945,6 @@ textarea {
   border-bottom: 1px solid var(--edge);
 }
 
-#side-facts {
-  flex: none;
-  white-space: pre;
-  color: var(--muted);
-}
-
-#side-facts::after {
-  content: " · ";
-}
-
 #side-title {
   flex: 1 1 auto;
   min-width: 0;
@@ -6952,11 +6952,6 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 600;
-}
-
-#side-close {
-  flex: none;
-  margin-inline-start: auto;
 }
 
 /* `#259 thread-list-unread-filter`. The cards' own filter, at the far end of the heading it narrows,
@@ -7159,6 +7154,92 @@ textarea {
 /* Found by the search in the thread's replies rather than the card's own words: said quietly. */
 .side-card-hint {
   font-style: italic;
+}
+
+/*
+ * `#289 thread-card-header`. OVER A THREAD THE HEADING IS THE THREAD'S CARD: the list card's own look
+ * and words (`.side-card-row` and its parts, above and below), ringed and tinted in the thread's colour
+ * as a highlighted card is, and the X at the end of its facts. It is the heading's only content then,
+ * so the heading gives up its rule and its least height, the card having its own border, and lines the
+ * card up with the cards of the list under it.
+ *
+ * A FIXED HEIGHT: three lines of text, clamped as a list card's are, then a facts line as tall as the
+ * X. So the card is the same height whatever it says, and a summary or a count arriving after the
+ * thread opened moves nothing under the reader (`#280 scroll-stability`).
+ *
+ * It must never carry `data-highlighted`, whose rule unclamps a card's text: the ring and the tint are
+ * stated here instead.
+ */
+#side-heading:has(> #side-thread-card:not([hidden])) {
+  align-items: flex-start;
+  min-height: 0;
+  padding-block: 0.45rem 0.4rem;
+  border-bottom: 0;
+}
+
+.side-card-row.thread-card-header {
+  flex: 1 1 auto;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  padding-inline-end: 0.3rem;
+  border-color: hsl(var(--thread-hue, 210) 55% 50%);
+  background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
+  cursor: auto;
+}
+
+/* `#252 thread-button-state`: a thread nobody has answered spends no colour, here as on its tag. */
+.side-card-row.thread-card-header[data-thread-state="start"] {
+  border-color: var(--thread-grey);
+  background: color-mix(in srgb, var(--thread-grey) 14%, var(--panel));
+}
+
+/* Its text is a button only where the clamp cuts it, which it then opens. */
+.thread-card-header:not([data-clamped]) > .side-card {
+  cursor: auto;
+}
+
+/* "3 replies · 2 unread", said rather than pressed: the thread is open. Its unread in the accent, as
+   on the card's button (`.side-card-unread`). */
+.thread-card-count {
+  grid-column: 2;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+/* The X, at the end of the facts line: a mouse's way back to the cards, the size of the card's own
+   chip on a desk, and a thumb's under a finger. */
+.thread-card-close {
+  grid-column: 3;
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+@media (pointer: coarse) {
+  .thread-card-close {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+}
+
+/* Opened, where the clamp cut its text: all of it, over the list. The heading keeps its height (the
+   script holds it while the card is open), so the card grows out of it downward and neither the list
+   nor anything in it moves; a very long text scrolls inside the card. Over the list, its line under
+   the heading and the links between the columns. */
+.thread-card-header[data-expanded] {
+  position: relative;
+  z-index: 3;
+  box-shadow: var(--card-shadow);
+}
+
+.thread-card-header[data-expanded] > .side-card > .side-card-text {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  overflow-y: auto;
+  height: auto;
+  min-height: calc(3 * 1.35em);
+  max-height: 60vh;
 }
 
 #side-more-threads {
