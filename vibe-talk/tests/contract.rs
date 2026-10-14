@@ -272,6 +272,9 @@ fn client_config(
         }),
         voice_prompt: full.then(|| voice_prompt(true, PromptDelivery::Page)),
         voice_post_prefix: full.then(|| post_prefix(None, true)),
+        // `#208 persistent-cache`. Present only in the full sample, as the server sends it only to
+        // a write-scope caller of a server with a `[message_cache]` table.
+        message_cache: full.then(|| message_cache_status(true)),
     }
 }
 

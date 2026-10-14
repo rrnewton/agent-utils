@@ -117,6 +117,16 @@
       "idempotent_posts_supported": true,
       "live_delivery": "push",
       "live_poll_seconds": 5,
+      "message_cache": {
+        "available": true,
+        "bytes": 1048576,
+        "channels": 3,
+        "enabled": true,
+        "max_days": 14,
+        "max_megabytes": 256,
+        "messages": 1200,
+        "oldest_covered": "2026-10-01T00:00:00Z"
+      },
       "noise_rules": {
         "matching": "a message counts as read when its whole text is one of these",
         "rules": [

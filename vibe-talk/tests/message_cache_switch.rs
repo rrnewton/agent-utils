@@ -692,3 +692,89 @@ async fn the_purge_names_every_table_the_store_empties_and_the_message_cache() {
         json!(vibe_talk::http::api::PURGED)
     );
 }
+
+async fn client_config(state: &AppState, token: &str) -> Value {
+    let (status, body) = send(state, "GET", "/api/v1/client-config", token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn client_config_carries_the_status_only_with_a_table_in_numbers_and_never_a_path() {
+    let scratch = TempDir::new("cache-switch-status");
+    let dir = scratch.path();
+    let clock = ManualClock::at(T0);
+    let (state, _) = server(dir, None, &clock).await;
+    let config = client_config(&state, WRITE_TOKEN).await;
+    assert!(config.get("message_cache").is_none(), "{config}");
+    stop(state);
+
+    let (state, _clock) = filled_server(dir, 9).await;
+    let status = client_config(&state, WRITE_TOKEN).await["message_cache"].clone();
+    assert_eq!(status["available"], true, "{status}");
+    assert_eq!(status["enabled"], true);
+    assert!(status.get("reason").is_none(), "{status}");
+    assert_eq!(status["messages"], 9, "{status}");
+    assert_eq!(status["channels"], 1);
+    assert!(
+        status["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        "{status}"
+    );
+    assert_eq!(
+        (status["max_days"].clone(), status["max_megabytes"].clone()),
+        (json!(14), json!(256))
+    );
+    // Rows with no proof of a whole listing cover nothing.
+    assert!(status.get("oldest_covered").is_none(), "{status}");
+    // Numbers, booleans and codes: nothing that names a file, a channel or a message.
+    let text = status.to_string();
+    for leak in [
+        dir.to_string_lossy().as_ref(),
+        ".sqlite3",
+        "/",
+        READ_CHANNEL,
+    ] {
+        assert!(!text.contains(leak), "{leak} is in the status: {text}");
+    }
+    let fields: Vec<&String> = status.as_object().expect("an object").keys().collect();
+    assert!(
+        fields.iter().all(|name| [
+            "available",
+            "enabled",
+            "reason",
+            "bytes",
+            "messages",
+            "channels",
+            "oldest_covered",
+            "max_days",
+            "max_megabytes"
+        ]
+        .contains(&name.as_str())),
+        "{fields:?}"
+    );
+    // The read token, which cannot switch it, is not told.
+    let config = client_config(&state, READ_TOKEN).await;
+    assert!(config.get("message_cache").is_none(), "{config}");
+    // A switch is seen at once, not after the status is measured again.
+    let (status, _) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK);
+    let status = client_config(&state, WRITE_TOKEN).await["message_cache"].clone();
+    assert_eq!(
+        (
+            status["available"].clone(),
+            status["reason"].clone(),
+            status["messages"].clone()
+        ),
+        (json!(false), json!("switched_off"), json!(0)),
+        "{status}"
+    );
+    stop(state);
+
+    let (state, _) = server(dir, Some("enabled = false"), &clock).await;
+    let status = client_config(&state, WRITE_TOKEN).await["message_cache"].clone();
+    assert_eq!(
+        (status["enabled"].clone(), status["reason"].clone()),
+        (json!(false), json!("config_disabled")),
+        "{status}"
+    );
+}

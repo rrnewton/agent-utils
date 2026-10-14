@@ -234,6 +234,15 @@ declare namespace VibeTalk {
      */
     live_poll_seconds: number;
     /**
+     * The message cache, as Settings' "Saved messages on this server" shows it. `#208
+     * persistent-cache`.
+     *
+     * Present only when the server's configuration has a `[message_cache]` table, and sent only
+     * to a write-scope caller, the one scope that can switch it: numbers, dates and codes, never
+     * a path. Absent from an older server; the page then hides the group.
+     */
+    message_cache?: MessageCacheStatus | null;
+    /**
      * The rules that decide which messages are read automatically. `#196 auto-read-noise`.
      *
      * Here rather than behind a route of its own because the page needs them at startup, for the

@@ -209,6 +209,14 @@ pub struct ClientConfigResponse {
     /// an older server, which tags nothing; the page then hides the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_post_prefix: Option<VoicePostPrefix>,
+    /// The message cache, as Settings' "Saved messages on this server" shows it. `#208
+    /// persistent-cache`.
+    ///
+    /// Present only when the server's configuration has a `[message_cache]` table, and sent only
+    /// to a write-scope caller, the one scope that can switch it: numbers, dates and codes, never
+    /// a path. Absent from an older server; the page then hides the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_cache: Option<MessageCacheStatus>,
 }
 
 /// The tag this server puts before every message the voice agent posts. `#303 voice-post-prefix`.

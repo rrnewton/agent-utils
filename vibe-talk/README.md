@@ -3510,7 +3510,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channel-directory?q=&limit=&cursor=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here |
 | DELETE | `/api/v1/channels/{id}` | **write** | take a channel off the list: one added in the app is forgotten (managed mode also unregisters it upstream); one from the configuration file is hidden — see "Taking a channel off the list" |
 | DELETE | `/api/v1/channels/{id}/hidden` | **write** | show a hidden configured channel again; `unknown_channel` for anything the file does not name |
-| GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope`; a write-scope caller also gets `hidden_channels` |
+| GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope`; a write-scope caller also gets `hidden_channels`, and `message_cache` (the status `PUT /api/v1/message-cache` answers) when the configuration has a `[message_cache]` table |
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
 | POST | `/api/v1/live/hints` | ingest | content-free `{channel_id}` wake-up for that polled provider's existing cursor |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |

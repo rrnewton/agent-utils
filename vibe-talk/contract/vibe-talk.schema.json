@@ -224,6 +224,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "message_cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageCacheStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The message cache, as Settings' \"Saved messages on this server\" shows it. `#208\npersistent-cache`.\n\nPresent only when the server's configuration has a `[message_cache]` table, and sent only\nto a write-scope caller, the one scope that can switch it: numbers, dates and codes, never\na path. Absent from an older server; the page then hides the group."
+        },
         "noise_rules": {
           "anyOf": [
             {

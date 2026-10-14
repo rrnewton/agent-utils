@@ -790,6 +790,12 @@ pub async fn client_config(
         .default_provider_key()
         .and_then(|key| state.config.provider(key));
     let live_poll_seconds = state.config.live_poll_seconds();
+    // `#208 persistent-cache`. Only with a `[message_cache]` table, and only to the scope that can
+    // switch it.
+    let message_cache = match state.message_cache.lifecycle() {
+        Some(lifecycle) if scope >= Scope::Write => lifecycle.status(&state.message_cache).await,
+        _ => None,
+    };
     Ok(Json(ClientConfigResponse {
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
@@ -826,6 +832,7 @@ pub async fn client_config(
         voice_settings: Some(crate::send_approval::view(&state).await),
         voice_prompt: Some(crate::voice_prompt::view(&state).await),
         voice_post_prefix: Some(crate::post_prefix::view(&state).await),
+        message_cache,
     }))
 }
 
