@@ -38,14 +38,25 @@
 //! characters is the right number is not something this crate can know — see
 //! `scripts/smoke-agent.py --replay-check`, which is the only thing that can answer it.
 
-use crate::store::{Speaker, Turn};
+use crate::store::{SendOutcome, Speaker, Turn, TurnDetail};
 use crate::untrusted;
 
-/// What the agent is told when the record holds a message it posted. `#270
+/// What the agent is told when the record holds a message it posted, or tried to. `#270
 /// voice-transcript-markers`. Outside the fence, with the preamble, because it is this server
 /// explaining its own line format.
-pub const SENT_LINES: &str =
-    " Lines that begin 'sent to' are messages you posted to a channel, quoted exactly.";
+///
+/// One form per outcome, each with its own first words, because only one outcome is "it went". A
+/// resumed agent asked "did my message go?" answers from these lines: a send nobody confirmed that
+/// read as a posted one would have it say yes about words that may be nowhere, and a partial send
+/// quoted without a word about the rest would have it say the whole message went.
+pub const SENT_LINES: &str = concat!(
+    " Lines that begin 'sent to' are messages you posted to a channel, quoted exactly.",
+    " Lines that begin 'partly sent to' quote only the part of a message that was posted: the rest",
+    " of it was NOT posted, or, where the line says so, may not have been.",
+    " Lines that begin 'may have been sent to' are messages whose posting was never confirmed: do",
+    " not say they were sent; say it could not be confirmed and the user should check the channel.",
+    " Where a line says only the beginning is quoted, more was posted than the line shows."
+);
 
 /// The longest channel name a `sent to` line carries.
 const SENT_CHANNEL_CHARS: usize = 80;
@@ -153,9 +164,12 @@ pub struct Replay {
 /// that costs money. Markers (`#270 voice-transcript-markers`) are skipped for the same reason:
 /// none of them was said.
 ///
-/// A [`Speaker::Sent`] row IS included, as `sent to {channel}: {text}`, inside the fence and the
-/// budget like any other line: a resumed agent asked "did that go?" must have the truth, and the
-/// truth is what this server's own copy of the send says.
+/// A [`Speaker::Sent`] row IS included, inside the fence and the budget like any other line: a
+/// resumed agent asked "did that go?" must have the truth, and the truth is what this server's own
+/// copy of the send says — INCLUDING its outcome. A row is filed for a send that went whole, for
+/// one that went in part (its text is then only the parts that went), and for one nobody can
+/// confirm (its text is then every word it was asked to post). So the line is `sent to
+/// {channel}: {text}` only for the first; see [`sent_label`] for the other two.
 #[must_use]
 pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
     let spoken: Vec<&Turn> = turns
@@ -232,19 +246,9 @@ pub fn build(turns: &[Turn], policy: &ReplayPolicy) -> Replay {
 
 /// One transcript line, with the speaker named and the words neutralized.
 fn render(turn: &Turn) -> String {
-    let who = match (turn.speaker, &turn.detail) {
-        // The channel's name is text too — an owner's alias, or a provider's name for it — so it
-        // is neutralized like the words: one line, no fence, bounded.
-        (Speaker::Sent, Some(crate::store::TurnDetail::Sent(record))) => {
-            let name = untrusted::neutralize(&record.channel_name)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let name: String = name.chars().take(SENT_CHANNEL_CHARS).collect();
-            format!("sent to {name}")
-        }
-        (Speaker::Sent, _) => "sent to a channel".to_owned(),
-        (speaker, _) => speaker.as_str().to_owned(),
+    let who = match turn.speaker {
+        Speaker::Sent => sent_label(turn.detail.as_ref()),
+        speaker => speaker.as_str().to_owned(),
     };
     // Neutralized per turn as well as by `fenced` below. Belt and braces on purpose: a turn is the
     // unit a forged fence would be smuggled in, and neutralizing here means a single hostile turn
@@ -254,6 +258,72 @@ fn render(turn: &Turn) -> String {
         .trim()
         .to_owned();
     format!("{who}: {said}")
+}
+
+/// What goes in front of a `sent` row's words: whether they were posted, where, and how much of
+/// what went the line quotes. One opening per outcome, as [`SENT_LINES`] tells the agent:
+///
+/// - `sent to {channel}` — all of it went;
+/// - `partly sent to {channel} (…)` — the words quoted went, and the bracket says whether the rest
+///   certainly did not or may have;
+/// - `may have been sent to {channel} (NOT confirmed…)` — the chat service's answer was lost, or
+///   the request was abandoned on its way, so nobody knows. The page told the agent at the time "I
+///   could not confirm whether the message was sent", and its card says "Not confirmed"; a resumed
+///   agent told otherwise would tell the owner it went.
+///
+/// A row whose record this version cannot read says nothing about what went, so it gets the
+/// weakest of the three rather than the strongest: "check the channel" about a message that did
+/// go costs a look, and "it went" about one that did not costs the message.
+fn sent_label(detail: Option<&TurnDetail>) -> String {
+    let Some(TurnDetail::Sent(record)) = detail else {
+        return "may have been sent to a channel (NOT confirmed)".to_owned();
+    };
+    // The channel's name is text too — an owner's alias, or a provider's name for it — so it is
+    // neutralized like the words: one line, no fence, bounded.
+    let name = untrusted::neutralize(&record.channel_name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let name: String = name.chars().take(SENT_CHANNEL_CHARS).collect();
+    let mut notes: Vec<&str> = Vec::new();
+    let head = match record.outcome {
+        SendOutcome::Sent => format!("sent to {name}"),
+        SendOutcome::Partial => {
+            // The parts after an uncertain one were never attempted, so they certainly did not go;
+            // only the uncertain part itself is in doubt.
+            notes.push(
+                match (record.uncertain_part.is_some(), record.unsent_chars > 0) {
+                    (false, _) => "only these words were posted; the rest was NOT posted",
+                    (true, true) => {
+                        "these words were posted; the part after them may have been, NOT \
+                         confirmed; the rest was NOT posted"
+                    }
+                    (true, false) => {
+                        "these words were posted; whether the rest was is NOT confirmed"
+                    }
+                },
+            );
+            format!("partly sent to {name}")
+        }
+        SendOutcome::Unconfirmed => {
+            // Characters certainly not posted on a send nobody can confirm: a long message whose
+            // first part's answer was lost, so nothing after that part was tried.
+            notes.push(if record.unsent_chars > 0 {
+                "NOT confirmed; if any of it was posted, only its beginning was"
+            } else {
+                "NOT confirmed"
+            });
+            format!("may have been sent to {name}")
+        }
+    };
+    if record.text_truncated {
+        notes.push("only the beginning is quoted");
+    }
+    if notes.is_empty() {
+        head
+    } else {
+        format!("{head} ({})", notes.join("; "))
+    }
 }
 
 /// Whether a new call can actually be handed the earlier transcript: the operator allowed it AND
@@ -561,7 +631,16 @@ mod tests {
     // --- #270 voice-transcript-markers ---------------------------------------------------------
 
     fn sent(channel_name: &str, text: &str) -> Turn {
-        let record = crate::store::SentRecord {
+        sent_as(channel_name, text, |_| {})
+    }
+
+    /// A `sent` row whose record `edit` has had its way with: an outcome, a part count.
+    fn sent_as(
+        channel_name: &str,
+        text: &str,
+        edit: impl FnOnce(&mut crate::store::SentRecord),
+    ) -> Turn {
+        let mut record = crate::store::SentRecord {
             serial: 7,
             send_seq: 1,
             channel_id: "111".to_owned(),
@@ -584,10 +663,23 @@ mod tests {
             begun_at_ms: 0,
             sent_at_ms: 0,
         };
+        edit(&mut record);
         Turn {
             detail: Some(crate::store::TurnDetail::Sent(Box::new(record))),
             ..turn(Speaker::Sent, text)
         }
+    }
+
+    /// The one record line of a replay built from `turns` alone, and the text outside the fence.
+    fn record_line(turns: &[Turn]) -> (String, String) {
+        let built = build(turns, &policy(6000, 40));
+        let (outside, inside) = built.text.split_once(untrusted::FENCE).expect("fenced");
+        let lines: Vec<&str> = inside
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.contains(untrusted::FENCE))
+            .collect();
+        assert_eq!(lines.len(), 1, "{}", built.text);
+        (lines[0].to_owned(), outside.to_owned())
     }
 
     fn marker() -> Turn {
@@ -672,5 +764,141 @@ mod tests {
             "speaker labels and channel names are not words said"
         );
         assert_eq!(build(&[], &policy(6000, 40)).words, 0);
+    }
+
+    /// The call dropped while the commit was on the wire, so nobody knows whether "ship it" went.
+    /// The page told the agent so at the time, and the card it restores says "Not confirmed"; the
+    /// replay a resumed call is handed must not tell it the message was posted.
+    #[test]
+    fn a_send_nobody_confirmed_is_replayed_as_one_that_may_have_been_sent() {
+        let unconfirmed = |unsent_chars| {
+            sent_as("lead team", "ship it", |record| {
+                record.outcome = crate::store::SendOutcome::Unconfirmed;
+                record.parts_posted = 0;
+                record.unsent_chars = unsent_chars;
+            })
+        };
+        let (line, outside) = record_line(&[unconfirmed(0)]);
+        assert_eq!(
+            line, "may have been sent to lead team (NOT confirmed): ship it",
+            "an unconfirmed send was replayed as a posted one"
+        );
+        assert!(!line.starts_with("sent to "), "{line}");
+        assert!(outside.contains(SENT_LINES.trim()), "{outside}");
+        assert!(
+            outside.contains("Lines that begin 'may have been sent to'"),
+            "the preamble does not say what the line means: {outside}"
+        );
+
+        // A long message whose first part's answer was lost: nothing after it was tried.
+        let (line, _) = record_line(&[unconfirmed(900)]);
+        assert_eq!(
+            line,
+            "may have been sent to lead team (NOT confirmed; if any of it was posted, only its \
+             beginning was): ship it"
+        );
+    }
+
+    /// Only the parts that went are filed for a partial send, so the line must say the rest did
+    /// not: quoted bare, the agent would read the parts as the whole message.
+    #[test]
+    fn a_partial_send_is_replayed_saying_the_rest_was_not_posted() {
+        let partial = |uncertain_part, unsent_chars| {
+            sent_as("lead team", "alpha alpha", |record| {
+                record.outcome = crate::store::SendOutcome::Partial;
+                record.parts_posted = 1;
+                record.parts_total = 3;
+                record.uncertain_part = uncertain_part;
+                record.unsent_chars = unsent_chars;
+            })
+        };
+        let (line, outside) = record_line(&[partial(None, 1200)]);
+        assert_eq!(
+            line,
+            "partly sent to lead team (only these words were posted; the rest was NOT posted): \
+             alpha alpha"
+        );
+        assert!(
+            outside.contains("Lines that begin 'partly sent to'"),
+            "{outside}"
+        );
+
+        // The second part's answer was lost and the third was never tried.
+        let (line, _) = record_line(&[partial(Some(2), 600)]);
+        assert_eq!(
+            line,
+            "partly sent to lead team (these words were posted; the part after them may have \
+             been, NOT confirmed; the rest was NOT posted): alpha alpha"
+        );
+        // The last part's answer was lost: everything after the quoted words is in doubt.
+        let (line, _) = record_line(&[partial(Some(2), 0)]);
+        assert_eq!(
+            line,
+            "partly sent to lead team (these words were posted; whether the rest was is NOT \
+             confirmed): alpha alpha"
+        );
+    }
+
+    #[test]
+    fn each_outcome_opens_its_line_differently_and_only_a_whole_send_opens_sent_to() {
+        let outcomes = [
+            crate::store::SendOutcome::Sent,
+            crate::store::SendOutcome::Partial,
+            crate::store::SendOutcome::Unconfirmed,
+        ];
+        let lines: Vec<String> = outcomes
+            .iter()
+            .map(|&outcome| {
+                record_line(&[sent_as("ops", "ok", |record| record.outcome = outcome)]).0
+            })
+            .collect();
+        let opening = ["sent to ", "partly sent to ", "may have been sent to "];
+        for (line, opening) in lines.iter().zip(opening) {
+            assert!(line.starts_with(opening), "{line}");
+            assert!(
+                SENT_LINES.contains(&format!("Lines that begin '{}'", opening.trim_end())),
+                "the preamble does not explain {opening:?}"
+            );
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("sent to "))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    /// A `sent` row whose record this version cannot read says nothing about what went, so it is
+    /// never replayed as a send.
+    #[test]
+    fn a_sent_row_without_a_readable_record_is_not_replayed_as_a_send() {
+        let (line, outside) = record_line(&[turn(Speaker::Sent, "ship it")]);
+        assert_eq!(
+            line,
+            "may have been sent to a channel (NOT confirmed): ship it"
+        );
+        assert!(outside.contains(SENT_LINES.trim()), "{outside}");
+    }
+
+    /// A stored row is capped, so "quoted exactly" is said only of what the line holds.
+    #[test]
+    fn a_shortened_row_says_only_its_beginning_is_quoted() {
+        let (line, _) = record_line(&[sent_as("ops", "the start", |record| {
+            record.text_truncated = true;
+        })]);
+        assert_eq!(
+            line,
+            "sent to ops (only the beginning is quoted): the start"
+        );
+        let (line, _) = record_line(&[sent_as("ops", "the start", |record| {
+            record.outcome = crate::store::SendOutcome::Unconfirmed;
+            record.text_truncated = true;
+        })]);
+        assert_eq!(
+            line,
+            "may have been sent to ops (NOT confirmed; only the beginning is quoted): the start"
+        );
     }
 }
