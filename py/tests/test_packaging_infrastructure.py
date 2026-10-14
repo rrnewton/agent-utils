@@ -865,9 +865,20 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # checked before the lock, submodule facts derived before the lock, a file
     # written and index flags set after that check, one clean published
     # shallow submodule, and two refused shallow submodules) are mapped.
-    assert len(all_tests) == 1947
+    # The five interrupted absent-validate-batch cases of 6c16e882 (an overlap
+    # the batch does not name, a batch slot not reused, creation and
+    # classification beside the batch, and two host-context resumptions) are
+    # mapped.
+    # The three absent-batch cases of 844c2b85 (a batch-named row that changed,
+    # a batch-named row whose archive is not the batch recovery, and a
+    # host-context absent-agent-row resumption) are mapped.
+    # The three read-handoff absent-slot cases of
+    # https://github.com/rrnewton/agent-utils/issues/244 (a sidecar read that
+    # lets recovery archive the row, and refusals without a sidecar and with a
+    # fenced sibling) are mapped.
+    assert len(all_tests) == 1958
     assert len(ordinary) == 336
-    assert len(mapped) == 1611
+    assert len(mapped) == 1622
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
