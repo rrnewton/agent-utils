@@ -9,6 +9,8 @@
 //! provider is asked or answers:
 //! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test message_lookups`.
 
+mod slack_fake;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,6 +20,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
+use slack_fake::{profiled, system, ts, FakeState};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity, Lookup, ReadCaps, Support};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -824,4 +827,186 @@ async fn an_unseen_message_of_the_channel_is_found_in_the_window_and_the_allowli
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
     assert_eq!(native.calls().len(), before, "nothing was asked upstream");
+}
+
+// ---- Slack: a run of timestamps a call --------------------------------------------------------
+
+const SLACK_CH: &str = "C0000MAIN1";
+
+fn slack_channel() -> ChannelId {
+    ChannelId(SLACK_CH.to_owned())
+}
+
+fn slack_id(ts: &str) -> MessageId {
+    vibe_talk::slack::message_id_from_ts(ts).expect("encodable")
+}
+
+/// Sixty messages a second apart, a system event at second 70, and a thread on the first message
+/// with thirty replies a second apart from second 100.
+fn slack_state() -> FakeState {
+    let mut state = FakeState::default();
+    let mut list: Vec<Value> = (0..60)
+        .map(|i| profiled(&ts(i, 0), "UADA00001", "Ada", &format!("main {i}")))
+        .collect();
+    list.push(system(&ts(70, 0), "channel_join"));
+    let replies: Vec<(String, String)> = (0..30)
+        .map(|i| (ts(100 + i, 0), format!("reply {i}")))
+        .collect();
+    let mut root = list[0].clone();
+    slack_fake::thread(&mut state, SLACK_CH, &mut root, &replies);
+    list[0] = root;
+    state.history.insert(SLACK_CH.to_owned(), list);
+    state
+}
+
+fn contents(answers: &[Lookup]) -> Vec<String> {
+    answers
+        .iter()
+        .map(|answer| match answer {
+            Lookup::Found(message) => message.content.clone(),
+            Lookup::Absent => "<absent>".to_owned(),
+            Lookup::Unseen => "<unseen>".to_owned(),
+        })
+        .collect()
+}
+
+/// remote-ops-audit W11, Slack: eight replies of a thread are ONE `conversations.replies` call,
+/// pinned a microsecond either side of the first and last, where one lookup each was eight.
+#[tokio::test]
+async fn slack_looks_up_eight_replies_of_a_thread_in_one_call() {
+    let fake = slack_fake::Fake::start(slack_state(), 20).await;
+    let client = fake.client();
+    let root = ts(0, 0);
+    let asked: Vec<MessageId> = (3..11).map(|i| slack_id(&ts(100 + i, 0))).collect();
+    assert_eq!(client.read_caps(&slack_channel()).by_ids, Support::Native);
+    let answers = client
+        .fetch_messages(&slack_channel(), Some(&root), &asked)
+        .await
+        .expect("found");
+    assert_eq!(
+        contents(&answers),
+        (3..11).map(|i| format!("reply {i}")).collect::<Vec<_>>()
+    );
+    let calls = fake.requests("conversations.replies");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["ts"], root);
+    assert_eq!(calls[0]["oldest"], ts(102, 999_999));
+    assert_eq!(calls[0]["latest"], ts(110, 1));
+    assert_eq!(calls[0]["inclusive"], "true");
+    assert_eq!(fake.calls("conversations.history"), 0);
+
+    // What the same eight cost one at a time, as every caller looked them up before.
+    for id in &asked {
+        client
+            .fetch_thread_message(&slack_channel(), &root, id)
+            .await
+            .expect("found");
+    }
+    assert_eq!(fake.calls("conversations.replies"), 1 + 8);
+}
+
+/// Ids far apart are a call per run, each id proved absent only by a page that covered it, and a
+/// message this server would not show among the channel's own is unseen rather than absent.
+#[tokio::test]
+async fn slack_reads_ids_far_apart_a_run_a_call_and_proves_absence_only_where_it_read() {
+    let fake = slack_fake::Fake::start(slack_state(), 20).await;
+    let client = fake.client();
+    let asked = [
+        slack_id(&ts(5, 0)),
+        slack_id(&ts(7, 500_000)), // between two messages: none there
+        slack_id(&ts(50, 0)),
+        slack_id(&ts(70, 0)),  // the system event
+        slack_id(&ts(105, 0)), // a reply: not one of the channel's own messages
+    ];
+    let answers = client
+        .fetch_messages(&slack_channel(), None, &asked)
+        .await
+        .expect("read");
+    assert_eq!(
+        contents(&answers),
+        ["main 5", "<absent>", "main 50", "<unseen>", "<absent>"]
+    );
+    let calls = fake.requests("conversations.history");
+    // [5, 105]: the twenty newest are the reply-free stretch 70 down to 41, proving 105 absent
+    // and finding 70 and 50; then [5, 7.5] in one page, finding 5 and proving 7.5 absent.
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0]["oldest"], ts(4, 999_999));
+    assert_eq!(calls[0]["latest"], ts(105, 1));
+    assert_eq!(calls[1]["oldest"], ts(4, 999_999));
+    assert_eq!(calls[1]["latest"], ts(7, 500_001));
+    assert_eq!(fake.calls("conversations.replies"), 0);
+}
+
+/// A Slack deployment built from configuration exactly as `main` builds one, its one channel the
+/// conversation the Slack fixture fills.
+fn slack_deployment(fake: &slack_fake::Fake) -> AppState {
+    let text = format!(
+        r#"
+[auth]
+read_token = "{READ_TOKEN}"
+write_token = "{WRITE_TOKEN}"
+
+[[providers]]
+key = "slack"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = false
+"#,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    state
+}
+
+/// Through the routes: a message by id on Slack is one pinned read wherever it is, and a deleted
+/// one is a 404 from that same read, where both were a read of the recent window before.
+#[tokio::test]
+async fn slack_answers_a_message_by_id_with_one_pinned_read() {
+    let fake = slack_fake::Fake::start(slack_state(), 20).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let base = format!("/api/v1/channels/{SLACK_CH}");
+    let old = slack_id(&ts(2, 0));
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("{base}/messages/{}", old.as_str()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["message"]["content"], "main 2",
+        "older than the window"
+    );
+    let calls = fake.requests("conversations.history");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["latest"], ts(2, 1));
+
+    fake.with(|state| {
+        state
+            .history
+            .get_mut(SLACK_CH)
+            .expect("channel")
+            .retain(|message| message["ts"] != json!(ts(3, 0)));
+    });
+    let (status, answer) = call(
+        &router,
+        READ_TOKEN,
+        "GET",
+        &format!("{base}/messages/{}", slack_id(&ts(3, 0)).as_str()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(answer["error"], "unknown_message");
+    assert_eq!(fake.calls("conversations.history"), 2, "no window was read");
 }

@@ -10,6 +10,9 @@
 //! | `conversations.info` | verifying a conversation before it is registered |
 //! | `conversations.history` | a conversation's main timeline, the thread list, reply targets |
 //! | `conversations.replies` | a thread's messages, thread membership checks, exact lookups |
+//!
+//! A lookup of several messages by id reads `conversations.history` or `conversations.replies`
+//! a run of timestamps a call (`slack/lookup.rs`).
 //! | `chat.postMessage` | every post, in a conversation or in a thread |
 //! | `users.info` | an author's display name when the message does not carry one |
 //! | `users.conversations` | the channel browser |
@@ -42,6 +45,7 @@ mod clear;
 mod client;
 mod history;
 pub mod ids;
+mod lookup;
 pub mod mrkdwn;
 mod range;
 mod timeline;

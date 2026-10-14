@@ -1118,6 +1118,13 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   from `since` still reads from there to now, as it always did, and when that is more than ten
   pages it narrows by time to the messages next to `since`; such a step answers `has_more: true`
   unless Slack proved the span ends, so a walk never stops short.
+* **Lookups by id.** A message's id is its `ts`, so the messages speech preparation, a thread
+  summary or a lookup of one message asks for are read a run of timestamps a call:
+  `conversations.replies` (in a thread) or `conversations.history`, with `oldest` and `latest` a
+  microsecond either side of the run and `inclusive`. Eight replies of a thread are one call where
+  they were eight; ids more than a page apart are a call each, never more calls than ids. A
+  message is reported gone only when a page that covered its `ts` did not have it; one Slack has
+  but this server would not show there (a system event, say) is looked up as before.
 * **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.

@@ -1234,7 +1234,11 @@ impl HttpSlackClient {
     }
 
     /// A caller's thread id, checked against a thread-scoped channel's own thread.
-    fn member_thread(&self, target: &ChannelRef, thread_id: &str) -> Result<String, ChatError> {
+    pub(super) fn member_thread(
+        &self,
+        target: &ChannelRef,
+        thread_id: &str,
+    ) -> Result<String, ChatError> {
         let thread = thread_ts(thread_id)?;
         if target
             .thread_ts
