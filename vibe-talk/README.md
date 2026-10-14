@@ -694,6 +694,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Digest (`/digest`) | **works**, extractive and deterministic (no model call). This is the whole-channel digest, not the per-message summary below. |
 | **Per-message summaries and thread names, from one Messages API call** (`[summaries.llm]`) | **written, tested against a local mock Messages API only; never yet run against a live model provider.** One plain HTTP request per summary or thread name, with no agent harness and no tools, in the Anthropic API's dialect or Google Vertex's. See [Summaries](#summaries). |
 | Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is what runs when `[summaries.llm]` is absent.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
+| Message cache on the server's disk (`[message_cache]`) | **off by default; when an operator turns it on, it is filled and serves nothing yet.** It is filled from write-scope and server-owned reads, and is never filled by the read token. The owner can turn it off or erase it in Settings. It counts what it would have served. It has been tested against temporary files and in-memory providers only. The acceptance run on a real deployment, a day of fills with no writer drops, has not been done yet. See [The message cache](#the-message-cache). |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
 | Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
@@ -2179,7 +2180,7 @@ model provider or a real gateway.
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
-| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see, and never served from yet** (`#208 persistent-cache`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default, or `off`), `timeline_fallback_ms` (default `10000`, 1000 to 60000), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false` |
+| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see, and never served from yet** (`#208 persistent-cache`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default, or `off`; no effect yet), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
@@ -3450,6 +3451,379 @@ sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE voice_post_prefix; PRAGMA user_ve
 
 Run that only on a file at version 16 (`PRAGMA user_version;` says), and only when the build being
 returned to predates the step; a later step must be undone first, and its own note says how.
+
+## The message cache
+
+**The problem.** Every page load, every catch-up of the voice agent and every digest reads the chat
+provider afresh, and a provider can be slow: a rate limit, or a bridge's own fetch, puts seconds
+between a question and its answer. A copy of recent messages on the server's own disk is what
+later work answers from: a page drawn while the provider is down, and counts and search over
+history the provider will not walk quickly.
+
+**What this build does.** `#208 persistent-cache`, milestone `cache-fill`. Once an operator turns
+it on, the server keeps a copy of the messages its own reads see, in a SQLite file of its own. It
+applies the deletions and edits it learns of, and erases what it may no longer hold. **Nothing is
+answered from it yet.** Every route and every tool reads the provider exactly as before, whether
+the cache is on or off. For each read that a later build will answer from the cache, the server
+counts what the cache would have answered, and whether that would have matched the provider. So
+serving can be judged from numbers before anything is served (see "What the cache would have
+served" below).
+
+**Off unless an operator turns it on.** With no `[message_cache]` table, or with
+`enabled = false`, no cache file is opened and the server behaves as it did before the cache
+existed.
+
+**What it depends on.**
+
+* A store (`storage.path`). The cache's off switch, and the list of cache files this server has
+  made, are kept beside the store.
+* A Unix host, and a directory only this account can enter.
+* The bundled SQLite. The cache needs FTS5, its trigram tokenizer and `secure-delete`. It checks
+  for them when it opens, and if one is missing the server runs without a cache.
+
+### What it holds, and where
+
+* **One SQLite file, separate from the store.** The cache is never tables inside the store, and
+  is never attached to it. It holds message rows (text, author, times, thread membership) for the
+  channels on the server's list only, with:
+  * a full-text index of their text;
+  * the stretches of each channel's history known to be complete ("coverage");
+  * a tombstone for each message deleted upstream, holding only ids and times and kept seven
+    days, so that a read which began before the deletion cannot bring the message back.
+
+  No summary is ever in it: summaries stay in the store.
+* **Where.** `[message_cache] path`, which must be absolute and must not be the store's own file.
+  By default the file is beside the store, named after the store and this host:
+  `<store stem>.message-cache-<host>.sqlite3`. So a store at
+  `/var/lib/vibe-talk/vibe-talk.sqlite3` on a host called `reader` gets
+  `/var/lib/vibe-talk/vibe-talk.message-cache-reader.sqlite3`. The host name only guards against
+  collisions. A copy synced to another machine is not that machine's cache, and that machine's off
+  switch never finds it. SQLite's `-wal` and `-shm` files sit beside the cache file, and so does
+  `<path>.lock`.
+* **Private.** The file is created `0600` before SQLite opens it, so its working files are `0600`
+  too. Its directory must belong to this account and have no group or other permission bit.
+  * A directory the server creates is made `0700`.
+  * An existing directory with looser permissions is refused, never changed. The cache does not
+    open, and its status says `filesystem`.
+
+  With the default path, that directory is the store's own.
+* **One process.** The server holds an exclusive `flock` on `<path>.lock` for as long as it runs.
+  A second server configured with the same path refuses to open it (`locked`), so two servers can
+  never erase each other's file.
+* **The sidecar.** `<storage path>.message-cache.json` sits beside the store. It is `0600` and
+  written atomically. It holds:
+  * the owner's off switch, and when it was turned off;
+  * every cache path this store's server has ever opened;
+  * since when the configuration has had no `[message_cache]` table.
+
+  It is deliberately not in the store. Purging the store cannot turn the cache back on, and
+  restoring an older copy of the store cannot lose the switch. A sidecar that cannot be parsed is
+  read as **off**, because the safe reading of a damaged switch is the one that erases. Leave it
+  alone.
+* **Bounded on write.**
+  * **Age.** Nothing older than `max_days` is written, counted by the message's own time. An
+    hourly pass deletes what has aged out since, and any message not re-checked against the
+    provider for seven days.
+  * **Size.** `max_megabytes` bounds the file, its `-wal` and its `-shm` together. Past it, the
+    oldest messages across all channels are deleted until the total is under 90 % of the bound.
+  * **One channel.** A conversation the provider itself keeps for less time can have its own
+    limit, set with a `[[message_cache.channel]]` entry.
+
+  Neither bound is measured yet against real messages. At about 2.4 KB a message with its index
+  (an estimate), 256 MB holds on the order of 70,000 to 100,000 messages.
+
+It is **not encrypted**. Anyone who can read this account's files can read it, as with the store.
+
+### Turning it on for a host
+
+1. **Deploy this build first, without the table, and let it run.** A build from before
+   `summary-keep` refuses to start with a `[message_cache]` table at all (an unknown section). The
+   lines must never reach a host before a build that reads them.
+2. **Choose a directory outside anything that is synced or backed up**, and run the canary
+   preflight below against it. The cache holds other people's messages. Once a sync or backup
+   agent has taken a copy, turning the cache off never reaches it.
+3. **Add the table to that host's overlay** (see
+   [One config file, two hosts](#one-config-file-two-hosts)), with three keys:
+
+   ```toml
+   [message_cache]
+   enabled = true
+   max_days = 14
+   path = "/srv/vibe-talk-cache/vibe-talk.message-cache.sqlite3"
+   ```
+
+   `max_days = 14`, rather than the default 90, keeps less while it is unknown how long the
+   provider keeps each conversation. A conversation kept upstream for a day gets its own entry:
+   `[[message_cache.channel]]` with `id` and `max_days = 1`.
+4. **Restart, and read the startup line:** `the message cache is open; it is filled from what
+   write-scope and server-owned reads see, and nothing is served from it yet`, with the path,
+   `max_days` and `max_megabytes`. A cache that cannot open leaves the server running without one.
+   The log says why, and so does the status, as a code (see "Diagnostics and logs" below).
+
+Every key, with its default and range, is in the [Configuration](#configuration) table.
+
+### Before the first enable: the canary preflight
+
+A file-sync or backup agent may take a directory by rules that cannot be seen from the host. A
+check made after the first cache file exists comes too late by construction: the copy is already
+taken. So, before the first enable:
+
+1. Create an empty file named the way a cache file is named, `canary.message-cache-<host>.sqlite3`,
+   in the directory the cache will use. Do not put it at the cache's own path.
+2. Wait for at least two of the agent's cycles.
+3. Look in the agent's own record of what it has taken (its manifest, index or listing), and
+   confirm the canary's path is not there.
+4. Remove the canary.
+
+If the path is there, choose another directory. If the host has a deploy script, repeat the check
+from it on every deploy: an agent's rules can change. The server cannot run this check itself,
+because it cannot know which agents run on its host.
+
+### Turning it off, and rolling back
+
+* **Turning it off for a host.** Set `enabled = false` in the overlay and restart. At startup the
+  server erases every cache file this store's server ever made, and logs the bytes removed. That
+  means each path the sidecar lists, and each file in the store's directory that is named like a
+  cache and whose header says it is one. A file the server did not make is left alone.
+* **Removing the table is not the same.** With no `[message_cache]` table, nothing is opened, but
+  nothing is erased at first either. At every start the server warns that a message cache of that
+  many bytes, left from an earlier configuration, is present and unused. It erases the cache once
+  the table has been absent for seven days in a row, so that an overlay missing for a day does not
+  throw away a copy that took days to fill.
+* **Rolling back.** No build before this one ever erases a cache file:
+  * a build from `summary-keep` on, but older than this one, starts with the table and leaves the
+    file where it is. Its startup line says
+    `[message_cache] is present; this build has no message cache`, or
+    `[message_cache] is read and valid; this build does not open a message cache`;
+  * a build from before `summary-keep` refuses the table and does not start.
+
+  So, before rolling back past this build, **set `enabled = false` and deploy, or turn the cache
+  off in Settings**. Either one erases the file while a build that can still erase it is running.
+  Then keep `enabled = false`, which every build from `summary-keep` on accepts, or **remove the
+  overlay lines**. Remove them before rolling back past `summary-keep`. Removing the lines alone
+  only starts this build's seven-day count: an older build never finishes it, and the file stays
+  on disk with nothing left to manage it.
+* **By hand**, with the server stopped: delete the cache file and its `-wal`, `-shm`, `-journal`
+  and `.lock` files. While the configuration still enables the cache, the next start opens a
+  fresh, empty file.
+
+### The owner's switch
+
+The switch is in Settings, under **Storage and connection**, in the group "Saved messages on this
+server". The group is shown only to the write token, and only when the configuration has a
+`[message_cache]` table. It shows what the cache holds (its size, messages, channels, the oldest
+time covered, and the limits), a switch, and Erase. Turning the switch off, and Erase, each ask
+first.
+
+* **Off** (`PUT /api/v1/message-cache` with `{"enabled": false}`) writes the off switch into the
+  sidecar **first**, and erases second.
+  * If the switch cannot be saved, nothing is erased, and the route answers
+    `500 message_cache_switch_unsaved`.
+  * A crash between the two steps erases at the next start.
+  * Every cache file this server made is erased, not only the open one.
+
+  **Off outlasts a restart, and it outranks the configuration.** While the sidecar says off,
+  `enabled = true` opens nothing and erases at every start. Only the owner's on clears it.
+* **On** (`{"enabled": true}`) clears the switch and opens a fresh, empty file. It is refused with
+  `409 message_cache_not_enabled` while the configuration does not say `enabled = true`. In that
+  direction, the operator's configuration outranks the owner's switch.
+* **Erase** (`DELETE /api/v1/message-cache`) erases the open file and opens a fresh, empty one in
+  its place, so the cache stays on. With the cache off it erases nothing.
+
+All three need the write scope, and no MCP tool reaches them. Each answers the status (see below),
+or `409 message_cache_not_configured` when there is no table. After any erase of the whole file,
+each provider's account is checked again before anything more is filled.
+
+**The storage purge** (`DELETE /api/v1/storage`, see "How an operator purges it") erases the cache
+as Erase does, along with every other cache file this server made. It leaves the switch exactly as
+it was: a purge never turns the cache on, and never turns it off. Its `purged` list names
+`message_cache`.
+
+### What erases what
+
+| When | What is erased |
+|---|---|
+| The owner turns the cache off; the configuration says `enabled = false`; the sidecar says off at startup; the table has been absent for seven days | Every cache file this server made |
+| Erase in Settings (`DELETE /api/v1/message-cache`); the storage purge | The open file, replaced by a fresh one while the cache is on. The purge also erases every other cache file this server made |
+| A channel taken off the list: removed or hidden in Settings, or deleted from the configuration | That channel's messages, and the store's summaries of it |
+| At every start, and whenever the list changes: anything not on the list (a channel no longer listed, a hidden one, one under a provider key that no longer exists) | Those channels' messages, and the store's summaries of every channel no longer listed under any provider |
+| A provider refuses a read of a channel or a thread, and the server's own read, ten minutes later, is refused the same way | That channel and the store's summaries of it; or that thread's messages and the store's summaries of them |
+| A provider refuses the credential for 24 hours, or Slack answers `account_inactive` or `token_revoked`; a provider's account is no longer the one the file's messages were read as | Everything held from that provider |
+| A file from an incompatible schema, or a file of ours that SQLite cannot read | The file, rebuilt empty |
+
+**The startup sweep waits for the store.** The list at startup includes the channels added in the
+app and the configured channels hidden, and both come from the store. A store that failed to
+answer would leave the list short, and sweeping to a short list would erase every channel added in
+the app. So nothing is swept, and nothing filled, until the store has answered both. If it never
+does, the cache stays untouched for the life of the process.
+
+**Deletions and edits.** The server learns that a message was deleted upstream from a pushed
+deletion, from a delta that reports it, or from the message's absence from a listing that proves
+complete the stretch it was in. It then deletes the message from the file and leaves a tombstone.
+An edit replaces the text. In both cases a summary of the old text is deleted from the store once
+the change is written. Turning the cache off never deletes a summary. A message the server does
+not re-check is deleted within seven days anyway.
+
+### Whose reads fill it
+
+* **A read-scope token never fills it.** The read token is the one pasted into a voice agent. No
+  read it makes, by route or by MCP tool, writes anything to the file: no row, no coverage, no
+  tombstone, no last-used time and no counter. A test runs a read-token session across every read
+  route and tool, and finds the file unchanged.
+* **What does fill it:**
+  * reads made with the write token: the page's timeline in every view, with its catch-up
+    deltas; `/messages`; `/page`; `/count`; a message by id; a digest; the to-do list;
+    `resolve`; read-aloud's preparation; and the voice catch-up of a write-token session;
+  * the live poller's reads;
+  * every change the live feed publishes, offered before any page is sent it;
+  * the messages this server posts.
+* **The one change a read-scope request can set off is an erase.** Suppose a provider refuses a
+  read of a channel, whoever made that read. The cache stops treating the channel as one it could
+  answer for, at once and in memory. Ten minutes later the server reads the channel again on its
+  own account, and only the same refusal erases what the cache held of it. That erase removes data
+  and writes none.
+* **Rows belong to an account.** Nothing of a provider is filled until that provider's own client
+  has said, in this process, which account it is, and the file agrees.
+  * The first time, the account is recorded.
+  * A different account erases everything held from that provider before anything new is
+    written.
+  * No answer (a transport error, a 5xx) fills nothing. The server asks again after 5 seconds,
+    doubling the wait each time up to 10 minutes.
+  * A 401 from any operation suspends the provider: nothing of it is filled until its account
+    answers again, asked every 10 minutes.
+* **A claim needs the provider's word.** The cache may record a stretch of a channel as complete,
+  and so delete what a listing of that stretch no longer carries, only when the provider said so:
+  * a newest page whose `has_more` is false;
+  * a walk forward that was not cut short and found a message;
+  * a `/count` walk that followed its own continuation.
+
+  A read that merely came back short proves nothing. A page with a `notice`, a page stepped back
+  to, a pushed change and an empty page give rows only. Slack's coverage is never complete,
+  because its client omits a message that has no author.
+
+### What the cache would have served
+
+Some reads are ones a later build will answer from the cache: `/messages` and its callers (the
+digest, the to-do list, bankruptcy, and read-aloud's window), a message by id, the message a
+summary is of, `/page`, `/count`, and the page's newest timeline, as a stand-in for a provider that
+failed. In this build each of those is **shadowed**:
+
+1. while the read goes upstream, the cache is asked the same question, on the blocking pool;
+2. the rule a serving build would apply decides whether the cache would have answered;
+3. once upstream has answered, the two answers are compared.
+
+The shadow never delays a response and never writes. Read-scope requests are shadowed as well, and
+those write nothing either. Counts are kept per consumer, in memory, from the moment the process
+starts:
+
+* `asked`, `would_serve`, and `needs_existence_check`: answered, but only after one call upstream
+  to confirm the message still exists, as for Slack messages not re-checked within two hours;
+* `misses` by reason: `off`, `blocked`, `suspect`, `gap`, `incomplete`, `stale_head` and
+  `barrier`;
+* `late`: an evaluation that read what a newer read had already written, so it gives no verdict;
+* when the cache would have answered and upstream did too:
+  * `compared` and `agreed`;
+  * `missing_rows`, messages upstream listed that the cache lacked;
+  * `extra_rows`, messages the cache would have shown that the provider no longer lists. Each one
+    would have brought a deleted message back, so any is logged as a warning, with counts and
+    nothing else;
+  * `content_differs`.
+
+With a table but no file open, an ask counts as `off`. With no table, nothing is counted. An ask
+the cache would never answer, such as Slack's Flat view, is not counted at all.
+
+`backfill` and `timeline_fallback_ms` are read and checked, and do nothing in this build. There is
+no backfill yet, and nothing is answered from the cache when a timeline read is slow.
+
+### Diagnostics and logs
+
+**Status.** Client-config (to the write scope only) and the switch routes carry `{available,
+enabled, reason?, bytes, messages, channels, oldest_covered?, max_days, max_megabytes}`, measured
+at most once every 30 seconds. When no cache is open, `reason` says why, as a code and never a
+path:
+
+| `reason` | Why no cache is open |
+|---|---|
+| `config_disabled` | the configuration says `enabled = false` |
+| `switched_off` | the owner turned it off |
+| `switch_unreadable` | the sidecar could not be read |
+| `switch_unwritable` | the sidecar could not be written, so the file could not be registered before it opened |
+| `sqlite_unsupported` | the linked SQLite lacks something the cache needs |
+| `foreign_file` | the path holds a file this server did not make; it is left alone |
+| `locked` | another process, or another handle, holds the path |
+| `filesystem` | the directory or the file could not be created, or is not private |
+| `sqlite` | SQLite failed |
+| `not_open` | none of the above has been recorded |
+
+**`GET /api/v1/diagnostics`** gains a `message_cache` section when the configuration has a table:
+
+```jsonc
+"message_cache": {
+  "available": true, "enabled": true,
+  "bytes": 18874368, "messages": 6120, "channels": 9, "tombstones": 41, "intervals": 57,
+  "covered_days": 31.5,      // days of each channel's own timeline covered, summed over channels
+  "stats": {                  // what the writer has done since the file opened
+    "ops_applied": 15210, "ops_dropped": 0, "bytes_dropped": 0, "ops_stale": 3,
+    "ops_unrouted": 0, "ops_failed": 0, "batches": 2210, "rows_written": 9800,
+    "orphans_sent": 12, "orphans_dropped": 0, "…": "…",
+    "batch_us": { "count": 2210, "p50_us": 1500, "p99_us": 24000, "max_us": 31000,
+                  "octaves_us": [[1024, 1900], [16384, 310]] }
+  },
+  "providers": [ { "provider": "slack", "verification": "verified" } ],
+  "blocked": 0,               // channels and threads not answered for while access is in doubt
+  "shadow": [
+    { "consumer": "messages", "asked": 410, "would_serve": 120, "needs_existence_check": 0,
+      "misses": { "off": 0, "blocked": 0, "suspect": 0, "gap": 30, "incomplete": 0,
+                  "stale_head": 260, "barrier": 0 },
+      "late": 0, "compared": 120, "agreed": 118, "missing_rows": 2, "extra_rows": 0,
+      "content_differs": 0 }
+  ]
+}
+```
+
+What the fields mean:
+
+* **Drops.** `ops_dropped` and `bytes_dropped` count offers the writer's 32 MB queue had no room
+  for. Each drop also stops the cache treating the newest end of that channel as current, until a
+  later read of it lands.
+* **Stale and unrouted.** `ops_stale` counts what reads offered after an erase had overtaken
+  them. `ops_unrouted` counts offers for a channel that is not on the list.
+* **Batches.** `batch_us` gives how long the writer's batches take.
+* **Providers.** `verification` is `verified`, `unverified` or `suspended`.
+* **Shadow.** `shadow` lists every consumer: `messages`, `digest`, `todo`, `bankruptcy`, `speech`,
+  `message_by_id`, `summary`, `page`, `count` and `timeline_fallback`.
+* **Memory only.** The figures restart from zero with the process.
+
+**Every hour, one `info` line** gives the same figures, as totals since the process started, with
+the shadow summed over consumers:
+
+```text
+INFO vibe_talk::cache::sink: message cache figures since this process started available=true enabled=true bytes=18874368 messages=6120 channels=9 covered_days=31.5 ops_applied=15210 ops_dropped=0 … batch_p99_us=24000 orphans_dropped=0 providers_verified=1 providers_suspended=0 blocked=0 shadow_asked=410 shadow_would_serve=120 … shadow_extra_rows=0 shadow_content_differs=0
+```
+
+**What is never logged.** No log line about the cache, at any level, carries message text, a
+message or channel id, a content hash or a summary key. A line names a provider by its
+configuration key, a doubtful scope by its kind (`channel` or `thread`), and the cache's own files
+by their paths. The cache's SQLite failures are logged as result codes, never as SQLite's message,
+which can quote what it was given. Neither the diagnostics section nor the hourly line is written
+on a server whose configuration has no table.
+
+### Erasure is logical
+
+Deleting a message uses SQLite's `secure_delete` and the full-text index's `secure-delete`, so its
+pages are zeroed in the file. The write-ahead log is truncated after every deletion. Erasing the
+whole cache unlinks its files. A large deletion (a big erase, an age pass, eviction) deletes from
+the index by marker instead. Its entries stay in old index pages, which no query can reach, until a
+compaction rewrites them. That compaction runs in steps between batches, and resumes after a
+crash.
+
+All of that reaches only the file as the file system presents it:
+
+* on a copy-on-write file system, behind a snapshot, or on flash storage, old blocks can survive
+  on the device until they are reused;
+* copies that a backup or sync agent already took are not reached at all.
+
+Treat erasure as logical, not physical. The Settings help says so too.
 
 ## The access log
 
