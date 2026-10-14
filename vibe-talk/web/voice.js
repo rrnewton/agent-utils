@@ -35099,6 +35099,27 @@ let threadListShown = false;
  */
 let listHeldPlace = null;
 
+/**
+ * Where the reader was in the cards of the thread list, held while two columns brought from it are up,
+ * for the way back: `place`, read in the list, and `placed`, where two columns' cards then put them;
+ * on which channel. Set as two columns come from the list, spent by the next change of layout, and let
+ * go as the cards are opened afresh. `#280 scroll-stability` x `#269 approval-card-inline` x `#281
+ * view-keys`.
+ *
+ * A send card docked under the list takes its height from the foot of the cards, so their column is
+ * that much shorter there than beside Main, where the card is back at the foot of Main's list. A reader
+ * up the cards nearer their foot than that is at the foot in two columns, which is only geometry, as
+ * Main behind the cards is too short to keep a reader near its foot. But the way back read them as at
+ * the foot, and put them at the list's foot too. In Chromium at a desk, the long draft's card 246px tall,
+ * every reader 60 to 300px up the cards came back at the list's foot by Ctrl+4 and Ctrl+3: one 300px up
+ * kept their card in two columns, 10px from the foot, inside the slack, and moved about 290px. So the
+ * place read in the list is put back on the way back, where the reader left the cards where two columns
+ * put them; one who moved them is placed where they are, as before.
+ *
+ * @type {{place: {newest: boolean, id: string | null, offset: number}, placed: {newest: boolean, id: string | null, offset: number} | null, channel: string} | null}
+ */
+let listCardsHeld = null;
+
 /** Whether the right column is on screen: beside Main, or on its own as the thread list. */
 const sideColumnUp = () => columnsShown || threadListShown;
 
@@ -35401,11 +35422,20 @@ function renderColumns() {
  * its last button coming in after a reload — is for the right column's dock-growth keeper (`#229`), which
  * takes a reader at the foot of the cards back to it.
  *
+ * `#280 scroll-stability` x `#269 approval-card-inline`. Back from two columns to the thread list they
+ * were brought from, the reader still where two columns put them in the cards: where they were in the
+ * list (`listCardsHeld`). A send card docked under the list makes its column of cards shorter than two
+ * columns' right column, so a reader near the foot of the list was at the foot in two columns, and that
+ * is no reason to be at the foot of the list.
+ *
  * @param {"one" | "list" | "two"} now
  * @param {"one" | "list" | "two"} next
  * @param {{newest: boolean, id: string | null, offset: number} | null} [cards]
  */
 function moveLayout(now, next, cards = null) {
+  // Spent by this change of layout, whatever it is.
+  const held = listCardsHeld;
+  listCardsHeld = null;
   // `#277 reply-in-column`. A reply open in a column of the two that go moves to the reply screen once
   // the next layout is drawn under it (`leaveColumns`).
   const handOff = now === "two" ? leaveColumns(next) : null;
@@ -35414,8 +35444,19 @@ function moveLayout(now, next, cards = null) {
   else if (next === "list") enterThreadList(now);
   const kept = now !== "one" && next !== "one" ? cards : null;
   const place = sideColumnUp() && columns.side.mode === "list" ? kept || cardAnchor() : null;
+  const channel = String(el("discord-channel").value);
+  const back = place && kept && now === "two" && held && held.channel === channel && sameCardPlace(kept, held.placed)
+    ? held.place : null;
   renderThreadSelect();
-  placeCardAnchor(place);
+  if (back && placeCardAnchor(back)) {
+    // The card docked again under the list is not the dock growing under a reader two columns had at the
+    // foot of their cards (`cardsPlacedUnderLists`).
+    cardsPlacedUnderLists();
+  } else {
+    // Where the card the list's place was on has gone since, the place two columns had.
+    placeCardAnchor(place);
+  }
+  if (place && kept && now === "list" && next === "two") listCardsHeld = { place: kept, placed: cardAnchor(), channel };
   if (handOff) handOff();
 }
 
@@ -36056,6 +36097,18 @@ function placeCardAnchor(anchor) {
 }
 
 /**
+ * Whether two places in the cards, as `cardAnchor` reads them, are the same: both the foot, or the same
+ * card within a pixel of the same height. `#280 scroll-stability`.
+ *
+ * @param {{newest: boolean, id: string | null, offset: number} | null} one
+ * @param {{newest: boolean, id: string | null, offset: number} | null} other
+ */
+function sameCardPlace(one, other) {
+  if (!one || !other || one.newest !== other.newest) return false;
+  return one.newest || (one.id === other.id && Math.abs(one.offset - other.offset) <= 1);
+}
+
+/**
  * Run `change` to the cards, keeping the reader's place in them. `#261 two-column-connectors`.
  *
  * @param {() => void} change
@@ -36085,6 +36138,8 @@ function rememberCardPlace() {
 
 /** Show the cards in the right column, the reader placed in them as `placeOpenedCards` says. */
 function openSideCards() {
+  // A place held for the way back to the thread list is not one in cards opened afresh (`listCardsHeld`).
+  listCardsHeld = null;
   columns.side.mode = "list";
   cardsOpening = true;
   try {
@@ -41758,7 +41813,8 @@ let mainUnderLists = null;
  * or out of it, changing `heightUnderLists` by `px`: told to Main's keeper as no growth at all, since
  * the card left the foot of Main's list, or came back to it, in the same move (`placePostCard`). The
  * right column's keeper is not told: its cards never held the card, and a move into the dock is the
- * dock growing under them.
+ * dock growing under them, except where the change of layout that moves it puts the cards back where
+ * the reader had them in the thread list (`cardsPlacedUnderLists`).
  *
  * @param {number} px
  */
@@ -41776,6 +41832,29 @@ function cardMovedUnderLists(px) {
  */
 function cardCameUnderLists(gap) {
   if (mainUnderLists !== null) mainUnderLists = { ...mainUnderLists, gap };
+}
+
+/**
+ * What the dock-growth keeper of the right column (below) noted at its last report, or as the cards were
+ * last put back where the reader had them in the thread list (`cardsPlacedUnderLists`): the column's
+ * height and `heightUnderLists`. Null before the first.
+ *
+ * @type {{list: number, dock: number} | null}
+ */
+let sideUnderLists = null;
+
+/**
+ * `#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`. The cards were just put back
+ * where the reader had them in the thread list, on the way back to it from two columns (`moveLayout`,
+ * `listCardsHeld`), in their column as it now stands, with everything now under it: told to the right
+ * column's keeper, which measures what grows under the cards from there. The send card that change moved
+ * into the dock under the list, and the picker's new name if it wrapped the dock, are not the dock growing
+ * under a reader at the foot of two columns' cards. Counted as growth, they took anyone within the slack
+ * plus the card's height of the list's foot for a reader at it: in Chromium at a desk, the long draft's
+ * card 246px tall, a reader put back 160px up the list's cards was pulled to its foot.
+ */
+function cardsPlacedUnderLists() {
+  sideUnderLists = { list: leftEl("side-scroll").clientHeight, dock: heightUnderLists() };
 }
 // `#218 desktop-dock`. On a desk the dock is one row of controls or two, and which depends on what
 // is in it — a call going live, a long channel name, a label changing length. When it grows it takes
@@ -41844,13 +41923,16 @@ if (typeof window.ResizeObserver === "function") {
   // columns' dock spans the window and does not: on a reload in the thread list the cards were put at
   // their foot and the dock's last button came about 30 ms later, a second row that left the list 43px
   // above its foot for good, since nothing after the placement took it the rest of the way. This does,
-  // whatever grew the dock and whenever: a reload, a view key, a channel's longer name.
-  let seenSide = null;
+  // whatever grew the dock and whenever: a reload, a view key, a channel's longer name. The growth is
+  // reckoned from the last report, or from where the cards were last put back as the reader had them in
+  // the thread list, in the column as it then stood, the card docked under it included
+  // (`cardsPlacedUnderLists`).
   new window.ResizeObserver(() => {
     const area = leftEl("side-scroll");
     const now = { list: area.clientHeight, dock: heightUnderLists() };
-    const grew = seenSide !== null && seenSide.list > 0 && currentScreen === "main" ? now.dock - seenSide.dock : 0;
-    seenSide = now;
+    const seen = sideUnderLists;
+    const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
+    sideUnderLists = now;
     if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {
       if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
       return;

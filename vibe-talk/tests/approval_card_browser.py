@@ -72,11 +72,18 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      the cards and back by Cmd+1, which offers the jump, as a draft arriving on the channel does: the
      box at Main's foot shrinks to one line in the same layout as the card docks. And with no card at
      all, a reader 100px up All, Cmd+3 and then Esc or Cmd+2, is on the same row within a pixel.
+ 14. At the desk, a reader up the thread list's cards with the card docked under them, Ctrl+4 and
+     Ctrl+3, is on the same card within a pixel, the list opened from Main and from two columns: 60,
+     160 and 300px up with the long draft (its card 246px tall), and 100px up with the short one. Two
+     columns' right column, which the card leaves, is that much taller, and each of them is at the
+     foot of the cards there or within the slack of it, which is checked. A reader who moves 200px up
+     the cards in two columns is on the card they moved to after Ctrl+3, not back where they were in
+     the list.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
 9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 to 13 at 393x852; and points
-8 and 11 to 13 at 1280x800 with a mouse.
+8 and 11 to 14 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1720,8 +1727,96 @@ def thread_list_arrival_case(page: Page, url: str, voice: FakeVoice, api: FakeAp
             f" jump; with no card, one 100px up All on their row by Esc and {mod}+2")
 
 
+SIDE_UP_JS = ("(up) => { const a = document.getElementById('side-scroll');"
+              " a.scrollTop = a.scrollHeight - a.clientHeight - up; }")
+
+
+def thread_list_cards_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> str:
+    """Point 14, at the desk: a reader up the thread list's cards with a send card docked under them is on
+    their card again by Ctrl+4 and Ctrl+3, though two columns' right column, the card gone from under it, is
+    taller than the list's column of cards and put them at its foot or within the slack of it."""
+    width, height = size
+    where = f"{width}x{height}, up the thread list's cards and back from two columns"
+    mod = "Control"
+    api.threaded = True
+    api.older_threads = 14
+    lines: list[str] = []
+    try:
+        open_call(page, url, voice, api, 30, False)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        view_key(page, mod, 1, None, None)
+
+        def to_list(start: int) -> None:
+            """Into the thread list from Main (`start` 1) or two columns (4), the card docked under it."""
+            layout = page.evaluate(COLUMNS_ATTR_JS)
+            if start == 1 and layout is not None:
+                view_key(page, mod, 1, None, None)
+            if start == 4 and layout != "two":
+                view_key(page, mod, 4, None, "two")
+            view_key(page, mod, 3, None, "list")
+            page.wait_for_function("() => document.querySelectorAll('#side-cards > li[data-id]').length > 10",
+                                   timeout=10_000)
+
+        def up_the_cards(up: int, label: str) -> dict[str, object]:
+            page.evaluate(SIDE_UP_JS, up)
+            page.wait_for_timeout(300)
+            m = thread_list_measure(page)
+            check(isinstance(m["first"], dict) and abs(float(str(m["sideGap"])) - up) <= 1,
+                  f"{where}: the premise, a reader {up}px up the cards {label}: {m['first']}, {m['sideGap']}px")
+            return m
+
+        for serial, draft, ups in ((61, LONG_DRAFT, (60, 160, 300)), (62, SHORT_DRAFT, (100,))):
+            words = "long" if draft is LONG_DRAFT else "short"
+            propose(page, api, serial, draft)
+            page.wait_for_timeout(HOLD_MS + 200)
+            for up in ups:
+                for start in (1, 4):
+                    whence = "Main" if start == 1 else "two columns"
+                    to_list(start)
+                    before = up_the_cards(up, "of the list")
+                    check(before["place"] == "dock",
+                          f"{where}: the {words} draft is not docked under the cards ({before['place']})")
+                    card = rect(before["card"], "height")
+                    view_key(page, mod, 4, None, "two")
+                    two = thread_list_measure(page)
+                    # The premise: two columns read this reader as at the foot of their cards.
+                    check(float(str(two["sideGap"])) <= 24,
+                          f"{where}: the premise, a reader {up}px up the cards ({words} draft, card {card:.0f}px) is"
+                          f" {float(str(two['sideGap'])):.0f}px from the foot in two columns, outside the slack")
+                    view_key(page, mod, 3, None, "list")
+                    now = thread_list_measure(page)
+                    check(same_row(before["first"], now["first"]),
+                          f"{where}: {mod}+4 and {mod}+3 moved the card a reader {up}px up the list's cards was on, the"
+                          f" list opened from {whence} with the {words} draft's {card:.0f}px card docked under it, from"
+                          f" {before['first']} to {now['first']} ({float(str(now['sideGap'])):.0f}px from the foot)")
+            lines.append(f"{', '.join(str(up) for up in ups)}px up with the {words} draft")
+            if draft is LONG_DRAFT:
+                # A reader who moves the cards in two columns is placed where they moved to, not where they were.
+                to_list(1)
+                up_the_cards(60, "of the list")
+                view_key(page, mod, 4, None, "two")
+                moved = up_the_cards(200, "in two columns")
+                view_key(page, mod, 3, None, "list")
+                now = thread_list_measure(page)
+                check(same_row(moved["first"], now["first"]),
+                      f"{where}: a reader who moved 200px up the cards in two columns was not kept there by {mod}+3:"
+                      f" from {moved['first']} to {now['first']}")
+            api.settle()
+            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            page.wait_for_timeout(1300)
+        check(not api.commits and not api.cancels, f"{where}: a view key posted or withdrew a draft")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader {' and '.join(lines)} on their card again by {mod}+4 and {mod}+3, from Main and"
+            " from two columns; one who moved in two columns kept where they moved to")
+
+
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Points 8 and 11 to 13 on a desk with a mouse, where two columns are offered."""
+    """Points 8 and 11 to 14 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -1738,6 +1833,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
             line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
             line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
+            line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
