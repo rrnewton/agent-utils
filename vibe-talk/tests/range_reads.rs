@@ -529,6 +529,7 @@ async fn slack_reads_a_window_newest_first_in_one_call_per_page_it_holds() {
         ReadCaps {
             range: Support::Native,
             by_ids: Support::Native,
+            heads: Support::Emulated,
             page_rows: 20,
         }
     );

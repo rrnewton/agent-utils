@@ -917,10 +917,15 @@ impl ChatClient for HttpSlackClient {
     /// `oldest`, `latest` and a cursor. remote-ops-audit W10 `#287 bulk-reads`; see `super::range`.
     /// The same bounds look several messages up a run of timestamps a call (W11, see
     /// `super::lookup`).
+    ///
+    /// Heads stay emulated (remote-ops-audit W12): no Slack call answers the newest message of
+    /// several conversations, so a head here is a one-message history read per channel, and the
+    /// callers that would use heads only as a cheap gate do not ask.
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
         crate::chat::ReadCaps {
             range: crate::chat::Support::Native,
             by_ids: crate::chat::Support::Native,
+            heads: crate::chat::Support::Emulated,
             page_rows: super::range::PAGE_ROWS,
         }
     }

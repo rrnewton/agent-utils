@@ -470,6 +470,11 @@ pub struct ReadCaps {
     /// [`ChatClient::fetch_messages`]: several messages by id in fewer upstream calls than one
     /// each. remote-ops-audit W11.
     pub by_ids: Support,
+    /// [`ChatClient::channel_heads`]: the newest message of several channels in fewer upstream
+    /// calls than a read of each. A caller that would ask for heads only as a cheap gate (the live
+    /// poller, a catch-up deciding what to read again) asks only when this is native.
+    /// remote-ops-audit W12.
+    pub heads: Support,
     /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
     /// 100 unless the provider says otherwise.
     pub page_rows: u16,
@@ -480,6 +485,7 @@ impl Default for ReadCaps {
         Self {
             range: Support::Emulated,
             by_ids: Support::Emulated,
+            heads: Support::Emulated,
             page_rows: crate::discord::http::DISCORD_MAX_LIMIT,
         }
     }
@@ -515,6 +521,49 @@ impl Lookup {
 /// How many [`ChatClient::fetch_thread_message`] calls [`emulated_messages`] keeps in flight: what
 /// speech preparation has always used for one thread (`crate::read_ahead`).
 pub const LOOKUPS_IN_FLIGHT: usize = 4;
+
+/// What a provider knows of a channel's newest message without reading the channel: enough to tell
+/// whether it moved since it was last read. remote-ops-audit W12 `#287 bulk-reads`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelHead {
+    /// The newest of the channel's own messages, as [`ChatClient::fetch_page`] lists them; `None`
+    /// when it has none. It may name a message deleted since (Discord's `last_message_id` does),
+    /// so all it says is that nothing NEWER was added: a message created after it would have
+    /// taken its place.
+    pub newest_id: Option<MessageId>,
+    /// When that message was created, in Unix milliseconds, where the provider says.
+    pub newest_at_ms: Option<i64>,
+    /// The latest activity in the channel, thread replies included, in Unix milliseconds, where
+    /// the provider knows it.
+    pub activity_ms: Option<i64>,
+    /// An instant, in Unix milliseconds, after which the provider KNOWS nothing in the channel
+    /// changed: no message created, edited or deleted, a thread reply included. `None` when it
+    /// cannot say, which is always so for a provider whose head moves only when a message is added
+    /// (Discord).
+    ///
+    /// Only a head that carries this can prove a held copy of the channel still current;
+    /// `newest_id` alone proves that nothing was added, never that nothing was edited or deleted.
+    pub unchanged_since_ms: Option<i64>,
+    /// As [`RecentRead::as_of`]: the instant, RFC 3339, up to which the provider knows this head is
+    /// current, when it answered from a copy it could not bring up to date. `None` means now. A
+    /// head with an `as_of` proves nothing about the channel after it, so no caller acts on one.
+    pub as_of: Option<String>,
+}
+
+impl ChannelHead {
+    /// Whether this head is the provider's word for now, rather than an older copy's.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.as_of.is_none()
+    }
+}
+
+/// One answer per channel of a [`ChatClient::channel_heads`] call, in the order asked.
+pub type HeadAnswers = Vec<(ChannelId, Result<ChannelHead, ChatError>)>;
+
+/// How many [`ChatClient::fetch_recent`] reads [`emulated_heads`] keeps in flight: the bounded
+/// fan-out every bulk default keeps, per provider.
+pub const HEADS_IN_FLIGHT: usize = 4;
 
 /// Read and post access to configured chat channels.
 #[async_trait]
@@ -822,6 +871,26 @@ pub trait ChatClient: Send + Sync {
         emulated_messages(self, channel, thread, ids).await
     }
 
+    /// The newest message of each of `channels`, without reading their messages: one answer per
+    /// channel, in the order asked, a repeated channel answered each time. remote-ops-audit W12
+    /// `#287 bulk-reads`.
+    ///
+    /// A native head read ([`ReadCaps::heads`]) costs fewer upstream calls than a read of each
+    /// channel (Discord's channel list is one call per server), so a caller may use it as a cheap
+    /// gate: leave alone a channel whose head has not moved. An emulated one costs exactly what
+    /// reading each channel's newest message costs, so a caller that would ask only because it is
+    /// cheap does not ask.
+    ///
+    /// The default is [`emulated_heads`]: one [`ChatClient::fetch_recent`] of one message per
+    /// channel, [`HEADS_IN_FLIGHT`] at a time. The router asks each provider once, for its own
+    /// channels only.
+    ///
+    /// A channel that cannot be answered is an `Err` in its own place, never a failure of the
+    /// whole call.
+    async fn channel_heads(&self, channels: &[ChannelId]) -> HeadAnswers {
+        emulated_heads(self, channels).await
+    }
+
     /// Post `content` to `channel`, optionally as a reply to an existing message.
     ///
     /// # Errors
@@ -1087,6 +1156,278 @@ pub async fn emulated_messages<C: ChatClient + ?Sized>(
                 })
                 .collect())
         }
+    }
+}
+
+/// [`ChatClient::channel_heads`]'s default: a head read made of the read of each channel's newest
+/// message. remote-ops-audit W12 `#287 bulk-reads`.
+///
+/// One [`ChatClient::fetch_recent`] of one message per channel, [`HEADS_IN_FLIGHT`] at a time, in
+/// the order asked; each read's failure is that channel's answer. The head is the newest message
+/// the read returned, with its creation instant; it says nothing about activity or changes, and
+/// claims no `as_of`. Nothing is read for an empty list.
+pub async fn emulated_heads<C: ChatClient + ?Sized>(
+    client: &C,
+    channels: &[ChannelId],
+) -> HeadAnswers {
+    use futures_util::StreamExt as _;
+
+    // Made before they are streamed, as in `emulated_messages`.
+    let reads: Vec<_> = channels
+        .iter()
+        .map(|channel| client.fetch_recent(channel, 1))
+        .collect();
+    let answers: Vec<_> = futures_util::stream::iter(reads)
+        .buffered(HEADS_IN_FLIGHT)
+        .collect()
+        .await;
+    channels
+        .iter()
+        .cloned()
+        .zip(answers.into_iter().map(|read| {
+            read.map(|messages| {
+                let newest = messages.last();
+                ChannelHead {
+                    newest_id: newest.map(|m| m.id.clone()),
+                    newest_at_ms: newest.and_then(Message::created_ms),
+                    ..ChannelHead::default()
+                }
+            })
+        }))
+        .collect()
+}
+
+/// Put head answers given for parts of a list of channels back in the list's order: each part is
+/// the positions its channels held in `channels` and what was answered for them, in that order.
+/// remote-ops-audit W12 `#287 bulk-reads`.
+///
+/// A position no part answered, or answered for a different channel, is a [`ChatError::Shape`] in
+/// its own place: a provider that skips or reorders channels must not have one channel's head
+/// taken for another's.
+#[must_use]
+pub fn heads_in_order(
+    channels: &[ChannelId],
+    parts: Vec<(Vec<usize>, HeadAnswers)>,
+) -> HeadAnswers {
+    let mut answers: Vec<Option<Result<ChannelHead, ChatError>>> = vec![None; channels.len()];
+    for (positions, answered) in parts {
+        let mut answered = answered.into_iter();
+        for at in positions {
+            let Some(slot) = answers.get_mut(at) else {
+                continue;
+            };
+            *slot = Some(match answered.next() {
+                Some((channel, head)) if channel == channels[at] => head,
+                Some(_) => Err(ChatError::Shape(
+                    "a head read answered for a different channel than the one in its place"
+                        .to_owned(),
+                )),
+                None => Err(ChatError::Shape(
+                    "a head read answered for fewer channels than it was asked about".to_owned(),
+                )),
+            });
+        }
+    }
+    channels
+        .iter()
+        .cloned()
+        .zip(answers.into_iter().map(|answer| {
+            answer.unwrap_or_else(|| {
+                Err(ChatError::Shape(
+                    "no head was asked for in this channel's place".to_owned(),
+                ))
+            })
+        }))
+        .collect()
+}
+
+#[cfg(test)]
+mod heads_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::discord::fake::FakeDiscord;
+
+    const BASE_MS: i64 = 1_787_000_000_000;
+
+    /// A provider that writes only what the trait requires, counts its recent reads and the most
+    /// in flight at once, and logs each one.
+    struct Plain {
+        inner: FakeDiscord,
+        in_flight: AtomicUsize,
+        most_in_flight: AtomicUsize,
+        reads: Mutex<Vec<(String, u16)>>,
+    }
+
+    impl Plain {
+        fn new() -> Self {
+            Self {
+                inner: FakeDiscord::new(),
+                in_flight: AtomicUsize::new(0),
+                most_in_flight: AtomicUsize::new(0),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatClient for Plain {
+        async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+            self.inner.identity().await
+        }
+
+        async fn fetch_page(
+            &self,
+            channel: &ChannelId,
+            limit: u16,
+            before: Option<&MessageId>,
+            after: Option<&MessageId>,
+        ) -> Result<Vec<Message>, ChatError> {
+            self.reads
+                .lock()
+                .expect("log")
+                .push((channel.0.clone(), limit));
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.inner.fetch_page(channel, limit, before, after).await
+        }
+
+        async fn post_message(
+            &self,
+            channel: &ChannelId,
+            content: &str,
+            reply_to: Option<&MessageId>,
+        ) -> Result<Message, ChatError> {
+            self.inner.post_message(channel, content, reply_to).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_reads_one_message_of_each_channel_four_at_a_time_in_order() {
+        let provider = Plain::new();
+        let mut channels = Vec::new();
+        let mut newest = Vec::new();
+        for n in 0..6_i64 {
+            let channel = ChannelId(format!("{}", 100 + n));
+            provider
+                .inner
+                .seed_at(&channel, "ada", "older", BASE_MS + n * 10_000);
+            newest.push(provider.inner.seed_at(
+                &channel,
+                "ada",
+                "newest",
+                BASE_MS + n * 10_000 + 1_000,
+            ));
+            channels.push(channel);
+        }
+        let unknown = ChannelId("404".to_owned());
+        let mut asked = channels.clone();
+        asked.insert(2, unknown.clone());
+        asked.push(channels[0].clone());
+
+        let answers = provider.channel_heads(&asked).await;
+
+        assert_eq!(
+            answers.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+            asked,
+            "one answer per channel, in the order asked, a repeat answered again"
+        );
+        let reads = provider.reads.lock().expect("log").clone();
+        assert_eq!(reads.len(), asked.len(), "one read per channel asked");
+        assert!(reads.iter().all(|(_, limit)| *limit == 1), "{reads:?}");
+        assert_eq!(
+            provider.most_in_flight.load(Ordering::SeqCst),
+            HEADS_IN_FLIGHT
+        );
+        let heads: Vec<&ChannelHead> = answers
+            .iter()
+            .filter_map(|(_, head)| head.as_ref().ok())
+            .collect();
+        assert_eq!(
+            heads.len(),
+            asked.len() - 1,
+            "only the unknown channel failed"
+        );
+        assert!(
+            answers[2].1.is_err(),
+            "the unknown channel fails in its own place"
+        );
+        for (head, id) in heads.iter().zip(newest.iter().chain([&newest[0]])) {
+            assert_eq!(head.newest_id.as_ref(), Some(id));
+            assert_eq!(head.newest_at_ms, id.created_at_ms());
+            assert_eq!(head.activity_ms, None, "a read says nothing of activity");
+            assert_eq!(head.unchanged_since_ms, None, "nor of edits and deletes");
+            assert!(head.is_current());
+        }
+
+        provider.reads.lock().expect("log").clear();
+        assert!(provider.channel_heads(&[]).await.is_empty());
+        assert!(
+            provider.reads.lock().expect("log").is_empty(),
+            "nothing asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_head_of_an_empty_channel_names_no_message() {
+        let provider = Plain::new();
+        let channel = ChannelId("7".to_owned());
+        provider.inner.register_channel(&channel);
+        let answers = provider.channel_heads(std::slice::from_ref(&channel)).await;
+        assert_eq!(
+            answers[0].1.as_ref().expect("read"),
+            &ChannelHead::default()
+        );
+    }
+
+    #[test]
+    fn heads_go_back_in_the_order_asked_and_a_skipped_or_reordered_one_is_an_error() {
+        let ids: Vec<ChannelId> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| ChannelId((*id).to_owned()))
+            .collect();
+        let head = |n: u64| ChannelHead {
+            newest_id: Some(MessageId(n.to_string())),
+            ..ChannelHead::default()
+        };
+        let answers = heads_in_order(
+            &ids,
+            vec![
+                (
+                    vec![0, 2],
+                    vec![(ids[0].clone(), Ok(head(1))), (ids[2].clone(), Ok(head(3)))],
+                ),
+                (vec![1], vec![(ids[3].clone(), Ok(head(4)))]),
+            ],
+        );
+        assert_eq!(answers[0].1.as_ref().ok(), Some(&head(1)));
+        assert!(
+            matches!(answers[1].1, Err(ChatError::Shape(_))),
+            "another channel's head"
+        );
+        assert_eq!(answers[2].1.as_ref().ok(), Some(&head(3)));
+        assert!(
+            matches!(answers[3].1, Err(ChatError::Shape(_))),
+            "never asked"
+        );
+        assert_eq!(
+            answers.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn a_provider_that_says_nothing_reads_heads_as_it_always_read_channels() {
+        assert_eq!(ReadCaps::default().heads, Support::Emulated);
+        assert_eq!(
+            FakeDiscord::new()
+                .read_caps(&ChannelId("42".to_owned()))
+                .heads,
+            Support::Emulated
+        );
     }
 }
 

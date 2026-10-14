@@ -22,8 +22,8 @@ use serde_json::Value;
 use slack_fake::{profiled, ts, Fake, FakeState, METHODS, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
-    ChatClient, ChatError, ChatIdentity, Lookup, PostLimit, RangeOrder, RangeRead, ReadCaps,
-    ReadScope, RecentRead, RegisteredChannel, SourceClaim, Support, TimeRange,
+    ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, Lookup, PostLimit, RangeOrder,
+    RangeRead, ReadCaps, ReadScope, RecentRead, RegisteredChannel, SourceClaim, Support, TimeRange,
     UpstreamClearOutcome,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
@@ -433,6 +433,7 @@ impl ChatClient for Recorder {
         ReadCaps {
             range: Support::Native,
             by_ids: Support::Native,
+            heads: Support::Native,
             page_rows: 7,
         }
     }
@@ -471,6 +472,22 @@ impl ChatClient for Recorder {
                 }
             })
             .collect())
+    }
+    async fn channel_heads(&self, channels: &[ChannelId]) -> HeadAnswers {
+        self.note("channel_heads");
+        channels
+            .iter()
+            .map(|channel| {
+                (
+                    channel.clone(),
+                    Ok(ChannelHead {
+                        newest_id: Some(self.message.id.clone()),
+                        unchanged_since_ms: Some(7),
+                        ..ChannelHead::default()
+                    }),
+                )
+            })
+            .collect()
     }
     async fn post_message(
         &self,
@@ -687,6 +704,20 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         calls.remove(0);
     }
     ran("fetch_messages");
+    let heads = client
+        .channel_heads(&[channel.clone(), ChannelId("C9".to_owned())])
+        .await;
+    assert_eq!(heads.len(), 2);
+    assert!(heads
+        .iter()
+        .all(|(_, head)| head.as_ref().expect("a head").unchanged_since_ms == Some(7)));
+    // The profiler asks, channel by channel, whether the provider reads the head itself.
+    {
+        let mut calls = recorder.calls.lock().expect("calls");
+        assert_eq!(calls[..2], ["read_caps", "read_caps"], "{calls:?}");
+        calls.drain(..2);
+    }
+    ran("channel_heads");
     client
         .post_message(&channel, "hi", None)
         .await
@@ -1165,4 +1196,38 @@ async fn an_emulated_lookup_by_id_is_timed_and_counted_as_the_reads_it_is_made_o
         .expect("lookup");
     assert_eq!(counting.count("fetch_recent_dated"), 1);
     assert_eq!(counting.count("fetch_messages"), 0);
+}
+
+/// remote-ops-audit W12 `#287 bulk-reads`: a provider that does not read heads itself is asked the
+/// one-message reads the default is made of, and each is timed and counted as itself; nothing is
+/// ever timed as `channel_heads` for it.
+#[tokio::test]
+async fn an_emulated_head_read_is_timed_and_counted_as_the_reads_it_is_made_of() {
+    let fake = Arc::new(FakeDiscord::new());
+    let channels = [ChannelId("C1".to_owned()), ChannelId("C2".to_owned())];
+    let newest = fake.seed(&channels[0], "ada", "words of some length");
+    fake.register_channel(&channels[1]);
+    let profile = UpstreamProfile::new();
+    let profiled = ProfiledClient::new(
+        Arc::clone(&fake) as Arc<dyn ChatClient>,
+        profile.provider("fake", "Fake"),
+    );
+    let heads = profiled.channel_heads(&channels).await;
+    assert_eq!(
+        heads[0].1.as_ref().expect("a head").newest_id.as_ref(),
+        Some(&newest)
+    );
+    assert_eq!(heads[1].1.as_ref().expect("a head").newest_id, None);
+    let report = profile.report();
+    let names: Vec<(&str, u64)> = report.providers[0]
+        .operations
+        .iter()
+        .map(|row| (row.name, row.count))
+        .collect();
+    assert_eq!(names, [("fetch_recent", 2)], "{names:?}");
+
+    let counting = vibe_talk::testing::CountingChat::new(Arc::clone(&fake) as Arc<dyn ChatClient>);
+    counting.channel_heads(&channels).await;
+    assert_eq!(counting.count("fetch_recent"), 2);
+    assert_eq!(counting.count("channel_heads"), 0);
 }

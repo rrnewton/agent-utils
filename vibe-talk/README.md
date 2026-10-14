@@ -1425,7 +1425,9 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   Likewise a provider that looks several messages up by id itself counts one such lookup (speech
   preparation of a thread, a thread summary's parts, a message by id) as `fetch_messages`; on any
   other it is the reads it was always made of, one `fetch_thread_message` per message or the
-  recent window, counted as those.
+  recent window, counted as those. A provider that reads the newest message of several channels
+  itself counts that as one `channel_heads` per call; on any other a head is a one-message
+  `fetch_recent` per channel, counted as that.
   Operations are timed around each provider's
   own client, so the live poller and this report's own token check count as well as the page and
   the voice agent. Questions a provider answers from memory, such as whether it supports threads,

@@ -843,6 +843,45 @@ impl crate::chat::ChatClient for CountingChat {
         }
     }
 
+    /// Counted as what it costs upstream, as `ProfiledClient` times it: the channels whose heads
+    /// the provider reads itself are one `channel_heads` (naming no single channel); for the rest
+    /// the trait's default runs here, so each `fetch_recent` it is made of is counted as itself. A
+    /// scripted failure of `channel_heads` is every native channel's answer. remote-ops-audit W12
+    /// `#287 bulk-reads`.
+    async fn channel_heads(
+        &self,
+        channels: &[crate::model::ChannelId],
+    ) -> crate::chat::HeadAnswers {
+        let (native, emulated): (Vec<usize>, Vec<usize>) = (0..channels.len()).partition(|at| {
+            self.inner.read_caps(&channels[*at]).heads == crate::chat::Support::Native
+        });
+        let pick = |positions: &[usize]| -> Vec<crate::model::ChannelId> {
+            positions.iter().map(|at| channels[*at].clone()).collect()
+        };
+        let (native_channels, emulated_channels) = (pick(&native), pick(&emulated));
+        let native_answers = if native_channels.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .counted(call_without_channel("channel_heads"), async {
+                    Ok(self.inner.channel_heads(&native_channels).await)
+                })
+                .await
+            {
+                Ok(answers) => answers,
+                Err(error) => native_channels
+                    .iter()
+                    .map(|channel| (channel.clone(), Err(error.clone())))
+                    .collect(),
+            }
+        };
+        let emulated_answers = crate::chat::emulated_heads(self, &emulated_channels).await;
+        crate::chat::heads_in_order(
+            channels,
+            vec![(native, native_answers), (emulated, emulated_answers)],
+        )
+    }
+
     async fn post_message(
         &self,
         channel: &crate::model::ChannelId,

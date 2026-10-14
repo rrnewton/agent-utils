@@ -1012,6 +1012,22 @@ impl ProfiledClient {
         &self.profile
     }
 
+    /// One native head read, timed as `channel_heads`: its rows are the heads answered, and it
+    /// failed when no channel was answered. Nothing is asked, or timed, for no channels.
+    async fn timed_heads(&self, channels: &[ChannelId]) -> crate::chat::HeadAnswers {
+        if channels.is_empty() {
+            return Vec::new();
+        }
+        let timer = self.profile.start(Series::Operation, "channel_heads");
+        let answers = self.inner.channel_heads(channels).await;
+        let answered = answers.iter().filter(|(_, head)| head.is_ok()).count();
+        match answers.iter().find_map(|(_, head)| head.as_ref().err()) {
+            Some(error) if answered == 0 => timer.finish(Outcome::of(error), 0),
+            _ => timer.finish(Outcome::Ok, answered),
+        };
+        answers
+    }
+
     async fn timed<T, F>(
         &self,
         operation: &'static str,
@@ -1285,6 +1301,28 @@ impl ChatClient for ProfiledClient {
                 crate::chat::emulated_messages(self, channel, thread, ids).await
             }
         }
+    }
+
+    async fn channel_heads(&self, channels: &[ChannelId]) -> crate::chat::HeadAnswers {
+        // Timed under what it costs upstream, as a lookup by id is. The channels whose heads the
+        // provider reads itself are one `channel_heads`; for the rest the trait's default runs
+        // HERE, so each `fetch_recent` it is made of is timed as itself, as it was before this
+        // method existed. remote-ops-audit W12 `#287 bulk-reads`.
+        let (native, emulated): (Vec<usize>, Vec<usize>) = (0..channels.len()).partition(|at| {
+            self.inner.read_caps(&channels[*at]).heads == crate::chat::Support::Native
+        });
+        let pick = |positions: &[usize]| -> Vec<ChannelId> {
+            positions.iter().map(|at| channels[*at].clone()).collect()
+        };
+        let (native_channels, emulated_channels) = (pick(&native), pick(&emulated));
+        let (native_answers, emulated_answers) = tokio::join!(
+            self.timed_heads(&native_channels),
+            crate::chat::emulated_heads(self, &emulated_channels)
+        );
+        crate::chat::heads_in_order(
+            channels,
+            vec![(native, native_answers), (emulated, emulated_answers)],
+        )
     }
 
     async fn post_message(

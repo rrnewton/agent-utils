@@ -1350,6 +1350,7 @@ impl ChatClient for HttpDiscordClient {
                 range: crate::chat::Support::Native,
                 by_ids,
                 page_rows: BRIDGE_RANGE_ROWS,
+                ..crate::chat::ReadCaps::default()
             }
         } else {
             crate::chat::ReadCaps {

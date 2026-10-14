@@ -20,11 +20,14 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
-use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
+use vibe_talk::chat::{
+    ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, ReadCaps, Support,
+};
 use vibe_talk::discord::fake::FakeDiscord;
-use vibe_talk::model::{ChannelId, Message, MessageId};
+use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId};
+use vibe_talk::providers::{ChatRouter, ProviderEntry};
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
+use vibe_talk::testing::{CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
 
 /// A third channel, so every caller here reads more than two.
 const THIRD: &str = "3333333333";
@@ -488,4 +491,191 @@ async fn a_provider_without_a_head_read_gets_todays_answers_at_todays_cost() {
     );
     assert_eq!(upstream("the startup probe").len(), 3);
     assert!(upstream("diagnostics").len() >= 4);
+}
+
+/// A provider that reads heads itself (or says it does not, with `native: false`), answering each
+/// channel it is asked about from its fake's newest message and logging the channels of each call.
+/// What it reads to answer is not an upstream call of its own: a [`CountingChat`] around it
+/// counts what the server asks.
+struct Headed {
+    inner: Arc<FakeDiscord>,
+    native: bool,
+    /// What every head says about changes; see [`ChannelHead::unchanged_since_ms`].
+    unchanged_since_ms: Mutex<Option<i64>>,
+    /// What every head says about its currency; see [`ChannelHead::as_of`].
+    as_of: Mutex<Option<String>>,
+    asked: Mutex<Vec<Vec<String>>>,
+}
+
+impl Headed {
+    fn new(inner: Arc<FakeDiscord>, native: bool) -> Self {
+        Self {
+            inner,
+            native,
+            unchanged_since_ms: Mutex::new(None),
+            as_of: Mutex::new(None),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<Vec<String>> {
+        self.asked.lock().expect("log").clone()
+    }
+}
+
+#[async_trait]
+impl ChatClient for Headed {
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            heads: if self.native {
+                Support::Native
+            } else {
+                Support::Emulated
+            },
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn channel_heads(&self, channels: &[ChannelId]) -> HeadAnswers {
+        self.asked
+            .lock()
+            .expect("log")
+            .push(channels.iter().map(|c| c.0.clone()).collect());
+        let unchanged_since_ms = *self.unchanged_since_ms.lock().expect("setting");
+        let as_of = self.as_of.lock().expect("setting").clone();
+        let mut answers = Vec::new();
+        for channel in channels {
+            let head = self.inner.fetch_recent(channel, 1).await.map(|messages| {
+                let newest = messages.last();
+                ChannelHead {
+                    newest_id: newest.map(|m| m.id.clone()),
+                    newest_at_ms: newest.and_then(Message::created_ms),
+                    activity_ms: None,
+                    unchanged_since_ms,
+                    as_of: as_of.clone(),
+                }
+            });
+            answers.push((channel.clone(), head));
+        }
+        answers
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn post_message(
+        &self,
+        _channel: &ChannelId,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused("this test posts nothing".to_owned()))
+    }
+}
+
+fn routed(id: &str, provider: &str) -> ChannelInfo {
+    ChannelInfo {
+        id: channel(id),
+        label: id.to_owned(),
+        writable: false,
+        alias: None,
+        added: false,
+        provider: Some(provider.to_owned()),
+    }
+}
+
+/// remote-ops-audit W12, the router's proof: three channels on two providers are two calls, each
+/// provider asked once for its own channels, every answer back in the order asked, and a channel
+/// no provider holds refused in its own place and asked of nobody.
+#[tokio::test]
+async fn the_router_asks_each_provider_once_for_its_own_channels() {
+    let fake_a = Arc::new(FakeDiscord::new());
+    let fake_b = Arc::new(FakeDiscord::new());
+    let a1 = fake_a.seed(&channel("A1"), "ada", "a one");
+    let a2 = fake_a.seed(&channel("A2"), "ada", "a two");
+    let b1 = fake_b.seed(&channel("B1"), "ada", "b one");
+    let headed_a = Arc::new(Headed::new(fake_a, true));
+    let headed_b = Arc::new(Headed::new(fake_b, true));
+    let counting_a = Arc::new(CountingChat::new(
+        Arc::clone(&headed_a) as Arc<dyn ChatClient>
+    ));
+    let counting_b = Arc::new(CountingChat::new(
+        Arc::clone(&headed_b) as Arc<dyn ChatClient>
+    ));
+    let entry = |key: &str, client: Arc<CountingChat>| ProviderEntry {
+        key: key.to_owned(),
+        namespace: key.to_owned(),
+        client,
+        live_poll_seconds: 0,
+    };
+    let router = ChatRouter::new(
+        vec![
+            entry("a", Arc::clone(&counting_a)),
+            entry("b", Arc::clone(&counting_b)),
+        ],
+        None,
+    );
+    router.replace_routes(&[routed("A1", "a"), routed("A2", "a"), routed("B1", "b")]);
+
+    let asked = [
+        channel("A1"),
+        channel("B1"),
+        channel("A2"),
+        channel("NOWHERE"),
+    ];
+    let answers = router.channel_heads(&asked).await;
+
+    assert_eq!(counting_a.count("channel_heads"), 1);
+    assert_eq!(counting_b.count("channel_heads"), 1);
+    assert_eq!(
+        counting_a.calls().len() + counting_b.calls().len(),
+        2,
+        "two calls in all, and no read of any channel"
+    );
+    assert_eq!(headed_a.asked(), [["A1", "A2"]]);
+    assert_eq!(headed_b.asked(), [["B1"]]);
+    assert_eq!(
+        answers.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+        asked
+    );
+    let newest = |at: usize| answers[at].1.as_ref().expect("a head").newest_id.clone();
+    assert_eq!(newest(0), Some(a1));
+    assert_eq!(newest(1), Some(b1));
+    assert_eq!(newest(2), Some(a2));
+    assert!(
+        matches!(answers[3].1, Err(ChatError::Refused(_))),
+        "{:?}",
+        answers[3].1
+    );
+}
+
+/// The other side of the same proof: through the router, a provider whose heads are emulated is
+/// asked exactly the one-message reads the default is made of, counted as themselves.
+#[tokio::test]
+async fn through_the_router_an_emulated_head_is_a_one_message_read_per_channel() {
+    let fake = Arc::new(FakeDiscord::new());
+    fake.seed(&channel("A1"), "ada", "a one");
+    fake.seed(&channel("A2"), "ada", "a two");
+    let headed = Arc::new(Headed::new(fake, false));
+    let counting = Arc::new(CountingChat::new(Arc::clone(&headed) as Arc<dyn ChatClient>));
+    let router = ChatRouter::single(Arc::clone(&counting) as Arc<dyn ChatClient>, "a", 0);
+    let answers = router.channel_heads(&[channel("A1"), channel("A2")]).await;
+    assert!(answers.iter().all(|(_, head)| head.is_ok()));
+    assert!(
+        headed.asked().is_empty(),
+        "an emulated provider's own head read is never asked"
+    );
+    assert_eq!(counting.count("channel_heads"), 0);
+    assert_eq!(counting.count("fetch_recent"), 2);
 }

@@ -581,6 +581,38 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    /// Each provider is asked once, for its own channels, and every provider at once; the answers
+    /// go back in the order asked. remote-ops-audit W12 `#287 bulk-reads`. So three channels on two
+    /// providers are two calls, and a Discord server's channel list and a bridge's heads are each
+    /// read once whatever else is asked beside them. A channel no provider holds is refused in its
+    /// own place and asked of nobody.
+    async fn channel_heads(&self, channels: &[ChannelId]) -> crate::chat::HeadAnswers {
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut unrouted = (Vec::new(), Vec::new());
+        for (at, channel) in channels.iter().enumerate() {
+            match self.index_for(channel) {
+                Some(index) => groups.entry(index).or_default().push(at),
+                None => {
+                    unrouted.0.push(at);
+                    unrouted.1.push((
+                        channel.clone(),
+                        Err(ChatError::Refused(format!(
+                            "channel {channel} is not assigned to any configured chat provider"
+                        ))),
+                    ));
+                }
+            }
+        }
+        let asks = groups.into_iter().map(|(index, positions)| async move {
+            let subset: Vec<ChannelId> = positions.iter().map(|at| channels[*at].clone()).collect();
+            let answered = self.entries[index].client.channel_heads(&subset).await;
+            (positions, answered)
+        });
+        let mut parts = futures_util::future::join_all(asks).await;
+        parts.push(unrouted);
+        crate::chat::heads_in_order(channels, parts)
+    }
+
     fn supports_channel_registration(&self) -> bool {
         match self.entries.as_slice() {
             [only] => only.client.supports_channel_registration(),
