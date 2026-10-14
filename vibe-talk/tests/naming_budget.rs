@@ -1556,6 +1556,65 @@ async fn a_provider_whose_thread_view_counts_a_reply_fewer_than_its_list_names_e
     assert_eq!(h.summarizer.thread_prompts().len(), ids.len());
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_list_answered_from_a_stale_cache_now_and_then_does_not_make_the_thread_due_at_every_turn(
+) {
+    alternating_with_a_stale_list(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn nor_does_it_when_the_read_at_the_turn_says_it_is_behind() {
+    alternating_with_a_stale_list(true).await;
+}
+
+/// A bridge answers every other read of the thread list from a cache it could not bring up to
+/// date: a thread with three replies and older activity, where the rest of its answers show the
+/// thread as it is since a reply was deleted — two replies, newer activity — as the read at its
+/// turn does, with `as_of` when `behind`. A write-scope page lands one of the two every five
+/// seconds for ten minutes, the fresh one first. The newest copy by activity is the fresh one, so
+/// filed at its count the sentence was due again at the next stale answer, and the thread was read
+/// and named at every turn (21 times). Filed at the most replies any page showed while it waited,
+/// it is read at most twice: once when first listed, and once more if the stale answer showed it
+/// only after that.
+async fn alternating_with_a_stale_list(behind: bool) {
+    let h = harness();
+    let thread = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+    h.upstream
+        .change(&thread, |thread| thread.active_second = 600);
+    let fresh = h.upstream.channels.lock().unwrap()[WRITE_CHANNEL][0].clone();
+    let mut stale = fresh.clone();
+    stale.replies.push("a reply deleted since".to_owned());
+    stale.active_second = 60;
+    if behind {
+        h.upstream
+            .behind
+            .lock()
+            .unwrap()
+            .insert(thread.clone(), (fresh, "2026-10-13T08:10:00Z".to_owned()));
+    }
+    for (n, second) in (0..=600).step_by(5).enumerate() {
+        h.at(second).await;
+        if n % 2 == 0 {
+            h.poll(WRITE_CHANNEL, true).await;
+        } else {
+            let mut page = TimelinePage {
+                threads: vec![summary_of(WRITE_CHANNEL, &stale)],
+                has_threads: true,
+                ..TimelinePage::default()
+            };
+            h.annotate(WRITE_CHANNEL, &mut page, true).await;
+        }
+        tokio::task::yield_now().await;
+    }
+    h.at(601).await;
+    let reads = reads_of(&h, std::slice::from_ref(&thread))[0];
+    assert!(
+        reads <= 2,
+        "the thread was read {reads} times while a stale list and a fresh one alternated"
+    );
+    assert_eq!(h.summarizer.thread_prompts().len(), reads);
+}
+
 /// A reply deleted at the start, where `named_at` is `None`, or, with `Some(replies)`, after the
 /// thread was named with two replies and grew to `replies`: the list shows the deletion, and the
 /// read at the thread's turn is answered from the bridge's copy from before it, with `as_of`, so

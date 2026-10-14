@@ -48,12 +48,12 @@
 //!   it is the copy the latest page to show the thread showed, as for a thread already named —
 //!   never the newer-looking of the two: a page that showed a reply deleted shows fewer replies
 //!   and no later activity. After it, each later page that shows the thread.
-//! * The sentence is filed at no fewer messages than the newest copy of the thread a page showed
-//!   before that read began, so the next page showing that count does not find the thread due
-//!   again. A read that is behind — `as_of`, or, should a provider's thread view count fewer
-//!   replies than its list, that view — answers the same at every turn, and would otherwise be
-//!   made at every interval. When the read says it is behind (`as_of`) the sentence is filed at
-//!   exactly what that page counted: a copy from before a reply was deleted still counts it, and
+//! * The sentence is filed at no fewer messages than the most replies any page showed for the
+//!   thread while it waited, before that read began, so no page showing that count finds the
+//!   thread due again. A read that is behind — `as_of`, or, should a provider's thread view count
+//!   fewer replies than its list, that view — answers the same at every turn, and would otherwise
+//!   be made at every interval. When the read says it is behind (`as_of`) the sentence is filed at
+//!   exactly what those pages counted: a copy from before a reply was deleted still counts it, and
 //!   filed at its count the sentence would keep the deleted reply past the next reply.
 //! * After a naming read meets a provider failure — an HTTP 5xx, a read that never completed or
 //!   outlasted [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out — no thread
@@ -539,11 +539,14 @@ struct ChannelQueue {
 struct Waiting {
     deps: ThreadDeps,
     /// The newest copy of the thread any page has shown while it waits ([`not_older`]; an answer
-    /// that lands after a newer one does not replace it). Its id says what to read, and the
-    /// sentence is filed at no fewer messages than its reply count says, whatever the read at the
-    /// turn counts: a read that is behind would otherwise leave the thread due at every turn. At
-    /// exactly that count when the read says it is behind (`as_of`).
+    /// that lands after a newer one does not replace it). Its id says what to read.
     snapshot: ThreadSummary,
+    /// The most replies any page has shown for the thread while it waits, from the page that
+    /// queued it on. The sentence is filed at no fewer messages than this says, whatever the read
+    /// at the turn counts — and at exactly that when the read says it is behind (`as_of`). Not
+    /// [`Waiting::snapshot`]'s count: the newest copy by activity need not be the one with the
+    /// most replies, and a page that shows the most again would find the thread due at every turn.
+    most_replies: Option<u64>,
     /// The copy of the thread the latest page to show it showed, whatever it showed, as a renamed
     /// thread's copy is kept ([`ThreadNames::refresh_copies`]): what a forward delta carries once
     /// the thread is named, unless the read at its turn supplies a current one ([`InFlight`]).
@@ -1036,6 +1039,7 @@ impl ThreadNames {
             if not_older(summary, &waiting.snapshot) {
                 waiting.snapshot = summary.clone();
             }
+            waiting.most_replies = waiting.most_replies.max(summary.reply_count);
             waiting.shown = summary.clone();
         }
         if let Some(in_flight) = state.naming.get_mut(&(channel.clone(), summary.id.clone())) {
@@ -1133,6 +1137,7 @@ impl ThreadNames {
             // An answer that lands after a newer one can be older: neither its activity nor its
             // copy is taken back.
             waiting.activity = waiting.activity.max(activity_of(&snapshot));
+            waiting.most_replies = waiting.most_replies.max(snapshot.reply_count);
             waiting.shown = snapshot.clone();
             if not_older(&snapshot, &waiting.snapshot) {
                 waiting.snapshot = snapshot;
@@ -1144,6 +1149,7 @@ impl ThreadNames {
         let entry = Waiting {
             deps: deps.clone(),
             activity: activity_of(&snapshot),
+            most_replies: snapshot.reply_count,
             shown: snapshot.clone(),
             snapshot,
             prior,
@@ -1404,29 +1410,32 @@ impl ThreadNames {
             .map_err(TurnFailure::Other)?;
         let renamed = kept.is_none();
         let cut_at = naming.cut_at;
-        // How many messages the sentence is filed at. Never fewer than the newest copy a page
-        // showed before the read began: a write-scope page that shows that count again would find
-        // the thread due and queue it, and a read that is behind (a bridge's `as_of`, or a thread
-        // view that counts fewer replies than the list) answers the same at every turn, so the
-        // thread would be read and named again at every interval, for as long as it stays behind.
-        // No reply that came after the read began is counted: every page counted here landed
-        // before it began.
+        // How many messages the sentence is filed at. Never fewer than the most replies a page
+        // showed while the thread waited, before the read began: a write-scope page that shows
+        // that count again would find the thread due and queue it, and a read that is behind (a
+        // bridge's `as_of`, or a thread view that counts fewer replies than the list) answers the
+        // same at every turn, so the thread would be read and named again at every interval, for
+        // as long as it stays behind. The most, not the newest copy's: two copies whose order by
+        // activity and by replies cross — a list a bridge answers from its cache now and then,
+        // or a deletion that moved the thread's activity forward — would otherwise leave the one
+        // with more replies due at every turn. No reply that came after the read began is
+        // counted: every page counted here landed before it began.
         //
-        // A read that says it is behind is filed at exactly what that page counted (or at how
-        // many messages the read held, when the page gave no count), as before W5: nothing it
-        // counted is trusted, as nothing it returned is carried on a delta. A copy from before a
-        // reply was deleted still counts the deleted reply, so filed at its count the sentence
-        // would keep the deleted reply's text and the next reply would not make the thread due.
-        // Otherwise it is the most of what the read counted, what that page counted, and how many
-        // messages the read held.
+        // A read that says it is behind is filed at exactly what those pages counted (or at how
+        // many messages the read held, when none gave a count), as before W5: nothing it counted
+        // is trusted, as nothing it returned is carried on a delta. A copy from before a reply was
+        // deleted still counts the deleted reply, so filed at its count the sentence would keep
+        // the deleted reply's text and the next reply would not make the thread due. Otherwise it
+        // is the most of what the read counted, what those pages counted, and how many messages
+        // the read held.
         let at = if behind {
-            snapshot
-                .reply_count
+            waiting
+                .most_replies
                 .map_or(messages.len() as u64, |replies| replies.saturating_add(1))
         } else {
             [
                 read_copy.as_ref().and_then(|thread| thread.reply_count),
-                snapshot.reply_count,
+                waiting.most_replies,
             ]
             .into_iter()
             .flatten()
