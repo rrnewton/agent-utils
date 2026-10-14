@@ -243,6 +243,21 @@ pub struct UpstreamClearOutcome {
     pub dry_run: bool,
 }
 
+/// What a channel's provider read marker covers, beside what this server reads of the channel.
+/// `#300 reply-marks-read`; see [`ChatClient::upstream_read_scope`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamReadScope {
+    /// The marker covers this channel and nothing more: marking a message in it marks read only
+    /// messages this server reads there too.
+    Channel,
+    /// The channel is one thread of a larger space whose marker covers the whole space, so marking
+    /// a message in it would also mark read messages this server never received.
+    Wider,
+    /// The provider cannot say. Treated as [`UpstreamReadScope::Wider`] by anything that moves the
+    /// marker without the owner asking.
+    Unknown,
+}
+
 /// How much text one post may carry at a provider, counted the way that provider counts it.
 /// `#263 post-split-per-provider`.
 ///
@@ -1154,6 +1169,25 @@ pub trait ChatClient: Send + Sync {
         Err(ChatError::Refused(
             "the configured chat provider does not support upstream read marks".to_owned(),
         ))
+    }
+
+    /// Whether [`ChatClient::mark_read_upstream`] in `channel` would mark read only messages this
+    /// server reads there, or more. `#300 reply-marks-read`.
+    ///
+    /// Asked before a mark nobody pressed for — a reply's — moves the marker: the owner's own
+    /// **Mark read in** names its scope (the whole space) and is his choice, but a mark that follows
+    /// a reply must not clear messages vibe-talk never received, such as the rest of a space one
+    /// thread of which is registered as the channel. [`UpstreamReadScope::Unknown`] by default, and
+    /// a provider that cannot tell must keep it, so an automatic mark is never made blind.
+    ///
+    /// # Errors
+    ///
+    /// The provider's failure, when it had to be read to tell.
+    async fn upstream_read_scope(
+        &self,
+        _channel: &ChannelId,
+    ) -> Result<UpstreamReadScope, ChatError> {
+        Ok(UpstreamReadScope::Unknown)
     }
 
     /// Whether this provider can clear its own unread state automatically, as vibe-talk ingests

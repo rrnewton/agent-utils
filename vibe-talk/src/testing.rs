@@ -1030,6 +1030,17 @@ impl crate::chat::ChatClient for CountingChat {
         .await
     }
 
+    async fn upstream_read_scope(
+        &self,
+        channel: &crate::model::ChannelId,
+    ) -> Result<crate::chat::UpstreamReadScope, crate::chat::ChatError> {
+        self.counted(
+            call_in("upstream_read_scope", channel),
+            self.inner.upstream_read_scope(channel),
+        )
+        .await
+    }
+
     fn supports_upstream_clear(&self) -> bool {
         self.inner.supports_upstream_clear()
     }

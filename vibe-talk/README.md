@@ -124,6 +124,16 @@ it, and the service's bridge keeps its own cursor forward too. The status line t
 read here and in** *the service*. Slack has no such marker for vibe-talk to move (its **Clear unread
 in Slack** setting is separate and unchanged), and nor does a bot on Discord itself.
 
+**A reply never moves the service's marker past what vibe-talk holds of the channel.** On a channel
+that is one thread of a larger space — a registration narrowed to one conversation — the service's
+marker still covers the whole space, so moving it through a reply's message would mark every earlier
+message of the space read in the service's own app, messages vibe-talk never received, and nothing
+here could move it back. There a reply marks its message Done and nothing more, and so does a reply
+in a channel whose service cannot say what its marker covers. **Mark read in** under the **⋯** menu
+still moves it when you choose to, labelled with the whole space. Such a reply's status line says
+**Marked read here, not in** *the service*, and why; a channel the page already holds as one thread
+asks nothing at all, and the Done's own words say the service was not marked.
+
 Opening Reply marks nothing, and nor does a send that fails or is only partly posted; the **Retry**
 that sends it does. A message already Done is left as it is, and the **Undo** chip keeps offering
 the last Done. A reply that finishes sending after you have moved to another channel marks its
@@ -135,9 +145,10 @@ reply typed in a new thread on the right marking its root read in both columns.
 **A voice agent's reply follows the same rule.** Its `post_reply` with a reply target is a targeted
 reply; it has no thread box of its own to write in. Once it is posted — at once, with **Ask me
 before the voice agent sends** off, or when you confirm its card by a tap or a yes — the server marks
-the message it answers Done and moves the service's marker through it where it can, never backward
-and never twice. The page shows that Done at its next read of the channel. A proposal not yet
-confirmed, a refusal and a partly posted reply mark nothing.
+the message it answers Done and moves the service's marker through it where it can, never backward,
+never twice, and never on a channel whose marker covers more than the channel (above). The page
+shows that Done at its next read of the channel. A proposal not yet confirmed, a refusal and a
+partly posted reply mark nothing.
 
 **The reply screen says where the reply goes, and shows what came before.** Its title bar names
 the thread the reply posts into as the thread picker and the heading over a thread name it (age and
@@ -1515,8 +1526,9 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   unread replies), `reply-place`, `threads` (the thread list's newest page, read for "Older
   threads…" when no cursor is known yet) and `side` (the right column's thread or list of threads,
   read beside Main). The server names its own: `naming` (a thread read to name it), `recent` (a
-  voice catch-up's window), `probe`, `summary-window`, `speech`, `shadow` (the recent-view check)
-  and `tool` (an MCP tool call). A bulk read (see
+  voice catch-up's window), `probe`, `summary-window`, `speech`, `shadow` (the recent-view check),
+  `tool` (an MCP tool call) and `reply-mark` (whether a reply's provider read mark would clear more
+  than the channel). A bulk read (see
   [Bulk and time-range reads](#bulk-and-time-range-reads)) carries the reason of the reads it
   stands in for, native or emulated: a catch-up's head read and its read of several channels are
   `recent`, the head read checked beside the probe is `probe`, and speech preparation's lookup by
@@ -2792,8 +2804,15 @@ message's **⋯** menu, labelled with the scope it moves (the whole space). That
 not write vibe-talk's local read mark and does not archive the message. Thread-level behavior is
 defined by the provider. A reply sent from vibe-talk moves it the same way, through the message the
 reply answers or the root of the thread it starts, after marking that message Done (`#300
-reply-marks-read`): see "A reply marks read what it answers" above. The bridge may return JSON or an empty successful response such as `204
-No Content`. Direct Discord deployments must leave the setting off.
+reply-marks-read`): see "A reply marks read what it answers" above. A reply's mark is made only on a
+whole registration, because nobody pressed anything for it and the cursor covers the whole space.
+Before the first one in a channel, once per run, vibe-talk reads the newest page of the bridge's main
+timeline (`view=main&limit=1`, read reason `reply-mark`): a registration narrowed to one conversation
+names it as `thread` there and is never marked by a reply, nor is a channel on a bridge without the
+timeline contract (`thread_api` other than `"bridge"`), which cannot say. A `409` with
+`"code":"thread_channel"` from this route, whoever asked the mark, is remembered the same way. The
+bridge may return JSON or an empty successful response such as `204 No Content`. Direct Discord
+deployments must leave the setting off.
 
 **Clearing unread automatically, per channel** (`#232 upstream-mark-read`). vibe-talk reads only
 some of the owner's channels, and those are mostly coding agents posting updates; in the service's
@@ -3240,7 +3259,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
-| POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…", thread_id?, after_reply?}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined. `thread_id` is checked to hold the message. `after_reply: true` is the page asking because a reply it sent answered the message (`#300 reply-marks-read`): the provider is not asked for a message this server has already marked through, nor one before it, and the answer's `outcome` says `marked`, `already_marked` or `behind`. Without it the provider is always asked |
+| POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…", thread_id?, after_reply?}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined. `thread_id` is checked to hold the message. `after_reply: true` is the page asking because a reply it sent answered the message (`#300 reply-marks-read`): the provider is not asked for a message this server has already marked through, nor one before it, and the answer's `outcome` says `marked`, `already_marked` or `behind`; or `thread_channel` or `scope_unknown`, asking nothing, where the provider's cursor covers more than the channel (one thread of a larger space) or the provider cannot say whether it does. Without it the provider is always asked |
 | GET | `/api/v1/channels/{id}/upstream-clear` | read | whether this server clears the channel's unread state in the provider's own client as it ingests messages, and what it last did; see "Clearing unread automatically" |
 | PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on"}` — set it. Turning it on pushes nothing by itself; the next message that arrives is pushed. Refused for a channel whose provider cannot do it |
 | POST | `/api/v1/channels/{id}/upstream-clear/now` | **write** | no body — Settings' **Mark read now**: push the channel's newest message at once through the running loop and answer `{outcome, message_id?, message_at_ms?, attempt?, state}`: `outcome` is `pushed` (the provider took the push that covers the pressed message; `attempt` is it), `failed` or `skipped` (that push failed, or named a message the bridge no longer holds; `attempt` says so), `covered`, `no_message`, `retry_waiting`, `changed` (the setting changed meanwhile), `unavailable`, or `waiting` (nothing recorded within 45 s, the whole request included; the server carries on). Changes no setting; refused while the channel is off |
@@ -6418,8 +6437,10 @@ The memory is the server's own, in memory: a restart forgets it.
 **A reply it posts marks what it answers read**, as the voice page's Reply does (`#300
 reply-marks-read`): once posted whole, the message named by `reply_to` is Done on this server before
 the tool answers, and the provider's read marker is moved through it afterwards where the provider
-lets this server move it, never backward and never twice. A confirmed proposal is marked the same way
-when its commit posts it. A refusal, a partial post and a proposal not yet confirmed mark nothing.
+lets this server move it and that marker covers no more than the channel, never backward and never
+twice. On a channel that is one thread of a larger space nobody is watching to object, so it is not
+moved there at all. A confirmed proposal is marked the same way when its commit posts it. A
+refusal, a partial post and a proposal not yet confirmed mark nothing.
 
 The log gets one content-free `post_gate event=sent_direct` line (or `direct_failed`, with the
 reason, or `direct_repeat`, with what became of the earlier send): a number, the channel, the

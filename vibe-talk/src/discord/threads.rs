@@ -419,6 +419,34 @@ impl HttpDiscordClient {
         }
     }
 
+    /// What `channel`'s read marker covers, by the bridge's own word. `#300 reply-marks-read`.
+    ///
+    /// A registration narrowed to one conversation names that conversation as `thread` in every
+    /// main page (see [`parse_bridge_page`]), and the provider's marker it moves is the whole
+    /// space's, so marking in it would clear messages vibe-talk never received. A main page that
+    /// names none is a whole registration. Only the bridge's timeline says: native threads and
+    /// threads turned off serve a narrowed registration as an ordinary channel, so there the answer
+    /// is [`crate::chat::UpstreamReadScope::Unknown`] and nothing is read.
+    pub(super) async fn upstream_read_scope_of(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<crate::chat::UpstreamReadScope, ChatError> {
+        if self.thread_api != ThreadApi::Bridge {
+            return Ok(crate::chat::UpstreamReadScope::Unknown);
+        }
+        let request = TimelineRequest {
+            view: TimelineView::Main,
+            limit: 1,
+            ..TimelineRequest::default()
+        };
+        let page = self.timeline(channel, &request).await?;
+        Ok(if page.thread.is_some() {
+            crate::chat::UpstreamReadScope::Wider
+        } else {
+            crate::chat::UpstreamReadScope::Channel
+        })
+    }
+
     /// A channel's most recent messages, read from the newest page of the bridge's Flat view.
     /// `#208 persistent-cache`, milestone `bridge-recent-flat`.
     ///
@@ -2283,6 +2311,80 @@ mod tests {
                 "{view:?} listed the channel as its own child"
             );
             assert_eq!(page.thread.expect("scope").id, "opaque/scope");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_read_markers_scope_is_the_bridge_timelines_word_and_unknown_without_one() {
+        // `#300 reply-marks-read`. A narrowed registration's main page names its conversation as
+        // `thread`, and its marker is the whole space's; a whole registration's names none.
+        use crate::chat::UpstreamReadScope;
+        let mut routes = Replies::new();
+        let mut root = message("scoped", "root-id", "the linked conversation");
+        root["thread"] = json!({"id":"opaque/scope","root_message_id":"root-id","is_root":true,"reply_count":2,"reply_count_exact":true});
+        let scope = json!({"id":"opaque/scope","root":root.clone(),"title":"Linked","reply_count":2,"reply_count_exact":true,"updated_at":"2026-09-19T10:00:00Z"});
+        ok(
+            &mut routes,
+            "/channels/scoped/timeline?view=main&limit=1",
+            json!({"messages":[root],"threads":[],"thread":scope,"has_threads":false,"has_more":false,"next_before":null,"notice":null}),
+        );
+        ok(
+            &mut routes,
+            "/channels/whole/timeline?view=main&limit=1",
+            json!({"messages":[message("whole", "m-1", "a space of its own")],"threads":[],"thread":null,"has_threads":false,"has_more":false,"next_before":null,"notice":null}),
+        );
+        let bridge = mock_with(routes.clone(), |discord| {
+            discord.thread_api = ThreadApi::Bridge;
+            discord.upstream_read_marks = true;
+        })
+        .await;
+        let id = |text: &str| ChannelId(text.into());
+        assert_eq!(
+            bridge
+                .client
+                .upstream_read_scope(&id("scoped"))
+                .await
+                .expect("scoped"),
+            UpstreamReadScope::Wider
+        );
+        assert_eq!(
+            bridge
+                .client
+                .upstream_read_scope(&id("whole"))
+                .await
+                .expect("whole"),
+            UpstreamReadScope::Channel
+        );
+        // A failed read is a failure, not a guess either way.
+        assert!(bridge
+            .client
+            .upstream_read_scope(&id("gone"))
+            .await
+            .is_err());
+
+        // Native threads and threads turned off serve a narrowed registration as an ordinary
+        // channel, so they cannot say, and nothing is read; nor is it without the read-mark opt-in.
+        for (mode, marks) in [
+            (ThreadApi::Native, true),
+            (ThreadApi::Off, true),
+            (ThreadApi::Bridge, false),
+        ] {
+            let other = mock_with(routes.clone(), |discord| {
+                discord.thread_api = mode;
+                discord.upstream_read_marks = marks;
+            })
+            .await;
+            assert_eq!(
+                other
+                    .client
+                    .upstream_read_scope(&id("scoped"))
+                    .await
+                    .expect("no read"),
+                UpstreamReadScope::Unknown,
+                "{mode:?}, marks {marks}"
+            );
+            let seen = other.seen.lock().expect("seen").clone();
+            assert!(seen.is_empty(), "{mode:?}, marks {marks}: {seen:?}");
         }
     }
 

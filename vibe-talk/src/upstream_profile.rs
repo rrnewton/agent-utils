@@ -1148,6 +1148,7 @@ impl Rows for () {}
 impl Rows for ChatIdentity {}
 impl Rows for RegisteredChannel {}
 impl Rows for crate::chat::UpstreamClearOutcome {}
+impl Rows for crate::chat::UpstreamReadScope {}
 
 /// Whether an operation's messages are counted for size: reads only, not our own posts.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1674,6 +1675,19 @@ impl ChatClient for ProfiledClient {
             "mark_read_upstream",
             Direction::Other,
             self.inner.mark_read_upstream(channel, through),
+        )
+        .await
+    }
+
+    async fn upstream_read_scope(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<crate::chat::UpstreamReadScope, ChatError> {
+        // A read: a bridge answers it from its own timeline.
+        self.timed(
+            "upstream_read_scope",
+            Direction::Read,
+            self.inner.upstream_read_scope(channel),
         )
         .await
     }

@@ -95,6 +95,9 @@ pub enum ReadReason {
     Shadow,
     /// The server: a voice agent's MCP tool call.
     Tool,
+    /// The server: telling whether moving a channel's provider read marker after a reply would
+    /// clear more than the channel holds. `#300 reply-marks-read`.
+    ReplyMark,
     /// A reason was given, but it is not one the page sends.
     Other,
     /// No reason was given at all.
@@ -102,7 +105,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 24] = [
+pub const ALL: [ReadReason; 25] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -125,6 +128,7 @@ pub const ALL: [ReadReason; 24] = [
     ReadReason::Speech,
     ReadReason::Shadow,
     ReadReason::Tool,
+    ReadReason::ReplyMark,
     ReadReason::Other,
     ReadReason::Untagged,
 ];
@@ -156,6 +160,7 @@ impl ReadReason {
             Self::Speech => "speech",
             Self::Shadow => "shadow",
             Self::Tool => "tool",
+            Self::ReplyMark => "reply-mark",
             Self::Other => "other",
             Self::Untagged => "untagged",
         }

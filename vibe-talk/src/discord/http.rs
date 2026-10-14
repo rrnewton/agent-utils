@@ -1691,6 +1691,20 @@ impl ChatClient for HttpDiscordClient {
         .map_err(|error| error.with_provider(self.provider_name()))
     }
 
+    /// Told by the bridge's own timeline where it serves one; unknown otherwise, and without the
+    /// read-mark opt-in, which nothing would ask it for. `#300 reply-marks-read`.
+    async fn upstream_read_scope(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<crate::chat::UpstreamReadScope, ChatError> {
+        if !self.upstream_read_marks {
+            return Ok(crate::chat::UpstreamReadScope::Unknown);
+        }
+        self.upstream_read_scope_of(channel)
+            .await
+            .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
     /// The same bridge opt-in as the manual mark, and never against Discord itself, which has no
     /// such route and no user read state for a bot. `#232 upstream-mark-read`.
     fn supports_upstream_clear(&self) -> bool {

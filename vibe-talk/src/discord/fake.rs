@@ -102,6 +102,12 @@ struct State {
     /// holds to keep one in flight. A failed or held mark is still recorded as asked.
     upstream_read_mark_failures: VecDeque<ChatError>,
     upstream_read_mark_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// What each channel's read marker covers, where a test said ([`crate::chat::UpstreamReadScope::Channel`]
+    /// otherwise: this fake's channels are whole channels), every ask in order, and queued failures
+    /// for the next asks.
+    upstream_read_scopes: BTreeMap<ChannelId, crate::chat::UpstreamReadScope>,
+    upstream_read_scope_asks: Vec<ChannelId>,
+    upstream_read_scope_failures: VecDeque<ChatError>,
     /// `#232 upstream-mark-read`: whether automatic clearing is offered, every call in order as
     /// `(channel, through, dry_run)`, each channel's provider cursor, queued failures, and an
     /// optional gate a test holds to keep a call in flight.
@@ -277,6 +283,30 @@ impl FakeDiscord {
         let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         self.lock().upstream_read_mark_gate = Some(std::sync::Arc::clone(&gate));
         gate
+    }
+
+    /// Say what `channel`'s read marker covers: [`crate::chat::UpstreamReadScope::Wider`] for a
+    /// channel registered as one thread of a larger space, as a bridge's timeline names it.
+    /// `#300 reply-marks-read`.
+    pub fn set_upstream_read_scope(
+        &self,
+        channel: &ChannelId,
+        scope: crate::chat::UpstreamReadScope,
+    ) {
+        self.lock()
+            .upstream_read_scopes
+            .insert(channel.clone(), scope);
+    }
+
+    /// Every channel this fake was asked the read marker's scope of, in call order.
+    #[must_use]
+    pub fn upstream_read_scope_asks(&self) -> Vec<ChannelId> {
+        self.lock().upstream_read_scope_asks.clone()
+    }
+
+    /// Make the next ask of a read marker's scope fail with `error`, after it is recorded.
+    pub fn fail_upstream_read_scope_next(&self, error: ChatError) {
+        self.lock().upstream_read_scope_failures.push_back(error);
     }
 
     /// A seeded message, as this fake would answer for it, or `None` when it holds none by that id.
@@ -905,6 +935,22 @@ impl ChatClient for FakeDiscord {
             Some(failure) => Err(failure),
             None => Ok(()),
         }
+    }
+
+    async fn upstream_read_scope(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<crate::chat::UpstreamReadScope, ChatError> {
+        let mut state = self.lock();
+        state.upstream_read_scope_asks.push(channel.clone());
+        if let Some(failure) = state.upstream_read_scope_failures.pop_front() {
+            return Err(failure);
+        }
+        Ok(state
+            .upstream_read_scopes
+            .get(channel)
+            .copied()
+            .unwrap_or(crate::chat::UpstreamReadScope::Channel))
     }
 
     fn supports_upstream_clear(&self) -> bool {
