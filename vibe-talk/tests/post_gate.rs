@@ -1341,3 +1341,95 @@ async fn forgetting_one_conversation_forgets_the_sends_filed_into_it() {
         .collect();
     assert_eq!(left, [tagged("second")], "{after}");
 }
+
+/// The store harness, with `[replay]` on, so a claimed send can be read back as a resumed call
+/// would be handed it.
+fn replay_store_harness() -> Harness {
+    let toml = format!(
+        "{}\n[replay]\nenabled = true\n",
+        vibe_talk::testing::config_toml()
+    );
+    let (state, discord, _store) = vibe_talk::testing::state_with_store_from_toml(&toml);
+    Harness {
+        router: router(state),
+        discord,
+    }
+}
+
+/// The whole chain the page drives: a commit whose answer is lost, the page claiming the send into
+/// its conversation, and the next call resuming that conversation. The agent was told at the time
+/// that the send could not be confirmed, and the restored card says "Not confirmed"; the recap
+/// must not tell the resumed agent it was posted. Likewise a send that went in part.
+#[tokio::test]
+async fn a_resumed_call_is_not_told_that_an_unconfirmed_or_partial_send_was_posted() {
+    let harness = replay_store_harness();
+    let claim = |send_seq: Value| {
+        let harness = &harness;
+        async move {
+            let (status, body) = record(
+                harness,
+                "conv_r",
+                json!({ "speaker": "sent", "send": send_seq }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body
+        }
+    };
+
+    let proposal = propose(&harness, "ship it").await;
+    harness.discord.lose_answer_after(0, "timed out");
+    let (status, committed) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{committed}");
+    let filed = claim(committed["send_seq"].clone()).await;
+    assert_eq!(filed["turn"]["detail"]["outcome"], "unconfirmed", "{filed}");
+
+    let long = three_parts();
+    let proposal = propose_again(&harness, &long).await;
+    harness
+        .discord
+        .refuse_post_after(1, 400, "{\"message\":\"no\"}");
+    let (status, committed) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{committed}");
+    let filed = claim(committed["send_seq"].clone()).await;
+    assert_eq!(filed["turn"]["detail"]["outcome"], "partial", "{filed}");
+    assert_eq!(filed["turn"]["detail"]["uncertain_part"], Value::Null);
+
+    let (status, payload) = send(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_r/replay",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["included"], 2, "{payload}");
+    let text = payload["text"].as_str().expect("text");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("sent to"))
+        .filter(|line| !line.starts_with(' ') && !line.contains("Lines that begin"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(
+        lines[0], "may have been sent to lead team (NOT confirmed): ship it",
+        "the recap said an unconfirmed send was posted: {text}"
+    );
+    assert!(
+        lines[1].starts_with(
+            "partly sent to lead team (only these words were posted; the rest was NOT posted): \
+             alpha"
+        ),
+        "the recap quoted the parts that went as the whole message: {text}"
+    );
+    assert!(!lines[1].contains("charlie"), "{text}");
+    assert!(
+        !text.lines().any(|line| line.starts_with("sent to ")),
+        "nothing in this conversation went whole: {text}"
+    );
+    assert!(
+        text.contains(vibe_talk::replay::SENT_LINES.trim()),
+        "{text}"
+    );
+}
