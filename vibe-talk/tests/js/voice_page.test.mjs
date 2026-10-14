@@ -29,7 +29,7 @@
 //
 // No dependencies, no build step, no framework — same rule the page itself follows.
 
-import { beforeEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -45,6 +45,25 @@ import vm from "node:vm";
 let messagesBuilt = 0;
 beforeEach(() => {
   messagesBuilt = 0;
+});
+
+/**
+ * `remote-ops-audit`, read reason tags. The words the server takes from the page as a read's
+ * `reason=` (`ReadReason::from_the_page` in src/read_reason.rs); any other is logged as `other`.
+ */
+const PAGE_READ_REASONS = ["enter", "poll", "live", "mutation", "visible", "reset", "replay", "pull", "expired",
+  "older", "search", "counts", "reply-place", "threads", "side"];
+
+/**
+ * Every read of a channel's messages (`/timeline`, `/page`, `/todo`) the page sent in the test now
+ * running without one of `PAGE_READ_REASONS`, collected by the fake server and checked after each
+ * test: a path that forgets to say why it reads fails whichever test walks it, not only the tests
+ * written about the words. Up here for the reason `messagesBuilt` is.
+ */
+const unexplainedReads = [];
+afterEach(() => {
+  const found = unexplainedReads.splice(0);
+  assert.deepStrictEqual(found, [], "a read of the channel did not say why it was made (remote-ops-audit)");
 });
 
 const WEB = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
@@ -2499,6 +2518,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     WebSocket: FakeWebSocket,
     fetch: async (path, options) => {
       page.requests.push(`${(options && options.method) || "GET"} ${path}`);
+      if (/^\/api\/v1\/channels\/[^/]+\/(timeline|page|todo)(\?|$)/.test(String(path)) &&
+          !((options && options.method) || "GET").match(/^(POST|PUT|DELETE)$/) &&
+          !PAGE_READ_REASONS.includes(new URL(String(path), "http://fixture.test").searchParams.get("reason"))) {
+        unexplainedReads.push(String(path));
+      }
       if (String(path).startsWith("/api/v1/voice-session")) {
         return page.mint(path, options);
       }
@@ -15696,6 +15720,8 @@ test("IN A THREAD, A PULL UP REFRESHES THAT THREAD — AND A SHORT LIST IS PULLE
   assert.equal(read.searchParams.get("view"), "thread", "the pull up read something other than the thread");
   assert.equal(read.searchParams.get("thread_id"), page.threads[0].id, "the pull up read another thread");
   assert.equal(read.searchParams.get("before"), null, "the pull up walked back instead of refreshing");
+  // `remote-ops-audit`: and it says so to the server, which counts its reads by why they were made.
+  assert.equal(read.searchParams.get("reason"), "pull", "the pull up did not say it was one");
   assert.deepStrictEqual(shownIds(page), ["201", "202", "205"], "the thread's new answer is not on the screen");
   assert.equal(page.el("thread-heading").hidden, false, "refreshing the thread closed it");
   assert.equal(affordance.getAttribute("data-state"), "done");
@@ -52819,4 +52845,64 @@ test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the car
     ""));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
   assert.deepStrictEqual(threadOnly, { ...real, listFoot: false, nearFoot: false, twoFoot: false });
+});
+
+// --- remote-ops-audit: every read of the channel says why it was made ----------------------------
+//
+// The server writes a read's `reason=` in its access line and counts the provider reads it makes under
+// it (src/read_reason.rs), so a figure like "forty timeline reads a minute" can be taken apart by
+// cause. Attribution only: these tests check what the page SAYS; nothing it sends changes because of
+// the word, which every other test in this file holds it to.
+
+/** The `reason=` a request path carries, or null. */
+const readReasonIn = (path) => new URL(String(path).replace(/^[A-Z]+ /, ""), "http://fixture.test").searchParams.get("reason");
+
+/** Every read of a channel's messages the page sent: timeline, page and to-do reads. */
+const channelReadRequests = (page) => page.requests.filter((request) => /^GET \/api\/v1\/channels\/[^/]+\/(timeline|page|todo)\?/.test(request));
+
+/** Every channel read carries one of the server's words. */
+function assertEveryReadSaysWhy(page) {
+  const reads = channelReadRequests(page);
+  assert.ok(reads.length > 0, "no channel read was sent, so this proves nothing");
+  const silent = reads.filter((request) => !PAGE_READ_REASONS.includes(readReasonIn(request)));
+  assert.deepStrictEqual(silent, [], "a channel read said nothing the server takes about why it was made");
+}
+
+test("`remote-ops-audit`: every timeline read says what it was made for, in a word the server takes", async () => {
+  const page = await threadPage();
+  assert.equal(readReasonIn(page.timelineCalls[0]), "enter", "opening the channel");
+  const reads = page.timelineCalls.length;
+  await pollOnce(page);
+  const polled = page.timelineCalls.slice(reads);
+  assert.ok(polled.length > 0, "the poll read nothing");
+  assert.deepStrictEqual(polled.map(readReasonIn), polled.map(() => "poll"), polled.join("\n"));
+  assertEveryReadSaysWhy(page);
+});
+
+test("`remote-ops-audit`: in two columns the right column's read beside Main says side", async () => {
+  const { page, server } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const reads = page.timelineCalls.length;
+  await pollOnce(page);
+  const polled = page.timelineCalls.slice(reads).map((path) => `${viewOf(path)} ${readReasonIn(path)}`);
+  assert.ok(polled.includes("thread side"), `the right column's thread was not read as side: ${polled}`);
+  assert.ok(polled.some((read) => read.endsWith(" poll") && !read.startsWith("thread")),
+    `Main was not read for the poll: ${polled}`);
+  assert.ok(server.reads.length > 0);
+  assertEveryReadSaysWhy(page);
+});
+
+test("`remote-ops-audit`: a channel without threads says why it reads its page and its to-do list", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(5));
+  const reads = () => channelReadRequests(page).map(readReasonIn);
+  assert.equal(reads()[0], "enter", "entering the channel");
+  await reReadChannel(page);
+  assert.equal(reads().at(-1), "poll", "the poll");
+  await turnTodoOn(page);
+  assert.ok(page.todoReadPaths.length > 0, "turning Hide read on did not read the to-do list");
+  assert.equal(readReasonIn(page.todoReadPaths.at(-1)), "enter", "the to-do list is a view entered");
+  assertEveryReadSaysWhy(page);
 });

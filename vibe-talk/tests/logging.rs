@@ -1426,3 +1426,84 @@ async fn the_hourly_upstream_line_is_names_and_numbers_and_never_the_channel() {
         lines[1]
     );
 }
+
+#[tokio::test]
+async fn a_read_says_why_it_was_made_and_a_reason_the_page_does_not_send_is_other() {
+    // `remote-ops-audit`, read reason tags. The page's timeline and recent-window reads say what
+    // they are for, so a figure like "forty timeline reads a minute" can be taken apart by cause.
+    // Only the page's own words are written: anything else is `other`, and the word sent is not
+    // copied anywhere, so a client cannot write into this log through it.
+    let capture = LogCapture::info_only();
+    let (state, discord) = vibe_talk::testing::state();
+    let profile = std::sync::Arc::clone(state.providers.profile());
+    let harness = Harness {
+        router: router(state),
+        discord,
+    };
+    for query in [
+        "view=main&reason=poll",
+        "view=main&reason=because-i-said-so",
+        "view=main&reason=naming",
+        "view=main",
+    ] {
+        call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{READ_CHANNEL}/timeline?{query}"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+    }
+    let lines: Vec<String> = capture
+        .access_lines()
+        .into_iter()
+        .filter(|line| line.contains("request") && line.contains("/timeline"))
+        .collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(lines[0].contains(" read_reason=\"poll\""), "{}", lines[0]);
+    assert!(lines[1].contains(" read_reason=\"other\""), "{}", lines[1]);
+    assert!(
+        lines[2].contains(" read_reason=\"other\""),
+        "a request passed itself off as the server's own background work: {}",
+        lines[2]
+    );
+    assert!(lines[3].contains(" read_reason=\"-\""), "{}", lines[3]);
+    // Not `reason`, which the tool, mcp and post_gate lines use for a refusal code.
+    for line in &lines {
+        assert!(!line.contains(" reason="), "{line}");
+    }
+    assert!(
+        !capture.text().contains("because-i-said-so"),
+        "the word a client sent reached the log"
+    );
+
+    // The hourly line counts the provider's reads under the reason each was made for: the four
+    // timeline reads above (refused by this provider, which has no threads, but asked all the same)
+    // and the recent-window read of the page below.
+    harness
+        .discord
+        .seed(&ChannelId(READ_CHANNEL.to_owned()), "Somebody", "something");
+    call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/page?limit=5&reason=side"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    profile.log_hour();
+    let hourly: Vec<String> = capture
+        .text()
+        .lines()
+        .filter(|line| line.contains("upstream timings for the last hour"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(hourly.len(), 1, "{hourly:?}");
+    assert!(
+        hourly[0]
+            .contains("reasons=\"fetch_page side=1; fetch_timeline poll=1 other=2 untagged=1\""),
+        "{}",
+        hourly[0]
+    );
+}

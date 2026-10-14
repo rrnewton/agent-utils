@@ -153,7 +153,9 @@ async fn check(state: AppState) {
             limit: waiting.limit,
             ..TimelineRequest::default()
         };
-        let flat = state.chat.fetch_timeline(&waiting.channel, &request).await;
+        let flat = crate::read_reason::ReadReason::Shadow
+            .scope(state.chat.fetch_timeline(&waiting.channel, &request))
+            .await;
         let raced = state
             .live
             .recent()

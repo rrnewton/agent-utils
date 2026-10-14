@@ -1388,6 +1388,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
       "shim_calls": [                         // one row per Web API method and outcome
         { "name": "conversations.history", "outcome": "rate_limited", "count": 2, "…": "…" }
       ],
+      "reasons": [                            // reads per operation and the reason they were made for
+        { "name": "fetch_timeline", "reason": "poll", "count": 30 },
+        { "name": "fetch_timeline", "reason": "naming", "count": 12 }
+      ],
       "content_bytes": { "messages": 2050, "total": 553500, "mean": 270, "p50": 140,
                          "p90": 610, "p99": 2900, "max": 11800, "octaves": [[0, 12], [1, 3]] }
     }
@@ -1409,6 +1413,21 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   bridge's, for example), so the two can be compared hour by hour. The time here runs from sending
   the request to reading the whole answer, so it includes the network both ways. Other providers
   leave this list empty.
+* **Reasons** say why each read was made (`remote-ops-audit`, `src/read_reason.rs`), counted when it
+  is asked. The page names each of its timeline and recent-window reads (`/timeline`, `/page`,
+  `/todo`) in `reason=`: `enter` (opening a channel or a view), `poll`, `live` (after a live
+  message), `mutation` (after a live edit or deletion, or the reader's own change: a Done undone,
+  the noise rules), `visible` (the page shown again), `reset` and `replay` (the live stream), `pull`
+  (pull to refresh, at either end), `expired` (a forward cursor the server could not continue),
+  `older` (a step back), `search` (a step back the search took), `counts` (All read behind Main for
+  unread replies), `reply-place`, `threads` (the thread list's newest page, read for "Older
+  threads…" when no cursor is known yet) and `side` (the right column's thread or list of threads,
+  read beside Main). The server names its own: `naming` (a thread read to name it), `recent` (a
+  voice catch-up's window), `probe`, `summary-window`, `speech`, `shadow` (the recent-view check)
+  and `tool` (an MCP tool call). A word the page does not send is `other`; a read nobody gave a
+  reason for (the live poller's, for one) is `untagged`. **Attribution only:** nothing in the
+  server or the page decides anything by the reason — no read is shared, skipped, kept or made
+  fresher because of it.
 * **Outcomes** are `ok`, `transport`, `rate_limited`, `unauthorized` (401), `forbidden` (403),
   `not_found` (404), `client_error` (another 4xx), `server_error` (5xx), `unexpected_status`,
   `shape` (an answer this server could not read), `refused` (this server said no before asking),
@@ -1429,7 +1448,7 @@ is a number: no channel, no message id, no author, no text.
 hour after the server starts. Its target is `vibe_talk::upstream_profile`:
 
 ```text
-INFO vibe_talk::upstream_profile: upstream timings for the last hour provider="slack" seconds=3600 operations=88 operations_failed=1 operation_timings="fetch_recent ok n=60 p50_ms=812.5 p90_ms=1937.5 max_ms=4102; fetch_recent transport n=1 p50_ms=10000 p90_ms=10000 max_ms=10000; …" shim_calls=402 shim_calls_failed=2 shim_call_timings="conversations.history ok n=300 p50_ms=687.5 p90_ms=1437.5 max_ms=3010; …" content_messages=1900 content_bytes_p50=140 content_bytes_p90=610 content_bytes_max=11800
+INFO vibe_talk::upstream_profile: upstream timings for the last hour provider="slack" seconds=3600 operations=88 operations_failed=1 operation_timings="fetch_recent ok n=60 p50_ms=812.5 p90_ms=1937.5 max_ms=4102; fetch_recent transport n=1 p50_ms=10000 p90_ms=10000 max_ms=10000; …" shim_calls=402 shim_calls_failed=2 shim_call_timings="conversations.history ok n=300 p50_ms=687.5 p90_ms=1437.5 max_ms=3010; …" reasons="fetch_recent_dated poll=50 recent=10; …" content_messages=1900 content_bytes_p50=140 content_bytes_p90=610 content_bytes_max=11800
 ```
 
 ## Summaries
@@ -2451,7 +2470,7 @@ ambiguity**. The server says so in a banner at startup, because a reader has to 
 have spoken.
 
 ```text
-INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" status=200 millis=12
+INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" read_reason="-" status=200 millis=12
 INFO vibe_talk::access: mcp rpc_method="tools/call" credential="write" is_notification=false
 INFO vibe_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48 millis=9
 INFO vibe_talk::access: post_gate event="proposed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="-"
@@ -2460,6 +2479,13 @@ INFO vibe_talk::access: post_gate event="committed" proposal=4 channel="123…" 
 
 Filter for just these: `RUST_LOG=vibe_talk::access=info`. Three lines answer the question that
 started this: *did the agent call, which tool, which channel, and was it allowed?*
+
+A request that says why it was made carries that in `read_reason`: the page's timeline and
+recent-window reads send `reason=poll`, `reason=live` and the rest of the words listed under "How
+long upstream takes", and every provider read the request makes is counted under it there. A word
+outside that list is written as `other`, so nothing a client sends is copied into the log, and a
+request that gave no reason shows `-` (`remote-ops-audit`). It is a different field from the
+`reason` on `tool`, `mcp` and `post_gate` lines, which is a refusal code.
 
 A tool call the caller stopped waiting for — a voice runtime gives a tool fifteen seconds and then
 drops the request — writes `tool tool="…" outcome="abandoned" millis=…` from the moment its handler
@@ -2509,8 +2535,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
-| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not |
-| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
+| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=&reason=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not; optional `reason=` says what the read is for, for the access log and the upstream profile only (`remote-ops-audit`), as on the next two routes |
+| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=&reason=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
 | GET | `/api/v1/channels/{id}/count?since=&hours=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A post longer than the channel's provider takes in one message is cut into parts; one to the channel itself continues in the first part's thread where the provider threads a long message (Google Chat, Slack) and as consecutive messages on Discord (`#263 post-split-per-provider`). A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable, thread_id?}`, where `thread_id` names the thread `unsent` belongs in — send it there, and without `reply_to` when that is not the request's own thread; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent. Posts to one destination — the channel, or one thread — are made one at a time, in the order they arrive, a long post's parts together; a post whose caller disconnects still holds its destination until the provider answers or its request timeout gives up (`#277 send-order`) |
@@ -2527,7 +2553,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn |
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
-| GET | `/api/v1/channels/{id}/todo?limit=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
+| GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
 | POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
@@ -6443,6 +6469,7 @@ src/probe.rs          the startup channel reachability probe and its failure tax
 src/diagnostics.rs    those same checks on demand, structured, redacted, and time-bounded
 src/upstream_profile.rs  how long each provider operation and Slack Web API call takes, and how
                       big messages are: numbers only, for diagnostics and one line an hour
+src/read_reason.rs    why a provider read was made: the page's word or the server's own
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
 src/bin/mock_elevenlabs.rs     that mock as a process, for a browser or the smoke script

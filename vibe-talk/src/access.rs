@@ -140,12 +140,28 @@ impl std::fmt::Display for ToolOutcome {
 }
 
 /// One line for one HTTP request, emitted after the response status is known.
-pub fn request(method: &str, path: &str, credential: Credential, status: u16, millis: u128) {
+///
+/// `read_reason` is why the caller says it made the request, when it said: the page's `reason=` on
+/// a timeline or recent-window read, one of a closed set of words, and `other` for any word outside
+/// it, so nothing a client sends is copied into the log. `-` when no reason was given.
+/// `remote-ops-audit`; see [`crate::read_reason`].
+///
+/// Logged as `read_reason`, not `reason`: on the `tool`, `mcp` and `post_gate` lines `reason` is
+/// already the refusal code, and a reader filtering by field name must not get the two mixed.
+pub fn request(
+    method: &str,
+    path: &str,
+    credential: Credential,
+    read_reason: Option<crate::read_reason::ReadReason>,
+    status: u16,
+    millis: u128,
+) {
     tracing::info!(
         target: "vibe_talk::access",
         method,
         path,
         credential = credential.as_str(),
+        read_reason = read_reason.map_or("-", crate::read_reason::ReadReason::as_str),
         status,
         millis,
         "request"
@@ -276,7 +292,7 @@ mod tests {
         // check that an operator following `RUST_LOG=vibe_talk::access=info` from the README gets
         // the lines this module emits.
         let capture = crate::testing::LogCapture::start();
-        request("GET", "/healthz", Credential::Absent, 200, 0);
+        request("GET", "/healthz", Credential::Absent, None, 200, 0);
         assert!(
             capture.text().contains(TARGET),
             "the emitted target does not match TARGET: {}",

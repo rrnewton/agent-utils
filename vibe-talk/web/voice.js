@@ -16057,7 +16057,9 @@ async function refreshThreadDirectory() {
   if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
   threadDirectoryInFlight = channel;
   threadDirectoryReadAt.set(channel, Date.now());
-  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
+  // `remote-ops-audit`: the right column's list of threads, read beside Main (`readSideColumn`).
+  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}` +
+    "&reason=side";
   // `#203 incremental-refresh`. With the thread list's forward cursor, only the threads that moved,
   // under the same rule as the poll's: a list a complete delta keeps current needs no full read.
   const cover = channelCanon.channel === channel ? channelCanon.views.get(viewKey("threads")) : null;
@@ -16183,7 +16185,8 @@ async function loadOlderThreads() {
   const stale = () => generation !== pages.generation || String(el("discord-channel").value) !== channel;
   try {
     if (!pages.cursor) {
-      const newest = await apiDecoded("TimelineResponse", base);
+      // `remote-ops-audit`: the thread list's newest page, read for its cursor, says "threads"; the step back "older".
+      const newest = await apiDecoded("TimelineResponse", `${base}&reason=threads`);
       if (stale()) return;
       foldTimelinePage(newest, false, "threads", null);
       threadDirectoryReadAt.set(channel, Date.now());
@@ -16191,7 +16194,7 @@ async function loadOlderThreads() {
       noteNewestThreadPage(channel, newest);
     }
     if (pages.cursor) {
-      const older = await apiDecoded("TimelineResponse", `${base}&before=${encodeURIComponent(pages.cursor)}`);
+      const older = await apiDecoded("TimelineResponse", `${base}&reason=older&before=${encodeURIComponent(pages.cursor)}`);
       if (stale()) return;
       foldTimelinePage(older, true, "threads", null);
       pages.cursor = older.has_more === true ? older.next_before || null : null;
@@ -17043,7 +17046,8 @@ async function readAllForCounts(channel) {
   const read = { context: JSON.stringify([channel, "flat", null]), channel, view: "flat", thread: null, canon: channelCanon };
   try {
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
-      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`, { signal }));
+      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
+      { signal }));
     countsAllReadFor.set(channel, outrun);
     // Not over a newest page of All that landed while this was on the wire — the reader switched to
     // All, or tapped N replies, and that read answered first: this answer is the older, and folded
@@ -17303,13 +17307,55 @@ async function writeInBatches(route, ids, landed) {
   return stored;
 }
 
-function timelinePath(before = null, after = null) {
+/**
+ * The path of a read of the view on screen. `reason` is the word it sends as `reason=`
+ * (`readReasonOf`).
+ *
+ * @param {string | null} [before]
+ * @param {string | null} [after]
+ * @param {string | null} [reason]
+ */
+function timelinePath(before = null, after = null, reason = null) {
   let path = `/api/v1/channels/${encodeURIComponent(el("discord-channel").value)}/timeline` +
     `?view=${channelView}&limit=${DISCORD_PAGE_LIMIT}`;
   path = withThreadQuery(path, selectedThreadId);
   if (before) path += `&before=${encodeURIComponent(before)}`;
   if (after) path += `&after=${encodeURIComponent(after)}`;
+  if (reason) path += `&reason=${encodeURIComponent(reason)}`;
   return path;
+}
+
+/**
+ * The word a read of the channel sends the server as `reason=`: why it was made. `remote-ops-audit`,
+ * read reason tags. The server writes it in the request's access line and counts the provider reads
+ * the request makes under it, so a figure like "forty timeline reads a minute" can be taken apart by
+ * cause. ATTRIBUTION ONLY: nothing on the server, and nothing here, decides anything by the word.
+ *
+ * `readAs` names it where the refresh's `reason` would say the wrong thing or nothing: the right
+ * column's read beside Main is `side` whatever refresh asked for it, and a pull up, a step back the
+ * walk to a cursor takes, or a re-read after the reader's own change says so, where its `reason`
+ * (which decides what the read asks for) is left as it was. Otherwise the refresh's own `reason`, the
+ * first of several merged into one queued read (`queueDiscordLoad`). Null when neither names one.
+ *
+ * @param {{readAs?: string, reason?: string | (string | undefined)[]} | undefined} options
+ * @returns {string | null}
+ */
+function readReasonOf(options) {
+  if (options && typeof options.readAs === "string") return options.readAs;
+  const reason = options && options.reason;
+  const first = Array.isArray(reason) ? reason.find((one) => typeof one === "string") : reason;
+  return typeof first === "string" ? first : null;
+}
+
+/** `path` with the `reason=` of `options` (`readReasonOf`), when it names one. */
+function withReadReason(path, options) {
+  const reason = readReasonOf(options);
+  return reason ? `${path}${path.includes("?") ? "&" : "?"}reason=${encodeURIComponent(reason)}` : path;
+}
+
+/** The word a step back sends: `search` while the column's walk for the search is under way. */
+function olderReadReason() {
+  return activeColumn.searchWalk ? "search" : "older";
 }
 
 /**
@@ -17645,7 +17691,7 @@ async function loadTimeline(options) {
   };
   try {
     for (;;) {
-      const path = timelinePath(null, sent);
+      const path = timelinePath(null, sent, readReasonOf(options));
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
@@ -17851,7 +17897,7 @@ async function pagesBackTo(payload, placeAt, current) {
   try {
     while (pages.length < REPLY_JUMP_PAGES && last.has_more === true && last.next_before &&
         !(timeOf((last.messages || [])[0], "timestamp") <= placeAt)) {
-      const path = timelinePath(last.next_before);
+      const path = timelinePath(last.next_before, null, "older");
       try {
         steps.pause();
         last = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
@@ -17880,7 +17926,7 @@ async function readWalkCursor() {
   renderOlderControl();
   try {
     steps.pause();
-    await loadDiscord({ keepPosition: true, quiet: true, reason: "enter" });
+    await loadDiscord({ keepPosition: true, quiet: true, reason: "enter", readAs: olderReadReason() });
     steps.resume();
   } catch (error) {
     steps.resume();
@@ -17906,7 +17952,7 @@ async function loadOlderTimeline(signal) {
   olderFetchInFlight = true;
   renderOlderControl();
   try {
-    const path = timelinePath(discordOlderCursor);
+    const path = timelinePath(discordOlderCursor, null, olderReadReason());
     steps.pause();
     let payload;
     try {
@@ -18248,7 +18294,8 @@ async function placeReplyTarget(entry) {
   if (held && !channelCanon.unplaced.has(id)) return answeredThread(held);
   const payload = await apiDecoded(
     "TimelineResponse",
-    `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`
+    `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
+      "&reason=reply-place"
   );
   const messages = payload.messages || [];
   if (current()) {
@@ -25197,7 +25244,8 @@ async function loadOlderPage(signal) {
     try {
       payload = await api(
         `/api/v1/channels/${encodeURIComponent(channel)}/page` +
-          `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}&render=html`,
+          `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}&render=html` +
+          `&reason=${olderReadReason()}`,
         signal ? { signal } : undefined
       );
     } catch (error) {
@@ -25680,7 +25728,7 @@ async function refreshFromNewest() {
         await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
       }
     } else {
-      await loadDiscord({ keepPosition: true });
+      await loadDiscord({ keepPosition: true, readAs: "pull" });
     }
   } catch (error) {
     failure = error;
@@ -25852,7 +25900,7 @@ function channelReadPosition(area) {
 }
 
 /**
- * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[]}} [options]
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  *   `keepPosition` marks a RE-read of a channel already on screen — the background poll, or the
  *   Refresh button. It must not drag the reader to the bottom while they are reading older
  *   messages; it follows the newest line only if that is where they already were. The FIRST load
@@ -25863,7 +25911,7 @@ function channelReadPosition(area) {
  *   trigger it stands for (`queueDiscordLoad`). `#203 incremental-refresh`. `quiet` and `ownAct`
  *   are a read behind rows a view switch has already drawn (`readBehindSwitch`, `#220
  *   view-switch-instant`): it shows no loading line over them, and what it adds is not counted as
- *   arrived.
+ *   arrived. `readAs` is only the word the read sends the server (`readReasonOf`), and decides nothing.
  */
 async function loadDiscord(options) {
   screenBelongsToToken();
@@ -25896,7 +25944,8 @@ async function loadDiscord(options) {
     }
     // `render=html`: this route is also the voice agent's `read_page`, so its bodies are rendered
     // only when asked. `#217 markdown-blocks`.
-    const path = `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`;
+    const path = withReadReason(
+      `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}&render=html`, options);
     const sent = readStateEpoch;
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }));
     // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
@@ -26505,7 +26554,7 @@ async function loadTodo(options) {
     // displayed would clear messages the reader never saw. See `clearBacklog`.
     const sent = readStateEpoch;
     const payload = await api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`
+      withReadReason(`/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`, options)
     );
     // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
     if (payload && typeof payload === "object") readSentEpochs.set(payload, sent);
@@ -27077,7 +27126,7 @@ async function restoreMessages(ids) {
     settleHeldDone(held, true);
     settled = true;
     if (todoMode && !threadingSupported) {
-      await loadTodo({ keepPosition: true, ownAct: true });
+      await loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" });
     }
   } catch (error) {
     // Only what the server did not put back is Done again: the batches before the one that failed
@@ -27217,7 +27266,7 @@ function setReadMode(mode) {
     } else if (todoMode !== wasHiding) {
       // A read of another route, which keeps the reader's place as a refresh does and is placed again
       // when it lands. What it brings is the reader's own act, not something that arrived.
-      return (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true });
+      return (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "enter" });
     } else {
       // Show read and Collapse read are the same read of the channel, drawn two ways.
       applyReadRuns();
@@ -27700,7 +27749,7 @@ async function saveNoiseRules(rules, said) {
   el("noise-state").textContent = said;
   setStatus(said);
   if (el("discord-channel").value) {
-    guardQuietly(() => loadDiscord({ keepPosition: true }))();
+    guardQuietly(() => loadDiscord({ keepPosition: true, readAs: "mutation" }))();
   }
 }
 
@@ -29569,6 +29618,7 @@ async function loadEarlierReplyContext() {
       let path = withThreadQuery(
         `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=${view}&limit=${DISCORD_PAGE_LIMIT}`, thread);
       if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
+      path += "&reason=older";
       const payload = await readTimeline(path);
       if (generation !== replyContext.generation || String(el("discord-channel").value) !== channel) return;
       foldTimelinePage(payload, Boolean(cursor), view, thread);
@@ -31244,7 +31294,7 @@ async function readSideColumn(reason, since = null) {
   if (!sideColumnUp()) return;
   if (columns.side.mode === "thread") {
     await inColumn(columns.side, () => (since !== null && answeredSince(since, reason)
-      ? undefined : loadDiscord({ keepPosition: true, reason })));
+      ? undefined : loadDiscord({ keepPosition: true, reason, readAs: "side" })));
   } else {
     await refreshThreadDirectory();
   }
@@ -31894,7 +31944,7 @@ const replaysAwaitingRead = new Map();
  * drew stays one without the loading line over them when a poll queues behind it (`#220
  * view-switch-instant`; a list with nothing in it shows the line whatever was asked).
  *
- * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[]}} [options]
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  */
 function queueDiscordLoad(options) {
   const queued = discordQueuedLoads.get(activeColumn);
@@ -32877,7 +32927,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // even when the event's ID is already visible from a POST acknowledgement; otherwise it
     // could erase the row after this event retired its durable send receipt.
     ++discordLoadGeneration;
-    if (!discordQueuedLoads.has(columns.main)) queueDiscordLoad({ keepPosition: true });
+    if (!discordQueuedLoads.has(columns.main)) queueDiscordLoad({ keepPosition: true, readAs: "live" });
   }
   if (threadingSupported) {
     // A replayed copy is from when it was published, so the store's copy is at least as new — its
@@ -34854,7 +34904,7 @@ el("mark-own-read").addEventListener("change", () => {
     renderChannelRows();
   }
   if (todoMode && !threadingSupported) {
-    guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true }))();
+    guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
   }
 });
 

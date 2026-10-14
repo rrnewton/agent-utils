@@ -568,7 +568,8 @@ pub async fn probe_channels_within(
     let mut outcomes = Vec::with_capacity(channels.len());
     let mut aborted = false;
     for channel in channels {
-        let read = chat.probe_channel(&channel.id, PROBE_LIMIT);
+        let read = crate::read_reason::ReadReason::Probe
+            .scope(chat.probe_channel(&channel.id, PROBE_LIMIT));
         let answered = match budget {
             Some(budget) => match tokio::time::timeout(budget, read).await {
                 Ok(answered) => answered,

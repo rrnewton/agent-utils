@@ -551,7 +551,10 @@ pub async fn messages_for_speech(
                     .extend(state.read_ahead.recall(&channel.id, None, &missing));
             } else {
                 // `ops::messages` remembers the window for everyone else as well.
-                let window = ops::messages(state, channel.id.as_str(), limit).await?;
+                // `remote-ops-audit`: counted as speech preparation's.
+                let window = crate::read_reason::ReadReason::Speech
+                    .scope(ops::messages(state, channel.id.as_str(), limit))
+                    .await?;
                 *turn = Some(WindowRead::of(&window));
                 found.fetches = 1;
                 let wanted: HashSet<&str> = missing.iter().map(String::as_str).collect();
@@ -568,7 +571,14 @@ pub async fn messages_for_speech(
                 .map(|id| async move {
                     // Never closed, so this always holds a permit.
                     let _slot = lookups.acquire().await;
-                    ops::message_by_id_scoped(state, channel.id.as_str(), &id, limit, Some(thread))
+                    crate::read_reason::ReadReason::Speech
+                        .scope(ops::message_by_id_scoped(
+                            state,
+                            channel.id.as_str(),
+                            &id,
+                            limit,
+                            Some(thread),
+                        ))
                         .await
                         .map(|(_, message)| message)
                 })

@@ -2931,8 +2931,11 @@ async fn shared_window(
             });
         }
     }
-    // `messages` remembers the window for everyone else as well.
-    let window = messages(state, channel.id.as_str(), limit).await?;
+    // `messages` remembers the window for everyone else as well. `remote-ops-audit`: counted as a
+    // summary's context, whoever asked for the summary.
+    let window = crate::read_reason::ReadReason::SummaryWindow
+        .scope(messages(state, channel.id.as_str(), limit))
+        .await?;
     state.summary_counters.fetched(1);
     *turn = Some(crate::read_ahead::WindowRead::of(&window));
     Ok(window)

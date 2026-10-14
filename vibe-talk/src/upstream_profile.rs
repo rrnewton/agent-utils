@@ -9,7 +9,7 @@
 //! belonged to, and the only size estimate was a guess. This module measures both, in memory,
 //! from the moment the process starts.
 //!
-//! # Three series per provider
+//! # Four series per provider
 //!
 //! * **Operations.** Every [`ChatClient`] method that can reach the provider, timed by
 //!   [`ProfiledClient`], which [`crate::providers::ChatRouter`] wraps around each provider's client.
@@ -23,6 +23,11 @@
 //! * **Content size.** The UTF-8 bytes of each message's `content`, for every message a read
 //!   returned. A message read twice counts twice: this describes what crosses the wire, which is
 //!   also what a cache would hold most of.
+//! * **Reasons.** Every read operation, counted per (operation, [`ReadReason`]): why it was made —
+//!   the page's poll, a re-read after a live message, thread naming, a voice catch-up.
+//!   `remote-ops-audit`, read reason tags: what makes a figure from the far end's log attributable.
+//!   Counted when the read is asked, so one its caller gave up on still counts. Counted only:
+//!   nothing here or anywhere else decides anything by it.
 //!
 //! # Histograms
 //!
@@ -57,6 +62,7 @@ use crate::chat::{
     ChatClient, ChatError, ChatIdentity, PostLimit, RecentRead, RegisteredChannel, SourceClaim,
 };
 use crate::model::{ChannelId, Message, MessageId};
+use crate::read_reason::ReadReason;
 
 /// Equal steps each power of two is divided into.
 pub const SUBDIVISIONS: u64 = 8;
@@ -343,6 +349,8 @@ impl Tally {
 struct Tallies {
     operations: BTreeMap<(&'static str, Outcome), Tally>,
     shim_calls: BTreeMap<(&'static str, Outcome), Tally>,
+    /// Reads per (operation, reason): since start, and this hour.
+    reasons: BTreeMap<(&'static str, ReadReason), [u64; 2]>,
     content_total: Histogram,
     content_hour: Histogram,
     hour_started: Instant,
@@ -372,6 +380,7 @@ impl ProviderProfile {
             tallies: Mutex::new(Tallies {
                 operations: BTreeMap::new(),
                 shim_calls: BTreeMap::new(),
+                reasons: BTreeMap::new(),
                 content_total: Histogram::size(),
                 content_hour: Histogram::size(),
                 hour_started: Instant::now(),
@@ -424,6 +433,14 @@ impl ProviderProfile {
         tally.rows_hour = tally.rows_hour.saturating_add(rows);
     }
 
+    /// Count one read operation asked for `reason`.
+    pub fn record_reason(&self, name: &'static str, reason: ReadReason) {
+        let mut tallies = self.lock();
+        let counts = tallies.reasons.entry((name, reason)).or_default();
+        counts[0] = counts[0].saturating_add(1);
+        counts[1] = counts[1].saturating_add(1);
+    }
+
     /// Count the content bytes of each of `messages`.
     pub fn record_content(&self, messages: &[Message]) {
         if messages.is_empty() {
@@ -458,6 +475,7 @@ impl ProviderProfile {
                     TimingReport::of(name, outcome, &tally.total, None)
                 })
                 .collect(),
+            reasons: ReasonCount::rows(&tallies.reasons, 0),
             content_bytes: SizeReport::of(&tallies.content_total),
         }
     }
@@ -486,6 +504,10 @@ impl ProviderProfile {
         };
         let operations = take(&mut tallies.operations, true);
         let shim_calls = take(&mut tallies.shim_calls, false);
+        let reasons = ReasonCount::rows(&tallies.reasons, 1);
+        for counts in tallies.reasons.values_mut() {
+            counts[1] = 0;
+        }
         let content_bytes = SizeReport::of(&tallies.content_hour);
         tallies.content_hour = Histogram::size();
         HourReport {
@@ -493,6 +515,7 @@ impl ProviderProfile {
             seconds,
             operations,
             shim_calls,
+            reasons,
             content_bytes,
         }
     }
@@ -648,8 +671,36 @@ pub struct ProviderReport {
     /// One row per (Web API method, outcome) seen. Empty for a provider whose client does not
     /// time its own calls.
     pub shim_calls: Vec<TimingReport>,
+    /// Read operations per (operation, reason) seen. `remote-ops-audit`.
+    pub reasons: Vec<ReasonCount>,
     /// Bytes of `content` per message read.
     pub content_bytes: SizeReport,
+}
+
+/// How many read operations were asked for one reason. `remote-ops-audit`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReasonCount {
+    /// The operation (a [`ChatClient`] read method).
+    pub name: &'static str,
+    /// Why they were asked.
+    pub reason: ReadReason,
+    /// How many.
+    pub count: u64,
+}
+
+impl ReasonCount {
+    /// The rows of `reasons` whose count in `slot` (0 since start, 1 this hour) is not zero.
+    fn rows(reasons: &BTreeMap<(&'static str, ReadReason), [u64; 2]>, slot: usize) -> Vec<Self> {
+        reasons
+            .iter()
+            .filter(|(_, counts)| counts[slot] > 0)
+            .map(|(&(name, reason), counts)| Self {
+                name,
+                reason,
+                count: counts[slot],
+            })
+            .collect()
+    }
 }
 
 /// Latency figures for one (name, outcome).
@@ -754,8 +805,29 @@ pub struct HourReport {
     pub operations: Vec<TimingReport>,
     /// One row per (Web API method, outcome) seen this hour.
     pub shim_calls: Vec<TimingReport>,
+    /// Read operations per (operation, reason) this hour.
+    pub reasons: Vec<ReasonCount>,
     /// Bytes of `content` per message read this hour.
     pub content_bytes: SizeReport,
+}
+
+/// `fetch_timeline poll=3 live=1; fetch_recent_dated recent=2`: names, reason words and numbers.
+fn reasons_text(rows: &[ReasonCount]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<&str> = None;
+    for row in rows {
+        let pair = format!("{}={}", row.reason.as_str(), row.count);
+        if current == Some(row.name) {
+            if let Some(last) = out.last_mut() {
+                last.push(' ');
+                last.push_str(&pair);
+            }
+        } else {
+            current = Some(row.name);
+            out.push(format!("{} {pair}", row.name));
+        }
+    }
+    out.join("; ")
 }
 
 /// `fetch_recent ok n=3 p50_ms=12 p90_ms=40; …`: names, outcome words and numbers.
@@ -808,6 +880,7 @@ impl HourReport {
             shim_calls = self.shim_call_count(),
             shim_calls_failed = Self::failed(&self.shim_calls),
             shim_call_timings = timings_text(&self.shim_calls).as_str(),
+            reasons = reasons_text(&self.reasons).as_str(),
             content_messages = content.messages,
             content_bytes_p50 = content.p50,
             content_bytes_p90 = content.p90,
@@ -927,6 +1000,9 @@ impl ProfiledClient {
         T: Rows + Send,
         F: std::future::Future<Output = Result<T, ChatError>> + Send,
     {
+        if direction == Direction::Read {
+            self.profile.record_reason(operation, ReadReason::current());
+        }
         let timer = self.profile.start(Series::Operation, operation);
         let result = work.await;
         match &result {
