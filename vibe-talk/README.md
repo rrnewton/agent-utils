@@ -5038,14 +5038,18 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   All, from a list opened from All, finds them where they left All, from the place read as the list came
   up — Main lacks All's replies, and a place near All's foot taken through Main came back at All's foot;
   otherwise Ctrl+2 and Ctrl+4 show All and two columns at their newest or the reader's place, and the
-  cards keep theirs between the thread list and two columns. The cards are placed once the view picker
-  says the new view: it is as wide as what it says, and "Thread list" wrapped a desk's dock onto a second
-  row after the cards had been put at their foot, which left the list 43px above it. In the thread list,
-  as on the right, a reader at the foot of the cards stays there as they change size, and as the dock
-  grows under them whenever it does: there the dock is only as wide as the reading column, and on a
-  reload in the thread list its last button came in about 30 ms after the cards were placed and wrapped
-  it, which left the list 43px above its foot for good. The same keeps the cards beside Main at their foot
-  when a channel's longer name wraps the dock.
+  cards keep theirs between the thread list and two columns. A send card docked under the list makes its
+  column of cards shorter than two columns' right column, so a reader near the list's foot is at the foot
+  of the cards beside Main; Ctrl+3 back finds them where they were in the list, unless they moved the
+  cards in two columns. Before, it found them at the list's foot: at a desk with a long draft up, every
+  reader 60 to 300px up the cards. The cards are placed once the view picker says the new view: it is as
+  wide as what it says, and "Thread list" wrapped a desk's dock onto a second row after the cards had been
+  put at their foot, which left the list 43px above it. In the thread list, as on the right, a reader at
+  the foot of the cards stays there as they change size, and as the dock grows under them whenever it
+  does: there the dock is only as wide as the reading column, and on a reload in the thread list its last
+  button came in about 30 ms after the cards were placed and wrapped it, which left the list 43px above
+  its foot for good. The same keeps the cards beside Main at their foot when a channel's longer name wraps
+  the dock.
 
 `tests/scroll_stability_browser.py` (DAG step `scroll-stability-browser`) measures them in Chromium at
 1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
@@ -6805,7 +6809,9 @@ foot again with Send on screen, and one up the list is on the row they were read
 jump to the card below them. A draft arriving while the list is up moves Main behind it no more than
 one arriving on the channel does, though Main's box gives up its room under the card in the same
 moment: a reader at Main's foot follows it, and one up Main stays on their row, there and on the way
-back.
+back. The cards keep their reader too: the card takes its height from the foot of the list's cards
+and gives it back beside Main, so a reader near the list's foot is at the foot of the cards in two
+columns, and Ctrl+3 back finds them on their card again, unless they moved the cards there.
 
 **What happens to a draft when the call ends depends on who ended it.** Hang up retires it: the
 card goes, and the next call on the same page does not offer it again; it lapses on the server. The
