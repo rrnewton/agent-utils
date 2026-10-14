@@ -181,8 +181,9 @@ send-order-browser:
 # and one at the foot there (`#280 scroll-stability`); and at 393x852 and 1280x800 docked under the
 # thread list, through Cmd/Ctrl+3 and +4 pressed on its own buttons, which post nothing (`#281
 # view-keys`), and back from it with the channel's reader where they were, at the foot of All or on
-# their row up Main (`#280`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep
-# a PNG of each placement.
+# their row up All or Main, card or no card, and a draft arriving under it leaving a reader up Main on
+# their row (`#280`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of
+# each placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

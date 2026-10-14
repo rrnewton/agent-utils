@@ -322,21 +322,23 @@ steps:
   # post and withdraw nothing, the card docked under the cards, which stay at their foot above it, whole
   # on screen with Send at a thumb's reach, back at the foot of Main in two columns, and a draft arriving
   # there moving neither a reader at the cards' foot nor one up them; and back from the list, a reader
-  # at All's foot at it again with Send on screen, and one 100 to 380px up Main on their row
-  # (`#280`).
-  # Measured on 2026-10-13: about 200s wall and 15s CPU, with the way back from the thread list; its
-  # limits stay 300s wall and 200s CPU.
+  # at All's foot at it again with Send on screen, one 100 or 225px up All and one 100 to 380px up Main
+  # on their row; and with no card up as the list comes, a draft arriving under it leaving a reader 40
+  # or 100px up Main on their row behind the cards and back, and with none at all, one 100px up All on
+  # theirs (`#280`).
+  # Measured on 2026-10-13: about 235s wall and 45s CPU on a loaded host, with a draft arriving under the
+  # thread list; its wall limit goes from 300s to 420s for that headroom, and its CPU limit stays 200s.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, and back from it with the channel's reader where they were, at 393x852 and 1280x800
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
-    timeout: 300
+    timeout: 420
     cpu_timeout: 200
     hint:
       resources: {browser: 1}
-      est_duration_s: 200
+      est_duration_s: 230
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

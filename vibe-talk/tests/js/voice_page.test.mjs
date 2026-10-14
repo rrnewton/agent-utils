@@ -60745,6 +60745,16 @@ const rowOnScreen = (page) => {
   return row ? `${row.getAttribute("data-id")}@${row.getBoundingClientRect().top - main.getBoundingClientRect().top}` : null;
 };
 
+/** The place read in All put back in All once the way out of the thread list has shown it, and not. */
+const BACK_IN_ALL = 'const backInAll = next === "one" &&';
+const NOT_BACK_IN_ALL = "const backInAll = false &&";
+
+/** `script`, already a broken copy, broken in one more place, which it must contain. */
+function brokenFurther(script, find, replace) {
+  assert.ok(script.includes(find), `the negative control patches ${JSON.stringify(find)}, which the copy no longer contains`);
+  return script.replace(find, replace);
+}
+
 test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: LEAVING THE THREAD LIST FOR ALL with a send card up finds a reader who was at All's foot at its foot, Send on screen — by Esc, where the list was chosen from All, and by Cmd-2", async () => {
   const DOCKED = 60;
   const run = async (script) => {
@@ -60781,12 +60791,13 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   const real = await run(SCRIPT);
   assert.deepStrictEqual(real, { escape: true, cmd2: true, untouched: true });
 
-  // THE CONTROL. Main's reader told nothing as the card comes back, before All is decided: All keeps the
-  // place Main's reader is at, now above the card, and draws them on the rows they could see, Send below
-  // the screen — 369px above All's foot on a phone in Chromium, and 337px at a desk.
-  const untold = await run(brokenScript(
+  // THE CONTROL. Main's reader told nothing as the card comes back, before All is decided, and All's own
+  // place not put back once it is: All keeps the place Main's reader is at, now above the card, and draws
+  // them on the rows they could see, Send below the screen — 369px above All's foot on a phone in
+  // Chromium, and 337px at a desk. Either alone puts them back at All's foot.
+  const untold = await run(brokenFurther(brokenScript(
     "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n    if (follows) scrollToNewest();\n    return follows;",
-    "    return false;"));
+    "    return false;"), BACK_IN_ALL, NOT_BACK_IN_ALL));
   assert.deepStrictEqual(untold, { ...real, escape: false, cmd2: false });
 });
 
@@ -60851,4 +60862,140 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
     keeperOne: false, keeperEscape: false, keeperTwo: false, keeperBehind: false, movedOne: false, movedEscape: false,
     movedTwo: false, untouched: true,
   });
+});
+
+// `#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`, from review. Two ways the thread
+// list moved the left column's reader that the card's move did not cover. A draft ARRIVING under the list
+// docks there and gives the main screen `data-draft`, which shrinks the box at the foot of Main's list to
+// one line in the same layout: in Chromium 192px to 90px as the card took 246px from under the list, and
+// Main's dock-growth keeper took readers up to 110px up for readers at its foot. And a reader up All goes
+// to Main behind the list, which lacks All's replies, so their place near All's foot was clamped at Main's,
+// and the way back read Main's reader as on its newest line and took All to its foot.
+
+/** The parts of a broken copy that put the page back as it was before review's second round. */
+const CAME_UNDER = "  if (coming) cardCameUnderLists(gap);\n";
+const HELD_ALWAYS = '  listHeldPlace = inColumn(columns.main, () => (channelView === "main" || channelView === "flat"\n';
+const HELD_WITH_CARD = "  listHeldPlace = inColumn(columns.main, () => (postWatch.shown !== null && " +
+  'leftEl("post-confirm").getAttribute("data-place") === "channel" && (channelView === "main" || channelView === "flat")\n';
+
+test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: A DRAFT ARRIVING UNDER THE THREAD LIST leaves a Main reader up the list on their row, behind the cards and back by Cmd-1, Esc and Cmd-4, offered the jump — the box at Main's foot shrinking to one line in the same layout not taken for their being at the foot — and keeps one at Main's foot at it", async () => {
+  const DOCKED = 200;
+  // web/voice.css's box at the foot of the channel's list: whole, and one line under a draft.
+  const BOX = { whole: 192, draft: 90 };
+  const run = async (script) => {
+    const { page, card, main, settled } = await draftOverThreads(script, DOCKED, { proposed: false });
+    page.wideDesk = true;
+    page.el("channel-composer").height = () => (page.el("screen-main").hasAttribute("data-draft") ? BOX.draft : BOX.whole);
+    await settled();
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    const sendShown = () => {
+      const box = page.el("post-confirm-send").getBoundingClientRect();
+      return box.height > 0 && box.top >= 0 && box.bottom <= main.clientHeight;
+    };
+    const behind = {};
+    const back = {};
+    let serial = 30;
+    // `near` and `up`: both within the keeper's reach as it reckoned it, the slack and the card's height,
+    // once the box has given up its room; `near` just past the slack.
+    for (const [name, up] of [["foot", 0], ["near", BOTTOM_SLACK_PX + 16], ["up", 100]]) {
+      assert.ok(up + DOCKED - (BOX.whole - BOX.draft) <= BOTTOM_SLACK_PX + DOCKED,
+        `the premise: the ${name} reader is left within the slack and the growth of Main's foot`);
+      for (const [route, key, fields] of [["One", "1", { metaKey: true }], ["Escape", "Escape", {}], ["Two", "4", { metaKey: true }]]) {
+        if (layout() !== null) {
+          await press(page, focused(page) || main, "1", { metaKey: true });
+          await settled();
+        }
+        main.scrollTop = main.scrollHeight - main.clientHeight - up;
+        await main.dispatch("scroll");
+        await settled();
+        const before = rowOnScreen(page);
+        assert.ok(card.hidden && gap() === up, `the premise: no card, and the reader ${up}px up Main (${name}, ${route})`);
+        await press(page, focused(page) || main, "3", { metaKey: true });
+        await settled();
+        assert.equal(layout(), "list", "the premise: Cmd-3 shows the thread list");
+        serial += 1;
+        page.propose(proposal({ serial, handle: `hAnDlE-arriving-${String(serial).padStart(8, "0")}`, text: LONG_CARD_DRAFT }));
+        await page.settle();
+        assert.ok(!card.hidden && card.parentNode === page.el("frame-body") && page.el("screen-main").hasAttribute("data-draft"),
+          "the premise: the draft docks under the cards, and the box at Main's foot gives up its room");
+        await settled();
+        behind[`${name}${route}`] = up === 0 ? atBottomOf(main) : rowOnScreen(page) === before;
+        await press(page, focused(page) || page.el("side-scroll"), key, fields);
+        await settled();
+        assert.equal(layout(), key === "4" ? "two" : null, `the premise: ${key} left the thread list`);
+        assert.equal(card.parentNode, page.el("pane-discord"), "the premise: the card is back at the foot of Main");
+        back[`${name}${route}`] = up === 0 ? atBottomOf(main) && sendShown() : rowOnScreen(page) === before && jumpShown(page);
+        // The draft taken down, and the box given back its room a second later.
+        page.settleProposal("cancelled");
+        await page.settle();
+        page.expireTimers(1000);
+        await settled();
+        assert.ok(card.hidden && !page.el("screen-main").hasAttribute("data-draft"), "the premise: the draft and its room are gone");
+      }
+    }
+    return { behind, back, untouched: page.proposalCommits.length === 0 && page.proposalCancels.length === 0 };
+  };
+  const every = (value) => Object.fromEntries(["foot", "near", "up"].flatMap((name) =>
+    ["One", "Escape", "Two"].map((route) => [`${name}${route}`, typeof value === "function" ? value(name) : value])));
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { behind: every(true), back: every(true), untouched: true });
+
+  // THE CONTROLS. Main's keeper not told where its reader was before the card came: the box's room going
+  // in the same layout leaves the near and up readers within the slack and the growth of the foot, and
+  // they are pulled down to it behind the cards. The place held from Cmd-3 still puts them back.
+  const told = brokenScript(CAME_UNDER, "");
+  assert.deepStrictEqual(await run(told), { ...real, behind: every((name) => name === "foot") });
+  // As the page was before: no place held from Cmd-3 without a card either, and on the way back they
+  // follow the card down from the foot they were pulled to.
+  const before = brokenFurther(brokenFurther(told, HELD_ALWAYS, HELD_WITH_CARD), BACK_IN_ALL, NOT_BACK_IN_ALL);
+  assert.deepStrictEqual(await run(before), {
+    behind: every((name) => name === "foot"), back: every((name) => name === "foot"), untouched: true,
+  });
+});
+
+test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: LEAVING THE THREAD LIST FOR ALL finds a reader who was up All on their row, card or no card — by Esc, where the list was chosen from All, and by Cmd-2 — though Main behind the list lacks All's replies, and offers the jump to a card below them", async () => {
+  const UPS = [BOTTOM_SLACK_PX + 6, 80, 120, 200];
+  const run = async (script, proposed) => {
+    const { page, card, main, settled } = await draftOverThreads(script, 60, { proposed });
+    const picker = page.el("thread-select");
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const kept = {};
+    for (const up of UPS) {
+      for (const [route, key, fields] of [["Escape", "Escape", {}], ["Two", "2", { metaKey: true }]]) {
+        if (layout() !== null || picker.value !== "flat") {
+          await press(page, focused(page) || main, "2", { metaKey: true });
+          await settled();
+        }
+        main.scrollTop = main.scrollHeight - main.clientHeight - up;
+        await main.dispatch("scroll");
+        await settled();
+        const before = rowOnScreen(page);
+        assert.ok(picker.value === "flat" && main.scrollHeight - main.scrollTop - main.clientHeight === up,
+          `the premise: the reader ${up}px up All`);
+        assert.equal(!card.hidden && card.parentNode === page.el("pane-discord"), proposed,
+          "the premise: the card is All's next message, or none is up");
+        await press(page, focused(page) || main, "3", { metaKey: true });
+        await settled();
+        assert.equal(layout(), "list", "the premise: Cmd-3 shows the thread list");
+        await press(page, focused(page) || page.el("side-scroll"), key, fields);
+        const atOnce = rowOnScreen(page) === before;
+        await settled();
+        assert.ok(layout() === null && picker.value === "flat", `the premise: ${key} showed All`);
+        kept[`${up}${route}`] = atOnce && rowOnScreen(page) === before && (!proposed || jumpShown(page));
+      }
+    }
+    return kept;
+  };
+  const all = (value) => Object.fromEntries(UPS.flatMap((up) =>
+    ["Escape", "Two"].map((route) => [`${up}${route}`, typeof value === "function" ? value(up) : value])));
+  const real = { card: await run(SCRIPT, true), none: await run(SCRIPT, false) };
+  assert.deepStrictEqual(real, { card: all(true), none: all(true) });
+
+  // THE CONTROL. All's place not put back in All: whoever Main's place clamped at Main's foot is taken to
+  // All's foot — with a card, every reader but one whose rows Main still holds above its own foot, and
+  // without one, every reader.
+  const unkept = brokenScript(BACK_IN_ALL, NOT_BACK_IN_ALL);
+  assert.deepStrictEqual({ card: await run(unkept, true), none: await run(unkept, false) },
+    { card: all((up) => up === 200), none: all(false) });
 });
