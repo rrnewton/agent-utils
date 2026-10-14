@@ -25,8 +25,8 @@ desk size, with a mouse:
   height, the summarised one saying its name and summary, the long first message cut to three lines,
   still three lines under the mouse and shown whole on the card a click highlights (`#257
   summary-truncation`, `#277 thread-card-focus`) -> a card's replies button selects its thread: its
-  rows in the right column under a heading naming it, its region "Thread: " and that name, with the
-  X, and no line saying it is stale -> each column scrolls on its own, under the
+  rows in the right column under its card (`#298 thread-card-header`), its region "Thread: " and its
+  name, with the X, and no line saying it is stale -> each column scrolls on its own, under the
   wheel over it -> the X goes back to the cards, and a Main message's Thread(N) selects its thread on
   the right -> the window narrowed to 900px: one column, as the channel was in one, the button not
   drawn; widened again: two columns, the same thread selected -> the keys, pressed for real: ] gives
@@ -451,7 +451,8 @@ def columns_walk(desk: Desk) -> None:
     desk.wait_for(f"() => !document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").hasAttribute('data-highlighted')",
                   "a second click on the highlighted card did not put the highlight out")
 
-    # A card's replies button selects its thread on the right, under a heading naming it, with the X.
+    # A card's replies button selects its thread on the right, under its card (`#298 thread-card-header`),
+    # with the X.
     page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
     desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 9",
                   "the card did not select its thread on the right")
@@ -459,8 +460,9 @@ def columns_walk(desk: Desk) -> None:
     desk.check(desk.rows("side-log") == ["202", "204", "206", "208", "211", "213", "217", "219", "221"],
                f"the right column is not the thread: {desk.rows('side-log')}")
     desk.check(page.is_visible("#side-close"), "the X is not drawn")
-    title = page.text_content("#side-title") or ""
-    desk.check(title == "runner-wedged", f"the heading calls the thread {title!r}")
+    said = page.text_content("#side-thread-card .side-card-text") or ""
+    desk.check(said == "runner-wedged: The overnight runner hung twice and was restarted by hand.",
+               f"the card at the top of the thread says {said!r}")
     named = page.evaluate("() => document.getElementById('side-scroll').getAttribute('aria-label')")
     desk.check(named == "Thread: runner-wedged", f"the right column's region is called {named!r}")
     desk.check(not page.is_visible("#side-freshness"), "a thread read a moment ago is said to be stale")
@@ -526,11 +528,13 @@ def columns_walk(desk: Desk) -> None:
     # The keys, pressed for real: ] to the right column, Esc its X, j to a card with a ring, -> selects
     # it (`#277 thread-card-focus`), [ back to the left column. The right column keeps a selected
     # message per thread, and opening this one from Thread(N) selected its root there, so ] lands on
-    # that message: the one row lit on the page, and the focus on it (`#239 single-selection`).
+    # that message: the one row lit on the page, and the focus on it (`#239 single-selection`). The
+    # line from the thread's root to its card is drawn as the selection's (`#298 thread-card-header`),
+    # and is no row.
     page.focus("#scroll-area")
     page.keyboard.press("]")
     desk.wait_for("() => { const held = document.activeElement;"
-                  " const lit = [...document.querySelectorAll('[data-selected=\"true\"]')];"
+                  " const lit = [...document.querySelectorAll('[data-selected=\"true\"]:not(#column-links > *)')];"
                   " return held && held.matches(\"#side-log > li[data-id='209']\")"
                   " && lit.length === 1 && lit[0] === held; }",
                   "] did not give the keys to the right column's selected message, the thread's root, the one row lit")
