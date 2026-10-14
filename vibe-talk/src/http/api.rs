@@ -3282,8 +3282,8 @@ pub async fn upstream_clear_now(
     if candidates.mode(&channel.id) == crate::store::UpstreamClearMode::Off {
         return Err(off());
     }
-    // `slack-reply-live`: the newest message the live stream would offer, never a thread reply a
-    // provider reads apart.
+    // `#307 slack-reply-live`: the newest message the live stream would offer, never a thread reply
+    // a provider reads apart.
     let newest = tokio::time::timeout_at(
         deadline,
         crate::upstream_clear::newest_to_push(state.chat.as_ref(), &channel.id),

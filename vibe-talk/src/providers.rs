@@ -850,14 +850,14 @@ impl ChatClient for ChatRouter {
             .await
     }
 
-    /// `slack-reply-live`. The channel's own provider's answer; a channel no provider holds is
+    /// `#307 slack-reply-live`. The channel's own provider's answer; a channel no provider holds is
     /// polled as before, and its read is refused there.
     fn polls_thread_replies(&self, channel: &ChannelId) -> bool {
         self.route(channel)
             .is_ok_and(|entry| entry.client.polls_thread_replies(channel))
     }
 
-    /// `slack-reply-live`. Forwarded, so the provider keeps its own place in each thread.
+    /// `#307 slack-reply-live`. Forwarded, so the provider keeps its own place in each thread.
     async fn fetch_live(
         &self,
         channel: &ChannelId,

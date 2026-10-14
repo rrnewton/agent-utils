@@ -352,7 +352,8 @@ impl LiveHub {
     }
 
     /// Publish one thread reply a provider read apart from the channel's own timeline, and
-    /// remember it for replay. `slack-reply-live`; see [`crate::chat::ChatClient::fetch_live`].
+    /// remember it for replay. `#307 slack-reply-live`; see
+    /// [`crate::chat::ChatClient::fetch_live`].
     ///
     /// Exactly [`LiveHub::publish`], held windows included, except that the reply is not offered
     /// for clearing unread at the provider ([`crate::upstream_clear`]). It was read out of step
@@ -693,7 +694,7 @@ pub struct Tick {
     /// fact worth a log line and not a loss.
     pub backlog: bool,
     /// Whether the provider left thread replies for the next tick ([`crate::chat::LiveRead`]).
-    /// `slack-reply-live`. Not a gap either: a later tick publishes them.
+    /// `#307 slack-reply-live`. Not a gap either: a later tick publishes them.
     pub replies_behind: bool,
 }
 
@@ -717,8 +718,8 @@ pub struct Tick {
 /// honest way to place them relative to the cursor, and publishing them on every tick would be a
 /// permanent duplicate.
 ///
-/// **Thread replies a provider reads apart are published as well.** `slack-reply-live`. A channel
-/// whose provider [`ChatClient::polls_thread_replies`] is seeded and stepped with
+/// **Thread replies a provider reads apart are published as well.** `#307 slack-reply-live`. A
+/// channel whose provider [`ChatClient::polls_thread_replies`] is seeded and stepped with
 /// [`ChatClient::fetch_live`] instead, and the first page of each tick then also carries the thread
 /// replies posted since the provider's previous read ([`crate::chat::LiveRead`]). They are
 /// published in time order among that page's messages, through [`LiveHub::publish_reply`], and
@@ -1088,8 +1089,8 @@ async fn poll_loop_with_channels(
                         );
                     }
                     *was_behind = tick.backlog;
-                    // `slack-reply-live`. Thread replies left for the next tick, said once on the
-                    // way in and once on the way out, as the page ceiling is.
+                    // `#307 slack-reply-live`. Thread replies left for the next tick, said once on
+                    // the way in and once on the way out, as the page ceiling is.
                     let replies_were_behind =
                         replies_behind.entry(channel.clone()).or_insert(false);
                     if tick.replies_behind && !*replies_were_behind {
@@ -1222,8 +1223,8 @@ async fn quiet_channels(
         .iter()
         .filter(|channel| {
             chat.read_caps(channel).heads == crate::chat::Support::Native
-                // `slack-reply-live`: a head names the newest of the channel's own messages, and
-                // says nothing of a reply this channel's provider reads apart.
+                // `#307 slack-reply-live`: a head names the newest of the channel's own messages,
+                // and says nothing of a reply this channel's provider reads apart.
                 && !chat.polls_thread_replies(channel)
                 && cursors.get(*channel).copied().flatten().is_some()
                 && failures.get(*channel).copied().unwrap_or(0) == 0

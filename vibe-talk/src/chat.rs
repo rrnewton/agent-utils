@@ -390,7 +390,7 @@ pub struct RecentRead {
 }
 
 /// One read the live poller makes of a channel whose provider reads its thread replies apart.
-/// `slack-reply-live`; see [`ChatClient::fetch_live`].
+/// `#307 slack-reply-live`; see [`ChatClient::fetch_live`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiveRead {
     /// The channel's own messages, oldest first: what [`ChatClient::fetch_page`] with `after`
@@ -957,7 +957,7 @@ pub trait ChatClient: Send + Sync {
     }
 
     /// Whether the live poller reads `channel` with [`ChatClient::fetch_live`] rather than with
-    /// [`ChatClient::fetch_recent`] and [`ChatClient::fetch_page`]. `slack-reply-live`.
+    /// [`ChatClient::fetch_recent`] and [`ChatClient::fetch_page`]. `#307 slack-reply-live`.
     ///
     /// True for a provider whose forward read of the channel leaves its thread replies out, so
     /// that the poller would otherwise never deliver one: Slack, whose `conversations.history`
@@ -968,7 +968,7 @@ pub trait ChatClient: Send + Sync {
     }
 
     /// One read of the live poller, for a channel that [`ChatClient::polls_thread_replies`].
-    /// `slack-reply-live`.
+    /// `#307 slack-reply-live`.
     ///
     /// With `after`, [`LiveRead::messages`] is exactly what [`ChatClient::fetch_page`] with that
     /// `after` answers, and [`LiveRead::replies`] the thread replies posted since the provider's

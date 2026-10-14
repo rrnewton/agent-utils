@@ -1217,13 +1217,13 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
 
 ### Live thread replies
 
-`slack-reply-live`. `conversations.history` lists no thread reply, so a poll that only walked it
-forward never delivered one. With `live_poll_seconds` set, each poll of a whole conversation instead
-reads the newest page of its history with no `oldest`: one call, the count of the forward read it
-replaces, and it answers that read too whenever it reaches back to the last message delivered. An
-interval with more new messages than that page holds is then walked forward from the last one
-delivered, as before, so it costs that call as well. Every thread root on that page reports its
-`reply_count` and `latest_reply`, and:
+`#307 slack-reply-live`. `conversations.history` lists no thread reply, so a poll that only walked
+it forward never delivered one. With `live_poll_seconds` set, each poll of a whole conversation
+instead reads the newest page of its history with no `oldest`: one call, the count of the forward
+read it replaces, and it answers that read too whenever it reaches back to the last message
+delivered. An interval with more new messages than that page holds is then walked forward from the
+last one delivered, as before, so it costs that call as well. Every thread root on that page reports
+its `reply_count` and `latest_reply`, and:
 
 * **A thread whose root's `latest_reply` is no newer than the newest reply the poll has already
   delivered from it costs no call.** A root that names no `latest_reply` is read when its reply

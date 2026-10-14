@@ -37,9 +37,9 @@
 //!
 //! There is no Events API or Socket Mode connection: new messages arrive through the server's
 //! ordinary bounded live polling, which reads a conversation's main timeline and the new replies of
-//! the threads rooted on its newest page whose root moved (`slack-reply-live`, `slack/live.rs`).
-//! A reply's edit or deletion, and a reply in a thread rooted further back, are read when the
-//! thread, Flat or the newest messages are read.
+//! the threads rooted on its newest page whose root moved (`#307 slack-reply-live`,
+//! `slack/live.rs`). A reply's edit or deletion, and a reply in a thread rooted further back, are
+//! read when the thread, Flat or the newest messages are read.
 //!
 //! There is no manual "Mark read in Slack" on a message. The one upstream write besides posting is
 //! the automatic clear of [`crate::upstream_clear`], off unless the deployment sets

@@ -240,11 +240,11 @@ async fn clearing_unread_in_slack_is_offered_only_when_the_deployment_turns_it_o
     );
 }
 
-/// `slack-reply-live`. A Slack read of a channel's newest messages now carries thread replies, but
-/// Settings' "Mark read now" pushes the newest message of the conversation's own, as the live stream
-/// offers them for clearing, never a thread reply newer than all of them, and reads no thread to
-/// find it. Here the newest message roots a thread whose reply is newer, so a read of the newest
-/// message with its thread's replies would answer the reply.
+/// `#307 slack-reply-live`. A Slack read of a channel's newest messages now carries thread replies,
+/// but Settings' "Mark read now" pushes the newest message of the conversation's own, as the live
+/// stream offers them for clearing, never a thread reply newer than all of them, and reads no
+/// thread to find it. Here the newest message roots a thread whose reply is newer, so a read of the
+/// newest message with its thread's replies would answer the reply.
 #[tokio::test]
 async fn mark_read_now_pushes_the_conversations_own_newest_message_never_a_thread_reply() {
     let mut state = fixture();

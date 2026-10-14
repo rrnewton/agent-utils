@@ -563,7 +563,7 @@ async fn the_main_view_pages_back_through_the_whole_conversation() {
     let fake = Fake::start(state, 4).await;
     let client = fake.client();
     // The conversation's own timeline: `fetch_recent` carries thread replies too
-    // (`slack-reply-live`).
+    // (`#307 slack-reply-live`).
     let expected = ts_list(
         &client
             .fetch_page(&channel(), 1000, None, None)
@@ -893,7 +893,7 @@ async fn a_message_nobody_has_answered_heads_its_own_empty_thread_which_its_firs
     );
 
     // The conversation's own timeline: `fetch_recent` carries thread replies too
-    // (`slack-reply-live`).
+    // (`#307 slack-reply-live`).
     let messages = client
         .fetch_page(&channel(), 50, None, None)
         .await

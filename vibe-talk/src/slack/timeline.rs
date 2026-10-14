@@ -759,7 +759,7 @@ impl HttpSlackClient {
     }
 
     /// [`crate::chat::ChatClient::fetch_recent`], without the provider label: the newest `limit`
-    /// messages of `channel`, thread replies included. `slack-reply-live`.
+    /// messages of `channel`, thread replies included. `#307 slack-reply-live`.
     ///
     /// The conversation's newest `limit` messages from history, as before, and the replies Flat
     /// holds ([`Self::flat_replies`]) for the threads rooted on them whose latest reply falls inside

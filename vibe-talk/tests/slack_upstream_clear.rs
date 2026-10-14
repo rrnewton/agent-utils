@@ -400,11 +400,11 @@ async fn a_dry_run_through_the_loop_writes_nothing_at_slack() {
     assert_eq!(last.previous.as_deref(), Some(instant(10, 0).as_str()));
 }
 
-/// `slack-reply-live`. A Slack read of a channel's newest messages now carries thread replies, but
-/// a clear goes only through a message of the conversation's own, as the live stream offers them:
-/// seeding a channel set to clear pushes the newest of those, never a thread reply newer than all
-/// of them, and reads no thread to find it. Here the newest message roots a thread whose reply is
-/// newer, so a read of the newest message with its thread's replies would answer the reply.
+/// `#307 slack-reply-live`. A Slack read of a channel's newest messages now carries thread replies,
+/// but a clear goes only through a message of the conversation's own, as the live stream offers
+/// them: seeding a channel set to clear pushes the newest of those, never a thread reply newer than
+/// all of them, and reads no thread to find it. Here the newest message roots a thread whose reply
+/// is newer, so a read of the newest message with its thread's replies would answer the reply.
 #[tokio::test]
 async fn the_seed_pushes_the_conversations_own_newest_message_never_a_thread_reply() {
     let mut state = FakeState::default();

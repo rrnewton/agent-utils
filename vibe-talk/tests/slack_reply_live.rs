@@ -1,5 +1,5 @@
-//! `slack-reply-live`: a reply posted in a Slack thread reaches the live stream, and the recent
-//! window the voice tools read, within one poll.
+//! `#307 slack-reply-live`: a reply posted in a Slack thread reaches the live stream, and the
+//! recent window the voice tools read, within one poll.
 //!
 //! `conversations.history` lists no thread reply, so a poller that only walks it forward never
 //! delivered one. Each poll now reads the newest page of history once, which also answers the

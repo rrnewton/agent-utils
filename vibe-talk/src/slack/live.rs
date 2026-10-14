@@ -1,5 +1,5 @@
 //! The live poller's read of a Slack conversation: its own new messages, and the thread replies
-//! posted since its previous read. `slack-reply-live`.
+//! posted since its previous read. `#307 slack-reply-live`.
 //!
 //! `conversations.history` lists a conversation's own timeline and never a thread reply, so a
 //! poller that only walks it forward delivers no reply at all. Each read here therefore starts from
@@ -137,7 +137,7 @@ struct Moved {
     count: u64,
 }
 
-/// What the poller holds for one conversation. `slack-reply-live`.
+/// What the poller holds for one conversation. `#307 slack-reply-live`.
 #[derive(Clone, Debug, Default)]
 pub(super) struct LiveThreads {
     /// The newest instant the seeding read saw, in microseconds: a reply after it is news in a

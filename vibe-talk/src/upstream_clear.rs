@@ -120,7 +120,7 @@ fn position_of(id: &MessageId, timestamp: &str) -> Option<(i64, u64)> {
 
 /// The newest message of `channel` that a push may go through, read for the seed of a channel
 /// set to clear ([`Clearer::seed`]) and for "Mark read now": the newest message the live stream
-/// would offer. `slack-reply-live`.
+/// would offer. `#307 slack-reply-live`.
 ///
 /// For a channel whose provider reads its thread replies apart from its own messages
 /// ([`ChatClient::polls_thread_replies`], Slack), that is the newest of its own messages
