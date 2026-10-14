@@ -450,10 +450,13 @@ struct Expire {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
+    /// Coverage raised to each channel's cutoff, in one step, before any row below it goes: a
+    /// claim is weakened before its rows are deleted, never after, so no read between two steps
+    /// finds a claim over rows already gone. No claim reaches below the cutoff again: a write
+    /// stamps none below its own cutoff, which is never older than the plan's.
+    Floors,
     /// Rows older than their channel's cutoff, oldest first, after this (created, row id).
     Age { after: (i64, i64) },
-    /// Coverage raised to each channel's cutoff.
-    Floors,
     /// Rows nothing revalidated within a week, by row id after this; and, in each step's own
     /// transaction, every claim and head not revalidated within it either.
     Revalidate { after: i64 },
@@ -2391,9 +2394,7 @@ impl Writer<'_> {
             until,
             total,
             deleted: 0,
-            phase: Phase::Age {
-                after: (i64::MIN, i64::MIN),
-            },
+            phase: Phase::Floors,
         })
     }
 
@@ -2428,20 +2429,32 @@ impl Writer<'_> {
                     picked
                 };
                 if picked.is_empty() {
-                    plan.phase = Phase::Floors;
+                    plan.phase = Phase::Revalidate { after: 0 };
                     return Ok(false);
                 }
                 let last = picked
                     .last()
                     .map_or(after, |&(row_id, _, created)| (created, row_id));
                 // An erased channel has no cutoff here: its rows go by the erase.
+                let mut floors: HashMap<i64, i64> = HashMap::new();
                 let due: Vec<(i64, (i64, i64))> = picked
                     .into_iter()
                     .filter(|&(_, chan, created)| {
-                        created < plan.cutoffs.get(&chan).copied().unwrap_or(i64::MIN)
+                        let cutoff = plan.cutoffs.get(&chan).copied().unwrap_or(i64::MIN);
+                        let due = created < cutoff;
+                        if due {
+                            floors.insert(chan, cutoff);
+                        }
+                        due
                     })
                     .map(|(row_id, _, created)| (row_id, (created, row_id)))
                     .collect();
+                // The Floors step trimmed every claim to its cutoff already. Trimmed again here,
+                // in the transaction that deletes the rows, so that not even a claim stamped since
+                // under a clock that stepped back outlives them.
+                for (chan, cutoff) in floors {
+                    self.raise_floor(chan, cutoff)?;
+                }
                 let cursor = if due.is_empty() {
                     last
                 } else {
@@ -2462,7 +2475,9 @@ impl Writer<'_> {
                 for (chan, cutoff) in &plan.cutoffs {
                     self.raise_floor(*chan, *cutoff)?;
                 }
-                plan.phase = Phase::Revalidate { after: 0 };
+                plan.phase = Phase::Age {
+                    after: (i64::MIN, i64::MIN),
+                };
                 Ok(false)
             }
             Phase::Revalidate { after } => {

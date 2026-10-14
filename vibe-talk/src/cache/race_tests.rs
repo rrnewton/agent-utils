@@ -557,3 +557,93 @@ fn a_file_erase_discards_the_control_operations_queued_before_it() {
     assert_eq!(after.expired_rows, before.expired_rows);
     drop(dir);
 }
+
+/// The hourly pass, single-stepped: the writer is held still between each of its steps while a
+/// page reaching back past the age limit is decided on. The pass weakens the claims before it
+/// deletes the rows under them, so no step leaves a claim over rows already gone, and no page of
+/// them is served with rows missing. The age limit lowered to a day puts four rows past it.
+#[test]
+fn the_age_pass_never_leaves_a_claim_over_rows_it_has_deleted_between_its_steps() {
+    let fx = Fixture::with_limits(
+        "cache-race-age-steps",
+        Limits {
+            max_days: 1,
+            ..Limits::default()
+        },
+    );
+    let step_ms = super::tests::STEP;
+    let first = T0 + 8 * step_ms + 1_000;
+    fx.clock.set(first);
+    fx.list(
+        (1..=8).map(m).collect(),
+        first,
+        Some(newest_proof(ListStart::At(T0 + step_ms))),
+    );
+    // A day and four steps on: m1 to m4 are past the age limit.
+    let now = T0 + 86_400_000 + 4 * step_ms + 1;
+    fx.clock.set(now);
+    let pause = |cache: &MessageCache| {
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        cache
+            .control(Op::Pause {
+                paused: paused_tx,
+                resume: resume_rx,
+            })
+            .expect("queued");
+        (paused_rx, resume_tx)
+    };
+    let (paused, mut resume) = pause(&fx.cache);
+    paused.recv_timeout(SECONDS).expect("paused");
+    fx.cache.maintain(Maintenance::Hourly);
+    let ask = shadow::Ask::Page {
+        since_ms: T0 + step_ms,
+        until_ms: Some(T0 + 4 * step_ms + 1),
+        limit: 20,
+    };
+    let facts = shadow::Facts {
+        asked_ms: now + 1,
+        live_fed: false,
+        fed_since_ms: None,
+        dropped_ms: None,
+        barrier: true,
+        feed: shadow::Feed::AdditionsOnly,
+    };
+    let decide = || {
+        let query = shadow::query(&ask, observe::Shape::DiscordNative, false).expect("a query");
+        let view = fx
+            .cache
+            .shadow_view(&fx.chan, &query)
+            .served()
+            .expect("served");
+        (shadow::decide(&ask, &view, &facts), view.rows.len())
+    };
+    let mut seen = Vec::new();
+    for step in 0..80 {
+        let (next_paused, next_resume) = pause(&fx.cache);
+        resume.send(()).expect("resume");
+        next_paused.recv_timeout(SECONDS).expect("paused again");
+        resume = next_resume;
+        let (decision, rows) = decide();
+        seen.push((step, decision, rows));
+        assert!(
+            decision != shadow::Decision::Serve || rows == 4,
+            "after step {step}: a page of m1 to m4 served with {rows} rows; claims {:?}; \
+             history {seen:?}",
+            fx.cache.coverage(&fx.chan, &Scope::Main)
+        );
+    }
+    drop(resume);
+    fx.settle();
+    assert_eq!(
+        held(&fx, "m4"),
+        None,
+        "the pass took the rows past the age limit"
+    );
+    let (decision, rows) = decide();
+    assert_ne!(
+        decision,
+        shadow::Decision::Serve,
+        "the page served with {rows} rows once the pass was over: {seen:?}"
+    );
+}
