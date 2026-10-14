@@ -1,12 +1,13 @@
 ---
 title: 'voice-post-prefix: a configurable tag on every message the voice agent posts'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-14T16:42:44.612016485+00:00
-updated_at: 2026-10-14T16:42:44.612016485+00:00
+updated_at: 2026-10-14T18:47:05.459559053+00:00
+closed_at: 2026-10-14T18:47:05.459558883+00:00
 ---
 
 # Description
