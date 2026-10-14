@@ -3096,6 +3096,17 @@ an added one, in Settings, deletes that channel's cached summaries and thread se
 from the store and from the running server's memory; its thread names are kept, so the channel
 comes back under the names you knew, and its sentences are asked for again.
 
+**A record of a send keeps a little of what it answered.** Each message the voice agent posted is
+kept in its conversation as a `sent` row (`#270 voice-transcript-markers`), and the row's detail
+names who wrote the message it replied to, that message's first few words (at most 80 characters)
+and the name of the thread it went to: text written by someone else, kept for as long as the
+conversation is, and served to a page that asks for records (`records=1`). Forgetting that
+conversation, forgetting them all, and the purge remove it with the rest of the conversation;
+taking the channel off the list does not, because the row is part of your conversation, not of
+the channel's cache. The server also holds the last 32 sends, with their words, in memory for 15
+minutes so the page can draw and file them; forgetting the conversations and the purge empty that
+too.
+
 Two tables are deliberately outside all of it: the "dealt with" marks, which an age bound would
 put back into the to-do list purely because time passed, and the **channel aliases**, which an age
 bound would rename back months later with nothing on screen saying why. Both are bounded by
@@ -3311,16 +3322,30 @@ the server stopped, newest first; each step's note below says how.
 what a transcript row records beyond words. It also brought two kinds of row: `sent`, a message the
 voice agent posted, and `marker`, which records a conversation's start or a draft that was not
 sent. A page that does not ask for records never sees either. To take a file back to step 16,
-run this with the server stopped (`DROP COLUMN` needs `sqlite3` 3.35 or later):
+stop the server and run this, with the path to your file:
 
-```sql
+```sh
+sqlite3 -bail /path/to/vibe-talk.sqlite3 <<'SQL'
+.bail on
 BEGIN IMMEDIATE;
+ALTER TABLE turns DROP COLUMN detail;
 DELETE FROM turns WHERE speaker IN ('sent', 'marker');
 DELETE FROM conversations WHERE id NOT IN (SELECT DISTINCT conversation_id FROM turns);
-ALTER TABLE turns DROP COLUMN detail;
 PRAGMA user_version = 16;
 COMMIT;
+SQL
 ```
+
+**It needs `sqlite3` 3.37 or later** (`sqlite3 --version`): every table in the file is `STRICT`,
+which an older tool cannot read at all, and `DROP COLUMN` itself needs 3.35. The script is written
+so that an older one changes nothing. Without `-bail` and `.bail on`, the command-line tool reports
+each statement it cannot run and carries on with the next, so an older `sqlite3` still stamped
+version 16 and committed, with `turns.detail` still in place: a file the old build opens, but one
+this build then refuses to open, because the column its upgrade adds is already there. With both,
+the tool stops at the first refusal and the open transaction is rolled back; and the `DROP COLUMN`
+comes first, so that refusal comes before any change. It exits non-zero either way, so a script
+that runs it can tell. (Checked on `sqlite3` 3.34.1: it stops at the `DROP COLUMN` and the file is
+byte-for-byte unchanged.)
 
 No conversation's preview needs repair, because a record row never sets one. A spoken yes that
 was tagged as the answer to a send stays an ordinary `you` turn.
