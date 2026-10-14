@@ -1,7 +1,7 @@
 {
   "schema": "agentctl-plugin-manifest/v1alpha1",
   "name": "slack",
-  "capability": "slack.events.cli",
+  "capability": "chat-subscription.slack",
   "executable": "agentctl-slack-plugin",
   "protocol": {
     "name": "agentctl-chat-subscription",

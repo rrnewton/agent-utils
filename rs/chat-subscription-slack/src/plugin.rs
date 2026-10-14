@@ -604,8 +604,12 @@ impl SlackDriver {
         {
             return Err("non-message subtype");
         }
-        if message.bot_id.is_some() || message.app_id.is_some() {
-            return Err("bot or app author");
+        // The event stream's slack_message extension fills app_id with the
+        // app the delivery came through, not the author; only bot_id marks a
+        // bot-authored message (live finding 2026-10-14: the owner's own
+        // message arrived with app_id set and was dropped).
+        if message.bot_id.is_some() {
+            return Err("bot author");
         }
         let Some(user) = message
             .user_id

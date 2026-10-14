@@ -1698,7 +1698,7 @@ request/reply contract as any other provider: durable cursor, reply IDs,
 per-thread replies, the 🤖 admission ACK and the ✅ delivery reaction.
 
 * `agentctl-slack-plugin` is the subscription plugin (manifest name `slack`,
-  capability `slack.events.cli`). It runs the installed Slack
+  capability `chat-subscription.slack`). It runs the installed Slack
   command-line client's `slack.conversation tail` for the configured channel and
   turns each `message.created` event into one batch.
 * `agentctl-slack-outbound` is the `outbound_command`. It posts replies with

@@ -3,7 +3,7 @@
 This crate holds two executables for an `agentctl chat` bridge:
 
 * `agentctl-slack-plugin`, the chat-subscription plugin `slack`
-  (capability `slack.events.cli`). It speaks
+  (capability `chat-subscription.slack`). It speaks
   `agentctl-chat-subscription` v1 on stdin/stdout and turns `message.created`
   events from one Slack channel into ordered, durably cursored requests.
 * `agentctl-slack-outbound`, the bridge's one-shot `outbound_command`. It posts
