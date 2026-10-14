@@ -2217,8 +2217,72 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       node.namespaceURI = namespace;
       return node;
     },
+    // `#296 copy-highlighted-message`. Where the old way of copying puts its textarea out of sight.
+    body: new FakeElement("", "body"),
+    /**
+     * `document.execCommand("copy")`, as Chromium runs it with a user's key behind it: the browser's
+     * copy command (`page.browserCopy`), and true. False, copying nothing and firing nothing, where a
+     * test says the browser refuses it (`page.execCopyRefuses`). No other command is modelled.
+     */
+    execCommand: (name) => {
+      if (String(name).toLowerCase() !== "copy") throw new Error(`execCommand("${name}") is not modelled`);
+      page.execCopies += 1;
+      if (page.execCopyRefuses) return false;
+      page.browserCopy();
+      return true;
+    },
   };
   page.document = document;
+  /**
+   * The browser's copy command, run by Ctrl+C (Cmd+C on a Mac, through its Edit menu) and by
+   * `execCommand("copy")`. `#296 copy-highlighted-message`. As Chromium 149 does, measured: `beforecopy`
+   * and then `copy` at the document, synchronously, whatever is selected — with nothing selected too —
+   * each with a `clipboardData` the page may write. Where the page refuses the `copy`, what it wrote is
+   * the clipboard (`page.clipboard`, and the rich flavour in `page.clipboardHtml`); where it does not,
+   * the browser copies what is selected: the selected text of a focused textarea, else the page's own
+   * selection, else nothing. A test can stand in a browser that fires no events for a copy with
+   * nothing selected (`page.copyFiresNothing`), whose copy then only copies what is selected. Returns
+   * the `copy` event, or null where none fired.
+   */
+  page.browserCopy = () => {
+    const event = (data) => {
+      const fired = {
+        defaultPrevented: false,
+        clipboardData: { setData: (type, value) => data.set(type, String(value)), getData: (type) => data.get(type) || "" },
+      };
+      fired.preventDefault = () => {
+        fired.defaultPrevented = true;
+      };
+      return fired;
+    };
+    const field = FakeElement.focused;
+    const fieldText = field && String(field.tagName).toLowerCase() === "textarea" && field.selectedTimes
+      ? String(field.value) : "";
+    const selected = fieldText || page.selection.text;
+    let copy = null;
+    if (!page.copyFiresNothing || selected !== "") {
+      const before = event(new Map());
+      for (const fn of documentListeners.get("beforecopy") || []) fn(before);
+      const data = new Map();
+      copy = event(data);
+      for (const fn of documentListeners.get("copy") || []) fn(copy);
+      copy.beforeRefused = before.defaultPrevented;
+      copy.written = data;
+      page.copyEvents.push(copy);
+      if (copy.defaultPrevented) {
+        page.clipboard = data.get("text/plain");
+        page.clipboardHtml = data.get("text/html");
+        return copy;
+      }
+    }
+    if (selected !== "") {
+      page.clipboard = selected;
+      page.clipboardHtml = undefined;
+    }
+    return copy;
+  };
+  page.copyEvents = [];
+  page.execCopies = 0;
   /**
    * Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. A mouse's
    * `pointermove` or `pointerover` puts the pointer on its target, which is what `:hover` answers from
@@ -2302,6 +2366,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       writeText: async (text) => {
         if (page.clipboardRefuses) throw new Error("NotAllowedError");
         page.clipboard = text;
+        // Plain text only: whatever rich flavour a copy left there before is gone.
+        page.clipboardHtml = undefined;
+        page.clipboardWrites = (page.clipboardWrites || 0) + 1;
       },
     },
     mediaDevices: {
@@ -13956,8 +14023,22 @@ test("Copy text in the ⋯ menu copies the whole row's text, and says so", async
   assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after copying");
   assert.equal(page.el("status").textContent, "Copied the message text.");
 
-  // A refusal is said, never mistaken for a copy.
+  // The Clipboard API refusing, the old way through a hidden textarea copies the same text, and gives
+  // the focus back to what had it. `#296 copy-highlighted-message`.
   page.clipboardRefuses = true;
+  page.clipboard = undefined;
+  await rowMoreButton(rows[0]).click();
+  await copy.click();
+  await page.settle();
+  assert.match(String(page.clipboard), /^first half of a \*\*long\*\* answer[\s\S]*a_b_c\.txt$/,
+    "with the Clipboard API refusing, the textarea did not copy the text");
+  assert.equal(page.el("status").textContent, "Copied the message text.");
+  const held = page.document.activeElement;
+  assert.notEqual(String(held && held.tagName), "textarea", "the hidden textarea kept the focus");
+  assert.equal(page.document.body.children.length, 0, "the hidden textarea was left in the page");
+
+  // Both refusing, it is said, never mistaken for a copy.
+  page.execCopyRefuses = true;
   page.clipboard = undefined;
   await rowMoreButton(rows[0]).click();
   await copy.click();
@@ -19563,6 +19644,21 @@ async function press(page, target, key, fields = {}) {
   return event;
 }
 
+/**
+ * Ctrl+C (with `fields`, Cmd+C) and the focus on `target`, as a browser answers the chord: the keydown;
+ * then, where the page left the key's default alone and `menu` says the browser copies with this chord
+ * (Ctrl+C on Linux and Windows, Cmd+C through a Mac's Edit menu), its copy command (`page.browserCopy`);
+ * then the next task, where the page's own way for a copy no event carried runs. `#296
+ * copy-highlighted-message`. Returns the keydown, the `copy` event on it as `copy` (null where none fired).
+ */
+async function pressCopy(page, target, fields = { ctrlKey: true }, menu = true) {
+  const event = await press(page, target, "c", fields);
+  event.copy = event.defaulted && menu ? page.browserCopy() : null;
+  page.expireTimers(0);
+  await page.settle();
+  return event;
+}
+
 /** A page on a channel taller than the screen, at its newest message. */
 async function keyboardPage(platform = "Linux x86_64") {
   const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
@@ -20786,18 +20882,360 @@ test("r REPLIES with the box ready; p pins; . opens the ⋯ menu on its first it
   assert.match(sheet().text(), /id 2/, "the details do not name the message");
   await press(page, channelRow(page, "2"), "Escape");
   assert.equal(sheet(), undefined, "Esc did not close the details");
-  // Ctrl+C with no text selected: the text of the message.
-  event = await press(page, channelRow(page, "2"), "c", { ctrlKey: true });
-  assert.equal(event.defaulted, false, "Ctrl+C on the selected message was left to the browser, which copies nothing");
+  // Ctrl+C with no text selected: the text of the message, by the copy the browser fires for the key.
+  // `#296 copy-highlighted-message`, whose own tests follow.
+  event = await pressCopy(page, channelRow(page, "2"));
+  assert.equal(event.defaulted, true, "Ctrl+C on the selected message was taken from the browser, whose copy carries it");
   assert.match(String(page.clipboard), /^message 2: /, "Ctrl+C did not copy the text of the selected message");
   // In a field, Ctrl+C is the field's.
-  event = await press(page, page.el("channel-compose-text"), "c", { ctrlKey: true });
+  page.clipboard = undefined;
+  event = await pressCopy(page, page.el("channel-compose-text"));
   assert.equal(event.defaulted, true, "Ctrl+C in a message box was taken from it");
+  assert.equal(page.clipboard, undefined, "Ctrl+C in an empty message box copied the message");
   // r: the reply screen, its box ready to type in.
   await press(page, channelRow(page, "2"), "r");
   assert.equal(page.screen(), "reply", "r did not open the reply screen");
   assert.equal(focused(page), page.el("reply-text"), `on Reply after r the focus is on ${focusName(page)}`);
   assert.ok(row, "the row went");
+});
+
+// --- copying the highlighted message (#296 copy-highlighted-message) ------------------------------
+//
+// The owner, 2026-10-14: a keystroke that copies the highlighted message, with no text selected first.
+// Cmd+C (Ctrl+C) stays the browser's wherever the browser has something to copy: text selected on the
+// page, or the focus in a text field. Otherwise, with a message highlighted, it copies all of that
+// message as written, a summarised or folded one too; a bare y does the same outside the fields; with
+// nothing highlighted both are the browser's. The page answers the `copy` event the browser's own copy
+// fires (`page.browserCopy`, modelled on Chromium 149, measured). tests/copy_message_browser.py presses
+// the real keys in Chromium and reads the clipboard back.
+
+/** What the clipboard holds before a test copies anything: a negative control's sentinel. */
+const CLIPBOARD_BEFORE = "what was on the clipboard";
+
+/**
+ * A channel at its top with message `downs + 1` highlighted by the keys (↓, then j `downs` times), the
+ * clipboard holding `CLIPBOARD_BEFORE`. `platform` is what `navigator.platform` says; `script` is
+ * web/voice.js, or a copy broken on purpose for a negative control.
+ */
+async function copyPage({ messages = tallChannel(30), platform = "Linux x86_64", script = SCRIPT, downs = 1 } = {}) {
+  const page = newPage(new Map(), script, (p) => p.setPlatform(platform));
+  await signIn(page);
+  await showDiscord(page, messages);
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < downs; i += 1) await pressHere(page, "j");
+  page.clipboard = CLIPBOARD_BEFORE;
+  return page;
+}
+
+/** That the browser's copy was left to the browser: the `copy` event not refused, nothing said. */
+function browserKeptCopy(page, event, where) {
+  assert.ok(!event.copy || !event.copy.defaultPrevented, `${where}: the page took the browser's copy`);
+  assert.ok(!event.copy || !event.copy.beforeRefused, `${where}: the page refused beforecopy`);
+  assert.notEqual(page.el("status").textContent, "Copied message.", `${where}: the page said it copied the message`);
+}
+
+test("`#296 copy-highlighted-message`: Ctrl+C with nothing selected copies all of the highlighted message, folded, by the browser's own copy", async () => {
+  const page = await copyPage();
+  const row = channelRow(page, "2");
+  assert.deepStrictEqual(litIds(page), ["2"], "the fixture did not highlight message 2");
+  // Folded: its opening lines, and how much the fold keeps back.
+  assert.equal(row.getAttribute("data-collapsed"), "true", "message 2 is not folded; this proves nothing about a fold");
+  assert.equal(elidedOf(row).hidden, false, "message 2 does not say what its fold hides");
+  const event = await pressCopy(page, row);
+  assert.equal(event.defaulted, true, "Ctrl+C was taken from the browser, whose copy event carries the message");
+  assert.ok(event.copy, "the fixture's browser fired no copy");
+  assert.equal(event.copy.defaultPrevented, true, "the page left the copy to the browser, which has nothing to copy");
+  assert.equal(event.copy.beforeRefused, true, "beforecopy was not refused, which Safari needs to enable Copy");
+  assert.equal(page.clipboard, longMessage("message 2"), "the copy is not all of the message as written");
+  assert.doesNotMatch(page.clipboard, /more words|more characters/, "the copy holds the fold's count");
+  assert.equal(page.clipboardHtml, `<div><p>${longMessage("message 2")}</p></div>`, "the rich flavour is not the body as drawn");
+  assert.equal(page.el("status").textContent, "Copied message.");
+  assert.equal(page.el("status-line").hidden, false, "the copy was not said");
+  assert.match(HTML_CODE, /<span id="status" role="status" aria-live="polite">/, "the pill is not read out politely");
+  assert.equal(page.execCopies + (page.clipboardWrites || 0), 0, "the copy event carried it, and a fallback copied again");
+  assert.deepStrictEqual(litIds(page), ["2"], "the copy moved the highlight");
+  assert.equal(focused(page), row, "the copy moved the focus");
+
+  // Cmd+C on a Mac, through its Edit menu: the same.
+  const mac = await copyPage({ platform: "MacIntel", downs: 3 });
+  const cmd = await pressCopy(mac, channelRow(mac, "4"), { metaKey: true });
+  assert.equal(cmd.defaulted, true);
+  assert.equal(mac.clipboard, longMessage("message 4"), "Cmd+C on a Mac did not copy the highlighted message");
+  assert.equal(mac.el("status").textContent, "Copied message.");
+
+  // The mouse's highlight, as the keys': the message the mouse moved over.
+  await mouseTo(page, channelRow(page, "5"), 100, 300);
+  assert.deepStrictEqual(litIds(page), ["5"], "the mouse did not highlight message 5");
+  await pressCopy(page, focused(page) || page.el("scroll-area"));
+  assert.equal(page.clipboard, longMessage("message 5"), "Ctrl+C did not copy the message the mouse highlighted");
+});
+
+test("`#296 copy-highlighted-message`: a summarised message copies the message, not the summary; a rendered one its source and its rendering", async () => {
+  const page = newPage();
+  await signIn(page);
+  const html = "<p><strong>bold</strong> &lt;b&gt;x&lt;/b&gt;</p>\n";
+  const rows = await showDiscord(page, [
+    message({ id: "7000000000000000020", content: longMessage("overnight") }),
+    message({ id: "7000000000000000021", author: "alice", author_id: "1000000000000000002", author_is_bot: false,
+      content: "**bold** <b>x</b>", content_html: html }),
+    message({ id: "7000000000000000022", content: "plain <b>not markup</b> & \"quoted\"\nsecond line\n\nnext paragraph" }),
+    // Two from one author, combined into one row: both, in order, as the ⋯ menu's Copy text gives them.
+    message({ id: "7000000000000000023", author: "alice", author_id: "1000000000000000002", author_is_bot: false,
+      content: "first half", timestamp: "2026-08-19T05:31:00.000Z" }),
+    message({ id: "7000000000000000024", author: "alice", author_id: "1000000000000000002", author_is_bot: false,
+      content: "second half", timestamp: "2026-08-19T05:31:01.000Z" }),
+  ]);
+  assert.equal(rows.length, 4, "the fixture's last two messages are not one combined row");
+  await turnSummariesOn(page);
+  assert.equal(rows[0].getAttribute("data-summarised"), "true", "the fixture never summarised");
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.deepStrictEqual(litIds(page), ["7000000000000000020"]);
+  page.clipboard = CLIPBOARD_BEFORE;
+  await pressCopy(page, focused(page));
+  assert.equal(page.clipboard, longMessage("overnight"), "a summarised row did not copy its message, whole");
+  assert.notEqual(page.clipboard, summaryText(rows[0]), "a summarised row copied its summary");
+  assert.doesNotMatch(page.clipboard, /a short line about/, "the copy holds the summary");
+  // A body the server rendered: its source as the text, its rendering as the rich flavour.
+  await pressHere(page, "j");
+  await pressCopy(page, focused(page));
+  assert.equal(page.clipboard, "**bold** <b>x</b>", "a rendered message did not copy its source");
+  assert.equal(page.clipboardHtml, `<div>${html}</div>`, "the rich flavour is not the server's rendering");
+  // A plain body: its text, and as plain paragraphs, every character markup means escaped.
+  await pressHere(page, "j");
+  await pressCopy(page, focused(page));
+  assert.equal(page.clipboard, "plain <b>not markup</b> & \"quoted\"\nsecond line\n\nnext paragraph");
+  assert.equal(page.clipboardHtml,
+    "<div><p>plain &#60;b&#62;not markup&#60;/b&#62; &#38; &#34;quoted&#34;<br>second line</p><p>next paragraph</p></div>",
+    "the rich flavour of a plain message is not its paragraphs, escaped");
+  await pressHere(page, "j");
+  await pressCopy(page, focused(page));
+  assert.equal(page.clipboard, "first half\nsecond half", "a combined row did not copy both of its messages, in order");
+  assert.equal(page.clipboardHtml, "<div><p>first half</p></div><div><p>second half</p></div>");
+});
+
+test("`#296 copy-highlighted-message`: NEGATIVE CONTROLS: text selected, a text field focused, nothing highlighted or a tap's silent selection leave the copy to the browser", async () => {
+  const page = await copyPage();
+  const row = channelRow(page, "2");
+  // Words of the message selected: the browser copies those.
+  await page.selectText(bodyOf(row), bodyOf(row), "a sentence about");
+  let event = await pressCopy(page, row);
+  browserKeptCopy(page, event, "with text selected");
+  assert.equal(page.clipboard, "a sentence about", "with text selected, the copy is not the selection");
+  event = await press(page, row, "y");
+  assert.equal(event.defaulted, true, "y with text selected was taken");
+  assert.equal(page.clipboard, "a sentence about", "y with text selected copied the message");
+  // ...and let go of, the same key copies the message: it was the selection that held it back.
+  await page.clearSelection();
+  await pressCopy(page, row);
+  assert.equal(page.clipboard, longMessage("message 2"), "with the selection gone, Ctrl+C did not copy the message");
+
+  // In the channel's box, its own text selected: the browser copies that, and y is typed.
+  page.clipboard = CLIPBOARD_BEFORE;
+  page.el("status").textContent = "";
+  const box = page.el("channel-compose-text");
+  await box.setValue("half a thought");
+  box.focus();
+  box.select();
+  event = await pressCopy(page, box);
+  browserKeptCopy(page, event, "in the message box");
+  assert.equal(page.clipboard, "half a thought", "in the box, the copy is not the box's selected text");
+  box.selectedTimes = 0;
+  page.clipboard = CLIPBOARD_BEFORE;
+  event = await pressCopy(page, box);
+  browserKeptCopy(page, event, "in the message box with nothing selected in it");
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE, "Ctrl+C in the box with nothing selected in it copied the message");
+  event = await press(page, box, "y");
+  assert.equal(event.defaulted, true, "y in the message box was taken from it");
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE, "y in the message box copied the message");
+  // The search field too.
+  await press(page, page.el("scroll-area"), "/");
+  event = await pressCopy(page, page.el("search-field"));
+  browserKeptCopy(page, event, "in the search field");
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE, "Ctrl+C in the search field copied the message");
+  await press(page, page.el("search-field"), "Escape");
+
+  // Settings, over the list: the message highlighted behind it is not on screen.
+  await press(page, page.el("scroll-area"), ",");
+  assert.equal(page.screen(), "settings");
+  event = await pressCopy(page, page.el("screen-settings"));
+  browserKeptCopy(page, event, "on Settings");
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE, "Ctrl+C on Settings copied the message behind it");
+  await press(page, page.el("screen-settings"), "Escape");
+
+  // Nothing highlighted: a page fresh from its load, then a tap's silent selection.
+  const fresh = newPage();
+  await signIn(fresh);
+  await showDiscord(fresh, tallChannel(30));
+  fresh.clipboard = CLIPBOARD_BEFORE;
+  assert.deepStrictEqual(litIds(fresh), [], "a message is highlighted on load; this proves nothing");
+  event = await pressCopy(fresh, fresh.el("scroll-area"));
+  browserKeptCopy(fresh, event, "with nothing highlighted");
+  assert.equal(fresh.clipboard, CLIPBOARD_BEFORE, "Ctrl+C with nothing highlighted copied something");
+  event = await press(fresh, fresh.el("scroll-area"), "y");
+  assert.equal(event.defaulted, true, "y with nothing highlighted was taken");
+  assert.equal(fresh.execCopies, 0, "y with nothing highlighted ran a copy");
+  fresh.el("scroll-area").scrollTop = 0;
+  await pressOn(fresh, channelRow(fresh, "3"), "touch");
+  assert.deepStrictEqual(litIds(fresh), [], "a tap lit the message it selected");
+  event = await pressCopy(fresh, fresh.el("scroll-area"));
+  browserKeptCopy(fresh, event, "after a tap's silent selection");
+  assert.equal(fresh.clipboard, CLIPBOARD_BEFORE, "Ctrl+C copied a message a tap selected without lighting it");
+});
+
+test("`#296 copy-highlighted-message`: where the browser fires no copy, the message goes by execCommand, the Clipboard API or a textarea, and a refusal is said", async () => {
+  // Cmd+C off a Mac: no menu copies with it, and the browser fires no copy for the key.
+  const page = await copyPage();
+  const row = channelRow(page, "2");
+  let event = await pressCopy(page, row, { metaKey: true }, false);
+  assert.equal(event.defaulted, true);
+  assert.equal(page.execCopies, 1, "the page did not ask for the copy itself once no copy event came");
+  assert.equal(page.clipboard, longMessage("message 2"), "execCommand's copy event did not carry the message");
+  assert.equal(page.clipboardHtml, `<div><p>${longMessage("message 2")}</p></div>`);
+  // A browser whose execCommand fires nothing with nothing selected: the Clipboard API, as plain text.
+  page.copyFiresNothing = true;
+  page.clipboard = CLIPBOARD_BEFORE;
+  page.el("status").textContent = "";
+  event = await pressCopy(page, row);
+  assert.equal(event.copy, null, "the fixture's browser fired a copy; this proves nothing about the fallback");
+  assert.equal(page.clipboard, longMessage("message 2"), "the Clipboard API did not carry the message");
+  assert.equal(page.clipboardHtml, undefined);
+  assert.equal(page.el("status").textContent, "Copied message.");
+  // That refusing as well: a hidden textarea, the focus given back to the message.
+  page.clipboardRefuses = true;
+  page.clipboard = CLIPBOARD_BEFORE;
+  event = await pressCopy(page, row);
+  assert.equal(page.clipboard, longMessage("message 2"), "the textarea did not carry the message");
+  assert.equal(focused(page), row, `the textarea kept the focus from the message: ${focusName(page)}`);
+  assert.equal(page.document.body.children.length, 0, "the textarea was left in the page");
+  assert.deepStrictEqual(litIds(page), ["2"]);
+  // Everything refusing: said, and the clipboard left as it was.
+  page.execCopyRefuses = true;
+  page.clipboard = CLIPBOARD_BEFORE;
+  event = await pressCopy(page, row);
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE);
+  assert.equal(page.el("status").textContent, "This browser would not copy to the clipboard.");
+});
+
+test("`#296 copy-highlighted-message`: y copies the highlighted message, is turned off with the single keys, and both keys are listed", async () => {
+  const page = await copyPage();
+  const row = channelRow(page, "2");
+  let event = await press(page, row, "y");
+  assert.equal(event.defaulted, false, "y on a highlighted message was left to the browser");
+  assert.equal(page.execCopies, 1, "y did not ask for the browser's copy");
+  assert.equal(page.clipboard, longMessage("message 2"), "y did not copy the highlighted message");
+  assert.equal(page.clipboardHtml, `<div><p>${longMessage("message 2")}</p></div>`);
+  assert.equal(page.el("status").textContent, "Copied message.");
+  // Y with Shift held is another key, and nothing.
+  page.clipboard = CLIPBOARD_BEFORE;
+  event = await press(page, row, "Y", { shiftKey: true });
+  assert.equal(event.defaulted, true, "Shift+Y was taken");
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE);
+  // The list of keys, in the words of each keyboard, and what a screen reader hears on the row's Copy text.
+  const listed = (one) => one.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
+  assert.ok(listed(page).includes("Ctrl+C or y"), `the list of keys does not name Ctrl+C or y: ${listed(page).join(" | ")}`);
+  const entry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Ctrl+C or y");
+  assert.match(entry.parentNode.text(), /highlighted message/);
+  assert.match(entry.parentNode.text(), /first message/, "the list does not say what a card copies");
+  const copyButton = row.descendants().find((node) => node.className === "row-copy-button");
+  assert.equal(copyButton.getAttribute("aria-keyshortcuts"), "Control+C Meta+C Y");
+  const mac = await copyPage({ platform: "MacIntel" });
+  assert.ok(listed(mac).includes("Cmd+C or y"), `on a Mac the list does not say Cmd+C: ${listed(mac).join(" | ")}`);
+  // Single keys off: y is nothing, and Ctrl+C still copies.
+  await page.el("single-keys").setChecked(false);
+  await page.settle();
+  page.clipboard = CLIPBOARD_BEFORE;
+  event = await press(page, row, "y");
+  assert.equal(event.defaulted, true, "y with the single keys off was taken");
+  assert.equal(page.clipboard, CLIPBOARD_BEFORE, "y copied with the single keys off");
+  assert.equal(channelRow(page, "2").descendants().find((node) => node.className === "row-copy-button")
+    .getAttribute("aria-keyshortcuts"), "Control+C Meta+C");
+  await pressCopy(page, row);
+  assert.equal(page.clipboard, longMessage("message 2"), "Ctrl+C stopped copying with the single keys off");
+});
+
+test("`#296 copy-highlighted-message`: in All, in a thread, on the thread list's cards and in two columns, the highlighted message is the one copied, a card's its first message", async () => {
+  const page = await threadPage();
+  assert.equal(page.el("thread-select").value, "flat", "the fixture does not open in All");
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "j");
+  assert.deepStrictEqual(litIds(page), ["201"]);
+  await pressCopy(page, focused(page));
+  assert.equal(page.clipboard, "first thread root", "Ctrl+C in All did not copy the highlighted message");
+  // Into its thread, onto the reply.
+  await press(page, focused(page), "ArrowRight");
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, false, "→ did not open the thread");
+  await press(page, page.el("scroll-area"), "End");
+  assert.deepStrictEqual(litIds(page), ["202"]);
+  await pressCopy(page, focused(page));
+  assert.equal(page.clipboard, "first thread answer", "Ctrl+C in a thread did not copy the highlighted reply");
+  await press(page, focused(page), "Escape");
+  await page.settle();
+
+  // The thread list: a card copies its thread's first message, whatever the card says of it.
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  await page.settle();
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+  await press(page, page.el("side-scroll"), "ArrowDown");
+  const card = focused(page);
+  assert.ok(card && card.hasAttribute("data-card"), `↓ in the thread list did not select a card: ${focusName(page)}`);
+  assert.deepStrictEqual(litRows(page), [`side-cards:${card.getAttribute("data-id")}`]);
+  const root = threadData().threads.find((thread) => thread.id === card.getAttribute("data-id")).root.content;
+  page.clipboard = CLIPBOARD_BEFORE;
+  await pressCopy(page, card);
+  assert.equal(page.clipboard, root, "Ctrl+C on a card did not copy its thread's first message");
+  page.clipboard = CLIPBOARD_BEFORE;
+  await press(page, card, "y");
+  assert.equal(page.clipboard, root, "y on a card did not copy its thread's first message");
+
+  // Two columns: a card on the right, then a message of the thread it opens.
+  const desk = await threadPage();
+  await twoColumns(desk);
+  await press(desk, desk.el("scroll-area"), "]");
+  await press(desk, focused(desk), "j");
+  const first = desk.el("side-cards").children[0];
+  assert.deepStrictEqual(litRows(desk), [`side-cards:${first.getAttribute("data-id")}`]);
+  await pressCopy(desk, first);
+  assert.equal(desk.clipboard, threadData().threads.find((thread) => thread.id === first.getAttribute("data-id")).root.content,
+    "Ctrl+C on a card on the right did not copy its first message");
+  await press(desk, first, "ArrowRight");
+  await desk.settle();
+  await press(desk, desk.el("side-scroll"), "End");
+  const reply = litRows(desk);
+  assert.equal(reply.length, 1);
+  assert.match(reply[0], /^side-log:/, `End on the right highlighted ${reply}`);
+  await pressCopy(desk, focused(desk));
+  assert.equal(desk.clipboard, "first thread answer", "Ctrl+C in the right column did not copy its highlighted message");
+});
+
+test("`#296 copy-highlighted-message`: NEGATIVE CONTROLS on the page itself: a page that ignores the highlight, or the selection, fails these checks", async () => {
+  /** Ctrl+C on message 2 highlighted, then with words of it selected: what each left on the clipboard. */
+  const observe = async (script) => {
+    const page = await copyPage({ script });
+    const row = channelRow(page, "2");
+    await pressCopy(page, row);
+    const plain = page.clipboard;
+    page.clipboard = CLIPBOARD_BEFORE;
+    await page.selectText(bodyOf(row), bodyOf(row), "a sentence about");
+    await pressCopy(page, row);
+    return [plain, page.clipboard];
+  };
+  const mutant = (from, to) => {
+    assert.ok(SCRIPT.includes(from), `web/voice.js no longer says ${JSON.stringify(from)}`);
+    return SCRIPT.replace(from, to);
+  };
+  assert.deepStrictEqual(await observe(SCRIPT), [longMessage("message 2"), "a sentence about"]);
+  // Highlight ignored: nothing of the message is copied, and the browser has nothing to copy.
+  assert.deepStrictEqual(await observe(mutant("const row = pane ? pane.lit : null;", "const row = null;")),
+    [CLIPBOARD_BEFORE, "a sentence about"], "a page that ignores the highlight passed");
+  // Selection ignored: the message is copied over the words the reader selected.
+  assert.deepStrictEqual(
+    await observe(mutant('const browserCopies = () => isTextField(document.activeElement) || selectedText() !== "";',
+      "const browserCopies = () => isTextField(document.activeElement);")),
+    [longMessage("message 2"), longMessage("message 2")], "a page that copies the message over a selection passed");
 });
 
 test("c FOCUSES THE CHANNEL'S BOX; ↑ in it while empty selects the newest message, and with text is the caret's", async () => {

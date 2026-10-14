@@ -5507,7 +5507,7 @@ from, so it cannot name a key the page does not answer.
 | `z` | Undo the last Done |
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
-| Ctrl+C (Cmd+C) | Copy the text of the selected message, when no text is selected |
+| Ctrl+C (Cmd+C) or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, or in a text box, Ctrl+C is the browser's copy as ever (see below) |
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
 | `h` | Show read, Collapse read, Hide read, in turn |
 | Shift+P, Shift+L | The Pinned and Links filters |
@@ -5549,6 +5549,35 @@ the agent's box starts nothing: a conversation starts only when you send. Ctrl+E
 in a message box it sends, as before. Held down from outside a box, it goes to the box and leaves the
 draft there unsent: its repeats arrive in the box, and a repeat never sends. The search keeps `/` and
 the magnifying glass, and the Help list says where Ctrl+S went.
+
+### Copying the highlighted message
+
+`#296 copy-highlighted-message`. The owner asked for a keystroke that copies the highlighted message
+without first selecting its text. **Ctrl+C (Cmd+C on a Mac) with nothing selected copies the message
+highlighted in the list**: the selection the keys or the mouse made in Main, All, a thread, the right
+column or the thread list. A thread card copies its thread's first message. A bare **`y`** does the same
+outside the text boxes, and is turned off with the other single-key shortcuts.
+
+- **What is copied** is the message as written: its raw text, every message of a combined row in order,
+  the same as the ⋯ menu's Copy text. A summarised row copies the message, not its summary, and a folded
+  row copies all of it, not the opening lines it shows. Messages carry no attachments of their own here,
+  and every link a message has is in its text, so its addresses are copied with it. Beside the plain
+  text goes a rich flavour, the body as the page renders it, for editors that paste formatting.
+- **Where the browser keeps its copy**: with any text selected on the page, Ctrl+C copies that text, as
+  it always has, and `y` does nothing, so it never copies the message in place of a selection you made;
+  with the focus in a text box (the message boxes, the search) it is the box's copy. With
+  no message highlighted, including after a tap on a touch screen, which selects without lighting
+  anything, both keys do nothing and Ctrl+C is the browser's.
+- **How it is said**: the status pill says "Copied message.", read out politely to a screen reader. It
+  floats over the list, so nothing moves under the reader.
+
+The page answers the `copy` event the browser's own copy fires (Chromium fires it for Ctrl+C with
+nothing selected, and a Mac's Edit menu for Cmd+C), and writes the clipboard from it, so no permission is
+asked for. Where no such event comes, as for `y`, it asks for one with `execCommand("copy")`, and
+failing that uses the Clipboard API or a hidden text box. Cmd+Shift+C (Ctrl+Shift+C) was set aside
+because Chrome keeps it for the DevTools element picker. `make -C vibe-talk copy-message-browser`
+presses the keys in a real Chromium at 1280x800, on Linux and in a tab emulating a Mac, and on a
+412x915 phone with a hardware keyboard, and reads the clipboard back after each press.
 
 ### The reading bookmark
 

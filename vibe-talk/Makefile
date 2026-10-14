@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser copy-message-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -229,6 +229,17 @@ two-column-browser:
 # SCREENSHOTS=dir to keep a PNG of each state.
 thread-card-focus-browser:
 	python3 tests/thread_card_focus_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#296 copy-highlighted-message` in a real Chromium, the keys pressed through CDP and the clipboard read
+# back with `clipboard-read` granted: at 1280x800, Ctrl+C with nothing highlighted copies nothing; on the
+# folded long question it copies all of it as written, with a text/html flavour, and moves nothing; in the
+# message box, and with words selected, the browser's copy as ever; y copies the message, and a thread
+# list card copies its first message; in a tab emulating a Mac, Cmd+C with the Edit menu's "copy" command
+# and without it; on a 412x915 phone with a hardware keyboard, a tap's silent selection copies nothing and
+# j's highlight does. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
+# keep a PNG of each state.
+copy-message-browser:
+	python3 tests/copy_message_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#280 scroll-stability` in a real Chromium at 1280x800 in two columns (mouse) and 412x915 in one (touch):
 # the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive

@@ -449,6 +449,29 @@ steps:
       resources: {browser: 1}
       est_duration_s: 5
 
+  # `#296 copy-highlighted-message` in the browser engine, the keys pressed through CDP and the clipboard
+  # read back with `clipboard-read` granted, a sentinel on it before every press: at 1280x800 with Ctrl,
+  # nothing highlighted copies nothing; Ctrl+C on the folded long question copies all of it as written,
+  # with a text/html flavour, says "Copied message." and moves nothing; in the message box it copies the
+  # box's selection, nothing with the caret alone, and y is typed; words of the question selected, those;
+  # y copies the message; a card of the thread list its first message; then, in a tab emulating a Mac,
+  # Cmd+C with the Edit menu's "copy" command and without it; and at 412x915 with a hardware keyboard, a
+  # tap's silent selection copies nothing while j's highlight copies by Ctrl+C and y. Measured on
+  # 2026-10-14: about 8s wall.
+  - group: check
+    job: copy-message-browser
+    desc: Ctrl+C, Cmd+C and y copy the highlighted message whole, and leave a selection, a text box and nothing highlighted to the browser, read back from the clipboard in current Chromium at 1280x800 and 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/copy_message_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
   # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
   # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message
