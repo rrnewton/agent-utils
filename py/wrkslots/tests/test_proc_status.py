@@ -27,8 +27,13 @@ def scripted_status(
 ) -> list[Path]:
     pending = iter(samples)
     calls: list[Path] = []
+    original_read = Path.read_bytes
 
     def read_bytes(path: Path) -> bytes:
+        if path == pid_dir / "stat":
+            # The /proc walks read stat to find zombie thread-group leaders;
+            # only status is scripted here.
+            return original_read(path)
         assert path == pid_dir / "status"
         calls.append(path)
         sample = next(pending)

@@ -14,6 +14,7 @@ walks holds only a link to the leader, exactly the view readdir gives.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -27,12 +28,15 @@ import pytest
 from wrkslots import cli
 
 
-# argv: slot, then what the surviving thread holds inside it: cwd, fd or both.
-# The main thread waits for one line on stdin and then calls pthread_exit.
+# argv: slot, then what the surviving thread holds inside it: cwd, fd or both,
+# then optionally "nodump".  The main thread waits for one line on stdin, makes
+# the process non-dumpable if asked (so this user may no longer read its
+# links), and then calls pthread_exit.
 _ZOMBIE_LEADER_CHILD = """
 import ctypes, os, sys, threading, time
 
 slot, hold = sys.argv[1], sys.argv[2]
+PR_SET_DUMPABLE = 4
 
 def survive():
     if hold in ("cwd", "both"):
@@ -45,6 +49,8 @@ def survive():
 
 threading.Thread(target=survive, daemon=True).start()
 sys.stdin.readline()
+if sys.argv[3:] == ["nodump"]:
+    ctypes.CDLL(None).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
 ctypes.CDLL(None).pthread_exit(None)
 """
 
@@ -102,9 +108,11 @@ def _slot(tmp_path: Path) -> Path:
 
 
 @contextmanager
-def _started(slot: Path, hold: str) -> Iterator[subprocess.Popen[str]]:
+def _started(
+    slot: Path, hold: str, *extra: str,
+) -> Iterator[subprocess.Popen[str]]:
     child = subprocess.Popen(
-        [sys.executable, "-I", "-c", _ZOMBIE_LEADER_CHILD, str(slot), hold],
+        [sys.executable, "-I", "-c", _ZOMBIE_LEADER_CHILD, str(slot), hold, *extra],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
@@ -131,11 +139,11 @@ def _ready(child: subprocess.Popen[str]) -> tuple[int, int]:
 
 
 @contextmanager
-def _zombie_leader(tmp_path: Path, hold: str) -> Iterator[_Child]:
+def _zombie_leader(tmp_path: Path, hold: str, *extra: str) -> Iterator[_Child]:
     """Yield a child whose leader is a zombie and whose thread holds ``hold``."""
 
     slot = _slot(tmp_path)
-    with _started(slot, hold) as child:
+    with _started(slot, hold, *extra) as child:
         thread, fd = _ready(child)
         leader_ticks = cli._process_start_ticks(Path("/proc") / str(child.pid))
         _exit_leader(child)
@@ -145,6 +153,12 @@ def _zombie_leader(tmp_path: Path, hold: str) -> Iterator[_Child]:
         proc_root.mkdir()
         (proc_root / str(child.pid)).symlink_to(Path("/proc") / str(child.pid))
         yield _Child(child.pid, thread, fd, slot, proc_root)
+
+
+def _use_of(child: _Child, hold: str) -> str:
+    """The refusal of a walk that found the surviving thread's ``hold``."""
+
+    return rf"^live process {child.thread} uses slot {re.escape(str(child.slot))}: {hold}[=/]"
 
 
 def test_the_premise_a_zombie_leader_shows_nothing_its_thread_holds(tmp_path: Path) -> None:
@@ -181,8 +195,10 @@ def test_the_zombie_leader_stands_for_its_running_thread(tmp_path: Path) -> None
         survivor = leader / "task" / str(child.thread)
         assert cli._zombie_leader_thread_dirs(leader) == (survivor,)
         assert cli._zombie_leader_has_live_threads(leader)
+        assert cli._walked_zombie_leader_threads(leader) == (survivor,)
         # Only a leader stands for its threads; a thread names its whole group.
         assert cli._zombie_leader_thread_dirs(Path("/proc") / str(child.thread)) == ()
+        assert cli._walked_zombie_leader_threads(survivor) == ()
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
@@ -297,6 +313,102 @@ def test_a_leader_that_exits_under_running_threads_discards_the_attempt(
     }
 
 
+@pytest.mark.parametrize("use_lsof", (True, False))
+@pytest.mark.parametrize("hold", ("cwd", "fd"))
+def test_the_slot_use_walk_reports_the_slot_the_thread_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_lsof: bool, hold: str,
+) -> None:
+    """lsof proves only direct absence among the processes it lists.
+
+    lsof +D, run for real over this child, reported nothing (exit 1, no
+    output; lsof 4.94, 2026-10-14), so the stub returns exactly that.  A full
+    host lsof scan takes seconds, which is why it is not repeated here.
+    """
+
+    if use_lsof and not any(
+        candidate.is_file() and os.access(candidate, os.X_OK)
+        for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
+    ):
+        pytest.skip("the lsof branch needs an lsof executable")
+    scans: list[Path] = []
+
+    def lsof_reports_nothing(
+        _executable: Path, slot_path: Path,
+    ) -> tuple[cli._LsofUseDiagnostic | None, bool, int]:
+        scans.append(slot_path)
+        return None, False, 1
+
+    monkeypatch.setattr(cli, "_lsof_slot_use", lsof_reports_nothing)
+    with _zombie_leader(tmp_path, hold) as child:
+        with pytest.raises(cli.Refusal, match=_use_of(child, hold)):
+            cli._assert_slot_unused(child.slot, use_lsof=use_lsof, proc_root=child.proc_root)
+    assert scans == ([child.slot] if use_lsof else [])
+
+
+def test_a_thread_this_user_may_not_read_is_no_more_evidence_than_to_lsof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another user's surviving thread cannot make every slot-use check refuse.
+
+    lsof run as this user reads no link of a process this user may not read,
+    and the walk after it holds the threads it never listed to the same rule:
+    such a link is no evidence, and the thread's mount table still is.  The
+    child here makes itself non-dumpable, which hides its links from its own
+    user exactly as another user's are hidden.
+    """
+
+    monkeypatch.setattr(cli, "_lsof_slot_use", lambda _executable, _slot: (None, False, 1))
+    mount_reads: list[Path] = []
+    real_uses = cli._MountTableVerdicts.uses
+
+    def recorded(self: cli._MountTableVerdicts, pid_dir: Path) -> list[str]:
+        mount_reads.append(pid_dir)
+        return real_uses(self, pid_dir)
+
+    monkeypatch.setattr(cli._MountTableVerdicts, "uses", recorded)
+    with _zombie_leader(tmp_path, "cwd", "nodump") as child:
+        survivor = child.proc_root / str(child.leader) / "task" / str(child.thread)
+        try:
+            os.readlink(survivor / "cwd")
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("this user may read a non-dumpable task's links")
+        if not any(
+            candidate.is_file() and os.access(candidate, os.X_OK)
+            for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
+        ):
+            pytest.skip("the lsof branch needs an lsof executable")
+        cli._assert_slot_unused(child.slot, proc_root=child.proc_root)
+    assert survivor in mount_reads
+
+
+@pytest.mark.parametrize("hold", ("cwd", "fd"))
+def test_the_agent_batch_scans_report_the_slot_the_thread_holds(
+    tmp_path: Path, hold: str,
+) -> None:
+    with _zombie_leader(tmp_path, hold) as child:
+        with pytest.raises(cli.Refusal, match=_use_of(child, hold)):
+            cli._agent_batch_fresh_use(
+                child.slot, None, capture_generation=False, proc_root=child.proc_root
+            )
+        fresh = cli._agent_batch_fresh_use(
+            child.slot, None, capture_generation=True, proc_root=child.proc_root
+        )
+        assert isinstance(fresh, cli._LiveUseObservation)
+        assert fresh.pid == child.thread
+        assert fresh.start_ticks == cli._process_start_ticks(Path("/proc") / str(child.thread))
+
+        fenced = cli._agent_batch_fenced_use(
+            child.slot, child.slot, None, capture_generation=True, proc_root=child.proc_root
+        )
+        if isinstance(fenced, cli._UndecidedFencedUse) and "filesystem" in fenced.reason:
+            pytest.skip(f"the fenced scan does not compare this filesystem: {fenced.reason}")
+        assert isinstance(fenced, cli._LiveUseObservation), fenced
+        assert fenced.pid == child.thread
+        assert re.match(_use_of(child, hold), str(fenced.refusal))
+
+
 def test_a_whole_process_zombie_and_a_live_leader_stand_for_nothing(tmp_path: Path) -> None:
     """The negative controls: no thread hides behind either."""
 
@@ -306,6 +418,7 @@ def test_a_whole_process_zombie_and_a_live_leader_stand_for_nothing(tmp_path: Pa
         pid_dir = Path("/proc") / str(exited.pid)
         assert cli._zombie_leader_thread_dirs(pid_dir) == ()
         assert not cli._zombie_leader_has_live_threads(pid_dir)
+        assert cli._walked_zombie_leader_threads(pid_dir) == ()
         observed = cli._AbsentProcessObservation(
             exited.pid, cli._process_start_ticks(pid_dir) or 0, "", "mnt:[0]"
         )
@@ -318,8 +431,8 @@ def test_a_whole_process_zombie_and_a_live_leader_stand_for_nothing(tmp_path: Pa
     finally:
         exited.wait(timeout=10)
 
-    # A running leader with a running thread answers for itself: it is no
-    # zombie, and its own entries show the slot.
+    # A running leader with a running thread answers for itself: the walks
+    # add nothing, and its own entries show the slot.
     (tmp_path / "live").mkdir()
     slot = _slot(tmp_path / "live")
     with _started(slot, "both") as child:
@@ -327,5 +440,5 @@ def test_a_whole_process_zombie_and_a_live_leader_stand_for_nothing(tmp_path: Pa
         pid_dir = Path("/proc") / str(child.pid)
         assert int(_status_field(child.pid, "Threads")) == 2
         assert thread != child.pid
-        assert not cli._process_is_zombie(pid_dir)
+        assert cli._walked_zombie_leader_threads(pid_dir) == ()
         assert os.readlink(pid_dir / "cwd") == str(slot)

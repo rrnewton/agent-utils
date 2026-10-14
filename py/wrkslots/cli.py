@@ -18887,7 +18887,13 @@ def _observe_slot_use_once(
     # Resolved once: it describes the record, not the process being inspected,
     # and asking per PID would read the owner's /proc entry thousands of times.
     owner_cgroup_is_evidence = _owner_cgroup_is_evidence(record)
-    for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
+    # Popped from the end, so the surviving threads of a zombie leader, pushed
+    # back on top, are observed next.  lsof never saw them (readdir hides
+    # them), so its absence proof does not cover them.
+    pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
+    surviving_threads: set[Path] = set()
+    while pending:
+        pid_dir = pending.pop()
         pid = int(pid_dir.name)
         if pid == current_pid or pid in invoking_ancestry:
             continue
@@ -18934,11 +18940,31 @@ def _observe_slot_use_once(
         ):
             continue
         try:
-            if direct_use_proven_absent:
+            threads = _walked_zombie_leader_threads(pid_dir)
+        except Refusal as exc:
+            if indeterminate_use is None:
+                indeterminate_use = exc
+            continue
+        surviving_threads.update(threads)
+        pending.extend(reversed(threads))
+        try:
+            if direct_use_proven_absent and pid_dir not in surviving_threads:
                 mount_namespace = _mount_namespace(pid_dir)
                 if mount_namespace is None:
                     uses = []
                 else:
+                    uses = mount_verdicts.uses(pid_dir)
+            elif direct_use_proven_absent:
+                # lsof never listed this thread, so read what it would have:
+                # a link this user may not read is no evidence, as it is not
+                # to lsof run as this user.  The mount table still is.
+                try:
+                    uses = _process_uses_slot(
+                        pid_dir, slot_path, mount_verdicts=mount_verdicts
+                    )
+                except Refusal as exc:
+                    if not isinstance(exc.__cause__, PermissionError):
+                        raise
                     uses = mount_verdicts.uses(pid_dir)
             else:
                 uses = _process_uses_slot(
@@ -35155,9 +35181,10 @@ def _agent_batch_fresh_use(
 
     For every process it reads the owner cgroup when that is evidence for the
     record, every mount table (as the ordinary check does after lsof), and the
-    cwd, root, exe, descriptor, and mapping paths it may read.  It stops at the
-    first use found; the caller may wait for that exact process generation
-    and then repeat the whole scan.
+    cwd, root, exe, descriptor, and mapping paths it may read, and those of
+    the surviving threads of a zombie thread-group leader, which readdir
+    hides.  It stops at the first use found; the caller may wait for that
+    exact process generation and then repeat the whole scan.
     """
 
     base = str(slot_path)
@@ -35180,7 +35207,11 @@ def _agent_batch_fresh_use(
         else None
     )
     slot_bytes = base.encode("utf-8", errors="surrogateescape")
-    for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
+    # Popped from the end, so the surviving threads of a zombie leader, pushed
+    # back on top, are observed next; the shared lsof scan never saw them.
+    pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
+    while pending:
+        pid_dir = pending.pop()
         pid = int(pid_dir.name)
         if pid == current_pid:
             continue
@@ -35193,6 +35224,7 @@ def _agent_batch_fresh_use(
             start_ticks = None if generation is None else generation.start_ticks
         if _process_uids(pid_dir) is None:
             continue
+        pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
         uses: list[str] = []
         if owner_cgroup is not None:
             try:
@@ -35498,7 +35530,8 @@ def _agent_batch_fenced_use(
     mount namespace, is found although no path names the slot.  A socket
     descriptor matches a socket bound below the slot's canonical or fenced
     path in this network namespace.  A mapping matches by path, or by inode
-    on the filesystem's device.
+    on the filesystem's device.  The surviving threads of a zombie
+    thread-group leader, which readdir hides, are compared in its place.
 
     Returns the first use found (with ``capture_generation``) or raises it,
     returns None when there is none, and returns _UndecidedFencedUse when the
@@ -35554,7 +35587,11 @@ def _agent_batch_fenced_use(
         and _owner_cgroup_is_evidence(record)
         else None
     )
-    for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
+    # Popped from the end, so the surviving threads of a zombie leader, pushed
+    # back on top, are observed next; the shared lsof scan never saw them.
+    pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
+    while pending:
+        pid_dir = pending.pop()
         if stop.is_set():
             raise _ScanCancelled
         pid = int(pid_dir.name)
@@ -35569,6 +35606,7 @@ def _agent_batch_fenced_use(
             start_ticks = None if generation is None else generation.start_ticks
         if _process_uids(pid_dir) is None:
             continue
+        pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
         if owner_cgroup is not None:
             try:
                 cgroup = _read_process_cgroup(pid_dir)
@@ -46860,6 +46898,33 @@ def _zombie_leader_has_live_threads(pid_dir: Path) -> bool:
         if not _process_is_zombie(thread_dir):
             return True
     return False
+
+
+def _walked_zombie_leader_threads(pid_dir: Path) -> tuple[Path, ...]:
+    """Return the threads a /proc walk must also observe for ``pid_dir``.
+
+    The walks that read every process's own entries call this once per
+    process, so it reads the one-line stat record, not status.  Only a leader
+    in State Z or X has any; its own entries then hold nothing, and its
+    surviving threads hold everything it held.  A process that vanished has
+    none.  Unreadable or malformed state refuses: it is not proof that no
+    thread hides behind the process.
+    """
+
+    try:
+        raw = (pid_dir / "stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return ()
+    except OSError as exc:
+        raise Refusal(
+            f"process state is indeterminate because {pid_dir / 'stat'} is unreadable: {exc}"
+        ) from exc
+    parsed = _parse_proc_stat(raw)
+    if parsed is None or str(parsed.pid) != pid_dir.name:
+        raise Refusal(f"process state is invalid for PID {pid_dir.name}")
+    if parsed.state not in {"Z", "X"}:
+        return ()
+    return _zombie_leader_thread_dirs(pid_dir)
 
 
 def _absent_validate_process_snapshot(
