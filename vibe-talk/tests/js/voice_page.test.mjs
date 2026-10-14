@@ -60423,3 +60423,91 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: the left column's
   assert.equal(label.textContent, "Draft to send", "once the reply was seen, the jump forgot the draft still below");
   assert.equal(page.el("jump-newest").getAttribute("aria-label"), "Jump to the draft waiting to be sent");
 });
+
+// `#269 approval-card-inline` x `#280 scroll-stability`. On the channel the card is the list's tentative
+// next message, and it moves the reader no more than a message arriving live does (`liveFollowers`):
+// a reader on the newest line follows it down, and no other rule's place is undone by it. Asking only
+// whether the reader was at the foot let go a message a filter change holds there, and undid a short
+// thread's landing, which ends within the slack of the foot on purpose.
+
+/** The card's follow asking only whether the reader is at the foot. */
+const cardFollowsFootOnly = () => brokenScript(
+  '  return currentView === "discord" ? liveFollowers().main : atBottom(leftEl("scroll-area"));',
+  '  return atBottom(leftEl("scroll-area"));'
+);
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving under a message a filter change holds at the newest line leaves it there, and held", async () => {
+  const run = async (script) => {
+    const { page, messages } = pinnedPlacePage(["12", "27", "40"], script);
+    await startTalking(page);
+    await page.settle();
+    await showDiscord(page, messages);
+    await showPinned(page);
+    // The newest message, pinned and chosen: once the filter goes it is at the newest line, held.
+    await clickRow(page, "40", "pinned-log");
+    await page.el("pinned-filter").click();
+    await page.settle();
+    return page;
+  };
+  const page = await run(SCRIPT);
+  const area = page.el("scroll-area");
+  assert.ok(atBottomOf(area), "the premise: the pin is at the newest line once the filter goes");
+  const y = yOf(page, "40");
+  page.propose(proposal());
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false, "the draft never reached the card");
+  assert.equal(page.el("post-confirm").parentNode, page.el("pane-discord"), "the card is not the channel's next message");
+  keptAt(page, "40", y, "the draft arriving");
+  assert.equal(page.el("jump-newest").hidden, false, "nothing says a draft waits below");
+  // ...and still held: a read bringing a message below moves it no more than it would have without the card.
+  page.messages = [...page.messages, message({ id: "41", content: longMessage("arrived") })];
+  await reReadChannel(page);
+  keptAt(page, "40", y, "a read after the draft arrived");
+
+  // THE CONTROL: the card followed by the foot alone lets the held message go, and the read moves it.
+  const control = await run(cardFollowsFootOnly());
+  const before = yOf(control, "40");
+  control.propose(proposal());
+  await control.settle();
+  control.messages = [...control.messages, message({ id: "41", content: longMessage("arrived") })];
+  await reReadChannel(control);
+  assert.ok(Math.abs(yOf(control, "40") - before) > 1,
+    "the control kept the message too, so this test cannot see the card let it go");
+});
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving under a short thread's landing leaves its first unread at the head, where the entry put it", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: [["agent", false]] });
+    await startTalking(page);
+    await page.settle();
+    await showDiscord(page, messages);
+    await chooseReadMode(page, "Hide read");
+    // The list as tall as the dock leaves it at a desk once the thread's name wraps it: the landing's
+    // foot within the slack, as "...and the dock and the chips changing as the thread opens" has it.
+    const area = page.el("scroll-area");
+    area.clientHeight = 428;
+    await pickThread(page, `thread:${RUN_THREAD}`);
+    const answer = () => rowWithId(page, runId(500));
+    const landed = atTheHead(page, answer());
+    const short = area.scrollHeight - area.scrollTop - area.clientHeight;
+    page.propose(proposal());
+    await page.settle();
+    return {
+      landed,
+      nearTheEnd: short >= 0 && short <= BOTTOM_SLACK_PX,
+      shown: !page.el("post-confirm").hidden && page.el("post-confirm").parentNode === page.el("pane-discord"),
+      kept: atTheHead(page, answer()),
+      offered: !page.el("jump-newest").hidden,
+    };
+  };
+  const real = await run(SCRIPT);
+  assert.equal(real.landed, true, "the entry did not land the first unread at the head");
+  assert.equal(real.nearTheEnd, true, "the premise: the landing is within the slack of the list's foot");
+  assert.equal(real.shown, true, "the draft is not the thread's next message");
+  assert.equal(real.kept, true, "the draft arriving took the landed message up under the floating line");
+  assert.equal(real.offered, true, "nothing says a draft waits below");
+  // THE CONTROL: followed by the foot alone, the card undoes the landing.
+  const control = await run(cardFollowsFootOnly());
+  assert.deepStrictEqual(control, { ...real, kept: false, offered: control.offered });
+});

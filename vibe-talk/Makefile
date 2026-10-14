@@ -177,8 +177,9 @@ send-order-browser:
 # by a reload (`#270 voice-transcript-markers`); and at 1280x800 in two columns, wholly above a reply
 # open at the foot of the left column (`#277 reply-in-column`), its Send outlined beside a reply in
 # either column; and on the three phones, the line above a hosted call sent a 412-word recap saying
-# so (`#270`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
-# placement.
+# so (`#270`), and the card coming and going on the channel leaving a reader up the list on their row
+# and one at the foot there (`#280 scroll-stability`). Pass WEB_ROOT=dir for another copy of the page,
+# SCREENSHOTS=dir to keep a PNG of each placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
