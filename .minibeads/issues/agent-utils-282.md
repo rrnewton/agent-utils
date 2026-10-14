@@ -1,12 +1,13 @@
 ---
 title: 'slack-flat-skip: Slack Flat reads replies only for threads that moved since the last read'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-13T19:57:59.379982269+00:00
-updated_at: 2026-10-13T19:57:59.379982269+00:00
+updated_at: 2026-10-14T00:14:51.187387561+00:00
+closed_at: 2026-10-14T00:14:51.187387290+00:00
 ---
 
 # Description
