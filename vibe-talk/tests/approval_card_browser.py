@@ -1181,7 +1181,7 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
         # The right column: a reply open in the thread there outlines the card's Send as well.
         propose(page, api, 16, SHORT_DRAFT)
         page.wait_for_timeout(HOLD_MS + 200)
-        page.click(f"#side-cards > li[data-id='{THREAD_ID}'] .side-card")
+        page.click(f"#side-cards > li[data-id='{THREAD_ID}'] .side-card-open")
         page.wait_for_function("() => document.querySelectorAll('#side-log > li[data-id]').length === 3",
                                timeout=10_000)
         press_reply(page, "side-log", str(channel_message(14, "codex", "")["id"]), "side-reply", where)
