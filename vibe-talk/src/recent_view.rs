@@ -117,6 +117,23 @@ pub async fn read(
     Ok(read)
 }
 
+/// Read the newest messages of several channels in one call, through their providers.
+/// remote-ops-audit W13 `#287 bulk-reads`.
+///
+/// A recent read as far as the shadow's quiet spell goes: while it runs, no check starts. It
+/// queues nothing to be checked: the shadow compares `/messages` with Flat, and a read of several
+/// channels at once is neither. A channel it does not answer is read again through [`read`] by its
+/// caller ([`crate::recent::refresh_all`]), and that read is checked like any other.
+pub async fn read_many(
+    state: &AppState,
+    asks: &[(ChannelId, crate::chat::RecentAsk)],
+) -> crate::chat::RecentAnswers {
+    let reading = state.recent_view_shadow.reading();
+    let answers = state.chat.fetch_recent_many(asks).await;
+    drop(reading);
+    answers
+}
+
 /// Whether recent reads of `channel` are `/messages` reads its provider wants checked against Flat.
 #[must_use]
 pub fn shadowed(state: &AppState, channel: &ChannelId) -> bool {

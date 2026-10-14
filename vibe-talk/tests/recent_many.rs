@@ -183,6 +183,20 @@ impl Labels {
     }
 }
 
+/// The TOML of a server with five channels, and `more` after it.
+fn five_channel_toml(more: &str) -> String {
+    let extra: String = EXTRA
+        .iter()
+        .map(|id| {
+            format!("[[channels]]\nid = \"{id}\"\nlabel = \"extra {id}\"\nwritable = false\n\n")
+        })
+        .collect();
+    let mut toml =
+        vibe_talk::testing::config_toml().replace("[elevenlabs]", &format!("{extra}[elevenlabs]"));
+    toml.push_str(more);
+    toml
+}
+
 /// A server with five channels, read through `plain`.
 fn server() -> (AppState, Arc<FakeDiscord>, Arc<Plain>) {
     let extra: String = EXTRA
@@ -482,6 +496,9 @@ struct Gathered {
     as_of: Mutex<Option<String>>,
     /// Channels the provider leaves out of its answers.
     leaves_out: Mutex<HashSet<String>>,
+    /// How long a read of several channels takes. It answers with the channels as they stood when
+    /// it began, as a provider's snapshot does.
+    delay: Mutex<Duration>,
     asked: Mutex<Vec<Vec<String>>>,
 }
 
@@ -492,6 +509,7 @@ impl Gathered {
             native,
             as_of: Mutex::new(None),
             leaves_out: Mutex::new(HashSet::new()),
+            delay: Mutex::new(Duration::ZERO),
             asked: Mutex::new(Vec::new()),
         }
     }
@@ -537,6 +555,8 @@ impl ChatClient for Gathered {
             };
             answers.push((channel.clone(), read));
         }
+        let delay = *self.delay.lock().expect("setting");
+        tokio::time::sleep(delay).await;
         answers
     }
 
@@ -661,5 +681,417 @@ async fn the_router_asks_each_provider_once_for_its_own_channels() {
             [format!("said in {id}")],
             "{at}: each channel's own messages, in its own place"
         );
+    }
+}
+
+/// A server with five channels, each with its first message, reading through a [`CountingChat`]
+/// around a [`Gathered`] that does (`native`) or does not read several channels together, and the
+/// ids of those first messages. `more` is added to its configuration.
+fn gathered_server(
+    native: bool,
+    more: &str,
+) -> (
+    AppState,
+    Arc<FakeDiscord>,
+    Arc<Gathered>,
+    Arc<CountingChat>,
+    Vec<MessageId>,
+) {
+    let (mut state, fake, _elevenlabs) =
+        vibe_talk::testing::state_from_toml(&five_channel_toml(more));
+    let now = vibe_talk::ops::now_ms();
+    let mut seeded = Vec::new();
+    for (n, (id, text)) in five().into_iter().zip(FIRST_WORDS).enumerate() {
+        let n = i64::try_from(n).expect("small");
+        seeded.push(fake.seed_at(
+            &channel(id),
+            "agent",
+            text,
+            now - 60 * MINUTE_MS + n * 1_000,
+        ));
+    }
+    let gathered = Arc::new(Gathered::new(Arc::clone(&fake), native));
+    let counting = Arc::new(CountingChat::new(
+        Arc::clone(&gathered) as Arc<dyn ChatClient>
+    ));
+    state.replace_chat(Arc::clone(&counting) as Arc<dyn ChatClient>);
+    (state, fake, gathered, counting, seeded)
+}
+
+/// What the server asked of the provider since the last look, by method and channel.
+fn calls(counting: &CountingChat, seen: &mut usize) -> Vec<String> {
+    let calls = counting.calls();
+    let asked = calls[*seen..]
+        .iter()
+        .map(|call| match &call.channel {
+            Some(channel) => format!("{} {channel}", call.method),
+            None => call.method.to_owned(),
+        })
+        .collect();
+    *seen = calls.len();
+    asked
+}
+
+/// A recent read of each of the five channels alone, in the order the server lists them.
+fn five_alone() -> Vec<String> {
+    five()
+        .into_iter()
+        .map(|id| format!("fetch_recent_dated {id}"))
+        .collect()
+}
+
+/// Whether every channel of a projected catch-up was answered, current, from a current read.
+fn all_current(answer: &Value) -> bool {
+    answer["channels"]
+        .as_array()
+        .expect("channels")
+        .iter()
+        .all(|part| {
+            part["currency"] == "current"
+                && part["as_of"].is_null()
+                && part["read"]["error"].is_null()
+        })
+}
+
+fn said_in(answer: &Value, id: &str) -> Vec<String> {
+    answer["channels"]
+        .as_array()
+        .expect("channels")
+        .iter()
+        .find(|part| part["id"] == id)
+        .expect("the channel")["read"]["said"]
+        .as_array()
+        .expect("said")
+        .iter()
+        .map(|line| line.as_str().expect("text").to_owned())
+        .collect()
+}
+
+/// remote-ops-audit W13, the catch-up's proof: five channels of a provider that reads several
+/// together cost a catch-up ONE call where they cost five reads, a call start's warm-up likewise,
+/// and the answer is the one five reads give. On a provider that does not, the same catch-up is
+/// the five reads it always was, and the provider's own read of several channels is never asked.
+#[tokio::test(start_paused = true)]
+async fn five_channels_read_together_cost_a_catch_up_and_a_warm_up_one_call_each() {
+    let (state, _fake, gathered, counting, _seeded) = gathered_server(true, "");
+    let mut seen = 0;
+    let cold = catch_up(&state).await;
+    assert_eq!(calls(&counting, &mut seen), ["fetch_recent_many"]);
+    assert_eq!(gathered.asked(), [five()], "every channel in the one call");
+    assert!(all_current(&cold), "{cold}");
+    assert_eq!(said_in(&cold, EXTRA[1]), [FIRST_WORDS[3]]);
+    assert_eq!(catch_up(&state).await, cold);
+    assert!(calls(&counting, &mut seen).is_empty(), "reused, as before");
+
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(vibe_talk::recent::warm(&state), 5);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(calls(&counting, &mut seen), ["fetch_recent_many"]);
+    assert_eq!(
+        catch_up(&state).await,
+        cold,
+        "answered from what the warm-up read"
+    );
+    assert!(calls(&counting, &mut seen).is_empty());
+
+    let (state, _fake, gathered, counting, _seeded) = gathered_server(false, "");
+    let mut seen = 0;
+    assert_eq!(catch_up(&state).await, cold, "the same answer");
+    assert_eq!(
+        calls(&counting, &mut seen),
+        five_alone(),
+        "five reads, as before"
+    );
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    vibe_talk::recent::warm(&state);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(calls(&counting, &mut seen), five_alone());
+    assert!(
+        gathered.asked().is_empty(),
+        "never asked to read several together"
+    );
+}
+
+/// A read together reads every window again, so an edit, a delete and a new message since the
+/// last one are all in the next catch-up's answer, which is again one call.
+#[tokio::test(start_paused = true)]
+async fn a_read_together_still_sees_edits_deletes_and_new_messages() {
+    let (state, fake, _gathered, counting, seeded) = gathered_server(true, "");
+    let mut seen = 0;
+    catch_up(&state).await;
+    calls(&counting, &mut seen);
+    fake.edit(&seeded[1], "ship it tomorrow, edited");
+    fake.delete(&seeded[2]);
+    fake.seed_at(
+        &channel(EXTRA[2]),
+        "grace",
+        "something new",
+        vibe_talk::ops::now_ms(),
+    );
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let answer = catch_up(&state).await;
+    assert_eq!(calls(&counting, &mut seen), ["fetch_recent_many"]);
+    assert!(all_current(&answer), "{answer}");
+    assert_eq!(
+        said_in(&answer, WRITE_CHANNEL),
+        ["ship it tomorrow, edited"]
+    );
+    assert!(said_in(&answer, EXTRA[0]).is_empty(), "the delete is seen");
+    assert_eq!(
+        said_in(&answer, EXTRA[2]),
+        [FIRST_WORDS[4], "something new"]
+    );
+}
+
+/// What a read together does not answer for a channel, the channel is read on its own, as it
+/// would have been without it: a channel the provider left out, every channel of a read that
+/// failed, and every channel answered from a copy older than now, so that copy never stands in
+/// for the read the server would have made. Every channel is still answered current.
+#[tokio::test(start_paused = true)]
+async fn what_a_read_together_does_not_answer_is_read_alone_as_before() {
+    let (state, _fake, gathered, counting, _seeded) = gathered_server(true, "");
+    let mut seen = 0;
+    gathered
+        .leaves_out
+        .lock()
+        .expect("setting")
+        .insert(EXTRA[1].to_owned());
+    let answer = catch_up(&state).await;
+    assert_eq!(
+        calls(&counting, &mut seen),
+        [
+            "fetch_recent_many".to_owned(),
+            format!("fetch_recent_dated {}", EXTRA[1])
+        ]
+    );
+    assert!(all_current(&answer), "{answer}");
+    assert_eq!(said_in(&answer, EXTRA[1]), [FIRST_WORDS[3]]);
+    gathered.leaves_out.lock().expect("setting").clear();
+
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    counting.fail_next(
+        "fetch_recent_many",
+        None,
+        ChatError::Transport("the read of several channels is down".to_owned()),
+    );
+    let answer = catch_up(&state).await;
+    let mut expected = vec!["fetch_recent_many".to_owned()];
+    expected.extend(five_alone());
+    assert_eq!(calls(&counting, &mut seen), expected);
+    assert!(all_current(&answer), "{answer}");
+
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    *gathered.as_of.lock().expect("setting") = Some("2026-10-13T12:00:00Z".to_owned());
+    let answer = catch_up(&state).await;
+    assert_eq!(
+        calls(&counting, &mut seen),
+        expected,
+        "an older copy is read again"
+    );
+    assert!(all_current(&answer), "no older copy was kept: {answer}");
+}
+
+/// Each channel's read is marked before the read together asks the provider, as a refresh's is,
+/// so a message pushed while it runs survives the read landing without it.
+#[tokio::test(start_paused = true)]
+async fn a_push_that_arrives_while_channels_are_read_together_survives_the_read_landing() {
+    let (state, fake, gathered, counting, _seeded) = gathered_server(
+        true,
+        "\n[ingest]\ntoken = \"test-ingest-token-0000000000\"\n",
+    );
+    *gathered.delay.lock().expect("setting") = Duration::from_secs(2);
+    let running = {
+        let state = state.clone();
+        tokio::spawn(async move { catch_up(&state).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let lead = channel(WRITE_CHANNEL);
+    let id = fake.seed_at(&lead, "lead", "pushed mid read", vibe_talk::ops::now_ms());
+    state
+        .live
+        .publish(&lead, fake.message(&id).expect("seeded"));
+    let first = running.await.expect("the catch-up ran");
+    assert_eq!(counting.count("fetch_recent_many"), 1);
+    assert_eq!(
+        said_in(&first, WRITE_CHANNEL),
+        [FIRST_WORDS[1], "pushed mid read"],
+        "the read that landed after the push undid it"
+    );
+    let second = catch_up(&state).await;
+    assert_eq!(
+        said_in(&second, WRITE_CHANNEL),
+        [FIRST_WORDS[1], "pushed mid read"]
+    );
+    assert_eq!(counting.count("fetch_recent_many"), 1, "reused");
+}
+
+/// A read together is single-flight like every refresh: a second catch-up while it runs waits on
+/// it rather than asking again.
+#[tokio::test(start_paused = true)]
+async fn a_second_catch_up_joins_the_read_together_already_running() {
+    let (state, _fake, gathered, counting, _seeded) = gathered_server(true, "");
+    *gathered.delay.lock().expect("setting") = Duration::from_secs(2);
+    let first = {
+        let state = state.clone();
+        tokio::spawn(async move { catch_up(&state).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let second = catch_up(&state).await;
+    let first = first.await.expect("the catch-up ran");
+    assert_eq!(counting.count("fetch_recent_many"), 1);
+    assert_eq!(counting.calls().len(), 1);
+    assert_eq!(first, second);
+    assert!(all_current(&second), "{second}");
+}
+
+/// Two providers: each reads its own channels its own way. The one that reads several together is
+/// one call for its three; the other is a read of each of its two, as before.
+#[tokio::test(start_paused = true)]
+async fn each_provider_reads_its_own_channels_its_own_way() {
+    const SLACK: [&str; 2] = ["C0SLACK001", "C0SLACK002"];
+    let slack_channels: String = SLACK
+        .iter()
+        .map(|id| {
+            format!(
+                "[[channels]]\nid = \"{id}\"\nlabel = \"{id}\"\nwritable = false\n\
+                 provider = \"slack\"\n\n"
+            )
+        })
+        .collect();
+    let extra = format!(
+        "[[channels]]\nid = \"{}\"\nlabel = \"extra\"\nwritable = false\n\n{slack_channels}",
+        EXTRA[0]
+    );
+    let toml = format!(
+        "[[providers]]\nkey = \"slack\"\nkind = \"slack\"\ntoken = \"xoxb-test\"\n\n{}",
+        vibe_talk::testing::config_toml().replace("[elevenlabs]", &format!("{extra}[elevenlabs]"))
+    );
+    let (mut state, discord, _elevenlabs) = vibe_talk::testing::state_from_toml(&toml);
+    let slack = Arc::new(FakeDiscord::new());
+    for id in [READ_CHANNEL, WRITE_CHANNEL, EXTRA[0]] {
+        discord.seed_at(
+            &channel(id),
+            "ada",
+            "from the bridge",
+            vibe_talk::ops::now_ms() - MINUTE_MS,
+        );
+    }
+    for id in SLACK {
+        slack.seed_at(
+            &channel(id),
+            "ada",
+            "from slack",
+            vibe_talk::ops::now_ms() - MINUTE_MS,
+        );
+    }
+    let bridge = Arc::new(Gathered::new(Arc::clone(&discord), true));
+    let other = Arc::new(Gathered::new(Arc::clone(&slack), false));
+    let counting_bridge = Arc::new(CountingChat::new(Arc::clone(&bridge) as Arc<dyn ChatClient>));
+    let counting_other = Arc::new(CountingChat::new(Arc::clone(&other) as Arc<dyn ChatClient>));
+    let entries = vec![
+        ProviderEntry {
+            key: "discord".to_owned(),
+            namespace: state.config.providers[0].namespace(),
+            client: Arc::clone(&counting_bridge) as Arc<dyn ChatClient>,
+            live_poll_seconds: 0,
+        },
+        ProviderEntry {
+            key: "slack".to_owned(),
+            namespace: state.config.providers[1].namespace(),
+            client: Arc::clone(&counting_other) as Arc<dyn ChatClient>,
+            live_poll_seconds: 0,
+        },
+    ];
+    let router = ChatRouter::new(entries, state.config.default_provider_key());
+    state.replace_providers(Arc::new(router));
+
+    let answer = catch_up(&state).await;
+    assert!(all_current(&answer), "{answer}");
+    assert_eq!(
+        bridge.asked(),
+        [[READ_CHANNEL, WRITE_CHANNEL, EXTRA[0]]],
+        "the bridge's three in one call"
+    );
+    assert_eq!(counting_bridge.calls().len(), 1);
+    let mut seen = 0;
+    assert_eq!(
+        calls(&counting_other, &mut seen),
+        SLACK.map(|id| format!("fetch_recent_dated {id}"))
+    );
+    assert!(other.asked().is_empty());
+    assert_eq!(said_in(&answer, SLACK[1]), ["from slack"]);
+    assert_eq!(said_in(&answer, EXTRA[0]), ["from the bridge"]);
+}
+
+/// The whole path, against a loopback bridge configured with `recent_many_reads`: a catch-up of
+/// five channels is ONE request, `GET /recent` naming all five, and no `/messages` at all.
+/// Real time, not a paused clock: the client's request timeout must not fire while the loopback
+/// server answers.
+#[tokio::test]
+async fn a_catch_up_of_five_bridge_channels_is_one_request_to_the_bridge() {
+    use axum::http::{Method, Uri};
+    use axum::response::IntoResponse as _;
+
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured = Arc::clone(&seen);
+    let base_ms = vibe_talk::ops::now_ms() - 30 * MINUTE_MS;
+    let app = axum::Router::new().fallback(move |method: Method, uri: Uri| {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .expect("seen")
+                .push(format!("{method} {uri}"));
+            if uri.path() != "/recent" {
+                return (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response();
+            }
+            let url = reqwest::Url::parse(&format!("http://bridge{uri}")).expect("a url");
+            let recent: Vec<Value> = url
+                .query_pairs()
+                .filter(|(key, _)| key == "channels")
+                .enumerate()
+                .map(|(n, (_, channel))| {
+                    let ms = base_ms + i64::try_from(n).expect("small") * 1_000;
+                    json!({"channel": channel, "messages": [{
+                        "id": MessageId::at_time_ms(ms).as_str(),
+                        "channel_id": channel,
+                        "content": format!("the bridge says hello in {channel}"),
+                        "timestamp": vibe_talk::clock::iso_from_ms(ms),
+                        "author": {"id": "7", "username": "bridge", "bot": false}
+                    }]})
+                })
+                .collect();
+            axum::Json(json!({ "recent": recent })).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server");
+    });
+
+    let toml = five_channel_toml("").replace(
+        "[discord]\n",
+        &format!(
+            "[discord]\nthread_api = \"bridge\"\napi_base = \"http://{address}\"\n\
+             recent_many_reads = true\n"
+        ),
+    );
+    let (mut state, _fake, _elevenlabs) = vibe_talk::testing::state_from_toml(&toml);
+    let client =
+        vibe_talk::discord::http::HttpDiscordClient::new(state.config.discord().expect("a bridge"))
+            .expect("a client");
+    state.replace_chat(Arc::new(client));
+
+    let answer = catch_up(&state).await;
+    server.abort();
+    let requests = seen.lock().expect("seen").clone();
+    let channels: String = five().iter().map(|id| format!("channels={id}&")).collect();
+    assert_eq!(requests, [format!("GET /recent?{channels}limit=20")]);
+    assert!(all_current(&answer), "{answer}");
+    for id in five() {
+        assert_eq!(said_in(&answer, id).len(), 1, "{answer}");
     }
 }

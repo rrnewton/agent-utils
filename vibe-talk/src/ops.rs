@@ -1004,15 +1004,10 @@ pub async fn activity(state: &AppState, request: ActivityRequest) -> Result<Acti
         .filter(|channel| !recent.reusable(channel, scan, crate::recent::reuse_for(state, channel)))
         .collect();
     // remote-ops-audit W12 `#287 bulk-reads`: a held window a native head proves unchanged is kept
-    // rather than read again. Every other read is started first, so the head read never delays it.
+    // rather than read again. Every other read is started first, so the head read never delays it,
+    // and the channels of a provider that reads several natively are one read (W13).
     let (candidates, now) = crate::recent::head_candidates(state, due, scan);
-    let mut waits: std::collections::BTreeMap<ChannelId, _> = now
-        .into_iter()
-        .map(|channel| {
-            let wait = crate::recent::refresh(state, &channel, scan);
-            (channel, wait)
-        })
-        .collect();
+    let mut waits = crate::recent::refresh_all(state, &now, scan);
     waits.extend(crate::recent::keep_or_refresh(state, &candidates, scan).await);
     for channel in &channels {
         let Some(mut done) = waits.remove(&channel.id) else {

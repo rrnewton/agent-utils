@@ -2384,6 +2384,22 @@ flight, which costs exactly what reading each channel did, and says so
 call that reads several channels at once. A caller that would gather its reads into one only to
 save calls gathers them only for a provider that reads them natively.
 
+**A voice catch-up, and a call start's warm-up.** Of the channels a catch-up or a warm-up reads
+again, those of a provider that reads several channels natively are read together: one call for
+all of that provider's channels, holding one of its four refresh permits, in place of a read of
+each. Each channel's held window is then kept exactly as its own read would have kept it, with
+every push that arrived while the call ran applied on top, and a second catch-up while it runs
+waits for it rather than asking again. A channel that call does not answer for (one the provider
+left out, or every channel of a call that failed) and a channel it answered from a copy older than
+now (`as_of`) are then read on their own, exactly as before, so an older copy never stands in for
+the read this server would have made, at the cost of the wasted call. Every other provider's
+channels are read one by one, as before. When a provider also reads heads natively (see
+[Channel heads](#channel-heads)), the channels its heads do not let a catch-up keep are the ones
+read together. Five bridge channels past their reuse period cost one request instead of five
+reads, and with `head_reads` too, a catch-up after one channel changed costs one head request and
+one read. A read of several channels is not checked by `recent_view_shadow`, which compares
+`/messages` with Flat; the shadow does wait for it, as for any recent read.
+
 ### A bridge's recent reads of several channels
 
 **The problem.** A bridge is asked for each channel's newest messages one channel at a time,
@@ -2424,7 +2440,9 @@ cannot read, and then reads each channel as it would have without it.
   channel's first message. A short list is not that; vibe-talk never infers it from one.
 * `as_of` (optional): present only when the answer came from a copy the bridge could not bring up
   to date, as on a timeline read. Absent means now: answer from a copy only while it is current,
-  for example while the bridge's live feed of the channel is healthy.
+  for example while the bridge's live feed of the channel is healthy. A catch-up does not keep a
+  channel answered with `as_of`: it reads that channel again on its own, as it would have without
+  this request, so an `as_of` costs a wasted request rather than an older answer.
 
 Every field but `channel` and `messages` may be absent or `null`; an unknown field is ignored;
 anything else that cannot be read fails the request, and vibe-talk reads its channels as before.

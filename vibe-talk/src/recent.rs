@@ -39,6 +39,18 @@
 //! and fills the window — even when the caller that started it has given up. That is what makes
 //! the retry after an abandoned call cheap: the read it would have repeated has already landed.
 //!
+//! # Several channels in one read
+//!
+//! A catch-up or a warm-up refreshes every channel it needs with [`refresh_all`]. For a provider
+//! that reads the newest messages of several channels natively (a bridge configured with
+//! `recent_many_reads`, remote-ops-audit W13), every channel of that provider not already being
+//! read is claimed, exactly as a refresh claims one, and all of them are ONE read of several
+//! channels, holding one of that provider's permits. Each channel's window is kept as its own read
+//! would have kept it, with its own mark. What that read does not answer for a channel — a channel
+//! it left out or failed, or one it answered from a copy older than now (`as_of`) — is then read on
+//! its own, as a refresh would have read it, so an older copy never stands in for the read this
+//! server would have made. Every other provider's channels are refreshed one by one, as before.
+//!
 //! # A read does not undo what arrived while it ran
 //!
 //! A read takes seconds, and the provider's answer is a picture of the channel at some moment
@@ -774,56 +786,180 @@ pub fn refresh(state: &AppState, channel: &ChannelId, limit: u16) -> watch::Rece
     let windows = Arc::clone(state.live.recent());
     let (done, claim) = windows.claim(channel);
     if let Some(claim) = claim {
-        let state = state.clone();
-        tokio::spawn(async move {
-            // Begun when asked for, not when a permit came free: the window is no newer than that,
-            // and every push from then on is applied to it again. See the module documentation.
-            let mark = claim.windows.mark(&claim.channel);
-            let started = mark.started();
-            let permits = claim
-                .windows
-                .permits(state.providers.key_for(&claim.channel).as_deref());
-            let read = match permits.acquire().await {
-                // `remote-ops-audit`: counted as the catch-up's, whoever's request queued it.
-                Ok(_permit) => {
-                    crate::read_reason::ReadReason::Recent
-                        .scope(crate::recent_view::read(&state, &claim.channel, limit))
-                        .await
-                }
-                Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
-            };
-            let millis = started.elapsed().as_millis();
-            match read {
-                Ok(read) => {
-                    tracing::info!(
-                        channel = %claim.channel,
-                        returned = read.messages.len(),
-                        millis,
-                        stale = read.as_of.is_some(),
-                        "recent window refreshed"
-                    );
-                    claim.windows.record_as_of(
-                        &claim.channel,
-                        &read.messages,
-                        limit,
-                        mark,
-                        read.as_of.as_deref(),
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        channel = %claim.channel,
-                        millis,
-                        %error,
-                        "recent window refresh failed"
-                    );
-                    claim.windows.note_failure(&claim.channel, error, mark);
-                }
-            }
-            drop(claim);
-        });
+        tokio::spawn(read_alone(state.clone(), claim, limit));
     }
     done
+}
+
+/// Read one claimed channel's newest `limit` messages on their own, keep what the read brought or
+/// its failure, and end the refresh.
+async fn read_alone(state: AppState, claim: Claim, limit: u16) {
+    // Begun when asked for, not when a permit came free: the window is no newer than that, and
+    // every push from then on is applied to it again. See the module documentation.
+    let mark = claim.windows.mark(&claim.channel);
+    let started = mark.started();
+    let permits = claim
+        .windows
+        .permits(state.providers.key_for(&claim.channel).as_deref());
+    let read = match permits.acquire().await {
+        // `remote-ops-audit`: counted as the catch-up's, whoever's request queued it.
+        Ok(_permit) => {
+            crate::read_reason::ReadReason::Recent
+                .scope(crate::recent_view::read(&state, &claim.channel, limit))
+                .await
+        }
+        Err(_) => Err(ChatError::Refused("the server is shutting down".to_owned())),
+    };
+    keep(&claim, mark, limit, read, started.elapsed().as_millis());
+    drop(claim);
+}
+
+/// Keep what a read of a claimed channel that began at `mark` brought, or its failure, and say so.
+fn keep(
+    claim: &Claim,
+    mark: ReadMark,
+    limit: u16,
+    read: Result<crate::chat::RecentRead, ChatError>,
+    millis: u128,
+) {
+    match read {
+        Ok(read) => {
+            tracing::info!(
+                channel = %claim.channel,
+                returned = read.messages.len(),
+                millis,
+                stale = read.as_of.is_some(),
+                "recent window refreshed"
+            );
+            claim.windows.record_as_of(
+                &claim.channel,
+                &read.messages,
+                limit,
+                mark,
+                read.as_of.as_deref(),
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                channel = %claim.channel,
+                millis,
+                %error,
+                "recent window refresh failed"
+            );
+            claim.windows.note_failure(&claim.channel, error, mark);
+        }
+    }
+}
+
+/// Start reading the newest `limit` messages of each of `channels`, or join the reads already
+/// running, and return each channel's refresh. remote-ops-audit W13 `#287 bulk-reads`.
+///
+/// The channels of a provider that reads several channels natively
+/// ([`crate::chat::ReadCaps::many_channels`]) are read together: each one not already being read
+/// is claimed and marked, as [`refresh`] claims and marks one, and all of a provider's are ONE
+/// [`crate::chat::ChatClient::fetch_recent_many`], in the background, holding one of that
+/// provider's permits. A channel that read does not answer for, or answers from a copy older than
+/// now, is then read on its own (see "Several channels in one read" in the module
+/// documentation). Every other channel is [`refresh`]ed on its own, in the order given, exactly as
+/// before, so a provider without a read of several channels is asked what it always was.
+pub fn refresh_all(
+    state: &AppState,
+    channels: &[ChannelId],
+    limit: u16,
+) -> BTreeMap<ChannelId, watch::Receiver<bool>> {
+    let windows = Arc::clone(state.live.recent());
+    let mut started = BTreeMap::new();
+    let mut together: BTreeMap<Option<String>, Vec<(Claim, ReadMark)>> = BTreeMap::new();
+    for channel in channels {
+        if started.contains_key(channel) {
+            continue;
+        }
+        if state.chat.read_caps(channel).many_channels != crate::chat::Support::Native {
+            started.insert(channel.clone(), refresh(state, channel, limit));
+            continue;
+        }
+        let (done, claim) = windows.claim(channel);
+        if let Some(claim) = claim {
+            // Begun when asked for, as a refresh's read is.
+            let mark = windows.mark(channel);
+            together
+                .entry(state.providers.key_for(channel))
+                .or_default()
+                .push((claim, mark));
+        }
+        started.insert(channel.clone(), done);
+    }
+    for (provider, claims) in together {
+        tokio::spawn(read_together(state.clone(), provider, claims, limit));
+    }
+    started
+}
+
+/// Read every claimed channel of one provider in one read of several channels, keep each answer
+/// that is the provider's word for now, and read every other channel on its own. See
+/// [`refresh_all`].
+async fn read_together(
+    state: AppState,
+    provider: Option<String>,
+    claims: Vec<(Claim, ReadMark)>,
+    limit: u16,
+) {
+    let windows = Arc::clone(state.live.recent());
+    let began = Instant::now();
+    let asks: Vec<(ChannelId, crate::chat::RecentAsk)> = claims
+        .iter()
+        .map(|(claim, _)| (claim.channel.clone(), crate::chat::RecentAsk::newest(limit)))
+        .collect();
+    let permits = windows.permits(provider.as_deref());
+    let answers = match permits.acquire().await {
+        // `remote-ops-audit`: counted as the catch-up's, as a channel read on its own is.
+        Ok(_permit) => {
+            crate::read_reason::ReadReason::Recent
+                .scope(crate::recent_view::read_many(&state, &asks))
+                .await
+        }
+        // Nothing answered: each channel is read on its own, and meets the same refusal there.
+        Err(_) => Vec::new(),
+    };
+    let millis = began.elapsed().as_millis();
+    let asked = claims.len();
+    let mut answers = answers.into_iter();
+    let mut alone = Vec::new();
+    for (claim, mark) in claims {
+        match answers.next() {
+            Some((channel, Ok(read))) if channel == claim.channel && read.as_of.is_none() => {
+                keep(&claim, mark, limit, Ok(read), millis);
+                drop(claim);
+            }
+            Some((channel, answer)) => {
+                let why = match answer {
+                    Err(error) => error.to_string(),
+                    Ok(_) if channel != claim.channel => "answered for another channel".to_owned(),
+                    Ok(_) => "answered from a copy older than now".to_owned(),
+                };
+                tracing::warn!(
+                    channel = %claim.channel,
+                    why,
+                    "a read of several channels did not answer for this one; reading it alone"
+                );
+                alone.push(claim);
+            }
+            None => alone.push(claim),
+        }
+    }
+    tracing::info!(
+        provider = provider.as_deref().unwrap_or("-"),
+        asked,
+        kept = asked - alone.len(),
+        millis,
+        "recent windows read together"
+    );
+    futures_util::future::join_all(
+        alone
+            .into_iter()
+            .map(|claim| read_alone(state.clone(), claim, limit)),
+    )
+    .await;
 }
 
 /// Of `channels`, each due to be read again, the ones a head could let this server keep instead,
@@ -851,7 +987,8 @@ pub fn head_candidates(
 
 /// Ask for the heads of `candidates` (see [`head_candidates`]) in one call, keep each held window
 /// its head proves unchanged ([`RecentWindows::keep_on_head`]), and start a refresh of every other
-/// one, as a catch-up would have without heads. remote-ops-audit W12 `#287 bulk-reads`.
+/// one, as a catch-up would have without heads ([`refresh_all`], so a provider that reads several
+/// channels natively reads them in one call). remote-ops-audit W12 and W13 `#287 bulk-reads`.
 ///
 /// The heads are given [`HEADS_DEADLINE`]; past it, or for a channel whose head failed, the
 /// channel is read. Returns the refreshes started, by channel.
@@ -860,9 +997,8 @@ pub async fn keep_or_refresh(
     candidates: &[ChannelId],
     scan: u16,
 ) -> BTreeMap<ChannelId, watch::Receiver<bool>> {
-    let mut started = BTreeMap::new();
     if candidates.is_empty() {
-        return started;
+        return BTreeMap::new();
     }
     let recent = state.live.recent();
     let marks: Vec<ReadMark> = candidates
@@ -886,11 +1022,12 @@ pub async fn keep_or_refresh(
             }
         }
     }
-    for channel in candidates {
-        if !kept.contains(channel) && !started.contains_key(channel) {
-            started.insert(channel.clone(), refresh(state, channel, scan));
-        }
-    }
+    let unkept: Vec<ChannelId> = candidates
+        .iter()
+        .filter(|channel| !kept.contains(*channel))
+        .cloned()
+        .collect();
+    let started = refresh_all(state, &unkept, scan);
     tracing::info!(
         asked = candidates.len(),
         kept = kept.len(),
@@ -909,7 +1046,8 @@ pub async fn keep_or_refresh(
 ///
 /// A channel whose held window a native head may prove unchanged (remote-ops-audit W12, see
 /// [`head_candidates`]) is checked in the background instead, all of them in one head read, and
-/// read only if its head does not prove it.
+/// read only if its head does not prove it. The channels of a provider that reads several channels
+/// natively are read in one call ([`refresh_all`], remote-ops-audit W13).
 pub fn warm(state: &AppState) -> usize {
     let scan = crate::ops::activity_scan(state, crate::ops::DEFAULT_ACTIVITY_LINES);
     let recent = state.live.recent();
@@ -921,9 +1059,7 @@ pub fn warm(state: &AppState) -> usize {
         .collect();
     let reading = due.len();
     let (candidates, now) = head_candidates(state, due, scan);
-    for channel in &now {
-        drop(refresh(state, channel, scan));
-    }
+    drop(refresh_all(state, &now, scan));
     if !candidates.is_empty() {
         let state = state.clone();
         tokio::spawn(async move {
