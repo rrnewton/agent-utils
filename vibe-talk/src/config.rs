@@ -4182,6 +4182,93 @@ provider = "slack"
     }
 
     #[test]
+    fn the_example_message_cache_table_parses_once_uncommented_and_states_the_defaults() {
+        // `#208 persistent-cache`. The example ships `[message_cache]` commented out, because an
+        // absent table is the default; an operator turning the cache on uncomments it. A block that
+        // does not parse once uncommented is a server that refuses to start on the day the cache
+        // is turned on, and a default it states that the code does not have is a wrong number an
+        // operator copies.
+        let example = include_str!("../vibe-talk.example.toml")
+            .replace(
+                "REPLACE-ME-at-least-24-characters",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .replace(
+                "REPLACE-ME-different-and-at-least-24-characters",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+        let shipped = Config::from_toml_and_env(&example, &env(&[])).expect("the example parses");
+        assert_eq!(
+            shipped.message_cache, None,
+            "the example ships the table commented out, which is the default: absent"
+        );
+
+        // Uncomment the block's settings: from `# [message_cache]` to the first line that is not
+        // a comment, every `# [...]` header and every `# key = value`, and no prose.
+        let is_setting = |rest: &str| {
+            rest.starts_with('[')
+                || rest.split_once(" = ").is_some_and(|(key, _)| {
+                    !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                })
+        };
+        let mut inside = false;
+        let mut uncommented: Vec<&str> = Vec::new();
+        let mut text = String::new();
+        for line in example.lines() {
+            if line == "# [message_cache]" {
+                inside = true;
+            } else if !line.starts_with('#') {
+                inside = false;
+            }
+            match line
+                .strip_prefix("# ")
+                .filter(|rest| inside && is_setting(rest))
+            {
+                Some(rest) => {
+                    uncommented.push(rest.split_once(" = ").map_or(rest, |(key, _)| key));
+                    text.push_str(rest);
+                }
+                None => text.push_str(line),
+            }
+            text.push('\n');
+        }
+        // Every key `FileMessageCache` and `FileCacheChannel` accept, in the order they are read.
+        assert_eq!(
+            uncommented,
+            [
+                "[message_cache]",
+                "enabled",
+                "path",
+                "max_days",
+                "max_megabytes",
+                "backfill",
+                "timeline_fallback_ms",
+                "[[message_cache.channel]]",
+                "id",
+                "max_days",
+            ],
+            "the example must carry a commented [message_cache] block naming every key"
+        );
+
+        let cfg = Config::from_toml_and_env(&text, &env(&[]))
+            .expect("the example's [message_cache] block must parse once uncommented");
+        assert_eq!(
+            cfg.message_cache,
+            Some(MessageCacheConfig {
+                path: Some(PathBuf::from(
+                    "/srv/vibe-talk-cache/vibe-talk.message-cache.sqlite3"
+                )),
+                channels: vec![CacheChannelLimit {
+                    id: ChannelId("123456789012345678".to_owned()),
+                    max_days: 1,
+                }],
+                ..MessageCacheConfig::default()
+            }),
+            "every value the example states, except its path and its one channel, is the default"
+        );
+    }
+
+    #[test]
     fn unknown_configuration_keys_are_refused() {
         let text = format!("{FULL}\n[nonsense]\nkey = 1\n");
         let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");

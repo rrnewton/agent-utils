@@ -289,10 +289,10 @@ enabled = true
 
 [storage]
 # Durable state: the app's conversation transcript, how far you have read in each channel,
-# and the cached summaries below. Everything else this server does is stateless — a channel is
-# never cached as a channel. A cached SUMMARY is: it is a model's paraphrase of somebody else's
-# message, written from that message, so it is a second at-rest copy of third-party text and is
-# bounded and purged as one.
+# and the cached summaries below. No channel's messages are kept here: the optional message cache
+# ([message_cache], after this section) is a separate file. A cached SUMMARY is kept: it is a
+# model's paraphrase of somebody else's message, written from that message, so it is a second
+# at-rest copy of third-party text and is bounded and purged as one.
 #
 # UNSET MEANS OFF, and off is honest: the routes that need a store answer 503
 # storage_not_configured rather than keeping state in memory that evaporates on restart.
@@ -319,11 +319,12 @@ enabled = true
 # summary_retain_days = 30          # Defaults to retain_days; 0 means no age limit. Applies to
 #                                   # cached summaries, thread sentences and thread names, since
 #                                   # they were last USED by the write token (a read-token hit
-#                                   # keeps nothing alive). For a summary it is the only thing that
-#                                   # collects an entry whose message was edited or deleted
-#                                   # upstream, because such an entry is unreachable by key and
-#                                   # nothing announces it — so keep it within how long the chat
-#                                   # provider itself keeps messages.
+#                                   # keeps nothing alive). Without the message cache, this is
+#                                   # the only thing that collects a summary whose message was
+#                                   # edited or deleted upstream: such an entry is unreachable by
+#                                   # key and nothing announces it, so keep it within how long the
+#                                   # chat provider itself keeps messages. With the cache on, a
+#                                   # summary is deleted once the cache learns of the change.
 #                                   #
 #                                   # Neither applies to max_dismissals, and that is deliberate:
 #                                   # expiring a "dealt with" mark would put a message you
@@ -331,6 +332,44 @@ enabled = true
 #                                   # passed, with nothing on the row saying why. The count bound
 #                                   # is enough there — it is the one table holding no message
 #                                   # text, only two snowflakes and an instant.
+
+# [message_cache]
+# A DISPOSABLE COPY OF CHANNEL MESSAGES ON THIS SERVER'S DISK: erasing it loses nothing the
+# provider cannot give again (#208 persistent-cache). This build FILLS it from what write-scope
+# and server-owned reads see, and answers nothing from it yet. A read-token request never writes
+# to it. It is a SEPARATE SQLite file, created 0600, in a directory that must belong to this
+# account and be 0700. It is NOT encrypted. It needs [storage] path, because the owner's off
+# switch is kept beside the store, in <storage path>.message-cache.json.
+#
+# The table is ABSENT by default, and absent is not the same as enabled = false:
+#   - absent: no cache is opened. A cache file left from an earlier configuration is warned about
+#     at every start, and erased once the table has been absent for seven days;
+#   - enabled = false: every cache file this server made is erased at startup;
+#   - enabled = true: the cache is opened, unless the owner turned it off in Settings ("Saved
+#     messages on this server"). The owner's off outranks this setting until the owner turns the
+#     cache on again.
+#
+# TURNING IT ON FOR A HOST:
+#   1. deploy this build first;
+#   2. check the cache's directory with the canary preflight in the README ("The message cache");
+#   3. add this table to that host's overlay, with enabled = true, max_days = 14, and a path
+#      OUTSIDE anything synced or backed up.
+# BEFORE ROLLING BACK to an older build, set enabled = false and deploy, so that this build erases
+# the file. No older build ever erases one, and builds from before summary-keep refuse this table.
+# enabled = false
+# path = "/srv/vibe-talk-cache/vibe-talk.message-cache.sqlite3"
+#                                   # Absolute, and never [storage] path itself. The default is
+#                                   # beside the store: <store stem>.message-cache-<host>.sqlite3
+# max_days = 90                     # 1 to 365, counted by each message's own time. 0 is refused,
+#                                   # not read as unlimited
+# max_megabytes = 256               # 16 to 4096: the file and its -wal and -shm together
+# backfill = "adaptive"             # "adaptive" or "off". No effect in this build
+# timeline_fallback_ms = 10000      # 1000 to 60000. No effect in this build
+#
+# A conversation the provider keeps for less time can have its own age limit:
+# [[message_cache.channel]]
+# id = "123456789012345678"
+# max_days = 1                      # 1 to 365
 
 [summaries]
 # How a long channel message is turned into one short line. Every setting here that changes what a
