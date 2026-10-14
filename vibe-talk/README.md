@@ -3303,9 +3303,30 @@ the minted URL**, which carries a single-use token and is quoted verbatim by a c
 statements would corrupt data quietly.
 
 **Rolling back past a step.** Because a newer file is refused, going back to an older build means
-taking the file back too. Step 16 (`#303 voice-post-prefix`) only adds the one-row
-`voice_post_prefix` table, so with the server stopped it can be undone in place, losing nothing but
-the owner's saved tag:
+taking the file back too. **Take a copy of `storage.path` before an upgrade.** Restoring that copy
+is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
+the server stopped, newest first; each step's note below says how.
+
+**Step 17 (`#270 voice-transcript-markers`)** added one nullable column, `turns.detail`, which holds
+what a transcript row records beyond words. It also brought two kinds of row: `sent`, a message the
+voice agent posted, and `marker`, which records a conversation's start or a draft that was not
+sent. A page that does not ask for records never sees either. To take a file back to step 16,
+run this with the server stopped (`DROP COLUMN` needs `sqlite3` 3.35 or later):
+
+```sql
+BEGIN IMMEDIATE;
+DELETE FROM turns WHERE speaker IN ('sent', 'marker');
+DELETE FROM conversations WHERE id NOT IN (SELECT DISTINCT conversation_id FROM turns);
+ALTER TABLE turns DROP COLUMN detail;
+PRAGMA user_version = 16;
+COMMIT;
+```
+
+No conversation's preview needs repair, because a record row never sets one. A spoken yes that
+was tagged as the answer to a send stays an ordinary `you` turn.
+
+**Step 16 (`#303 voice-post-prefix`)** only adds the one-row `voice_post_prefix` table, so with the
+server stopped it can be undone in place, losing nothing but the owner's saved tag:
 
 ```sh
 sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE voice_post_prefix; PRAGMA user_version = 15;'

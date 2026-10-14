@@ -1436,6 +1436,72 @@ async fn a_transcript_can_be_written_read_back_and_forgotten() {
     );
 }
 
+/// `#270 voice-transcript-markers`. A page that has not asked for records never meets one: not a
+/// `sent` or `marker` row on either read, and not the detail on a spoken turn. And no page can
+/// write one through the plain append, which takes only words.
+#[tokio::test]
+async fn record_rows_stay_out_of_every_read_a_page_did_not_ask_them_on_and_cannot_be_appended() {
+    use vibe_talk::store::{NotSentWhy, Speaker, Turn, TurnDetail};
+    let (harness, store) = store_harness();
+    let id = vibe_talk::store::ConversationId::parse("conv_r").expect("id");
+    store
+        .append_turn(
+            &id,
+            &Turn::now(Speaker::Agent, "To lead team: ship it. Send it?"),
+        )
+        .await
+        .expect("append");
+    store
+        .append_turn(
+            &id,
+            &Turn::record(Speaker::You, "yes", Some(TurnDetail::Answer { serial: 7 })),
+        )
+        .await
+        .expect("append");
+    store
+        .append_turn(
+            &id,
+            &Turn::record(
+                Speaker::Marker,
+                "",
+                Some(TurnDetail::NotSent {
+                    why: NotSentWhy::Lapsed,
+                    serial: 8,
+                }),
+            ),
+        )
+        .await
+        .expect("append");
+
+    for path in ["/api/v1/conversations/conv_r", "/api/v1/transcript"] {
+        let (status, payload) = call(&harness, "GET", path, Some(WRITE_TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {payload}");
+        let turns = payload["turns"].as_array().expect("array");
+        assert_eq!(turns.len(), 2, "{path}: {payload}");
+        for turn in turns {
+            assert!(
+                matches!(turn["speaker"].as_str(), Some("you" | "agent")),
+                "{path}: {turn}"
+            );
+            assert!(turn.get("detail").is_none(), "{path}: {turn}");
+        }
+    }
+
+    for speaker in ["sent", "marker"] {
+        let (status, payload) = call(
+            &harness,
+            "POST",
+            "/api/v1/conversations/conv_r/turns",
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({"speaker": speaker, "text": "posted, honestly"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{speaker}: {payload}");
+        assert_eq!(payload["error"], "bad_record", "{payload}");
+    }
+    assert_eq!(store.turns(&id).await.expect("turns").len(), 3);
+}
+
 #[tokio::test]
 async fn the_record_is_walked_backwards_across_conversations_without_a_gap_or_a_repeat() {
     // The property that makes the walk usable, and the one a limit alone does not give: every
