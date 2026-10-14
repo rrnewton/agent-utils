@@ -1137,6 +1137,14 @@ fn window_activity(
 /// impossible on the largest page and force `has_more` back into a guess.
 pub const MAX_PAGE: u16 = crate::discord::http::DISCORD_MAX_LIMIT - 1;
 
+/// Most range reads one step of a walk through a span makes on a provider that reads by time
+/// itself ([`crate::chat::ReadCaps::range`]): the first, and the provider's own continuations of a
+/// step that came back empty without being exhausted. Past that, the step is the read `/page`
+/// always made. So a bridge that keeps answering empty steps costs at most this many requests more
+/// than that read, and a step that is not the end never answers `has_more: false`. Fix round 2 of
+/// remote-ops-audit W10 `#287 bulk-reads`.
+pub const MAX_SPAN_STEPS: usize = 3;
+
 /// What a caller wants one step of a walk to cover.
 ///
 /// Two modes, and mixing them is an error rather than a precedence rule: `before` steps BACKWARDS
@@ -1205,7 +1213,9 @@ pub struct Page {
     /// a full window. A time span read from a provider that reads by time is also `true` when the
     /// provider could not prove the span ends after this page: the next step may come back empty,
     /// which is better than a walk that silently stops short. remote-ops-audit W10
-    /// `#287 bulk-reads`.
+    /// `#287 bulk-reads`. Such a provider's step that came back empty is continued on its own
+    /// cursor, or answered by the read this route always made, never by `false`
+    /// ([`MAX_SPAN_STEPS`]).
     pub has_more: bool,
     /// The `before` cursor for the next step back. Set only when [`Page::has_more`].
     pub next_before: Option<MessageId>,
@@ -1313,24 +1323,56 @@ pub async fn page(
                 since_ms: from,
                 until_ms: until,
             };
-            let mut read = state
-                .chat
-                .fetch_range(
-                    &channel.id,
-                    &crate::chat::ReadScope::Main,
-                    range,
-                    crate::chat::RangeOrder::OldestFirst,
-                    probe,
-                    None,
-                )
-                .await?;
-            if read.emulated {
-                // The read this route always made, answered as it always was, even where the
-                // provider said it reads by time and then could not just now. Fix round 1 of
-                // remote-ops-audit W10 `#287 bulk-reads`.
-                native = false;
-            }
-            if native && read.as_of.is_some() {
+            // Both edges applied to the message's own creation instant, because the boundary
+            // cursor is only millisecond-accurate: the extra millisecond it lets through at the
+            // bottom is trimmed here, and a message exactly at `until` is deterministically OUT.
+            // The range read has trimmed already; this holds every provider to the same edges.
+            let in_span = |m: &Message| {
+                message_ms(m).is_none_or(|ms| ms >= from && until.is_none_or(|to| ms < to))
+            };
+            let mut cursor: Option<String> = None;
+            let mut steps = 0;
+            let mut read = loop {
+                let mut step = state
+                    .chat
+                    .fetch_range(
+                        &channel.id,
+                        &crate::chat::ReadScope::Main,
+                        range,
+                        crate::chat::RangeOrder::OldestFirst,
+                        probe,
+                        cursor.as_deref(),
+                    )
+                    .await?;
+                steps += 1;
+                if step.emulated {
+                    // The read this route always made, answered as it always was, even where the
+                    // provider said it reads by time and then could not just now. Fix round 1 of
+                    // remote-ops-audit W10 `#287 bulk-reads`.
+                    native = false;
+                }
+                step.messages.retain(in_span);
+                // A provider's own step may come back empty and still not be the end: a bridge
+                // "may answer fewer, as long as next and exhausted say so", and Slack's narrowing
+                // can prove a long stretch empty without reaching a message past it. Such a step
+                // is followed on the provider's own cursor, within `MAX_SPAN_STEPS`. Fix round 2
+                // of remote-ops-audit W10 `#287 bulk-reads`.
+                let nothing_yet =
+                    native && step.as_of.is_none() && !step.exhausted && step.messages.is_empty();
+                match step.next.clone() {
+                    Some(next) if nothing_yet && steps < MAX_SPAN_STEPS => cursor = Some(next),
+                    _ => break step,
+                }
+            };
+            // A native step that is not exhausted and still gives this route no message to resume
+            // after would answer `has_more: false`, and end the walk on a short step. Fix round 2
+            // of remote-ops-audit W10 `#287 bulk-reads`: never; the read this route always made is
+            // made instead, as for an older copy below.
+            let stranded = native
+                && !read.exhausted
+                && read.messages.len() <= usize::from(limit)
+                && read.messages.last().and_then(message_ms).is_none();
+            if native && (read.as_of.is_some() || stranded) {
                 // An answer from a copy the provider could not bring up to date never stands in
                 // for the read this route always made: that one is made instead, at the cost of
                 // the wasted request. remote-ops-audit section 4.3 `#287 bulk-reads`.
@@ -1352,13 +1394,7 @@ pub async fn page(
             // isolate. That is "there may be more", never "there is no more".
             let unproven = native && !read.exhausted;
             let mut fetched = read.messages;
-            // Both edges applied to the message's own creation instant, because the boundary
-            // cursor is only millisecond-accurate: the extra millisecond it lets through at the
-            // bottom is trimmed here, and a message exactly at `until` is deterministically OUT.
-            // The range read has trimmed already; this holds every provider to the same edges.
-            fetched.retain(|m| {
-                message_ms(m).is_none_or(|ms| ms >= from && until.is_none_or(|to| ms < to))
-            });
+            fetched.retain(in_span);
             (fetched, true, unproven)
         }
         None => {

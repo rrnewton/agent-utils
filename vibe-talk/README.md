@@ -2328,7 +2328,11 @@ not asked for a range read again for ten minutes.
   characters), or `null` when there is nowhere further to go.
 * `exhausted`: `true` only when the bridge KNOWS the window holds nothing beyond these messages in
   that direction. A short answer is not exhaustion; vibe-talk never infers it from one, and an
-  answer that is `exhausted` and still gives a `next` is refused.
+  answer that is `exhausted` and still gives a `next` is refused. A step of `/page` that comes back
+  empty and not exhausted is continued on its `next`, up to three range reads in all; one that
+  still leaves no message to resume after (no `next`, the third read empty too, or a newest message
+  whose instant cannot be read) is the read `/page` makes without `range_reads`, so a walk never
+  ends on a step the bridge did not say ends it.
 * `as_of` (optional): as on a timeline read, the instant up to which the bridge knows its answer is
   complete when it could not bring its copy up to date. Absent means now. vibe-talk never answers
   from such a window: `/page` and `/count` then make the read they made without `range_reads`, so

@@ -1518,3 +1518,241 @@ async fn only_a_bridge_without_the_route_has_its_range_reads_made_as_before() {
         "from the window's edge"
     );
 }
+
+/// How a loopback bridge that serves range reads answers the first steps of a span short.
+#[derive(Clone, Copy, Debug)]
+enum ShortSteps {
+    /// The first step empty with a `next`; on that cursor, the whole window, exhausted.
+    ThenServed,
+    /// Every step empty, with a `next` that never runs out, and never exhausted.
+    Forever,
+    /// The first step empty with nowhere further to go, and not exhausted.
+    Nowhere,
+    /// The first step one message whose creation instant cannot be read, with a `next`, and not
+    /// exhausted: nothing to resume after either.
+    Undated,
+}
+
+/// A loopback bridge that serves range reads of one channel as its contract allows, answering the
+/// steps through `window` as `steps` says and its plain message list with `all`. Records every
+/// request it is sent.
+async fn short_step_bridge(
+    all: Vec<Value>,
+    window: Vec<Value>,
+    steps: ShortSteps,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let (all, window) = (all.clone(), window.clone());
+        async move {
+            let asked = uri.to_string();
+            log.lock().expect("log").push(asked.clone());
+            if !asked.contains("since=") {
+                return axum::Json(Value::Array(all));
+            }
+            // This bridge's cursors are `p1`, `p2`, …: how many steps the walk has taken.
+            let taken = asked
+                .split("cursor=p")
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(0);
+            axum::Json(match steps {
+                ShortSteps::ThenServed if taken > 0 => {
+                    json!({"messages": window, "next": null, "exhausted": true})
+                }
+                ShortSteps::Nowhere => json!({"messages": [], "next": null, "exhausted": false}),
+                ShortSteps::Undated => json!({
+                    "messages": [{
+                        "id": "undated",
+                        "channel_id": READ_CHANNEL,
+                        "content": "undated",
+                        "timestamp": "some time",
+                        "author": { "id": "7", "username": "bridge", "bot": false }
+                    }],
+                    "next": "p1",
+                    "exhausted": false
+                }),
+                _ => json!({"messages": [], "next": format!("p{}", taken + 1), "exhausted": false}),
+            })
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (base, seen)
+}
+
+/// Fix round 2 of remote-ops-audit W10 `#287 bulk-reads`: a bridge "may answer fewer, as long as
+/// next and exhausted say so", and a short answer is not exhaustion. A walk through a span whose
+/// step came back empty and not exhausted follows the bridge's `next`; when that runs out (after
+/// `MAX_SPAN_STEPS` range reads, or at once with no `next`) and still leaves no message to resume
+/// after (none, or a newest one whose instant cannot be read), the step is the read `/page` makes
+/// with the setting off. Before, such a step answered `has_more: false` with no `next_since`: the
+/// walk was over, and every message of the span lost.
+#[tokio::test]
+async fn a_short_range_step_from_a_bridge_is_never_the_end_of_a_page_walk() {
+    let since = BASE_MS + 10 * MINUTE_MS;
+    let all = vec![
+        bridge_wire(since - MINUTE_MS, "before"),
+        bridge_wire(since + 1, "just after"),
+        bridge_wire(since + 2 * MINUTE_MS, "newest"),
+    ];
+    let window = all[1..].to_vec();
+    let page = format!(
+        "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=10",
+        iso(since)
+    );
+    let answer = |status: StatusCode, body: &Value| {
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let said: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content"))
+            .collect();
+        json!({"said": said, "has_more": body["has_more"], "next_since": body["next_since"]})
+    };
+
+    // With the setting off: the page after `since` it always was.
+    let (base, seen) = short_step_bridge(all.clone(), window.clone(), ShortSteps::Forever).await;
+    let (status, body) = get(
+        &vibe_talk::http::router(bridge_deployment(&base, "")),
+        &page,
+    )
+    .await;
+    let today = answer(status, &body);
+    assert_eq!(
+        today,
+        json!({"said": ["just after", "newest"], "has_more": false, "next_since": null})
+    );
+    let today_asked = seen.lock().expect("log").clone();
+    assert_eq!(today_asked.len(), 1, "{today_asked:?}");
+    assert!(
+        today_asked[0].starts_with(&format!(
+            "/channels/{READ_CHANNEL}/messages?limit=11&after="
+        )),
+        "{today_asked:?}"
+    );
+
+    // The bridge's `next` is followed: the span from the bridge, in one request more.
+    let (base, seen) = short_step_bridge(all.clone(), window.clone(), ShortSteps::ThenServed).await;
+    let (status, body) = get(
+        &vibe_talk::http::router(bridge_deployment(&base, "range_reads = true")),
+        &page,
+    )
+    .await;
+    assert_eq!(answer(status, &body), today, "the span, not an empty end");
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(
+        asked[0].contains("since=") && !asked[0].contains("cursor="),
+        "{asked:?}"
+    );
+    assert!(
+        asked[1].contains("since=") && asked[1].ends_with("&cursor=p1"),
+        "{asked:?}"
+    );
+
+    // No proof and nowhere to resume after: the read made with the setting off, after a bounded
+    // number of wasted range reads.
+    for (steps, range_reads) in [
+        (ShortSteps::Forever, vibe_talk::ops::MAX_SPAN_STEPS),
+        (ShortSteps::Nowhere, 1),
+        (ShortSteps::Undated, 1),
+    ] {
+        let (base, seen) = short_step_bridge(all.clone(), window.clone(), steps).await;
+        let (status, body) = get(
+            &vibe_talk::http::router(bridge_deployment(&base, "range_reads = true")),
+            &page,
+        )
+        .await;
+        assert_eq!(answer(status, &body), today, "{steps:?}");
+        let asked = seen.lock().expect("log").clone();
+        assert_eq!(asked.len(), range_reads + 1, "{steps:?}: {asked:?}");
+        assert!(
+            asked[..range_reads]
+                .iter()
+                .all(|asked| asked.contains("since=")),
+            "{steps:?}: {asked:?}"
+        );
+        assert_eq!(asked[range_reads], today_asked[0], "{steps:?}: {asked:?}");
+    }
+}
+
+/// Fix round 2 of remote-ops-audit W10 `#287 bulk-reads`: on Slack, a step through a span with no
+/// end comes back empty and not exhausted when the window is too large to read whole and a run of
+/// system events next to `since` outlasts the narrowing probes (`Narrowed::Proven`). Its `next`
+/// continues past the stretch it proved empty, and `/page` follows it, so the walk reaches the
+/// messages after the run. Before, that step answered `has_more: false` and the walk ended there.
+#[tokio::test]
+async fn a_slack_page_walk_crosses_a_run_of_system_events_one_step_cannot_prove_empty() {
+    let mut state = FakeState::default();
+    let mut list: Vec<Value> = (0..5)
+        .map(|i| profiled(&ts(i, 0), "UADA00001", "Ada", &format!("old {i}")))
+        .collect();
+    list.extend((0..100).map(|i| system(&ts(10_000 + i, 0), "channel_join")));
+    list.extend(
+        (0..3).map(|i| profiled(&ts(10_100 + i, 0), "UADA00001", "Ada", &format!("in {i}"))),
+    );
+    state.history.insert(SLACK_CH.to_owned(), list);
+    // Two rows a page: ten pages do not hold the window, and each probe proves two rows at most.
+    let fake = Fake::start(state, 2).await;
+    let since = slack_ms(10_000);
+
+    // The fixture is the case: one range step, as `/page?limit=5` asks for it, proves only part
+    // of the run empty and continues past it.
+    let first = fake
+        .client()
+        .fetch_range(
+            &slack_channel(),
+            &ReadScope::Main,
+            TimeRange {
+                since_ms: since,
+                until_ms: None,
+            },
+            RangeOrder::OldestFirst,
+            6,
+            None,
+        )
+        .await
+        .expect("read");
+    assert!(
+        first.messages.is_empty() && !first.exhausted && first.next.is_some(),
+        "{first:?}"
+    );
+
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let mut query = format!(
+        "/api/v1/channels/{SLACK_CH}/page?since={}&limit=5",
+        iso(since)
+    );
+    let mut walked: Vec<String> = Vec::new();
+    for steps in 1.. {
+        let (status, body) = get(&router, &query).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        walked.extend(
+            body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|m| m["content"].as_str().expect("content").to_owned()),
+        );
+        let Some(next) = body["next_since"].as_str() else {
+            assert_eq!(body["has_more"], false);
+            break;
+        };
+        assert!(steps < 10, "the walk ends");
+        query = format!(
+            "/api/v1/channels/{SLACK_CH}/page?since={}&limit=5",
+            next.replace(':', "%3A")
+        );
+    }
+    assert_eq!(walked, ["in 0", "in 1", "in 2"]);
+}
