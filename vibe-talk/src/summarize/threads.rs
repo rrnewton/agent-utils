@@ -49,20 +49,20 @@
 //!   held. Nothing the server has been told of since that read may touch the thread
 //!   ([`crate::read_ahead::ThreadChanges`]: a message pushed into it, or pushed into its channel
 //!   with no thread label, or a reply this server posted to it, whether or not the post said it
-//!   arrived). If a delta has said the thread left the list, the count must have been read after
-//!   that delta. Every row, the root included, must come from a page that SAID the provider had
-//!   brought it up to date: a timeline page or channel window answered with no `as_of`. A page with
-//!   `as_of` can hold a message as it was before an edit pushed earlier, which the push's tombstone
-//!   cannot keep out because the page's read began after it; and a single-message lookup (speech
-//!   preparation, a summary in a thread) or a page of the bare message format (`ops::page`) has no
-//!   room for `as_of`, so a provider answering it from an older copy cannot say so. Rows from
-//!   either are never named from. Exactly as many replies as the count must be held, the newest no
-//!   older than the thread's last activity. So an edit or delete pushed while the thread waits
-//!   (which drops the row from read-ahead), a reply pushed or posted here, a reply counted by a
-//!   page read since, a delta saying the thread left the list, or rows that expired while it waited
-//!   all send the thread to the provider. A thread of more than [`THREAD_FETCH_LIMIT`] replies is
-//!   always read: rows held cannot show they are its newest replies rather than an older page of
-//!   them.
+//!   arrived), and no post of this server's own that may land in it may still be on its way. If a
+//!   delta has said the thread left the list, the count must have been read after that delta. Every
+//!   row, the root included, must come from a page that SAID the provider had brought it up to
+//!   date: a timeline page or channel window answered with no `as_of`. A page with `as_of` can hold
+//!   a message as it was before an edit pushed earlier, which the push's tombstone cannot keep out
+//!   because the page's read began after it; and a single-message lookup (speech preparation, a
+//!   summary in a thread) or a page of the bare message format (`ops::page`) has no room for
+//!   `as_of`, so a provider answering it from an older copy cannot say so. Rows from either are
+//!   never named from. Exactly as many replies as the count must be held, the newest no older than
+//!   the thread's last activity. So an edit or delete pushed while the thread waits (which drops
+//!   the row from read-ahead), a reply pushed or posted here, a reply counted by a page read since,
+//!   a delta saying the thread left the list, or rows that expired while it waited all send the
+//!   thread to the provider. A thread of more than [`THREAD_FETCH_LIMIT`] replies is always read:
+//!   rows held cannot show they are its newest replies rather than an older page of them.
 //! * What that still accepts is a change the server is not told of, inside the 30 s a row is held.
 //!   An edit, to the root or a reply, changes neither the count nor the last activity, so the
 //!   thread is named from the text as the page read it. A delete can go unseen too: a deleted reply
@@ -71,16 +71,22 @@
 //!   before its turn: otherwise the thread is named without that reply, the name is kept, and the
 //!   sentence is filed at the old count, so it is not replaced before the next milestone. The same
 //!   30 s read-ahead allows speech; here the name it gives is kept. A provider that pushes every
-//!   change, each labelled with its thread, narrows all of this to the time a push takes to
-//!   arrive; this server's own posts need no push. And a thread naming does read is named from
-//!   that read even when the provider could not bring it up to date (`as_of`), as it always was:
-//!   there is nothing fresher to fall back to.
+//!   change, each labelled with its thread, narrows all of this to the time a push takes to arrive.
+//!   This server's own posts need no push: each is marked before it is sent
+//!   ([`crate::read_ahead::ThreadChanges::posting`]) and noted when it answers or fails, so a
+//!   thread decided while one is already upstream with its answer still on the way, or after one
+//!   lost its answer, is read. A post to a thread marks that thread; a reply that names no thread
+//!   marks every thread of its channel, and is noted against the thread its answer names, or
+//!   against the whole channel when the answer names none or never came. And a thread naming does
+//!   read is named from that read even when the provider could not bring it up to date (`as_of`),
+//!   as it always was: there is nothing fresher to fall back to.
 //! * Being this strict costs reads. Rows read AFTER the thread's count (a Flat page read after the
 //!   thread list) are not used until a page reads the count again; a reply pushed or posted into a
 //!   thread does the same to it, and a message pushed with no thread label to every thread of its
-//!   channel. A list the provider could not bring up to date names nothing without a read, and rows
-//!   from any page it could not bring up to date, or from a fetch that cannot say, are never named
-//!   from.
+//!   channel. A post of this server's own sends its thread to a read while it is on its way, and a
+//!   reply that names no thread every thread of its channel. A list the provider could not bring
+//!   up to date names nothing without a read, and rows from any page it could not bring up to
+//!   date, or from a fetch that cannot say, are never named from.
 //! * Any other thread costs one read, and naming reads at most one thread per channel per
 //!   [`READ_INTERVAL`]. A thread over the budget waits for its channel's next turn without holding
 //!   up the queue, and at most [`MAX_PENDING_PER_CHANNEL`] wait per channel, so another channel is
@@ -474,8 +480,9 @@ pub struct ThreadDeps {
     /// What this server has read in the last 30 s, looked at before the thread is read from
     /// `chat`. `#278 naming-throttle`.
     pub read_ahead: Arc<ReadAhead>,
-    /// Which threads the live feed, or this server's own posts, have said changed: a count read
-    /// before that names nothing from `read_ahead`. `#278 naming-throttle`.
+    /// Which threads the live feed, or this server's own posts, have said changed, and which this
+    /// server is posting into now: a count read before a change, or while a post that may land in
+    /// the thread is on its way, names nothing from `read_ahead`. `#278 naming-throttle`.
     pub changes: Arc<ThreadChanges>,
     /// Whether a channel is on this server's list NOW. A thread can wait minutes for its turn, and
     /// a channel taken off the list meanwhile is not read for it, nor is anything filed for it
@@ -1325,7 +1332,9 @@ impl From<SummaryError> for NameError {
 ///   after any delta that said the thread left the list (`seen` is `None` otherwise). An older
 ///   count says nothing about the thread now.
 /// * no change to the thread, or to its channel with no thread known, has been noted in `changes`
-///   since the count was read: a reply pushed, or posted by this server, after it.
+///   since the count was read: a reply pushed, or posted by this server, after it. Nor is a post of
+///   this server's own still on its way that may land in the thread: one sent to it, or a reply
+///   that names no thread, sent to the channel. It may be upstream already, its answer not back.
 /// * every row, the root included, came from a page that said the provider had brought it up to
 ///   date ([`crate::read_ahead::Recalled::current`]). A page that carried `as_of` may hold a
 ///   message as it was before an edit pushed earlier, which its tombstone cannot keep out because

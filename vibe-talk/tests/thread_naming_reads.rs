@@ -16,11 +16,12 @@
 //! for a read only when they are what the read would bring. They are looked up at the thread's
 //! turn, the root included, never copied when it is queued, and checked against the newest summary
 //! any page has carried of the thread since: an exact count of at most 50, from a current page,
-//! read no earlier than any reply held and with nothing pushed or posted into the thread since,
-//! matched exactly by rows that all came from pages that said they were current (a single-message
-//! lookup cannot say), the newest reply no older than the thread's last activity. What changes
-//! while a thread waits (an edit or delete pushed, a reply pushed or posted here, a reply counted by
-//! a later page, a delta that removes it) is seen at its turn; a reply added with nothing pushed is not, unless a page
+//! read no earlier than any reply held, with nothing pushed or posted into the thread since and no
+//! post from here that may land in it still on its way, matched exactly by rows that all came from
+//! pages that said they were current (a single-message lookup cannot say), the newest reply no
+//! older than the thread's last activity. What changes while a thread waits (an edit or delete
+//! pushed, a reply pushed, posted here or being posted, a reply counted by a later page, a delta
+//! that removes it) is seen at its turn; a reply added with nothing pushed is not, unless a page
 //! counts it first, and no test here claims otherwise. Pages that land out of order are ordered by
 //! the instant their answers are complete up to (when a current read began; no later than an
 //! `as_of`), so a renamed thread rides a delta as the newest read showed it, and never once a delta
@@ -89,6 +90,12 @@ struct Forum {
     unlisted: Mutex<Vec<String>>,
     /// When set, a post to a thread arrives upstream and its answer is lost on the way back.
     lose_post_answers: Mutex<bool>,
+    /// When set, the next post arrives upstream and its answer waits for a permit from this: a
+    /// post in flight, already in the thread, its answer not yet back.
+    hold_next_post_answer: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// When set, a post's answer says nothing of the thread it landed in, as a provider's answer to
+    /// a reply can.
+    unlabelled_post_answers: Mutex<bool>,
     /// When set, a single-message lookup in a thread answers from THESE threads: a provider that
     /// answers a lookup from an older copy it keeps, in a format with no room for `as_of`.
     stale_lookups: Mutex<Option<Vec<ForumThread>>>,
@@ -199,6 +206,45 @@ impl Forum {
             display_name: None,
             summary: None,
         }
+    }
+
+    /// Put a reply to `thread_id` upstream, newer than everything in it.
+    fn land_post(&self, channel: &ChannelId, thread_id: &str, content: &str) -> Option<Message> {
+        let mut posted = None;
+        self.change(channel, |threads| {
+            if let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) {
+                let id = thread
+                    .replies
+                    .last()
+                    .unwrap_or(&thread.root)
+                    .id
+                    .numeric()
+                    .unwrap()
+                    + 1;
+                let reply = message(channel, id, content, thread_id, false);
+                thread.replies.push(reply.clone());
+                posted = Some(reply);
+            }
+        });
+        posted
+    }
+
+    /// The answer to a post that has landed upstream, as this provider is set to give it: held,
+    /// lost, or without its thread label.
+    async fn answer(&self, mut posted: Message) -> Result<Message, ChatError> {
+        let hold = self.hold_next_post_answer.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.acquire().await.expect("never closed").forget();
+        }
+        if *self.lose_post_answers.lock().unwrap() {
+            return Err(ChatError::Transport(
+                "the connection dropped before the answer".to_owned(),
+            ));
+        }
+        if *self.unlabelled_post_answers.lock().unwrap() {
+            posted.thread = None;
+        }
+        Ok(posted)
     }
 
     /// When each thread was read, oldest first.
@@ -318,13 +364,27 @@ impl ChatClient for Forum {
         };
         Ok(page)
     }
+    /// A reply to a message lands in that message's thread, as a reply does on a threaded
+    /// provider. A post to the conversation itself is refused: nothing here needs one.
     async fn post_message(
         &self,
-        _channel: &ChannelId,
-        _content: &str,
-        _reply: Option<&MessageId>,
+        channel: &ChannelId,
+        content: &str,
+        reply: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        Err(ChatError::Refused("read only".to_owned()))
+        let reply = reply.ok_or_else(|| ChatError::Refused("read only".to_owned()))?;
+        let thread_id = self
+            .threads(channel)
+            .into_iter()
+            .find(|thread| {
+                thread.root.id == *reply || thread.replies.iter().any(|m| m.id == *reply)
+            })
+            .map(|thread| thread.id)
+            .ok_or_else(|| ChatError::Refused("no such message".to_owned()))?;
+        let posted = self
+            .land_post(channel, &thread_id, content)
+            .ok_or_else(|| ChatError::Refused("no such thread".to_owned()))?;
+        self.answer(posted).await
     }
     async fn post_in_thread(
         &self,
@@ -333,29 +393,10 @@ impl ChatClient for Forum {
         content: &str,
         _reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        let mut posted = None;
-        self.change(channel, |threads| {
-            if let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) {
-                let id = thread
-                    .replies
-                    .last()
-                    .unwrap_or(&thread.root)
-                    .id
-                    .numeric()
-                    .unwrap()
-                    + 1;
-                let reply = message(channel, id, content, thread_id, false);
-                thread.replies.push(reply.clone());
-                posted = Some(reply);
-            }
-        });
-        let posted = posted.ok_or_else(|| ChatError::Refused("no such thread".to_owned()))?;
-        if *self.lose_post_answers.lock().unwrap() {
-            return Err(ChatError::Transport(
-                "the connection dropped before the answer".to_owned(),
-            ));
-        }
-        Ok(posted)
+        let posted = self
+            .land_post(channel, thread_id, content)
+            .ok_or_else(|| ChatError::Refused("no such thread".to_owned()))?;
+        self.answer(posted).await
     }
     async fn fetch_thread_message(
         &self,
@@ -1975,7 +2016,7 @@ async fn a_list_the_provider_could_not_bring_up_to_date_does_not_replace_a_curre
     );
 }
 
-// --- third re-review: what a read is complete up to, and rows nothing dates ----------------------
+// --- third re-review: what a read is complete up to, rows nothing dates, and posts in flight -----
 
 #[tokio::test(start_paused = true)]
 async fn a_list_complete_up_to_after_the_last_current_read_is_what_deltas_carry() {
@@ -2055,6 +2096,146 @@ async fn a_reply_a_lookup_brought_from_an_older_copy_does_not_undo_a_pushed_edit
         "named from a lookup's old copy of a reply whose edit was pushed: {prompt}"
     );
     assert!(!prompt.contains("reply 1 in thread 0"), "{prompt}");
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+/// Post `body` to the write channel as the owner's page does.
+async fn post_reply(h: &Harness, body: Value) -> (StatusCode, Value) {
+    call(
+        h.app.clone(),
+        WRITE_TOKEN,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        Some(body),
+    )
+    .await
+}
+
+/// Two threads of one reply, both held from a Flat page and the list; thread 0 holds the naming
+/// turn inside its model call, so thread 1 is decided only once the gate opens.
+async fn two_threads_waiting() -> Harness {
+    let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 1), 0);
+    get(&h, &flat_page(WRITE_CHANNEL)).await;
+    thread_list(&h, WRITE_CHANNEL).await;
+    run_for(1).await;
+    assert_eq!(h.names.pending(), 2);
+    assert_eq!(thread_reads(&h, &write_channel()), 0, "both are held");
+    h
+}
+
+/// Let the waiting threads be named, and answer the prompt thread 1 was named from.
+async fn thread_1_named(h: &Harness) -> String {
+    h.gate.add_permits(10);
+    until_named(&h.names, 2).await;
+    prompt_about(h, "thread 1 starts here")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_to_a_message_whose_answer_was_lost_is_in_its_threads_name() {
+    // The owner answers reply 1 of thread 1 by `reply_to`, with no thread named: the voice agent's
+    // post tool and the post-proposal commit both post this way. It lands in thread 1, and the
+    // answer is lost, so nothing says which thread it went to: no count read before it, in any
+    // thread of the channel, may be trusted.
+    let h = two_threads_waiting().await;
+    let target = h.forum.threads(&write_channel())[1].replies[0].id.clone();
+    *h.forum.lose_post_answers.lock().unwrap() = true;
+    let (status, body) = post_reply(
+        &h,
+        serde_json::json!({ "text": "the owner's answer in thread 1", "reply_to": target }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    let prompt = thread_1_named(&h).await;
+    assert!(
+        prompt.contains("the owner's answer in thread 1"),
+        "named without a reply whose post may have arrived: {prompt}"
+    );
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_to_a_message_answered_with_no_thread_label_is_in_its_threads_name() {
+    // The same post answered, but the answer does not say which thread it landed in.
+    let h = two_threads_waiting().await;
+    let target = h.forum.threads(&write_channel())[1].replies[0].id.clone();
+    *h.forum.unlabelled_post_answers.lock().unwrap() = true;
+    let (status, body) = post_reply(
+        &h,
+        serde_json::json!({ "text": "the owner's answer in thread 1", "reply_to": target }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let prompt = thread_1_named(&h).await;
+    assert!(
+        prompt.contains("the owner's answer in thread 1"),
+        "named without a reply that landed in it: {prompt}"
+    );
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+/// Send `body` as a post whose answer is held, and decide thread 1 while it is in flight: already
+/// in the thread upstream, its answer not yet back. Answers the prompt thread 1 was named from.
+async fn thread_1_named_while_posting(h: &Harness, body: Value) -> String {
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *h.forum.hold_next_post_answer.lock().unwrap() = Some(Arc::clone(&hold));
+    let app = h.app.clone();
+    let posting = tokio::spawn(async move {
+        call(
+            app,
+            WRITE_TOKEN,
+            "POST",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+            Some(body),
+        )
+        .await
+    });
+    run_for(1).await;
+    assert!(
+        h.forum.hold_next_post_answer.lock().unwrap().is_none(),
+        "the post has not landed"
+    );
+    assert_eq!(h.forum.threads(&write_channel())[1].replies.len(), 2);
+    let prompt = thread_1_named(h).await;
+    hold.add_permits(1);
+    let (status, answer) = posting.await.expect("the post");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    prompt
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_in_flight_to_a_thread_when_it_is_decided_is_in_its_name() {
+    // The post is already in thread 1 upstream when thread 1's turn comes, and its answer is not
+    // back: what was read before it cannot be what the thread has.
+    let h = two_threads_waiting().await;
+    let prompt = thread_1_named_while_posting(
+        &h,
+        serde_json::json!({
+            "text": "the owner's reply in thread 1",
+            "thread_id": write_thread(1),
+        }),
+    )
+    .await;
+    assert!(
+        prompt.contains("the owner's reply in thread 1"),
+        "named from rows read before a post in flight to it: {prompt}"
+    );
+    assert_eq!(thread_reads(&h, &write_channel()), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_to_a_message_in_flight_when_its_thread_is_decided_is_in_its_name() {
+    // The same by `reply_to`: until it answers, it may be in any thread of the channel.
+    let h = two_threads_waiting().await;
+    let target = h.forum.threads(&write_channel())[1].replies[0].id.clone();
+    let prompt = thread_1_named_while_posting(
+        &h,
+        serde_json::json!({ "text": "the owner's answer in thread 1", "reply_to": target }),
+    )
+    .await;
+    assert!(
+        prompt.contains("the owner's answer in thread 1"),
+        "named from rows read before a post in flight to it: {prompt}"
+    );
     assert_eq!(thread_reads(&h, &write_channel()), 1);
 }
 

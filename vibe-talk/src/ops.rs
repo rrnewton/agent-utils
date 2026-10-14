@@ -1704,6 +1704,7 @@ pub async fn reply_scoped(
     }
 
     let keys = idempotency_key.map(|key| part_keys(key, &parts));
+    let changes = state.live.thread_changes();
     let mut posted: Vec<Message> = Vec::new();
     // Where the parts after the first go, for a post to the conversation itself: the thread under
     // the first part, where the provider continues a long message there. Learned from the first
@@ -1716,6 +1717,17 @@ pub async fn reply_scoped(
         let parent = if index == 0 { reply_to.as_ref() } else { None };
         let key = keys.as_ref().map(|keys| keys[index].as_str());
         let into = thread_id.or(continuation.as_deref());
+        // What this part may change, marked BEFORE it is sent: it can be in the thread upstream
+        // while its answer is still on the way, or lost, and thread naming must not take a count
+        // read before it for what that thread has now (`#278 naming-throttle`). A part to a thread
+        // marks that thread. A reply with no thread named marks the whole channel, since it lands
+        // in whichever thread holds the message it answers. A new message to the conversation
+        // changes no thread already there, so it marks nothing.
+        let posting = match (into, parent) {
+            (Some(thread), _) => Some(changes.posting(&info.id, Some(thread))),
+            (None, Some(_)) => Some(changes.posting(&info.id, None)),
+            (None, None) => None,
+        };
         let sent = match into {
             Some(thread) => {
                 state
@@ -1730,20 +1742,23 @@ pub async fn reply_scoped(
                     .await
             }
         };
-        // The thread this part went to has a reply its last-read count does not show, whether or
-        // not the answer says it arrived: thread naming must not take that count for what the
-        // thread has now (`#278 naming-throttle`). A part to the conversation itself starts its own
-        // thread, or none, and changes no other.
-        let changed = match &sent {
-            Ok(one) => one
-                .thread
-                .as_ref()
-                .map(|thread| thread.id.as_str())
-                .or(into),
-            Err(_) => into,
-        };
-        if let Some(thread) = changed {
-            state.live.thread_changes().note(&info.id, Some(thread));
+        // Answered or failed: noted as of now, and the mark cleared in the same step. A failed
+        // post, or a reply whose answer does not say which thread it landed in, is noted against
+        // all it was marked for, the whole channel included: it may have arrived.
+        let landed_in = sent
+            .as_ref()
+            .ok()
+            .and_then(|one| one.thread.as_ref())
+            .map(|thread| thread.id.as_str());
+        match posting {
+            Some(posting) => posting.settle(landed_in),
+            // A new message to the conversation: only the thread it starts, if the answer names
+            // one.
+            None => {
+                if let Some(thread) = landed_in {
+                    changes.note(&info.id, Some(thread));
+                }
+            }
         }
         match sent {
             Ok(mut one) => {

@@ -57,8 +57,10 @@
 //!   out. A fetch with no room for `as_of` ([`ReadAhead::remember`]: a single-message lookup for
 //!   speech or a summary, a page of `ops::page`) cannot say either way. Such rows are
 //!   [`Recalled::current`] `false`, and naming does not use them.
-//! - which threads the live feed has said changed ([`ThreadChanges`]): a reply pushed into a thread
-//!   adds no row to forget, but it does make every count read before it out of date.
+//! - which threads the live feed has said changed, and which this server is posting into
+//!   ([`ThreadChanges`]): a reply pushed into a thread adds no row to forget, but it does make
+//!   every count read before it out of date, and so does a post of this server's own from the
+//!   moment it is sent.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -565,7 +567,9 @@ impl ReadAhead {
 /// no thread) is noted against the whole channel.
 ///
 /// Fed by [`crate::live::LiveHub`], which both live producers reach (a pushed event and a polled
-/// message), and by this server's own posts ([`crate::ops::reply_scoped`]). Ids only, never text.
+/// message), and by this server's own posts ([`crate::ops::reply_scoped`]), which are marked
+/// BEFORE they are sent ([`ThreadChanges::posting`]): a post can be in the thread upstream while
+/// its answer is still on the way back, or lost. Ids only, never text.
 /// A note older than [`RECENT_TTL`] is not needed: a count read before it is too old to be used
 /// anyway. Bounded by [`MAX_RECENT`] notes of each kind; past that, the oldest go and a floor rises
 /// in their place, as [`ReadAhead::forget`]'s tombstones do, so the bound never makes a count read
@@ -582,6 +586,38 @@ struct Changes {
     channels: HashMap<ChannelId, Instant>,
     /// Every count read at or before this proves nothing.
     floor: Option<Instant>,
+    /// This server's own posts on their way upstream, counted by channel and the thread they were
+    /// sent to (`None`: a reply to a message whose thread is not known, which may land in any
+    /// thread of the channel). While one is counted, no count read of what it may land in proves
+    /// anything, however recently it was read.
+    posting: HashMap<(ChannelId, Option<String>), usize>,
+}
+
+impl Changes {
+    fn note(&mut self, channel: &ChannelId, thread: Option<&str>, now: Instant) {
+        let fresh = |at: &Instant| now.saturating_duration_since(*at) < RECENT_TTL;
+        self.threads.retain(|_, at| fresh(at));
+        self.channels.retain(|_, at| fresh(at));
+        match thread {
+            Some(thread) => {
+                self.threads
+                    .insert((channel.clone(), thread.to_owned()), now);
+            }
+            None => {
+                self.channels.insert(channel.clone(), now);
+            }
+        }
+        let mut dropped = None;
+        if self.threads.len() > MAX_RECENT {
+            dropped = oldest_out(&mut self.threads).max(dropped);
+        }
+        if self.channels.len() > MAX_RECENT {
+            dropped = oldest_out(&mut self.channels).max(dropped);
+        }
+        if let Some(at) = dropped {
+            self.floor = Some(self.floor.map_or(at, |floor| floor.max(at)));
+        }
+    }
 }
 
 impl ThreadChanges {
@@ -600,33 +636,35 @@ impl ThreadChanges {
         let Ok(mut held) = self.held.lock() else {
             return;
         };
-        let fresh = |at: &Instant| now.saturating_duration_since(*at) < RECENT_TTL;
-        held.threads.retain(|_, at| fresh(at));
-        held.channels.retain(|_, at| fresh(at));
-        match thread {
-            Some(thread) => {
-                held.threads
-                    .insert((channel.clone(), thread.to_owned()), now);
-            }
-            None => {
-                held.channels.insert(channel.clone(), now);
-            }
+        held.note(channel, thread, now);
+    }
+
+    /// Mark a post this server is about to send into `thread` of `channel`, BEFORE it is sent:
+    /// `None` for a reply to a message whose thread is not known, which may land in any thread of
+    /// the channel. Until the post settles ([`Posting::settle`]), or the guard is dropped, no count
+    /// read of what it may land in proves anything; then the change is noted as of that moment.
+    /// So a thread decided while the post is already upstream, its answer not yet back, is read,
+    /// and so is one whose post failed or lost its answer. `#278 naming-throttle`.
+    pub fn posting(self: &Arc<Self>, channel: &ChannelId, thread: Option<&str>) -> Posting {
+        let thread = thread.map(str::to_owned);
+        if let Ok(mut held) = self.held.lock() {
+            *held
+                .posting
+                .entry((channel.clone(), thread.clone()))
+                .or_default() += 1;
         }
-        let mut dropped = None;
-        if held.threads.len() > MAX_RECENT {
-            dropped = oldest_out(&mut held.threads).max(dropped);
-        }
-        if held.channels.len() > MAX_RECENT {
-            dropped = oldest_out(&mut held.channels).max(dropped);
-        }
-        if let Some(at) = dropped {
-            held.floor = Some(held.floor.map_or(at, |floor| floor.max(at)));
+        Posting {
+            changes: Arc::clone(self),
+            channel: channel.clone(),
+            thread,
+            settled: false,
         }
     }
 
     /// Whether a change to `thread` of `channel`, or to the channel with no thread known, was
-    /// noted at or after `since`: then what a read that began at `since` said of the thread may
-    /// not show it. A poisoned lock says yes.
+    /// noted at or after `since`, or a post of this server's own that may land in it is still on
+    /// its way: then what a read that began at `since` said of the thread may not show it. A
+    /// poisoned lock says yes.
     #[must_use]
     pub fn changed_since(&self, channel: &ChannelId, thread: &str, since: Instant) -> bool {
         let Ok(held) = self.held.lock() else {
@@ -638,6 +676,67 @@ impl ThreadChanges {
                 .threads
                 .get(&(channel.clone(), thread.to_owned()))
                 .is_some_and(|at| *at >= since)
+            || held.posting.contains_key(&(channel.clone(), None))
+            || held
+                .posting
+                .contains_key(&(channel.clone(), Some(thread.to_owned())))
+    }
+}
+
+/// A post of this server's own on its way upstream, marked by [`ThreadChanges::posting`].
+/// `#278 naming-throttle`.
+#[derive(Debug)]
+#[must_use = "the mark is cleared, and the change noted, when this settles or is dropped"]
+pub struct Posting {
+    changes: Arc<ThreadChanges>,
+    channel: ChannelId,
+    thread: Option<String>,
+    settled: bool,
+}
+
+impl Posting {
+    /// The post answered or failed: `landed_in` is the thread its answer labelled it with, if it
+    /// answered with one. Notes the change as of now and clears the mark, in one step, so no count
+    /// read is trusted in between. What is noted: the thread it was sent to, and the thread it
+    /// landed in if that is another; for a reply whose thread was not known, the thread it landed
+    /// in, or the whole channel when the answer does not say or never came.
+    pub fn settle(mut self, landed_in: Option<&str>) {
+        self.finish(landed_in);
+    }
+
+    fn finish(&mut self, landed_in: Option<&str>) {
+        if std::mem::replace(&mut self.settled, true) {
+            return;
+        }
+        let Ok(mut held) = self.changes.held.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        match (self.thread.as_deref(), landed_in) {
+            (Some(sent_to), landed_in) => {
+                held.note(&self.channel, Some(sent_to), now);
+                if let Some(landed_in) = landed_in.filter(|landed_in| *landed_in != sent_to) {
+                    held.note(&self.channel, Some(landed_in), now);
+                }
+            }
+            (None, Some(landed_in)) => held.note(&self.channel, Some(landed_in), now),
+            (None, None) => held.note(&self.channel, None, now),
+        }
+        let key = (self.channel.clone(), self.thread.clone());
+        if let Some(count) = held.posting.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.posting.remove(&key);
+            }
+        }
+    }
+}
+
+impl Drop for Posting {
+    /// Dropped unsettled (the request was abandoned mid-post): the post may have landed, so it is
+    /// noted as one that failed would be.
+    fn drop(&mut self) {
+        self.finish(None);
     }
 }
 
@@ -1214,6 +1313,67 @@ mod tests {
             .recall_thread(&channel, "T")
             .iter()
             .any(|held| held.message.id.0 == "10" && held.current));
+    }
+
+    #[test]
+    fn a_post_of_our_own_counts_against_every_read_while_it_is_on_its_way_and_after_it_settles() {
+        // `#278 naming-throttle`. A post can be in its thread upstream while its answer is still on
+        // the way, or lost: marked before it is sent, it counts against reads made at any time
+        // until it settles, and is then noted as of that moment.
+        let changes = Arc::new(ThreadChanges::new());
+        let channel = ChannelId("1".to_owned());
+        let other = ChannelId("2".to_owned());
+
+        // To a thread: that thread only, even against a read made after it was sent.
+        let to_thread = changes.posting(&channel, Some("T"));
+        let read_while_posting = Instant::now();
+        assert!(changes.changed_since(&channel, "T", read_while_posting));
+        assert!(!changes.changed_since(&channel, "U", read_while_posting));
+        assert!(!changes.changed_since(&other, "T", read_while_posting));
+        to_thread.settle(Some("T"));
+        assert!(
+            changes.changed_since(&channel, "T", read_while_posting),
+            "noted as of when it settled"
+        );
+        let after = Instant::now() + Duration::from_millis(1);
+        assert!(!changes.changed_since(&channel, "T", after), "mark cleared");
+
+        // A reply with no thread known: every thread of its channel until it settles, then the
+        // thread its answer names...
+        let changes = Arc::new(ThreadChanges::new());
+        let reply = changes.posting(&channel, None);
+        let read = Instant::now();
+        assert!(changes.changed_since(&channel, "T", read));
+        assert!(changes.changed_since(&channel, "U", read));
+        assert!(!changes.changed_since(&other, "T", read));
+        reply.settle(Some("U"));
+        assert!(changes.changed_since(&channel, "U", read));
+        assert!(!changes.changed_since(&channel, "T", read), "landed in U");
+        // ...or the whole channel when it names none, or failed.
+        let unlabelled = changes.posting(&channel, None);
+        let read = Instant::now();
+        unlabelled.settle(None);
+        assert!(changes.changed_since(&channel, "T", read));
+
+        // Dropped unsettled (the request was abandoned): noted as a failure would be.
+        let changes = Arc::new(ThreadChanges::new());
+        let read = Instant::now();
+        drop(changes.posting(&channel, Some("T")));
+        assert!(changes.changed_since(&channel, "T", read));
+        assert!(!changes.changed_since(&channel, "U", read));
+        assert!(changes.held.lock().unwrap().posting.is_empty());
+
+        // Two posts to one thread: marked until both settle.
+        let first = changes.posting(&channel, Some("V"));
+        let second = changes.posting(&channel, Some("V"));
+        first.settle(Some("V"));
+        let later = Instant::now() + Duration::from_secs(1);
+        assert!(
+            changes.changed_since(&channel, "V", later),
+            "one still on its way"
+        );
+        second.settle(Some("V"));
+        assert!(!changes.changed_since(&channel, "V", later));
     }
 
     #[test]

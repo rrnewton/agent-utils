@@ -1537,33 +1537,42 @@ of the thread reads a deployment made. So:
   provider had brought up to date (no `as_of`, however recent), and read no earlier than any of
   the replies held, and nothing this server has been told of since may touch the thread: a
   message pushed into it (or pushed into its channel with no thread label), or a reply you posted
-  to it from here, whether or not the post said it arrived. After a delta saying the thread left
-  the list, only a count read after that delta will do. Every message held must come from a page
-  that *said* the provider had brought it up to date, which only a thread-list, thread, Flat or
-  channel-window read answered without `as_of` can say: one marked `as_of` can still hold a
-  message as it was before an edit that was pushed earlier, and a single-message lookup
-  (read-aloud preparation, a summary in a thread) or a step of `/api/v1/channels/{id}/page` has
-  no room for `as_of`, so its messages are never named from. Exactly as many replies as the count
-  must be held, and the newest of them must be no older than the thread's last activity. So an
-  edit or delete pushed while the thread waits, a reply pushed or posted here, a reply a later
-  page counts, a delta saying it left the list, or messages that have expired all send it to the
-  provider instead. A thread of more than 50 replies is always read: the replies held might be an
-  older page you scrolled to rather than its newest.
-* What this cannot see is a change the server is not told of, within those 30 seconds. An edit,
-  to the root or a reply, changes neither the count nor the last activity, so the thread is named
-  from the text as the page read it; a deleted reply can still be among the messages a thread is
-  named from, or a deleted thread still be named; and a reply added with nothing pushed is missed
-  unless a page reads the thread's count again before its turn. When it is missed, the thread is
-  named without it, the name is kept, and the sentence is filed at the old count, so it is not
-  replaced before the next milestone. A provider that pushes every change, each labelled with its
-  thread, narrows this to the time a push takes to arrive. A thread that naming does read is named
-  from that read even if the provider could not bring it up to date (`as_of`), as before: there is
-  nothing fresher to fall back to.
+  to it from here, whether or not the post said it arrived. Nor may a post from here that could
+  land in it still be on its way. After a delta saying the thread left the list, only a count
+  read after that delta will do. Every message held must come from a page that *said* the
+  provider had brought it up to date, which only a thread-list, thread, Flat or channel-window
+  read answered without `as_of` can say: one marked `as_of` can still hold a message as it was
+  before an edit that was pushed earlier, and a single-message lookup (read-aloud preparation, a
+  summary in a thread) or a step of `/api/v1/channels/{id}/page` has no room for `as_of`, so its
+  messages are never named from. Exactly as many replies as the count must be held, and the
+  newest of them must be no older than the thread's last activity. So an edit or delete pushed
+  while the thread waits, a reply pushed or posted here, a reply a later page counts, a delta
+  saying it left the list, or messages that have expired all send it to the provider instead. A
+  thread of more than 50 replies is always read: the replies held might be an older page you
+  scrolled to rather than its newest.
+* What this cannot see is a change the server is not told of, within those 30 seconds. An edit, to
+  the root or a reply, changes neither the count nor the last activity, so the thread is named from
+  the text as the page read it; a deleted reply can still be among the messages a thread is named
+  from, or a deleted thread still be named; and a reply added with nothing pushed is missed unless a
+  page reads the thread's count again before its turn. When it is missed, the thread is named
+  without it, the name is kept, and the sentence is filed at the old count, so it is not replaced
+  before the next milestone. A provider that pushes every change, each labelled with its thread,
+  narrows this to the time a push takes to arrive. Your own posts from here need no push: each is
+  marked before it is sent and noted when it answers or fails, so a thread decided while one is
+  already upstream with its answer still on the way, or after one lost its answer, is read. A post
+  to a thread marks that thread; a reply to a message that names no thread, as the voice agent's
+  post tool and a confirmed post proposal send one, marks every thread of its channel until its
+  answer names the thread it landed in, and if the answer names none, or never comes, the change is
+  noted against the whole channel. A thread that naming does read is named from that read even if
+  the provider could not bring it up to date (`as_of`), as before: there is nothing fresher to fall
+  back to.
 * Being strict costs reads: a Flat page read *after* the thread list is not used until a page
   shows the thread's count again; a reply pushed or posted into a thread does the same to it, and
-  a message pushed with no thread label to every thread of its channel; a thread list the
-  provider could not bring up to date (`as_of`) names nothing without a read; and messages from
-  any page marked `as_of`, or from a fetch that cannot say, are never named from.
+  a message pushed with no thread label to every thread of its channel; a post from here sends its
+  thread to a read while it is on its way, and a reply that names no thread every thread of its
+  channel; a thread list the provider could not bring up to date (`as_of`) names nothing without
+  a read; and messages from any page marked `as_of`, or from a fetch that cannot say, are never
+  named from.
 * Any other thread costs one read, and naming reads **at most one thread per channel every 30
   seconds**. Twenty unnamed threads in one channel are named over ten minutes, not in one burst;
   at most 64 of one channel's threads wait at a time, so other channels are not held behind
