@@ -1375,6 +1375,107 @@ async fn a_provider_whose_thread_view_counts_a_reply_fewer_than_its_list_names_e
     assert_eq!(h.summarizer.thread_prompts().len(), ids.len());
 }
 
+/// A reply deleted at the start, where `named_at` is `None`, or, with `Some(replies)`, after the
+/// thread was named with two replies and grew to `replies`: the list shows the deletion, and the
+/// read at the thread's turn is answered from the bridge's copy from before it, with `as_of`, so
+/// the sentence is made from the deleted reply — the read at its turn is all a name is made from.
+/// The bridge then catches up, one new reply arrives, and a write-scope page polls the list every
+/// five seconds for over ten minutes. Returns how many times the thread was read in all, and the
+/// prompt of its last naming.
+async fn deleted_while_behind_then_a_reply(named_at: Option<usize>) -> (usize, String) {
+    let h = harness();
+    let thread = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+    let replies = match named_at {
+        None => 1,
+        Some(replies) => {
+            h.poll(WRITE_CHANNEL, true).await;
+            h.at(5).await;
+            assert_eq!(reads_of(&h, std::slice::from_ref(&thread)), [1]);
+            h.at(40).await;
+            replies
+        }
+    };
+    h.upstream.change(&thread, |thread| {
+        thread.replies = (1..replies).map(|n| format!("reply {n}")).collect();
+        thread.replies.push("a reply deleted since".to_owned());
+        thread.active_second = 40;
+    });
+    let before = h.upstream.channels.lock().unwrap()[WRITE_CHANNEL][0].clone();
+    h.upstream.change(&thread, |thread| {
+        thread.replies.pop();
+        thread.active_second = 35;
+    });
+    h.upstream
+        .behind
+        .lock()
+        .unwrap()
+        .insert(thread.clone(), (before, "2026-10-13T08:00:40Z".to_owned()));
+    let shown = h.poll(WRITE_CHANNEL, true).await;
+    assert_eq!(shown.threads[0].reply_count, Some(replies as u64 - 1));
+    let at = named_at.map_or(0, |_| 40);
+    h.at(at + 30).await;
+    let prompts = h.summarizer.thread_prompts();
+    assert_eq!(prompts.len(), if named_at.is_some() { 2 } else { 1 });
+    assert!(
+        prompts.last().unwrap().contains("a reply deleted since"),
+        "named from something other than the read at its turn: {}",
+        prompts.last().unwrap()
+    );
+
+    h.at(at + 60).await;
+    h.upstream.behind.lock().unwrap().clear();
+    h.upstream.change(&thread, |thread| {
+        thread.replies.push("a reply after the deletion".to_owned());
+        thread.active_second = u32::try_from(at + 60).unwrap();
+    });
+    paced(&h, (at + 60, at + 700, 5), |_, _| {}).await;
+    let reads = reads_of(&h, std::slice::from_ref(&thread))[0];
+    let last = h.summarizer.thread_prompts().pop().unwrap();
+    // What a page serves is the sentence of that last naming.
+    let page = h.poll(WRITE_CHANNEL, false).await;
+    assert_eq!(
+        page.threads[0].summary.as_deref(),
+        Some(format!("thread summary #{}", h.summarizer.thread_prompts().len()).as_str())
+    );
+    (reads, last)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_deleted_while_the_read_at_the_turn_was_behind_leaves_the_sentence_at_the_next_reply(
+) {
+    // An unnamed thread whose only reply was deleted: the list shows none, and the read at its
+    // turn still holds it. Filed at that read's count, two messages, the sentence was not due again
+    // when the next reply brought the thread to two, and the deleted reply's text was served for as
+    // long as the thread stayed there. Before W5, and now, it is filed at the one message the list
+    // showed, and the next reply makes it due.
+    let (reads, last) = deleted_while_behind_then_a_reply(None).await;
+    assert_eq!(
+        reads, 2,
+        "the reply after the deletion did not make the thread due"
+    );
+    assert!(
+        last.contains("a reply after the deletion") && !last.contains("a reply deleted since"),
+        "the sentence still holds the deleted reply: {last}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_deleted_while_a_fresh_read_was_behind_leaves_the_sentence_at_the_next_reply() {
+    // The same further up the schedule: named at three messages, the thread grows to seven
+    // replies, the last is deleted (the list shows six, seven messages, which is due), and the read
+    // is from before the deletion. Filed at that read's eight messages, the next fresh sentence was
+    // not due until eighteen; filed at the list's seven, the next reply makes it due at eight.
+    let (reads, last) = deleted_while_behind_then_a_reply(Some(7)).await;
+    assert_eq!(
+        reads, 3,
+        "the reply after the deletion did not make the thread due"
+    );
+    assert!(
+        last.contains("a reply after the deletion") && !last.contains("a reply deleted since"),
+        "the sentence still holds the deleted reply: {last}"
+    );
+}
+
 // --- the order threads are read in --------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
