@@ -98,16 +98,46 @@ without saying which thread it is in, and that no read has placed since, is plac
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
 text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.
 
-**A reply you send marks what it answers Done.** Once the chat service has taken the reply, the
-message you answered is marked Done exactly as its **Done** button would mark it: on the server, at
+**A reply marks read what it answers, whichever way it was started.** `#256 reply-marks-read`,
+`#300 reply-marks-read`. Reply on a message and opening its thread to write in it both make a reply
+to the message before, so they mark alike:
+
+* **A targeted reply** — **Reply**, **Quote reply** or a row's **Draft**, on the reply screen or at
+  the foot of a column in two columns — marks the message it answers, on Main or inside a thread, and
+  only that message, never the rest of its thread.
+* **The first reply that starts a thread** marks the thread's first message, however it was started:
+  **Reply** on that message (with **Start a new thread from this message** ticked, or on Slack, where a
+  reply is a thread reply), or the thread opened from its grey **Thread** (or **→** on the message)
+  and written in while nobody had answered it.
+* **A later message written in a thread's box** marks nothing, and nor does the main channel's box.
+
+Marking read is what the message's own read action does. Once the chat service has taken the
+reply, the message is marked Done exactly as its **Done** button would mark it: on the server, at
 once on screen in both columns, with the **Undo** chip to take it back, and with the bookmark line
 sliding on if it was right above that message. Its button then reads **Unarchive**, **Hide read**
 leaves it out, **Collapse read** folds it, and a thread's count of unread replies on Main stops
-counting it. Only that message is marked, never the rest of its thread. Opening Reply marks nothing,
-and nor does a send that fails or is only partly posted; the **Retry** that sends it does. A message
-already Done is left as it is, and the **Undo** chip keeps offering the last Done. A reply that
-finishes sending after you have moved to another channel marks its message Done on the server only,
-with no **Undo** here. `#256 reply-marks-read`.
+counting it. Where the chat service lets vibe-talk move its own read marker — where the **⋯** menu
+offers **In** *the service* **only** — that marker is then moved through the message as well, as
+that item moves it: for the whole space, and never backward. The server does not ask the service
+again for a message it has already marked through, by a reply or by that item, nor for one before
+it, and the service's bridge keeps its own cursor forward too. The status line then says **Marked
+read here and in** *the service*. Slack has no such marker for vibe-talk to move (its **Clear unread
+in Slack** setting is separate and unchanged), and nor does a bot on Discord itself.
+
+Opening Reply marks nothing, and nor does a send that fails or is only partly posted; the **Retry**
+that sends it does. A message already Done is left as it is, and the **Undo** chip keeps offering
+the last Done. A reply that finishes sending after you have moved to another channel marks its
+message Done on the server only, with no **Undo** here, and moves the service's marker where it can.
+`make -C vibe-talk reply-marks-read-browser` walks it in Chromium at 1280x800 in two columns: a Reply
+docked in each column, a later message in an answered thread's box marking nothing, and the first
+reply typed in a new thread on the right marking its root read in both columns.
+
+**A voice agent's reply follows the same rule.** Its `post_reply` with a reply target is a targeted
+reply; it has no thread box of its own to write in. Once it is posted — at once, with **Ask me
+before the voice agent sends** off, or when you confirm its card by a tap or a yes — the server marks
+the message it answers Done and moves the service's marker through it where it can, never backward
+and never twice. The page shows that Done at its next read of the channel. A proposal not yet
+confirmed, a refusal and a partly posted reply mark nothing.
 
 **The reply screen says where the reply goes, and shows what came before.** Its title bar names
 the thread the reply posts into as the thread picker and the heading over a thread name it (age and
@@ -2760,7 +2790,9 @@ A compatible provider bridge may separately implement `POST /channels/{id}/read`
 `discord.upstream_read_marks = true`. The web app then offers **Mark read in** *the service* under each
 message's **⋯** menu, labelled with the scope it moves (the whole space). That action advances the provider's monotone cursor through the selected message; it does
 not write vibe-talk's local read mark and does not archive the message. Thread-level behavior is
-defined by the provider. The bridge may return JSON or an empty successful response such as `204
+defined by the provider. A reply sent from vibe-talk moves it the same way, through the message the
+reply answers or the root of the thread it starts, after marking that message Done (`#300
+reply-marks-read`): see "A reply marks read what it answers" above. The bridge may return JSON or an empty successful response such as `204
 No Content`. Direct Discord deployments must leave the setting off.
 
 **Clearing unread automatically, per channel** (`#232 upstream-mark-read`). vibe-talk reads only
@@ -2847,7 +2879,10 @@ would make them wrong:
 * **The owner's own mark**, `POST /channels/{id}/read` (**Mark read in**). It is rare, and it can
   name any message, however old, so a stale cursor below that message would let it move the cursor
   back behind what the owner has read since. It reads fresh before writing and writes nothing when
-  the cursor is already at or past the message.
+  the cursor is already at or past the message. A reply's mark (`#300 reply-marks-read`) is this same
+  call, and vibe-talk spends it sparingly: it asks for a reply's message only when that message is
+  newer than every message it has already marked there, by a reply or by **Mark read in**, since its
+  last restart.
 * **A dry run.** It writes nothing and exists to show what a real push would do, so its `advanced`
   and `previous` must be the provider's own, not a remembered value.
 
@@ -3190,7 +3225,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
 | GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting asks first, unless you turn that off" |
 | POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does: propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder, and the thread it belongs in, as the reply route answers, when only part went; the same words again within a minute post nothing, answering the first send's `{sent: true}` when it posted and `409 post_repeated` when it may have) — see "Posting asks first, unless you turn that off" |
-| POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once |
+| POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once; posted whole, its `reply_to` is then marked Done, and read at the provider where it can be (`#300 reply-marks-read`) |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
 | GET | `/api/v1/conversations` | **write** | stored `/voice` transcripts, most recent first |
@@ -3205,7 +3240,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
-| POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…"}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined |
+| POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…", thread_id?, after_reply?}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined. `thread_id` is checked to hold the message. `after_reply: true` is the page asking because a reply it sent answered the message (`#300 reply-marks-read`): the provider is not asked for a message this server has already marked through, nor one before it, and the answer's `outcome` says `marked`, `already_marked` or `behind`. Without it the provider is always asked |
 | GET | `/api/v1/channels/{id}/upstream-clear` | read | whether this server clears the channel's unread state in the provider's own client as it ingests messages, and what it last did; see "Clearing unread automatically" |
 | PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on"}` — set it. Turning it on pushes nothing by itself; the next message that arrives is pushed. Refused for a channel whose provider cannot do it |
 | POST | `/api/v1/channels/{id}/upstream-clear/now` | **write** | no body — Settings' **Mark read now**: push the channel's newest message at once through the running loop and answer `{outcome, message_id?, message_at_ms?, attempt?, state}`: `outcome` is `pushed` (the provider took the push that covers the pressed message; `attempt` is it), `failed` or `skipped` (that push failed, or named a message the bridge no longer holds; `attempt` says so), `covered`, `no_message`, `retry_waiting`, `changed` (the setting changed meanwhile), `unavailable`, or `waiting` (nothing recorded within 45 s, the whole request included; the server carries on). Changes no setting; refused while the channel is off |
@@ -5671,7 +5706,8 @@ a person selects the text of a message they want to quote.
 Replying from the page closes the loop on the spot: the reply carries a `message_reference`, so what
 it answers dims immediately rather than at the next forty-five-second re-read, and once the reply is
 sent the message it answers is marked Done through the Done button's own act (`#256
-reply-marks-read`).
+reply-marks-read`) — and, since `#300 reply-marks-read`, read at the provider where it can be, as is
+the root of a thread the first reply written in it starts.
 
 ### Settings is controls; Help is the paragraphs that used to be in the way
 
@@ -6378,6 +6414,12 @@ failure did, whether the rest of a partly posted one was not sent or could not b
 `409 post_repeated`). A send that certainly posted nothing — a refusal — is forgotten at once, so it
 can always be tried again, and different words, or the same words as a reply, are a different post.
 The memory is the server's own, in memory: a restart forgets it.
+
+**A reply it posts marks what it answers read**, as the voice page's Reply does (`#300
+reply-marks-read`): once posted whole, the message named by `reply_to` is Done on this server before
+the tool answers, and the provider's read marker is moved through it afterwards where the provider
+lets this server move it, never backward and never twice. A confirmed proposal is marked the same way
+when its commit posts it. A refusal, a partial post and a proposal not yet confirmed mark nothing.
 
 The log gets one content-free `post_gate event=sent_direct` line (or `direct_failed`, with the
 reason, or `direct_repeat`, with what became of the earlier send): a number, the channel, the

@@ -47619,7 +47619,7 @@ async function replyAndSend(page, id, text = "on it", list = "discord-log") {
   await page.settle();
 }
 
-const ANSWERED_HOOK = "    if (entry.replyTo) guardQuietly(markAnsweredDone)(entry);\n";
+const ANSWERED_HOOK = "    if (entry.marksRead) guardQuietly(markSentRead)(entry);\n";
 
 test("`#256 reply-marks-read`: a SENT reply marks the message it answers Done — the button, the look, the server and the Undo chip agree, and Undo puts it back", async () => {
   const run = async (script) => {
@@ -47673,11 +47673,15 @@ test("`#256 reply-marks-read`: a SENT reply marks the message it answers Done �
 test("`#256 reply-marks-read`: the reply's Done is the Done button's own act, called only where a send has succeeded", () => {
   assert.match(SCRIPT_CODE, /async function markAnsweredDone\([\s\S]*?toggleArchived\(/,
     "the reply's Done does not go through the act the Done button and the swipe use");
+  // `#300 reply-marks-read`: through the one act that marks a confirmed send read.
+  assert.match(SCRIPT_CODE, /async function markSentRead\([\s\S]*?await markAnsweredDone\(entry\.channel, id\)/,
+    "a confirmed send's read does not begin with the reply's Done");
+  assert.equal(SCRIPT_CODE.split("markAnsweredDone(").length - 1, 2, "the reply's Done is called from more than one place");
   // Once, in the send's success, after the posted parts are drawn and before anything can fail it.
-  assert.equal(SCRIPT_CODE.split("markAnsweredDone)(").length - 1, 1, "the reply's Done is called from more than one place");
+  assert.equal(SCRIPT_CODE.split("markSentRead)(").length - 1, 1, "a send's read is marked from more than one place");
   const send = SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("async function dispatchOutgoingMessage("));
   const success = send.indexOf('entry.state = "sent";');
-  const call = send.indexOf("markAnsweredDone)(entry)");
+  const call = send.indexOf("markSentRead)(entry)");
   assert.ok(success > 0 && call > success && call < send.indexOf("} catch (error) {", success),
     "the reply's Done is not in the send's success");
 });
@@ -47898,9 +47902,12 @@ function threadedService(page) {
   };
 }
 
-/** A page on the channel of `freshMessageData`, opened in All, its service answering posts. */
-async function freshMessagePage(arrange = null) {
-  const page = newPage();
+/**
+ * A page on the channel of `freshMessageData`, opened in All, its service answering posts. `script`
+ * is web/voice.js, or a copy broken on purpose for a negative control.
+ */
+async function freshMessagePage(arrange = null, script = SCRIPT) {
+  const page = newPage(new Map(), script);
   const data = freshMessageData();
   page.threadingSupported = true;
   page.threads = data.threads;
@@ -48259,6 +48266,226 @@ test("`#252 thread-button-state`: → on a message nobody has answered opens its
     await page.settle();
     assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "typed straight after →", thread_id: data.lone.id });
   }
+});
+
+// --- a reply marks read consistently, whichever way it was started (`#300 reply-marks-read`) ------
+//
+// The owner, 2026-10-14: Reply on a message and opening its thread to write in it both make a reply to
+// the message before, and they marked read differently. The rule: the first reply that starts a thread
+// marks its root, whether started from Reply or from the thread; a later message in an existing thread
+// marks nothing on its own; a targeted Reply marks the message it answers. Marking read is the page's
+// own: Done, and the provider's marker where it has one, asked `after_reply` once the send is confirmed.
+
+/** A page on `freshMessageData`'s channel whose provider has a read marker the server can move. */
+const markerPage = (script = SCRIPT) =>
+  freshMessagePage((page) => { page.upstreamReadMarkSupported = true; }, script);
+
+/** Write `text` in the box of the column on screen (`side` for the right one) and send it. */
+async function writeInThread(page, text, side = false) {
+  page.el(side ? "side-compose-text" : "channel-compose-text").value = text;
+  await page.el(side ? "side-send" : "channel-send").click();
+  await page.settle();
+}
+
+/** The rule's own line in `sendChannelMessage`, taken out for a negative control. */
+const STARTS_THREAD = "    marksRead: rootThisStarts(channel, selectedThreadId),\n";
+
+test("`#300 reply-marks-read`: the first reply written in a thread nobody has answered marks its root read, here and at the provider; the next marks nothing", async () => {
+  const { page, data } = await markerPage();
+  await pickThread(page, "main");
+  await threadBadge(rowOf(page, "210")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["210"], "the premise is the empty thread, opened from its grey Thread");
+  await writeInThread(page, "the first reply, which starts the thread");
+  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+    [{ text: "the first reply, which starts the thread", thread_id: data.lone.id }], "the reply went elsewhere");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["210"] }], "the root of the thread it started is not Done");
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "210", after_reply: true }],
+    "the provider's marker was not asked to move through the root, as a reply's mark");
+  assert.equal(rowOf(page, "210").getAttribute("data-archived"), "true", "the root is not drawn read");
+  assert.equal(doneButton(rowOf(page, "210")).text(), "Unarchive");
+  assert.match(page.el("status").textContent, /^Marked read here and in Discord\./);
+  assert.equal(page.el("undo-dismiss").hidden, false, "the root's Done offers no Undo");
+
+  // The thread has its reply now: the next message in its box is a later one, and marks nothing.
+  await writeInThread(page, "a second thought");
+  assert.equal(page.repliesPosted.length, 2);
+  assert.equal(page.dismissCalls.length, 1, "a later message in the thread marked something Done");
+  assert.equal(page.upstreamReadCalls.length, 1, "a later message in the thread asked the provider again");
+
+  // THE CONTROL, which is the owner's report: without the rule the first reply in the thread marks
+  // nothing, where Reply on the same message would have.
+  const { page: control } = await markerPage(brokenScript(STARTS_THREAD, "    marksRead: null,\n"));
+  await pickThread(control, "main");
+  await threadBadge(rowOf(control, "210")).click();
+  await control.settle();
+  await writeInThread(control, "the first reply, which starts the thread");
+  assert.equal(control.repliesPosted.length, 1);
+  assert.deepStrictEqual(control.dismissCalls, [], "with the rule taken out the root still went read, so this test cannot see it");
+  assert.deepStrictEqual(control.upstreamReadCalls, []);
+});
+
+test("`#300 reply-marks-read`: in two columns the first reply in the right column's new thread marks its root in both columns", async () => {
+  const { page, data } = await markerPage();
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "210")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["210"], "the premise is the empty thread on the right");
+  await writeInThread(page, "the first reply, from the right", true);
+  assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "the first reply, from the right", thread_id: data.lone.id });
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["210"] }]);
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "210", after_reply: true }]);
+  assert.equal(rowWithId(page, "210").getAttribute("data-archived"), "true", "Main does not draw the root read");
+  assert.equal(sideRow(page, "210").getAttribute("data-archived"), "true", "the right column does not draw the root read");
+});
+
+test("`#300 reply-marks-read`: two messages written at once in a thread nobody has answered — only the first marks its root", async () => {
+  const run = async (script) => {
+    const { page } = await markerPage(script);
+    await pickThread(page, "main");
+    await threadBadge(rowOf(page, "210")).click();
+    await page.settle();
+    const finish = delayedReply(page);
+    page.el("channel-compose-text").value = "one";
+    const first = page.el("channel-send").click();
+    page.el("channel-compose-text").value = "two";
+    const second = page.el("channel-send").click();
+    await page.settle();
+    threadedService(page);
+    const posted = message({ id: "9400000000000000009", content: "one",
+      thread: { ...freshMessageData().lone, is_root: false, reply_count: null, reply_count_exact: false } });
+    page.messages = [...page.messages, posted];
+    finish(json(200, { posted }));
+    await Promise.all([first, second]);
+    await page.settle();
+    await page.settle();
+    return page;
+  };
+  const page = await run(SCRIPT);
+  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body.text), ["one", "two"], "the premise is two sends");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["210"] }]);
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "210", after_reply: true }],
+    "the second message, a later one, asked the provider to mark the root again");
+  // THE CONTROL: without the outbox counted, the second was taken for the first as well.
+  const control = await run(brokenScript(
+    "    if (entry.channel === String(channel) && (entry.threadId === key || entry.continueIn === key)) return null;\n", ""));
+  assert.equal(control.upstreamReadCalls.length, 2, "with the outbox not counted only one asked, so this test cannot see it");
+});
+
+test("`#300 reply-marks-read`: in a thread that has replies its box marks nothing, and Reply inside it marks the message it answers", async () => {
+  const { page } = await markerPage();
+  await pickThread(page, "thread:spaces/A/threads/one & two");
+  assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+  await writeInThread(page, "a later message in an answered thread");
+  assert.equal(page.repliesPosted.length, 1);
+  assert.deepStrictEqual(page.dismissCalls, [], "a message in an answered thread's box marked something Done");
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "a message in an answered thread's box marked something at the provider");
+  await replyAndSend(page, "202", "agreed, merging");
+  assert.deepStrictEqual(page.repliesPosted.at(-1).body,
+    { text: "agreed, merging", reply_to: "202", thread_id: "spaces/A/threads/one & two" });
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["202"] }], "Reply in the thread did not mark what it answered");
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "202", after_reply: true }]);
+  assert.equal(rowOf(page, "201").getAttribute("data-archived"), "false", "Reply on a reply marked its root");
+});
+
+test("`#300 reply-marks-read`: a Reply's mark at the provider follows its Done, only once the reply is sent, and only where the provider has a marker", async () => {
+  const target = "1000000000000000003";
+  const run = async (marker, script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = marker;
+    await signIn(page);
+    await showDiscord(page, conversation());
+    return page;
+  };
+  const page = await run(true);
+  const refused = page.replyResponse;
+  page.replyResponse = errorResponse(400, "bad_request", "the chat service refused the message");
+  await replyAndSend(page, target, "refused");
+  assert.deepStrictEqual([page.dismissCalls, page.upstreamReadCalls], [[], []], "a reply that was not sent marked something");
+  page.replyResponse = refused;
+  await outgoingRetry(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [target] }]);
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: target, after_reply: true }]);
+  const dismissed = page.requests.findIndex((one) => one.endsWith("/dismiss"));
+  const marked = page.requests.findIndex((one) => one.endsWith("/upstream-read"));
+  assert.ok(dismissed >= 0 && marked > dismissed, "the provider was asked before the Done was saved");
+  assert.match(page.el("status").textContent, /^Marked read here and in Discord\./,
+    "the status line still says the message was not marked in the chat service");
+
+  // No marker at the provider: Done, and nothing asked of it.
+  const plain = await run(false);
+  await replyAndSend(plain, target, "on it");
+  assert.deepStrictEqual(plain.dismissCalls, [{ messages: [target] }]);
+  assert.deepStrictEqual(plain.upstreamReadCalls, [], "a provider with no marker was asked to move it");
+  // THE CONTROL: the provider's word is what keeps the page from asking.
+  const control = await run(false, brokenScript("  if (!channelMarksUpstream(entry.channel)) return;\n", ""));
+  await replyAndSend(control, target, "on it");
+  assert.equal(control.upstreamReadCalls.length, 1, "with the check taken out nothing was asked, so this test cannot see it");
+});
+
+test("`#300 reply-marks-read`: Quote reply, and Reply docked in either column, mark what they answer as Reply does", async () => {
+  const page = await quotePage((p) => { p.upstreamReadMarkSupported = true; });
+  const first = rowWithId(page, "1000000000000000001");
+  await page.selectText(wordsIn(first), null, "the first message");
+  await replyButton(first).click();
+  await page.el("reply-text").setValue("> the first message\n\nit is wedged");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, "1000000000000000001", "the premise is a quote reply");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }]);
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "1000000000000000001", after_reply: true }]);
+
+  const { page: two } = await twoColumnServer((p) => { p.upstreamReadMarkSupported = true; });
+  await threadBadge(rowWithId(two, "201")).click();
+  await two.settle();
+  await replyAndSend(two, "202", "agreed", "side-log");
+  await replyAndSend(two, "200", "noted");
+  assert.deepStrictEqual(two.dismissCalls, [{ messages: ["202"] }, { messages: ["200"] }]);
+  assert.deepStrictEqual(two.upstreamReadCalls,
+    [{ message_id: "202", after_reply: true }, { message_id: "200", after_reply: true }],
+    "a reply docked in a column was not marked at the provider as Reply is");
+});
+
+test("`#300 reply-marks-read`: an outbox entry saved by an earlier page marks what it answers once sent; one saved marking nothing marks nothing", async () => {
+  const target = "1000000000000000003";
+  const saved = (id, fields) => ({ id, channel: CHANNEL.id, text: `saved ${id}`, remaining: `saved ${id}`,
+    state: "failed", threadId: null, replyTo: null, createdAt: 1, postedCount: 0, parts: [], observedParts: [],
+    detail: "refused", ...fields });
+  const store = new Map([["vibe-talk.outgoing-messages", JSON.stringify([
+    saved("outgoing-older-page", { replyTo: target }),
+    saved("outgoing-marks-nothing", { marksRead: null, threadId: "spaces/A/threads/elsewhere" }),
+  ])]]);
+  const page = newPage(store);
+  page.upstreamReadMarkSupported = true;
+  await signIn(page);
+  await showDiscord(page, conversation());
+  assert.equal(outgoingRows(page).length, 2, "the premise is two saved sends");
+  await outgoingRetry(outgoingRows(page)[0]).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [target] }], "an entry an earlier page saved no longer marks what it answers");
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: target, after_reply: true }]);
+  const rest = outgoingRows(page).find((row) => outgoingRetry(row));
+  await outgoingRetry(rest).click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 2, "the premise is both sent");
+  assert.equal(page.dismissCalls.length, 1, "an entry saved marking nothing marked something");
+  assert.equal(page.upstreamReadCalls.length, 1);
+  // And a new one is saved with what it marks.
+  await replyAndSend(page, "1000000000000000001", "fresh");
+  assert.ok(savedOutgoing(page).some((entry) => entry.marksRead === "1000000000000000001"),
+    "the outbox does not keep what a send marks read across a reload");
+});
+
+test("`#300 reply-marks-read`: a voice reply confirmed on the card is marked by the server, and the page writes no second mark", async () => {
+  const page = newPage();
+  page.upstreamReadMarkSupported = true;
+  await proposedDuringACall(page);
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.proposalCommits.length, 1, "the premise is a committed voice reply");
+  assert.deepStrictEqual(page.dismissCalls, [], "the page wrote a Done the server already wrote for the voice reply");
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "the page asked the provider for a mark the server already asked");
 });
 
 // --- whose messages: the author filter (#251 author-filter) -------------------------------------------
