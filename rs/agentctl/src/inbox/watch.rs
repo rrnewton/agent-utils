@@ -439,8 +439,9 @@ struct HerdrAgent {
     agent_status: Option<String>,
 }
 
+/// One Claude Code session as `claude agents --json` lists it: the fields this crate reads.
 #[derive(Deserialize)]
-struct ClaudeSession {
+pub(crate) struct ClaudeSession {
     #[serde(default)]
     pid: Option<serde_json::Value>,
     #[serde(default, rename = "sessionId")]
@@ -566,8 +567,28 @@ struct Sources<'a> {
 /// Claude sessions keyed by pane; `None` when Claude could not be asked. When two sessions claim
 /// one pane, the lowest process id (normally the parent) wins, so the choice is stable.
 fn claude_sessions(sources: &Sources<'_>) -> Option<BTreeMap<String, ClaudeSession>> {
-    let bytes = query(sources.claude, &["agents", "--json"], sources.timeout).ok()?;
-    let sessions = serde_json::from_slice::<Vec<ClaudeSession>>(&bytes).ok()?;
+    claude_sessions_by_pane(sources.claude, sources.proc_root, sources.timeout).ok()
+}
+
+/// The Claude Code sessions that `claude agents --json`, run as `claude`, lists, keyed by the
+/// Herdr pane each runs in: `HERDR_PANE_ID` in `<proc_root>/<pid>/environ` of the session's
+/// process. A session whose process id is missing or whose environment names no pane is left
+/// out. When two sessions claim one pane, the lowest process id (normally the parent) wins, so
+/// the choice is stable. Fails, saying why, when Claude could not be asked or its answer is not a
+/// JSON list of sessions. `agentctl inbox watch` and the chat bridge's reply reminders both ask
+/// through this one reader.
+pub(crate) fn claude_sessions_by_pane(
+    claude: &Path,
+    proc_root: &Path,
+    timeout: Duration,
+) -> Result<BTreeMap<String, ClaudeSession>> {
+    let bytes = query(claude, &["agents", "--json"], timeout)?;
+    let sessions = serde_json::from_slice::<Vec<ClaudeSession>>(&bytes).map_err(|error| {
+        InboxError::unavailable(format!(
+            "cannot parse `{} agents --json`: {error}",
+            claude.display()
+        ))
+    })?;
     let mut by_pane: BTreeMap<String, (u64, ClaudeSession)> = BTreeMap::new();
     for session in sessions {
         let pid = match &session.pid {
@@ -578,19 +599,17 @@ fn claude_sessions(sources: &Sources<'_>) -> Option<BTreeMap<String, ClaudeSessi
         let Ok(number) = pid.parse::<u64>() else {
             continue;
         };
-        let Some(pane) = pane_of_process(sources.proc_root, &pid) else {
+        let Some(pane) = pane_of_process(proc_root, &pid) else {
             continue;
         };
         if by_pane.get(&pane).is_none_or(|(held, _)| number < *held) {
             by_pane.insert(pane, (number, session));
         }
     }
-    Some(
-        by_pane
-            .into_iter()
-            .map(|(pane, (_, session))| (pane, session))
-            .collect(),
-    )
+    Ok(by_pane
+        .into_iter()
+        .map(|(pane, (_, session))| (pane, session))
+        .collect())
 }
 
 /// Take one sample of every Herdr pane that hosts an agent.
@@ -1841,6 +1860,41 @@ mod tests {
             ],
             "the lower pid wins the pane; Claude's busy overrides Herdr's idle; the coordinator and agentless panes are skipped"
         );
+    }
+
+    #[test]
+    fn the_shared_reader_keys_claude_sessions_by_pane_and_says_why_it_could_not_ask() {
+        let _serial = exclusive();
+        let directory = scratch();
+        let (_, claude, proc_root, _) = fixture(
+            &directory,
+            "echo '[{\"pid\":\"250\",\"sessionId\":\"s-child\",\"status\":\"idle\"},{\"pid\":101,\"sessionId\":\"s-1\",\"status\":\"busy\"},{\"pid\":7,\"status\":\"idle\"},{\"id\":\"bg\",\"state\":\"blocked\"}]'",
+        );
+        let sessions = claude_sessions_by_pane(&claude, &proc_root, Duration::from_secs(10))
+            .expect("Claude answers");
+        let statuses = sessions
+            .iter()
+            .map(|(pane, session)| (pane.as_str(), session.status.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [("w:p2", Some("busy"))],
+            "the lower pid wins the pane; a process with no pane and a background session are left out"
+        );
+        let failing = directory.join("failing-claude");
+        executable(&failing, "exit 1");
+        let failed = claude_sessions_by_pane(&failing, &proc_root, Duration::from_secs(10))
+            .err()
+            .expect("a failed query is an error")
+            .to_string();
+        assert!(failed.contains("agents --json exited"), "{failed}");
+        let garbling = directory.join("garbling-claude");
+        executable(&garbling, "echo not-json");
+        let garbled = claude_sessions_by_pane(&garbling, &proc_root, Duration::from_secs(10))
+            .err()
+            .expect("an unreadable answer is an error")
+            .to_string();
+        assert!(garbled.contains("cannot parse"), "{garbled}");
     }
 
     #[test]
