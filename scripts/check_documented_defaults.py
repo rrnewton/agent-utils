@@ -919,6 +919,11 @@ PINS: tuple[Pin, ...] = (
                 r"Every\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+`run`\s+scans\s+the\s+request\s+records\.",
                 "the scan period the chat guide's prompt delivery section states",
             ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"checks\s+at\s+each\s+scan\s+of\s+the\s+request\s+records,\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the reply reminder check period the chat guide states",
+            ),
         ),
     ),
     Pin(
@@ -1154,6 +1159,130 @@ PINS: tuple[Pin, ...] = (
                 "rs/agentctl/src/embedded_chat_userguide.md",
                 r"At\s+most\s+(?P<value>[A-Za-z\d,]+)\s+✅\s+reactions\s+wait\s+at\s+once",
                 "the receipt reaction cap the chat guide states",
+            ),
+        ),
+    ),
+    # Reply reminders (#292 reply-in-thinking-block): when `chat run` reminds a Claude Code
+    # coordinator of a request it has not answered, and the bounds on doing so.
+    Pin(
+        "chat-reply-reminder-idle-seconds",
+        "how long a Claude Code coordinator must be idle before `chat run` reminds it of an"
+        " unanswered request, by default, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service/reply_reminders.rs",
+                r"(?m)^pub const DEFAULT_REPLY_REMINDER_IDLE: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust default idle time",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r'default_value = "(?P<value>\d+)s", value_parser = reply_reminder_idle',
+                "the `chat run --reply-reminder-idle` default",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"`--reply-reminder-idle\s+DURATION`:\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+by\s+default",
+                "the default idle time the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"since that prompt was typed \(default: (?P<value>\d+)s\)",
+                "the default idle time `chat run --help` states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-ready-seconds",
+        "the longest a reply reminder waits for the coordinator before it is taken back out of"
+        " the queue, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime/reply_reminders.rs",
+                r"(?m)^pub\(crate\) const REPLY_REMINDER_READY_TIMEOUT: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust reminder wait",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"no\s+longer\s+than\s+`--ready-timeout`\s+or\s+(?P<value>[A-Za-z\d,]+)\s+seconds,\s+whichever\s+is\s+shorter",
+                "the reminder wait the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"if it is not typed within (?P<value>\d+) seconds \(or --ready-timeout if shorter\)",
+                "the reminder wait `chat run --help` states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-max-age-hours",
+        "how long after its prompt was typed a request can still be reminded, in hours",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime/reply_reminders.rs",
+                r"(?m)^pub\(crate\) const MAX_REPLY_REMINDER_AGE: Duration = Duration::from_secs\((?P<value>[\d_]+) \* 60 \* 60\);$",
+                "the Rust age limit, in hours",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"no\s+more\s+than\s+(?P<value>[A-Za-z\d,]+)\s+hours\s+ago",
+                "the age limit the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"reminded\s+within\s+(?P<value>[A-Za-z\d,]+)\s+hours",
+                "the age after which the chat guide says the record drops a reminded request",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"or more than (?P<value>\d+) hours ago, are never reminded",
+                "the age limit `chat run --help` states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-listed-ids",
+        "how many reply IDs one reply reminder names before it counts the rest",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime/reply_reminders.rs",
+                r"(?m)^pub\(crate\) const MAX_REMINDER_LISTED_IDS: usize = (?P<value>[\d_]+);$",
+                "the Rust listing bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"It\s+names\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+reply\s+IDs",
+                "the listing bound the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-reply-reminder-claude-timeout-seconds",
+        "how long one `claude agents --json` for a reply reminder may run, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service/reply_reminders.rs",
+                r"(?m)^const CLAUDE_QUERY_TIMEOUT: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust query deadline",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"Each\s+run\s+is\s+killed\s+after\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the query deadline the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"Each run is killed after (?P<value>\d+) seconds",
+                "the query deadline `chat run --help` states",
             ),
         ),
     ),
