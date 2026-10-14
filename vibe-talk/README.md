@@ -6782,7 +6782,10 @@ above that list's box, which shrinks to one line under it — and docked at the 
 the thread list, Settings and Help. It moves the list no more than a message arriving does (`#280
 scroll-stability`): a reader on the newest line follows it down, and anyone else — up the list, on a
 message a filter change holds, or where entering a thread landed them — stays where they are and is
-offered the jump to it. In two columns, where Reply is a box at the foot of a column rather than
+offered the jump to it. Its going moves the list no more: a reader on the newest line is on it still
+as the box takes the focus the card had, and when the box takes back its room a second later,
+whatever redraws the list in that second, without leaning on the browser's own scroll anchoring.
+In two columns, where Reply is a box at the foot of a column rather than
 a screen (`#277 reply-in-column`), the card stays the left list's next message, wholly above that
 box. Under Reply, and while a reply is open in either column, the card's Send is outlined, so the
 filled **Send reply** is never taken for it. It names what it answers in words ("replying to Alex:
@@ -6806,7 +6809,9 @@ why. The card going and coming back moves the channel's reader no more than the 
 going does (`#280 scroll-stability`): back from the list to the view they left — Main by Ctrl+1, All
 by Ctrl+2, either by Esc where the list was opened from it — a reader who was at its foot is at its
 foot again with Send on screen, and one up the list is on the row they were reading and offered the
-jump to the card below them. A draft arriving while the list is up moves Main behind it no more than
+jump to the card below them. One who sees only the card, as a long draft opened by More is taller
+than a phone's list, finds it where it stood, there and across a switch between Main and All. A
+draft arriving while the list is up moves Main behind it no more than
 one arriving on the channel does, though Main's box gives up its room under the card in the same
 moment: a reader at Main's foot follows it, and one up Main stays on their row, there and on the way
 back. The cards keep their reader too: the card takes its height from the foot of the list's cards

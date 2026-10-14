@@ -79,11 +79,22 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      foot of the cards there or within the slack of it, which is checked. A reader who moves 200px up
      the cards in two columns is on the card they moved to after Ctrl+3, not back where they were in
      the list.
+ 15. A reader at the foot of Main or All who taps Send is at the foot still, with no jump, once the
+     box at the list's foot takes back its room a second later (`#280 scroll-stability`): with the
+     message they sent drawn by a live read of the channel 300ms after the card went, and with the
+     browser's own scroll anchoring turned off (`overflow-anchor: none`), as in a browser that has
+     none. Only Chromium's anchoring held them before, and a redraw in that second undid it. So is
+     a reader whose long draft, opened by a click on More, is settled elsewhere, anchoring off: the
+     focus goes from More to the box, which opens to its typing height at once.
+ 16. On the phone, a long draft opened by More stands taller than the list: a reader 40 and 200px up
+     Main and up All, who sees the card and no row, finds the card where it stood, within a pixel,
+     and Send as tappable as it was, after Cmd+3 and Esc, Cmd+3 and the view's own key, and a switch
+     between Main and All by Cmd+2 or Cmd+1.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
-9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 to 13 at 393x852; and points
-8 and 11 to 14 at 1280x800 with a mouse.
+9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 to 13, 15 and 16 at 393x852;
+and points 8 and 11 to 15 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -171,6 +182,9 @@ class FakeApi:
     hosted: bool = False
     replay: bool = False
     replays: list[str] = field(default_factory=list)
+    # Point 15: what a send posted, delivered to the channel's next read as a message of Main and All.
+    deliver_posts: bool = False
+    posted: list[Json] = field(default_factory=list)
 
     def client_config(self) -> Json:
         return {
@@ -198,7 +212,10 @@ class FakeApi:
     def timeline(self, query: dict[str, list[str]]) -> Json:
         messages = [channel_message(n, "codex", f"build {n} finished; every target is green")
                     for n in range(1, 13)]
+        with self.lock:
+            posted = list(self.posted)
         if not self.threaded:
+            messages += posted
             return {"channel": CHANNEL, "messages": messages, "threads": [], "thread": None,
                     "has_threads": False, "has_more": False, "next_before": None, "notice": None,
                     "dismissed": [], "view": "main", "limit": 50, "returned": len(messages),
@@ -212,10 +229,10 @@ class FakeApi:
         view = query.get("view", ["main"])[0]
         thread: Json = {"id": THREAD_ID, "root": messages[2], "title": "nightly runner", "reply_count": 2,
                         "reply_count_exact": True, "updated_at": replies[-1]["timestamp"]}
-        rows = (messages + replies if view == "flat"
+        rows = (messages + replies + posted if view == "flat"
                 else [messages[2], *replies] if view == "thread"
                 else [] if view == "threads"
-                else messages)
+                else messages + posted)
         threads = [thread] if view == "threads" else []
         if view == "threads":
             # Point 11: older threads, each started by a message from earlier in the day, oldest first.
@@ -342,6 +359,8 @@ class FakeApi:
             self.hosted = False
             self.replay = False
             self.replays.clear()
+            self.deliver_posts = False
+            self.posted.clear()
             self.changed.notify_all()
 
 
@@ -446,6 +465,10 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                     self.json(409, {"error": "proposal_used", "detail": "already settled"})
                 else:
                     message = channel_message(99, "bot", str(proposal["text"]))
+                    if api.deliver_posts:
+                        with api.lock:
+                            message = channel_message(40 + len(api.posted), "bot", str(proposal["text"]))
+                            api.posted.append(message)
                     how = "tap" if body.get("confirmed_by") == "ui" else "voice"
                     api.log.append("commit")
                     seq = api.file_send(proposal, how, str(message["id"]))
@@ -1155,6 +1178,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                 listed = "; " + thread_list_case(page, url, voice, api, size, True, args.screenshots)
                 listed += "; " + thread_list_place_case(page, url, voice, api, size, True)
                 listed += "; " + thread_list_arrival_case(page, url, voice, api, size, True)
+                listed += "; " + room_back_case(page, url, voice, api, size, True)
+                listed += "; " + opened_card_case(page, url, voice, api, size)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -1815,8 +1840,178 @@ def thread_list_cards_case(page: Page, url: str, voice: FakeVoice, api: FakeApi,
             " from two columns; one who moved in two columns kept where they moved to")
 
 
+# Point 15: whether the main screen still keeps the room it made for the card, and Main's or All's last row.
+ROOM_JS = """() => {
+  const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
+  return { room: document.getElementById('screen-main').hasAttribute('data-draft'),
+           newest: rows.length ? rows[rows.length - 1].getAttribute('data-id') : null };
+}"""
+
+# Point 15: the live feed's read of the channel, as the message a send posted brings it, and whether the room
+# made for the card was still kept when the read had drawn it.
+LIVE_READ_JS = """async () => {
+  await loadDiscord({ keepPosition: true, reason: 'live' });
+  return document.getElementById('screen-main').hasAttribute('data-draft');
+}"""
+
+
+def room_back_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int], phone: bool) -> str:
+    """Point 15: a reader at the foot of Main or All taps Send, and is still at the foot once the box at the
+    list's foot takes back its room a second later, though the message they sent is drawn by a live read in
+    that second, and with the browser's own scroll anchoring off; and so is one whose draft, opened by More
+    with a click, is settled elsewhere, which hands the focus from More to the box."""
+    width, height = size
+    where = f"{width}x{height}, the box taking back its room"
+    mod = "Meta" if phone else "Control"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        api.deliver_posts = True
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        serial = 70
+        hows = ("the message it sent drawn by a live read", "the browser's scroll anchoring off",
+                "the draft settled elsewhere with the focus on More, scroll anchoring off")
+        for view, digit in (("Main", 1), ("All", 2)):
+            for how in hows:
+                view_key(page, mod, digit, None, None)
+                anchoring = "" if how.startswith("the message") else "none"
+                page.evaluate("(value) => { document.getElementById('scroll-area').style.overflowAnchor = value; }",
+                              anchoring)
+                serial += 1
+                more = how.startswith("the draft")
+                propose(page, api, serial, LONG_DRAFT if more else SHORT_DRAFT)
+                page.wait_for_timeout(HOLD_MS + 200)
+                if more:
+                    # A click, as a mouse makes one: the focus stays on More, inside the card.
+                    page.click("#post-confirm-more")
+                    page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                                           timeout=5000)
+                page.evaluate(TO_NEWEST_JS)
+                page.wait_for_timeout(300)
+                check(rect(still(page), "gap") <= 1, f"{where}: the premise, a reader at {view}'s foot")
+                if more:
+                    api.settle()
+                elif phone:
+                    page.tap("#post-confirm-send")
+                else:
+                    page.click("#post-confirm-send")
+                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+                gone = time.monotonic()
+                if more:
+                    focus = page.evaluate("() => document.activeElement ? document.activeElement.id : ''")
+                    check(focus == "channel-compose-text",
+                          f"{where}: the premise, the focus handed from More to the box, not to #{focus}")
+                if anchoring == "":
+                    page.wait_for_timeout(300)
+                    kept = page.evaluate(LIVE_READ_JS)
+                    drawn = page.evaluate(ROOM_JS)
+                    check(kept is True and drawn["newest"] == api.posted[-1]["id"],
+                          f"{where}: the premise, the sent message drawn by a read while the card's room is kept"
+                          f" ({kept}, newest {drawn['newest']})")
+                page.wait_for_timeout(max(0, int(1800 - (time.monotonic() - gone) * 1000)))
+                check(page.evaluate(ROOM_JS)["room"] is False, f"{where}: the premise, the box has its room back")
+                now = still(page)
+                check(rect(now, "gap") <= 1 and now["jump"] is None,
+                      f"{where}: {'the draft going' if more else 'Send'} at {view}'s foot, {how}, left the reader"
+                      f" {rect(now, 'gap'):.0f}px above the foot once the box took back its room (the jump says"
+                      f" {now['jump']!r})")
+                page.evaluate("() => { document.getElementById('scroll-area').style.overflowAnchor = ''; }")
+                if more:
+                    # The focus back on the list, so that the next card's Send is clicked as the others were.
+                    page.evaluate("() => document.getElementById('scroll-area').focus()")
+        check(len(api.commits) == 4, f"{where}: {len(api.commits)} commits, not one per tap")
+        check(not api.cancels, f"{where}: a draft was withdrawn ({api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+        api.deliver_posts = False
+    return (f"{where}: a reader at the foot of Main and of All at it a second after Send, the sent message drawn"
+            " by a live read in that second, and with scroll anchoring off; and after the draft opened by More was"
+            " settled elsewhere, the focus handed to the box")
+
+
+# Point 16: the card's top and height against the channel's list, the list's height, and whether a tap at
+# Send's centre lands on Send.
+OPENED_CARD_JS = """() => {
+  const area = document.getElementById('scroll-area');
+  const card = document.getElementById('post-confirm');
+  const send = document.getElementById('post-confirm-send');
+  const box = card.getBoundingClientRect();
+  const r = send.getBoundingClientRect();
+  let hit = false;
+  if (r.height > 0 && r.top >= -0.5 && r.bottom <= innerHeight + 0.5) {
+    const n = document.elementFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    hit = Boolean(n && (n === send || send.contains(n)));
+  }
+  return { parent: card.parentElement ? card.parentElement.id : '', folded: card.hasAttribute('data-folded'),
+           top: box.top - area.getBoundingClientRect().top, height: box.height, list: area.clientHeight, sendHit: hit };
+}"""
+
+
+def opened_card_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> str:
+    """Point 16, on the phone: a long draft opened by More is taller than the list, and a reader whose screen
+    shows only the card finds it where it stood through the thread list and back, and across Main and All."""
+    width, height = size
+    where = f"{width}x{height}, the draft opened by More"
+    mod = "Meta"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        propose(page, api, 81, LONG_DRAFT)
+        page.wait_for_timeout(HOLD_MS + 200)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        page.click("#post-confirm-more")
+        page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                               timeout=5000)
+        page.wait_for_timeout(300)
+        routes = {1: (("Escape",), (1,), (2,)), 2: (("Escape",), (2,), (1,))}
+        for view, digit in (("Main", 1), ("All", 2)):
+            for up in (40, 200):
+                for keys in routes[digit]:
+                    through = keys[0] != (2 if digit == 1 else 1)
+                    how = (f"{mod}+3 and " if through else "") + " and ".join(
+                        "Esc" if key == "Escape" else f"{mod}+{key}" for key in keys)
+                    view_key(page, mod, digit, None, None)
+                    page.evaluate(UP_THE_LIST_JS, up)
+                    page.wait_for_timeout(300)
+                    before = page.evaluate(OPENED_CARD_JS)
+                    first = still(page)["first"]
+                    check(before["parent"] == "pane-discord" and not before["folded"] and
+                          before["height"] > before["list"] and first is None and before["top"] < 0,
+                          f"{where}: the premise, a reader {up}px up {view} who sees the opened card and no row:"
+                          f" {before}, first row {first}")
+                    if through:
+                        view_key(page, mod, 3, None, "list")
+                    for key in keys:
+                        if through:
+                            leave_thread_list(page, mod, str(key))
+                        else:
+                            view_key(page, mod, int(key), None, None)
+                    after = page.evaluate(OPENED_CARD_JS)
+                    check(after["parent"] == "pane-discord" and abs(after["top"] - before["top"]) <= 1 and
+                          after["sendHit"] == before["sendHit"],
+                          f"{where}: {how} moved the card a reader {up}px up {view} saw alone from {before['top']:.0f}"
+                          f" to {after['top']:.0f}px against the list (Send tappable {before['sendHit']} then"
+                          f" {after['sendHit']})")
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: a view key posted or withdrew the draft ({api.commits}, {api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader 40 and 200px up Main and All who saw only the card found it where it stood by"
+            f" {mod}+3 and Esc, {mod}+3 and the view's key, and {mod}+2 and {mod}+1")
+
+
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Points 8 and 11 to 14 on a desk with a mouse, where two columns are offered."""
+    """Points 8 and 11 to 15 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -1834,6 +2029,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
             line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
             line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
+            line += "; " + room_back_case(page, url, voice, api, DESK, False)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
