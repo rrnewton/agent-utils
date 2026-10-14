@@ -64474,8 +64474,8 @@ const LONG_CARD_DRAFT = "The release notes for this week, as agreed: the runner 
  * A draft from the voice agent on the card, and the channel of `manyThreads(16)` in Main, one column, at
  * its newest message, the card at its foot. The fixture lays nothing out, so the page is given what the
  * browser gives it: while the card is docked on the main screen it takes its `offsetHeight`, `docked` px
- * to begin with, from the foot of both columns' lists. `settled()` reports the sizes, as a browser does
- * after a layout, and runs what was waiting.
+ * to begin with, from the foot of both columns' lists. `settled()` is a browser's next layout: a list
+ * grown shorter than its place is clamped to its foot, the sizes are reported, and what was waiting runs.
  */
 async function draftOverThreads(script, docked, { proposed = true } = {}) {
   const data = manyThreads(16);
@@ -64508,6 +64508,7 @@ async function draftOverThreads(script, docked, { proposed = true } = {}) {
     });
   }
   const settled = async () => {
+    for (const box of [main, side]) box.scrollTop = box.scrollTop;
     for (const box of [main, side]) page.resized(box);
     page.expireTimers(0);
     await page.settle();
@@ -64599,8 +64600,8 @@ test("`#269 approval-card-inline` x `#281 view-keys`: CMD-3 AND CMD-4 WHILE A SE
     { listFoot: false, againDocked: true }, "docked after the cards were opened, the thread list still opened at its foot");
   // Main told nothing as the card comes back to its foot: its reader is left above the card.
   const unfollowed = await run(brokenScript(
-    "  if (carded && `${channelView}|${selectedThreadId}` === shown) {",
-    "  if (false) {"));
+    "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n    if (follows) scrollToNewest();\n    return follows;",
+    "    return false;"));
   assert.deepStrictEqual({ mainFollowed: unfollowed.mainFollowed, oneFollowed: unfollowed.oneFollowed },
     { mainFollowed: false, oneFollowed: false }, "the control followed the card down too");
 });
@@ -64679,4 +64680,125 @@ test("`#269 approval-card-inline` x `#281 view-keys`: a draft arriving under the
   const behind = await run(brokenScript(
     "  if (threadListOnScreen()) {\n    focusList(sidePane);\n    return;\n  }\n", ""));
   assert.deepStrictEqual(behind, { ...real, keysOnCards: false });
+});
+
+// `#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`. The card moving between the
+// foot of the left column's list and the dock under the thread list must move that list's reader no more
+// than the thread list coming and going does without a card: a reader at the foot of Main or All is at
+// its foot again on the way back, Send on screen, and a reader up the list is on their row, behind the
+// cards and on the way back. In Chromium the card stands 396px tall in a phone's list and 246px docked.
+
+/** The first of Main's or All's rows on screen, and where it stands: "id@top". */
+const rowOnScreen = (page) => {
+  const main = page.el("scroll-area");
+  const row = page.el("discord-log").children.find((li) => !li.hidden && li.getBoundingClientRect().bottom > 0);
+  return row ? `${row.getAttribute("data-id")}@${row.getBoundingClientRect().top - main.getBoundingClientRect().top}` : null;
+};
+
+test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: LEAVING THE THREAD LIST FOR ALL with a send card up finds a reader who was at All's foot at its foot, Send on screen — by Esc, where the list was chosen from All, and by Cmd-2", async () => {
+  const DOCKED = 60;
+  const run = async (script) => {
+    const { page, card, main, settled } = await draftOverThreads(script, DOCKED);
+    const picker = page.el("thread-select");
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const sendShown = () => {
+      const box = page.el("post-confirm-send").getBoundingClientRect();
+      return box.height > 0 && box.top >= 0 && box.bottom <= main.clientHeight;
+    };
+    await press(page, main, "2", { metaKey: true });
+    await settled();
+    main.scrollTop = main.scrollHeight;
+    await main.dispatch("scroll");
+    await settled();
+    assert.equal(picker.value, "flat", "the premise: Cmd-2 shows All");
+    assert.equal(card.parentNode, page.el("pane-discord"), "the premise: the card is All's next message");
+    assert.ok(atBottomOf(main) && sendShown(), "the premise: the reader is at All's foot, Send on screen");
+    assert.ok(card.outerHeight() - DOCKED > BOTTOM_SLACK_PX + 10,
+      "the premise: the card in the list is taller than docked, as a long draft is in Chromium");
+    const back = {};
+    for (const [name, key, fields] of [["escape", "Escape", {}], ["cmd2", "2", { metaKey: true }]]) {
+      await press(page, focused(page) || main, "3", { metaKey: true });
+      await settled();
+      assert.equal(layout(), "list", `the premise: Cmd-3 shows the thread list (${name})`);
+      await press(page, focused(page) || page.el("side-scroll"), key, fields);
+      const atOnce = layout() === null && picker.value === "flat" && card.parentNode === page.el("pane-discord") &&
+        atBottomOf(main) && sendShown();
+      await settled();
+      back[name] = atOnce && atBottomOf(main) && sendShown();
+    }
+    return { ...back, untouched: page.proposalCommits.length === 0 && page.proposalCancels.length === 0 && !card.hidden };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { escape: true, cmd2: true, untouched: true });
+
+  // THE CONTROL. Main's reader told nothing as the card comes back, before All is decided: All keeps the
+  // place Main's reader is at, now above the card, and draws them on the rows they could see, Send below
+  // the screen — 369px above All's foot on a phone in Chromium, and 337px at a desk.
+  const untold = await run(brokenScript(
+    "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n    if (follows) scrollToNewest();\n    return follows;",
+    "    return false;"));
+  assert.deepStrictEqual(untold, { ...real, escape: false, cmd2: false });
+});
+
+test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: A MAIN READER UP THE LIST with a send card up stays on their row through Cmd-3 — behind the cards once the sizes are reported, the card's going not taken for the dock growing — and is on it again by Cmd-1, Esc and Cmd-4, a reader the card's going moved included", async () => {
+  const DOCKED = 60;
+  const run = async (script) => {
+    const { page, card, main, settled } = await draftOverThreads(script, DOCKED);
+    page.wideDesk = true;
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const inList = card.outerHeight();
+    assert.ok(inList - DOCKED > 2 * BOTTOM_SLACK_PX + 20,
+      "the premise: the card in the list is taller than docked, as a long draft is in Chromium");
+    const result = {};
+    // `keeper`: as far up as the card is tall, where the card's going leaves them DOCKED px from the foot,
+    // inside the dock-growth keeper's reach (the slack plus the growth it is told of) and moved by nothing
+    // else. `moved`: nearer the foot than the card is taller in the list than docked, where the card's
+    // going leaves Main too short to keep them where they were.
+    for (const [name, up] of [["keeper", inList], ["moved", Math.round((inList - DOCKED) / 2)]]) {
+      let behind = true;
+      for (const [route, key, fields] of [["One", "1", { metaKey: true }], ["Escape", "Escape", {}], ["Two", "4", { metaKey: true }]]) {
+        if (layout() !== null) {
+          await press(page, focused(page) || main, "1", { metaKey: true });
+          await settled();
+        }
+        main.scrollTop = main.scrollHeight - main.clientHeight - up;
+        await main.dispatch("scroll");
+        await settled();
+        const before = rowOnScreen(page);
+        assert.ok(!atBottomOf(main) && main.scrollHeight - main.scrollTop - main.clientHeight === up,
+          `the premise: the reader is ${up}px up Main, not at its foot (${name}, ${route})`);
+        await press(page, focused(page) || main, "3", { metaKey: true });
+        await settled();
+        assert.equal(layout(), "list", "the premise: Cmd-3 shows the thread list");
+        behind = behind && rowOnScreen(page) === before;
+        await press(page, focused(page) || page.el("side-scroll"), key, fields);
+        const atOnce = rowOnScreen(page) === before && card.parentNode === page.el("pane-discord");
+        await settled();
+        assert.equal(layout(), key === "4" ? "two" : null, `the premise: ${key} left the thread list`);
+        result[`${name}${route}`] = atOnce && rowOnScreen(page) === before;
+      }
+      if (name === "keeper") result.keeperBehind = behind;
+    }
+    result.untouched = page.proposalCommits.length === 0 && page.proposalCancels.length === 0 && !card.hidden;
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, {
+    keeperOne: true, keeperEscape: true, keeperTwo: true, keeperBehind: true, movedOne: true, movedEscape: true,
+    movedTwo: true, untouched: true,
+  });
+
+  // THE CONTROLS. Main's keeper not told the card moved: the card's height going from under Main is taken
+  // for the dock growing, and a reader within it of the foot is pulled to the foot behind the cards. The
+  // place held from Cmd-3 still puts them back on the way out.
+  const unmoved = brokenScript("  if (moving) cardMovedUnderLists(heightUnderLists() - under);\n", "");
+  assert.deepStrictEqual(await run(unmoved), { ...real, keeperBehind: false });
+  // No place held from Cmd-3: a reader the card's going moved is followed down to the foot as one on it.
+  const held = "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n";
+  assert.deepStrictEqual(await run(brokenScript(held, "")), { ...real, movedOne: false, movedEscape: false, movedTwo: false });
+  // Neither, as the card's docking first left it: every one of them found at the foot of Main on the way back.
+  assert.deepStrictEqual(await run(unmoved.replace(held, "")), {
+    keeperOne: false, keeperEscape: false, keeperTwo: false, keeperBehind: false, movedOne: false, movedEscape: false,
+    movedTwo: false, untouched: true,
+  });
 });

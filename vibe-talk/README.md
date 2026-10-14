@@ -7576,7 +7576,9 @@ sends it, withdraws it or hides it. Ctrl+3 docks it under the cards, which open 
 it; Ctrl+1, Ctrl+2 and, in a window wide enough for two columns, Ctrl+4 put it back at the foot of
 the channel's list, Main followed down to it by a reader left on its newest line, and offering the
 jump to anyone up it; in a narrower one Ctrl+4 leaves the list and the card where they are, saying
-why.
+why. The card going and coming back moves the channel's reader no more than the list coming and
+going does (`#280 scroll-stability`): back from the list, a reader who was at the foot of Main or All
+is at its foot again with Send on screen, and one up the list is on the row they were reading.
 
 **What happens to a draft when the call ends depends on who ended it.** Hang up retires it: the
 card goes, and the next call on the same page does not offer it again; it lapses on the server. The
