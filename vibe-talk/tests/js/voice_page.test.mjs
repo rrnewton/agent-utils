@@ -3054,6 +3054,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         const body = JSON.parse((options && options.body) || "null");
         page.upstreamReadCalls.push(body);
         page.upstreamReadPaths.push(String(path));
+        // `#300 reply-marks-read`. A test that wants the provider to refuse a mark says how.
+        if (page.upstreamReadResponse) return page.upstreamReadResponse(body);
         return json(200, {
           channel: CHANNEL,
           through: body.message_id,
@@ -48412,6 +48414,17 @@ test("`#300 reply-marks-read`: a Reply's mark at the provider follows its Done, 
   assert.ok(dismissed >= 0 && marked > dismissed, "the provider was asked before the Done was saved");
   assert.match(page.el("status").textContent, /^Marked read here and in Discord\./,
     "the status line still says the message was not marked in the chat service");
+
+  // The provider refusing the mark for a while: the Done stands, and the status line, not the error
+  // banner, says the chat service was not marked.
+  page.upstreamReadResponse = () => json(503, { error: "upstream_unavailable", detail: "Google Chat returned HTTP 429" });
+  await replyAndSend(page, "1000000000000000001", "and this one");
+  assert.deepStrictEqual(page.dismissCalls.at(-1), { messages: ["1000000000000000001"] });
+  assert.equal(page.upstreamReadCalls.length, 2);
+  assert.match(page.el("status").textContent, /^Marked read here, not in Discord: /,
+    "a mark the provider refused was not said, or was said as a success");
+  assert.equal(page.el("error").hidden, true, `a refused mark put up the error banner: ${page.el("error").textContent}`);
+  assert.equal(rowWithId(page, "1000000000000000001").getAttribute("data-archived"), "true", "a refused mark took the Done back");
 
   // No marker at the provider: Done, and nothing asked of it.
   const plain = await run(false);

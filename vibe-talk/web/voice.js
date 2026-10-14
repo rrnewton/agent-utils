@@ -29585,21 +29585,29 @@ function rootThisStarts(channel, thread) {
  * the first and is not asked when the Done failed, as "Mark read through here" goes. See the section
  * note. `#300 reply-marks-read`.
  *
+ * The provider's half failing is said on the status line, not in the error banner: nobody pressed
+ * anything for it, the Done it follows stands, and the chat service refusing it for a while (Google
+ * Chat allows a bridge about two reads of its marker a minute) must not put a banner over every reply.
+ *
  * @param {{channel: string, marksRead: string}} entry
  */
 async function markSentRead(entry) {
   const id = String(entry.marksRead);
   await markAnsweredDone(entry.channel, id);
   if (!channelMarksUpstream(entry.channel)) return;
-  await api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/upstream-read`, {
-    method: "POST", body: { message_id: id, after_reply: true },
-  });
+  const service = chatServiceOf(entry.channel);
+  let said = `Marked read here and in ${service}.`;
+  try {
+    await api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/upstream-read`, {
+      method: "POST", body: { message_id: id, after_reply: true },
+    });
+  } catch (error) {
+    said = `Marked read here, not in ${service}: ${readableFailure(error, service)}`;
+  }
   // Said over the Done's own words, which say it was not marked in the chat service. Only for the
   // channel on screen: a reply that finished after the reader moved on says nothing over another.
   if (entry.channel !== String(el("discord-channel").value)) return;
-  const service = chatProviderName || "the chat service";
-  setStatus(`Marked read here and in ${service}.` +
-    (bookmarkAnchor(entry.channel) ? " b goes back to your bookmark." : ""));
+  setStatus(said + (bookmarkAnchor(entry.channel) ? " b goes back to your bookmark." : ""));
 }
 
 // --- the conversation a reply goes into ---------------------------------------------------------

@@ -41,6 +41,7 @@
 //! whose own check keeps it forward. A mark that fails moves no floor, so the next reply asks again.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, PoisonError};
 
 use crate::chat::ChatError;
 use crate::model::{ChannelId, ChannelInfo, MessageId};
@@ -64,10 +65,11 @@ pub enum UpstreamMark {
     Unsupported,
 }
 
-/// Every channel's floor.
+/// Every channel's floor, each behind a lock of its own, so a slow provider in one channel holds up
+/// no mark in another.
 #[derive(Debug, Default)]
 pub struct ReplyReads {
-    floors: tokio::sync::Mutex<HashMap<ChannelId, Floor>>,
+    floors: std::sync::Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Floor>>>>,
 }
 
 /// One channel's floor: the newest message marked through, and the unorderable ids marked.
@@ -127,15 +129,22 @@ impl ReplyReads {
         Self::default()
     }
 
+    /// `channel`'s floor, made empty the first time it is asked for. Bounded by the channels the
+    /// server answers for, which are the only ones a mark can name.
+    fn floor(&self, channel: &ChannelId) -> Arc<tokio::sync::Mutex<Floor>> {
+        Arc::clone(
+            self.floors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(channel.clone())
+                .or_default(),
+        )
+    }
+
     /// Note that the provider's marker for `channel` went through `message` by some other act — the
     /// owner's own **Mark read in** — so a later reply to it, or to anything before it, asks nothing.
     pub async fn note_marked(&self, channel: &ChannelId, message: &MessageId) {
-        self.floors
-            .lock()
-            .await
-            .entry(channel.clone())
-            .or_default()
-            .raise(message);
+        self.floor(channel).lock().await.raise(message);
     }
 }
 
@@ -151,8 +160,8 @@ pub fn supported(state: &AppState, channel: &ChannelId) -> bool {
 /// Move the provider's read marker for `channel` through `message`, because a reply answered it —
 /// unless this server has marked that message, or a later one, already. See the module note.
 ///
-/// One at a time across the server: the floor is read and raised around the provider's answer, so
-/// two replies to the same message landing together ask once.
+/// One at a time per channel: the channel's floor is read and raised around the provider's answer,
+/// so two replies to the same message landing together ask once.
 ///
 /// # Errors
 ///
@@ -165,12 +174,13 @@ pub async fn mark_upstream(
     if !supported(state, channel) {
         return Ok(UpstreamMark::Unsupported);
     }
-    let mut floors = state.reply_reads.floors.lock().await;
-    if let Some(covered) = floors.get(channel).and_then(|floor| floor.covers(message)) {
+    let floor = state.reply_reads.floor(channel);
+    let mut floor = floor.lock().await;
+    if let Some(covered) = floor.covers(message) {
         return Ok(covered);
     }
     state.chat.mark_read_upstream(channel, message).await?;
-    floors.entry(channel.clone()).or_default().raise(message);
+    floor.raise(message);
     Ok(UpstreamMark::Marked)
 }
 
