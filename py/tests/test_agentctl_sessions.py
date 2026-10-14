@@ -1226,6 +1226,7 @@ def test_profile_resume_cli_preserves_policy_and_boxes_the_selected_native_launc
 
     def slot_shell(
         slot: str, *, isolation: str | None, project: str, explicit_project: bool = False,
+        registry: object = None,
     ) -> tuple[str, str, str]:
         assert slot == "worker-slot" and isolation == "userns"
         assert project == str(tmp_path) and explicit_project

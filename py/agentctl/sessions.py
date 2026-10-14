@@ -69,7 +69,10 @@ class Sessions(ManagedAgents):
             result.append("move")
         if record.adapter in ("herdr", "herdr-foreign"):
             result.extend(("anchor", "rename"))
-        if record.mode == "interactive" and record.adapter in ("herdr", "herdr-pane", "herdr-relay"):
+        # An adopted agent becomes revivable once a launch spec records what it runs.
+        if record.mode == "interactive" and (
+                record.adapter in ("herdr", "herdr-pane", "herdr-relay")
+                or record.adapter == "herdr-foreign" and record.launch_spec is not None):
             result.append("revive")
         return result
 

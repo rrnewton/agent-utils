@@ -100,9 +100,9 @@ enum Commands {
         after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n  agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`).\n\nA headless turn-runner worker is retired only when every process its runtime recorded has\nprovably exited: stop --expected-token then archives the record with its runtime home and leaves\nthe tmux window or Herdr tab in place. A live or unprovable runner exits 69 and changes nothing."
     )]
     Stop(Stop),
-    /// Relaunch a dead owned local agent from its recorded conversation and launch policy, preserving its old queue in the archive
+    /// Relaunch a dead local agent by replaying its recorded launch spec and conversation, preserving its old queue in the archive
     #[command(
-        after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nAn interrupted revive reserves the name until the same command finishes publication or cleanup.\nAdopted agents, headless workers, and remote agentcloud sessions are refused."
+        after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nThe launch spec (`launch_spec` in status) is what ran: start writes it, adopt and anchor read it\nfrom the pinned process's command line. A record without one is rebuilt from its launch policy\nand profile. An adopted agent needs a spec, and its old pane is left open; the replacement is\nowned. An interrupted revive reserves the name until the same command finishes publication or\ncleanup. Headless workers and remote agentcloud sessions are refused."
     )]
     Revive(Revive),
     /// List registered agents with live status or an explicit probe error
@@ -215,6 +215,9 @@ struct Anchor {
     /// Replace anchors that no longer match (the pane may hold another program; inspect it first)
     #[arg(long)]
     replace: bool,
+    /// Native conversation id to record in the launch spec when Herdr reports none; a Claude agent anchoring itself can pass "$CLAUDE_CODE_SESSION_ID". Refused if it contradicts Herdr's report. Default: Herdr's report, then the conversation the harness command line selects
+    #[arg(long = "session-id", value_name = "ID")]
+    session_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -1361,7 +1364,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         )?,
         Commands::Move(value) => manager.move_to_project_workspace(&value.name)?,
         Commands::Rename(value) => manager.rename(&value.agent.name, &value.new_name)?,
-        Commands::Anchor(value) => manager.anchor(&value.agent.name, value.replace)?,
+        Commands::Anchor(value) => manager.anchor(
+            &value.agent.name,
+            value.replace,
+            value.session_id.as_deref(),
+        )?,
         Commands::Doctor(value) => {
             let report = manager.doctor(value.repair_labels)?;
             write_json(&report).map_err(Failure::Output)?;
@@ -1823,7 +1830,10 @@ fn add_capabilities(value: &mut serde_json::Value) {
             if matches!(adapter, Some("herdr" | "herdr-foreign")) {
                 capabilities.extend(["anchor", "rename"]);
             }
-            if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-relay")) {
+            // An adopted agent becomes revivable once a launch spec records what it runs.
+            if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-relay"))
+                || (adapter == Some("herdr-foreign") && value["launch_spec"].is_object())
+            {
                 capabilities.push("revive");
             }
             json!(capabilities)

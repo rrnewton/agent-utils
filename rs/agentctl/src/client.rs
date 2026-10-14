@@ -2806,6 +2806,41 @@ impl HerdrClient {
                 .then_some(observed.identity),
         )
     }
+    /// Read the argument vector of one pinned process generation, or `None`.
+    ///
+    /// The identity is proved before and after `/proc/PID/cmdline` is read, so the vector
+    /// cannot belong to a reused process ID. Only the command line is read, never the
+    /// environment. A vector that is not NUL-separated UTF-8 text, exceeds 256 KiB, or holds an
+    /// empty argument is `None`.
+    pub fn process_command_line(&self, expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+        const LIMIT: u64 = 256 << 10;
+        let same = || {
+            live_custom_process(expected.pid)
+                .ok()
+                .is_some_and(|observed| observed.identity == *expected)
+        };
+        if !same() {
+            return None;
+        }
+        let mut raw = Vec::new();
+        fs::File::open(format!("/proc/{}/cmdline", expected.pid))
+            .ok()?
+            .take(LIMIT + 1)
+            .read_to_end(&mut raw)
+            .ok()?;
+        if !same() || raw.is_empty() || raw.len() as u64 > LIMIT {
+            return None;
+        }
+        if raw.last() == Some(&0) {
+            raw.pop();
+        }
+        let argv = raw
+            .split(|byte| *byte == 0)
+            .map(|item| String::from_utf8(item.to_vec()).ok())
+            .collect::<Option<Vec<_>>>()?;
+        (!argv.is_empty() && argv.iter().all(|item| !item.is_empty())).then_some(argv)
+    }
+
     /// Is the pinned harness process, the same kernel lifetime, still the pane's only
     /// foreground process? (An anchor pinned to a launcher therefore fails.)
     pub fn verify_harness_identity(

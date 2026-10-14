@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
-from agentctl import agent
+from agentctl import agent, launch_spec
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
 from agentctl.profiles import configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
@@ -220,6 +220,49 @@ def _extras(record: AgentRecord) -> tuple[str, ...]:
     return extra
 
 
+def _revive_conversation(record: AgentRecord) -> str:
+    """The conversation a revive resumes: the launch spec's, else the record's own."""
+    spec = record.launch_spec
+    native = None if spec is None else spec["native_session"]
+    if isinstance(native, dict):
+        return cast(str, native["value"])
+    return _conversation(record)
+
+
+def _revived_adapter(record: AgentRecord) -> str:
+    """agentctl launches the replacement itself, so a revived adopted agent is owned."""
+    return "herdr" if record.adapter == "herdr-foreign" else record.adapter
+
+
+def _expected_arguments(record: AgentRecord) -> tuple[str, ...]:
+    """The exact harness arguments a revive of ``record`` launches."""
+    spec = record.launch_spec
+    if spec is not None:
+        return launch_spec.replay_arguments(
+            record.harness, cast(list[str], spec["argv"]), _revive_conversation(record),
+        )
+    return harness_arguments(record.harness, model=record.model, resume=_conversation(record),
+        extra=(*reasoning_arguments(record.harness, record.reasoning_effort), *_extras(record)))
+
+
+def _spec_environment(manager: ManagedAgents, record: AgentRecord, spec: dict[str, object]) -> tuple[str, ...]:
+    """Literal environment entries for the spec's names, read again from its private profile."""
+    names = cast(list[str], spec["environment_names"])
+    if not names:
+        return ()
+    profile = spec["profile"]
+    if not isinstance(profile, str):
+        raise AgentDeliveryError("recorded environment cannot be replayed safely without its launch profile")
+    root = configuration_root(record.cwd, manager.registry)
+    _path, profiles = load_profiles(root)
+    selected = profiles.get(profile)
+    if selected is None:
+        raise AgentDeliveryError("recorded launch profile is missing")
+    if sorted({entry.partition("=")[0] for entry in selected.environment}) != names:
+        raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
+    return selected.environment
+
+
 @dataclass(frozen=True)
 class _LaunchPolicy:
     arguments: tuple[str, ...]
@@ -227,51 +270,72 @@ class _LaunchPolicy:
     slot_command: str | None
     relay_command: str | None
     workspace_id: str | None
+    relay_executable: str | None = None
 
 
 def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
     if (record.lifecycle != "running" or record.mode != "interactive" or record.backend != "herdr"
-            or record.adapter not in ("herdr", "herdr-pane", "herdr-relay")
+            or record.adapter not in ("herdr", "herdr-pane", "herdr-relay", "herdr-foreign")
             or record.harness not in ("claude", "codex", "muse")):
-        raise AgentDeliveryError("revive requires a running owned Claude, Codex, or Muse interactive Herdr record")
+        raise AgentDeliveryError("revive requires a running Claude, Codex, or Muse interactive Herdr record")
+    spec = record.launch_spec
+    if record.adapter == "herdr-foreign" and spec is None:
+        raise AgentDeliveryError(
+            f"adopted record has no launch spec; while its harness runs, capture one with "
+            f"`agentctl anchor {record.name} --replace`"
+        )
     if record._unknown.get("project_box") is not None:
         raise AgentDeliveryError("this edition cannot reconstruct the recorded project box")
     if manager._pending_move_destination(record) is not None:
         raise AgentDeliveryError("record has an incomplete move; finish that move before revive")
     if not Path(record.cwd).is_dir() or str(Path(record.cwd).resolve()) != record.cwd:
         raise AgentDeliveryError("recorded working directory is missing or changed")
-    extra = _extras(record)
     environment: tuple[str, ...] = ()
-    if record.profile is not None:
-        root = configuration_root(record.cwd, manager.registry)
-        _path, profiles = load_profiles(root)
-        selected = profiles.get(record.profile)
-        if selected is None:
-            raise AgentDeliveryError("recorded launch profile is missing")
-        if (selected.harness != record.harness or selected.mode != record.mode
-                or selected.model != record.model or selected.reasoning_effort != record.reasoning_effort
-                or selected.argv != extra):
-            raise AgentDeliveryError("recorded launch profile policy changed (harness, mode, model, effort, or arguments)")
-        environment = selected.environment
-    if sorted({entry.partition("=")[0] for entry in environment}) != sorted(record.environment_names):
-        raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
-    arguments = harness_arguments(record.harness, model=record.model, resume=_conversation(record),
-        extra=(*reasoning_arguments(record.harness, record.reasoning_effort), *extra))
-    slot_command = relay_command = None
+    if spec is not None:
+        # Replay what ran. A profile edited after launch does not change the replay;
+        # it only supplies the environment values whose names the spec recorded.
+        if (spec["cwd"] != record.cwd or spec["profile"] != record.profile
+                or (spec["slot"], spec["slot_project"], spec["slot_isolation"])
+                != (record.slot, record.slot_project, record.slot_isolation)
+                or spec["environment_names"] != sorted(record.environment_names)):
+            raise AgentDeliveryError("recorded launch spec contradicts its record (cwd, profile, slot, or environment names)")
+        if not launch_spec.program_matches(record.harness, cast("str | None", spec["executable"])):
+            raise AgentDeliveryError(
+                f"recorded program {spec['executable']!r} is not the {record.harness} harness, so it cannot be replayed"
+            )
+        environment = _spec_environment(manager, record, spec)
+    else:
+        extra = _extras(record)
+        if record.profile is not None:
+            root = configuration_root(record.cwd, manager.registry)
+            _path, profiles = load_profiles(root)
+            selected = profiles.get(record.profile)
+            if selected is None:
+                raise AgentDeliveryError("recorded launch profile is missing")
+            if (selected.harness != record.harness or selected.mode != record.mode
+                    or selected.model != record.model or selected.reasoning_effort != record.reasoning_effort
+                    or selected.argv != extra):
+                raise AgentDeliveryError("recorded launch profile policy changed (harness, mode, model, effort, or arguments)")
+            environment = selected.environment
+        if sorted({entry.partition("=")[0] for entry in environment}) != sorted(record.environment_names):
+            raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
+    arguments = _expected_arguments(record)
+    slot_command = relay_command = relay_executable = None
     if record.slot is not None:
         if record.slot_project is None or record.slot_isolation is None:
             raise AgentDeliveryError("recorded slot lacks its project or isolation policy")
         slot_command, cwd, isolation = _slot_shell_command(record.slot, isolation=record.slot_isolation,
-            project=record.slot_project, explicit_project=True)
+            project=record.slot_project, explicit_project=True, registry=manager.registry)
         if str(Path(cwd).resolve()) != record.cwd or isolation != record.slot_isolation:
             raise AgentDeliveryError("recorded slot mapping or isolation changed")
         if isolation == "root":
             executable = manager.client._harness_executable(record.harness)
             relay_command, relay_cwd, relay_isolation = _slot_shell_command(record.slot, isolation=isolation,
-                project=record.slot_project, explicit_project=True, command=(executable, *arguments))
+                project=record.slot_project, explicit_project=True, command=(executable, *arguments),
+                registry=manager.registry)
             if str(Path(relay_cwd).resolve()) != record.cwd or relay_isolation != isolation:
                 raise AgentDeliveryError("recorded slot relay policy changed")
-            slot_command = None
+            slot_command, relay_executable = None, executable
     elif record.adapter == "herdr-relay":
         raise AgentDeliveryError("relay record lacks the slot boxing policy")
     project_workspace = manager._project_workspace()
@@ -285,11 +349,16 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
             if _missing_target(exc) != "workspace-missing":
                 raise
             workspace = None
-    return _LaunchPolicy(arguments, environment, slot_command, relay_command, workspace)
+    recorded_label = None if spec is None else spec["workspace_label"]
+    if workspace is None and project_workspace is None and isinstance(recorded_label, str):
+        # Without project policy, return to the workspace the agent was launched or adopted in.
+        workspace = manager.client.workspace_id_for_label(recorded_label)
+    return _LaunchPolicy(arguments, environment, slot_command, relay_command, workspace, relay_executable)
 
 
 def _old_process(record: AgentRecord) -> CustomProcessIdentity:
-    identity = record.harness_anchor if record.adapter == "herdr" else record.custom_process_identity
+    identity = (record.harness_anchor if record.adapter in ("herdr", "herdr-foreign")
+                else record.custom_process_identity)
     if identity is None:
         raise AgentDeliveryError("record lacks an independently pinned harness process; inspect it before replacing its generation")
     return identity
@@ -358,7 +427,7 @@ def _name_available(manager: ManagedAgents, record: AgentRecord) -> None:
     else:
         if pane != record.pane_id:
             raise AgentDeliveryError("managed name points to a different live presentation")
-    owner = manager._identity_owner(record.harness, _conversation(record), exclude=record.name)
+    owner = manager._identity_owner(record.harness, _revive_conversation(record), exclude=record.name)
     if owner is not None:
         raise AgentDeliveryError(f"native conversation is already registered as {owner.name!r}")
 
@@ -453,14 +522,25 @@ def _write_journal(manager: ManagedAgents, journal: dict[str, object]) -> None:
 
 
 def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> AgentRecord:
+    conversation = _revive_conversation(old)
     candidate = replace(old, token=token, created_at=time.time(), lifecycle="starting",
-        resume=_conversation(old), arguments=list(policy.arguments), native_session=_native_session(old.harness, _conversation(old), "asserted"),
+        adapter=_revived_adapter(old),
+        resume=conversation, arguments=list(policy.arguments), native_session=_native_session(old.harness, conversation, "asserted"),
         workspace_id=None, tab_id=None, pane_id=None, session_agent=None, session_value=None,
         terminal_id=None, harness_identity=None, anchor_rule=None, custom_process_identity=None, foreign_shell_identity=None,
         pane_reported_by_agentctl=False, startup_warning=None, effective_reasoning_effort=None, error=None, runtime_home=None,
         goal_delivery=None, goal_message_id=None, goal_messages={}, goal_session_id=None, goal_command=None)
     candidate._unknown = copy.deepcopy(old._unknown)
     candidate._unknown["revived_from"] = old.token
+    previous = old.launch_spec
+    candidate.set_launch_spec(launch_spec.build(
+        source="revive", captured_at=candidate.created_at, harness=old.harness,
+        executable=policy.relay_executable, argv=policy.arguments, cwd=old.cwd, profile=old.profile,
+        environment_names=old.environment_names, slot=old.slot, slot_project=old.slot_project,
+        slot_isolation=old.slot_isolation,
+        workspace_label=None if previous is None else cast("str | None", previous["workspace_label"]),
+        native_session=(conversation, "asserted"),
+    ))
     candidate._nested_storage = None
     candidate._session_source = None
     return candidate
@@ -469,15 +549,15 @@ def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> Agent
 def _same_policy(candidate: AgentRecord, old: AgentRecord) -> bool:
     return not (candidate.name != old.name
             or candidate.token == old.token or candidate.harness != old.harness
-            or candidate.cwd != old.cwd or candidate.adapter != old.adapter
+            or candidate.cwd != old.cwd or candidate.adapter != _revived_adapter(old)
             or candidate.mode != old.mode or candidate.backend != old.backend
             or candidate.model != old.model or candidate.profile != old.profile
             or candidate.reasoning_effort != old.reasoning_effort or candidate.environment_names != old.environment_names
             or candidate.slot != old.slot or candidate.slot_project != old.slot_project
             or candidate.slot_isolation != old.slot_isolation or candidate.paused != old.paused
-            or candidate.resume != _conversation(old) or _conversation(candidate) != _conversation(old)
-            or candidate.arguments != list(harness_arguments(old.harness, model=old.model, resume=_conversation(old),
-                extra=(*reasoning_arguments(old.harness, old.reasoning_effort), *_extras(old)))))
+            or candidate.resume != _revive_conversation(old)
+            or _conversation(candidate) != _revive_conversation(old)
+            or candidate.arguments != list(_expected_arguments(old)))
 
 
 class _SessionCensusClient:
@@ -663,7 +743,8 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
     # Publishing is final even if the replacement later exits. Finish only cleanup.
     current_proof = _proof(manager, original)
     pane_closed = False
-    if current_proof["kind"] != "missing":
+    # An adopted agent's pane was never agentctl's to close, even as an idle shell.
+    if current_proof["kind"] != "missing" and original.adapter != "herdr-foreign":
         if current_proof != journal["proof"]:
             raise AgentDeliveryError("stale revive shell or tab ownership changed; replacement and journal retained")
         _read_record(manager, active, name, identity=new_identity, digest=_digest(ready_bytes))
@@ -691,7 +772,7 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
     candidate._storage = None
     result = manager._status_record(candidate)
     result.update({"revived": True, "previous_token": original.token, "archive": str(archive),
-                   "pane_closed": pane_closed, "tab_closed": True})
+                   "pane_closed": pane_closed, "tab_closed": pane_closed or current_proof["kind"] == "missing"})
     return result
 
 

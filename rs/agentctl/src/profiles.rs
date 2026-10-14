@@ -80,6 +80,8 @@ struct Document {
     schema: String,
     #[serde(default)]
     workspace: Option<Value>,
+    #[serde(default)]
+    wrkslots: Option<Value>,
     profiles: UniqueMap<RawProfile>,
 }
 
@@ -726,7 +728,23 @@ pub(crate) fn load_configuration(
         .into_iter()
         .map(|(name, profile)| validate(name.clone(), profile).map(|value| (name, value)))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
+    wrkslots_value(document.wrkslots.as_ref())?;
     Ok((path, profiles, workspace))
+}
+
+/// The optional `wrkslots` key: an absolute path to the slot manager command.
+fn wrkslots_value(value: Option<&Value>) -> Result<Option<String>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path))
+            if !path.is_empty() && !path.contains('\0') && Path::new(path).is_absolute() =>
+        {
+            Ok(Some(path.clone()))
+        }
+        Some(_) => Err(fail(
+            "profile config wrkslots must be an absolute path to the wrkslots command",
+        )),
+    }
 }
 
 pub(crate) fn load_profiles(
@@ -798,6 +816,28 @@ pub(crate) fn configuration_root(
 /// Nonstandard registry directories use the default behavior: they do
 /// not acquire policy from an unrelated `.agentctl` directory beside them.
 pub(crate) fn workspace_for_registry(registry: &Path) -> Result<Option<String>, AgentError> {
+    let Some(object) = registry_policy(registry)? else {
+        return Ok(None);
+    };
+    match object.get("workspace") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if valid_workspace(value) => Ok(Some(value.clone())),
+        Some(_) => Err(fail(
+            "profile config workspace must be 1-128 bytes, have no surrounding whitespace, and contain no control characters",
+        )),
+    }
+}
+
+/// Read only the configured wrkslots command for a conventional project registry.
+pub(crate) fn wrkslots_for_registry(registry: &Path) -> Result<Option<String>, AgentError> {
+    match registry_policy(registry)? {
+        Some(object) => wrkslots_value(object.get("wrkslots")),
+        None => Ok(None),
+    }
+}
+
+/// The raw project configuration object beside a conventional registry, if any.
+fn registry_policy(registry: &Path) -> Result<Option<BTreeMap<String, Value>>, AgentError> {
     if registry.file_name().and_then(|name| name.to_str()) != Some(".agentctl") {
         return Ok(None);
     }
@@ -876,16 +916,7 @@ pub(crate) fn workspace_for_registry(registry: &Path) -> Result<Option<String>, 
             path.display()
         ))
     })?;
-    let workspace = match object.get("workspace") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) if valid_workspace(value) => Some(value.clone()),
-        Some(_) => {
-            return Err(fail(
-                "profile config workspace must be 1-128 bytes, have no surrounding whitespace, and contain no control characters",
-            ))
-        }
-    };
-    Ok(workspace)
+    Ok(Some(object))
 }
 
 pub(crate) fn reasoning_arguments(

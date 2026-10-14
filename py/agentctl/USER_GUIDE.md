@@ -432,11 +432,11 @@ fails, its retained status record uses a generic diagnostic so terminal-control
 errors cannot copy a value into later status output; the immediate command still
 reports the launch failure to its caller.
 
-### Revive a dead owned harness
+### Revive a dead harness
 
-After a harness is killed or its terminal server restarts, its registry record
-can still say `running`. Inspect the recovery plan, then resume its recorded
-native conversation in a fresh tab:
+After a harness is killed, its terminal server restarts, or the host reboots,
+its registry record can still say `running`. Inspect the recovery plan, then
+resume its recorded native conversation in a fresh tab:
 
 ```sh
 agentctl revive reviewer --dry-run
@@ -448,21 +448,53 @@ agentctl revive --all
 Revive requires proof that the recorded harness process is dead and that its
 old presentation is either absent or the same idle shell in a one-pane tab.
 A live process, a server outage, changed pane ownership, or an unknown native
-conversation blocks recovery. Adopted agents, headless workers, and remote
-agentcloud sessions are not eligible. `--expected-token TOKEN` binds a named
+conversation blocks recovery. Headless workers and remote agentcloud sessions
+are not eligible, and an adopted agent is eligible only once its record holds a
+launch spec (below). `--expected-token TOKEN` binds a named
 revive to the old generation; it does not apply to `--all`. The replacement
 startup deadline is `--startup-timeout SECONDS`, greater than zero and at most
 300 seconds, default 30.
 
-The recorded model, reasoning effort, literal policy arguments, cwd, pause
-state, and slot isolation are retained. A recorded profile must still match
-those launch settings. Environment values come from that private profile;
-records store only their names. A changed or missing profile, an unrecoverable
-literal environment, or a changed slot mapping blocks revival before launch.
+Revive replays the record's **launch spec**: what actually ran. The spec holds
+the harness, the program, the exact argument vector after the program, the
+working directory, the profile name, the environment variable names (never
+values), the slot, project and isolation, the workspace label, and the native
+conversation with where it came from (`asserted` by agentctl, `observed` from
+Herdr, `argv` from the harness's own command line, or `caller`). `status` shows
+it as `launch_spec`.
+
+- `start` writes the spec before Herdr starts the harness, so even a launch that
+  never reports back can be replayed.
+- `adopt` and `anchor` read it from the pinned harness process's
+  `/proc/PID/cmdline` (the identity is proved before and after the read; the
+  environment is never read). An adopted agent started by hand therefore keeps
+  its exact flags, for example `--dangerously-skip-permissions`.
+- The replay removes every conversation selector the arguments held
+  (`--session-id`, `--resume`, `-r`, `--continue`, `--fork-session` for Claude,
+  `resume ID` for Codex and Muse) and adds one explicit resume of the recorded
+  conversation. A selector that cannot be reproduced, such as Codex
+  `resume --last` or a bare Claude `--resume` picker, blocks revival.
+- A profile edited after launch does not change the replay. The profile only
+  supplies the values of the environment names the spec recorded; a missing
+  profile, or one whose names differ, blocks revival before launch.
+- A spec whose program is not the harness itself (for example `node cli.js`)
+  blocks revival, because Herdr launches the harness by kind.
+- Without a project workspace setting, the replacement returns to the workspace
+  the spec names. The slot manager comes from `AGENTCTL_WRKSLOTS_BIN`, then the
+  `wrkslots` key of the project's `.agentctl/profiles.json` (an absolute path),
+  then `wrkslots` on PATH.
+
+Records written before launch specs existed keep the older rule: the recorded
+model, reasoning effort, literal policy arguments, cwd, pause state, and slot
+isolation are rebuilt, and a recorded profile must still match them. An adopted
+record without a spec is refused; while its harness still runs, capture one with
+`agentctl anchor NAME --replace`.
 
 Once the replacement is verified, the complete old generation is archived,
 including its queue, quarantine, and terminal output. The stale pane and its
-one-pane tab are closed after publication. Old queued prompts and goal delivery
+one-pane tab are closed after publication; a revived adopted agent's old pane
+is left open, because it was never agentctl's to close, and the replacement is
+an owned agent. Old queued prompts and goal delivery
 receipts are never replayed into the replacement; the recorded goal text remains
 available for the coordinator to inspect and assign deliberately.
 
@@ -920,6 +952,16 @@ Records written before anchors existed refuse input until `agentctl anchor NAME`
 pins the terminal and harness process now in the pane. Run it only after
 looking at the pane and confirming it is that agent. A record whose anchor no
 longer matches needs `--replace`, for the same reason.
+
+`anchor` also records the pinned process's command line as the record's launch
+spec, which is what `revive` replays. `--session-id ID` names the native
+conversation when Herdr reports none; a Claude agent anchoring itself can pass
+`--session-id "$CLAUDE_CODE_SESSION_ID"`. An ID that contradicts Herdr's report
+is refused. Without it, the conversation is Herdr's report, then the one
+agentctl recorded at start, then the one the command line selects. When the
+command line cannot be read, a replaced harness loses its old spec and
+`--session-id` is refused; the result's `launch_spec_source` says which spec,
+if any, the record now holds.
 
 `agentctl rename OLD NEW` changes the registry entry, the Herdr agent name, and
 the tab label of a running native agent together; an adopted agent's alias is

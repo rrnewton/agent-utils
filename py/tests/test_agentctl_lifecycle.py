@@ -2108,12 +2108,14 @@ def test_revive_reloads_matching_private_profile_and_preserves_literal_policy(
     elif change is not None:
         profile[change] = "different" if change == "model" else []
         agent._atomic_json(str(path), {"schema": "agentctl-profiles/v1", "profiles": {"owner-policy": profile}})
-    if change is not None:
+    if change == "missing":
+        # The launch spec names the environment, whose values only the profile holds.
         assert manager.revive("worker", dry_run=True)["action"] == "blocked"
         with pytest.raises(AgentDeliveryError):
             manager.revive("worker")
         assert len(fake.launched) == 1 and fake.closed == []
         return
+    # A profile edited after launch does not change the replay of what ran.
     result = manager.revive("worker")
     assert result["revived"] is True and result["profile"] == "owner-policy" and result["model"] == "chosen"
     assert fake.environments == [("RECOVERY_MODE=value=with spaces",)] * 2
@@ -2121,6 +2123,27 @@ def test_revive_reloads_matching_private_profile_and_preserves_literal_policy(
     assert record.environment_names == ["RECOVERY_MODE"]
     assert record.arguments == ["--resume", old.native_session["value"] if old.native_session else "", "--model", "chosen", "--dangerously-skip-permissions"]
     assert all(b"value=with spaces" not in content for content in registry_bytes(manager.registry).values())
+
+
+@pytest.mark.parametrize("change", ["model", "argv"])
+def test_revive_without_a_launch_spec_still_refuses_a_changed_profile(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from .test_agentctl_sessions import _write_profiles
+    profile: dict[str, object] = {"harness": "claude", "mode": "interactive", "model": "chosen",
+        "argv": ["--dangerously-skip-permissions"]}
+    _write_profiles(tmp_path, {"owner-policy": profile})
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness="claude", profile="owner-policy",
+        model="chosen", harness_args=("--dangerously-skip-permissions",))
+    old.set_launch_spec(None)
+    manager._save(old)
+    profile[change] = "different" if change == "model" else []
+    agent._atomic_json(str(tmp_path / ".agentctl" / "profiles.json"),
+                       {"schema": "agentctl-profiles/v1", "profiles": {"owner-policy": profile}})
+    assert manager.revive("worker", dry_run=True)["action"] == "blocked"
+    with pytest.raises(AgentDeliveryError, match="profile policy changed"):
+        manager.revive("worker")
+    assert len(fake.launched) == 1 and fake.closed == []
 
 
 def test_revive_literal_environment_without_profile_is_unrecoverable(
@@ -2140,6 +2163,9 @@ def test_revive_rechecks_slot_mapping_and_reuses_recorded_boxing(
     from agentctl import revive as recovery
     manager, fake, old = prepare_revive(tmp_path, monkeypatch)
     old.slot, old.slot_project, old.slot_isolation = "worker-slot", str(tmp_path), "userns"
+    spec = old.launch_spec
+    assert spec is not None
+    old.set_launch_spec({**spec, "slot": old.slot, "slot_project": old.slot_project, "slot_isolation": old.slot_isolation})
     manager._save(old)
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(recovery, "_slot_shell_command",

@@ -162,6 +162,10 @@ def parser() -> argparse.ArgumentParser:
         "agentctl anchor reviewer", named=True)
     anchor.add_argument("--replace", action="store_true",
         help="replace anchors that no longer match (the pane may hold another program; inspect it first)")
+    anchor.add_argument("--session-id", metavar="ID",
+        help="native conversation id to record in the launch spec when Herdr reports none; a Claude agent "
+        "anchoring itself can pass \"$CLAUDE_CODE_SESSION_ID\". Refused if it contradicts Herdr's report. "
+        "Default: Herdr's report, then the conversation the harness command line selects")
     doctor = command("doctor", "Compare every registry record with live Herdr state and report each mismatch. "
         "Read-only unless --repair-labels. Exit 0 when clean, 1 with findings.",
         "agentctl doctor")
@@ -188,7 +192,10 @@ def parser() -> argparse.ArgumentParser:
     wait = command("wait", "Wait for readiness; readiness does not mean the goal is complete.",
         "agentctl wait reviewer --timeout 60", named=True)
     wait.add_argument("--timeout", type=_ascii_float, default=900.0, metavar="SECONDS", help="readiness deadline (default: 900 seconds)")
-    revive = command("revive", "Resume a running record whose owned interactive harness is positively dead, in a fresh tab. "
+    revive = command("revive", "Resume a running record whose interactive harness is positively dead, in a fresh tab, by "
+        "replaying its launch spec (launch_spec in status: what ran, written at start and read from the pinned process at "
+        "adopt and anchor) with one explicit resume. A record without a spec is rebuilt from its launch policy and profile; "
+        "an adopted record needs a spec, and its old pane is left open. "
         "Preserves the old queue and quarantine in its archive; never replays queued prompts.",
         "agentctl revive reviewer\n  agentctl revive --all --dry-run")
     revive.add_argument("name", nargs="?", metavar="NAME", help="registered session name; required unless --all is used")
@@ -445,7 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.revive(name, dry_run=args.dry_run, expected_token=args.expected_token,
                                      startup_timeout=args.startup_timeout)
         elif args.command == "anchor":
-            result = sessions.anchor(name, replace=args.replace)
+            result = sessions.anchor(name, replace=args.replace, session=args.session_id)
         elif args.command == "doctor":
             report = sessions.doctor(repair_labels=args.repair_labels)
             print(json.dumps(report, indent=2, sort_keys=True))

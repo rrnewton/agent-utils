@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import NoReturn, TypeVar, cast
 
-from agentctl import agent
+from agentctl import agent, launch_spec
 from agentctl.client import (
     AgentPaneInfo,
     CustomProcessIdentity,
@@ -57,6 +57,7 @@ from agentctl.profiles import (
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
     workspace_for_registry,
+    wrkslots_for_registry,
 )
 from agentctl.submission import (
     PromptNotStaged, SubmissionReceipt, _compact, submit_verified,
@@ -405,6 +406,21 @@ class AgentRecord:
     def harness_anchor(self) -> CustomProcessIdentity | None:
         """The pinned harness process, if the current pinning rule produced it."""
         return self.harness_identity if self.anchor_rule == ANCHOR_RULE else None
+
+    @property
+    def launch_spec(self) -> dict[str, object] | None:
+        """The replayable launch spec, when start, adopt, anchor or revive captured one."""
+        value = self._unknown.get(launch_spec.FIELD)
+        return cast(dict[str, object], value) if isinstance(value, dict) else None
+
+    def set_launch_spec(self, spec: dict[str, object] | None) -> None:
+        """Store or drop the spec; it is kept beside unknown keys so absent stays absent."""
+        if spec is None:
+            self._unknown.pop(launch_spec.FIELD, None)
+        else:
+            self._unknown[launch_spec.FIELD] = launch_spec.validate(
+                spec, harness=self.harness, label=f"agent {self.name!r}",
+            )
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
     _nested_storage: dict[str, object] | None = field(
         default=None, init=False, repr=False,
@@ -692,6 +708,9 @@ class AgentRecord:
         home = document.get("runtime_home")
         if home is not None and (not isinstance(home, str) or not Path(home).is_absolute()):
             raise AgentDeliveryError(f"invalid runtime directory in {path}")
+        spec = document.get(launch_spec.FIELD)
+        if spec is not None:
+            launch_spec.validate(spec, harness=cast(str, document["harness"]), label=str(path))
         record = cls(**fields)  # type: ignore[arg-type]
         record._unknown = {key: value for key, value in document.items() if key not in known}
         record._nested_storage = nested_storage
@@ -2556,6 +2575,48 @@ class ManagedAgents:
                     f"pane {record.pane_id} is already registered as {owner!r}"
                 )
 
+    def _captured_launch_spec(
+        self, record: AgentRecord, identity: CustomProcessIdentity | None, *,
+        source: str, workspace_label: str | None, session: str | None = None,
+    ) -> dict[str, object] | None:
+        """Read a spec from the pinned harness's own command line, or ``None``.
+
+        The conversation is, in order: one the caller names, the one Herdr reports, the
+        one agentctl recorded at start, and the one the command line selects. A caller's
+        conversation that contradicts Herdr's report is refused.
+        """
+        if identity is None:
+            return None
+        argv = self.client.process_command_line(identity)
+        if argv is None or not launch_spec._bounded_arguments(list(argv[1:])):
+            return None
+        reported = record.session_value if record._session_source != "asserted" else None
+        if session is not None and reported is not None and session != reported:
+            raise AgentDeliveryError(
+                f"session {session!r} contradicts the session Herdr reports for {record.name!r}"
+            )
+        selected: str | None = None
+        if record.harness in ("claude", "codex", "muse"):
+            try:
+                selected = launch_spec.argv_conversation(record.harness, argv[1:])
+            except AgentDeliveryError:
+                selected = None
+        recorded = None if record.native_session is None else record.native_session["value"]
+        native = (
+            (session, "caller") if session is not None
+            else (reported, "observed") if reported is not None
+            else (recorded, "asserted") if recorded is not None
+            else (selected, "argv") if selected is not None
+            else None
+        )
+        return launch_spec.build(
+            source=source, captured_at=time.time(), harness=record.harness,
+            executable=argv[0], argv=argv[1:], cwd=record.cwd, profile=record.profile,
+            environment_names=record.environment_names, slot=record.slot,
+            slot_project=record.slot_project, slot_isolation=record.slot_isolation,
+            workspace_label=workspace_label, native_session=native,
+        )
+
     def _peer_claims(
         self, name: str,
     ) -> Callable[[], builtins.list[tuple[str, str, str | None]]]:
@@ -2761,6 +2822,7 @@ class ManagedAgents:
                 )
         slot_command: str | None = None
         relay_command: str | None = None
+        relay_executable: str | None = None
         launch_project: str | None = None
         effective_isolation: str | None = None
         if slot is not None:
@@ -2770,7 +2832,7 @@ class ManagedAgents:
             launch_project = str(Path(project).expanduser().resolve())
             slot_command, root, effective_isolation = _slot_shell_command(
                 slot, isolation=slot_isolation, project=project,
-                explicit_project=slot_project is not None,
+                explicit_project=slot_project is not None, registry=self.registry,
             )
             if effective_isolation == "root":
                 # sudo stays the pane's foreground process under root isolation,
@@ -2787,8 +2849,9 @@ class ManagedAgents:
                 relay_command, _path, _isolation = _slot_shell_command(
                     slot, isolation=slot_isolation, project=project,
                     explicit_project=slot_project is not None,
-                    command=(executable, *arguments),
+                    command=(executable, *arguments), registry=self.registry,
                 )
+                relay_executable = executable
                 slot_command = None
         with self._lock(name):
             with self._identity_transaction():
@@ -2813,6 +2876,16 @@ class ManagedAgents:
                                      environment_names=sorted({entry.partition("=")[0] for entry in environment}),
                                      adapter="herdr-relay" if relay_command is not None
                                      else "herdr-pane" if harness == "muse" else "herdr")
+                # The spec is durable before Herdr starts anything, so a launch that never
+                # reports back can still be replayed exactly.
+                record.set_launch_spec(launch_spec.build(
+                    source="start", captured_at=record.created_at, harness=harness,
+                    executable=relay_executable, argv=arguments, cwd=root, profile=profile,
+                    environment_names=record.environment_names, slot=slot,
+                    slot_project=launch_project, slot_isolation=effective_isolation,
+                    workspace_label=project_workspace,
+                    native_session=None if conversation is None else (conversation, "asserted"),
+                ))
                 self._save(record)
                 try:
                     self._launch_interactive(
@@ -2992,14 +3065,15 @@ class ManagedAgents:
                 target_lock, _locked_pane, info = agent._lock_resolved_target(self.client, target)
                 try:
                     return self._adopt_locked(
-                        name, directory, root, harness, pane_id, info
+                        name, directory, root, harness, pane_id, info,
+                        expected_workspace,
                     )
                 finally:
                     target_lock.close()
 
     def _adopt_locked(
         self, name: str, directory: Path, root: str, harness: str,
-        pane_id: str, info: AgentPaneInfo,
+        pane_id: str, info: AgentPaneInfo, workspace_label: str | None = None,
     ) -> dict[str, object]:
         """Commit one adoption while its registry and live pane are locked."""
         if info.agent is None:
@@ -3126,6 +3200,9 @@ class ManagedAgents:
             terminal_id=info.terminal_id, harness_identity=harness_identity,
             anchor_rule=ANCHOR_RULE if harness_identity is not None else None,
         )
+        record.set_launch_spec(self._captured_launch_spec(
+            record, harness_identity, source="adopt", workspace_label=workspace_label,
+        ))
         self._save(record)
         try:
             result = self._status_record(record)
@@ -5305,8 +5382,17 @@ class ManagedAgents:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
-    def anchor(self, name: str, *, replace: bool = False) -> dict[str, object]:
-        """Pin the terminal and harness process an operator has confirmed for NAME."""
+    def anchor(
+        self, name: str, *, replace: bool = False, session: str | None = None,
+    ) -> dict[str, object]:
+        """Pin the terminal and harness process an operator has confirmed for NAME.
+
+        The pinned process's command line becomes the record's launch spec. ``session``
+        names its native conversation when Herdr does not report one, for example a
+        Claude agent anchoring itself with ``$CLAUDE_CODE_SESSION_ID``.
+        """
+        if session is not None and (not session or "\0" in session):
+            raise AgentDeliveryError("native session id must be nonempty and contain no NUL")
         with self._lock(name):
             with self._identity_transaction():
                 record = self._load(name)
@@ -5358,12 +5444,31 @@ class ManagedAgents:
                     record.terminal_id = info.terminal_id
                     record.harness_identity = harness
                     record.anchor_rule = ANCHOR_RULE
+                    label: str | None = None
+                    if record.workspace_id is not None:
+                        try:
+                            label = self.client.workspace_label(record.workspace_id)
+                        except HerdrRunError:
+                            label = None
+                    spec = self._captured_launch_spec(
+                        record, harness, source="anchor", workspace_label=label, session=session,
+                    )
+                    if spec is not None or changed:
+                        # A replaced harness makes an older spec describe another program.
+                        record.set_launch_spec(spec)
+                    elif session is not None:
+                        raise AgentDeliveryError(
+                            f"cannot read the command line of the {record.harness} process of "
+                            f"pane {record.pane_id}, so --session-id cannot be recorded"
+                        )
                     self._save(record)
+                    current = record.launch_spec
                     return {
                         "name": name, "pane_id": record.pane_id,
                         "terminal_id": record.terminal_id, "harness_pid": harness.pid,
                         "replaced": changed, "previous": previous,
                         "migrated_from": migrated_from,
+                        "launch_spec_source": None if current is None else current["source"],
                     }
 
     def rename(self, old: str, new: str) -> dict[str, object]:
@@ -5739,9 +5844,16 @@ RELAY_HARNESSES = ("claude", "codex")
 RELAY_WORKING_MARKER = "esc to interrupt"
 
 
+def wrkslots_executable(registry: str | Path | None = None) -> str | None:
+    """The slot manager: ``AGENTCTL_WRKSLOTS_BIN``, then the project's configured
+    ``wrkslots``, then ``wrkslots`` on PATH."""
+    configured = None if registry is None else wrkslots_for_registry(registry)
+    return os.environ.get("AGENTCTL_WRKSLOTS_BIN") or configured or shutil.which("wrkslots")
+
+
 def _slot_shell_command(
     slot: str, *, isolation: str | None, project: str, explicit_project: bool = False,
-    command: Sequence[str] = (),
+    command: Sequence[str] = (), registry: str | Path | None = None,
 ) -> tuple[str, str, str]:
     """Ask the slot manager for the exec-only line that boxes a pane shell (or ``command``).
 
@@ -5749,10 +5861,11 @@ def _slot_shell_command(
     """
     if isolation is not None and isolation not in SLOT_ISOLATIONS:
         raise AgentDeliveryError("--slot-isolation must be userns, cgroup, or root")
-    executable = os.environ.get("AGENTCTL_WRKSLOTS_BIN") or shutil.which("wrkslots")
+    executable = wrkslots_executable(registry)
     if not executable:
         raise AgentDeliveryError(
-            "--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
+            "--slot needs wrkslots on PATH, in AGENTCTL_WRKSLOTS_BIN, or as \"wrkslots\" "
+            "in the project's .agentctl/profiles.json"
         )
     argv = [executable, "shell-command", slot, "--format", "json"]
     if isolation is not None:

@@ -459,7 +459,7 @@ fn rename_refuses_a_nested_row_and_names_anchor() {
 fn anchor_migrates_a_v2_row_to_flat_schema_1() {
     let fixture = Fixture::new();
     let nested = started_nested(&fixture);
-    let anchored = fixture.manager().anchor("worker", false).unwrap();
+    let anchored = fixture.manager().anchor("worker", false, None).unwrap();
     assert_eq!(anchored["migrated_from"], "agentctl-session/v2");
     let flat = stored(&fixture);
     assert_eq!(flat["schema"], 1);
@@ -472,7 +472,7 @@ fn anchor_migrates_a_v2_row_to_flat_schema_1() {
     assert_eq!(flat["runner_identity"], Value::Null);
     assert!(flat.get("launch").is_none() && flat.get("extensions").is_none());
     assert_eq!(
-        fixture.manager().anchor("worker", false).unwrap()["migrated_from"],
+        fixture.manager().anchor("worker", false, None).unwrap()["migrated_from"],
         Value::Null
     );
 }
@@ -496,7 +496,7 @@ fn anchor_keeps_an_asserted_v3_session_asserted() {
         .report_session
         .store(false, Ordering::Relaxed);
 
-    let anchored = fixture.manager().anchor("worker", false).unwrap();
+    let anchored = fixture.manager().anchor("worker", false, None).unwrap();
     assert_eq!(anchored["migrated_from"], "agentctl-session/v3");
     let flat = stored(&fixture);
     assert_eq!(flat["schema"], 1);
@@ -517,7 +517,7 @@ fn anchor_failure_leaves_the_nested_row_unchanged() {
         .client
         .missing_harness_identity
         .store(true, Ordering::Relaxed);
-    assert!(fixture.manager().anchor("worker", false).is_err());
+    assert!(fixture.manager().anchor("worker", false, None).is_err());
     assert_eq!(stored(&fixture), nested);
 }
 
@@ -607,7 +607,7 @@ fn a_v2_row_without_a_session_queues_until_anchored_then_drains() {
         error.to_string().contains("agentctl anchor worker"),
         "{error}"
     );
-    let anchored = fixture.manager().anchor("worker", false).unwrap();
+    let anchored = fixture.manager().anchor("worker", false, None).unwrap();
     assert_eq!(anchored["migrated_from"], "agentctl-session/v2");
     let migrated = stored(&fixture);
     assert_eq!(migrated["schema"], 1);

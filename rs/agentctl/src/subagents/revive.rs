@@ -527,6 +527,7 @@ struct LaunchPlan {
     project_workspace: Option<String>,
     slot_command: Option<String>,
     relay_command: Option<String>,
+    relay_executable: Option<String>,
 }
 
 fn conversation(record: &AgentRecord) -> Result<NativeSession> {
@@ -608,6 +609,75 @@ fn policy_arguments(record: &AgentRecord, native: &NativeSession) -> Result<Vec<
     Ok(arguments)
 }
 
+/// The conversation a revive resumes: the launch spec's, else the record's own.
+fn revive_conversation(record: &AgentRecord) -> Result<NativeSession> {
+    match record
+        .launch_spec
+        .as_ref()
+        .and_then(|spec| spec["native_session"]["value"].as_str())
+    {
+        Some(value) => Ok(NativeSession::new(&record.harness, value, "asserted")),
+        None => conversation(record),
+    }
+}
+
+/// agentctl launches the replacement itself, so a revived adopted agent is owned.
+fn revived_adapter(record: &AgentRecord) -> &str {
+    if record.adapter == "herdr-foreign" {
+        "herdr"
+    } else {
+        &record.adapter
+    }
+}
+
+/// The recorded spec's argument vector, if the record has a spec.
+fn spec_arguments(record: &AgentRecord) -> Option<Vec<String>> {
+    record.launch_spec.as_ref().map(|spec| {
+        spec["argv"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect()
+    })
+}
+
+/// The exact harness arguments a revive of `record` launches.
+fn expected_arguments(record: &AgentRecord) -> Result<Vec<String>> {
+    let native = revive_conversation(record)?;
+    if let Some(argv) = spec_arguments(record) {
+        return launch_spec::replay_arguments(&record.harness, &argv, &native.value);
+    }
+    let policy = policy_arguments(record, &native)?;
+    Ok(if record.harness == "muse" {
+        policy
+            .into_iter()
+            .chain(["resume".to_owned(), native.value.clone()])
+            .collect()
+    } else {
+        [
+            if record.harness == "claude" {
+                "--resume"
+            } else {
+                "resume"
+            }
+            .to_owned(),
+            native.value.clone(),
+        ]
+        .into_iter()
+        .chain(policy)
+        .collect()
+    })
+}
+
+/// The project's configured wrkslots, unless `AGENTCTL_WRKSLOTS_BIN` already names one.
+pub(super) fn configured_wrkslots(registry: &Path) -> Result<Option<PathBuf>> {
+    if std::env::var_os(WRKSLOTS_BIN_ENV).is_some_and(|value| !value.is_empty()) {
+        return Ok(None);
+    }
+    Ok(crate::profiles::wrkslots_for_registry(registry)?.map(PathBuf::from))
+}
+
 fn validate_census(panes: &[Pane]) -> Result<()> {
     let mut ids = BTreeSet::new();
     if panes.iter().any(|pane| {
@@ -687,13 +757,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             || record.backend != "herdr"
             || !matches!(
                 record.adapter.as_str(),
-                "herdr" | "herdr-pane" | "herdr-relay"
+                "herdr" | "herdr-pane" | "herdr-relay" | "herdr-foreign"
             )
             || !matches!(record.harness.as_str(), "claude" | "codex" | "muse")
         {
             return Err(fail(
-                "revive requires an owned local interactive Claude, Codex, or Muse agent",
+                "revive requires a local interactive Claude, Codex, or Muse agent",
             ));
+        }
+        if record.adapter == "herdr-foreign" && record.launch_spec.is_none() {
+            return Err(fail(format!(
+                "adopted record has no launch spec; while its harness runs, capture one with `agentctl anchor {} --replace`",
+                record.name
+            )));
         }
         if self.pending_move_destination(record)?.is_some() {
             return Err(fail("record has an incomplete move; finish the move first"));
@@ -707,12 +783,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "record has an incomplete rename; finish the rename first",
             ));
         }
-        let native = conversation(record)?;
         let cwd = fs::canonicalize(&record.cwd)
             .map_err(|_| fail("recorded starting directory is unavailable"))?;
         if !cwd.is_dir() || cwd != Path::new(&record.cwd) {
             return Err(fail("recorded starting directory changed"));
         }
+        if let Some(spec) = record.launch_spec.as_ref() {
+            return self.spec_launch_plan(record, spec, cwd, startup_timeout);
+        }
+        let native = conversation(record)?;
         let policy = policy_arguments(record, &native)?;
         let mut options = StartOptions {
             harness: record.harness.clone(),
@@ -779,12 +858,97 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             Some(&native.value),
             &structured,
         )?;
+        self.finish_launch_plan(record, options, arguments, native, cwd)
+    }
+
+    /// Replay what ran: the spec's arguments with one explicit resume, and the environment
+    /// values its names select from the private profile. A profile edited after launch does
+    /// not change the replay.
+    fn spec_launch_plan(
+        &self,
+        record: &AgentRecord,
+        spec: &Value,
+        cwd: PathBuf,
+        startup_timeout: Duration,
+    ) -> Result<LaunchPlan> {
+        let names = spec["environment_names"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        if spec["cwd"] != record.cwd
+            || spec["profile"].as_str() != record.profile.as_deref()
+            || spec["slot"].as_str() != record.slot.as_deref()
+            || spec["slot_project"].as_str() != record.slot_project.as_deref()
+            || spec["slot_isolation"].as_str() != record.slot_isolation.as_deref()
+            || names
+                != record
+                    .environment_names
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+        {
+            return Err(fail("recorded launch spec contradicts its record (cwd, profile, slot, or environment names)"));
+        }
+        let executable = spec["executable"].as_str();
+        if !launch_spec::program_matches(&record.harness, executable) {
+            return Err(fail(format!(
+                "recorded program {:?} is not the {} harness, so it cannot be replayed",
+                executable.unwrap_or_default(),
+                record.harness
+            )));
+        }
+        let native = revive_conversation(record)?;
+        let mut options = StartOptions {
+            harness: record.harness.clone(),
+            profile: record.profile.clone(),
+            model: record.model.clone(),
+            resume: Some(native.value.clone()),
+            startup_timeout,
+            ..StartOptions::default()
+        };
+        if !names.is_empty() {
+            let Some(profile_name) = record.profile.as_deref() else {
+                return Err(fail(
+                    "recorded environment cannot be replayed safely without its launch profile",
+                ));
+            };
+            let root = crate::profiles::configuration_root(&cwd, &self.registry, false)?;
+            let (_, profiles) = crate::profiles::load_profiles(&root, false)?;
+            let profile = profiles
+                .get(profile_name)
+                .ok_or_else(|| fail("recorded launch profile is unavailable"))?;
+            if environment_names(&profile.environment) != names {
+                return Err(fail(
+                    "recorded environment names cannot be reconstructed from the private launch profile",
+                ));
+            }
+            options.environment = profile.environment.clone();
+        }
+        let argv = spec_arguments(record).unwrap_or_default();
+        let arguments = launch_spec::replay_arguments(&record.harness, &argv, &native.value)?;
+        self.finish_launch_plan(record, options, arguments, native, cwd)
+    }
+
+    /// The slot boxing, workspace policy, and identity checks every revive plan shares.
+    fn finish_launch_plan(
+        &self,
+        record: &AgentRecord,
+        mut options: StartOptions,
+        arguments: Vec<String>,
+        native: NativeSession,
+        cwd: PathBuf,
+    ) -> Result<LaunchPlan> {
         let mut slot_command = None;
         let mut relay_command = None;
+        let mut relay_executable = None;
         #[cfg(test)]
         let slot_executable = self.revive_wrkslots_executable.clone();
         #[cfg(not(test))]
-        let slot_executable = None;
+        let slot_executable = configured_wrkslots(&self.registry)?;
         let slot = if let Some(slot) = record.slot.as_ref() {
             Some(SlotLaunch {
                 slot: slot.clone(),
@@ -866,6 +1030,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 if fs::canonicalize(path).ok().as_ref() != Some(&cwd) || mode != isolation {
                     return Err(fail("recorded slot policy changed during preflight"));
                 }
+                relay_executable = Some(argv[0].clone());
                 relay_command = Some(line);
             } else {
                 if record.adapter == "herdr-relay" {
@@ -893,11 +1058,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             project_workspace,
             slot_command,
             relay_command,
+            relay_executable,
         })
     }
 
     fn revive_liveness(&self, record: &AgentRecord) -> ProcessLiveness {
-        let identity = if record.adapter == "herdr" {
+        let identity = if matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
             record.harness_anchor()
         } else {
             record.custom_process_identity.as_ref()
@@ -1062,27 +1228,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 
     fn candidate_policy_matches(&self, record: &AgentRecord, old: &AgentRecord) -> Result<bool> {
-        let native = conversation(old)?;
-        let policy = policy_arguments(old, &native)?;
-        let expected_arguments = if old.harness == "muse" {
-            policy
-                .into_iter()
-                .chain(["resume".to_owned(), native.value.clone()])
-                .collect::<Vec<_>>()
-        } else {
-            [
-                if old.harness == "claude" {
-                    "--resume"
-                } else {
-                    "resume"
-                }
-                .to_owned(),
-                native.value.clone(),
-            ]
-            .into_iter()
-            .chain(policy)
-            .collect::<Vec<_>>()
-        };
+        let native = revive_conversation(old)?;
+        let expected_arguments = expected_arguments(old)?;
         Ok(record.name == old.name
             && record.token != old.token
             && record.harness == old.harness
@@ -1092,7 +1239,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             && record.former_names == old.former_names
             && record.mode == old.mode
             && record.backend == old.backend
-            && record.adapter == old.adapter
+            && record.adapter == revived_adapter(old)
             && record.cwd == old.cwd
             && record.profile == old.profile
             && record.model == old.model
@@ -1626,6 +1773,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .as_secs_f64();
         let new_token = new_journal_id()?;
         let mut candidate = record.clone();
+        candidate.adapter = revived_adapter(&record).to_owned();
         // The new generation is a flat schema-1 record whatever form the old one had.
         candidate.nested = None;
         candidate.storage_directory = Some(StorageDirectory {
@@ -1666,6 +1814,25 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         candidate
             .extra
             .insert("revived_from".to_owned(), json!(record.token));
+        let previous_label = record
+            .launch_spec
+            .as_ref()
+            .and_then(|spec| spec["workspace_label"].as_str().map(str::to_owned));
+        candidate.launch_spec = Some(launch_spec::build(launch_spec::SpecFields {
+            source: "revive",
+            captured_at: now,
+            harness: &candidate.harness,
+            executable: plan.relay_executable.as_deref(),
+            argv: &candidate.arguments,
+            cwd: &candidate.cwd,
+            profile: candidate.profile.as_deref(),
+            environment_names: &candidate.environment_names,
+            slot: candidate.slot.as_deref(),
+            slot_project: candidate.slot_project.as_deref(),
+            slot_isolation: candidate.slot_isolation.as_deref(),
+            workspace_label: previous_label.as_deref(),
+            native_session: Some((&plan.native.value, "asserted")),
+        })?);
         self.save(&candidate)?;
         checkpoint("candidate-prepared")?;
         let mut journal = Journal {
@@ -1877,7 +2044,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             self.write_revive_journal(Some(&before), journal)?;
         }
         let current = self.revive_proof(old)?;
-        if current.kind != "missing" {
+        // An adopted agent's pane was never agentctl's to close, even as an idle shell.
+        let keep_pane = old.adapter == "herdr-foreign" && current.kind != "missing";
+        if current.kind != "missing" && !keep_pane {
             if current != journal.proof {
                 return Err(fail(
                     "stale pane shell generation changed; revive cleanup journal retained",
@@ -1894,7 +2063,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let panes = self.client.panes()?;
         validate_census(&panes)?;
         let tab_closed = !panes.iter().any(|pane| pane.tab_id == journal.proof.tab_id);
-        if !tab_closed {
+        if !tab_closed && !keep_pane {
             return Err(fail(
                 "stale revive tab reappeared during cleanup; journal retained",
             ));
@@ -1926,7 +2095,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         result["revived"] = json!(true);
         result["previous_token"] = json!(journal.old_token);
         result["archive"] = json!(archive_path);
-        result["pane_closed"] = json!(true);
+        result["pane_closed"] = json!(!keep_pane);
         result["tab_closed"] = json!(tab_closed);
         Ok(result)
     }

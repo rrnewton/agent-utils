@@ -394,7 +394,7 @@ fn an_unanchored_record_refuses_input_until_anchored() {
         error.to_string().contains("agentctl anchor worker"),
         "{error}"
     );
-    let result = fixture.manager().anchor("worker", false).unwrap();
+    let result = fixture.manager().anchor("worker", false, None).unwrap();
     assert_eq!(result["harness_pid"], 300);
     assert_eq!(result["replaced"], false);
     assert_eq!(result["terminal_id"], "term-owned");
@@ -424,13 +424,13 @@ fn anchor_refuses_a_changed_harness_without_replace() {
         .insert("owned".to_owned(), 999);
     let error = fixture
         .manager()
-        .anchor("worker", false)
+        .anchor("worker", false, None)
         .expect_err("changed harness");
     assert!(
         error.to_string().contains("rerun with --replace"),
         "{error}"
     );
-    let result = fixture.manager().anchor("worker", true).unwrap();
+    let result = fixture.manager().anchor("worker", true, None).unwrap();
     assert_eq!(result["replaced"], true);
     assert_eq!(result["harness_pid"], 999);
     send(&fixture, "worker", "after explicit re-anchor").unwrap();
@@ -443,7 +443,7 @@ fn a_duplicate_claim_is_refused_at_anchor() {
     write_claiming_record(&fixture, "other");
     let error = fixture
         .manager()
-        .anchor("worker", true)
+        .anchor("worker", true, None)
         .expect_err("duplicate claim");
     assert!(
         error.to_string().contains("already registered as 'other'"),
@@ -461,7 +461,7 @@ fn anchor_refuses_custom_pane_adapters() {
     write_record(&fixture, "worker", &document);
     let error = fixture
         .manager()
-        .anchor("worker", false)
+        .anchor("worker", false, None)
         .expect_err("relay");
     assert!(
         error.to_string().contains("custom panes pin their process"),

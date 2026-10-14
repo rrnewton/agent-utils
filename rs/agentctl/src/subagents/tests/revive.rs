@@ -331,8 +331,10 @@ fn revive_refuses_unsupported_aliases_and_unsafe_environment_replay() {
         let (fixture, mut old) = recoverable("codex", true);
         match kind {
             "adopted" => {
+                // An adopted record without a launch spec has nothing to replay.
                 old.adapter = "herdr-foreign".to_owned();
                 old.foreign_shell_identity = Some(Fake::foreign_shell_identity());
+                old.launch_spec = None;
             }
             "headless" => {
                 old.mode = "headless".to_owned();
@@ -1477,9 +1479,39 @@ fn revive_loads_profile_environment_privately_and_keeps_its_policy() {
 }
 
 #[test]
-fn revive_refuses_profile_model_effort_argv_and_environment_name_drift() {
+fn revive_replays_a_spec_through_profile_drift_but_not_environment_name_drift() {
     for field in ["model", "effort", "argv", "environment"] {
         let (fixture, _, path) = profile_fixture();
+        let mut config = agent::read_private_json(&path).unwrap();
+        let profile = &mut config["profiles"]["claude-recovery"];
+        match field {
+            "model" => profile["model"] = json!("different"),
+            "effort" => profile["reasoning_effort"] = json!("medium"),
+            "argv" => profile["argv"] = json!(["--allowedTools", "Read,Write"]),
+            _ => profile["env"] = json!({"DIFFERENT_MODE":"profile-private-value"}),
+        }
+        agent::atomic_json(&path, &config).unwrap();
+        let plan = fixture
+            .manager()
+            .revive("worker", true, None, TIMEOUT)
+            .unwrap();
+        // The spec replays what ran; the profile only supplies the named environment values.
+        let expected = if field == "environment" {
+            "blocked"
+        } else {
+            "revive"
+        };
+        assert_eq!(plan["action"], expected, "{field}");
+        assert!(!plan.to_string().contains("profile-private-value"));
+    }
+}
+
+#[test]
+fn revive_without_a_spec_refuses_profile_model_effort_argv_and_environment_name_drift() {
+    for field in ["model", "effort", "argv", "environment"] {
+        let (fixture, mut old, path) = profile_fixture();
+        old.launch_spec = None;
+        fixture.manager().save(&old).unwrap();
         let mut config = agent::read_private_json(&path).unwrap();
         let profile = &mut config["profiles"]["claude-recovery"];
         match field {
@@ -1510,6 +1542,10 @@ fn revive_checks_recorded_slot_path_and_isolation_in_read_only_preflight() {
         old.slot = Some("slot_name".to_owned());
         old.slot_project = Some(fixture.root.display().to_string());
         old.slot_isolation = Some("userns".to_owned());
+        let spec = old.launch_spec.as_mut().unwrap();
+        spec["slot"] = json!(old.slot);
+        spec["slot_project"] = json!(old.slot_project);
+        spec["slot_isolation"] = json!(old.slot_isolation);
         fixture.manager().save(&old).unwrap();
         let bin = fixture.root.join("wrkslots-test");
         let output_path = if field == "path" {
@@ -1529,6 +1565,13 @@ fn revive_checks_recorded_slot_path_and_isolation_in_read_only_preflight() {
         manager.revive_wrkslots_executable = Some(bin);
         let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
         assert_eq!(plan["action"], "blocked");
+        assert!(
+            plan["reason"]
+                .as_str()
+                .unwrap()
+                .contains("recorded slot directory or isolation changed"),
+            "{plan}"
+        );
         assert_eq!(files(&fixture.root.join("registry")), before);
         assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
     }
@@ -1540,6 +1583,10 @@ fn revive_reuses_the_recorded_slot_without_allocation_or_rebinding() {
     old.slot = Some("existing_slot".to_owned());
     old.slot_project = Some(fixture.root.display().to_string());
     old.slot_isolation = Some("userns".to_owned());
+    let spec = old.launch_spec.as_mut().unwrap();
+    spec["slot"] = json!(old.slot);
+    spec["slot_project"] = json!(old.slot_project);
+    spec["slot_isolation"] = json!(old.slot_isolation);
     fixture.manager().save(&old).unwrap();
     let output = json!({"command":"exec preserved-owner-policy", "slot_path":fixture.root, "isolation":"userns"}).to_string();
     let bin = fixture.root.join("wrkslots-test");

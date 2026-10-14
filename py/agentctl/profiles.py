@@ -471,6 +471,14 @@ def _workspace(value: object) -> str | None:
     return value
 
 
+def _wrkslots(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or "\0" in value or not os.path.isabs(value):
+        raise AgentDeliveryError("profile config wrkslots must be an absolute path to the wrkslots command")
+    return value
+
+
 def load_configuration(
     cwd: str | Path, *, absent_ok: bool = False,
 ) -> tuple[Path, dict[str, LaunchProfile], str | None]:
@@ -511,13 +519,14 @@ def load_configuration(
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
     if (not isinstance(raw, dict)
             or not {"schema", "profiles"}.issubset(raw)
-            or set(raw) - {"schema", "profiles", "workspace"}):
+            or set(raw) - {"schema", "profiles", "workspace", "wrkslots"}):
         raise AgentDeliveryError(
-            "profile config must contain schema and profiles, with optional workspace"
+            "profile config must contain schema and profiles, with optional workspace and wrkslots"
         )
     if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
         raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
+    _wrkslots(raw.get("wrkslots"))
     return path, dict(sorted(profiles.items())), _workspace(raw.get("workspace"))
 
 
@@ -569,6 +578,18 @@ def workspace_for_registry(registry: str | Path) -> str | None:
     in an unrelated launch profile must not disable ordinary managed-agent
     operations that only need the optional placement label.
     """
+    raw = _registry_policy(registry)
+    return None if raw is None else _workspace(raw.get("workspace"))
+
+
+def wrkslots_for_registry(registry: str | Path) -> str | None:
+    """Read only the configured wrkslots command for a conventional project registry."""
+    raw = _registry_policy(registry)
+    return None if raw is None else _wrkslots(raw.get("wrkslots"))
+
+
+def _registry_policy(registry: str | Path) -> dict[str, object] | None:
+    """The raw project configuration object beside a conventional registry, if any."""
     root = Path(registry).expanduser().resolve()
     if root.name != ".agentctl":
         return None
@@ -596,7 +617,7 @@ def workspace_for_registry(registry: str | Path) -> str | None:
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise AgentDeliveryError("profile config must be an object")
-    return _workspace(raw.get("workspace"))
+    return cast(dict[str, object], raw)
 
 
 def validate_muse_headless_arguments(

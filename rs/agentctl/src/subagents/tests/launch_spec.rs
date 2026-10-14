@@ -1,0 +1,214 @@
+use super::*;
+
+const TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX: &str = "/usr/local/bin/codex_cli/codex";
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+/// Adopt the fake's hand-started Codex pane, whose pinned process (pid 300) ran `argv`.
+fn adopted(argv: Option<&[&str]>, reports_session: bool) -> (Fixture, Value) {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .report_session
+        .store(reports_session, Ordering::Relaxed);
+    if let Some(argv) = argv {
+        fixture
+            .client
+            .command_lines
+            .lock()
+            .unwrap()
+            .insert(300, strings(argv));
+    }
+    let result = fixture.adopt();
+    (fixture, result)
+}
+
+fn kill(fixture: &Fixture, record: &AgentRecord) {
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    // Adoption created no tab, so count the adopted one before a replacement is allocated.
+    fixture.client.environments.lock().unwrap().push(Vec::new());
+}
+
+#[test]
+fn start_records_the_exact_launch_before_herdr_reports_back() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                model: Some("chosen".to_owned()),
+                harness_args: strings(&["--dangerously-skip-permissions"]),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    let spec = record.launch_spec.clone().unwrap();
+    let native = record.native_session.clone().unwrap();
+    assert_eq!(spec["source"], "start");
+    assert_eq!(spec["executable"], Value::Null);
+    assert_eq!(spec["argv"], json!(record.arguments));
+    assert_eq!(
+        record.arguments,
+        strings(&[
+            "--session-id",
+            &native.value,
+            "--model",
+            "chosen",
+            "--dangerously-skip-permissions"
+        ])
+    );
+    assert_eq!(
+        spec["native_session"],
+        json!({"agent": "claude", "value": native.value, "source": "asserted"})
+    );
+}
+
+#[test]
+fn adopt_reads_the_pinned_command_line_and_its_conversation() {
+    let argv = [CODEX, "resume", "argv-conversation", "--no-alt-screen"];
+    let (_fixture, result) = adopted(Some(&argv), false);
+    let spec = &result["launch_spec"];
+    assert_eq!(spec["source"], "adopt");
+    assert_eq!(spec["executable"], CODEX);
+    assert_eq!(spec["argv"], json!(argv[1..]));
+    assert_eq!(spec["workspace_label"], "subagents");
+    assert_eq!(
+        spec["native_session"],
+        json!({"agent": "codex", "value": "argv-conversation", "source": "argv"})
+    );
+}
+
+#[test]
+fn adopt_without_a_readable_command_line_records_no_spec_and_cannot_revive() {
+    let (fixture, result) = adopted(None, false);
+    assert!(result.get("launch_spec").is_none());
+    let record = fixture.manager().load("foreign").unwrap();
+    kill(&fixture, &record);
+    let plan = fixture
+        .manager()
+        .revive("foreign", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(plan["action"], "blocked");
+    assert!(plan["reason"]
+        .as_str()
+        .unwrap()
+        .contains("agentctl anchor foreign --replace"));
+}
+
+#[test]
+fn anchor_records_a_caller_conversation_and_refuses_a_contradiction() {
+    let (fixture, _) = adopted(Some(&[CODEX, "resume", "launched-as"]), false);
+    let anchored = fixture
+        .manager()
+        .anchor("foreign", false, Some("after-clear"))
+        .unwrap();
+    assert_eq!(anchored["launch_spec_source"], "anchor");
+    let record = fixture.manager().load("foreign").unwrap();
+    assert_eq!(
+        record.launch_spec.unwrap()["native_session"],
+        json!({"agent": "codex", "value": "after-clear", "source": "caller"})
+    );
+
+    let (reported, result) = adopted(Some(&[CODEX, "resume", "x"]), true);
+    let session = result["session_value"].as_str().unwrap().to_owned();
+    assert_ne!(session, "different");
+    let before = reported.manager().load("foreign").unwrap().launch_spec;
+    let error = reported
+        .manager()
+        .anchor("foreign", false, Some("different"))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("contradicts the session Herdr reports"));
+    assert_eq!(
+        reported.manager().load("foreign").unwrap().launch_spec,
+        before
+    );
+}
+
+#[test]
+fn revive_replays_an_adopted_spec_as_an_owned_agent_and_leaves_the_old_pane() {
+    let argv = [
+        CODEX,
+        "resume",
+        "lead-conversation",
+        "--no-alt-screen",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ];
+    let (fixture, _) = adopted(Some(&argv), false);
+    let old = fixture.manager().load("foreign").unwrap();
+    kill(&fixture, &old);
+    let plan = fixture
+        .manager()
+        .revive("foreign", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(plan["action"], "revive", "{plan}");
+    let result = fixture
+        .manager()
+        .revive("foreign", false, Some(&old.token), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true);
+    assert_eq!(result["pane_closed"], false);
+    assert_eq!(result["tab_closed"], false);
+    assert!(fixture.client.closed.lock().unwrap().is_empty());
+    let new = fixture.manager().load("foreign").unwrap();
+    let expected = strings(&argv[1..]);
+    assert_eq!(new.adapter, "herdr");
+    assert_eq!(new.arguments, expected);
+    assert_eq!(new.resume.as_deref(), Some("lead-conversation"));
+    assert!(new.foreign_shell_identity.is_none());
+    let spec = new.launch_spec.unwrap();
+    assert_eq!(spec["source"], "revive");
+    assert_eq!(spec["argv"], json!(expected));
+    assert_eq!(spec["workspace_label"], "subagents");
+}
+
+#[test]
+fn revive_refuses_a_spec_whose_program_is_not_the_harness() {
+    let (fixture, _) = adopted(
+        Some(&["/usr/bin/node", "/opt/cli.js", "resume", "x"]),
+        false,
+    );
+    let old = fixture.manager().load("foreign").unwrap();
+    kill(&fixture, &old);
+    let plan = fixture
+        .manager()
+        .revive("foreign", true, None, TIMEOUT)
+        .unwrap();
+    assert!(
+        plan["reason"]
+            .as_str()
+            .unwrap()
+            .contains("is not the codex harness"),
+        "{plan}"
+    );
+}
+
+#[test]
+fn record_with_a_malformed_spec_is_refused() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let path = fixture.root.join("registry/worker/agent.json");
+    let mut document = agent::read_private_json(&path).unwrap();
+    document["launch_spec"]["argv"] = json!(["", "x"]);
+    agent::atomic_json(&path, &document).unwrap();
+    let error = fixture.manager().load("worker").unwrap_err();
+    assert!(error.to_string().contains("invalid launch spec (argv)"));
+}

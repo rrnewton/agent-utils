@@ -63,6 +63,8 @@ class FakeManagedClient:
         #: One-shot: input addressed to the key pane is written to the value pane instead.
         self.redirect_once: dict[str, str] = {}
         self.keys_sent: list[tuple[str, str]] = []
+        #: ``/proc/PID/cmdline`` of pinned harness processes, by pid; absent reads fail.
+        self.command_lines: dict[int, tuple[str, ...]] = {}
 
     def workspace_id_for_label(self, label: str) -> str | None:
         if label == "project-agents":
@@ -139,6 +141,9 @@ class FakeManagedClient:
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
             pid=pid, starttime_ticks=pid, executable_device=5, executable_inode=6,
         )
+
+    def process_command_line(self, expected: CustomProcessIdentity) -> tuple[str, ...] | None:
+        return self.command_lines.get(expected.pid)
 
     def verify_harness_identity(self, pane_id: str, expected: CustomProcessIdentity) -> bool:
         return (pane_id in self.infos and self.infos[pane_id].agent is not None

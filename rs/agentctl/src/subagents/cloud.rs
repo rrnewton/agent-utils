@@ -1026,6 +1026,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             reasoning_effort: reasoning_effort.map(str::to_owned),
             environment_names: environment_names(&options.environment),
             agentcloud: Some(cloud),
+            launch_spec: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),

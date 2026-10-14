@@ -32,6 +32,7 @@ use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
 
 mod cloud;
+mod launch_spec;
 mod nested;
 mod revive;
 mod stop_advice;
@@ -1157,6 +1158,10 @@ pub trait ManagedApi: AgentApi {
             "harness process verification is unavailable",
         ))
     }
+    /// The argument vector of one pinned process generation; `None` when it cannot be read.
+    fn process_command_line(&self, _expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+        None
+    }
     /// Does the running server refuse input whose expected terminal does not match?
     fn input_expect_supported(&self) -> crate::error::Result<bool> {
         Ok(false)
@@ -1471,6 +1476,9 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<bool> {
         HerdrClient::verify_harness_identity(self, pane, expected)
     }
+    fn process_command_line(&self, expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+        HerdrClient::process_command_line(self, expected)
+    }
     fn input_expect_supported(&self) -> crate::error::Result<bool> {
         HerdrClient::input_expect_supported(self)
     }
@@ -1657,6 +1665,9 @@ struct AgentRecord {
     environment_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agentcloud: Option<cloud::CloudRecord>,
+    /// What ran, replayable by revive; see [`launch_spec`]. Absent when nothing captured one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_spec: Option<Value>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -1947,6 +1958,9 @@ impl AgentRecord {
                 "invalid launch recovery metadata in {}",
                 path.display()
             )));
+        }
+        if let Some(spec) = self.launch_spec.as_ref() {
+            launch_spec::validate(spec, &self.harness, &path.display().to_string())?;
         }
         Ok(())
     }
@@ -3908,9 +3922,9 @@ pub fn slot_shell_command(
         .or_else(wrkslots_executable)
         .ok_or_else(|| {
             fail(if launch.project_box {
-                "--project-box needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
+                "--project-box needs wrkslots on PATH, in AGENTCTL_WRKSLOTS_BIN, or as \"wrkslots\" in the project's .agentctl/profiles.json"
             } else {
-                "--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
+                "--slot needs wrkslots on PATH, in AGENTCTL_WRKSLOTS_BIN, or as \"wrkslots\" in the project's .agentctl/profiles.json"
             })
         })?;
     let slot = launch.slot.as_str();
@@ -5121,7 +5135,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     /// Pin the terminal and harness process an operator has confirmed for NAME.
-    pub fn anchor(&self, agent_name: &str, replace: bool) -> Result<Value> {
+    /// Pin the terminal and harness process an operator has confirmed for the agent.
+    ///
+    /// The pinned process's command line becomes the record's launch spec. `session` names its
+    /// native conversation when Herdr does not report one, for example a Claude agent anchoring
+    /// itself with `$CLAUDE_CODE_SESSION_ID`.
+    pub fn anchor(&self, agent_name: &str, replace: bool, session: Option<&str>) -> Result<Value> {
+        if session.is_some_and(|value| value.is_empty() || value.contains('\0')) {
+            return Err(fail(
+                "native session id must be nonempty and contain no NUL",
+            ));
+        }
         let _lock = self.lock(agent_name)?;
         let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
@@ -5170,6 +5194,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         record.terminal_id = info.terminal_id;
         record.harness_identity = Some(harness.clone());
         record.anchor_rule = Some(ANCHOR_RULE);
+        let label = match record.workspace_id.as_deref() {
+            Some(workspace) => self.client.workspace_label(workspace).ok(),
+            None => None,
+        };
+        let spec = self.captured_launch_spec(
+            &record,
+            Some(&harness),
+            "anchor",
+            label.as_deref(),
+            session,
+        )?;
+        if spec.is_some() || changed {
+            // A replaced harness makes an older spec describe another program.
+            record.launch_spec = spec;
+        } else if session.is_some() {
+            return Err(fail(format!(
+                "cannot read the command line of the {} process of pane {pane}, so --session-id cannot be recorded",
+                record.harness
+            )));
+        }
         self.save(&record)?;
         Ok(json!({
             "name": agent_name,
@@ -5179,6 +5223,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "replaced": changed,
             "previous": previous,
             "migrated_from": migrated_from,
+            "launch_spec_source": record.launch_spec.as_ref().map(|spec| spec["source"].clone()),
         }))
     }
 
@@ -5955,6 +6000,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // The agent works in the slot: its record and pane cwd are the slot
         // directory, which is where the boxed shell starts.
         let mut relay_command = None;
+        let mut relay_executable = None;
         let mut slot_project = None;
         let mut slot_isolation = None;
         let mut launch_extra = BTreeMap::new();
@@ -5971,6 +6017,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     ))
                 })?;
                 let mut launch = launch.clone();
+                if launch.executable.is_none() {
+                    launch.executable = revive::configured_wrkslots(&self.registry)?;
+                }
                 if launch.project_box && launch.box_cwd.is_none() {
                     // A coordinator box starts where the agent was asked to work.
                     launch.box_cwd = Some(cwd.clone());
@@ -6020,6 +6069,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     let (relay_line, _path, _isolation) =
                         slot_shell_command(launch, &project, &argv)?;
                     relay_command = Some(relay_line);
+                    relay_executable = Some(executable.display().to_string());
                     (slot_path, None)
                 } else {
                     (slot_path, Some(line))
@@ -6086,6 +6136,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             reasoning_effort: reasoning_effort.map(str::to_owned),
             environment_names: environment_names(&options.environment),
             agentcloud: None,
+            launch_spec: None,
             extra: launch_extra,
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -6112,6 +6163,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
+        // The spec is durable before Herdr starts anything, so a launch that never reports
+        // back can still be replayed exactly.
+        record.launch_spec = Some(launch_spec::build(launch_spec::SpecFields {
+            source: "start",
+            captured_at: record.created_at,
+            harness: &record.harness,
+            executable: relay_executable.as_deref(),
+            argv: &record.arguments,
+            cwd: &record.cwd,
+            profile: record.profile.as_deref(),
+            environment_names: &record.environment_names,
+            slot: record.slot.as_deref(),
+            slot_project: record.slot_project.as_deref(),
+            slot_isolation: record.slot_isolation.as_deref(),
+            workspace_label: project_workspace.as_deref(),
+            native_session: record
+                .native_session
+                .as_ref()
+                .map(|native| (native.value.as_str(), "asserted")),
+        })?);
         self.save(&record)?;
         let launched = self.launch(
             &mut record,
@@ -6186,7 +6257,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_agent: options.session.as_ref().map(|_| options.harness.clone()),
             session_value: options.session.clone(),
             expected_agent: Some(options.harness.clone()),
-            expected_workspace: Some(options.expected_workspace),
+            expected_workspace: Some(options.expected_workspace.clone()),
             expected_cwd: Some(cwd.clone()),
         };
         let _generation_lock = self.lock(agent_name)?;
@@ -6442,6 +6513,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             reasoning_effort: None,
             environment_names: Vec::new(),
             agentcloud: None,
+            launch_spec: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -6468,6 +6540,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
+        record.launch_spec = self.captured_launch_spec(
+            &record,
+            record.harness_identity.as_ref(),
+            "adopt",
+            Some(&options.expected_workspace),
+            None,
+        )?;
         self.save(&record)?;
         let final_status = self.status_record(&record).and_then(|result| {
             if !result["probe_error"].is_null() {
@@ -9668,6 +9747,7 @@ pub(crate) mod tests {
                     labels: Mutex::new(BTreeMap::new()),
                     terminals: Mutex::new(BTreeMap::new()),
                     harness_pids: Mutex::new(BTreeMap::new()),
+                    command_lines: Mutex::new(BTreeMap::new()),
                     missing_harness_identity: AtomicBool::new(false),
                     missing_terminal: AtomicBool::new(false),
                     replace_harness_after_pin: AtomicBool::new(false),
@@ -9961,6 +10041,8 @@ pub(crate) mod tests {
         terminals: Mutex<BTreeMap<String, String>>,
         /// Foreground harness pid per pane; a test replaces the harness by changing it.
         harness_pids: Mutex<BTreeMap<String, u64>>,
+        /// `/proc/PID/cmdline` of pinned harness processes, by pid; absent reads fail.
+        command_lines: Mutex<BTreeMap<u64, Vec<String>>>,
         missing_harness_identity: AtomicBool,
         missing_terminal: AtomicBool,
         replace_harness_after_pin: AtomicBool,
@@ -10684,6 +10766,13 @@ pub(crate) mod tests {
             Ok(Some(Self::harness(
                 *pids.entry(pane.to_owned()).or_insert(next),
             )))
+        }
+        fn process_command_line(&self, expected: &CustomProcessIdentity) -> Option<Vec<String>> {
+            self.command_lines
+                .lock()
+                .unwrap()
+                .get(&expected.pid)
+                .cloned()
         }
         fn verify_harness_identity(
             &self,
@@ -15732,6 +15821,8 @@ pub(crate) mod tests {
     mod herdr_compatibility;
     /// Recipient checks around input, anchors, rename transactions and doctor.
     mod identity;
+    /// Launch specs written at start, read at adopt and anchor, and replayed by revive.
+    mod launch_spec;
     /// Muse 1.4 paused, idle, staged and working status, and the input each one admits.
     mod muse_status;
     /// Nested agentctl-session/v2 and v3 rows: decode, write-back and anchor migration.

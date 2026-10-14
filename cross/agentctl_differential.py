@@ -62,7 +62,7 @@ def _normalize(value: object, conversations: set[str] | None = None) -> object:
     if isinstance(value, list):
         return [_normalize(item, conversations) for item in value]
     if isinstance(value, dict):
-        return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
+        return {str(key): ("<TOKEN>" if key == "token" else 0 if key in ("created_at", "captured_at")
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
                           # Each edition's fixture runs its own harness process: only its
                           # pid and start time differ, the rest of the identity is compared.
@@ -352,6 +352,43 @@ def _conversations(harness: Harness, report: Report) -> None:
     report.require("primary/conversation/resume/no-brief",
                    all(not _state(root).get("submitted") for root in (mismatch.python_root, mismatch.rust_root)),
                    "brief reached a contradictory conversation")
+
+
+def _launch_specs(harness: Harness, report: Report) -> None:
+    """Both editions write, validate, and refuse the same launch spec and promote states."""
+    case = harness.case("primary-launch-spec")
+    outcomes = _pair(harness, report, case, "primary/launch-spec/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", "--harness", "claude", *_COMMON,
+    ))
+    for edition, outcome in zip(("python", "rust"), outcomes, strict=True):
+        status = json.loads(outcome.stdout) if outcome.returncode == 0 else {}
+        spec = status.get("launch_spec")
+        report.require(f"primary/launch-spec/start/{edition}",
+                       isinstance(spec, dict) and spec.get("schema") == "agentctl-launch-spec/v1"
+                       and spec.get("source") == "start" and spec.get("argv") == status.get("arguments")
+                       and spec.get("executable") is None
+                       and isinstance(spec.get("native_session"), dict)
+                       and spec["native_session"].get("source") == "asserted",
+                       f"start did not record its exact launch: {status!r}")
+    for root in (case.python_root, case.rust_root):
+        path = root / "registry/worker/agent.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["launch_spec"]["source"] = "guess"
+        path.write_text(json.dumps(document), encoding="utf-8")
+    _pair(harness, report, case, "primary/launch-spec/malformed-status", ("status", "worker", *_COMMON), 75)
+    configured = harness.case("primary-launch-spec-wrkslots")
+    for value, expected in (("relative/wrkslots", 75), ("/opt/wrkslots", 0)):
+        for root in (configured.python_root, configured.rust_root):
+            directory = root / ".agentctl"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            config = directory / "profiles.json"
+            config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "wrkslots": value, "profiles": {}}),
+                              encoding="utf-8")
+            config.chmod(0o600)
+        _pair(harness, report, configured, f"primary/launch-spec/wrkslots-config/{value}",
+              ("profiles", "--cwd", "<ROOT>"), expected)
 
 
 def _profiles(harness: Harness, report: Report) -> None:
@@ -2845,6 +2882,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _orientation(harness, report)
             _lifecycle(harness, report)
             _conversations(harness, report)
+            _launch_specs(harness, report)
             _profiles(harness, report)
             _profile_resume(harness, report)
             _workspace_policy(harness, report)

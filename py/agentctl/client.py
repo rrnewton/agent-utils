@@ -59,6 +59,8 @@ _CONTROL_READ_BURST = 256 << 10
 # implementation (or a Linux process API) cannot represent.
 _MAX_PROCESS_ID = 2_147_483_647
 _MAX_U64 = (1 << 64) - 1
+#: Bound on one pinned process's /proc/PID/cmdline read for a launch spec.
+_MAX_COMMAND_LINE_BYTES = 256 << 10
 _SUPPORTED_PANE_SHELLS = frozenset(("bash", "zsh", "sh", "dash", "fish", "ksh"))
 _MAX_SHELL_TASKS = 4096
 _MAX_CHILDREN_BYTES = 64 << 10
@@ -1202,6 +1204,37 @@ class HerdrClient:
             first[0],
             executable_link_before,
         )
+
+    def process_command_line(
+        self, expected: CustomProcessIdentity,
+    ) -> tuple[str, ...] | None:
+        """Read the argument vector of one pinned process generation, or ``None``.
+
+        The identity is proved before and after ``/proc/PID/cmdline`` is read, so the
+        vector cannot belong to a reused process ID. Only the command line is read,
+        never the environment. A vector that is not NUL-separated UTF-8 text, exceeds
+        256 KiB, or has an empty program name is ``None``.
+        """
+        before = self._process_identity(expected.pid)
+        if before is None or before[0] != expected:
+            return None
+        try:
+            with open(f"/proc/{expected.pid}/cmdline", "rb") as stream:
+                raw = stream.read(_MAX_COMMAND_LINE_BYTES + 1)
+        except OSError:
+            return None
+        after = self._process_identity(expected.pid)
+        if after is None or after[0] != expected or not raw or len(raw) > _MAX_COMMAND_LINE_BYTES:
+            return None
+        if raw.endswith(b"\0"):
+            raw = raw[:-1]
+        try:
+            argv = tuple(item.decode("utf-8") for item in raw.split(b"\0"))
+        except UnicodeDecodeError:
+            return None
+        if not argv or not argv[0] or any(not item for item in argv):
+            return None
+        return argv
 
     @staticmethod
     def _supported_shell_name(executable: str) -> bool:
