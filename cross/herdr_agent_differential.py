@@ -2234,7 +2234,9 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
                 return [clean(entry) for entry in item]
             if isinstance(item, dict):
                 return {
-                    str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
+                    # A record's launch_spec.captured_at is its created_at: a clock reading.
+                    str(key): ("<TOKEN>" if key == "token"
+                               else 0 if key in ("created_at", "captured_at")
                                else "<ARCHIVE>" if key == "archive"
                                # Each edition's fixture runs its own harness process: only
                                # its pid and start time differ.
