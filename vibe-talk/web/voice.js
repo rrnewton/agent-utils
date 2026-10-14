@@ -19032,7 +19032,9 @@ async function loadTimeline(options) {
         const abandoned = { key: holdKey, context, channel, view, thread, canon, column: steps.column, sent,
           sentAt: Date.now(), live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0 };
         const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
-          (answer) => abandonRead(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned)));
+          // Once it settles, the placing read that waited for it goes (`placeUnplacedWaits`). `#308`.
+          (answer) => abandonRead(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned),
+            queuePlaceUnplaced));
         abandoned.number = timelineAnswersAsked;
         payload = await asked;
         steps.resume();
@@ -19677,27 +19679,31 @@ function answeredThread(message) {
 // So once the channel's reads go quiet, the messages the stream left unplaced that those reads did not
 // place are placed by ONE read of All, which carries every message with its thread record: what
 // changed in All since its last read where it can be, else its newest page. Folded as a read of All
-// is, it moves each into its thread in every column (`followPlacement`). Not for a channel that is one
-// thread, whose Main holds every message in it, nor while the page is hidden, nor while another read
-// of the channel is on the wire: the read ending asks again. One at a time. A read that fails is asked
-// again when the next read of the channel ends, the poll's at the latest — but not, once one has been
-// given up on, while the server may still be reading for it (`SERVER_READ_BOUND_MS`, `remote-ops-audit`
-// W7), unless a live event since says the service is answering. A read of All that lands — this one,
-// or the reader's own — answers for every unplaced message that arrived before it was sent, carried or
-// not: one it does not carry has nothing there to place it by, and asking again would bring the same
-// answer.
+// is, it moves each into its thread in every column (`followPlacement`), and brings the view on screen
+// up to date as any read of All does (`catchUpFromAll`). Not for a channel that is one thread, whose
+// Main holds every message in it, nor while the page is hidden, nor while another read of the channel
+// is on the wire: the read ending asks again. One at a time. A read that fails is asked again when the
+// next read of the channel ends, the poll's at the latest. A read of All that lands — this one, or the
+// reader's own — answers for every unplaced message that arrived before it was sent, carried or not:
+// one it does not carry has nothing there to place it by, and asking again would bring the same answer.
+//
+// NOR WHILE A READ OF THE CHANNEL THE PAGE GAVE UP ON MAY STILL BE ANSWERED (`remote-ops-audit` W7).
+// The server is still reading for it, and behind a bridge that read is a scan of the space: a read
+// beside it is the second scan W7 exists to prevent, and its late answer is used only if no read of the
+// channel was sent after it (`abandonedReadStands`), so a read beside it throws that answer away too.
+// Behind a slow bridge — newest pages taking longer than the page waits for them — that is the
+// ordinary case, and it is every message the stream left unplaced, a thread reply or one posted to the
+// channel itself. So the placing read waits while any view of the channel is held (`readHolds`): until
+// the read given up on answers or fails, when it is asked for at once (`abandonRead`), or the server's
+// bound has passed, or a live event says the service is answering. Given up on itself, it is kept the
+// same way: its late answer is used if nothing has replaced it, and until then the poll of the view on
+// screen waits for it, since that answer brings that view up to date as well. A late answer asks again
+// for what it could not answer; a failure waits for the next read of the channel to end.
 
 /** How many messages the stream has left unplaced in this page, in any channel: the clock `unplacedSince` reads. */
 let unplacedArrivals = 0;
 /** The channel whose placing read is on the wire, or null. */
 let placingReadInFlight = null;
-/**
- * The placing read last given up on: its channel, until when the server may still be reading for it,
- * and `liveNewsSeen` for the channel when it was sent. Null when none holds.
- *
- * @type {{channel: string, until: number, news: number} | null}
- */
-let placingHold = null;
 
 /** The ids the selected channel's stream left unplaced that no read of All has answered for. */
 function unplacedToAsk() {
@@ -19724,14 +19730,22 @@ function answerUnplaced(canon, seen) {
   }
 }
 
-/** Whether a placing read given up on in `channel` may still be running at the server, with no live news since. */
-function placingHeld(channel) {
-  if (!placingHold || placingHold.channel !== channel) return false;
-  if (Date.now() >= placingHold.until || (liveNewsSeen.get(channel) || 0) !== placingHold.news) {
-    placingHold = null;
-    return false;
+/**
+ * Whether a read of `channel` the page gave up on may still be answered: a hold on any of its views
+ * (`readHolds`), a placing read's own among them, that the server's bound has not ended and no live
+ * news has lifted (`noteLiveEvent`). The placing read waits for it: see above.
+ *
+ * @param {string} channel
+ */
+function placeUnplacedWaits(channel) {
+  const now = Date.now();
+  let waits = false;
+  for (const [key, hold] of [...readHolds]) {
+    if (hold.channel !== channel) continue;
+    if (now >= hold.until) readHolds.delete(key);
+    else waits = true;
   }
-  return true;
+  return waits;
 }
 
 /** `placeUnplaced`, once the read ending now has drawn what it brought. */
@@ -19741,21 +19755,26 @@ function queuePlaceUnplaced() {
 }
 
 /**
+ * @typedef {AbandonedRead & {sent: string | null, seen: number, number: number}} PlacingRead A placing
+ *   read: the position in All it continues, or null for All's newest page, and `unplacedArrivals` and
+ *   `timelineAnswersAsked` when it was sent. Its `key` is the view on screen in the left column, whose
+ *   poll waits for it once it is given up on.
+ */
+
+/**
  * Read All to place what the stream left unplaced and no read has placed since: see above. What changed
  * in All since its last read, when All has a position this page read recently enough to continue from
  * (`#203 incremental-refresh`) — behind a bridge that is the cheap read, where All's newest page can be
  * a scan of the space — and otherwise, or when the server can no longer continue from it, the newest
  * page. A delta that says more follows is not followed: the newest page is read instead, as a refresh
- * does past its last delta page. One that no longer continues All's cover — a read of All landed while
- * it was out — is dropped, and the read that landed has answered for what it carried. A newest page
- * that lands after the stream has delivered anything since it was sent is dropped too, and asked
- * again: as the newest page of All it would take that message out of the store as deleted upstream.
+ * does past its last delta page. Given up on, the read is kept, and its view held (`abandonRead`): its
+ * late answer lands as one in time does (`landPlacingRead`).
  */
 async function placeUnplaced() {
   const channel = String(el("discord-channel").value);
   if (!threadingSupported || !channel || channelCanon.channel !== channel || channelCanon.scope ||
       placingReadInFlight !== null || discordFetchInFlight || document.visibilityState === "hidden" ||
-      placingHeld(channel)) return;
+      placeUnplacedWaits(channel)) return;
   if (unplacedToAsk().length === 0) return;
   placingReadInFlight = channel;
   const canon = channelCanon;
@@ -19763,20 +19782,23 @@ async function placeUnplaced() {
   let sent = all && all.live && all.newest && Date.now() - (all.fullAt || 0) < TIMELINE_RECONCILE_MS
     ? all.newest : null;
   const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`;
-  let sentAt = Date.now();
-  let news = liveNewsSeen.get(channel) || 0;
+  const key = inColumn(columns.main, readHoldKey);
   let again = false;
   try {
     for (;;) {
-      sentAt = Date.now();
-      news = liveNewsSeen.get(channel) || 0;
-      const live = liveEventsSeen.get(channel) || 0;
-      const seen = unplacedArrivals;
+      /** @type {PlacingRead} */
+      const read = { key, channel, canon, sent, seen: unplacedArrivals, sentAt: Date.now(),
+        live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0 };
       const path = `${base}${sent ? `&after=${encodeURIComponent(sent)}` : ""}&reason=place`;
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
-        payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }));
+        // A late answer that lands asks again for what it could not answer; a failure does not.
+        const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
+          (answer) => abandonRead(answer, read, (late) => landPlacingRead(late, read),
+            (landed) => { if (landed) queuePlaceUnplaced(); }));
+        read.number = timelineAnswersAsked;
+        payload = await asked;
       } catch (error) {
         if (sent && isCursorRefusal(error)) {
           sent = null;
@@ -19785,41 +19807,58 @@ async function placeUnplaced() {
         throw error;
       }
       if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return;
-      if (sent && payload.delta) {
-        if (payload.delta.more) {
-          sent = null;
-          continue;
-        }
-        if (!foldTimelineDelta(payload, sent, "flat", null)) return;
-      } else {
-        if ((liveEventsSeen.get(channel) || 0) !== live) {
-          again = true;
-          return;
-        }
-        // Not over a newest page of All that landed while this was on the wire: that answer is the
-        // newer, and it placed whatever it carried.
-        const cover = canon.views.get(viewKey("flat"));
-        if (!(cover && cover.fullAt > sentAt)) foldTimelinePage(payload, false, "flat", null);
+      if (sent && payload.delta && payload.delta.more) {
+        sent = null;
+        continue;
       }
-      answerUnplaced(canon, seen);
-      if (inColumn(columns.main, () => channelView === "flat")) {
-        // On All: what the page says is read is what All's rows show, as for All's own read.
-        noteArchived(payload, false);
-      } else {
-        // Behind another view: All is as current as this read from its next showing.
-        canon.views.get(viewKey("flat")).landedHidden = true;
-      }
-      followPlacement();
+      again = !landPlacingRead(payload, read);
       return;
     }
-  } catch (error) {
-    // Asked again when the next read of the channel ends: once the server has stopped reading for
-    // this one, when it was given up on.
-    if (error && /** @type {any} */ (error).timedOut) placingHold = { channel, until: sentAt + SERVER_READ_BOUND_MS, news };
+  } catch (_error) {
+    // Asked again when the next read of the channel ends, and, once given up on, when the server has
+    // stopped reading for it (`placeUnplacedWaits`).
   } finally {
     placingReadInFlight = null;
     if (again) queuePlaceUnplaced();
   }
+}
+
+/**
+ * The answer of the placing read `read` describes, in time or late (`abandonRead`), folded as a read of
+ * All is. A delta that no longer continues All's cover — a read of All landed while it was out — is
+ * dropped, and the read that landed has answered for what it carried; so is a late delta that says
+ * more follows. A newest page is not folded over one of All that landed after it was sent, which is the
+ * newer and placed whatever it carried. One that lands after the stream has delivered anything since it
+ * was sent is dropped, and false is answered, to ask again: as the newest page of All it would take that
+ * message out of the store as deleted upstream. Folded, it places each message it carries in every
+ * column (`followPlacement`), and the view on screen in each is as current as this read of All, as for
+ * any (`catchUpFromAll`, `#220 view-switch-instant`).
+ *
+ * @param {VibeTalk.TimelineResponse} payload
+ * @param {PlacingRead} read
+ * @returns {boolean}
+ */
+function landPlacingRead(payload, read) {
+  const { canon, channel } = read;
+  if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return true;
+  if (read.sent && payload.delta) {
+    if (payload.delta.more || !foldTimelineDelta(payload, read.sent, "flat", null)) return true;
+  } else {
+    if ((liveEventsSeen.get(channel) || 0) !== read.live) return false;
+    const cover = canon.views.get(viewKey("flat"));
+    if (!(cover && cover.fullAt > read.sentAt)) foldTimelinePage(payload, false, "flat", null);
+  }
+  answerUnplaced(canon, read.seen);
+  if (inColumn(columns.main, () => channelView === "flat")) {
+    // On All: what the page says is read is what All's rows show, as for All's own read.
+    noteArchived(payload, false);
+  } else {
+    // Behind another view: All is as current as this read from its next showing.
+    canon.views.get(viewKey("flat")).landedHidden = true;
+  }
+  followPlacement();
+  eachColumn(catchUpFromAll);
+  return true;
 }
 
 /**
@@ -34553,14 +34592,18 @@ function noteLiveEvent(channel, fromTail) {
  *
  * No hold when a live event that is news arrived for the channel after the read was sent: the service
  * is answering, and a read that event queued behind this one must go. And the hold goes when the
- * answer settles, landed or failed, used or not: the server is reading nothing for it then.
+ * answer settles, landed or failed, used or not: the server is reading nothing for it then. What waited
+ * for that is told through `settled`, after the answer is used, with whether it landed: the placing read
+ * (`placeUnplaced`, `#308 live-reply-in-main`) waits while any read of its channel given up on may
+ * still be answered.
  *
  * @template T
  * @param {Promise<T>} answer
  * @param {AbandonedRead} read
  * @param {(payload: T) => void} land
+ * @param {((landed: boolean) => void) | null} [settled]
  */
-function abandonRead(answer, read, land) {
+function abandonRead(answer, read, land, settled = null) {
   const answering = (liveNewsSeen.get(read.channel) || 0) !== read.news;
   const hold = answering ? null : holdView(read.key, read.channel, read.sentAt);
   const release = () => {
@@ -34569,7 +34612,11 @@ function abandonRead(answer, read, land) {
   answer.then((payload) => {
     release();
     if (abandonedReadStands(read)) land(payload);
-  }, release);
+    if (settled) settled(true);
+  }, () => {
+    release();
+    if (settled) settled(false);
+  });
 }
 
 /**
