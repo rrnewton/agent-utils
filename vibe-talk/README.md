@@ -3685,11 +3685,24 @@ which is third-party Discord text. Every turn is neutralized and the whole recor
 the point of the fence is that nothing inside it is. A turn that forges the fence is defused and
 the tampering stays visible.
 
-A message the voice agent posted is in the record too (`#270 voice-transcript-markers`), as
-`sent to {channel}: {text}` — this server's own copy of what went, so a resumed agent asked "did
-that go?" has the truth. It is inside the fence and the budget like any other line, the channel's
-name is neutralized like the words, and the preamble says what such a line is. The page's markers
-— a conversation's start, a draft that was not sent — are never replayed.
+A message the voice agent posted is in the record too (`#270 voice-transcript-markers`), from
+this server's own copy of the send, so a resumed agent asked "did that go?" has the truth — and the
+truth includes whether it went. The line opens by outcome:
+
+- `sent to {channel}: {text}` — all of it was posted;
+- `partly sent to {channel} (only these words were posted; the rest was NOT posted): {text}` — the
+  text is only the parts that went, and where a part's answer was lost the bracket says that part
+  may have been posted;
+- `may have been sent to {channel} (NOT confirmed): {text}` — the chat service's answer was lost or
+  the request was abandoned on its way, so nobody knows. This is the send the agent was told at the
+  time it could not confirm, and whose card says "Not confirmed"; a recap that called it sent would
+  have the resumed agent tell you it went.
+
+A row whose record this version cannot read is replayed as the third, never the first, and a row
+capped at the stored length says only its beginning is quoted. Each line is inside the fence and
+the budget like any other, the channel's name is neutralized like the words, and the preamble says
+what each opening means. The page's markers — a conversation's start, a draft that was not sent —
+are never replayed.
 
 Where the voice backend cannot carry a recap at all — `conversation.backend = "websocket"` —
 client-config says `replay_unavailable: "backend"` as well as `replay_enabled: false`, so the page
