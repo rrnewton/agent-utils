@@ -456,6 +456,7 @@ pub struct TimelineChat {
     as_of: Mutex<Option<String>>,
     delta: Mutex<crate::threads::TimelineDelta>,
     hold: Mutex<Option<HoldGate>>,
+    hold_recent: Mutex<Option<HoldGate>>,
 }
 
 /// The provider's side of a [`HeldRead`].
@@ -483,6 +484,7 @@ impl TimelineChat {
             as_of: Mutex::new(None),
             delta: Mutex::new(crate::threads::TimelineDelta::default()),
             hold: Mutex::new(None),
+            hold_recent: Mutex::new(None),
         }
     }
 
@@ -490,9 +492,19 @@ impl TimelineChat {
     /// [`HeldRead::release`] is sent to or dropped.
     #[must_use]
     pub fn hold_next_timeline(&self) -> HeldRead {
+        Self::hold_next(&self.hold)
+    }
+
+    /// Hold the next read of a channel's most recent messages (`fetch_recent_dated`) the same way.
+    #[must_use]
+    pub fn hold_next_recent(&self) -> HeldRead {
+        Self::hold_next(&self.hold_recent)
+    }
+
+    fn hold_next(slot: &Mutex<Option<HoldGate>>) -> HeldRead {
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
-        *lock(&self.hold) = Some(HoldGate {
+        *lock(slot) = Some(HoldGate {
             entered: entered_tx,
             release: release_rx,
         });
@@ -500,8 +512,8 @@ impl TimelineChat {
     }
 
     /// Wait here if a test asked for this read to be held.
-    async fn held(&self) {
-        let gate = lock(&self.hold).take();
+    async fn held(slot: &Mutex<Option<HoldGate>>) {
+        let gate = lock(slot).take();
         if let Some(gate) = gate {
             let _ = gate.entered.send(());
             let _ = gate.release.await;
@@ -564,8 +576,10 @@ impl crate::chat::ChatClient for TimelineChat {
         channel: &crate::model::ChannelId,
         limit: u16,
     ) -> Result<crate::chat::RecentRead, crate::chat::ChatError> {
+        let messages = self.inner.fetch_recent(channel, limit).await?;
+        Self::held(&self.hold_recent).await;
         Ok(crate::chat::RecentRead {
-            messages: self.inner.fetch_recent(channel, limit).await?,
+            messages,
             as_of: lock(&self.as_of).clone(),
             exhausted: false,
             notice: None,
@@ -622,7 +636,7 @@ impl crate::chat::ChatClient for TimelineChat {
         if has_more {
             messages.drain(..messages.len() - limit);
         }
-        self.held().await;
+        Self::held(&self.hold).await;
         Ok(TimelinePage {
             next_before: has_more
                 .then(|| messages.first().map(|m| m.id.as_str().to_owned()))

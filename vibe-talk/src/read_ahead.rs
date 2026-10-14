@@ -575,7 +575,13 @@ pub async fn messages_for_speech(
                 // `ops::messages` remembers the window for everyone else as well.
                 // `remote-ops-audit`: counted as speech preparation's.
                 let window = crate::read_reason::ReadReason::Speech
-                    .scope(ops::messages(state, caller, channel.id.as_str(), limit))
+                    .scope(ops::messages_for(
+                        state,
+                        caller,
+                        channel.id.as_str(),
+                        limit,
+                        crate::cache::shadow::Wants::Window(crate::cache::shadow::Consumer::Speech),
+                    ))
                     .await?;
                 *turn = Some(WindowRead::of(&window));
                 found.fetches = 1;
@@ -603,6 +609,7 @@ pub async fn messages_for_speech(
                         Some(thread),
                         &missing,
                         limit,
+                        None,
                     ))
                     .await?
             };

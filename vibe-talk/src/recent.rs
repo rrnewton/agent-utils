@@ -779,17 +779,24 @@ fn insert(held: &mut Held, message: &Message) {
 #[must_use]
 pub fn reuse_for(state: &AppState, channel: &ChannelId) -> Duration {
     let timing = state.live.recent().timing();
+    if live_fed(state, channel) {
+        timing.reuse_live_fed
+    } else {
+        timing.reuse_unfed
+    }
+}
+
+/// Whether a live producer feeds `channel`: its provider is polled, or adapters may push changes
+/// to this server. Every change since a read of such a channel is merged into what the read saw.
+#[must_use]
+pub fn live_fed(state: &AppState, channel: &ChannelId) -> bool {
     let polled = state
         .providers
         .key_for(channel)
         .as_deref()
         .and_then(|key| state.providers.entry(key))
         .is_some_and(|entry| entry.live_poll_seconds > 0);
-    if polled || state.config.ingest.enabled() {
-        timing.reuse_live_fed
-    } else {
-        timing.reuse_unfed
-    }
+    polled || state.config.ingest.enabled()
 }
 
 /// Start reading `channel`'s newest `limit` messages, or join the read already running.

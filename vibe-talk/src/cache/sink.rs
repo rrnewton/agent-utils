@@ -85,6 +85,15 @@
 //! are on the server's list under no provider at all ([`super::orphans`]). With no cache, there is
 //! no task, and no summary is ever deleted on the cache's account.
 //!
+//! # What it would have served
+//!
+//! Nothing is served from the cache yet. While a read that a later milestone could answer from it
+//! goes upstream, [`Sink::shadow`] asks the cache what it holds for the same question, off the
+//! request's path, and once upstream has answered compares the two ([`super::shadow`]). Whoever
+//! asked, read scope included: an evaluation reads and counts in memory, and writes nothing. With
+//! no cache open, nothing is read; the ask is counted, as `off`, only when the configuration has a
+//! `[message_cache]` table, and costs nothing otherwise.
+//!
 //! # Who puts a cache behind it
 //!
 //! The server does, at startup, when the configuration enables the cache and the owner has not
@@ -94,7 +103,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -103,6 +112,7 @@ use super::grant::{FillGrant, ServerFill};
 use super::lifecycle::Lifecycle;
 use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
+use super::shadow::{self, Ask, Decision, Miss, Upstream, View};
 use super::{Account, ChanKey, MessageCache, Observation, Read, RouteSnapshot, Scope, Stamp};
 use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
@@ -165,6 +175,18 @@ struct State {
     /// Whether each provider's account has been checked against the file. Taken after the routes
     /// whenever both are held.
     identities: Mutex<Identities>,
+    /// What the shadow has counted, and how far its evaluations have got.
+    shadow: Arc<ShadowProgress>,
+}
+
+/// What the shadow has counted since the process started, and how many of its evaluations have
+/// read the cache and been counted, of how many begun.
+#[derive(Debug, Default)]
+struct ShadowProgress {
+    tallies: shadow::Tallies,
+    begun: AtomicU64,
+    read: AtomicU64,
+    counted: AtomicU64,
 }
 
 /// Each provider's standing against the cache behind the sink.
@@ -387,6 +409,166 @@ impl Fill {
         for observation in observations {
             self.cache.offer(self.chan.clone(), self.stamp, observation);
         }
+    }
+}
+
+/// One shadow evaluation under way, begun by [`Sink::shadow`]: hand it upstream's answer with
+/// [`Shadowed::compare`]. One dropped without it, because the read failed, is counted with no
+/// comparison. Either way it is decided and counted in a detached task: nothing waits for it.
+#[derive(Debug)]
+pub struct Shadowed {
+    task: Option<ShadowTask>,
+}
+
+#[derive(Debug)]
+struct ShadowTask {
+    ask: Ask,
+    feed: shadow::Feed,
+    live_fed: bool,
+    asked_ms: i64,
+    evaluated: tokio::task::JoinHandle<Evaluated>,
+    progress: Arc<ShadowProgress>,
+    cache: Weak<MessageCache>,
+}
+
+/// What an evaluation read.
+#[derive(Debug)]
+struct Evaluated {
+    read: Read<View>,
+    barrier: bool,
+    suspect: bool,
+    /// The highest sequence number applied once it had read.
+    applied_after: u64,
+}
+
+impl Evaluated {
+    /// No cache to read.
+    fn off() -> Self {
+        Self {
+            read: Read::Off,
+            barrier: false,
+            suspect: false,
+            applied_after: 0,
+        }
+    }
+}
+
+impl Shadowed {
+    /// Compare what the cache would have answered with `upstream`'s answer, once the evaluation
+    /// has read.
+    ///
+    /// Call it as soon as upstream has answered and BEFORE the request offers the cache what it
+    /// read: what was queued by then is noted, and an evaluation that read past it may have read
+    /// the request's own write, so it is counted `late`, with no verdict.
+    pub fn compare(mut self, upstream: Upstream) {
+        if let Some(task) = self.task.take() {
+            let enqueued = task.cache.upgrade().map(|cache| cache.enqueued_seq());
+            task.settle(Some((upstream, enqueued)));
+        }
+    }
+}
+
+impl Drop for Shadowed {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.settle(None);
+        }
+    }
+}
+
+impl ShadowTask {
+    /// Decide, compare and count, in a detached task.
+    fn settle(self, upstream: Option<(Upstream, Option<u64>)>) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(self.count(upstream)));
+        } else {
+            // No runtime to count it on; a request always has one.
+            self.progress.counted.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn count(self, upstream: Option<(Upstream, Option<u64>)>) {
+        let Self {
+            ask,
+            feed,
+            live_fed,
+            asked_ms,
+            evaluated,
+            progress,
+            ..
+        } = self;
+        let consumer = ask.consumer();
+        if let Ok(Evaluated {
+            read,
+            barrier,
+            suspect,
+            applied_after,
+        }) = evaluated.await
+        {
+            let (decision, view) = match read {
+                Read::Served(view) => {
+                    let past = upstream
+                        .as_ref()
+                        .and_then(|(_, enqueued)| *enqueued)
+                        .is_some_and(|enqueued| applied_after > enqueued);
+                    if past || shadow::late(&view, asked_ms) {
+                        (Decision::Late, None)
+                    } else {
+                        let facts = shadow::Facts {
+                            asked_ms,
+                            live_fed,
+                            suspect,
+                            barrier,
+                            feed,
+                        };
+                        (shadow::decide(&ask, &view, &facts), Some(view))
+                    }
+                }
+                Read::Off => (Decision::Miss(Miss::Off), None),
+                Read::Blocked | Read::Moved | Read::Failed(_) => {
+                    (Decision::Miss(Miss::Blocked), None)
+                }
+            };
+            progress.tallies.decided(consumer, decision);
+            if let (Decision::Serve, Some(view), Some((upstream, _))) = (decision, &view, &upstream)
+            {
+                if let Some(comparison) = shadow::compare(&ask, view, upstream) {
+                    progress.tallies.compared(consumer, &comparison);
+                    if comparison.extra > 0 {
+                        tracing::warn!(
+                            consumer = consumer.label(),
+                            extra_rows = comparison.extra,
+                            missing_rows = comparison.missing,
+                            content_differs = comparison.differs,
+                            "the message cache would have served messages its provider no \
+                             longer lists; nothing is served from it yet"
+                        );
+                    }
+                }
+            }
+        }
+        progress.counted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait up to `wait` for what was offered up to `target` to be applied to the cache `weak` names,
+/// holding the cache only while looking, so one taken out from behind the sink meanwhile closes as
+/// soon as its other holders let it go. Raises the writer's flush flag while there is anything to
+/// wait for, as every barrier does.
+fn barrier(weak: &Weak<MessageCache>, target: u64, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        let Some(cache) = weak.upgrade() else {
+            return false;
+        };
+        if cache.barrier_to_blocking(target, Duration::ZERO) {
+            return true;
+        }
+        drop(cache);
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -614,6 +796,128 @@ impl Sink {
     pub(crate) fn offer_push(&self, channel: &ChannelId, live: &LiveMessage, producer: ServerFill) {
         if let Some(fill) = self.begin(&FillGrant::server(producer), channel) {
             fill.offer_push(live);
+        }
+    }
+
+    /// Begin a shadow evaluation of `ask` of `channel`, before the request's own read goes
+    /// upstream: what the cache would have answered, read on the blocking pool while upstream
+    /// answers ([`super::shadow`]). Hand the returned [`Shadowed`] upstream's answer; nothing waits
+    /// for either.
+    ///
+    /// `None` when there is nothing to evaluate. With no cache open nothing is read, and the ask is
+    /// counted, as `off`, only when the configuration has a `[message_cache]` table; a channel the
+    /// cache would not read (the sink not armed, or the channel not on its list) is counted as
+    /// `blocked` and not read either; and an ask the cache would never answer is not counted at
+    /// all. `live_fed` is asked only when the cache is to be read.
+    #[must_use]
+    pub fn shadow(
+        &self,
+        channel: &ChannelId,
+        ask: Ask,
+        live_fed: impl FnOnce() -> bool,
+    ) -> Option<Shadowed> {
+        let consumer = ask.consumer();
+        let progress = &self.state.shadow;
+        let Some(cache) = self.cache().filter(|cache| cache.is_open()) else {
+            if self
+                .lifecycle()
+                .is_some_and(|lifecycle| lifecycle.configured())
+            {
+                progress
+                    .tallies
+                    .decided(consumer, Decision::Miss(Miss::Off));
+            }
+            return None;
+        };
+        let route = {
+            let routes = self.state.routes();
+            routes
+                .armed
+                .then(|| routes.fills.get(channel).cloned())
+                .flatten()
+        };
+        let Some(route) = route else {
+            progress
+                .tallies
+                .decided(consumer, Decision::Miss(Miss::Blocked));
+            return None;
+        };
+        let query = shadow::query(&ask, route.shape, route.recent_via_flat)?;
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let chan = ChanKey::new(route.key, channel.as_str());
+        let live_fed = live_fed();
+        // Both noted now, before the request's own read starts: the time the rule decides at, and
+        // the offers the barrier waits for, none of them the request's own.
+        let asked_ms = cache.now_ms();
+        let target = cache.enqueued_seq();
+        let weak = Arc::downgrade(&cache);
+        drop(cache);
+        progress.begun.fetch_add(1, Ordering::SeqCst);
+        let reading = Arc::clone(progress);
+        let reads = weak.clone();
+        let evaluated = runtime.spawn_blocking(move || {
+            let barrier = barrier(&reads, target, shadow::BARRIER);
+            let evaluated = reads.upgrade().map_or_else(Evaluated::off, |cache| {
+                let suspect = cache.is_suspect(&chan);
+                let read = cache.shadow_view(&chan, &query);
+                Evaluated {
+                    read,
+                    barrier,
+                    suspect,
+                    applied_after: cache.applied_seq(),
+                }
+            });
+            reading.read.fetch_add(1, Ordering::SeqCst);
+            evaluated
+        });
+        Some(Shadowed {
+            task: Some(ShadowTask {
+                ask,
+                feed: shadow::Feed::of(route.shape),
+                live_fed,
+                asked_ms,
+                evaluated,
+                progress: Arc::clone(progress),
+                cache: weak,
+            }),
+        })
+    }
+
+    /// What the shadow has counted since this process started, per consumer, in
+    /// [`shadow::Consumer::ALL`]'s order.
+    #[must_use]
+    pub fn shadow_counts(&self) -> Vec<shadow::ConsumerCounts> {
+        self.state.shadow.tallies.report()
+    }
+
+    /// Wait, up to `timeout`, until every shadow evaluation begun so far has read the cache. For
+    /// tests that hold a read upstream until the evaluation beside it is done.
+    pub async fn shadow_read(&self, timeout: Duration) -> bool {
+        self.shadow_wait(timeout, |progress| {
+            progress.read.load(Ordering::SeqCst) >= progress.begun.load(Ordering::SeqCst)
+        })
+        .await
+    }
+
+    /// Wait, up to `timeout`, until every shadow evaluation begun so far has been counted: handed
+    /// upstream's answer or dropped, and decided. For tests.
+    pub async fn shadow_settled(&self, timeout: Duration) -> bool {
+        self.shadow_wait(timeout, |progress| {
+            progress.counted.load(Ordering::SeqCst) >= progress.begun.load(Ordering::SeqCst)
+        })
+        .await
+    }
+
+    async fn shadow_wait(&self, timeout: Duration, done: impl Fn(&ShadowProgress) -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if done(&self.state.shadow) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 

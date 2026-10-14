@@ -114,7 +114,7 @@ pub use file::default_path;
 pub use grant::{FillGrant, ServerFill};
 pub use rows::{CachedMessage, ChanKey, Incoming, Scope};
 pub use search_text::{PlainText, Rendered, SearchTextSource};
-pub use sink::{Fill, Sink};
+pub use sink::{Fill, Shadowed, Sink};
 
 use crate::model::{ChannelId, MessageId};
 

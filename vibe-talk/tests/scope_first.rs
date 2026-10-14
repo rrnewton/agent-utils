@@ -1428,6 +1428,33 @@ mod read_scope_writes_nothing {
             }
         }
 
+        // The shadow evaluated beside every read the cache could one day answer, reading the file
+        // as it did; once every evaluation has been counted, still nothing has changed.
+        assert!(
+            state.message_cache.shadow_settled(WAIT).await,
+            "every evaluation was counted"
+        );
+        let shadowed: BTreeMap<&str, u64> = state
+            .message_cache
+            .shadow_counts()
+            .iter()
+            .map(|counts| (counts.consumer, counts.asked))
+            .collect();
+        for consumer in [
+            "messages",
+            "digest",
+            "message_by_id",
+            "page",
+            "count",
+            "timeline_fallback",
+            "todo",
+        ] {
+            assert!(
+                shadowed[consumer] > 0,
+                "{consumer} was not shadowed: {shadowed:?}"
+            );
+        }
+
         // Nothing was offered, so nothing changed, down to the bytes.
         assert_eq!(cache.applied_seq(), applied, "nothing reached the writer");
         assert_eq!(held(&cache, &scopes, &every_id), before);

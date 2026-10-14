@@ -11,6 +11,7 @@
 //! Every function below assumes the caller has already been authorized for the scope it needs;
 //! the scope each one needs is stated in its documentation and enforced by its only callers.
 
+use crate::cache::shadow::{Ask, Consumer, Upstream, Wants};
 use crate::chat::ChatError;
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
 use crate::retrieval::{self, Resolution};
@@ -404,6 +405,31 @@ pub async fn messages(
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<Window, OpError> {
+    messages_for(
+        state,
+        caller,
+        channel_id,
+        limit,
+        Wants::Window(Consumer::Messages),
+    )
+    .await
+}
+
+/// [`messages`], shadowed for what `wants` of the window: while the read goes upstream, the
+/// message cache is asked what it would have answered, and that is compared with what upstream
+/// answered (`#208 persistent-cache`, [`crate::cache::shadow`]). The shadow never delays the
+/// answer and writes nothing, whoever asked.
+///
+/// # Errors
+///
+/// As [`messages`].
+pub(crate) async fn messages_for(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    limit: Option<u16>,
+    wants: Wants,
+) -> Result<Window, OpError> {
     let channel = allowed(state, channel_id).await?;
     // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
     // preparation compares a remembered window against (`crate::read_ahead`) are one number.
@@ -414,8 +440,17 @@ pub async fn messages(
     // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
     // while it ran applied again on top. See `crate::recent`.
     let mark = state.live.recent().mark(&channel.id);
+    let shadow = state
+        .message_cache
+        .shadow(&channel.id, wants.ask(usize::from(limit)), || {
+            crate::recent::live_fed(state, &channel.id)
+        });
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let read = crate::recent_view::read(state, &channel.id, limit).await?;
+    // Before the read is offered, so the shadow knows which offers are this read's own.
+    if let Some(shadow) = shadow {
+        shadow.compare(Upstream::of(&read.messages, !read.exhausted));
+    }
     if let Some(fill) = fill {
         fill.offer_recent_dated(&read);
     }
@@ -487,12 +522,41 @@ pub async fn message_by_id(
     message_id: &str,
     limit: Option<u16>,
 ) -> Result<(ChannelInfo, Message), OpError> {
+    message_by_id_for(
+        state,
+        caller,
+        channel_id,
+        message_id,
+        limit,
+        Consumer::MessageById,
+    )
+    .await
+}
+
+/// [`message_by_id`], shadowed for `consumer` ([`crate::cache::shadow`]).
+async fn message_by_id_for(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    message_id: &str,
+    limit: Option<u16>,
+    consumer: Consumer,
+) -> Result<(ChannelInfo, Message), OpError> {
     // remote-ops-audit W11 `#287 bulk-reads`. A provider that looks messages up by id itself
     // answers for this one exactly, wherever it is in the channel; any other is read for the recent
     // window, as before.
+    let wanted = MessageId(message_id.to_owned());
     let channel =
         if configured(state, channel_id).is_ok_and(|channel| looks_up_by_ids(state, &channel.id)) {
             let channel = allowed(state, channel_id).await?;
+            let shadow = state.message_cache.shadow(
+                &channel.id,
+                Ask::Message {
+                    consumer,
+                    id: wanted.clone(),
+                },
+                || crate::recent::live_fed(state, &channel.id),
+            );
             let looked = lookup_messages(
                 state,
                 caller,
@@ -500,6 +564,7 @@ pub async fn message_by_id(
                 None,
                 &[message_id.to_owned()],
                 limit,
+                shadow.map(|shadow| (wanted.clone(), shadow)),
             )
             .await?;
             if let Some(message) = looked.messages.into_iter().next().flatten() {
@@ -507,20 +572,26 @@ pub async fn message_by_id(
             }
             channel
         } else {
-            let window = messages(state, caller, channel_id, limit).await?;
-            let wanted = MessageId(message_id.to_owned());
+            let window = messages_for(
+                state,
+                caller,
+                channel_id,
+                limit,
+                Wants::Message(consumer, wanted.clone()),
+            )
+            .await?;
             if let Some(message) = window.messages.into_iter().find(|m| m.id == wanted) {
                 return Ok((window.channel, message));
             }
             window.channel
         };
-    let wanted = MessageId(message_id.to_owned());
     let Some(thread) = known_thread(state, &channel.id, &wanted).await else {
         return Err(OpError::UnknownMessage);
     };
     // A thread this server was told of rather than one the caller chose: a read of it that finds
-    // nothing there, or refuses the id for it, is the same answer the channel gave.
-    match message_in_thread(state, caller, channel, message_id, limit, &thread).await {
+    // nothing there, or refuses the id for it, is the same answer the channel gave. The read above
+    // was already shadowed for this ask, so this one is not counted again.
+    match message_in_thread(state, caller, channel, message_id, limit, &thread, None).await {
         Err(OpError::Chat(error))
             if matches!(
                 error.cause(),
@@ -591,14 +662,42 @@ pub async fn message_by_id_scoped(
     limit: Option<u16>,
     thread_id: Option<&str>,
 ) -> Result<(ChannelInfo, Message), OpError> {
-    let Some(thread_id) = thread_id else {
-        return message_by_id(state, caller, channel_id, message_id, limit).await;
-    };
-    let channel = allowed(state, channel_id).await?;
-    message_in_thread(state, caller, channel, message_id, limit, thread_id).await
+    message_by_id_scoped_for(
+        state,
+        caller,
+        channel_id,
+        message_id,
+        limit,
+        thread_id,
+        Some(Consumer::MessageById),
+    )
+    .await
 }
 
-/// `message_id` in `thread_id` of `channel`, which the caller has checked against the allowlist.
+/// [`message_by_id_scoped`], shadowed for `consumer`, or, inside a thread, not at all with `None`
+/// ([`crate::cache::shadow`]).
+async fn message_by_id_scoped_for(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    message_id: &str,
+    limit: Option<u16>,
+    thread_id: Option<&str>,
+    consumer: Option<Consumer>,
+) -> Result<(ChannelInfo, Message), OpError> {
+    let Some(thread_id) = thread_id else {
+        let consumer = consumer.unwrap_or(Consumer::MessageById);
+        return message_by_id_for(state, caller, channel_id, message_id, limit, consumer).await;
+    };
+    let channel = allowed(state, channel_id).await?;
+    message_in_thread(
+        state, caller, channel, message_id, limit, thread_id, consumer,
+    )
+    .await
+}
+
+/// `message_id` in `thread_id` of `channel`, which the caller has checked against the allowlist;
+/// shadowed for `consumer`, or not at all with `None` ([`crate::cache::shadow`]).
 async fn message_in_thread(
     state: &AppState,
     caller: crate::auth::Scope,
@@ -606,8 +705,19 @@ async fn message_in_thread(
     message_id: &str,
     limit: Option<u16>,
     thread_id: &str,
+    consumer: Option<Consumer>,
 ) -> Result<(ChannelInfo, Message), OpError> {
     validate_thread_id(thread_id)?;
+    let wanted = MessageId(message_id.to_owned());
+    let shadow = consumer.and_then(|consumer| {
+        let ask = Ask::Message {
+            consumer,
+            id: wanted.clone(),
+        };
+        state.message_cache.shadow(&channel.id, ask, || {
+            crate::recent::live_fed(state, &channel.id)
+        })
+    });
     if looks_up_by_ids(state, &channel.id) {
         let looked = lookup_messages(
             state,
@@ -616,6 +726,7 @@ async fn message_in_thread(
             Some(thread_id),
             &[message_id.to_owned()],
             limit,
+            shadow.map(|shadow| (wanted, shadow)),
         )
         .await?;
         let message = looked
@@ -629,8 +740,11 @@ async fn message_in_thread(
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let mut message = state
         .chat
-        .fetch_thread_message(&channel.id, thread_id, &MessageId(message_id.to_owned()))
+        .fetch_thread_message(&channel.id, thread_id, &wanted)
         .await?;
+    if let Some(shadow) = shadow {
+        shadow.compare(Upstream::of(std::slice::from_ref(&message), true));
+    }
     if let Some(fill) = fill {
         fill.offer_single(&message, thread_id);
     }
@@ -674,7 +788,11 @@ pub struct Looked {
 /// the channel's own messages in the recent window ([`messages`]), where it may be `None` as it
 /// always could be. So no answer is less than it was before, and none older.
 ///
-/// `caller` is the scope of whoever asked, as for [`messages`].
+/// `caller` is the scope of whoever asked, as for [`messages`]. `shadow`, when given, is the
+/// evaluation of what the message cache would have answered for one of `ids` (`#208
+/// persistent-cache`, [`crate::cache::shadow`]): it is handed what the provider answered for that
+/// id as soon as the provider has: the message it found, or nothing at all where it proved there is
+/// none; for an id it did not see, what the read that looks it up instead found.
 ///
 /// # Errors
 ///
@@ -687,6 +805,7 @@ pub async fn lookup_messages(
     thread: Option<&str>,
     ids: &[String],
     limit: Option<u16>,
+    shadow: Option<(MessageId, crate::cache::Shadowed)>,
 ) -> Result<Looked, OpError> {
     use crate::chat::Lookup;
 
@@ -705,6 +824,23 @@ pub async fn lookup_messages(
             answers.len()
         ))
         .into());
+    }
+    // Compared before anything this lookup reads is offered to the cache, as every shadowed read
+    // is. An id the provider did not see waits for the read that looks it up instead.
+    let mut shadow = shadow;
+    if let Some((shadowed, evaluation)) = shadow.take() {
+        match wanted
+            .iter()
+            .position(|id| *id == shadowed)
+            .map(|at| &answers[at])
+        {
+            Some(Lookup::Found(message)) => {
+                evaluation.compare(Upstream::of(std::slice::from_ref(message), true));
+            }
+            Some(Lookup::Absent) => evaluation.compare(Upstream::of(&[], false)),
+            Some(Lookup::Unseen) => shadow = Some((shadowed, evaluation)),
+            None => drop(evaluation),
+        }
     }
     let mut reads = 1;
     let mut window: Option<Vec<Message>> = None;
@@ -729,12 +865,14 @@ pub async fn lookup_messages(
                 Some(thread) => {
                     reads += 1;
                     unprepared.push(answered.len());
-                    Some(
-                        state
-                            .chat
-                            .fetch_thread_message(&channel.id, thread, id)
-                            .await?,
-                    )
+                    let message = state
+                        .chat
+                        .fetch_thread_message(&channel.id, thread, id)
+                        .await?;
+                    if let Some(evaluation) = shadow_for(&mut shadow, id) {
+                        evaluation.compare(Upstream::of(std::slice::from_ref(&message), true));
+                    }
+                    Some(message)
                 }
                 None => {
                     if window.is_none() {
@@ -744,6 +882,11 @@ pub async fn lookup_messages(
                                 .await?
                                 .messages,
                         );
+                    }
+                    if let (Some(evaluation), Some(window)) =
+                        (shadow_for(&mut shadow, id), window.as_deref())
+                    {
+                        evaluation.compare(Upstream::of(window, true));
                     }
                     window
                         .as_ref()
@@ -767,6 +910,18 @@ pub async fn lookup_messages(
         messages: answered,
         reads,
     })
+}
+
+/// The shadow evaluation waiting in `shadow`, taken when it is the one for `id`.
+fn shadow_for(
+    shadow: &mut Option<(MessageId, crate::cache::Shadowed)>,
+    id: &MessageId,
+) -> Option<crate::cache::Shadowed> {
+    if shadow.as_ref().is_some_and(|(shadowed, _)| shadowed == id) {
+        shadow.take().map(|(_, evaluation)| evaluation)
+    } else {
+        None
+    }
 }
 
 /// Browse a channel or its threads through the provider's own pagination contract.
@@ -810,6 +965,19 @@ pub async fn timeline(
     } else {
         crate::cache::observe::TimelineRead::Newest
     };
+    // Only a newest page: what a page answered from the cache would stand in for were upstream to
+    // fail. A step back, and what changed since a cursor, are never answered from it.
+    let shadow = (timeline_read == crate::cache::observe::TimelineRead::Newest)
+        .then(|| Ask::Timeline {
+            view: request.view,
+            thread: request.thread_id.clone(),
+            limit: usize::from(request.limit.max(1)),
+        })
+        .and_then(|ask| {
+            state.message_cache.shadow(&channel.id, ask, || {
+                crate::recent::live_fed(state, &channel.id)
+            })
+        });
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let (mut page, position) = match resumed {
         Some(Forward::Native(own)) => {
@@ -829,6 +997,9 @@ pub async fn timeline(
         }
         None => (state.chat.fetch_timeline(&channel.id, request).await?, None),
     };
+    if let Some(shadow) = shadow {
+        shadow.compare(Upstream::of(&page.messages, page.has_more));
+    }
     if let Some(fill) = fill {
         fill.offer_timeline(request, timeline_read, &page);
     }
@@ -911,7 +1082,14 @@ pub async fn digest(
     limit: Option<u16>,
     width: Option<u16>,
 ) -> Result<Digest, OpError> {
-    let window = messages(state, caller, channel_id, limit).await?;
+    let window = messages_for(
+        state,
+        caller,
+        channel_id,
+        limit,
+        Wants::Window(Consumer::Digest),
+    )
+    .await?;
     let complete = window.is_whole_channel();
     let width = usize::from(width.unwrap_or(0));
     let width = if width == 0 {
@@ -1551,6 +1729,17 @@ pub async fn page(
         (None, Some(_)) => crate::cache::observe::PageRead::Before,
         (None, None) => crate::cache::observe::PageRead::Newest,
     };
+    // Only a walk forward from an instant: the span the cache would answer from its coverage.
+    let shadow = since.and_then(|since_ms| {
+        let ask = Ask::Page {
+            since_ms,
+            until_ms: until,
+            limit: usize::from(limit),
+        };
+        state.message_cache.shadow(&channel.id, ask, || {
+            crate::recent::live_fed(state, &channel.id)
+        })
+    });
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let (mut messages, forward, unproven, beyond) = match start {
         Some(SpanStart { ms: from, after }) => {
@@ -1693,6 +1882,9 @@ pub async fn page(
 
     let has_more = messages.len() > usize::from(limit)
         || (unproven && messages.last().is_some_and(|m| message_ms(m).is_some()));
+    if let Some(shadow) = shadow {
+        shadow.compare(Upstream::of(&messages, has_more || unproven));
+    }
     if let Some(fill) = fill {
         // A provider's own range read that did not prove it reached the span's end proves
         // nothing whole, whatever it returned: rows only (`#208 persistent-cache`).
@@ -1824,10 +2016,26 @@ pub async fn count_within(
     let cap = state.effective_count_cap(cap);
 
     let filter = crate::noise::filter_for(state, &channel.id).await;
+    // `#208 persistent-cache`. Begun before anything goes upstream: a count by range reads, and
+    // the walk such a count falls back to, are one ask.
+    let shadow = state.message_cache.shadow(
+        &channel.id,
+        Ask::Count {
+            since_ms: since,
+            cap: usize::try_from(cap).unwrap_or(usize::MAX),
+        },
+        || crate::recent::live_fed(state, &channel.id),
+    );
+    let fill = state.message_cache.begin_for(caller, &channel.id);
+    let keep_walk = fill.is_some() || shadow.is_some();
     if let Some(from) = since {
         if state.chat.read_caps(&channel.id).range == crate::chat::Support::Native {
-            if let Some(count) = count_range(state, &channel, from, cap, &filter).await? {
-                return Ok(count);
+            if let Some(ranged) = count_range(state, &channel, from, cap, &filter, keep_walk).await?
+            {
+                if let Some(shadow) = shadow {
+                    shadow.compare(Upstream::of(&ranged.read, ranged.count.at_least));
+                }
+                return Ok(ranged.count);
             }
         }
     }
@@ -1839,7 +2047,6 @@ pub async fn count_within(
     let mut newest_seen: Option<MessageId> = None;
     let mut before: Option<MessageId> = None;
     let mut noise: usize = 0;
-    let fill = state.message_cache.begin_for(caller, &channel.id);
     let mut walked: Vec<Message> = Vec::new();
 
     loop {
@@ -1850,7 +2057,7 @@ pub async fn count_within(
         if batch.is_empty() {
             break;
         }
-        if fill.is_some() {
+        if keep_walk {
             walked.extend_from_slice(&batch);
         }
         if newest_seen.is_none() {
@@ -1885,6 +2092,9 @@ pub async fn count_within(
         }
         before = Some(oldest.id);
     }
+    if let Some(shadow) = shadow {
+        shadow.compare(Upstream::of(&walked, at_least));
+    }
     if let Some(fill) = fill {
         fill.offer_walk(&walked);
     }
@@ -1918,13 +2128,16 @@ const MAX_COUNT_STEPS: usize = 16;
 /// counts the way it always did instead. `None` too when a step was not the provider's own range
 /// read after all ([`crate::chat::RangeRead::emulated`], a bridge that could not serve one): it
 /// proves nothing, and the caller counts the way it always did.
+///
+/// With `keep`, every message the reads returned is kept with the count ([`Ranged::read`]).
 async fn count_range(
     state: &AppState,
     channel: &ChannelInfo,
     since_ms: i64,
     cap: u32,
     filter: &crate::noise::NoiseFilter,
-) -> Result<Option<MessageCount>, OpError> {
+    keep: bool,
+) -> Result<Option<Ranged>, OpError> {
     let ceiling = usize::try_from(cap).unwrap_or(usize::MAX);
     let range = crate::chat::TimeRange {
         since_ms,
@@ -1934,6 +2147,7 @@ async fn count_range(
     let (mut newest_seen, mut oldest_seen): (Option<MessageId>, Option<MessageId>) = (None, None);
     let mut cursor: Option<String> = None;
     let mut at_least = true;
+    let mut kept: Vec<Message> = Vec::new();
     for _ in 0..MAX_COUNT_STEPS {
         let want = u16::try_from(ceiling.saturating_sub(counted + noise))
             .unwrap_or(u16::MAX)
@@ -1951,6 +2165,9 @@ async fn count_range(
             .await?;
         if read.as_of.is_some() || read.emulated {
             return Ok(None);
+        }
+        if keep {
+            kept.extend_from_slice(&read.messages);
         }
         if newest_seen.is_none() {
             newest_seen = read.messages.last().map(|m| m.id.clone());
@@ -1973,15 +2190,27 @@ async fn count_range(
             None => break,
         }
     }
-    Ok(Some(MessageCount {
-        channel: channel.clone(),
-        counted,
-        at_least,
-        cap,
-        oldest_seen,
-        newest_seen,
-        noise,
+    Ok(Some(Ranged {
+        count: MessageCount {
+            channel: channel.clone(),
+            counted,
+            at_least,
+            cap,
+            oldest_seen,
+            newest_seen,
+            noise,
+        },
+        read: kept,
     }))
+}
+
+/// What a [`count_range`] counted, and what it read to count it.
+struct Ranged {
+    /// The count.
+    count: MessageCount,
+    /// Every message its range reads returned, newest step last, when it was asked to keep them:
+    /// what the message cache is shown (`#208 persistent-cache`).
+    read: Vec<Message>,
 }
 
 /// Semantic random access: describe a message, get that message. Read scope.
@@ -2768,7 +2997,14 @@ pub async fn todo(
     channel_id: &str,
     limit: Option<u16>,
 ) -> Result<TodoView, OpError> {
-    let window = messages(state, caller, channel_id, limit).await?;
+    let window = messages_for(
+        state,
+        caller,
+        channel_id,
+        limit,
+        Wants::Window(Consumer::Todo),
+    )
+    .await?;
     let complete = window.is_whole_channel();
     let dismissed = state.store.dismissals(&window.channel.id).await?;
     let dismissed: std::collections::HashSet<&str> =
@@ -2990,7 +3226,14 @@ pub async fn declare_bankruptcy(
     through: &MessageId,
     limit: Option<u16>,
 ) -> Result<InboxChange, OpError> {
-    let window = messages(state, caller, channel_id, limit).await?;
+    let window = messages_for(
+        state,
+        caller,
+        channel_id,
+        limit,
+        Wants::Window(Consumer::Bankruptcy),
+    )
+    .await?;
     let boundary = window
         .messages
         .iter()
@@ -3399,19 +3642,47 @@ pub async fn summarize_message_scoped(
         let fetching = std::time::Instant::now();
         let messages = if looks_up_by_ids(state, &channel.id) {
             // remote-ops-audit W11 `#287 bulk-reads`: every part of the row in one lookup. A part
-            // the provider proved absent is a message this server cannot see.
-            lookup_messages(state, caller, &channel, Some(thread_id), &ids, limit)
-                .await?
-                .messages
-                .into_iter()
-                .collect::<Option<Vec<Message>>>()
-                .ok_or(OpError::UnknownMessage)?
+            // the provider proved absent is a message this server cannot see. The summary's own
+            // message is shadowed for the summary; the ones joined to it are not counted again.
+            let wanted = MessageId(message_id.to_owned());
+            let shadow = state.message_cache.shadow(
+                &channel.id,
+                Ask::Message {
+                    consumer: Consumer::Summary,
+                    id: wanted.clone(),
+                },
+                || crate::recent::live_fed(state, &channel.id),
+            );
+            lookup_messages(
+                state,
+                caller,
+                &channel,
+                Some(thread_id),
+                &ids,
+                limit,
+                shadow.map(|shadow| (wanted, shadow)),
+            )
+            .await?
+            .messages
+            .into_iter()
+            .collect::<Option<Vec<Message>>>()
+            .ok_or(OpError::UnknownMessage)?
         } else {
             let mut messages = Vec::with_capacity(ids.len());
             for id in &ids {
-                let (_, message) =
-                    message_by_id_scoped(state, caller, channel_id, id, limit, Some(thread_id))
-                        .await?;
+                // The summary's own message is shadowed for the summary; the ones joined to it are
+                // not counted again.
+                let consumer = (id == message_id).then_some(Consumer::Summary);
+                let (_, message) = message_by_id_scoped_for(
+                    state,
+                    caller,
+                    channel_id,
+                    id,
+                    limit,
+                    Some(thread_id),
+                    consumer,
+                )
+                .await?;
                 messages.push(message);
             }
             messages
@@ -3428,7 +3699,7 @@ pub async fn summarize_message_scoped(
             as_of: None,
         }
     } else {
-        shared_window(state, caller, channel, limit, began).await?
+        shared_window(state, caller, channel, limit, began, message_id).await?
     };
     let position = window
         .messages
@@ -3615,13 +3886,15 @@ async fn stored_summary(
 ///
 /// A request that waited behind a fetch which finished after it began, and was at least as wide as
 /// its own, rebuilds that window from memory instead of reading it again. If any message of it has
-/// been forgotten since — an edit or a delete was pushed — it reads the window itself.
+/// been forgotten since — an edit or a delete was pushed — it reads the window itself, shadowed for
+/// the summary of `message_id` ([`crate::cache::shadow`]).
 async fn shared_window(
     state: &AppState,
     caller: crate::auth::Scope,
     channel: ChannelInfo,
     limit: Option<u16>,
     began: std::time::Instant,
+    message_id: &str,
 ) -> Result<Window, OpError> {
     let width = window_limit(state, limit);
     let mut turn = state.read_ahead.window_turn(&channel.id).await;
@@ -3641,8 +3914,9 @@ async fn shared_window(
     }
     // `messages` remembers the window for everyone else as well. `remote-ops-audit`: counted as a
     // summary's context, whoever asked for the summary.
+    let wants = Wants::Message(Consumer::Summary, MessageId(message_id.to_owned()));
     let window = crate::read_reason::ReadReason::SummaryWindow
-        .scope(messages(state, caller, channel.id.as_str(), limit))
+        .scope(messages_for(state, caller, channel.id.as_str(), limit, wants))
         .await?;
     state.summary_counters.fetched(1);
     *turn = Some(crate::read_ahead::WindowRead::of(&window));
