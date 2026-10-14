@@ -2389,6 +2389,101 @@ fn revalidation_within_the_week_keeps_rows() {
     assert_eq!(fx.ids(&Scope::Main), ids(&["m1", "m2"]));
 }
 
+/// The week takes the rows of a stretch nothing re-read within it, and the claim over that stretch
+/// goes in the same pass: a claim that every message of the stretch is held, kept over rows it has
+/// just deleted, would have a page served without them. The head goes too, with the rows of its
+/// band.
+#[test]
+fn revalidation_never_leaves_a_claim_or_a_head_over_rows_it_deleted() {
+    let fx = Fixture::new("cache-revalidate-claims");
+    fx.list(
+        vec![m(1), m(2), m(3), m(4), m(5), m(6)],
+        T0 + 6 * STEP + 1_000,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    assert!(
+        !intervals(&fx, &Scope::Main).is_empty(),
+        "a claim was stamped"
+    );
+    let now = T0 + 8 * DAY_MS;
+    fx.clock.set(now);
+    fx.cache.maintain(Maintenance::Hourly);
+    fx.settle();
+    assert_eq!(content(&fx, "m2"), None, "the week took the row");
+    assert_eq!(intervals(&fx, &Scope::Main), Vec::new(), "nor its claim");
+    assert_eq!(
+        fx.cache
+            .head(&fx.chan, &Scope::Main)
+            .served()
+            .expect("served"),
+        None,
+        "nor the head whose band it held"
+    );
+    let ask = shadow::Ask::Page {
+        since_ms: T0 + STEP,
+        until_ms: Some(T0 + 4 * STEP),
+        limit: 20,
+    };
+    let query = shadow::query(&ask, observe::Shape::DiscordNative, false).expect("a query");
+    let view = fx
+        .cache
+        .shadow_view(&fx.chan, &query)
+        .served()
+        .expect("served");
+    let facts = shadow::Facts {
+        asked_ms: now + 1,
+        live_fed: false,
+        dropped_ms: None,
+        barrier: true,
+        feed: shadow::Feed::AdditionsOnly,
+    };
+    assert_eq!(
+        shadow::decide(&ask, &view, &facts),
+        shadow::Decision::Miss(shadow::Miss::Gap),
+        "a page of {} rows served from a claim whose rows are gone",
+        view.rows.len()
+    );
+}
+
+/// A claim re-read within the week survives the pass with its rows, and one that was not goes,
+/// though rows under it were seen since by a push: a claim is weakened, never invented.
+#[test]
+fn revalidation_keeps_a_claim_read_within_the_week_and_drops_one_that_was_not() {
+    let fx = Fixture::new("cache-revalidate-some");
+    fx.list(
+        vec![m(1), m(2), m(3)],
+        T0 + 3 * STEP + 1_000,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    // Six days on, the newer end is read again, and a push says m1 is there as it is.
+    let later = T0 + 6 * DAY_MS;
+    fx.clock.set(later);
+    fx.list(
+        vec![m(3), m(4), m(5), m(6)],
+        later,
+        Some(newest_proof(ListStart::At(T0 + 3 * STEP))),
+    );
+    push(&fx, m(1), true, later);
+    fx.clock.set(T0 + 8 * DAY_MS);
+    fx.cache.maintain(Maintenance::Hourly);
+    fx.settle();
+    assert_eq!(
+        content(&fx, "m2"),
+        None,
+        "nothing re-read m2 within the week"
+    );
+    assert!(content(&fx, "m1").is_some(), "the push saw m1 within it");
+    let claims = intervals(&fx, &Scope::Main);
+    assert!(
+        claims.iter().all(|claim| claim.t0_ms >= T0 + 3 * STEP),
+        "only the stretch read within the week is still claimed: {claims:?}"
+    );
+    assert!(
+        coverage::covers(&claims, T0 + 3 * STEP, T0 + 5 * STEP).is_some(),
+        "{claims:?}"
+    );
+}
+
 // ---- what the store's summaries must follow -----------------------------------------------------
 
 fn drain(events: &mut tokio::sync::mpsc::Receiver<WriterEvent>) -> Vec<WriterEvent> {

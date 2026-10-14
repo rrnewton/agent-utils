@@ -447,7 +447,8 @@ enum Phase {
     Age { after: (i64, i64) },
     /// Coverage raised to each channel's cutoff.
     Floors,
-    /// Rows nothing revalidated within a week, by row id after this.
+    /// Rows nothing revalidated within a week, by row id after this; and, in each step's own
+    /// transaction, every claim and head not revalidated within it either.
     Revalidate { after: i64 },
 }
 
@@ -2360,6 +2361,9 @@ impl Writer<'_> {
                 Ok(false)
             }
             Phase::Revalidate { after } => {
+                // In the very transaction that deletes rows, before it picks them: no claim this
+                // step keeps can be over a row it deletes.
+                self.drop_unrevalidated_claims(plan.week_ago)?;
                 let until = plan.until;
                 if after >= until {
                     return Ok(true);
@@ -2399,6 +2403,25 @@ impl Writer<'_> {
                 Ok(cursor >= until)
             }
         }
+    }
+
+    /// The revalidation phase's claims and heads. It deletes every row observed before `week_ago`
+    /// that no claim revalidated since (`full_ms` at or after it) holds, and a claim that was not
+    /// would still say every message of its stretch is held, with those rows gone. So every such
+    /// claim goes, whatever rows it holds: a claim may be weakened, never kept over a deletion.
+    /// The rows of a head's unsettled band are held by no claim at all, only by the read of the
+    /// newest end that listed them, so a head whose scope's newest end was last read before
+    /// `week_ago` goes too.
+    fn drop_unrevalidated_claims(&self, week_ago: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM coverage WHERE full_ms IS NULL OR full_ms < ?1",
+            [week_ago],
+        )?;
+        self.conn.execute(
+            "DELETE FROM scope_head WHERE COALESCE(checked_ms, head_listed_ms) < ?1",
+            [week_ago],
+        )?;
+        Ok(())
     }
 
     /// Coverage of a channel never reaches below `floor`: the rows there are gone.

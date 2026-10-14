@@ -566,3 +566,39 @@ async fn a_summary_that_reads_upstream_is_shadowed_for_its_message_and_counted_a
     );
     assert_eq!(d.messages().asked, 1, "only the fill: {:?}", d.messages());
 }
+
+#[tokio::test]
+async fn a_page_is_never_served_from_a_claim_whose_rows_the_week_took() {
+    let d = deployment("cache-shadow-week", &testing::config_toml()).await;
+    d.fill().await;
+    let cache = d.state.message_cache.cache().expect("installed");
+    let chan = ChanKey::new(LEGACY, READ_CHANNEL);
+    // Eight days on, nothing having read the channel again: the week takes its rows.
+    d.clock.advance(8 * 24 * HOUR);
+    cache.maintain(vibe_talk::cache::Maintenance::Hourly);
+    settled(&d.state).await;
+    assert_eq!(
+        cache.message(&chan, &d.ids[2]),
+        Read::Served(None),
+        "the week took the row"
+    );
+    let iso = vibe_talk::clock::iso_from_ms;
+    ok(
+        &d.state,
+        &path(
+            READ_CHANNEL,
+            &format!("/page?since={}&until={}", iso(T0), iso(T0 + 5 * MINUTE)),
+        ),
+        READ_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    let page = counts(&d.state, "page");
+    assert_eq!(
+        (page.would_serve, page.missing_rows),
+        (0, 0),
+        "a page served from a claim whose rows are gone: {page:?}, claims {:?}",
+        cache.coverage(&chan, &CacheScope::Main)
+    );
+    assert_eq!(page.misses.gap, 1, "{page:?}");
+}

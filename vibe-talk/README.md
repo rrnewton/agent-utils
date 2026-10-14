@@ -3675,7 +3675,8 @@ would have gone. An edit replaces the text, unless what the cache holds was seen
 the live poller publishes counts as seen when the poller's read began, not when it published it.
 In both cases a summary of the old text is deleted from the store once the change is written.
 Turning the cache off never deletes a summary. A message the server does not re-check is deleted
-within seven days anyway.
+within seven days anyway, and the cache's record that the stretch it was in is held whole goes in
+the same pass, so nothing would ever be answered for that stretch without it.
 
 A deletion is applied whatever is known of the provider's account: while it is being checked,
 while its credential is refused, and before the startup sweep. It writes nothing an account could

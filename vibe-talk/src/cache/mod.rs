@@ -1194,8 +1194,9 @@ pub(crate) fn probe(connection: &rusqlite::Connection) -> Vec<(String, String)> 
 /// Housekeeping the writer runs on a timer, or when asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Maintenance {
-    /// The hourly pass: the age limit, expired tombstones, rows not revalidated within a week,
-    /// the FTS integrity check, a bounded incremental vacuum, and a checkpoint.
+    /// The hourly pass: the age limit, expired tombstones, rows not revalidated within a week
+    /// with the claims and heads that were not either, the FTS integrity check, a bounded
+    /// incremental vacuum, and a checkpoint.
     Hourly,
     /// The weekly bounded FTS merge.
     Weekly,
