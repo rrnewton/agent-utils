@@ -757,6 +757,119 @@ async fn a_long_direct_slack_reply_is_said_to_be_all_in_the_thread_it_answered()
     assert!(!said.contains("in the channel"), "{said}");
 }
 
+/// One GET with the write token, as the page reads a route, with the answer's status and JSON body.
+async fn read(state: &AppState, uri: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// What Slack was sent for a voice agent's long reply to `ts(10, 0)`: every part in that message's
+/// thread, the owner's tag at the start of the first and nowhere else, and the parts, joined, exactly
+/// the tag and `words`.
+fn assert_tagged_once_in_the_thread(
+    sent: &[std::collections::HashMap<String, String>],
+    words: &str,
+) {
+    const TAG: &str = vibe_talk::post_prefix::DEFAULT_PREFIX;
+    assert!(sent.len() > 2, "the fixture did not split");
+    assert!(
+        sent.iter()
+            .all(|params| params.get("thread_ts") == Some(&ts(10, 0))),
+        "a part left the thread of the message it answers: {sent:?}"
+    );
+    let parts: Vec<&str> = sent.iter().map(|params| params["text"].as_str()).collect();
+    assert!(
+        parts.iter().all(|part| part.chars().count() <= 600),
+        "the tag was not counted toward max_post_chars: {parts:?}"
+    );
+    assert!(parts[0].starts_with(TAG), "{}", parts[0]);
+    assert!(
+        !parts[0][TAG.len()..].contains(TAG.trim_end()),
+        "the first part was tagged twice: {}",
+        parts[0]
+    );
+    for later in &parts[1..] {
+        assert!(
+            !later.contains(TAG.trim_end()),
+            "a later part was tagged: {later}"
+        );
+    }
+    assert_eq!(parts.concat(), format!("{TAG}{words}"));
+}
+
+/// `#303 voice-post-prefix`, on Slack. A voice agent's long reply to a message is cut into parts
+/// that all go into that message's thread, and the owner's tag is on the first part only, once:
+/// when the agent sends at once, and when the owner confirms the proposal, whose commit posts the
+/// proposal's text as it stands and never tags it again.
+#[tokio::test]
+async fn a_split_slack_voice_reply_in_a_thread_carries_the_tag_once_on_its_first_part() {
+    let target = vibe_talk::slack::message_id_from_ts(&ts(10, 0)).expect("id");
+    let words = prose(1_800);
+    let arguments = json!({ "channel_id": TEAM, "text": words, "reply_to": target.as_str() });
+
+    // Sent at once.
+    let fake = Fake::start(slack_fixture(), 20).await;
+    let state = slack(&fake, 600).await;
+    state
+        .store
+        .set_ask_before_send(false)
+        .await
+        .expect("confirmation off");
+    let said = voice_post_reply_with(&state, arguments.clone()).await;
+    assert!(said.starts_with("SENT. "), "{said}");
+    assert_tagged_once_in_the_thread(&fake.requests("chat.postMessage"), &words);
+
+    // Proposed, then confirmed with a tap: the proposal already holds the tag.
+    let fake = Fake::start(slack_fixture(), 20).await;
+    let state = slack(&fake, 600).await;
+    let said = voice_post_reply_with(&state, arguments).await;
+    assert!(
+        fake.requests("chat.postMessage").is_empty(),
+        "a proposal was posted before it was confirmed: {said}"
+    );
+    let (status, pending) = read(&state, "/api/v1/post-proposals").await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    let proposal = &pending["proposal"];
+    assert_eq!(
+        proposal["prefix"],
+        vibe_talk::post_prefix::DEFAULT_PREFIX,
+        "{proposal}"
+    );
+    let (status, committed) = call(
+        &state,
+        "/api/v1/post-proposals/commit",
+        json!({
+            "handle": proposal["handle"],
+            "channel_id": proposal["channel_id"],
+            "text": proposal["text"],
+            "reply_to": proposal["reply_to"],
+            "confirmed_by": "ui",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", brief(&committed));
+    assert_tagged_once_in_the_thread(&fake.requests("chat.postMessage"), &words);
+}
+
 /// `#264 voice-send-approval`: the same words asked for again after a direct send whose second
 /// part's answer was lost post nothing, and the model is told what the first send's own failure
 /// told it: part was posted, and whether the rest was could not be confirmed. Not that the rest

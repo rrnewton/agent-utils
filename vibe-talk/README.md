@@ -6966,7 +6966,10 @@ a box, a help line, **Save**, and **Reset to default**. It is the server's, kept
 the owner's instructions for the agent (`#272 voice-agent-instructions`), so every device and every
 call uses the same one: read at read scope through `GET /api/v1/voice-post-prefix` and
 client-config's `voice_post_prefix`, saved only by a write-scope `PUT` (`{prefix}`), and forgotten by
-`DELETE`. It is put in front exactly as saved — one line, no space in front, at most 100 characters
+`DELETE`. The page reads client-config once, at sign-in, so opening Settings reads the tag again:
+a tag saved or reset on another device since is what the box shows and what **Reset to default**
+acts on, while a tag typed here and not yet saved stays in the box, still marked unsaved. It is put
+in front exactly as saved — one line, no space in front, at most 100 characters
 — so the owner ends it with a space. An empty tag turns tagging off, and is kept apart from never
 having saved one: no row in the store is the default, a row holding `''` is off. No MCP tool reaches
 it, because a model that could take its own tag off could pass its words off as the owner's. A store

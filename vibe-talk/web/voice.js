@@ -621,6 +621,8 @@ function showScreen(name) {
   if (main) renderColumns();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") refreshUpstreamClear();
+  // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
+  if (name === "settings" && previous !== "settings") refreshVoicePostPrefix();
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
   if (name === "settings" && previous !== "settings") renderDismissedSends();
   if (name !== previous || focusLost()) settleFocus();
@@ -28495,12 +28497,22 @@ function renderVoiceSendSettingWhileSaving(wanted) {
 // half-typed tag must not go out on the agent's next post. An empty box saved is the owner's choice
 // of no tag, which the server keeps apart from never having chosen; Reset to default is the way back
 // to the shipped one.
+//
+// client-config is read once, at sign-in, and another device may save or reset the tag after that.
+// So opening Settings reads the tag again (`refreshVoicePostPrefix`): the box shows what is in force
+// now, and Reset takes the path the server's state calls for, not the one this page last heard of.
 
 /** The tag as the server last reported it, or null when it does not say (an older server). */
 let voicePostPrefix = null;
 
 /** True while a save or a reset is on its way, so a second click cannot race it. */
 let voicePostPrefixSaving = false;
+
+/**
+ * Counts the reads and writes of the tag this page has sent, so a read that answers after a newer
+ * one, or after a save or reset began, is not drawn over it.
+ */
+let voicePostPrefixReads = 0;
 
 /**
  * A tag as the server keeps it (`post_prefix::clean`): one line, any control character a space, no
@@ -28567,6 +28579,8 @@ async function saveVoicePostPrefix(reset) {
     return;
   }
   voicePostPrefixSaving = true;
+  // A read still on its way is older than what this write will answer.
+  voicePostPrefixReads += 1;
   renderVoicePostPrefix();
   let stored = null;
   try {
@@ -28590,6 +28604,31 @@ async function saveVoicePostPrefix(reset) {
         ? "Saved. Every message the voice agent posts starts with this prefix."
         : "Saved. The voice agent's messages carry no prefix."
   );
+}
+
+/**
+ * Read the tag again, as Settings opens: another device may have saved or reset it since this page
+ * read client-config. What the server answers is taken as the truth — the line, the buttons, and the
+ * path Reset takes — but a tag typed here and not yet saved stays in the box, still marked unsaved.
+ * Not for an older server that reports no tag, nor while a save or reset is on its way; a read that
+ * fails leaves what is shown, and the next save or reset answers with the truth anyway.
+ */
+async function refreshVoicePostPrefix() {
+  if (voicePostPrefix === null || voicePostPrefixSaving) return;
+  const read = ++voicePostPrefixReads;
+  let view;
+  try {
+    view = await apiDecoded("VoicePostPrefix", "/api/v1/voice-post-prefix");
+  } catch (_error) {
+    return;
+  }
+  if (read !== voicePostPrefixReads || voicePostPrefixSaving) return;
+  const typed = voicePostPrefixDirty() ? el("voice-post-prefix").value : null;
+  applyVoicePostPrefix(view);
+  if (typed !== null && voicePostPrefix !== null) {
+    el("voice-post-prefix").value = typed;
+    renderVoicePostPrefix();
+  }
 }
 
 // --- the voice agent's instructions ----------------------------------------------------------------

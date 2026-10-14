@@ -54887,15 +54887,22 @@ test("`remote-ops-audit` W7: once the read given up on has answered, or failed, 
 // the card and the read-back carry the tag, and the tag — his words, not the model's — does not make
 // a draft tap-only.
 
-/** Sign in with the tag as the server reports it, and open Settings. */
+/**
+ * Sign in with the tag as the server reports it, and open Settings, letting the read that opening it
+ * sends answer.
+ */
 async function postPrefixPage(fields = {}, arrange = (_page) => {}) {
   const page = newPage();
   page.voicePostPrefix = voicePostPrefixView(fields);
   arrange(page);
   await signIn(page);
   await page.el("open-settings").click();
+  await page.settle();
   return page;
 }
+
+/** What the page wrote to the prefix route, leaving out its reads. */
+const postPrefixWrites = (page) => page.voicePostPrefixCalls.filter((call) => call.method !== "GET");
 
 test("`#303 voice-post-prefix`: the Sending group has a labelled box, a help line, Save and Reset to default", () => {
   const sending = settingsGroup("Sending");
@@ -54940,7 +54947,7 @@ test("`#303 voice-post-prefix`: Save sends the box as typed and draws what the s
   assert.equal(page.el("reset-voice-post-prefix").disabled, false, "an edit cannot be put back");
   await page.el("save-voice-post-prefix").click();
   await page.settle();
-  assert.deepStrictEqual(page.voicePostPrefixCalls, [{ method: "PUT", body: { prefix: "  [voice] " } }]);
+  assert.deepStrictEqual(postPrefixWrites(page), [{ method: "PUT", body: { prefix: "  [voice] " } }]);
   assert.equal(page.el("voice-post-prefix").value, "[voice] ", "the box kept the click, not what was stored");
   assert.equal(page.el("voice-post-prefix-state").textContent, "Saved. Every message the agent posts starts with it.");
   assert.equal(page.el("save-voice-post-prefix").disabled, true);
@@ -54952,14 +54959,14 @@ test("`#303 voice-post-prefix`: an empty box is saved as off, and Reset to defau
   await page.el("voice-post-prefix").setValue("");
   await page.el("save-voice-post-prefix").click();
   await page.settle();
-  assert.deepStrictEqual(page.voicePostPrefixCalls, [{ method: "PUT", body: { prefix: "" } }]);
+  assert.deepStrictEqual(postPrefixWrites(page), [{ method: "PUT", body: { prefix: "" } }]);
   assert.equal(page.el("voice-post-prefix-state").textContent, "Off: the agent's messages carry no prefix.");
   assert.match(page.el("status").textContent, /carry no prefix/);
   // Off is a choice, so Reset has something to forget.
   assert.equal(page.el("reset-voice-post-prefix").disabled, false);
   await page.el("reset-voice-post-prefix").click();
   await page.settle();
-  assert.deepStrictEqual(page.voicePostPrefixCalls[1], { method: "DELETE", body: null });
+  assert.deepStrictEqual(postPrefixWrites(page)[1], { method: "DELETE", body: null });
   assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
   assert.equal(page.el("voice-post-prefix-state").textContent, "The default.");
   assert.equal(page.el("reset-voice-post-prefix").disabled, true);
@@ -54971,7 +54978,7 @@ test("`#303 voice-post-prefix`: Reset with nothing saved puts the default back i
   await page.el("voice-post-prefix").setValue("half a tag");
   await page.el("reset-voice-post-prefix").click();
   await page.settle();
-  assert.deepStrictEqual(page.voicePostPrefixCalls, [], "putting back an unsaved edit wrote to the server");
+  assert.deepStrictEqual(postPrefixWrites(page), [], "putting back an unsaved edit wrote to the server");
   assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
   assert.equal(page.el("voice-post-prefix-state").textContent, "The default.");
 });
@@ -55009,6 +55016,64 @@ test("`#303 voice-post-prefix`: a read token and a store-less server show the ta
 
   const older = await postPrefixPage({}, (p) => { p.voicePostPrefix = undefined; });
   assert.equal(older.el("voice-post-prefix-editor").hidden, true);
+  assert.deepStrictEqual(older.voicePostPrefixCalls, [], "a server that reports no tag was asked for one");
+});
+
+test("`#303 voice-post-prefix`: opening Settings reads the tag again, so a second device shows what another saved and Reset forgets it", async () => {
+  // Signed in while the default was in force; another device then saves its own tag.
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX, "fixture: sign-in read the default");
+  page.voicePostPrefix = voicePostPrefixView({ prefix: "[phone] ", custom: true });
+
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.deepStrictEqual(page.voicePostPrefixCalls, [{ method: "GET", body: null }], "opening Settings did not read the tag again");
+  assert.equal(page.el("voice-post-prefix").value, "[phone] ", "the box shows the tag read at sign-in");
+  assert.equal(page.el("voice-post-prefix-state").textContent, "Saved. Every message the agent posts starts with it.");
+  assert.equal(page.el("reset-voice-post-prefix").disabled, false, "Reset is held as though the default were in force");
+
+  await page.el("reset-voice-post-prefix").click();
+  await page.settle();
+  assert.deepStrictEqual(postPrefixWrites(page), [{ method: "DELETE", body: null }], "Reset took the default's path and forgot nothing at the server");
+  assert.equal(page.voicePostPrefix.custom, false, "the other device's tag is still in force");
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
+  assert.equal(page.el("voice-post-prefix-state").textContent, "The default.");
+});
+
+test("`#303 voice-post-prefix`: negative control: Settings left open reads nothing more, and shows the change only when opened again", async () => {
+  const page = await postPrefixPage();
+  const reads = page.voicePostPrefixCalls.length;
+  assert.equal(reads, 1, "fixture: opening Settings read the tag once");
+  page.voicePostPrefix = voicePostPrefixView({ prefix: "[phone] ", custom: true });
+  await page.settle();
+  // Nothing but opening Settings reads it, so without that read this page would stay stale.
+  assert.equal(page.voicePostPrefixCalls.length, reads, "something other than opening Settings read the tag");
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
+  assert.equal(page.el("reset-voice-post-prefix").disabled, true);
+
+  await page.el("close-settings").click();
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.voicePostPrefixCalls.length, reads + 1, "opening Settings again did not read the tag");
+  assert.equal(page.el("voice-post-prefix").value, "[phone] ");
+  assert.equal(page.el("reset-voice-post-prefix").disabled, false);
+});
+
+test("`#303 voice-post-prefix`: a tag typed and not saved stays in the box when Settings reads the tag again", async () => {
+  const page = await postPrefixPage();
+  await page.el("voice-post-prefix").setValue("half a tag");
+  await page.el("close-settings").click();
+  page.voicePostPrefix = voicePostPrefixView({ prefix: "[phone] ", custom: true });
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("voice-post-prefix").value, "half a tag", "the read threw away what was typed");
+  assert.equal(page.el("voice-post-prefix-state").textContent, "Not saved yet.");
+  // Measured against what the server now holds: Reset forgets the other device's tag.
+  await page.el("reset-voice-post-prefix").click();
+  await page.settle();
+  assert.deepStrictEqual(postPrefixWrites(page), [{ method: "DELETE", body: null }]);
+  assert.equal(page.el("voice-post-prefix").value, DEFAULT_POST_PREFIX);
 });
 
 /** A draft as the server holds one the voice agent proposed, with the owner's tag in front. */
