@@ -788,11 +788,12 @@ pub struct Looked {
 /// the channel's own messages in the recent window ([`messages`]), where it may be `None` as it
 /// always could be. So no answer is less than it was before, and none older.
 ///
-/// `caller` is the scope of whoever asked, as for [`messages`]. `shadow`, when given, is the
-/// evaluation of what the message cache would have answered for one of `ids` (`#208
-/// persistent-cache`, [`crate::cache::shadow`]): it is handed what the provider answered for that
-/// id as soon as the provider has: the message it found, or nothing at all where it proved there is
-/// none; for an id it did not see, what the read that looks it up instead found.
+/// `caller` is the scope of whoever asked, as for [`messages`]: what the lookup found is offered to
+/// the message cache under its grant, rows only ([`crate::cache::observe::looked_up`]). `shadow`,
+/// when given, is the evaluation of what the message cache would have answered for one of `ids`
+/// (`#208 persistent-cache`, [`crate::cache::shadow`]): it is handed what the provider answered for
+/// that id as soon as the provider has: the message it found, or nothing at all where it proved
+/// there is none; for an id it did not see, what the read that looks it up instead found.
 ///
 /// # Errors
 ///
@@ -813,6 +814,8 @@ pub async fn lookup_messages(
         validate_thread_id(thread)?;
     }
     let wanted: Vec<MessageId> = ids.iter().map(|id| MessageId(id.clone())).collect();
+    // `#208 persistent-cache`: begun before the lookup, under the caller's grant, as every fill is.
+    let fill = state.message_cache.begin_for(caller, &channel.id);
     let answers = state
         .chat
         .fetch_messages(&channel.id, thread, &wanted)
@@ -896,6 +899,16 @@ pub async fn lookup_messages(
             },
         };
         answered.push(message);
+    }
+    // `#208 persistent-cache`. What the lookup and the thread reads found, raw, before anything
+    // prepares it, and once every shadowed comparison is made. The window's rows were offered by
+    // the read that took it.
+    if let Some(fill) = fill {
+        let found: Vec<Message> = unprepared
+            .iter()
+            .filter_map(|&index| answered[index].clone())
+            .collect();
+        fill.offer_looked_up(&found, thread);
     }
     if !unprepared.is_empty() {
         let filter = crate::noise::filter_for(state, &channel.id).await;
@@ -1729,8 +1742,10 @@ pub async fn page(
         (None, Some(_)) => crate::cache::observe::PageRead::Before,
         (None, None) => crate::cache::observe::PageRead::Newest,
     };
-    // Only a walk forward from an instant: the span the cache would answer from its coverage.
-    let shadow = since.and_then(|since_ms| {
+    // Only a walk forward from an instant: the span the cache would answer from its coverage. Not
+    // a step that resumes after a message, which asks for less than the span from its instant.
+    let resumes = start.is_some_and(|start| start.after.is_some());
+    let shadow = since.filter(|_| !resumes).and_then(|since_ms| {
         let ask = Ask::Page {
             since_ms,
             until_ms: until,
@@ -1993,7 +2008,8 @@ pub async fn count(
 /// Read scope. `#190 voice-agent-tools`.
 ///
 /// `caller` is the scope of whoever asked, as for [`messages`]. Every page the walk read is
-/// offered once, together, when it ends.
+/// offered once, together, when it ends; so is every range read of a count made of them
+/// ([`crate::cache::observe::range_walk`]).
 ///
 /// # Errors
 ///
@@ -2030,10 +2046,14 @@ pub async fn count_within(
     let keep_walk = fill.is_some() || shadow.is_some();
     if let Some(from) = since {
         if state.chat.read_caps(&channel.id).range == crate::chat::Support::Native {
-            if let Some(ranged) = count_range(state, &channel, from, cap, &filter, keep_walk).await?
+            if let Some(ranged) =
+                count_range(state, &channel, from, cap, &filter, keep_walk).await?
             {
                 if let Some(shadow) = shadow {
                     shadow.compare(Upstream::of(&ranged.read, ranged.count.at_least));
+                }
+                if let Some(fill) = fill {
+                    fill.offer_range_walk(&ranged.read, ranged.exhausted);
                 }
                 return Ok(ranged.count);
             }
@@ -2147,6 +2167,7 @@ async fn count_range(
     let (mut newest_seen, mut oldest_seen): (Option<MessageId>, Option<MessageId>) = (None, None);
     let mut cursor: Option<String> = None;
     let mut at_least = true;
+    let mut exhausted = false;
     let mut kept: Vec<Message> = Vec::new();
     for _ in 0..MAX_COUNT_STEPS {
         let want = u16::try_from(ceiling.saturating_sub(counted + noise))
@@ -2180,6 +2201,7 @@ async fn count_range(
         noise += placeholders;
         if read.exhausted {
             at_least = false;
+            exhausted = true;
             break;
         }
         if counted + noise >= ceiling {
@@ -2201,6 +2223,7 @@ async fn count_range(
             noise,
         },
         read: kept,
+        exhausted,
     }))
 }
 
@@ -2208,9 +2231,12 @@ async fn count_range(
 struct Ranged {
     /// The count.
     count: MessageCount,
-    /// Every message its range reads returned, newest step last, when it was asked to keep them:
-    /// what the message cache is shown (`#208 persistent-cache`).
+    /// Every message its range reads returned, the newest read's first, when it was asked to keep
+    /// them: what the message cache is shown (`#208 persistent-cache`).
     read: Vec<Message>,
+    /// Whether the provider proved its last read reached the count's `since`
+    /// ([`crate::chat::RangeRead::exhausted`]).
+    exhausted: bool,
 }
 
 /// Semantic random access: describe a message, get that message. Read scope.
@@ -3923,7 +3949,13 @@ async fn shared_window(
     // summary's context, whoever asked for the summary.
     let wants = Wants::Message(Consumer::Summary, MessageId(message_id.to_owned()));
     let window = crate::read_reason::ReadReason::SummaryWindow
-        .scope(messages_for(state, caller, channel.id.as_str(), limit, wants))
+        .scope(messages_for(
+            state,
+            caller,
+            channel.id.as_str(),
+            limit,
+            wants,
+        ))
         .await?;
     state.summary_counters.fetched(1);
     *turn = Some(crate::read_ahead::WindowRead::of(&window));

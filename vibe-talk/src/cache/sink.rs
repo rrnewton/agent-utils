@@ -443,6 +443,15 @@ impl Fill {
         self.offer(observations);
     }
 
+    /// Offer one channel's answer to a read of several channels at once
+    /// ([`crate::chat::ChatClient::fetch_recent_many`]), dated as a recent read is: never as a
+    /// read through a bridge's Flat view ([`observe::window_among_several`]).
+    pub fn offer_recent_among_several(self, read: &RecentRead) {
+        let observed_ms = self.observed(read.as_of.as_deref());
+        let observations = observe::window_among_several(self.shape, read, observed_ms);
+        self.offer(observations);
+    }
+
     /// Offer one `/page` step: the messages the provider returned inside the requested span,
     /// before any was cut to the page's size, and whether one was.
     pub fn offer_page(self, read: PageRead, messages: &[Message], truncated: bool) {
@@ -453,6 +462,20 @@ impl Fill {
     /// Offer every message a `/count` walk read, from the newest page down.
     pub fn offer_walk(self, messages: &[Message]) {
         let observations = observe::walk(self.shape, messages, self.observed_ms);
+        self.offer(observations);
+    }
+
+    /// Offer every message a count made of the provider's own range reads read, and whether the
+    /// provider proved its last read reached the count's `since` ([`observe::range_walk`]).
+    pub fn offer_range_walk(self, messages: &[Message], exhausted: bool) {
+        let observations = observe::range_walk(self.shape, messages, exhausted, self.observed_ms);
+        self.offer(observations);
+    }
+
+    /// Offer the messages a lookup by id found, raw, in the thread `thread_id` when it looked in
+    /// one ([`observe::looked_up`]).
+    pub fn offer_looked_up(self, messages: &[Message], thread_id: Option<&str>) {
+        let observations = observe::looked_up(self.shape, messages, thread_id, self.observed_ms);
         self.offer(observations);
     }
 

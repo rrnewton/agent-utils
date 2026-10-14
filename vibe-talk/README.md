@@ -3716,8 +3716,9 @@ with the process.
   route and tool, and finds the file unchanged.
 * **What does fill it:**
   * reads made with the write token: the page's timeline in every view, with its catch-up
-    deltas; `/messages`; `/page`; `/count`; a message by id; a digest; the to-do list;
-    `resolve`; read-aloud's preparation; and the voice catch-up of a write-token session;
+    deltas; `/messages`; `/page`; `/count`; a message by id, by the provider's own lookup where
+    it has one; a digest; the to-do list; `resolve`; read-aloud's preparation; and the voice
+    catch-up of a write-token session, a read of several channels at once included;
   * the live poller's reads;
   * every change the live feed publishes, offered before any page is sent it;
   * the messages this server posts.
@@ -3745,12 +3746,18 @@ with the process.
     or a page of a Slack channel narrowed to one thread, is never taken as that: the client reads
     a long thread as one short page from its newest end, which says there is no more while older
     replies remain. Such a page vouches only for the stretch from its oldest message up;
-  * a walk forward that was not cut short and found a message;
-  * a `/count` walk that followed its own continuation.
+  * a walk forward that was not cut short and found a message. A step a provider's own range read
+    answered counts only when the provider said it reached the span's end, and a step that
+    resumes after a message (`next_since`) only from the millisecond after that message's;
+  * a `/count` walk that followed its own continuation, or a count made of a provider's own range
+    reads that the provider said reached its `since`.
 
   A read that merely came back short proves nothing. A page with a `notice`, a page stepped back
-  to, a pushed change and an empty page give rows only. Slack's coverage is never complete,
-  because its client omits a message that has no author.
+  to, a pushed change, a message looked up by id and an empty page give rows only, and so does a
+  bridge's answer to a read of several channels at once: nothing says it is the bridge's Flat
+  list. A lookup that proves a message absent does not delete it either: it is the provider's
+  word about the one place it looked. Slack's coverage is never complete, because its client
+  omits a message that has no author.
 
 ### What the cache would have served
 

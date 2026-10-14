@@ -25,9 +25,15 @@
 //! - **The newest end** from a read of the newest page or window, `[oldest row, newest]`.
 //! - **A `/page` walk forward from `since`** that was not cut short and returned at least one row:
 //!   `[since, min(until, newest row + 1))`. An empty one proves nothing, because a provider may
-//!   answer a stretch with an empty page that is not its last.
+//!   answer a stretch with an empty page that is not its last. A step a provider's own range read
+//!   answered (`#287 bulk-reads`) is not cut short only when the provider said it reached the
+//!   span's end ([`crate::chat::RangeRead::exhausted`]); and a step that resumes after a message
+//!   (`next_since`) proves its span from the millisecond after that message's, since it leaves out
+//!   the messages of that millisecond the step before returned.
 //! - **A `/count` walk**, which follows its own continuation from the newest page down: the union
-//!   of its pages, `[oldest row seen, newest]`.
+//!   of its pages, `[oldest row seen, newest]`. A count made of a provider's own range reads,
+//!   newest first on its own cursor ([`range_walk`]), is such a walk only when the provider said
+//!   it reached the count's `since`.
 //! - **The live poller's walk forward from its cursor**, when it ended on a page shorter than it
 //!   asked for rather than at its page bound, and found a row: `(cursor, newest row seen]`, and
 //!   on Discord's own API, where that shorter page is the channel's newest end, up to the newest
@@ -36,8 +42,9 @@
 //! Everything else gives rows only: a page a caller stepped `before` to (nothing joins it to the
 //! page above it), a page carrying a `notice` (the provider says it left something out), a delta
 //! (it lists changes, not a span; a complete one's deletions are offered as such), a change pushed
-//! by the live feed, a message this server posted, and an empty read. Rows only still tells the
-//! cache what each message says and where it belongs.
+//! by the live feed, a message this server posted, a message looked up by id ([`looked_up`]: an id
+//! the provider proved absent is not taken as deleted either), and an empty read. Rows only still
+//! tells the cache what each message says and where it belongs.
 //!
 //! # Scopes, per provider
 //!
@@ -49,7 +56,7 @@
 //! |---|---|---|
 //! | Slack | Main newest; Thread newest, from its oldest row; Flat newest only when it holds no thread at all; the poller's walk | Flat otherwise; the thread list |
 //! | Slack, narrowed to one thread | Main (every view) newest, as `main` of that channel, from its oldest row; the poller's walk | the thread list |
-//! | Bridge | Flat newest; a recent read through Flat | Main, Thread, `/messages` windows, `/page`, `/count`, the poller's walk |
+//! | Bridge | Flat newest; a recent read through Flat | Main, Thread, `/messages` windows, a read of several channels at once, `/page`, `/count`, the poller's walk |
 //! | Discord | Main newest; Thread newest; the poller's walk | Flat; the thread list |
 //!
 //! **Slack Flat.** It is the Main page plus the replies of at most ten of its threads, merged, and
@@ -249,6 +256,17 @@ pub fn window(
     )]
 }
 
+/// What a read of several channels at once tells the cache of one of them (`#287 bulk-reads`,
+/// [`crate::chat::ChatClient::fetch_recent_many`]): its most recent messages.
+///
+/// What [`window`] makes of a recent read, never as one through a bridge's Flat view: nothing says
+/// the copy a bridge answers several channels from is its Flat list, so on a bridge it is rows
+/// only, as a `/messages` window is.
+#[must_use]
+pub fn window_among_several(shape: Shape, read: &RecentRead, observed_ms: i64) -> Vec<Observation> {
+    window(shape, read, false, observed_ms)
+}
+
 /// What one `/page` step tells the cache. `rows` are the messages the provider returned inside
 /// the requested span, before any was cut to the page's size; `truncated` says one was.
 #[must_use]
@@ -315,6 +333,52 @@ pub fn walk(shape: Shape, rows_read: &[Message], observed_ms: i64) -> Vec<Observ
         ListEnd::Newest,
         Source::Walk,
     )]
+}
+
+/// What a count made of a provider's own range reads tells the cache (`#287 bulk-reads`): every
+/// row its reads returned, newest first from the channel's newest message, each read starting
+/// where the one before it ended on the provider's own cursor.
+///
+/// Such a count is a walk ([`walk`]) only when `exhausted` says the provider proved its last read
+/// reached the count's `since`: a count the cap or the provider's step budget stopped lists what it
+/// read, but the provider never said its reads joined up, so it is rows only. A bridge's is rows
+/// only either way, as its walk is.
+#[must_use]
+pub fn range_walk(
+    shape: Shape,
+    rows_read: &[Message],
+    exhausted: bool,
+    observed_ms: i64,
+) -> Vec<Observation> {
+    if exhausted {
+        return walk(shape, rows_read, observed_ms);
+    }
+    let listed_in = (shape != Shape::Bridge).then_some(Scope::Main);
+    rows(shape, rows_read, None, listed_in, observed_ms)
+        .into_iter()
+        .collect()
+}
+
+/// What a lookup by id tells the cache (`#287 bulk-reads`,
+/// [`crate::chat::ChatClient::fetch_messages`]): the messages it found, each at its home, listed in
+/// the thread it looked in when it looked in one. Rows only: a lookup lists no span of anything.
+/// Nor is an id the provider proved absent offered as a deletion: that is the provider's word about
+/// the one place it looked, and a message looked for in the wrong thread is absent from it while it
+/// still exists.
+#[must_use]
+pub fn looked_up(
+    shape: Shape,
+    messages: &[Message],
+    thread_id: Option<&str>,
+    observed_ms: i64,
+) -> Vec<Observation> {
+    let listed_in = match (shape, thread_id) {
+        (Shape::SlackThread, _) | (_, None) => None,
+        (_, Some(thread)) => Some(Scope::Thread(thread.to_owned())),
+    };
+    rows(shape, messages, thread_id, listed_in, observed_ms)
+        .into_iter()
+        .collect()
 }
 
 /// What one message read by id from a thread tells the cache.

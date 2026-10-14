@@ -911,7 +911,7 @@ pub fn refresh_all(
 ) -> BTreeMap<ChannelId, watch::Receiver<bool>> {
     let windows = Arc::clone(state.live.recent());
     let mut started = BTreeMap::new();
-    let mut together: BTreeMap<Option<String>, Vec<(Claim, ReadMark)>> = BTreeMap::new();
+    let mut together: BTreeMap<Option<String>, Vec<Together>> = BTreeMap::new();
     for channel in channels {
         if started.contains_key(channel) {
             continue;
@@ -922,12 +922,16 @@ pub fn refresh_all(
         }
         let (done, claim) = windows.claim(channel, grant);
         if let Some(claim) = claim {
-            // Begun when asked for, as a refresh's read is.
+            // Begun when asked for, as a refresh's read is, and the message cache's fill with it,
+            // under the claimant's grant (`#208 persistent-cache`).
             let mark = windows.mark(channel);
+            let fill = claim
+                .grant
+                .and_then(|grant| state.message_cache.begin(&grant, channel));
             together
                 .entry(state.providers.key_for(channel))
                 .or_default()
-                .push((claim, mark));
+                .push(Together { claim, mark, fill });
         }
         started.insert(channel.clone(), done);
     }
@@ -937,20 +941,34 @@ pub fn refresh_all(
     started
 }
 
+/// One channel claimed for a read of several channels: its claim, the mark taken when it was
+/// claimed, and the message cache's fill begun then under the claim's grant.
+struct Together {
+    claim: Claim,
+    mark: ReadMark,
+    fill: Option<crate::cache::Fill>,
+}
+
 /// Read every claimed channel of one provider in one read of several channels, keep each answer
 /// that is the provider's word for now, and read every other channel on its own. See
-/// [`refresh_all`].
+/// [`refresh_all`]. An answer kept is offered to the message cache as a recent read that a read
+/// of several channels answered ([`crate::cache::observe::window_among_several`]).
 async fn read_together(
     state: AppState,
     provider: Option<String>,
-    claims: Vec<(Claim, ReadMark)>,
+    claims: Vec<Together>,
     limit: u16,
 ) {
     let windows = Arc::clone(state.live.recent());
     let began = Instant::now();
     let asks: Vec<(ChannelId, crate::chat::RecentAsk)> = claims
         .iter()
-        .map(|(claim, _)| (claim.channel.clone(), crate::chat::RecentAsk::newest(limit)))
+        .map(|together| {
+            (
+                together.claim.channel.clone(),
+                crate::chat::RecentAsk::newest(limit),
+            )
+        })
         .collect();
     let permits = windows.permits(provider.as_deref());
     let answers = match permits.acquire().await {
@@ -967,9 +985,14 @@ async fn read_together(
     let asked = claims.len();
     let mut answers = answers.into_iter();
     let mut alone = Vec::new();
-    for (claim, mark) in claims {
+    for Together { claim, mark, fill } in claims {
         match answers.next() {
             Some((channel, Ok(read))) if channel == claim.channel && read.as_of.is_none() => {
+                // `#208 persistent-cache`. Only an answer kept is offered; a channel read alone
+                // instead begins a fill of its own.
+                if let Some(fill) = fill {
+                    fill.offer_recent_among_several(&read);
+                }
                 keep(&claim, mark, limit, Ok(read), millis);
                 drop(claim);
             }

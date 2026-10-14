@@ -2931,3 +2931,471 @@ async fn a_count_never_counts_a_message_deleted_moments_after_it_was_posted() {
         "a count the cache would serve, counting a deleted message: {counted:?}"
     );
 }
+
+// ---- range reads, lookups by id, reads of several channels at once (`#287 bulk-reads`) -------
+
+use vibe_talk::chat::{
+    ChatError, Lookup, RangeOrder, RangeRead, ReadCaps, ReadScope, RecentAnswers, RecentAsk,
+    Support, TimeRange,
+};
+
+/// A provider that answers the bulk reads itself, over the [`TimelineChat`] it wraps: a range read
+/// of a channel's own messages, a lookup by id, a read of several channels at once, each only when
+/// switched on, and everything else as the wrapped provider does.
+///
+/// A range read answers the messages of the window from the end its order names, a page at a
+/// time on a cursor of its own, and says it reached the end only while `prove` is set: otherwise
+/// it stops there and proves nothing, as a provider that cannot tell may. A lookup finds what the
+/// channel holds and proves every other id absent.
+struct BulkReads {
+    inner: Arc<TimelineChat>,
+    range: bool,
+    by_ids: bool,
+    many: bool,
+    prove: std::sync::atomic::AtomicBool,
+}
+
+impl BulkReads {
+    fn new(inner: Arc<TimelineChat>, range: bool, by_ids: bool, many: bool) -> Self {
+        Self {
+            inner,
+            range,
+            by_ids,
+            many,
+            prove: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn prove(&self, prove: bool) {
+        self.prove.store(prove, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn support(native: bool) -> Support {
+    if native {
+        Support::Native
+    } else {
+        Support::Emulated
+    }
+}
+
+#[async_trait::async_trait]
+impl vibe_talk::chat::ChatClient for BulkReads {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            range: support(self.range),
+            by_ids: support(self.by_ids),
+            many_channels: support(self.many),
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn identity(&self) -> Result<vibe_talk::chat::ChatIdentity, ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.inner.fetch_recent(channel, limit).await
+    }
+
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<vibe_talk::chat::RecentRead, ChatError> {
+        self.inner.fetch_recent_dated(channel, limit).await
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &vibe_talk::threads::TimelineRequest,
+    ) -> Result<vibe_talk::threads::TimelinePage, ChatError> {
+        self.inner.fetch_timeline(channel, request).await
+    }
+
+    async fn fetch_range(
+        &self,
+        channel: &ChannelId,
+        scope: &ReadScope,
+        range: TimeRange,
+        order: RangeOrder,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<RangeRead, ChatError> {
+        assert!(self.range, "a range read of a provider that has none");
+        assert_eq!(*scope, ReadScope::Main, "only a channel's own messages");
+        let inside: Vec<Message> = self
+            .inner
+            .fetch_recent(channel, 100)
+            .await?
+            .into_iter()
+            .filter(|m| m.created_ms().is_some_and(|ms| range.contains(ms)))
+            .collect();
+        let skip: usize = cursor.map_or(0, |raw| raw.parse().expect("this fake's cursor"));
+        let take = usize::from(limit);
+        let step: Vec<Message> = match order {
+            RangeOrder::OldestFirst => inside.iter().skip(skip).take(take).cloned().collect(),
+            RangeOrder::NewestFirst => {
+                let end = inside.len().saturating_sub(skip);
+                inside[end.saturating_sub(take)..end].to_vec()
+            }
+        };
+        let reached = skip + step.len() >= inside.len();
+        Ok(RangeRead {
+            next: (!reached).then(|| (skip + step.len()).to_string()),
+            exhausted: reached && self.prove.load(std::sync::atomic::Ordering::SeqCst),
+            messages: step,
+            as_of: None,
+            emulated: false,
+        })
+    }
+
+    async fn fetch_messages(
+        &self,
+        channel: &ChannelId,
+        _thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<Lookup>, ChatError> {
+        assert!(self.by_ids, "a lookup of a provider that has none");
+        let held = self.inner.fetch_recent(channel, 100).await?;
+        Ok(ids
+            .iter()
+            .map(|id| match held.iter().find(|m| m.id == *id) {
+                Some(message) => Lookup::Found(Box::new(message.clone())),
+                None => Lookup::Absent,
+            })
+            .collect())
+    }
+
+    async fn fetch_recent_many(&self, asks: &[(ChannelId, RecentAsk)]) -> RecentAnswers {
+        assert!(
+            self.many,
+            "a read of several channels of a provider that has none"
+        );
+        let mut answers = Vec::with_capacity(asks.len());
+        for (channel, ask) in asks {
+            let read = self.inner.fetch_recent_dated(channel, ask.limit).await;
+            answers.push((channel.clone(), read));
+        }
+        answers
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
+/// A deployment over `configuration` whose provider is [`BulkReads`], with `count` messages in the
+/// read-only channel a minute apart from [`T0`], and a cache read by `clock`.
+async fn bulk_deployment(
+    configuration: &str,
+    count: i64,
+    clock: &Arc<ManualClock>,
+    reads: impl FnOnce(Arc<TimelineChat>) -> BulkReads,
+) -> (Deployment, Arc<BulkReads>) {
+    let dir = TempDir::new("cache-fill-bulk");
+    let (mut state, fake, store) = testing::state_with_store_from_toml(configuration);
+    let ids = (0..count)
+        .map(|n| {
+            fake.seed_at(
+                &id(READ_CHANNEL),
+                "Ada",
+                &format!("message {n}"),
+                T0 + n * MINUTE,
+            )
+        })
+        .collect();
+    let chat = Arc::new(TimelineChat::new(fake.clone()));
+    let bulk = Arc::new(reads(chat.clone()));
+    state.replace_chat(bulk.clone());
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(WAIT), "the first sweep landed");
+    (
+        Deployment {
+            state,
+            fake,
+            chat,
+            store,
+            cache,
+            ids,
+            _dir: dir,
+        },
+        bulk,
+    )
+}
+
+#[tokio::test]
+async fn a_range_read_step_claims_its_span_only_when_the_provider_proved_it_reached_the_end() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let (d, bulk) = bulk_deployment(&testing::config_toml(), 10, &clock, |chat| {
+        BulkReads::new(chat, true, false, false)
+    })
+    .await;
+    let iso = vibe_talk::clock::iso_from_ms;
+    let since = T0 + 2 * MINUTE;
+    let page = format!(
+        "/api/v1/channels/{READ_CHANNEL}/page?since={}&until={}",
+        iso(since),
+        iso(T0 + HOUR)
+    );
+
+    // The provider read the whole span but did not say so: the rows, and no claim.
+    let unproven = get(&d.state, &page).await;
+    assert_eq!(unproven["has_more"], true, "{unproven}");
+    assert_eq!(held(&d.cache), 8);
+    assert!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main).is_empty(),
+        "a range read the provider did not prove claims nothing"
+    );
+
+    // The same step, proved: its span, as any walk from `since` proves it.
+    bulk.prove(true);
+    clock.advance(MINUTE);
+    let proven = get(&d.state, &page).await;
+    assert_eq!(proven["has_more"], false, "{proven}");
+    let newest = T0 + 9 * MINUTE;
+    assert_eq!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main),
+        [Interval {
+            t0_ms: since,
+            t1_ms: newest - SETTLE_MS,
+            listed_ms: clock.now(),
+            full_ms: Some(clock.now()),
+            complete: true,
+            source: Source::Read,
+        }]
+    );
+
+    // At read scope, nothing at all.
+    let fresh = ManualClock::at(T0 + HOUR);
+    let (d, bulk) = bulk_deployment(&testing::config_toml(), 10, &fresh, |chat| {
+        BulkReads::new(chat, true, false, false)
+    })
+    .await;
+    bulk.prove(true);
+    assert_eq!(
+        call_as(&d.state, &page, testing::READ_TOKEN).await,
+        StatusCode::OK
+    );
+    assert_eq!(held(&d.cache), 0);
+}
+
+#[tokio::test]
+async fn a_step_that_resumes_after_a_message_never_takes_one_of_its_millisecond_for_deleted() {
+    // Two messages created in one millisecond, as their snowflakes say, and two later ones. The
+    // fake numbers the messages it seeds from 10^18 up, all of them in that id's millisecond.
+    let at = MessageId("1000000000000000000".to_owned())
+        .created_at_ms()
+        .expect("a snowflake");
+    let clock = ManualClock::at(at + HOUR);
+    let d = deployment(false, 0, &clock).await;
+    let first = d.fake.seed(&id(READ_CHANNEL), "Ada", "first");
+    let second = d.fake.seed(&id(READ_CHANNEL), "Ada", "second");
+    assert_eq!(first.created_at_ms(), Some(at), "{first}");
+    assert_eq!(
+        second.created_at_ms(),
+        Some(at),
+        "one millisecond: {second}"
+    );
+    d.fake
+        .seed_at(&id(READ_CHANNEL), "Ada", "third", at + 5 * MINUTE);
+    d.fake
+        .seed_at(&id(READ_CHANNEL), "Ada", "fourth", at + 10 * MINUTE);
+
+    // A step of one message ends between the two, and hands back where the next one resumes.
+    let iso = vibe_talk::clock::iso_from_ms;
+    let step = get(
+        &d.state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=1",
+            iso(at)
+        ),
+    )
+    .await;
+    assert_eq!(step["has_more"], true, "{step}");
+    let resume = step["next_since"]
+        .as_str()
+        .expect("a resume point")
+        .to_owned();
+    assert!(resume.contains(first.as_str()), "{resume}");
+    assert!(holds(&d.cache, &read_chan(), &first));
+
+    // The next step lists everything after the first message, the second included, and so all of
+    // the span from the next millisecond on. The first message is not in it, and still exists.
+    clock.advance(MINUTE);
+    let next = get(
+        &d.state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=10",
+            resume.replace('~', "%7E")
+        ),
+    )
+    .await;
+    assert_eq!(next["has_more"], false, "{next}");
+    assert_eq!(next["messages"].as_array().expect("messages").len(), 3);
+    assert!(
+        holds(&d.cache, &read_chan(), &first),
+        "a message of the step's first millisecond that the step before returned is not deleted"
+    );
+    assert!(!tombstoned(&d.cache, &read_chan(), &first));
+    let claimed = coverage(&d.cache, &read_chan(), &CacheScope::Main);
+    assert_eq!(claimed.len(), 1, "{claimed:?}");
+    assert_eq!(
+        claimed[0].t0_ms,
+        at + 1,
+        "from the millisecond after the one it resumed in"
+    );
+}
+
+#[tokio::test]
+async fn a_count_by_range_reads_is_a_walk_only_when_the_provider_proved_it_reached_since() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let (d, bulk) = bulk_deployment(&testing::config_toml(), 10, &clock, |chat| {
+        BulkReads::new(chat, true, false, false)
+    })
+    .await;
+    let since = T0 + 2 * MINUTE;
+    let count = format!(
+        "/api/v1/channels/{READ_CHANNEL}/count?since={}",
+        vibe_talk::clock::iso_from_ms(since)
+    );
+
+    let unproven = get(&d.state, &count).await;
+    assert_eq!(unproven["counted"], 8, "{unproven}");
+    assert_eq!(held(&d.cache), 8, "the rows it read");
+    assert!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main).is_empty(),
+        "a count the provider did not prove reached `since` claims nothing"
+    );
+
+    bulk.prove(true);
+    clock.advance(MINUTE);
+    get(&d.state, &count).await;
+    let claimed = coverage(&d.cache, &read_chan(), &CacheScope::Main);
+    assert_eq!(claimed.len(), 1, "{claimed:?}");
+    assert_eq!(
+        (claimed[0].t0_ms, claimed[0].source),
+        (since, Source::Walk),
+        "a proved count is a walk, from the oldest row it read"
+    );
+
+    // At read scope, nothing at all.
+    let fresh = ManualClock::at(T0 + HOUR);
+    let (d, bulk) = bulk_deployment(&testing::config_toml(), 10, &fresh, |chat| {
+        BulkReads::new(chat, true, false, false)
+    })
+    .await;
+    bulk.prove(true);
+    assert_eq!(
+        call_as(&d.state, &count, testing::READ_TOKEN).await,
+        StatusCode::OK
+    );
+    assert_eq!(held(&d.cache), 0);
+}
+
+#[tokio::test]
+async fn a_lookup_by_id_writes_what_it_found_and_takes_nothing_it_proved_absent_for_deleted() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let (d, _bulk) = bulk_deployment(&testing::config_toml(), 10, &clock, |chat| {
+        BulkReads::new(chat, false, true, false)
+    })
+    .await;
+    let by_id = |message: &MessageId| {
+        format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            message.as_str()
+        )
+    };
+
+    // Found: that row, and no claim.
+    get(&d.state, &by_id(&d.ids[3])).await;
+    assert_eq!(held(&d.cache), 1);
+    assert!(holds(&d.cache, &read_chan(), &d.ids[3]));
+    assert!(coverage(&d.cache, &read_chan(), &CacheScope::Main).is_empty());
+
+    // Proved absent: not found, and what the file holds of it stays, since that proof is the
+    // provider's word about one place it looked.
+    get(&d.state, &by_id(&d.ids[5])).await;
+    assert!(holds(&d.cache, &read_chan(), &d.ids[5]));
+    clock.advance(MINUTE);
+    d.fake.delete(&d.ids[5]);
+    let (status, _) = call(&d.state, "GET", &by_id(&d.ids[5])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(holds(&d.cache, &read_chan(), &d.ids[5]));
+    assert!(!tombstoned(&d.cache, &read_chan(), &d.ids[5]));
+
+    // At read scope, nothing.
+    assert_eq!(
+        call_as(&d.state, &by_id(&d.ids[7]), testing::READ_TOKEN).await,
+        StatusCode::OK
+    );
+    assert!(!holds(&d.cache, &read_chan(), &d.ids[7]));
+}
+
+#[tokio::test]
+async fn a_read_of_several_channels_at_once_is_rows_only_on_a_bridge_and_nothing_at_read_scope() {
+    // A bridge whose own recent reads go through Flat, where a read of one channel alone would be
+    // listed as `flat`.
+    let configuration = format!(
+        "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n",
+        testing::config_toml().replace(
+            "[discord]",
+            "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9/api\"\n\
+             recent_view = \"flat\"",
+        )
+    );
+    for caller in [vibe_talk::auth::Scope::Write, vibe_talk::auth::Scope::Read] {
+        let clock = ManualClock::at(T0 + HOUR);
+        let (d, _bulk) = bulk_deployment(&configuration, 10, &clock, |chat| {
+            BulkReads::new(chat, false, false, true)
+        })
+        .await;
+        vibe_talk::ops::activity(&d.state, caller, vibe_talk::ops::ActivityRequest::default())
+            .await
+            .expect("activity");
+        if caller == vibe_talk::auth::Scope::Read {
+            assert_eq!(held(&d.cache), 0, "a read-scope catch-up writes nothing");
+            continue;
+        }
+        assert_eq!(
+            held(&d.cache),
+            10,
+            "the rows the read of several channels answered"
+        );
+        for scope in [CacheScope::Flat, CacheScope::Main] {
+            assert!(
+                coverage(&d.cache, &read_chan(), &scope).is_empty(),
+                "nothing says a bridge answers several channels from its Flat list: {scope:?}"
+            );
+        }
+    }
+}
