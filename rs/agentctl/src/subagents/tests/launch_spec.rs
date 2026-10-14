@@ -212,3 +212,88 @@ fn record_with_a_malformed_spec_is_refused() {
     let error = fixture.manager().load("worker").unwrap_err();
     assert!(error.to_string().contains("invalid launch spec (argv)"));
 }
+
+/// A resumed Codex launch whose readiness wait failed while the harness came up anyway.
+fn failed_codex_launch() -> (Fixture, AgentRecord) {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "liteinst",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                resume: Some("goal-conversation".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut record = fixture.manager().load("liteinst").unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    record.error = Some("agent start: timed out waiting for agent startup".to_owned());
+    record.harness_identity = None;
+    record.anchor_rule = None;
+    record.terminal_id = None;
+    record.session_agent = None;
+    record.session_value = None;
+    fixture.manager().save(&record).unwrap();
+    (fixture, record)
+}
+
+#[test]
+fn promote_pins_a_live_harness_behind_a_failed_launch_without_touching_its_tab() {
+    let (fixture, record) = failed_codex_launch();
+    let result = fixture
+        .manager()
+        .promote("liteinst", Some(&record.token))
+        .unwrap();
+    assert_eq!(result["promoted"], true);
+    let promoted = fixture.manager().load("liteinst").unwrap();
+    assert_eq!(promoted.lifecycle, "running");
+    assert!(promoted.error.is_none());
+    assert!(promoted.harness_anchor().is_some());
+    assert!(promoted.terminal_id.is_some());
+    assert_eq!(promoted.token, record.token);
+    assert!(fixture.client.closed.lock().unwrap().is_empty());
+    let error = fixture.manager().promote("liteinst", None).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("applies to a launch_failed record"));
+}
+
+#[test]
+fn promote_refuses_unless_the_launched_harness_is_provably_there() {
+    for failure in ["absent", "token", "unpinned"] {
+        let (fixture, record) = failed_codex_launch();
+        match failure {
+            "absent" => {
+                fixture
+                    .client
+                    .dead_panes
+                    .lock()
+                    .unwrap()
+                    .insert(record.pane_id.clone().unwrap());
+                fixture.client.started.store(false, Ordering::Relaxed);
+            }
+            "unpinned" => fixture
+                .client
+                .missing_harness_identity
+                .store(true, Ordering::Relaxed),
+            _ => {}
+        }
+        let token = if failure == "token" {
+            Some("stale")
+        } else {
+            None
+        };
+        assert!(
+            fixture.manager().promote("liteinst", token).is_err(),
+            "{failure}"
+        );
+        assert_eq!(
+            fixture.manager().load("liteinst").unwrap().lifecycle,
+            "launch_failed",
+            "{failure}"
+        );
+    }
+}

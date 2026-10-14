@@ -92,6 +92,9 @@ enum Commands {
     /// Pin the terminal and foreground harness process of an agent whose record pins no harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness process or observed native session is refused
     #[command(after_help = "Example: agentctl anchor reviewer")]
     Anchor(Anchor),
+    /// Mark a launch_failed record running when its harness is in fact live: Herdr reports the launched harness in the recorded pane, tab, workspace and cwd, the Herdr agent name still points there, and the harness is the pane's only foreground process. Pins that process and terminal; never touches the tab, pane, or process. Use it when a readiness wait timed out on a harness that runs fine
+    #[command(after_help = "Example: agentctl promote reviewer")]
+    Promote(Promote),
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
@@ -174,6 +177,15 @@ enum Commands {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+struct Promote {
+    /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
+    name: String,
+    /// Require this exact record generation token
+    #[arg(long, value_name = "TOKEN")]
+    expected_token: Option<String>,
 }
 
 #[derive(Args)]
@@ -1364,6 +1376,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         )?,
         Commands::Move(value) => manager.move_to_project_workspace(&value.name)?,
         Commands::Rename(value) => manager.rename(&value.agent.name, &value.new_name)?,
+        Commands::Promote(value) => {
+            manager.promote(&value.name, value.expected_token.as_deref())?
+        }
         Commands::Anchor(value) => manager.anchor(
             &value.agent.name,
             value.replace,

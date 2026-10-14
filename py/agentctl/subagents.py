@@ -2745,6 +2745,74 @@ class ManagedAgents:
         from agentctl.revive import revive_all
         return revive_all(self, dry_run=dry_run, startup_timeout=startup_timeout)
 
+    def promote(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
+        """Mark a ``launch_failed`` record running when its harness is in fact live and ours.
+
+        A readiness barrier can time out while the harness runs fine, for example a resumed
+        Codex that starts working on its goal at once. This pins the live harness and terminal
+        without touching the tab, the pane, or the process. Every identity the launch recorded
+        must still hold: the pane, tab, workspace and working directory, the Herdr agent name,
+        the harness kind as the pane's only foreground process, and any native session.
+        """
+        from agentctl.revive import refuse_pending
+        _name(name)
+        with self._lock(name), self._identity_transaction():
+            refuse_pending(self, (name,))
+            self._refuse_pending_rename(name)
+            record = self._load_expected(name, expected_token)
+            if record.lifecycle != "launch_failed":
+                raise AgentDeliveryError(
+                    f"promote applies to a launch_failed record; {name!r} is {record.lifecycle}"
+                )
+            if (record.adapter != "herdr" or record.mode != "interactive" or record.backend != "herdr"
+                    or record._nested_storage is not None):
+                raise AgentDeliveryError("promote applies to native interactive Herdr launches")
+            if not record.pane_id or not record.tab_id or not record.workspace_id:
+                raise AgentDeliveryError(f"agent {name!r} has no recorded pane, tab, or workspace")
+            pane_id = record.pane_id
+            with self._pane_lock(pane_id):
+                info = self.client.pane_info(pane_id)
+                presentations = [pane for pane in self.client.panes() if pane.pane_id == pane_id]
+                if (len(presentations) != 1 or presentations[0].tab_id != record.tab_id
+                        or presentations[0].workspace_id != record.workspace_id
+                        or info.workspace_id != record.workspace_id
+                        or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)):
+                    raise AgentDeliveryError(f"agent {name!r} pane, tab, workspace, or cwd changed")
+                if info.agent != record.harness:
+                    raise AgentDeliveryError(
+                        f"pane {pane_id} reports agent {info.agent!r}, not the launched {record.harness!r}"
+                    )
+                if self.client.agent_pane(name) != pane_id:
+                    raise AgentDeliveryError(f"Herdr agent name {name!r} points to another pane")
+                identity = self.client.harness_identity(pane_id, record.harness)
+                if identity is None:
+                    raise AgentDeliveryError(
+                        f"cannot pin the {record.harness} process of pane {pane_id}: it must be the "
+                        "pane's only foreground process; wait for a quiet moment and rerun promote"
+                    )
+                owner = self._claim_owner(pane_id, info.terminal_id, exclude=name)
+                if owner is not None:
+                    raise AgentDeliveryError(f"pane {pane_id} is already registered as {owner!r}")
+                promoted = copy.copy(record)
+                _capture_native_session(promoted, info)
+                if info.session_agent is not None and info.session_value is not None:
+                    session_owner = self._identity_owner(info.session_agent, info.session_value, exclude=name)
+                    if session_owner is not None:
+                        raise AgentDeliveryError(
+                            f"native session is already registered as {session_owner.name!r}"
+                        )
+                promoted.session_agent, promoted.session_value = info.session_agent, info.session_value
+                promoted.terminal_id = info.terminal_id
+                promoted.harness_identity, promoted.anchor_rule = identity, ANCHOR_RULE
+                promoted.lifecycle, promoted.error = "running", None
+                if (self.client.pane_info(pane_id) != info
+                        or not self.client.verify_harness_identity(pane_id, identity)):
+                    raise AgentDeliveryError(f"pane {pane_id} changed while it was being promoted")
+                self._save(promoted)
+                result = self._status_record(promoted)
+                result["promoted"] = True
+                return result
+
     def start(
         self, name: str, *, cwd: str, workspace_id: str | None = None,
         harness: str = "codex", model: str | None = None, resume: str | None = None,

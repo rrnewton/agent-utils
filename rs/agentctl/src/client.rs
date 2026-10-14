@@ -1476,9 +1476,13 @@ impl HerdrClient {
         args.extend_from_slice(arguments);
         let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
         if result.status != 0 {
+            let resumed = (arguments.len() >= 2
+                && arguments[0] == "resume"
+                && !arguments[1].starts_with('-'))
+            .then(|| arguments[1].as_str());
             if codex_startup_timeout(&result)
                 && initial.as_ref().is_some_and(|initial| {
-                    self.codex_ready_after_startup_timeout(name, initial)
+                    self.codex_ready_after_startup_timeout(name, initial, resumed)
                         .unwrap_or(false)
                 })
             {
@@ -1492,10 +1496,18 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Prove a Codex launch ready after Herdr's exact startup timeout.
+    ///
+    /// Herdr waits for an idle prompt. A fresh harness can instead sit at an unknown status with
+    /// an idle composer. A harness resuming `resumed` with an active goal starts working at once
+    /// and is never idle: it is ready when Herdr reports Codex working, any native session Herdr
+    /// reports is the resumed one, and the same pinned harness process stays the pane's only
+    /// foreground process across the observation.
     fn codex_ready_after_startup_timeout(
         &self,
         name: &str,
         initial: &AgentPaneInfo,
+        resumed: Option<&str>,
     ) -> Result<bool> {
         if initial.agent.is_some()
             || initial
@@ -1524,7 +1536,15 @@ impl HerdrClient {
         let Some(identity) = self.harness_identity(&info.pane_id, "codex")? else {
             return Ok(false);
         };
-        if !self.codex_idle_ready_with_cancellation(&info, &|| false)? {
+        let working = resumed.is_some()
+            && info.agent.as_deref() == Some("codex")
+            && info.status == "working"
+            && match (info.session_agent.as_deref(), info.session_value.as_deref()) {
+                (None, None) => true,
+                (Some("codex"), Some(value)) => Some(value) == resumed,
+                _ => false,
+            };
+        if !working && !self.codex_idle_ready_with_cancellation(&info, &|| false)? {
             return Ok(false);
         }
         Ok(self.agent_identity(name)? == named

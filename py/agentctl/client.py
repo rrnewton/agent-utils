@@ -922,8 +922,10 @@ class HerdrClient:
         )
         if completed.returncode != 0:
             if kind == "codex" and initial is not None and _is_codex_startup_timeout(completed):
+                resumed = (arguments[1] if len(arguments) >= 2 and arguments[0] == "resume"
+                           and not arguments[1].startswith("-") else None)
                 try:
-                    if self._codex_ready_after_startup_timeout(name, initial):
+                    if self._codex_ready_after_startup_timeout(name, initial, resumed):
                         return
                 except HerdrUnavailable:
                     # A failed or unavailable proof does not erase the launch failure.
@@ -931,7 +933,17 @@ class HerdrClient:
             detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
             raise HerdrUnavailable(f"agent start {name!r}: {detail}")
 
-    def _codex_ready_after_startup_timeout(self, name: str, initial: AgentPaneInfo) -> bool:
+    def _codex_ready_after_startup_timeout(
+        self, name: str, initial: AgentPaneInfo, resumed: str | None = None,
+    ) -> bool:
+        """Prove a Codex launch ready after Herdr's exact startup timeout.
+
+        Herdr waits for an idle prompt. A fresh harness can instead sit at an unknown status
+        with an idle composer. A harness resuming ``resumed`` with an active goal starts
+        working at once and is never idle: it is ready when Herdr reports Codex working, any
+        native session Herdr reports is the resumed one, and the same pinned harness process
+        stays the pane's only foreground process across the observation.
+        """
         if initial.agent is not None or not initial.terminal_id or "\0" in initial.terminal_id:
             return False
         info = self.pane_info(initial.pane_id)
@@ -943,7 +955,13 @@ class HerdrClient:
                 != (info.pane_id, info.tab_id, info.terminal_id)):
             return False
         identity = self.harness_identity(info.pane_id, "codex")
-        if identity is None or not self.codex_idle_ready(info):
+        if identity is None:
+            return False
+        working = (resumed is not None and info.agent == "codex" and info.status == "working"
+                   and info.session_agent in (None, "codex")
+                   and info.session_value in (None, resumed)
+                   and (info.session_agent is None) == (info.session_value is None))
+        if not working and not self.codex_idle_ready(info):
             return False
         return (self.agent_identity(name) == named and self.pane_info(info.pane_id) == info
                 and self.verify_harness_identity(info.pane_id, identity))

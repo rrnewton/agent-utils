@@ -263,3 +263,53 @@ def test_argv_conversation_refuses_two_different_conversations() -> None:
     with pytest.raises(AgentDeliveryError, match="more than one conversation"):
         launch_spec.argv_conversation("claude", ["--resume=one", "-rtwo"])
 
+
+def failed_codex_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Sessions, FakeManagedClient, AgentRecord]:
+    """A resumed Codex launch whose readiness wait failed while the harness came up anyway."""
+    monkeypatch.delenv("HERDR_WORKSPACE_ID", raising=False)
+    fake = FakeManagedClient()
+    sessions = Sessions(cast(HerdrClient, fake), tmp_path / "registry")
+    fake.fail_start = True
+    with pytest.raises(AgentDeliveryError):
+        sessions.start("liteinst", cwd=str(tmp_path), harness="codex", resume="goal-conversation")
+    record = sessions.get("liteinst")
+    assert record.lifecycle == "launch_failed" and record.pane_id is not None
+    fake.infos[record.pane_id] = replace(fake.infos[record.pane_id], agent="codex", status="working",
+                                         session_agent="codex", session_value="goal-conversation")
+    return sessions, fake, record
+
+
+def test_promote_pins_a_live_harness_behind_a_failed_launch_without_touching_its_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, record = failed_codex_launch(tmp_path, monkeypatch)
+    result = sessions.promote("liteinst", expected_token=record.token)
+    promoted = sessions.get("liteinst")
+    assert result["promoted"] is True and promoted.lifecycle == "running" and promoted.error is None
+    assert promoted.harness_anchor is not None and promoted.terminal_id is not None
+    assert promoted.session_value == "goal-conversation" and promoted.token == record.token
+    assert fake.closed == [] and len(fake.launched) == 1 and fake.submitted == []
+    with pytest.raises(AgentDeliveryError, match="applies to a launch_failed record"):
+        sessions.promote("liteinst")
+
+
+@pytest.mark.parametrize("failure", ["absent", "other-harness", "other-session", "renamed", "token"])
+def test_promote_refuses_unless_the_launched_harness_is_provably_there(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, record = failed_codex_launch(tmp_path, monkeypatch)
+    pane = cast(str, record.pane_id)
+    if failure == "absent":
+        fake.infos[pane] = replace(fake.infos[pane], agent=None, status="unknown",
+                                   session_agent=None, session_value=None)
+    elif failure == "other-harness":
+        fake.infos[pane] = replace(fake.infos[pane], agent="claude", session_agent=None, session_value=None)
+    elif failure == "other-session":
+        fake.infos[pane] = replace(fake.infos[pane], session_value="another-conversation")
+    elif failure == "renamed":
+        fake.launched = [("someone", *entry[1:]) for entry in fake.launched]
+    with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+        sessions.promote("liteinst", expected_token="stale" if failure == "token" else None)
+    assert sessions.get("liteinst").lifecycle == "launch_failed"

@@ -5227,6 +5227,119 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }))
     }
 
+    /// Mark a `launch_failed` record running when its harness is in fact live and ours.
+    ///
+    /// A readiness barrier can time out while the harness runs fine, for example a resumed Codex
+    /// that starts working on its goal at once. This pins the live harness and terminal without
+    /// touching the tab, the pane, or the process. Every identity the launch recorded must still
+    /// hold: the pane, tab, workspace and working directory, the Herdr agent name, the harness
+    /// kind as the pane's only foreground process, and any native session.
+    pub fn promote(&self, agent_name: &str, expected_token: Option<&str>) -> Result<Value> {
+        name(agent_name)?;
+        let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
+        self.refuse_pending_revive(&[agent_name])?;
+        self.refuse_pending_rename(&[agent_name])?;
+        let record = self.load(agent_name)?;
+        if expected_token.is_some_and(|token| token != record.token) {
+            return Err(fail(format!(
+                "agent {agent_name:?} was replaced before this operation"
+            )));
+        }
+        if record.lifecycle != "launch_failed" {
+            return Err(fail(format!(
+                "promote applies to a launch_failed record; {agent_name:?} is {}",
+                record.lifecycle
+            )));
+        }
+        if record.adapter != "herdr"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || record.nested.is_some()
+        {
+            return Err(fail("promote applies to native interactive Herdr launches"));
+        }
+        let (Some(pane), Some(tab), Some(workspace)) = (
+            record.pane_id.clone(),
+            record.tab_id.clone(),
+            record.workspace_id.clone(),
+        ) else {
+            return Err(fail(format!(
+                "agent {agent_name:?} has no recorded pane, tab, or workspace"
+            )));
+        };
+        let _pane_lock = self.pane_lock(&pane)?;
+        let info = self.client.pane_info(&pane)?;
+        let presentations = self
+            .client
+            .panes()?
+            .into_iter()
+            .filter(|presentation| presentation.pane_id == pane)
+            .collect::<Vec<_>>();
+        if presentations.len() != 1
+            || presentations[0].tab_id != tab
+            || presentations[0].workspace_id != workspace
+            || info.workspace_id != workspace
+            || !same_directory(&info.cwd, &record.cwd)
+        {
+            return Err(fail(format!(
+                "agent {agent_name:?} pane, tab, workspace, or cwd changed"
+            )));
+        }
+        if info.agent.as_deref() != Some(record.harness.as_str()) {
+            return Err(fail(format!(
+                "pane {pane} reports agent {:?}, not the launched {:?}",
+                info.agent, record.harness
+            )));
+        }
+        if self.client.agent_pane(agent_name)? != pane {
+            return Err(fail(format!(
+                "Herdr agent name {agent_name:?} points to another pane"
+            )));
+        }
+        let Some(identity) = self.client.harness_identity(&pane, &record.harness)? else {
+            return Err(fail(format!(
+                "cannot pin the {} process of pane {pane}: it must be the pane's only foreground process; wait for a quiet moment and rerun promote",
+                record.harness
+            )));
+        };
+        if let Some(owner) =
+            self.claim_owner(&pane, info.terminal_id.as_deref(), Some(agent_name))?
+        {
+            return Err(fail(format!(
+                "pane {pane} is already registered as '{owner}'"
+            )));
+        }
+        let mut promoted = record.clone();
+        promoted.capture_native_session(&info)?;
+        if let (Some(agent), Some(value)) = (&info.session_agent, &info.session_value) {
+            if let Some(owner) = self.identity_owner(agent, value, Some(agent_name))? {
+                return Err(fail(format!(
+                    "native session is already registered as {:?}",
+                    owner.name
+                )));
+            }
+        }
+        promoted.session_agent = info.session_agent.clone();
+        promoted.session_value = info.session_value.clone();
+        promoted.terminal_id = info.terminal_id.clone();
+        promoted.harness_identity = Some(identity.clone());
+        promoted.anchor_rule = Some(ANCHOR_RULE);
+        promoted.lifecycle = "running".to_owned();
+        promoted.error = None;
+        if self.client.pane_info(&pane)? != info
+            || !self.client.verify_harness_identity(&pane, &identity)?
+        {
+            return Err(fail(format!(
+                "pane {pane} changed while it was being promoted"
+            )));
+        }
+        self.save(&promoted)?;
+        let mut result = self.status_record(&promoted)?;
+        result["promoted"] = json!(true);
+        Ok(result)
+    }
+
     /// Rename a live agent: registry entry, Herdr agent name and tab label together.
     pub fn rename(&self, old: &str, new: &str) -> Result<Value> {
         self.refuse_pending_revive(&[old, new])?;

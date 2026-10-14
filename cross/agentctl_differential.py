@@ -370,6 +370,7 @@ def _launch_specs(harness: Harness, report: Report) -> None:
                        and isinstance(spec.get("native_session"), dict)
                        and spec["native_session"].get("source") == "asserted",
                        f"start did not record its exact launch: {status!r}")
+    _pair(harness, report, case, "primary/launch-spec/promote-running", ("promote", "worker", *_COMMON), 75)
     for root in (case.python_root, case.rust_root):
         path = root / "registry/worker/agent.json"
         document = json.loads(path.read_text(encoding="utf-8"))

@@ -604,6 +604,41 @@ def test_suggestion13_exact_codex_start_timeout_accepts_verified_unknown_idle_on
     assert screens == ["screen"] and client.pane_info(info.pane_id).status == "unknown"
 
 
+@pytest.mark.parametrize("session", [None, "goal-conversation"])
+def test_exact_codex_start_timeout_accepts_a_resumed_harness_already_working_on_its_goal(
+    session: str | None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, screens = _suggestion13_timeout_client(monkeypatch)
+    working = replace(info, status="working", session_agent=session and "codex", session_value=session)
+    monkeypatch.setattr(client, "pane_info", lambda _pane: working if calls else replace(
+        info, agent=None, session_agent=None, session_value=None))
+    client.start_agent("worker", "codex", info.pane_id, ("resume", "goal-conversation", "--no-alt-screen"),
+                       timeout=1)
+    assert len(calls) == 1 and screens == []
+
+
+@pytest.mark.parametrize("failure", ["fresh", "other-session", "blocked", "process", "unpinned"])
+def test_exact_codex_start_timeout_refuses_working_without_resume_proof(
+    failure: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, info, calls, _screens = _suggestion13_timeout_client(monkeypatch)
+    working = replace(info, status="blocked" if failure == "blocked" else "working",
+                      session_agent="codex" if failure == "other-session" else None,
+                      session_value="someone-else" if failure == "other-session" else None)
+    monkeypatch.setattr(client, "pane_info", lambda _pane: working if calls else replace(
+        info, agent=None, session_agent=None, session_value=None))
+    # A working screen is never an idle composer, so only the resume proof could accept it.
+    monkeypatch.setattr(client, "read_screen", lambda _pane: "›\n  esc to interrupt\n  GPT · /work\n")
+    if failure == "process":
+        monkeypatch.setattr(client, "verify_harness_identity", lambda _pane, _expected: False)
+    if failure == "unpinned":
+        monkeypatch.setattr(client, "harness_identity", lambda _pane, _kind: None)
+    arguments = ("--no-alt-screen",) if failure == "fresh" else ("resume", "goal-conversation")
+    with pytest.raises(HerdrUnavailable, match="timed out waiting for agent startup"):
+        client.start_agent("worker", "codex", info.pane_id, arguments, timeout=1)
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("returncode,stdout,stderr", [
     (2, "", _SUGGESTION13_START_TIMEOUT),
     (1, "unexpected output", _SUGGESTION13_START_TIMEOUT),

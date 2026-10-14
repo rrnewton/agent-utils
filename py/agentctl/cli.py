@@ -205,6 +205,13 @@ def parser() -> argparse.ArgumentParser:
     revive.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
 
+    promote = command("promote", "Mark a launch_failed record running when its harness is in fact live: Herdr reports "
+        "the launched harness in the recorded pane, tab, workspace and cwd, the Herdr agent name still points there, and "
+        "the harness is the pane's only foreground process. Pins that process and terminal; never touches the tab, pane, "
+        "or process. Use it when a readiness wait timed out on a harness that runs fine.",
+        "agentctl promote reviewer", named=True)
+    promote.add_argument("--expected-token", metavar="TOKEN", help="require this record generation")
+
     stop = command("stop", "Stop an owned runtime, or unregister an adopted runtime without closing it, and archive state.",
         "agentctl stop reviewer\nagentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256", named=True)
     stop.add_argument("--expected-token", metavar="TOKEN",
@@ -451,6 +458,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 75 if result["blocked"] and not args.dry_run else 0
             result = sessions.revive(name, dry_run=args.dry_run, expected_token=args.expected_token,
                                      startup_timeout=args.startup_timeout)
+        elif args.command == "promote":
+            result = sessions.promote(name, expected_token=args.expected_token)
         elif args.command == "anchor":
             result = sessions.anchor(name, replace=args.replace, session=args.session_id)
         elif args.command == "doctor":

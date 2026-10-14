@@ -324,6 +324,41 @@ fn herdr_093_start_accepts_only_the_exact_codex_timeout_with_independent_ready_p
     start_once(&herdr, "claude", false);
 }
 
+/// A resumed Codex with an active goal starts working at once and is never idle at Herdr's
+/// startup wait: the exact timeout is forgiven only for that resumed conversation.
+#[test]
+fn exact_codex_timeout_accepts_a_resumed_harness_already_working_on_its_goal() {
+    const WORKING_CODEX: &str = "Codex\n• Pursuing goal (3d 10h)\n  esc to interrupt\n";
+    let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_test_process(&executable);
+    let resume = |session: Option<&str>, arguments: &[&str]| {
+        let mut frame = configure_start(&herdr, process.0.id(), &executable, WORKING_CODEX);
+        frame["launched_pane"]["agent_status"] = Value::from("working");
+        frame["launched_pane"]["agent_session"] = match session {
+            Some(value) => serde_json::json!({"agent": "codex", "value": value}),
+            None => Value::Null,
+        };
+        fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+        let arguments = arguments
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        herdr.client().start_agent(
+            "worker",
+            "codex",
+            "pane",
+            &arguments,
+            Duration::from_millis(25),
+        )
+    };
+    assert!(resume(Some("goal"), &["resume", "goal", "--no-alt-screen"]).is_ok());
+    assert!(resume(None, &["resume", "goal"]).is_ok());
+    assert!(resume(Some("other"), &["resume", "goal"]).is_err());
+    assert!(resume(None, &["--no-alt-screen"]).is_err());
+    assert!(resume(None, &["resume", "--last"]).is_err());
+}
+
 #[test]
 fn herdr_093_start_never_forgives_near_timeout_envelopes_or_other_failures() {
     let herdr = FakeExecutable::new("{}");

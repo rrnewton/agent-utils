@@ -506,6 +506,29 @@ candidate record and terminal for inspection. `--dry-run` does not change
 records, locks, tabs, or processes. Batch recovery skips live and non-running
 records, continues past blocked names, and exits 75 if any name remains blocked.
 
+### Promote a launch that timed out but runs
+
+Herdr's startup wait expects an idle prompt. A Codex harness resuming a
+conversation with an active goal starts working at once, so the wait can time
+out on a harness that runs fine. After Herdr's exact startup-timeout error, a
+resumed Codex launch (`resume ID`) is accepted when Herdr reports Codex working
+in the launched pane, any native session Herdr reports is the resumed one, and
+the same pinned harness process stays the pane's only foreground process.
+
+For a record that still ended as `launch_failed` while its harness runs:
+
+```sh
+agentctl promote reviewer --expected-token TOKEN
+```
+
+`promote` requires Herdr to report the launched harness in the recorded pane,
+tab, workspace and cwd, the Herdr agent name to still point there, any native
+session to agree with the record and belong to no other record, and the harness
+to be the pane's only foreground process. It pins that process and terminal and
+marks the record `running`; it never touches the tab, pane, or process. A
+harness busy running a tool has several foreground processes; rerun at a quiet
+moment.
+
 ### Adopt an existing Herdr agent
 
 An agent that is already running in Herdr can join the same named registry
