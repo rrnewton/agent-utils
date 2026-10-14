@@ -327,20 +327,27 @@ steps:
   # or 100px up Main on their row behind the cards and back, and with none at all, one 100px up All on
   # theirs (`#280`); and at 1280x800 a reader 60 to 300px up the list's cards, the card docked under them,
   # on their card again by Ctrl+4 and Ctrl+3, though two columns put them at the foot of their cards, and
-  # one who moved the cards in two columns where they moved to.
+  # one who moved the cards in two columns where they moved to; and at 393x852 and 1280x800 a reader at
+  # the foot of Main or All still there once the box takes back its room a second after Send, the sent
+  # message drawn by a live read in that second and with the browser's scroll anchoring off, and after a
+  # draft opened by More is settled elsewhere and the box takes the focus; and at 393x852 a reader who
+  # sees only a long draft opened by More finding it where it stood through the
+  # thread list and back and across Main and All (`#280`).
   # Measured on 2026-10-13: about 235s wall and 45s CPU on a loaded host, with a draft arriving under the
   # thread list; its wall limit goes from 300s to 420s for that headroom, and its CPU limit stays 200s.
+  # Measured on 2026-10-14: about 330s wall on a loaded host with the box's room and the opened draft
+  # added; its wall limit goes from 420s to 480s, and its CPU limit stays 200s.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800, and the cards' reader kept across two columns and back at 1280x800
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800, the cards' reader kept across two columns and back at 1280x800, the channel's reader kept at its foot as the box takes back its room after Send at 393x852 and 1280x800, and a reader of a draft opened by More kept on it at 393x852
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
-    timeout: 420
+    timeout: 480
     cpu_timeout: 200
     hint:
       resources: {browser: 1}
-      est_duration_s: 230
+      est_duration_s: 300
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

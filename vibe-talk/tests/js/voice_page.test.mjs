@@ -61098,3 +61098,227 @@ test("`#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`: 
   const always = await run(brokenScript("function sameCardPlace(one, other) {\n", "function sameCardPlace(one, other) {\n  return true;\n"));
   assert.deepStrictEqual(always, { ...real, moved: false });
 });
+
+// `#280 scroll-stability` x `#269 approval-card-inline`, from review's fourth round. A second after the send
+// card goes, the main screen gives the box at the foot of the channel's list back the room it gave up for the
+// card (`POST_ROOM_KEEP_MS`): in Chromium the box grows from 90px to 192px. Nothing in the page followed a
+// reader at the list's foot through that; Chromium's own scroll anchoring did, until the list was redrawn in
+// that second — the message the card sent arriving by the live feed, a re-read, the poll — which left them
+// 142px above the foot with the jump up, no longer following the channel. With the browser's anchoring off,
+// it happened every time the card went. And the card going with the focus inside it, a mouse or the keys in
+// use, hands the focus to the box, which opens to its typing height at once: 42px more in Chromium, followed
+// by nothing either. This fixture has no scroll anchoring at all.
+
+/** web/voice.css's box at the foot of the channel's list in Chromium: whole, one line under a draft, and
+ * open for typing under a draft. */
+const CHANNEL_BOX = { whole: 192, draft: 90, typing: 132 };
+
+test("`#280 scroll-stability` x `#269 approval-card-inline`: THE BOX TAKING BACK ITS ROOM a second after the send card goes keeps a reader on the newest line of Main or All on it, and one up the list on their row — the card gone from the channel, from under the thread list with Cmd-1 or Esc pressed within that second, and with the focus on its More, which hands the focus to the box", async () => {
+  const run = async (script) => {
+    const { page, card, main, settled } = await draftOverThreads(script, 60);
+    // The page reads the list's layout as the card leaves it (`placeChipsOverComposer`), and a browser
+    // clamps a list grown shorter than its place to its foot there, before anything else the card's going
+    // does: before the box takes the focus.
+    let hidden = card.hidden;
+    Object.defineProperty(card, "hidden", {
+      configurable: true,
+      get: () => hidden,
+      set: (value) => {
+        hidden = Boolean(value);
+        main.scrollTop = main.scrollTop;
+      },
+    });
+    const roomy = () => page.el("screen-main").hasAttribute("data-draft");
+    const typing = () => focused(page) === page.el("channel-compose-text");
+    page.el("channel-composer").height = () =>
+      (roomy() ? (typing() ? CHANNEL_BOX.typing : CHANNEL_BOX.draft) : CHANNEL_BOX.whole);
+    await settled();
+    const picker = page.el("thread-select");
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    let serial = 40;
+    const result = {};
+    const routes = [
+      ["Main", "1", null, false], ["All", "2", null, false], ["ListOne", "1", "1", false],
+      ["ListEscape", "2", "Escape", false], ["MainMore", "1", null, true], ["AllMore", "2", null, true],
+    ];
+    for (const [route, view, back, more] of routes) {
+      for (const name of ["foot", "up"]) {
+        if (card.hidden) {
+          serial += 1;
+          page.propose(proposal({ serial, handle: `hAnDlE-room-${String(serial).padStart(8, "0")}`, text: LONG_CARD_DRAFT }));
+          await page.settle();
+          await settled();
+        }
+        if (layout() !== null || picker.value !== (view === "1" ? "main" : "flat")) {
+          await press(page, focused(page) || main, view, { metaKey: true });
+          await settled();
+        }
+        assert.ok(layout() === null && card.parentNode === page.el("pane-discord") && roomy(),
+          `the premise: the card is the next message of ${view === "1" ? "Main" : "All"}, the box one line under it`);
+        // `up`: further up than the card is tall, so that the card's going leaves them where they were.
+        const up = name === "foot" ? 0 : card.outerHeight() + 100;
+        main.scrollTop = main.scrollHeight - main.clientHeight - up;
+        await main.dispatch("scroll");
+        await settled();
+        assert.equal(gap(), up, `the premise: the reader is ${up}px up the list (${route})`);
+        const before = rowOnScreen(page);
+        if (back) {
+          await press(page, focused(page) || main, "3", { metaKey: true });
+          await settled();
+          assert.ok(layout() === "list" && card.parentNode === page.el("frame-body"), "the premise: Cmd-3 docks the card");
+        }
+        // The keys in use, the focus left on the card's More.
+        if (more) page.el("post-confirm-more").focus();
+        page.settleProposal("committed");
+        await page.settle();
+        await settled();
+        assert.ok(card.hidden && roomy(), `the premise: the card is gone and its room kept a moment (${route})`);
+        assert.equal(typing(), more, `the premise: the box has the focus exactly where the card took it with it (${route})`);
+        if (back) {
+          await press(page, focused(page) || page.el("side-scroll"), back, back === "Escape" ? {} : { metaKey: true });
+          await settled();
+          assert.ok(layout() === null && roomy(), `the premise: ${back} left the thread list within the second`);
+        }
+        const kept = name === "foot" ? gap() === 0 : rowOnScreen(page) === before;
+        assert.equal(page.expireTimers(1000), 1, "the premise: the room is taken back a second after the card goes");
+        assert.ok(!roomy(), "the premise: the box has its room again");
+        await settled();
+        result[`${name}${route}`] = kept && (name === "foot" ? gap() === 0 && !jumpShown(page) : rowOnScreen(page) === before);
+        if (more) {
+          page.el("channel-compose-text").blur();
+          await settled();
+        }
+      }
+    }
+    return result;
+  };
+  const every = (value) => Object.fromEntries(["foot", "up"].flatMap((name) =>
+    ["Main", "All", "ListOne", "ListEscape", "MainMore", "AllMore"]
+      .map((route) => [`${name}${route}`, typeof value === "function" ? value(name, route) : value])));
+  assert.ok(CHANNEL_BOX.whole - CHANNEL_BOX.typing > BOTTOM_SLACK_PX && CHANNEL_BOX.typing - CHANNEL_BOX.draft > BOTTOM_SLACK_PX,
+    "the premise: the box grows by more than the slack, as it takes the focus and as it takes back its room");
+  assert.deepStrictEqual(await run(SCRIPT), every(true));
+
+  // THE CONTROLS. The room taken back with nothing holding the reader: the box grows under the one at the
+  // foot, who is left its growth above it, past the slack, the jump up. The reader up the list is not moved.
+  const unheld = await run(brokenScript(
+    '      if (postWatch.shown === null) holdingReader(() => main.toggleAttribute("data-draft", false));\n',
+    '      if (postWatch.shown === null) main.toggleAttribute("data-draft", false);\n'));
+  assert.deepStrictEqual(unheld, every((name) => name === "up"));
+  // The focus handed to the box with nothing holding the reader: the one at the foot is left the box's
+  // opening above it, past the slack, and is no longer on the newest line when the room comes back.
+  const unparked = await run(brokenScript(
+    "  holdingReader(() => target.focus({ preventScroll: true }));\n", "  target.focus({ preventScroll: true });\n"));
+  assert.deepStrictEqual(unparked, every((name, route) => name === "up" || !route.endsWith("More")));
+});
+
+// `#269 approval-card-inline` x `#280 scroll-stability`, from review's fourth round. A long draft opened by
+// More is taller than a phone's list — in Chromium 907px in a list 739px tall — so a reader near its foot
+// sees the card and no row at all. The place a trip through the thread list puts back, and a switch between
+// Main and All keeps, was the rows on screen, and theirs had none: Cmd-3 and Esc brought a reader 40px up the
+// foot, Send on screen, back 995px above it, the card 919px lower and Send off screen, and one 200px up was
+// taken to the foot; Cmd-2 and Cmd-1 took both to the foot.
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHOSE SCREEN SHOWS ONLY THE SEND CARD, a long draft opened by More, finds it where it stood — through the thread list and back by Esc, by the view's own key and by Cmd-4, and across a switch between Main and All", async () => {
+  // Thirty lines of words in the fixture's layout: as More lays a long draft out, taller than the list.
+  const TALL_DRAFT = "The release notes for this week, as agreed, with every target named. ".repeat(18);
+  const run = async (script) => {
+    const { page, card, main, settled } = await draftOverThreads(script, 60);
+    page.wideDesk = true;
+    page.propose(proposal({ serial: 60, handle: "hAnDlE-tall-0000000060", text: TALL_DRAFT }));
+    await page.settle();
+    await page.el("post-confirm-more").click();
+    await settled();
+    const picker = page.el("thread-select");
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    const cardTop = () => card.getBoundingClientRect().top - main.getBoundingClientRect().top;
+    const sendShown = () => {
+      const box = page.el("post-confirm-send").getBoundingClientRect();
+      return box.height > 0 && box.top >= 0 && box.bottom <= main.clientHeight;
+    };
+    assert.ok(!card.hasAttribute("data-folded") && card.outerHeight() > main.clientHeight + 100,
+      "the premise: the draft is opened, and the card is taller than the list");
+    const result = {};
+    const routes = [
+      ["MainEscape", "1", ["3", "Escape"]], ["MainOne", "1", ["3", "1"]], ["MainTwo", "1", ["3", "4"]],
+      ["AllEscape", "2", ["3", "Escape"]], ["AllTwo", "2", ["3", "2"]], ["MainToAll", "1", ["2"]], ["AllToMain", "2", ["1"]],
+    ];
+    const toView = async (view) => {
+      if (layout() !== null || picker.value !== (view === "1" ? "main" : "flat")) {
+        await press(page, focused(page) || main, view, { metaKey: true });
+        await settled();
+      }
+    };
+    for (const [route, view, keys] of routes) {
+      for (const up of [40, 150]) {
+        // A switch between Main and All goes to a view this page holds: left at its foot first, so that
+        // where it was left is no help.
+        if (keys.length === 1) {
+          await toView(keys[0]);
+          main.scrollTop = main.scrollHeight;
+          await main.dispatch("scroll");
+          await settled();
+        }
+        await toView(view);
+        assert.ok(layout() === null && card.parentNode === page.el("pane-discord"),
+          `the premise: the card is the next message of ${view === "1" ? "Main" : "All"} (${route})`);
+        main.scrollTop = main.scrollHeight - main.clientHeight - up;
+        await main.dispatch("scroll");
+        await settled();
+        const before = cardTop();
+        assert.ok(gap() === up && rowOnScreen(page) === null && before < 0,
+          `the premise: the reader ${up}px up sees the card and no row (${route}, ${rowOnScreen(page)})`);
+        const sent = sendShown();
+        for (const key of keys) {
+          await press(page, focused(page) || (layout() === "list" ? page.el("side-scroll") : main), key,
+            key === "Escape" ? {} : { metaKey: true });
+          await settled();
+        }
+        assert.ok(layout() === (keys[keys.length - 1] === "4" ? "two" : null) && card.parentNode === page.el("pane-discord"),
+          `the premise: the card is back at the foot of the left column (${route})`);
+        result[`${route}${up}`] = cardTop() === before && sendShown() === sent;
+      }
+    }
+    // A reader who can see a row is placed by the rows, as before, card or no card: All's last row, a
+    // thread's reply, with the card under it, and Main, which lacks that reply and was left at its foot,
+    // put back at its foot by Cmd-1 rather than held on the card.
+    await toView("1");
+    main.scrollTop = main.scrollHeight;
+    await main.dispatch("scroll");
+    await settled();
+    await toView("2");
+    const rows = page.el("discord-log").children.filter((li) => li.getAttribute("data-id"));
+    const reply = rows[rows.length - 1];
+    main.scrollTop = reply.offsetTop() + 1;
+    await main.dispatch("scroll");
+    await settled();
+    const deep = (node) => [node.textContent, ...node.children.map(deep)].join(" ");
+    assert.ok(String(rowOnScreen(page)).startsWith(`${reply.getAttribute("data-id")}@`) &&
+      /thread \d+ answer/.test(deep(reply)) && cardTop() > 0 && cardTop() < main.clientHeight,
+      `the premise: All's last row, a reply, and the card under it on screen (${rowOnScreen(page)})`);
+    await toView("1");
+    result.byRow = picker.value === "main" && gap() === 0;
+    result.untouched = page.proposalCommits.length === 0 && page.proposalCancels.length === 0 && !card.hidden;
+    return result;
+  };
+  const real = await run(SCRIPT);
+  const every = (value) => ({
+    ...Object.fromEntries(["MainEscape", "MainOne", "MainTwo", "AllEscape", "AllTwo", "MainToAll", "AllToMain"]
+      .flatMap((route) => [40, 150].map((up) => [`${route}${up}`, typeof value === "function" ? value(route, up) : value]))),
+    byRow: true,
+    untouched: true,
+  });
+  assert.deepStrictEqual(real, every(true));
+
+  // THE CONTROLS. The card not a place: the reader who sees only the card is put wherever the rows above
+  // it leave them, or at the foot.
+  const unplaced = await run(brokenScript(
+    '  const card = typeof place.card === "number" ? channelCard() : null;\n', "  const card = null;\n"));
+  assert.deepStrictEqual(unplaced, every(false));
+  // The card a place whatever else is on screen: the reader who could see All's reply is held on the card.
+  const always = await run(brokenScript(
+    "  const card = seen.length === 0 ? channelCard() : null;\n", "  const card = channelCard();\n"));
+  assert.deepStrictEqual(always, { ...real, byRow: false });
+});
