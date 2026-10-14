@@ -60511,3 +60511,222 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving un
   const control = await run(cardFollowsFootOnly());
   assert.deepStrictEqual(control, { ...real, kept: false, offered: control.offered });
 });
+
+// `#269 approval-card-inline` x `#281 view-keys`. The thread list (Ctrl+3, Cmd+3 on a Mac) is the right
+// column's cards across the window, with no box of its own, over the left column laid out behind it. A
+// card left at the foot of the left column's list would wait there unseen, so the list docks it under
+// its cards, as the Threads screen it replaced did; and the view keys, pressed from anywhere, a card's
+// own buttons included, must move the card and do nothing else to it.
+
+const LONG_CARD_DRAFT = "The release notes for this week, as agreed: the runner fix landed and the nightly is green. ".repeat(4);
+
+/**
+ * A draft from the voice agent on the card, and the channel of `manyThreads(16)` in Main, one column, at
+ * its newest message, the card at its foot. The fixture lays nothing out, so the page is given what the
+ * browser gives it: while the card is docked on the main screen it takes its `offsetHeight`, `docked` px
+ * to begin with, from the foot of both columns' lists. `settled()` reports the sizes, as a browser does
+ * after a layout, and runs what was waiting.
+ */
+async function draftOverThreads(script, docked, { proposed = true } = {}) {
+  const data = manyThreads(16);
+  const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  const pending = proposal({ text: LONG_CARD_DRAFT });
+  if (proposed) {
+    await proposedDuringACall(page, pending);
+  } else {
+    await startTalking(page);
+    await page.settle();
+  }
+  await showDiscord(page, data.messages);
+  const card = page.el("post-confirm");
+  const main = page.el("scroll-area");
+  const side = page.el("side-scroll");
+  const isDocked = () => !card.hidden && card.parentNode === page.el("frame-body");
+  card.offsetHeight = docked;
+  for (const area of [main, side]) {
+    let base = area.clientHeight;
+    Object.defineProperty(area, "clientHeight", {
+      configurable: true,
+      get: () => base - (isDocked() ? card.offsetHeight : 0),
+      set: (value) => {
+        base = Number(value) || 0;
+      },
+    });
+  }
+  const settled = async () => {
+    for (const box of [main, side]) page.resized(box);
+    page.expireTimers(0);
+    await page.settle();
+  };
+  await press(page, main, "1", { metaKey: true });
+  await settled();
+  main.scrollTop = main.scrollHeight;
+  await main.dispatch("scroll");
+  await settled();
+  return { page, pending, card, main, side, isDocked, settled };
+}
+
+test("`#269 approval-card-inline` x `#281 view-keys`: CMD-3 AND CMD-4 WHILE A SEND CARD IS UP send nothing, withdraw nothing and hide nothing — the thread list docks the card under its cards, which open at their foot above it, and Main takes it back at its foot, a reader on its newest line following it down", async () => {
+  const DOCKED = 60;
+  const run = async (script) => {
+    const { page, pending, card, main, isDocked, settled } = await draftOverThreads(script, DOCKED);
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const untouched = () => page.proposalCommits.length === 0 && page.proposalCancels.length === 0 &&
+      !card.hidden && page.el("post-confirm-text").textContent === pending.text && page.screen() === "main";
+    assert.equal(card.parentNode, page.el("pane-discord"), "the premise: the card is the next message of Main");
+    assert.ok(atBottomOf(main), "the premise: the reader is on Main's newest line");
+    assert.ok(main.scrollHeight > main.clientHeight + 200, "the premise: Main runs past the screen");
+    assert.ok(card.outerHeight() - DOCKED > BOTTOM_SLACK_PX + 10,
+      "the premise: the card in the list is taller than docked, as a long draft is in Chromium");
+
+    // Cmd-3 with the keys on the card's own Send: the thread list, the card docked under its cards.
+    const three = await press(page, page.el("post-confirm-send"), "3", { metaKey: true });
+    const listUp = layout() === "list" && three.defaulted === false;
+    const docked = isDocked() && card.getAttribute("data-place") === "dock" &&
+      card.getAttribute("data-screen") === "main" && !nodeWithinFixture(main, card);
+    const listFoot = sideAtFoot(page);
+    const noJump = page.el("jump-newest-label").textContent !== "Draft to send";
+    await settled();
+    const listFootAfter = sideAtFoot(page);
+    const untouchedInList = untouched();
+
+    // Cmd-4 on Don't send, in a window too narrow for two columns: the list stays, and the card with it.
+    page.wideDesk = false;
+    await press(page, page.el("post-confirm-cancel"), "4", { metaKey: true });
+    const narrowKept = layout() === "list" && isDocked() && /wider window/.test(page.el("status").textContent) &&
+      untouched();
+
+    // Cmd-4 at a desk: two columns, the card back at the foot of Main, followed down to by its reader.
+    page.wideDesk = true;
+    await press(page, page.el("post-confirm-cancel"), "4", { metaKey: true });
+    const two = inTwoColumns(page);
+    const backInMain = card.parentNode === page.el("pane-discord") &&
+      card.nextSibling === page.el("channel-composer") && !card.hidden;
+    const mainFollowed = atBottomOf(main);
+    await settled();
+    const twoHeld = sideAtFoot(page) && atBottomOf(main) && untouched();
+
+    // Cmd-3 from two columns: the cards stay at their foot, above the card docked again.
+    await press(page, focused(page) || main, "3", { metaKey: true });
+    const againDocked = layout() === "list" && isDocked() && sideAtFoot(page);
+    await settled();
+    // Cmd-1: Main in one column, its reader on its newest line following the card down to it.
+    await press(page, focused(page) || main, "1", { metaKey: true });
+    const oneFollowed = layout() === null && card.parentNode === page.el("pane-discord") && atBottomOf(main);
+    await settled();
+    return {
+      listUp, docked, listFoot, noJump, listFootAfter, untouchedInList, narrowKept, two, backInMain,
+      mainFollowed, twoHeld, againDocked, oneFollowed, untouched: untouched(),
+    };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, {
+    listUp: true, docked: true, listFoot: true, noJump: true, listFootAfter: true, untouchedInList: true,
+    narrowKept: true, two: true, backInMain: true, mainFollowed: true, twoHeld: true, againDocked: true,
+    oneFollowed: true, untouched: true,
+  });
+
+  // THE CONTROLS. The card placed as before the thread list: it stays at the foot of Main, behind the
+  // cards, where nobody can see it.
+  const behind = await run(brokenScript(
+    "  if (currentScreen === \"main\" && !threadListOnScreen()) {",
+    "  if (currentScreen === \"main\") {"));
+  assert.equal(behind.docked, false, "the control docked the card too, so this test cannot see it left behind");
+  // Docked only once the cards have been opened: they open at the foot the card then covers. (The
+  // dock-growth keeper takes them the rest of the way once the browser reports the sizes.)
+  const late = SCRIPT.replace(
+    "  placePostCard();\n  leftColumnToMain();\n  if (from === \"two\"",
+    "  leftColumnToMain();\n  if (from === \"two\"").replace(
+    "  renderSearchInAll();\n  refreshSearchCount();\n}\n\n/**\n * Out of the thread list",
+    "  renderSearchInAll();\n  refreshSearchCount();\n  placePostCard();\n}\n\n/**\n * Out of the thread list");
+  assert.notEqual(late, SCRIPT, "the late-docking control changed nothing");
+  const dockedLate = await run(late);
+  assert.deepStrictEqual({ listFoot: dockedLate.listFoot, againDocked: dockedLate.againDocked },
+    { listFoot: false, againDocked: true }, "docked after the cards were opened, the thread list still opened at its foot");
+  // Main told nothing as the card comes back to its foot: its reader is left above the card.
+  const unfollowed = await run(brokenScript(
+    "  if (carded && `${channelView}|${selectedThreadId}` === shown) {",
+    "  if (false) {"));
+  assert.deepStrictEqual({ mainFollowed: unfollowed.mainFollowed, oneFollowed: unfollowed.oneFollowed },
+    { mainFollowed: false, oneFollowed: false }, "the control followed the card down too");
+});
+
+test("`#269 approval-card-inline` x `#281 view-keys`: a draft arriving under the thread list docks there and moves the cards no more than the dock growing does — a reader at their foot stays on it, at once and as the card grows, one up them on their card — Main behind it is kept on its newest line, and Send there leaves the keys on the cards", async () => {
+  const DOCKED = 60;
+  const GROWTH = 80;
+  const run = async (script) => {
+    const { page, card, main, side, isDocked, settled } = await draftOverThreads(script, DOCKED, { proposed: false });
+    await press(page, main, "3", { metaKey: true });
+    await settled();
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Cmd-3 did not show the thread list");
+    assert.ok(sideAtFoot(page), "the premise: the thread list opened at its foot");
+    assert.ok(atBottomOf(main), "the premise: Main behind the list is at its newest");
+    assert.ok(side.scrollHeight > side.clientHeight + 200, "the premise: the cards run past the column's foot");
+
+    // At the foot of the cards: the draft docks under them, and the reader is at their foot at once, in
+    // the same task, before the browser reports a size; Main behind them on its newest line too.
+    page.propose(proposal({ text: LONG_CARD_DRAFT }));
+    await page.settle();
+    const docked = isDocked();
+    const footAtOnce = sideAtFoot(page) && atBottomOf(main);
+    await settled();
+    const footKept = sideAtFoot(page) && atBottomOf(main);
+    const offered = page.el("jump-newest-label").textContent !== "Draft to send";
+    // The card growing with nothing redrawn, as the dock does: both feet kept once the size is reported.
+    card.offsetHeight = DOCKED + GROWTH;
+    await settled();
+    const grewFoot = sideAtFoot(page) && atBottomOf(main);
+    card.offsetHeight = DOCKED;
+    await settled();
+    // Cmd-1: the card at the foot of Main, the reader on its newest line still.
+    await press(page, focused(page) || side, "1", { metaKey: true });
+    const mainKept = card.parentNode === page.el("pane-discord") && atBottomOf(main);
+    await settled();
+    await press(page, focused(page) || main, "3", { metaKey: true });
+    await settled();
+
+    // Up the cards: the draft taken down and another arriving leave the reader on the very card.
+    page.expireTimers(2000);
+    page.settleProposal("withdrawn");
+    await page.settle();
+    await settled();
+    side.scrollTop = 100;
+    await side.dispatch("scroll");
+    page.propose(proposal({ serial: 8, handle: "hAnDlE-second-draft-0001", text: LONG_CARD_DRAFT }));
+    await page.settle();
+    await settled();
+    const upHeld = isDocked() && side.scrollTop === 100;
+
+    // Send under the thread list: posted once, and the keys go to the cards, not behind them.
+    page.expireTimers(2000);
+    page.el("post-confirm-send").focus();
+    await page.el("post-confirm-send").click();
+    await page.settle();
+    const sent = page.proposalCommits.length === 1 && card.hidden;
+    const keysOnCards = nodeWithinFixture(side, focused(page));
+    return { docked, footAtOnce, footKept, offered, grewFoot, mainKept, upHeld, sent, keysOnCards };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, {
+    docked: true, footAtOnce: true, footKept: true, offered: true, grewFoot: true, mainKept: true, upHeld: true,
+    sent: true, keysOnCards: true,
+  });
+
+  // THE CONTROLS. The cards not kept as the card comes: off their foot until the browser reports the size.
+  const late = await run(brokenScript("  if (cardsFoot) keepCardsAtFoot();\n", ""));
+  assert.deepStrictEqual(late, { ...real, footAtOnce: false });
+  // The keepers told of the dock alone: the card growing leaves both readers above their foot.
+  assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: the growth is more than the slack");
+  const dockOnly = await run(brokenScript(
+    "  return (el(\"dock\").offsetHeight || 0) + (docked ? card.offsetHeight || 0 : 0);",
+    "  return el(\"dock\").offsetHeight || 0;"));
+  assert.deepStrictEqual(dockOnly, { ...real, grewFoot: false });
+  // The keys given to the box of the list behind the thread list, as on the channel.
+  const behind = await run(brokenScript(
+    "  if (threadListOnScreen()) {\n    focusList(sidePane);\n    return;\n  }\n", ""));
+  assert.deepStrictEqual(behind, { ...real, keysOnCards: false });
+});

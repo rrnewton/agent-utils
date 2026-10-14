@@ -278,10 +278,12 @@ function placeChipsOverComposer() {
   let top = 0;
   // `#269 approval-card-inline`. A draft waiting above the channel's box is part of what they stand
   // on: they float over the messages above it, never over its Send. Docked under another screen, the
-  // pill stands on the card in the same way.
+  // pill stands on the card in the same way, and under the thread list too (`#281 view-keys`), where
+  // the channel's box is behind the list and out of sight.
   const card = leftEl("post-confirm");
   const carded = !card.hidden && card.parentNode === leftEl("pane-discord");
-  if (currentScreen === "main" && currentView === "discord") {
+  const docked = !card.hidden && card.getAttribute("data-place") === "dock";
+  if (currentScreen === "main" && currentView === "discord" && !docked) {
     const area = leftEl("scroll-area");
     const box = leftEl("channel-composer");
     const below = area.scrollHeight - area.scrollTop - (area.clientHeight || 0);
@@ -300,7 +302,7 @@ function placeChipsOverComposer() {
     if (!reply.hidden) {
       top = Math.max(top, Math.round(leftEl("screen-main").getBoundingClientRect().bottom - reply.getBoundingClientRect().top));
     }
-  } else if (currentScreen !== "main" && !card.hidden && card.getAttribute("data-place") === "dock") {
+  } else if (docked) {
     top = Math.max(0, Math.round(leftEl("frame-body").getBoundingClientRect().bottom - card.getBoundingClientRect().top));
   }
   if (top === composerTop) return;
@@ -10396,6 +10398,7 @@ function showPostProposal(proposal) {
   // the answer: a reader at the newest line follows the card down, one scrolled up is not moved.
   // `#269 approval-card-inline`.
   const pinned = followsCard();
+  const cardsFoot = cardsAtFootUnderCard();
   const card = leftEl("post-confirm");
   const hadFocus = nodeWithin(card, document.activeElement);
   postWatch.shown = proposal;
@@ -10459,9 +10462,31 @@ function showPostProposal(proposal) {
   renderPostExpiry();
   placePostCard();
   // Only over the list on screen: a draft that arrives while the owner is in Settings waits docked
-  // there, and must not move the list he left.
+  // there, and must not move the list he left. Under the thread list that is the left column's, laid
+  // out behind the cards, and a reader left on its newest line is kept on it as the docked card takes
+  // its height, so that Ctrl+1 finds them there with the card (`leaveThreadList`).
   if (fresh && currentScreen === "main") followIfPinned(pinned, 0, currentView);
+  // ...and the cards over it, whose foot the card takes as it comes, and as its words change or open.
+  if (cardsFoot) keepCardsAtFoot();
   renderJumpNewest();
+}
+
+/**
+ * Whether the thread list is up with its reader at the foot of its cards, asked BEFORE the card docked
+ * under them comes or changes size: as the dock growing under them does (`#281 view-keys` x `#280
+ * scroll-stability`), it keeps a reader at the foot there and leaves one up the cards on their card.
+ * Kept at once, in the same task, so that nothing waits for the browser to report the sizes; the
+ * dock-growth keeper (`heightUnderLists`) covers the card growing with nothing redrawn.
+ */
+function cardsAtFootUnderCard() {
+  return threadListOnScreen() && columns.side.mode === "list" && !cardsOpening && atBottom(leftEl("side-scroll"));
+}
+
+/** Take the cards to their foot again, above the card docked under them. */
+function keepCardsAtFoot() {
+  if (!threadListOnScreen()) return;
+  const area = leftEl("side-scroll");
+  area.scrollTop = area.scrollHeight;
 }
 
 /**
@@ -10475,7 +10500,9 @@ function showPostProposal(proposal) {
  * let go and the list moved to the foot; nor one a thread's landing has just put on its first unread
  * (`#221`), which a short thread leaves within the slack of its foot on purpose, and which the card
  * would scroll up under the floating line — "something updating underneath". They are told a draft
- * waits below instead. On the call's view, the transcript's own rule (`followIfPinned`).
+ * waits below instead. On the call's view, the transcript's own rule (`followIfPinned`). Under the
+ * thread list (`#281 view-keys`), the channel's, laid out behind the cards: the docked card takes its
+ * height from the foot of that list too, and Ctrl+1 brings it back.
  */
 function followsCard() {
   if (currentScreen !== "main") return false;
@@ -10534,11 +10561,19 @@ function postCardWhere(proposal) {
  *
  * The card is the tentative next message: on the main screen it is the last thing in the list on
  * screen, just above that list's message box — under the call's transcript, or under the channel's
- * messages — and on Reply, Threads, Settings and Help it is docked at the foot of the screen, so a
- * draft never waits somewhere the owner is not. ONE element moved between those places, so every
- * id, every listener and the hold stay with it. Nothing on the sign-in screen: no call can be open.
+ * messages — and on Reply, Settings and Help it is docked at the foot of the screen, so a draft never
+ * waits somewhere the owner is not. ONE element moved between those places, so every id, every
+ * listener and the hold stay with it. Nothing on the sign-in screen: no call can be open.
  * `data-draft` on the main screen is what lets the stylesheet make room for it there: the message
  * box shrinks to one line under it.
+ *
+ * `#281 view-keys`. The thread list docks it too, as the Threads screen the list replaced did. The
+ * list is the right column's cards across the window, and it has no message box: the channel's, and
+ * the channel's messages the card would end, are the left column, laid out behind the list and out of
+ * sight, where a card would wait unseen. So it stands under the cards, just above the control bar, and
+ * goes back to the foot of the left column's list as Ctrl+1, Ctrl+2 or Ctrl+4 brings that column back
+ * (`leaveThreadList`). `data-screen` is "main" there, which tells the stylesheet that the control pane
+ * under it carries the bottom inset.
  */
 function placePostCard() {
   const card = leftEl("post-confirm");
@@ -10546,7 +10581,7 @@ function placePostCard() {
   let parent = null;
   let before = null;
   let place = "none";
-  if (currentScreen === "main") {
+  if (currentScreen === "main" && !threadListOnScreen()) {
     const channel = currentView === "discord";
     parent = leftEl(channel ? "pane-discord" : "pane-voice");
     before = leftEl(channel ? "channel-composer" : "voice-composer");
@@ -10625,6 +10660,12 @@ function parkFocusOffCard() {
     focusList(null);
     return;
   }
+  // The thread list has no box, and the left column's is behind it, out of sight: the cards take the
+  // keys, as from every other place the list is left by (`#281 view-keys`).
+  if (threadListOnScreen()) {
+    focusList(sidePane);
+    return;
+  }
   const target = drawnBy()
     ? leftEl(currentView === "discord" ? "channel-compose-text" : "compose-text")
     : leftEl("scroll-area");
@@ -10635,7 +10676,8 @@ function parkFocusOffCard() {
 function draftBelowView() {
   if (currentScreen !== "main" || postWatch.shown === null) return false;
   const card = leftEl("post-confirm");
-  if (card.hidden) return false;
+  // Docked under the thread list, it is on screen whatever the list behind shows (`#281 view-keys`).
+  if (card.hidden || card.getAttribute("data-place") === "dock") return false;
   const area = leftEl("scroll-area");
   return card.getBoundingClientRect().top >= area.getBoundingClientRect().top + (area.clientHeight || 0);
 }
@@ -34100,6 +34142,10 @@ function showOneColumnLeft() {
  */
 function enterThreadList(from = "one") {
   threadListShown = true;
+  // `#269 approval-card-inline`. A send card waiting at the foot of the left column, behind the list
+  // now, is docked under the cards (`placePostCard`) BEFORE they are opened or put back, so that the
+  // foot they are placed at is the one above it.
+  placePostCard();
   leftColumnToMain();
   if (from === "two" && columns.side.mode === "list") {
     // The same cards, where the reader was in them.
@@ -34118,8 +34164,20 @@ function enterThreadList(from = "one") {
  * @param {"one" | "list" | "two"} next
  */
 function leaveThreadList(next = "one") {
+  // `#269 approval-card-inline`. A send card docked under the cards goes back to the foot of the left
+  // column's list, its next message, BEFORE that column's view is decided, so that a view drawn afresh
+  // (All, a thread) is placed with it in. Main kept behind the list, which nothing redraws, is told as a
+  // message arriving tells it (`#280 scroll-stability`): a reader on its newest line follows the card
+  // down, and anyone else stays on their row and is offered the jump to it.
+  const carded = postWatch.shown !== null;
+  const follows = carded && liveFollowers().main;
+  const shown = `${channelView}|${selectedThreadId}`;
   threadListShown = false;
+  placePostCard();
   if (next === "one") showOneColumnLeft();
+  if (carded && `${channelView}|${selectedThreadId}` === shown) {
+    inColumn(columns.main, () => followIfPinned(follows, 0, "discord"));
+  }
   renderSearchInAll();
   refreshSearchCount();
 }
@@ -39390,7 +39448,9 @@ el("dismiss-status").addEventListener("click", dismissStatus);
 el("post-confirm-send").addEventListener("click", sendPostProposal);
 el("post-confirm-cancel").addEventListener("click", cancelPostProposal);
 // `#269 approval-card-inline`. More opens a long draft in place, and Less folds it again. Measured
-// before, so a reader at the newest line still sees the buttons after the card grows upward.
+// before, so a reader at the newest line still sees the buttons after the card grows upward. Docked
+// under the thread list (`#281 view-keys`), the same for the left column's list behind the cards, and
+// `showPostProposal` keeps a reader at the foot of the cards on it.
 el("post-confirm-more").addEventListener("click", () => {
   if (!postWatch.shown) return;
   const pinned = atBottom(leftEl("scroll-area"));
@@ -39907,6 +39967,16 @@ if (typeof window.ResizeObserver === "function") {
   });
   for (const box of [leftEl("side-scroll"), ...leftEl("side-scroll").children]) sideGeometry.observe(box);
 }
+/**
+ * How much stands under the main screen's lists, for the dock-growth keepers below: the dock, and the
+ * send card while it is docked under the thread list (`#269 approval-card-inline` x `#281 view-keys`).
+ * Off the main screen the card is docked too, but there the lists are not drawn and nothing is kept.
+ */
+function heightUnderLists() {
+  const card = leftEl("post-confirm");
+  const docked = currentScreen === "main" && !card.hidden && card.getAttribute("data-place") === "dock";
+  return (el("dock").offsetHeight || 0) + (docked ? card.offsetHeight || 0 : 0);
+}
 // `#218 desktop-dock`. On a desk the dock is one row of controls or two, and which depends on what
 // is in it — a call going live, a long channel name, a label changing length. When it grows it takes
 // that height from the bottom of #scroll-area, and a reader on the newest line is left that far above
@@ -39925,11 +39995,16 @@ if (typeof window.ResizeObserver === "function") {
 // and the dock growing then (the pane returning) is not a reader losing their place. A window that
 // shrinks is not the dock growing either, and it leaves the reader where they are, as `#207`
 // decided. What is kept between reports is the list's height and the dock's.
+//
+// `#269 approval-card-inline` x `#281 view-keys`. The send card docked under the thread list counts
+// as the dock (`heightUnderLists`): it takes its height from the foot of the cards, and of the left
+// column's list behind them, exactly as a second row of the dock does, so a reader at either foot is
+// kept on it as the card comes, and as it grows, and More opens it.
 if (typeof window.ResizeObserver === "function") {
   let seen = null;
   new window.ResizeObserver(() => {
     const area = el("scroll-area");
-    const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
+    const now = { list: area.clientHeight, dock: heightUnderLists() };
     const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
     const shrank = seen !== null && seen.list > 0 && now.list < seen.list;
     seen = now;
@@ -39964,7 +40039,7 @@ if (typeof window.ResizeObserver === "function") {
   let seenSide = null;
   new window.ResizeObserver(() => {
     const area = leftEl("side-scroll");
-    const now = { list: area.clientHeight, dock: el("dock").offsetHeight };
+    const now = { list: area.clientHeight, dock: heightUnderLists() };
     const grew = seenSide !== null && seenSide.list > 0 && currentScreen === "main" ? now.dock - seenSide.dock : 0;
     seenSide = now;
     if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {

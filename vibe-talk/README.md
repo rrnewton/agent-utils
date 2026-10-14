@@ -6893,7 +6893,7 @@ it outside anything a model can call:
 The card is the tentative next message (`#269 approval-card-inline`): the owner's own outgoing tile
 at the foot of the list he is looking at — under the call's transcript or the channel's messages,
 above that list's box, which shrinks to one line under it — and docked at the foot of Reply,
-Threads, Settings and Help. It moves the list no more than a message arriving does (`#280
+the thread list, Settings and Help. It moves the list no more than a message arriving does (`#280
 scroll-stability`): a reader on the newest line follows it down, and anyone else — up the list, on a
 message a filter change holds, or where entering a thread landed them — stays where they are and is
 offered the jump to it. In two columns, where Reply is a box at the foot of a column rather than
@@ -6905,6 +6905,18 @@ proposal replaces the text, both its buttons are held for two seconds and a repl
 text changed, so a tap already on its way lands on neither the new words nor Don't send. Don't send
 is never held while a spoken yes to the card is settling, though: then the card says "Heard yes —
 tap Don't send to stop", and that tap stops the send, however recently the card appeared.
+
+**The thread list docks it** (`#281 view-keys`), as the Threads screen the list replaced did: the
+list is cards, with no box of its own to stand on, and the channel's messages and box are behind it,
+out of sight, where the card would wait unseen. So it stands under the cards, as wide as their
+column, just above the control bar, and a reader at the foot of the cards stays at their foot as it
+comes, as when the dock grows under them; a reader up the cards stays on theirs. Ctrl+1 to Ctrl+4
+(Cmd on a Mac) only move it: a view key pressed while a card is up, its buttons included, never
+sends it, withdraws it or hides it. Ctrl+3 docks it under the cards, which open at their foot above
+it; Ctrl+1, Ctrl+2 and, in a window wide enough for two columns, Ctrl+4 put it back at the foot of
+the channel's list, Main followed down to it by a reader left on its newest line, and offering the
+jump to anyone up it; in a narrower one Ctrl+4 leaves the list and the card where they are, saying
+why.
 
 **What happens to a draft when the call ends depends on who ended it.** Hang up retires it: the
 card goes, and the next call on the same page does not offer it again; it lapses on the server. The
