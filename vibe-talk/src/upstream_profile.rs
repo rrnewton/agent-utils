@@ -1189,6 +1189,9 @@ impl ProfiledClient {
         if channels.is_empty() {
             return Vec::new();
         }
+        // Counted under its reason when asked, as every read `timed` runs is (`#287 bulk-reads`).
+        self.profile
+            .record_reason("channel_heads", ReadReason::current());
         let timer = self.profile.start(Series::Operation, "channel_heads");
         let answers = timer.run(self.inner.channel_heads(channels)).await;
         let answered = answers.iter().filter(|(_, head)| head.is_ok()).count();
@@ -1209,6 +1212,9 @@ impl ProfiledClient {
         if asks.is_empty() {
             return Vec::new();
         }
+        // Counted under its reason when asked, as every read `timed` runs is (`#287 bulk-reads`).
+        self.profile
+            .record_reason("fetch_recent_many", ReadReason::current());
         let timer = self.profile.start(Series::Operation, "fetch_recent_many");
         let answers = timer.run(self.inner.fetch_recent_many(asks)).await;
         let reads: Vec<&RecentRead> = answers
@@ -1238,6 +1244,9 @@ impl ProfiledClient {
         if asks.is_empty() {
             return Vec::new();
         }
+        // Counted under its reason when asked, as every read `timed` runs is (`#287 bulk-reads`).
+        self.profile
+            .record_reason("fetch_threads", ReadReason::current());
         let timer = self.profile.start(Series::Operation, "fetch_threads");
         let answers = timer.run(self.inner.fetch_threads(channel, asks)).await;
         let pages: Vec<&crate::threads::TimelinePage> = answers

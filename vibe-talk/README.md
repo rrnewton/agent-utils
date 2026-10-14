@@ -1486,8 +1486,12 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   threads…" when no cursor is known yet) and `side` (the right column's thread or list of threads,
   read beside Main). The server names its own: `naming` (a thread read to name it), `recent` (a
   voice catch-up's window), `probe`, `summary-window`, `speech`, `shadow` (the recent-view check)
-  and `tool` (an MCP tool call). A word the page does not send is `other`; a read nobody gave a
-  reason for (the live poller's, for one) is `untagged`. **Attribution only:** nothing in the
+  and `tool` (an MCP tool call). A bulk read (see
+  [Bulk and time-range reads](#bulk-and-time-range-reads)) carries the reason of the reads it
+  stands in for, native or emulated: a catch-up's head read and its read of several channels are
+  `recent`, the head read checked beside the probe is `probe`, and speech preparation's lookup by
+  id is `speech`. A word the page does not send is `other`; a read nobody gave a reason for (the
+  live poller's, its head read included) is `untagged`. **Attribution only:** nothing in the
   server or the page decides anything by the reason — no read is shared, skipped, kept or made
   fresher because of it.
 * **Outcomes** are `ok`, `transport`, `rate_limited`, `unauthorized` (401), `forbidden` (403),

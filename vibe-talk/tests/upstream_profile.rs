@@ -1476,6 +1476,136 @@ async fn a_native_bulk_read_and_its_emulation_differ_in_operations_and_upstream_
     assert_eq!(rows[1], [("fetch_recent", 3, Some(3))], "emulated");
 }
 
+/// A provider that reads heads, several channels and several threads itself when `native`, each
+/// answered from [`FakeDiscord`] in one operation; otherwise none of them.
+struct Bulk {
+    fake: Arc<FakeDiscord>,
+    native: bool,
+}
+
+#[async_trait]
+impl ChatClient for Bulk {
+    fn provider_name(&self) -> &str {
+        "Bulk"
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.fake.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.fake.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.fake.post_message(channel, content, reply_to).await
+    }
+
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        let support = if self.native {
+            Support::Native
+        } else {
+            Support::Emulated
+        };
+        ReadCaps {
+            heads: support,
+            many_channels: support,
+            many_threads: support,
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn channel_heads(&self, channels: &[ChannelId]) -> HeadAnswers {
+        vibe_talk::chat::emulated_heads(self.fake.as_ref(), channels).await
+    }
+
+    async fn fetch_recent_many(&self, asks: &[(ChannelId, RecentAsk)]) -> RecentAnswers {
+        vibe_talk::chat::emulated_recent_many(self.fake.as_ref(), asks).await
+    }
+
+    async fn fetch_threads(&self, channel: &ChannelId, asks: &[ThreadAsk]) -> ThreadAnswers {
+        vibe_talk::chat::emulated_threads(self.fake.as_ref(), channel, asks).await
+    }
+}
+
+/// `#287 bulk-reads` with `remote-ops-audit`'s read reasons: a native read of heads, of several
+/// channels or of several threads is counted once, under the reason it was asked for, as every
+/// other read is; and its emulation counts each read it is made of under that same reason.
+#[tokio::test]
+async fn a_bulk_read_counts_under_the_reason_it_was_asked_for_native_or_emulated() {
+    use vibe_talk::read_reason::ReadReason;
+
+    let fake = Arc::new(FakeDiscord::new());
+    let channels: Vec<ChannelId> = ["C1", "C2", "C3"]
+        .iter()
+        .map(|id| ChannelId((*id).to_owned()))
+        .collect();
+    for channel in &channels {
+        fake.seed(channel, "ada", "words");
+    }
+    let asks: Vec<(ChannelId, RecentAsk)> = channels
+        .iter()
+        .map(|channel| (channel.clone(), RecentAsk::newest(5)))
+        .collect();
+    let threads = [ThreadAsk::newest("t1", 50), ThreadAsk::newest("t2", 50)];
+    let mut counted = Vec::new();
+    for native in [true, false] {
+        let profile = UpstreamProfile::new();
+        let profiled = ProfiledClient::new(
+            Arc::new(Bulk {
+                fake: Arc::clone(&fake),
+                native,
+            }),
+            profile.provider("bulk", "Bulk"),
+        );
+        ReadReason::Recent
+            .scope(async {
+                profiled.channel_heads(&channels).await;
+                profiled.fetch_recent_many(&asks).await;
+            })
+            .await;
+        ReadReason::Tool
+            .scope(profiled.fetch_threads(&channels[0], &threads))
+            .await;
+        counted.push(
+            profile.report().providers[0]
+                .reasons
+                .iter()
+                .map(|row| (row.name, row.reason, row.count))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        counted[0],
+        [
+            ("channel_heads", ReadReason::Recent, 1),
+            ("fetch_recent_many", ReadReason::Recent, 1),
+            ("fetch_threads", ReadReason::Tool, 1),
+        ],
+        "native"
+    );
+    assert_eq!(
+        counted[1],
+        [
+            ("fetch_recent", ReadReason::Recent, 3),
+            ("fetch_recent_dated", ReadReason::Recent, 3),
+            ("fetch_timeline", ReadReason::Tool, 2),
+        ],
+        "emulated"
+    );
+}
+
 /// Slack's requests are counted against the operation that sent them: a `/count` since an
 /// instant with 150 messages after it is one native `fetch_range` of eight
 /// `conversations.history` calls; a read that met one 429 is one operation of two calls; and

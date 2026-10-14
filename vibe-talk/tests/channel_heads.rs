@@ -26,6 +26,7 @@ use vibe_talk::chat::{
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId};
 use vibe_talk::providers::{ChatRouter, ProviderEntry};
+use vibe_talk::read_reason::ReadReason;
 use vibe_talk::state::AppState;
 use vibe_talk::testing::{CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
 
@@ -513,6 +514,8 @@ struct Headed {
     /// What every head says about its currency; see [`ChannelHead::as_of`].
     as_of: Mutex<Option<String>>,
     asked: Mutex<Vec<Vec<String>>>,
+    /// The read reason each call was made under (`remote-ops-audit`, `#287 bulk-reads`).
+    reasons: Mutex<Vec<ReadReason>>,
 }
 
 impl Headed {
@@ -526,11 +529,16 @@ impl Headed {
             delay: Mutex::new(Duration::ZERO),
             as_of: Mutex::new(None),
             asked: Mutex::new(Vec::new()),
+            reasons: Mutex::new(Vec::new()),
         }
     }
 
     fn asked(&self) -> Vec<Vec<String>> {
         self.asked.lock().expect("log").clone()
+    }
+
+    fn reasons(&self) -> Vec<ReadReason> {
+        self.reasons.lock().expect("log").clone()
     }
 
     /// A bridge's kind of head: native, and vouching for edits and deletes, every channel quiet
@@ -576,6 +584,10 @@ impl ChatClient for Headed {
             .lock()
             .expect("log")
             .push(channels.iter().map(|c| c.0.clone()).collect());
+        self.reasons
+            .lock()
+            .expect("log")
+            .push(ReadReason::current());
         let delay = *self.delay.lock().expect("setting");
         tokio::time::sleep(delay).await;
         let quiet_since = *self.quiet_since.lock().expect("setting");
@@ -1217,7 +1229,7 @@ async fn a_catch_up_reads_every_channel_a_head_cannot_prove_unchanged() {
 /// one call, and the catch-up that follows is answered from what it kept without a read.
 #[tokio::test(start_paused = true)]
 async fn a_warm_up_keeps_what_a_head_proves_unchanged_in_one_head_read() {
-    let (state, router, _fake, _headed, counting, _draft, _stray) =
+    let (state, router, _fake, headed, counting, _draft, _stray) =
         catch_up_server(|fake| Headed::new(fake, true).covering_edits());
     let mut seen = 0;
     catch_up_once(&router, &counting, &mut seen).await;
@@ -1232,6 +1244,14 @@ async fn a_warm_up_keeps_what_a_head_proves_unchanged_in_one_head_read() {
     let (answer, asked) = catch_up_once(&router, &counting, &mut seen).await;
     assert!(asked.is_empty(), "{asked:?}");
     assert!(all_current(&answer), "{answer}");
+    // `remote-ops-audit`: every head read, the catch-up's and the warm-up's, is counted as the
+    // catch-up's, as the window reads it stands in for are (`#287 bulk-reads`).
+    let reasons = headed.reasons();
+    assert!(!reasons.is_empty());
+    assert!(
+        reasons.iter().all(|reason| *reason == ReadReason::Recent),
+        "{reasons:?}"
+    );
 }
 
 /// Heads that do not answer within [`vibe_talk::recent::HEADS_DEADLINE`] are given up on, and the
@@ -1304,6 +1324,11 @@ async fn diagnostics_check_a_native_head_read_beside_the_probe_in_one_call() {
         "the probe still reads every channel"
     );
     assert_eq!(headed.asked().len(), 1);
+    assert_eq!(
+        headed.reasons(),
+        [ReadReason::Probe],
+        "counted as the probe's, as the reads beside it are (`#287 bulk-reads`)"
+    );
 
     counting.fail_next(
         "channel_heads",

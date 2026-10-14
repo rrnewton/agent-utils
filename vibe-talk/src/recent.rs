@@ -1005,7 +1005,13 @@ pub async fn keep_or_refresh(
         .iter()
         .map(|channel| recent.mark(channel))
         .collect();
-    let heads = tokio::time::timeout(HEADS_DEADLINE, state.chat.channel_heads(candidates))
+    // `remote-ops-audit`: counted as the catch-up's, as the reads it stands in for are, whoever's
+    // request asked for the catch-up (`#287 bulk-reads`).
+    let heads = crate::read_reason::ReadReason::Recent
+        .scope(tokio::time::timeout(
+            HEADS_DEADLINE,
+            state.chat.channel_heads(candidates),
+        ))
         .await
         .unwrap_or_else(|_| {
             tracing::warn!(

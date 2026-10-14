@@ -588,7 +588,9 @@ pub async fn check_heads(
             continue;
         }
         let provider = entry.client.provider_name().to_owned();
-        let read = entry.client.channel_heads(&held);
+        // `remote-ops-audit`: counted as the probe's, as the reads beside it are
+        // (`#287 bulk-reads`).
+        let read = crate::read_reason::ReadReason::Probe.scope(entry.client.channel_heads(&held));
         let diagnosis = match budget {
             Some(budget) => match tokio::time::timeout(budget, read).await {
                 Ok(answers) => heads_diagnosis(&provider, &answers),

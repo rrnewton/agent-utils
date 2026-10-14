@@ -27,6 +27,7 @@ use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity, Lookup, ReadCaps, Sup
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::providers::ChatRouter;
+use vibe_talk::read_reason::ReadReason;
 use vibe_talk::state::AppState;
 use vibe_talk::testing::{CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
 use vibe_talk::threads::MessageThread;
@@ -464,6 +465,8 @@ async fn a_provider_without_batch_lookups_gets_todays_answers_at_todays_cost() {
 struct Native {
     plain: Plain,
     unseen: Vec<String>,
+    /// The read reason each lookup was made under (`remote-ops-audit`, `#287 bulk-reads`).
+    reasons: Mutex<Vec<ReadReason>>,
 }
 
 impl Native {
@@ -471,6 +474,7 @@ impl Native {
         Self {
             plain: Plain::new(inner),
             unseen: unseen.iter().map(|id| (*id).to_owned()).collect(),
+            reasons: Mutex::new(Vec::new()),
         }
     }
 }
@@ -498,6 +502,10 @@ impl ChatClient for Native {
         thread: Option<&str>,
         ids: &[MessageId],
     ) -> Result<Vec<Lookup>, ChatError> {
+        self.reasons
+            .lock()
+            .expect("log")
+            .push(ReadReason::current());
         let held = match thread {
             Some(thread) => self.plain.threads.get(thread).cloned().unwrap_or_default(),
             None => {
@@ -596,13 +604,19 @@ async fn preparing_eight_thread_messages_is_one_lookup_where_the_provider_has_on
     let uri = format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare");
 
     let (discord, _) = seeded();
-    let (native, router) = counted(Arc::new(Native::new(discord, &[])));
+    let provider = Arc::new(Native::new(discord, &[]));
+    let (native, router) = counted(Arc::clone(&provider) as Arc<dyn ChatClient>);
     let (status, answer) = call(&router, READ_TOKEN, "POST", &uri, Some(body.clone())).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(prepared_ids(&answer), eight);
     assert_eq!(native.count("fetch_messages"), 1, "{:?}", native.calls());
     assert_eq!(native.count("fetch_thread_message"), 0);
     assert_eq!(native.calls()[0].thread.as_deref(), Some(THREAD));
+    assert_eq!(
+        *provider.reasons.lock().expect("log"),
+        [ReadReason::Speech],
+        "counted as speech preparation's, as the reads of one message are (`#287 bulk-reads`)"
+    );
 
     let (discord, _) = seeded();
     let (plain, router) = counted(Arc::new(Plain::new(discord)));

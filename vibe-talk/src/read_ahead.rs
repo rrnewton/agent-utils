@@ -591,7 +591,17 @@ pub async fn messages_for_speech(
             // simply absent, as one outside the window is.
             let looked = {
                 let _slot = state.read_ahead.lookups.acquire().await;
-                ops::lookup_messages(state, channel, Some(thread), &missing, limit).await?
+                // `remote-ops-audit`: counted as speech preparation's, as the reads of one message
+                // it stands in for are (`#287 bulk-reads`).
+                crate::read_reason::ReadReason::Speech
+                    .scope(ops::lookup_messages(
+                        state,
+                        channel,
+                        Some(thread),
+                        &missing,
+                        limit,
+                    ))
+                    .await?
             };
             found.fetches = looked.reads;
             let fetched: Vec<Message> = looked.messages.into_iter().flatten().collect();
