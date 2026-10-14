@@ -63,14 +63,20 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
  12. The card going to the dock under the thread list and back moves the left column's reader no
      more than the list coming and going does (`#280 scroll-stability`), with a long draft up, which
      stands taller in the list than docked: a reader at All's foot, Cmd+3 and then Esc (the list was
-     chosen from All) or Cmd+2, is at All's foot again with Send on screen; a reader 100, 200 and
-     380px up Main, Cmd+3 and then Cmd+1, Esc and, at the desk, Cmd+4, is on the same row within a
-     pixel, and from 200px up on it behind the cards too.
+     chosen from All) or Cmd+2, is at All's foot again with Send on screen, and a reader 100 or 225px
+     up All on the same row within a pixel; a reader 100, 200 and 380px up Main, Cmd+3 and then
+     Cmd+1, Esc and, at the desk, Cmd+4, is on the same row within a pixel, and from 200px up on it
+     behind the cards too.
+ 13. With no card up as the thread list comes, a long draft arriving under it with a reader 40px up
+     Main, and a short one with a reader 100px up, leaves them on the same row within a pixel behind
+     the cards and back by Cmd+1, which offers the jump, as a draft arriving on the channel does: the
+     box at Main's foot shrinks to one line in the same layout as the card docks. And with no card at
+     all, a reader 100px up All, Cmd+3 and then Esc or Cmd+2, is on the same row within a pixel.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
-9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 and 12 at 393x852; and points
-8, 11 and 12 at 1280x800 with a mouse.
+9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 to 13 at 393x852; and points
+8 and 11 to 13 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1141,6 +1147,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             if size == PHONES[0]:
                 listed = "; " + thread_list_case(page, url, voice, api, size, True, args.screenshots)
                 listed += "; " + thread_list_place_case(page, url, voice, api, size, True)
+                listed += "; " + thread_list_arrival_case(page, url, voice, api, size, True)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -1531,6 +1538,35 @@ def thread_list_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size:
 
 
 PICKED_VIEW_JS = "() => document.getElementById('thread-select').value"
+COLUMNS_ATTR_JS = "() => document.getElementById('screen-main').getAttribute('data-columns')"
+UP_THE_LIST_JS = ("(up) => { const a = document.getElementById('scroll-area');"
+                  " a.scrollTop = a.scrollHeight - a.clientHeight - up; }")
+
+
+def same_row(was: object, now: object) -> bool:
+    """The same first row on screen, within a pixel of where it stood."""
+    return (isinstance(was, dict) and isinstance(now, dict) and now["id"] == was["id"] and
+            abs(rect(now, "offset") - rect(was, "offset")) <= 1)
+
+
+def all_on_row(page: Page, where: str, mod: str, ups: tuple[int, ...]) -> None:
+    """A reader `up` px up All, Cmd+3 and then Esc (the list chosen from All) or Cmd+2: on the same row."""
+    for up in ups:
+        for key in ("Escape", "2"):
+            how = "Esc" if key == "Escape" else f"{mod}+2"
+            if page.evaluate(COLUMNS_ATTR_JS) or page.evaluate(PICKED_VIEW_JS) != "flat":
+                view_key(page, mod, 2, None, None)
+            page.evaluate(UP_THE_LIST_JS, up)
+            page.wait_for_timeout(300)
+            before = still(page)
+            first = before["first"]
+            check(isinstance(first, dict) and rect(before, "gap") > 30,
+                  f"{where}: the premise, a reader {up}px up All: {before}")
+            view_key(page, mod, 3, None, "list")
+            leave_thread_list(page, mod, key)
+            now = still(page)["first"]
+            check(page.evaluate(PICKED_VIEW_JS) == "flat" and same_row(first, now),
+                  f"{where}: {mod}+3 and {how} moved the row a reader {up}px up All was on from {first} to {now}")
 
 
 def leave_thread_list(page: Page, mod: str, key: str) -> None:
@@ -1582,6 +1618,11 @@ def thread_list_place_case(page: Page, url: str, voice: FakeVoice, api: FakeApi,
                   inside(back["send"], float(str(back["innerHeight"])), float(str(back["innerWidth"]))),
                   f"{where}: after {how} the card's Send is off screen")
 
+        # A reader up All: Cmd+3, then Esc or Cmd+2, finds them on the same row. All is Main behind the
+        # list, and Main lacks All's replies, so their place was clamped at Main's foot, and the way back
+        # took Main's reader for one on its newest line and All to its foot.
+        all_on_row(page, where, mod, (100, 225))
+
         # A reader up Main, the card in view or just below it: on their row behind the cards and on it again
         # by Cmd+1, Esc and, at the desk, Cmd+4. Nearer the foot than the card is taller in the list than
         # docked (150px on the phone, 118px at the desk), Main behind the cards is too short to keep them
@@ -1617,12 +1658,70 @@ def thread_list_place_case(page: Page, url: str, voice: FakeVoice, api: FakeApi,
     finally:
         api.threaded = False
         api.older_threads = 0
-    return (f"{where}: a reader at All's foot at it again by Esc and {mod}+2, Send on screen; one 100 to 380px up"
-            f" Main on their row by {', '.join('Esc' if key == 'Escape' else f'{mod}+{key}' for key in keys)}")
+    return (f"{where}: a reader at All's foot at it again by Esc and {mod}+2, Send on screen; one 100 or 225px up"
+            f" All on their row by both; one 100 to 380px up Main on their row by"
+            f" {', '.join('Esc' if key == 'Escape' else f'{mod}+{key}' for key in keys)}")
+
+
+def thread_list_arrival_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                             phone: bool) -> str:
+    """Point 13: with no card up when the thread list comes, a draft arriving under it moves Main's reader no
+    more than one arriving on the channel does, and the way back to All finds a reader up All on their row."""
+    width, height = size
+    where = f"{width}x{height}, a draft arriving under the thread list"
+    mod = "Meta" if phone else "Control"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        view_key(page, mod, 1, None, None)
+
+        # A reader 40 or 100px up Main, Cmd+3, and a draft arrives: on the same row behind the cards, and by
+        # Cmd+1 on it again with the jump offered. The card docks, and the box at Main's foot gives up its
+        # room in the same layout: Main's dock-growth keeper took them for readers at the foot.
+        for serial, up, draft in ((51, 40, LONG_DRAFT), (52, 100, SHORT_DRAFT)):
+            words = "long" if draft is LONG_DRAFT else "short"
+            if page.evaluate(COLUMNS_ATTR_JS):
+                view_key(page, mod, 1, None, None)
+            page.evaluate(UP_THE_LIST_JS, up)
+            page.wait_for_timeout(300)
+            before = still(page)
+            first = before["first"]
+            check(isinstance(first, dict) and rect(before, "gap") > 30,
+                  f"{where}: the premise, a reader {up}px up Main: {before}")
+            view_key(page, mod, 3, None, "list")
+            propose(page, api, serial, draft)
+            page.wait_for_timeout(500)
+            check(thread_list_measure(page)["place"] == "dock", f"{where}: the {words} draft did not dock under the cards")
+            behind = still(page)["first"]
+            check(same_row(first, behind),
+                  f"{where}: a {words} draft arriving moved the row a reader {up}px up Main was on from {first} to"
+                  f" {behind}, behind the cards")
+            view_key(page, mod, 1, None, None)
+            back = still(page)
+            check(same_row(first, back["first"]) and back["jump"] is not None,
+                  f"{where}: a {words} draft arriving and {mod}+1 moved the row a reader {up}px up Main was on from"
+                  f" {first} to {back['first']}, or offered no jump ({back['jump']!r})")
+            api.settle()
+            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            page.wait_for_timeout(1300)
+
+        # No card at all: a reader up All, Cmd+3, then Esc or Cmd+2, on the same row.
+        all_on_row(page, where, mod, (100,))
+        check(not api.commits and not api.cancels, f"{where}: a view key posted or withdrew a draft")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader 40 or 100px up Main on their row behind the cards and back by {mod}+1, offered the"
+            f" jump; with no card, one 100px up All on their row by Esc and {mod}+2")
 
 
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Points 8 and 11 on a desk with a mouse, where two columns are offered."""
+    """Points 8 and 11 to 13 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -1638,6 +1737,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             line = columns_case(page, url, voice, api, args.screenshots)
             line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
             line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
+            line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
