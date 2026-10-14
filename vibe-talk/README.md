@@ -3696,7 +3696,8 @@ channel's other messages, and a page of the newest two says nothing about the me
 The same holds for a change the server could not keep up with (its queue to the file was full) and
 for one whose write to the file failed (a full disk, an I/O error, another program holding the
 file): either marks the channel suspect at once, and the file records it as soon as it takes
-writes again.
+writes again, at the latest as the server stops. A record the file still cannot take then is lost
+with the process.
 
 ### Whose reads fill it
 

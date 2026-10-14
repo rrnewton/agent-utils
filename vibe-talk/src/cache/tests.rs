@@ -1646,6 +1646,55 @@ fn a_write_that_fails_is_a_drop_and_the_file_records_it_once_it_takes_writes() {
     );
 }
 
+/// A drop whose record the file could not take is owed, and retried after a backoff of a second
+/// or more. A process that stops before then (its cache handle dropped, as at a normal shutdown)
+/// still writes it, in the writer's last turn, once the file takes writes: the next start doubts
+/// the channel.
+#[test]
+fn a_drop_record_still_owed_is_written_as_the_writer_stops() {
+    let dir = crate::testing::TempDir::new("cache-drop-at-stop");
+    let clock = Arc::new(ManualClock(AtomicI64::new(T0 + 7 * STEP)));
+    let marked = ChanKey::new("p", "C2");
+    let open = || {
+        let cache = fixtures::open(&dir, &clock, Limits::default());
+        cache.retain_only(RouteSnapshot::new([marked.clone()], ["p".to_owned()]));
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        cache
+    };
+    {
+        let cache = open();
+        let stamp = cache.stamp(&marked);
+        cache.offer(
+            marked.clone(),
+            stamp,
+            Observation::Listing(Listing {
+                scope: Scope::Main,
+                rows: (1..=3).map(|i| Incoming::new(m(i), Scope::Main)).collect(),
+                observed_ms: T0 + 7 * STEP,
+                proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+            }),
+        );
+        assert!(cache.quiesce_blocking(Duration::from_secs(30)));
+        let (release, locker) = hold_write_lock(&cache);
+        clock.set(T0 + 7 * STEP + 10);
+        // The drop's own record fails, and so does the step that writes it again; only then is
+        // the file let go, and the step's next turn is a backoff away.
+        let steps = cache.stats().steps;
+        cache.mark_suspect(&marked);
+        wait_for("the owed drop record was tried again, and failed", || {
+            cache.stats().steps > steps
+        });
+        release.send(()).expect("release");
+        locker.join().expect("locker");
+        // Stopped at once, well inside the backoff: no retry has run.
+    }
+    let cache = open();
+    assert!(
+        cache.is_suspect(&marked),
+        "the drop owed when the writer stopped was never written"
+    );
+}
+
 #[test]
 fn a_barrier_with_nothing_to_wait_for_leaves_the_flush_flag_down() {
     let fx = Fixture::new("cache-flush-flag");

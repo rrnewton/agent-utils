@@ -9,8 +9,9 @@
 //!   observation would leave a segment per message. When an observation fails, the batch is
 //!   rolled back and its observations are applied again one transaction each, so only the
 //!   failing one is lost; and that one is recorded as a drop of its channel, in memory at once and
-//!   in the file as soon as it takes writes, since what it carried (an edit, a deletion) is left
-//!   out exactly as a dropped offer's is.
+//!   in the file as soon as it takes writes (at the latest in the writer's last turn, when it is
+//!   closed or its cache handle dropped), since what it carried (an edit, a deletion) is left out
+//!   exactly as a dropped offer's is.
 //! - **Control operations** (an erase, a sweep, maintenance) run alone, after the batch before
 //!   them has committed and been published, and are published themselves as soon as their own
 //!   short transaction commits. An erase detaches the channel's rows from its name (no read can
@@ -690,7 +691,10 @@ impl Writer<'_> {
                     self.step();
                     continue;
                 }
-                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.last_drops();
+                    return None;
+                }
                 Err(TryRecvError::Empty) => {}
             }
             if self.step() {
@@ -704,7 +708,10 @@ impl Writer<'_> {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.last_drops();
+                    return None;
+                }
             }
         }
     }
@@ -853,12 +860,7 @@ impl Writer<'_> {
     fn control(&mut self, envelope: Envelope) -> Option<mpsc::Sender<()>> {
         let Envelope { seq, op, .. } = envelope;
         if let Op::Close { ack } = op {
-            // A drop the file still owes is written first, if the file takes it: the next start
-            // knows only what the file says.
-            if self.work.drops && !self.stale() {
-                let result = self.drops_step();
-                self.report("drop record", result);
-            }
+            self.last_drops();
             return Some(ack);
         }
         // Queued before a file erase: discarded, as the erase protocol says.
@@ -869,6 +871,18 @@ impl Writer<'_> {
         self.shared.seq.mark_applied(seq);
         self.check_bytes();
         None
+    }
+
+    /// Before the writer stops, whether it is closed or the cache handle that fed it is dropped (as
+    /// at a normal shutdown): a drop the file still owes is written one last time, if the file
+    /// takes it, whatever backoff the last failure set. The next start knows only what the file
+    /// says. A drop whose write fails even now is lost with the process, as a queue that never
+    /// reached the file is.
+    fn last_drops(&mut self) {
+        if self.work.drops && !self.stale() {
+            let result = self.drops_step();
+            self.report("drop record", result);
+        }
     }
 
     fn standalone(&mut self, op: Op) {
