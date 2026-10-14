@@ -2623,7 +2623,18 @@ function setAllFolded(folded) {
 //     (2), or past it to the third when (2) would leave the list as it is too, as it does a list all
 //     open with nothing in it read. No first press does nothing. The chips, pressed, are (1) and (3) of
 //     Main's list (`setAllFolded`).
-//   * IN THE COLUMN THE KEYS ARE IN, as every key on the messages is (`onPageKey`).
+//   * FROM ANYWHERE AS A CHORD. The owner, 2026-10-14, of ;: "I also want 'Cmd-;' bound to the same
+//     thing so it works more reliably irrespective of what's highlighted or where the cursor is". So
+//     Ctrl+; and Ctrl+: (Cmd+; and Cmd+:, which is Cmd+Shift+;, on a Mac; either on every platform, as
+//     every chord here) step too, and as chords they fire in a message box and in the search, where the
+//     bare keys are typed and never fire. Their default is kept from the browser: in Chrome on a Mac
+//     they are Check Document Now and Show Spelling and Grammar, menu items Chrome hands the page first
+//     (they are no Chrome command, so none it reserves), and in a text field the first would run a spell
+//     check. A held chord's repeats are taken too and do nothing, as Ctrl+S's are.
+//   * IN THE COLUMN THE KEYS ARE IN, as every key on the messages is (`onPageKey`): the column of the
+//     field the focus is in for a chord pressed in one — the channel's box steps Main's list, the
+//     right column's box its thread — and for the search, which belongs to no column, the column the
+//     keys moved last.
 //   * THE READER STAYS PUT (`#280 scroll-stability`): the selected message while any of it shows, else
 //     the first message showing, keeps its top where it was, and is then held as a filter change holds
 //     its message (`placeFilterAnchor`) — the chips changing height under the list, a message arriving,
@@ -2724,9 +2735,17 @@ function applyFoldStep(step, folds) {
   renderScrollTools();
 }
 
-/** ; and :: the next step `way` round (1 or -1) in the list on screen of the column the keys are in. */
-function foldStepFromKeyboard(way) {
+/**
+ * ; and :, and Ctrl+; and Ctrl+: (Cmd on a Mac): the next step `way` round (1 or -1) in the list on
+ * screen of the column the keys are in. A held chord's repeats are taken, so that none reaches the
+ * browser's own default for the chord, and do nothing; a held bare key's are left alone, as before.
+ *
+ * @param {number} way
+ * @param {KeyboardEvent} [event]
+ */
+function foldStepFromKeyboard(way, event) {
   if (!channelOnScreen()) return false;
+  if (event && event.repeat) return modHeld(event);
   const folds = visibleFolds();
   if (folds.length === 0) {
     setStatus(FOLD_STEP_NONE);
@@ -8305,20 +8324,25 @@ const KEYMAP = [
     run: () => filterFromKeyboard("author"),
   },
   // `#301 semicolon-expand-cycle`. Not the keys of the Expand all and Collapse all chips any more: a press
-  // does what one of them does only one time in three, so neither chip names them.
+  // does what one of them does only one time in three, so neither chip names them in `aria-keyshortcuts`,
+  // and no other control is what they press. The chords are the same steps from anywhere, at the owner's
+  // word, a message box and the search included; they repeat only so that a held chord's repeats are
+  // taken from the browser, and step nothing (`foldStepFromKeyboard`).
   {
-    group: KEYS_VIEW, chords: [{ key: ";" }],
-    does: "The long messages, a step a press: expand all, then open the unread and fold the read, then collapse " +
-      "all, and round again. Each list, in either column, goes on from the step it was left at; the first press " +
-      "in one expands all, or if they are all open already goes on round to the first step that changes " +
-      "something. The message you are on stays where it is",
-    run: () => foldStepFromKeyboard(1),
+    group: KEYS_VIEW, chords: [{ key: ";" }, { key: ";", mod: true }], repeats: true,
+    does: () => "The long messages, a step a press: expand all, then open the unread and fold the read, then " +
+      "collapse all, and round again. Each list, in either column, goes on from the step it was left at; the first " +
+      "press in one expands all, or if they are all open already goes on round to the first step that changes " +
+      `something. The message you are on stays where it is. ${modKeyName()}+; works from anywhere, a message box or ` +
+      "the search included, on the list of the column you are in",
+    run: (event) => foldStepFromKeyboard(1, event),
   },
   {
-    group: KEYS_VIEW, chords: [{ key: ":" }],
-    does: "The same steps the other way round: the first press in a list collapses all, or if they are all " +
-      "folded already goes on round to the first step that changes something",
-    run: () => foldStepFromKeyboard(-1),
+    group: KEYS_VIEW, chords: [{ key: ":" }, { key: ":", mod: true }], repeats: true,
+    does: () => "The same steps the other way round: the first press in a list collapses all, or if they are all " +
+      `folded already goes on round to the first step that changes something. ${modKeyName()}+: ` +
+      `(${modKeyName()}+Shift+;) from anywhere, as ${modKeyName()}+; does`,
+    run: (event) => foldStepFromKeyboard(-1, event),
   },
   {
     group: KEYS_WRITING, chords: [{ key: "c" }],

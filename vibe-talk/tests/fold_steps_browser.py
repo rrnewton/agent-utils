@@ -23,7 +23,10 @@ At 1280x800, with the keys:
   Collapsed all, Expanded unread, collapsed read, Expanded all -> each said on the status line, and the
   selected message held within a pixel throughout. Then : once more, End to the newest line and k twice,
   and ; -> Expanded all, everything opening above and below the selected message, which holds still:
-  the newest line is not followed.
+  the newest line is not followed. Then : to Collapsed all, End and k twice again, and the focus in the
+  channel's message box, with "half a thought;" typed into it -> the ; is the draft's and steps nothing;
+  Ctrl+; -> Expanded all, Cmd+; -> Expanded unread, collapsed read, Ctrl+: (Ctrl+Shift+;) -> Expanded
+  all again, each from the box, which keeps the focus and the draft, the selected message held.
 
   in two columns, the thread opened on the right by its card's replies button, ] to the right column, End
   to its foot and k twice, to its first read reply: ; -> the right column's thread all open, Main
@@ -32,7 +35,10 @@ At 1280x800, with the keys:
   it open and it and the two under it folded, and : back to Expanded all -> only what is under the reader
   opens, so the step scrolls nothing, and the right column's keeper of a reader at its foot does not take
   them down to the new foot a frame later (unheld, it took them 679px); [ to Main, k and ; -> Main's own
-  first step, Expanded all, the right column untouched.
+  first step, Expanded all, the right column untouched; ] back, : to Collapsed all, at its foot on the
+  first read reply again, and the focus in the right column's message box with "and another;" typed ->
+  the ; steps nothing, and Ctrl+; -> the right column's thread Expanded all, Main untouched: the chord
+  steps the list of the box's own column.
 
 No page error at any step. Pass --screenshots DIR to keep a PNG of each step; --web-root DIR to run the
 walk against another copy of the page.
@@ -230,6 +236,10 @@ STATUS_JS = """() => {
 SCROLL_JS = """(id) => { const area = document.getElementById(id);
   return {top: area.scrollTop, gap: area.scrollHeight - area.scrollTop - area.clientHeight}; }"""
 
+# Where the focus is, and what the message box holds.
+FOCUS_JS = """(box) => ({focused: document.activeElement ? document.activeElement.id : null,
+  value: document.getElementById(box).value})"""
+
 
 def check(condition: bool, message: str) -> None:
     if not condition:
@@ -300,6 +310,30 @@ class Desk:
         found: object = self.page.evaluate(SCROLL_JS, area)
         assert isinstance(found, dict)
         return number(found["top"]), number(found["gap"])
+
+    def box(self, box_id: str) -> tuple[str | None, str]:
+        """Which element holds the focus, by id, and the text in message box `box_id`."""
+        found: object = self.page.evaluate(FOCUS_JS, box_id)
+        assert isinstance(found, dict)
+        focused = found["focused"]
+        return (str(focused) if focused is not None else None), str(found["value"])
+
+    def typed_in_box(self, box_id: str, list_id: str, draft: str, what: str) -> None:
+        """Focus message box `box_id` and type `draft`, ; and all: typed into the box, stepping nothing in `list_id`."""
+        before = self.state(list_id)
+        self.page.focus(f"#{box_id}")
+        self.page.wait_for_timeout(300)
+        self.page.keyboard.type(draft)
+        self.page.wait_for_timeout(300)
+        check(self.box(box_id) == (box_id, draft), f"{self.label} {what}: the box holds {self.box(box_id)}, not {draft!r}")
+        check(self.state(list_id) == before, f"{self.label} {what}: a ; typed in the box stepped #{list_id}")
+
+    def chord_step(self, chord: str, box_id: str, list_id: str, step: str, what: str) -> None:
+        """`held_step` for a chord pressed in message box `box_id`, whose focus and draft it leaves as they were."""
+        before = self.box(box_id)
+        check(before[0] == box_id, f"{self.label} {what}: the focus is on {before[0]}, not #{box_id}")
+        self.held_step(chord, list_id, step, what)
+        check(self.box(box_id) == before, f"{self.label} {what}: the box went from {before} to {self.box(box_id)}")
 
     def key(self, chord: str) -> None:
         self.page.keyboard.press(chord)
@@ -405,6 +439,25 @@ def one_column(desk: Desk) -> None:
     desk.held_step(";", "discord-log", "expand", "one column at the newest line, ; to expand")
     _top, gap = desk.scroll("scroll-area")
     check(gap > 200, f"{desk.label}: the list followed its newest line after ; ({gap}px above it)")
+    # The chords from the channel's message box, where ; is typed: everything folded again, back at the
+    # newest line with the box under the last message, a message near the foot selected by the keys, and
+    # the focus then put in the box.
+    desk.key("Shift+Semicolon")
+    page.wait_for_timeout(400)
+    desk.judge("discord-log", "collapse", "one column, : to collapse before the box")
+    desk.key("End")
+    page.wait_for_timeout(600)
+    for chord in ("k", "k"):
+        desk.key(chord)
+        page.wait_for_timeout(200)
+    page.wait_for_timeout(400)
+    desk.typed_in_box("channel-compose-text", "discord-log", "half a thought;", "one column, ; typed in the box")
+    desk.chord_step("Control+Semicolon", "channel-compose-text", "discord-log", "expand",
+                    "one column, Ctrl+; in the box to expand")
+    desk.chord_step("Meta+Semicolon", "channel-compose-text", "discord-log", "unread",
+                    "one column, Cmd+; in the box to unread")
+    desk.chord_step("Control+Shift+Semicolon", "channel-compose-text", "discord-log", "expand",
+                    "one column, Ctrl+: in the box back to expand")
 
 
 def two_columns(desk: Desk) -> None:
@@ -462,6 +515,20 @@ def two_columns(desk: Desk) -> None:
     page.wait_for_timeout(400)
     desk.held_step(";", "discord-log", "expand", "Main beside it, its own first ; to expand")
     check(desk.state("side-log") == side, f"{desk.label}: ; in Main folded the right column")
+    # The chord in the right column's message box steps the right column's thread, the box's own list,
+    # and leaves Main as it is. The thread folded again by : from the right column's keys, then at its
+    # foot, its box under its last reply.
+    desk.key("]")
+    page.wait_for_timeout(300)
+    desk.key("Shift+Semicolon")
+    page.wait_for_timeout(400)
+    desk.judge("side-log", "collapse", "right column, : to collapse before its box")
+    to_first_read("before its box")
+    main = desk.state("discord-log")
+    desk.typed_in_box("side-compose-text", "side-log", "and another;", "right column, ; typed in its box")
+    desk.chord_step("Control+Semicolon", "side-compose-text", "side-log", "expand",
+                    "right column, Ctrl+; in its box to expand")
+    check(desk.state("discord-log") == main, f"{desk.label}: Ctrl+; in the right column's box folded Main")
 
 
 def main() -> int:
@@ -493,8 +560,10 @@ def main() -> int:
             browser.close()
     print(f"Chromium {version} at 1280x800: ; went round Expanded all, Expanded unread, collapsed read, and"
           " Collapsed all, and : the other way, each drawn as said and said politely; the selected message held"
-          " within a pixel at every frame, at the newest line too; in two columns ; on the right folded the"
-          " right column alone and held its reader at its foot, and ; in Main was Main's own first step:")
+          " within a pixel at every frame, at the newest line too; Ctrl+;, Cmd+; and Ctrl+: stepped from the"
+          " message box, where a typed ; stepped nothing; in two columns ; on the right folded the right column"
+          " alone and held its reader at its foot, ; in Main was Main's own first step, and Ctrl+; in the right"
+          " column's box stepped the right column alone:")
     for note in notes:
         print(f"  {note}")
     return 0

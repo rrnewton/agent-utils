@@ -5568,7 +5568,7 @@ from, so it cannot name a key the page does not answer.
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
 | `h` | Show read, Collapse read, Hide read, in turn |
 | Shift+P, Shift+L | The Pinned and Links filters |
-| `;`, `:` | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. See below |
+| `;`, `:`; Ctrl+;, Ctrl+: (Cmd on a Mac) | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. The chords do the same from anywhere, a message box or the search included. See below |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
 | `c` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
 | Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on Settings or Help too. The browser's "Save page" never opens |
@@ -5662,8 +5662,27 @@ would change nothing either. So a first `;` in a list already all open folds the
 with none of them read, collapses all; a first `:` in a list already all folded opens the unread, or,
 with every one read, expands all. No first press does nothing. The chips count as steps: after
 **Collapse all** the next `;` expands all, and after **Expand all** it opens the unread and folds the
-read. The keys work wherever the page's single keys do (never while you are typing in a box), in
+read. The bare keys work wherever the page's single keys do (never while you are typing in a box), in
 either column in two columns, on the list the keys are in; in the call's view they do nothing.
+
+**Ctrl+; and Ctrl+: (Cmd+; and Cmd+: on a Mac) do the same from anywhere.** The owner asked for the
+chord "so it works more reliably irrespective of what's highlighted or where the cursor is". `:` is
+Shift+`;`, so Cmd+: is Cmd+Shift+;. As chords they act while you are typing in a message box or the
+search, where the bare keys are typed, and type nothing there; they stay on when the single-key
+shortcuts are turned off; and a chord held down is one step. Pressed in a message box, they step the
+list that box belongs to: the channel's box steps Main (or All, or the thread, whatever the left column
+shows), the right column's box steps its thread. The search belongs to neither column, so from there
+they step the column the keys moved last. Settings, Help, Reply and the call's view have no long
+messages to step, and leave the chord to the browser.
+
+Chrome on a Mac has Cmd+; and Cmd+: in its own menus: Edit → Spelling and Grammar → Check Document Now
+and Show Spelling and Grammar. They are not among the shortcuts Chrome keeps for itself: in Chromium's
+source (`chrome/browser/ui/cocoa/main_menu_builder.mm`, `chrome/browser/global_keyboard_shortcuts_mac.mm`)
+they are plain Cocoa menu actions rather than browser commands, and Chrome sends a page every key
+equivalent that is not a reserved browser command before its menu sees it. The page takes the chord,
+so the spell check never runs in the message box. Off a Mac, Chrome's own table of shortcuts
+(`chrome/browser/ui/accelerator_table.cc`) has nothing on Ctrl+; or Ctrl+:. All of this was read from
+Chromium's source; the chord has not yet been pressed in Chrome on a real Mac.
 
 **The message you are on stays where it is.** The selected message while any of it shows, or else the
 first message showing, keeps its place on the screen through every step, even at the newest line:
@@ -5683,9 +5702,13 @@ the folds from the rows on screen.
 presses the real keys in Chromium at a 1280x800 desk: `;` four times and `:` three times in one column,
 each step judged by whether each message's text overflows its box, with the status line read, and the
 selected message sampled at every frame for 0.8 s after each press, which must not move it by more than
-a pixel; then `;` at the newest line; then in two columns, the right column's thread at its foot,
-`;` and `;` and a `:` that opens only what is under the reader, Main untouched, and `;` in Main, the
-right column untouched.
+a pixel; then `;` at the newest line; then, from the channel's message box with a draft in it, a `;`
+typed into the draft that steps nothing, and Ctrl+;, Cmd+; and Ctrl+: that step, the focus and the
+draft left as they were; then in two columns, the right column's thread at its foot, `;` and `;` and a
+`:` that opens only what is under the reader, Main untouched, `;` in Main, the right column untouched,
+and Ctrl+; in the right column's box, which steps that column's thread and leaves Main alone. The page
+suite holds the rest: the chords from the search, with the single-key shortcuts off, held down, on
+Settings and the call's view, and the first press that goes on to the third step.
 
 ### The reading bookmark
 

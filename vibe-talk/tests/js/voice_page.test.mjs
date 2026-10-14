@@ -22202,6 +22202,161 @@ test("`#301 semicolon-expand-cycle`: A FIRST PRESS (2) WOULD ALSO LEAVE AS IT IS
   assert.equal(statusSaid(page), FOLD_SAID.expand, "a list with a step skipped a step");
 });
 
+test("`#301 semicolon-expand-cycle`: Ctrl+; AND Ctrl+: (Cmd on a Mac) STEP FROM ANYWHERE — the message box, the search — where the bare keys are typed, the focus and the draft left where they are", async () => {
+  const back = { shiftKey: true };
+  for (const [platform, mod, name] of [["Linux x86_64", "ctrlKey", "Ctrl"], ["MacIntel", "metaKey", "Cmd"]]) {
+    const page = newPage(new Map(), SCRIPT, (p) => p.setPlatform(platform));
+    const messages = tallChannel(12);
+    for (const one of messages) if (Number(one.id) % 2 === 1) page.dealtWith.add(String(one.id));
+    await signIn(page);
+    await showDiscord(page, messages);
+    const steps = foldSteps(page);
+    const expected = { expand: steps.expand, unread: steps.unread_open, collapse: steps.collapse };
+    const area = page.el("scroll-area");
+    const box = page.el("channel-compose-text");
+    await box.setValue("half a thought");
+    // Negative control: the bare keys in the message box are the box's, typed, and step nothing.
+    for (const [key, fields] of [[";", {}], [":", back]]) {
+      const event = await press(page, box, key, fields);
+      assert.equal(event.defaulted, true, `${platform}: ${key} in the message box was taken from it`);
+      assert.deepStrictEqual(foldState(page), steps.collapse, `${platform}: ${key} typed in the message box stepped the list`);
+    }
+    // The chords, from the box: the steps both ways round, said, with the focus and the draft where they were.
+    for (const [key, fields, step] of [[";", {}, "expand"], [";", {}, "unread"], [":", back, "expand"], [":", back, "collapse"]]) {
+      const what = `${platform}: ${name}+${key} in the message box`;
+      const event = await press(page, box, key, { ...fields, [mod]: true });
+      assert.equal(event.defaulted, false, `${what} was left to the browser`);
+      assert.deepStrictEqual(foldState(page), expected[step], `${what} did not go to ${step}`);
+      assert.equal(statusSaid(page), FOLD_SAID[step], `${what} said ${statusSaid(page)}`);
+      assert.equal(focused(page), box, `${what} left the focus on ${focusName(page)}`);
+      assert.equal(box.value, "half a thought", `${what} touched the draft`);
+    }
+    // One rotation, the chord's and the bare key's: ; on the list goes on from the chord's (3).
+    await press(page, area, ";");
+    assert.equal(statusSaid(page), FOLD_SAID.expand, `${platform}: ; on the list did not go on from the chord's step`);
+    // A held chord is one step; its repeats are taken from the browser (in Chrome on a Mac, Check Document
+    // Now) and step nothing.
+    await press(page, box, ";", { [mod]: true });
+    let event = await press(page, box, ";", { [mod]: true, repeat: true });
+    assert.equal(event.defaulted, false, `${platform}: a held ${name}+;'s repeat reached the browser`);
+    assert.deepStrictEqual(foldState(page), steps.unread_open, `${platform}: a held ${name}+; stepped on its repeat`);
+    // Negative control: a held bare key's repeat is still nothing, and left alone.
+    event = await press(page, area, ";", { repeat: true });
+    assert.equal(event.defaulted, true, `${platform}: a held ;'s repeat was taken`);
+    assert.deepStrictEqual(foldState(page), steps.unread_open, `${platform}: a held ; stepped on its repeat`);
+    // From the search, while it is open and holds the focus: the chord steps, the bare key is typed.
+    await press(page, area, "/");
+    const field = page.el("search-field");
+    assert.equal(focused(page), field, `${platform}: / did not put the focus in the search`);
+    event = await press(page, field, ";");
+    assert.equal(event.defaulted, true, `${platform}: ; in the search was taken from it`);
+    assert.deepStrictEqual(foldState(page), steps.unread_open, `${platform}: ; typed in the search stepped the list`);
+    event = await press(page, field, ";", { [mod]: true });
+    assert.equal(event.defaulted, false, `${platform}: ${name}+; in the search was left to the browser`);
+    assert.deepStrictEqual(foldState(page), steps.collapse, `${platform}: ${name}+; in the search did not step the list`);
+    assert.equal(focused(page), field, `${platform}: ${name}+; in the search took the focus out of it`);
+    // The Help list names the chords in the reader's words, and says where they work.
+    const kbds = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd");
+    const entry = (words) => kbds.find((node) => node.textContent === words);
+    assert.ok(entry(`; or ${name}+;`), `${platform}: the list of keys does not name ; or ${name}+;: ${kbds.map((n) => n.textContent).join(" | ")}`);
+    assert.ok(entry(`: or ${name}+:`), `${platform}: the list of keys does not name : or ${name}+:`);
+    assert.match(entry(`; or ${name}+;`).parentNode.text(), new RegExp(`${name}\\+; works from anywhere, a message box or the search included`));
+    assert.match(entry(`: or ${name}+:`).parentNode.text(), new RegExp(`${name}\\+: \\(${name}\\+Shift\\+;\\) from anywhere`));
+    assert.match(entry(`; or ${name}+;`).parentNode.text(), /goes on round to the first step that changes something/);
+    const other = name === "Cmd" ? "Ctrl" : "Cmd";
+    assert.ok(!page.el("keyboard-keys").text().includes(`${other}+;`), `${platform}: the list of keys names ${other}+;`);
+    // Neither chip says a key, the chords included: ; and : press neither, but one time in three.
+    for (const chip of ["expand-all", "collapse-all"]) {
+      assert.equal(page.el(chip).getAttribute("aria-keyshortcuts"), null, `${platform}: #${chip} announces a key it is not`);
+    }
+  }
+});
+
+test("`#301 semicolon-expand-cycle`: THE CHORD WORKS WITH THE SINGLE KEYS OFF and on no screen without long messages to step — Settings, the call's view — where the browser keeps it", async () => {
+  const page = await foldStepPage();
+  const steps = foldSteps(page);
+  const area = page.el("scroll-area");
+  await page.el("open-settings").click();
+  await page.el("single-keys").setChecked(false);
+  // Settings has none, and a box of its own: the chord is the browser's there, and steps nothing.
+  const prompt = page.el("prompt-summary");
+  let event = await press(page, prompt, ";", { ctrlKey: true });
+  assert.equal(event.defaulted, true, "Ctrl+; on Settings was taken from the browser");
+  assert.equal(page.screen(), "settings", "Ctrl+; left Settings");
+  await press(page, page.el("screen-settings"), "Escape");
+  assert.equal(page.screen(), "main");
+  // The single keys off: ; is nothing, and the chord still steps.
+  event = await press(page, area, ";");
+  assert.equal(event.defaulted, true, "; with the single keys off was taken");
+  assert.deepStrictEqual(foldState(page), steps.collapse, "; stepped the list with the single keys off");
+  event = await press(page, area, ";", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+; with the single keys off was left to the browser");
+  assert.deepStrictEqual(foldState(page), steps.expand, "Ctrl+; did not step the list with the single keys off");
+  event = await press(page, page.el("channel-compose-text"), ":", { metaKey: true, shiftKey: true });
+  assert.deepStrictEqual(foldState(page), steps.collapse, "Cmd+: did not step the list back with the single keys off");
+  // The call's view: none of the channel's lists is on screen, and the chord is left to the browser.
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "voice");
+  event = await press(page, page.el("compose-text"), ";", { ctrlKey: true });
+  assert.equal(event.defaulted, true, "Ctrl+; acted on the call's view");
+  assert.equal(page.tab(), "voice");
+});
+
+test("`#301 semicolon-expand-cycle`: IN TWO COLUMNS THE CHORD IN A MESSAGE BOX STEPS THAT BOX'S COLUMN, and in the search the column the keys moved last", async () => {
+  const page = newPage();
+  threadHistory(page, { replies: 8, size: 20, top: 4, content: (i) => longMessage(`reply ${i}`),
+    posted: (i) => longMessage(`post ${i}`) });
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  const replies = page.messages.filter((m) => m.thread && !m.thread.is_root).map((m) => String(m.id));
+  await twoColumns(page);
+  await openerOf(cardRow(page, page.threads[0].id)).click();
+  await page.settle();
+  assert.equal(page.el("side-pane").hidden, false, "the thread did not open on the right");
+  const area = page.el("scroll-area");
+  const side = page.el("side-scroll");
+  const leftIds = () => page.el("discord-log").children.filter((li) => li.hasAttribute("data-collapsed")).map((li) => li.getAttribute("data-id"));
+  const rightIds = () => page.el("side-log").children.map((li) => li.getAttribute("data-id")).filter((id) => replies.includes(id));
+  const left = (open) => (open ? { open: leftIds(), shut: [] } : { open: [], shut: leftIds() });
+  const right = (open) => (open ? { open: rightIds(), shut: [] } : { open: [], shut: rightIds() });
+  assert.ok(leftIds().length >= 3 && rightIds().length >= 4, `too few long messages: ${leftIds()} | ${rightIds()}`);
+  assert.deepStrictEqual(foldState(page), left(false), "Main is not folded");
+  assert.deepStrictEqual(foldState(page, "side-log"), right(false), "the right column's thread is not folded");
+  // The keys last in the right column (]); the chord in the channel's box steps Main, the box's column,
+  // and leaves the right column alone.
+  await press(page, area, "]");
+  const channelBox = page.el("channel-compose-text");
+  let event = await press(page, channelBox, ";", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+; in the channel's box was left to the browser");
+  assert.deepStrictEqual(foldState(page), left(true), "Ctrl+; in the channel's box did not step Main");
+  assert.deepStrictEqual(foldState(page, "side-log"), right(false), "Ctrl+; in the channel's box stepped the right column");
+  assert.equal(focused(page), channelBox);
+  // The chord in the right column's box steps its thread, and leaves Main alone.
+  const sideBox = page.el("side-compose-text");
+  await sideBox.setValue("and another");
+  event = await press(page, sideBox, ";");
+  assert.equal(event.defaulted, true, "; in the right column's box was taken from it");
+  assert.deepStrictEqual(foldState(page, "side-log"), right(false), "; typed in the right column's box stepped its thread");
+  event = await press(page, sideBox, ";", { metaKey: true });
+  assert.equal(event.defaulted, false, "Cmd+; in the right column's box was left to the browser");
+  assert.deepStrictEqual(foldState(page, "side-log"), right(true), "Cmd+; in the right column's box did not step its thread");
+  assert.deepStrictEqual(foldState(page), left(true), "Cmd+; in the right column's box stepped Main");
+  assert.equal(focused(page), sideBox);
+  assert.equal(sideBox.value, "and another");
+  // The search belongs to neither column: from it the chord steps the column the keys moved last. The
+  // right column's first, by its keys; then Main's, by its keys.
+  await press(page, side, "/");
+  const field = page.el("search-field");
+  assert.equal(focused(page), field, "/ did not put the focus in the search");
+  await press(page, field, ":", { ctrlKey: true, shiftKey: true });
+  assert.deepStrictEqual(foldState(page, "side-log"), right(false), "Ctrl+: in the search did not step the right column, where the keys were");
+  assert.deepStrictEqual(foldState(page), left(true), "Ctrl+: in the search stepped Main, where the keys were not");
+  await press(page, area, "k");
+  await press(page, field, ":", { ctrlKey: true, shiftKey: true });
+  assert.deepStrictEqual(foldState(page), left(false), "Ctrl+: in the search did not step Main, where the keys were");
+  assert.deepStrictEqual(foldState(page, "side-log"), right(false), "Ctrl+: in the search stepped the right column, where the keys were not");
+});
+
 test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chosen from — Main, All or a thread in one column, or two columns — and never to a thread opened from it", async () => {
   // The owner, of the Threads screen the list replaced: "rather ESC works". A view is left the way it was come to.
   const page = await threadPage();
