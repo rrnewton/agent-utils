@@ -1664,9 +1664,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   the noise rules), `visible` (the page shown again), `reset` and `replay` (the live stream), `pull`
   (pull to refresh, at either end), `expired` (a forward cursor the server could not continue),
   `older` (a step back), `search` (a step back the search took), `counts` (All read behind Main for
-  unread replies), `reply-place`, `threads` (the thread list's newest page, read for "Older
-  threads…" when no cursor is known yet) and `side` (the right column's thread or list of threads,
-  read beside Main). The server names its own: `naming` (a thread read to name it), `recent` (a
+  unread replies), `reply-place`, `place` (All read to put into their threads the messages the live
+  stream delivered without a thread record), `threads` (the thread list's newest page, read for
+  "Older threads…" when no cursor is known yet) and `side` (the right column's thread or list of
+  threads, read beside Main). The server names its own: `naming` (a thread read to name it), `recent` (a
   voice catch-up's window), `probe`, `summary-window`, `speech`, `shadow` (the recent-view check),
   `tool` (an MCP tool call) and `reply-mark` (whether a reply's provider read mark would clear more
   than the channel). A bulk read (see

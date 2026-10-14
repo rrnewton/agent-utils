@@ -52,7 +52,7 @@ beforeEach(() => {
  * `reason=` (`ReadReason::from_the_page` in src/read_reason.rs); any other is logged as `other`.
  */
 const PAGE_READ_REASONS = ["enter", "poll", "live", "mutation", "visible", "reset", "replay", "pull", "expired",
-  "older", "search", "counts", "reply-place", "threads", "side"];
+  "older", "search", "counts", "reply-place", "place", "threads", "side"];
 
 /**
  * Every read of a channel's messages (`/timeline`, `/page`, `/todo`) the page sent in the test now
@@ -28764,6 +28764,9 @@ async function threadPage(view = null) {
  * sent while the reader is on Main is never answered. It is moved from `timelineCalls` and `requests`
  * to `countsReads`, so the reads such a test counts are the ones it is about. Installed over any other
  * stand-in for the server, last.
+ *
+ * `page.servePlacing` answers the read of All that places what the stream left unplaced (`reason=place`,
+ * `#308 live-reply-in-main`) as any other read, for a test whose subject that read is.
  */
 function holdCountsRead(page) {
   const serve = page.timeline;
@@ -28771,7 +28774,7 @@ function holdCountsRead(page) {
   page.timeline = (path, options) => {
     const url = new URL(path, "http://fixture.test");
     if (url.searchParams.get("view") === "flat" && !url.searchParams.get("before") && !url.searchParams.get("after") &&
-        page.el("thread-select").value === "main") {
+        page.el("thread-select").value === "main" && !(page.servePlacing && url.searchParams.get("reason") === "place")) {
       page.countsReads.push(page.timelineCalls.pop());
       page.requests.splice(page.requests.lastIndexOf(`GET ${path}`), 1);
       return new Promise(() => {});
@@ -58206,4 +58209,378 @@ test("`#304 back-gesture-in-app`: a Back that cannot close what is open never tr
   assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" }, "an entry was pushed again for what could not close");
   await page.browserBack();
   assert.equal(page.left, true, "the reader was trapped in a thread the gesture cannot close");
+});
+
+// --- `#308 live-reply-in-main`: a thread reply the stream delivers without its thread ----------------
+//
+// The owner, 2026-10-14: in a space where a bridge answers him in threads, its threaded answer appeared
+// live in MAIN; opening the thread did not show it; after a reload it was inside the thread. The
+// provider's stream had carried the reply with no thread record, and the page drew it as a Main row and
+// then read only Main, which never carries a thread reply. Now the page reads All for what the stream
+// left unplaced once the reads behind it are done, and any later copy that names the thread — that
+// read, a delta, a page, another copy from the stream — moves the message into its thread.
+
+/**
+ * Post a reply into the first discussion, as the bridge's own reads show it — in its thread, and the
+ * root's count moved on — and answer what the stream carries of it: the same message with no thread
+ * record, as a provider's stream may.
+ */
+function bridgeReply(page, server, id = "300") {
+  const first = page.messages.find((m) => m.id === "201").thread;
+  const pushed = message({ id, content: "the bridge's answer, in the first discussion" });
+  server.post({ ...pushed, thread: { ...first, is_root: false, reply_count: 2 } });
+  server.edit("201", { thread: { ...first, reply_count: 2 } });
+  return { first, pushed };
+}
+
+/** Each read since the `from`th, as its view and whether it was a delta, and its reason. */
+const readsSince = (page, from) => page.timelineCalls.slice(from).map((call) => {
+  const url = new URL(call, "http://fixture.test");
+  return [url.searchParams.get("view"), url.searchParams.get("after") !== null, url.searchParams.get("reason")];
+});
+
+for (const mode of ["delta", "newest"]) {
+  test(`\`#308 live-reply-in-main\`: a thread reply the stream delivers without its thread leaves Main for its thread once Main's ${mode} read behind it is done`, async () => {
+    const run = async (script) => {
+      const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+      const from = page.timelineCalls.length;
+      const { first, pushed } = bridgeReply(page, server);
+      // A forward position the server can no longer continue: the read behind the arrival is Main's newest page.
+      if (mode === "newest") server.refuse = { status: 410, error: "cursor_expired" };
+      await deliver(page, page.stream(), sseMessage(pushed));
+      await page.settle();
+      await page.settle();
+      return { page, server, first, from };
+    };
+    const { page, first, from } = await run(SCRIPT);
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the thread reply was left on Main");
+    const reads = readsSince(page, from);
+    assert.deepStrictEqual(reads.at(-1), ["flat", false, "place"], `All was not read to place the reply: ${JSON.stringify(reads)}`);
+    assert.equal(reads.filter(([, , reason]) => reason === "place").length, 1, `the reply was placed more than once: ${JSON.stringify(reads)}`);
+    assert.equal(threadButton(rowOf(page, "201")).textContent, "2 replies", "the root did not count the reply");
+    // In its thread, from what the page holds: nothing the thread is read for has to land first.
+    page.timeline = errorResponse(502, "chat_error", "history read timed out");
+    await pickThread(page, `thread:${first.id}`);
+    assert.deepStrictEqual(shownIds(page), ["201", "202", "300"], "the reply is not in its thread");
+    await pickThread(page, "main");
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the reply came back to Main");
+
+    // THE CONTROL: without the read that places it, the reply stays on Main (a delta), or goes
+    // nowhere (a newest page of Main), and its thread does not have it.
+    const control = await run(brokenScript("  queuePlaceUnplaced();\n}", "}"));
+    if (mode === "delta") {
+      assert.deepStrictEqual(shownIds(control.page), ["200", "201", "203", "300"],
+        "without the placing read the reply still left Main, so this test cannot see it");
+    }
+    control.page.timeline = errorResponse(502, "chat_error", "history read timed out");
+    await pickThread(control.page, `thread:${control.first.id}`);
+    assert.ok(!shownIds(control.page).includes("300"),
+      "without the placing read the thread still had the reply, so this test cannot see it");
+  });
+}
+
+test("`#308 live-reply-in-main`: THE OWNER'S CASE — reads failing as the reply arrives: it waits on Main, and the first read that lands places it in its thread", async () => {
+  const run = async (script) => {
+    const data = threadData();
+    const page = newPage(new Map(), script);
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    page.messages = data.messages;
+    const server = forwardTimeline(page, {});
+    await signIn(page);
+    await page.el("view-switch").click();
+    await page.settle();
+    await page.settle();
+    // Opened in All, as a threaded channel does; the reader goes to Main.
+    await pickThread(page, "main");
+    const { first, pushed } = bridgeReply(page, server);
+    const standard = page.timeline;
+    page.timeline = errorResponse(502, "chat_error", "history read timed out");
+    await deliver(page, page.stream(), sseMessage(pushed));
+    await page.settle();
+    await page.settle();
+    return { page, first, standard };
+  };
+  const { page, first, standard } = await run(SCRIPT);
+  // Nothing has said where it is: drawn where most of what arrives this way belongs.
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "300"]);
+  page.timeline = standard;
+  await pollOnce(page);
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the read that landed left the reply on Main");
+  assert.equal(threadButton(rowOf(page, "201")).textContent, "2 replies", "the root did not count the reply");
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await pickThread(page, `thread:${first.id}`);
+  assert.deepStrictEqual(shownIds(page), ["201", "202", "300"], "the reply is not in its thread");
+
+  // THE CONTROL, which is the owner's report: Main's read lands and the reply is still not in its thread.
+  const control = await run(brokenScript("  queuePlaceUnplaced();\n}", "}"));
+  control.page.timeline = control.standard;
+  await pollOnce(control.page);
+  await control.page.settle();
+  control.page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await pickThread(control.page, `thread:${control.first.id}`);
+  assert.ok(!shownIds(control.page).includes("300"),
+    "without the placing read the reply still reached its thread, so this test cannot see it");
+});
+
+for (const kind of ["replayed copy", "edit", "second copy"]) {
+  test(`\`#308 live-reply-in-main\`: a later ${kind} from the stream that names the thread moves the reply out of Main at once, with no read to wait for`, async () => {
+    const run = async (script) => {
+      // The read of All that would place it never answers here: only the copy can.
+      const { page, server } = await forwardPage({}, null, script);
+      const { first, pushed } = bridgeReply(page, server);
+      await deliver(page, page.stream(), sseMessage(pushed));
+      await page.settle();
+      assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "300"], "fixture: the reply was placed some other way");
+      const placed = { ...pushed, thread: { ...first, is_root: false, reply_count: 2 } };
+      // Whatever read the copy asks for fails: what moves the reply is the copy.
+      const standard = page.timeline;
+      page.timeline = errorResponse(502, "chat_error", "history read timed out");
+      const from = page.timelineCalls.length;
+      const frame = kind === "replayed copy" ? sseMessage(placed, { replayed: true })
+        : kind === "edit" ? sseUpdate("edit-300", placed) : sseMessage(placed);
+      await deliver(page, page.stream(), frame);
+      await page.settle();
+      return { page, first, from, standard };
+    };
+    const { page, first, from, standard } = await run(SCRIPT);
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the copy naming the thread left the reply on Main");
+    assert.equal(threadButton(rowOf(page, "201")).textContent, "2 replies", "the root did not count the reply");
+    if (kind === "replayed copy") assert.deepStrictEqual(page.timelineCalls.slice(from), [], "a replayed copy was read for");
+    page.timeline = standard;
+    await pickThread(page, `thread:${first.id}`);
+    assert.deepStrictEqual(shownIds(page), ["201", "202", "300"], "the reply is not in its thread");
+
+    // THE CONTROL: a copy that places nothing leaves the reply where the threadless one drew it.
+    const control = await run(kind === "edit"
+      ? brokenScript("      placeFromEdit(payload.message);\n", "")
+      : brokenScript("    const places = placesHeld(message);\n", "    const places = false;\n"));
+    if (kind === "second copy") {
+      // The copy itself still replaces the store's, and the row on Main stays until a read redraws it.
+      assert.ok(shownIds(control.page).includes("300"), "without the placement the reply still left Main, so this test cannot see it");
+    } else {
+      assert.deepStrictEqual(shownIds(control.page), ["200", "201", "203", "300"],
+        "without the placement the reply still left Main, so this test cannot see it");
+    }
+  });
+}
+
+/**
+ * A channel with threads taller than the list — a question with a thread at its head, then fourteen
+ * long messages to the channel — on a server with a change record, opened in All and read in Main,
+ * and polled once there, so Main's next read is a delta.
+ */
+async function tallThreadedMain(script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  page.threadingSupported = true;
+  const thread = { id: "spaces/A/threads/tall", root_message_id: "27720", is_root: true,
+    reply_count: 1, reply_count_exact: true };
+  const root = message({ id: "27720", content: longMessage("the question"), thread });
+  const answer = message({ id: "27721", content: "the first answer", thread: { ...thread, is_root: false } });
+  const rest = Array.from({ length: 14 }, (_unused, index) =>
+    message({ id: `277${String(index).padStart(2, "0")}`, content: longMessage(`message ${index}`) }));
+  page.messages = [root, answer, ...rest];
+  page.threads = [{ id: thread.id, root, title: "The question", reply_count: 1, reply_count_exact: true,
+    updated_at: answer.timestamp }];
+  const server = forwardTimeline(page, {});
+  await signIn(page);
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.settle();
+  await pickThread(page, "main");
+  await pollOnce(page);
+  /** Post a reply into the question's thread, and answer the stream's copy of it, with no thread record. */
+  const reply = (id) => {
+    const pushed = message({ id, content: longMessage(`the bridge's answer ${id}`) });
+    const count = page.messages.filter((m) => m.thread && m.thread.id === thread.id && !m.thread.is_root).length + 1;
+    server.post({ ...pushed, thread: { ...thread, is_root: false, reply_count: count } });
+    server.edit("27720", { thread: { ...thread, reply_count: count } });
+    return pushed;
+  };
+  return { page, server, thread, reply };
+}
+
+test("`#308 live-reply-in-main` x `#280 scroll-stability`: the reply leaving Main moves no reader — one up the list stays on their row, and the jump no longer counts it; one on the newest line stays on it", async () => {
+  const run = async (script) => {
+    const { page, reply } = await tallThreadedMain(script);
+    const area = page.el("scroll-area");
+    assert.ok(atBottomOf(area), "the channel did not open on its newest line");
+    area.scrollTop = Math.round(area.scrollHeight / 3);
+    const before = readerOn(page);
+    await deliver(page, page.stream(), sseMessage(reply("27790")));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return { page, area, before, reply };
+  };
+  const { page, area, before, reply } = await run(SCRIPT);
+  assert.ok(!shownIds(page).includes("27790"), "the thread reply was left on Main");
+  assert.deepStrictEqual(readerOn(page), before, "the reply leaving Main moved the row the reader was on");
+  assert.equal(jumpSaysArrived(page), false, "the jump still counts a message that is not on Main");
+  assert.equal(page.el("jump-newest").hidden, false, "the way back down went from a reader up the list");
+
+  page.el("jump-newest").click();
+  await page.settle();
+  assert.ok(atBottomOf(area));
+  await deliver(page, page.stream(), sseMessage(reply("27791")));
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.ok(!shownIds(page).includes("27791"), "the second thread reply was left on Main");
+  assert.ok(atBottomOf(area), "a reader on the newest line was taken off it");
+  assert.equal(jumpSaysArrived(page), false, "a message leaving Main was offered as news");
+
+  // THE CONTROLS: the jump still counting what left, and the reader taken to the newest line.
+  const counting = await run(brokenScript("    if (!newer && gone > 0 && typeof counted === \"number\") {",
+    "    if (false) {"));
+  assert.equal(jumpSaysArrived(counting.page), true, "the jump never counted the reply, so this test cannot see it");
+  const thrown = await run(brokenScript("settleAfterRead(shown, { keepPosition: true, area, ...position, ownAct: !newer });",
+    "settleAfterRead(shown, { area, ...position, keepPosition: false, ownAct: !newer });"));
+  assert.notDeepStrictEqual(readerOn(thrown.page), thrown.before, "the reader stayed put anyway, so this test cannot see it");
+});
+
+test("`#308 live-reply-in-main`: in two columns the reply leaves Main on the left for its thread on the right", async () => {
+  const run = async (script) => {
+    const { page, server, data } = await twoColumnServer(null, script);
+    await threadBadge(rowWithId(page, "201")).click();
+    await page.settle();
+    assert.deepStrictEqual(sideIds(page), ["201", "202"], "fixture: the thread is not on the right");
+    const { pushed } = bridgeReply(page, server);
+    await deliver(page, page.stream(), sseMessage(pushed));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return { page, data };
+  };
+  const { page } = await run(SCRIPT);
+  assert.ok(!shownIds(page).includes("300"), "the thread reply was left on Main");
+  assert.deepStrictEqual(sideIds(page), ["201", "202", "300"], "the reply did not reach its thread on the right");
+  assert.equal(threadButton(rowWithId(page, "201")).textContent, "2 replies", "Main's root did not count the reply");
+
+  const control = await run(brokenScript("  queuePlaceUnplaced();\n}", "}"));
+  assert.ok(!sideIds(control.page).includes("300"),
+    "without the placing read the reply still reached the right column, so this test cannot see it");
+});
+
+test("`#308 live-reply-in-main`: a placing read that fails is asked again when the next read ends; one that lands is not asked again for what it did not carry", async () => {
+  const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; });
+  const serve = page.timeline;
+  let failing = 1;
+  page.timeline = (path, options) => {
+    if (/reason=place/.test(path) && failing > 0) {
+      failing -= 1;
+      return errorResponse(502, "chat_error", "history read timed out")();
+    }
+    return serve(path, options);
+  };
+  const placing = () => page.timelineCalls.filter((call) => /reason=place/.test(call)).length;
+  const { first, pushed } = bridgeReply(page, server);
+  await deliver(page, page.stream(), sseMessage(pushed));
+  await page.settle();
+  await page.settle();
+  assert.equal(placing(), 1, "no read of All was made to place the reply");
+  assert.ok(shownIds(page).includes("300"), "fixture: the placing read did not fail");
+  assert.notEqual(freshness(page).getAttribute("data-state"), "failed", "a placing read nobody asked for said the refresh failed");
+  await pollOnce(page);
+  await page.settle();
+  assert.equal(placing(), 2, "the placing read that failed was not asked again when the poll's read ended");
+  assert.ok(!shownIds(page).includes("300"), "the placing read that landed left the reply on Main");
+
+  // A message All's newest page does not carry: asked once, and then not again on every poll.
+  await deliver(page, page.stream(), sseMessage(message({ id: "310", content: "never on any page" })));
+  await page.settle();
+  await page.settle();
+  assert.equal(placing(), 3);
+  await pollOnce(page);
+  await pollOnce(page);
+  assert.equal(placing(), 3, "a message All's page had answered for was asked for again");
+  assert.ok(first, "fixture");
+});
+
+test("`#308 live-reply-in-main`: the placing read asks only what changed in All since All's last read, and All's newest page when the server cannot continue from there", async () => {
+  for (const refused of [false, true]) {
+    const { page, reply } = await tallThreadedMain();
+    const serve = page.timeline;
+    let refusals = refused ? 1 : 0;
+    page.timeline = (path, options) => {
+      if (/reason=place/.test(path) && /after=/.test(path) && refusals > 0) {
+        refusals -= 1;
+        return json(410, { error: "cursor_expired", detail: "that position is gone" });
+      }
+      return serve(path, options);
+    };
+    const from = page.timelineCalls.length;
+    await deliver(page, page.stream(), sseMessage(reply("27790")));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.ok(!shownIds(page).includes("27790"), `the thread reply was left on Main (refused: ${refused})`);
+    const placing = readsSince(page, from).filter(([, , reason]) => reason === "place");
+    assert.deepStrictEqual(placing, refused ? [["flat", true, "place"], ["flat", false, "place"]] : [["flat", true, "place"]],
+      `the placing read did not continue All, or fall back to its newest page: ${JSON.stringify(readsSince(page, from))}`);
+  }
+});
+
+test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up on is not asked again while the server may still be reading for it", async () => {
+  const run = async (script) => {
+    const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+    const serve = page.timeline;
+    const state = { hang: true };
+    page.timeline = (path, options) =>
+      (/reason=place/.test(path) && state.hang ? new Promise(() => {}) : serve(path, options));
+    const placing = () => page.timelineCalls.filter((call) => /reason=place/.test(call)).length;
+    const { pushed } = bridgeReply(page, server);
+    const sent = page.clock();
+    await deliver(page, page.stream(), sseMessage(pushed));
+    await page.settle();
+    assert.equal(placing(), 1, "no read of All was made to place the reply");
+    page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+    assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the placing read");
+    await page.settle();
+    state.hang = false;
+    page.setClock(sent + 30000);
+    await pollOnce(page);
+    return { page, placing, sent };
+  };
+  const { page, placing, sent } = await run(SCRIPT);
+  assert.equal(placing(), 1, "the placing read given up on was asked again inside the server's bound");
+  assert.ok(shownIds(page).includes("300"), "fixture: something else placed the reply");
+  page.setClock(sent + SERVER_READ_BOUND_MS + 1000);
+  await pollOnce(page);
+  assert.equal(placing(), 2, "the placing read was not asked again once the server's bound had passed");
+  assert.ok(!shownIds(page).includes("300"), "the placing read that landed left the reply on Main");
+
+  // THE CONTROL: without the hold the poll's read ending asks again at once.
+  const control = await run(brokenScript(" ||\n      placingHeld(channel)) return;", ") return;"));
+  assert.equal(control.placing(), 2, "the placing read waited without the hold, so this test cannot see it");
+});
+
+test("`#308 live-reply-in-main`: a placing page of All that lands after the stream delivered another message does not take that message away, and is read again", async () => {
+  const run = async (script) => {
+    const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+    const serve = page.timeline;
+    const held = [];
+    let holding = true;
+    // Answered as the server had it when asked, and handed over later.
+    page.timeline = (path, options) => {
+      if (!/reason=place/.test(path) || !holding) return serve(path, options);
+      const answer = serve(path, options);
+      return new Promise((resolve) => held.push(() => resolve(answer)));
+    };
+    const { pushed } = bridgeReply(page, server);
+    await deliver(page, page.stream(), sseMessage(pushed));
+    await page.settle();
+    assert.equal(held.length, 1, "no read of All was made to place the reply");
+    // A message to the channel itself, delivered while that read is out: its page cannot carry it.
+    const aside = server.post(message({ id: "207", content: "an aside on the main channel" }));
+    await deliver(page, page.stream(), sseMessage(aside));
+    await page.settle();
+    assert.ok(shownIds(page).includes("207"), "fixture: the aside was not drawn");
+    holding = false;
+    held[0]();
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    return { page };
+  };
+  const { page } = await run(SCRIPT);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "207"],
+    "the placing page took away a message delivered after it was asked, or left the reply on Main");
+
+  // THE CONTROL: folded regardless, the page sent before the aside takes it out as deleted.
+  const control = await run(brokenScript("        if ((liveEventsSeen.get(channel) || 0) !== live) {",
+    "        if (false) {"));
+  assert.ok(!shownIds(control.page).includes("207"),
+    "the stale placing page left the aside alone anyway, so this test cannot see it");
 });

@@ -77,6 +77,9 @@ pub enum ReadReason {
     Counts,
     /// The page: settling which thread a reply to an unplaced message belongs in.
     ReplyPlace,
+    /// The page: reading All to place messages the live stream delivered without their thread.
+    /// `#308 live-reply-in-main`.
+    Place,
     /// The page: the thread list's newest page, read for "Older threads…" when no cursor is known yet.
     Threads,
     /// The page: the right column's thread, or its list of threads, read beside Main.
@@ -105,7 +108,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 25] = [
+pub const ALL: [ReadReason; 26] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -119,6 +122,7 @@ pub const ALL: [ReadReason; 25] = [
     ReadReason::Search,
     ReadReason::Counts,
     ReadReason::ReplyPlace,
+    ReadReason::Place,
     ReadReason::Threads,
     ReadReason::Side,
     ReadReason::Naming,
@@ -151,6 +155,7 @@ impl ReadReason {
             Self::Search => "search",
             Self::Counts => "counts",
             Self::ReplyPlace => "reply-place",
+            Self::Place => "place",
             Self::Threads => "threads",
             Self::Side => "side",
             Self::Naming => "naming",
@@ -185,6 +190,7 @@ impl ReadReason {
                 | Self::Search
                 | Self::Counts
                 | Self::ReplyPlace
+                | Self::Place
                 | Self::Threads
                 | Self::Side
         )
@@ -283,6 +289,7 @@ mod tests {
                 "search",
                 "counts",
                 "reply-place",
+                "place",
                 "threads",
                 "side"
             ]
