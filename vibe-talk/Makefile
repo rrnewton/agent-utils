@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser copy-message-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser copy-message-browser fold-steps-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -347,6 +347,16 @@ done-feedback-browser:
 # it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each layout.
 elision-browser:
 	python3 tests/elision_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#301 semicolon-expand-cycle` in a real Chromium at a 1280x800 desk: ; four times and : three times step
+# the long messages round Expanded all, Expanded unread, collapsed read, and Collapsed all, judged by whether
+# each message's text overflows its box, with the status line read; the selected message, sampled at every
+# frame after each press, never moves by more than a pixel, at the newest line too; in two columns the keys
+# on the right step the right column's thread alone, its reader at its foot held, and ; in Main is Main's
+# own. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of
+# each step.
+fold-steps-browser:
+	python3 tests/fold_steps_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
 # reconciliation, PCM-duration metric, re-answer separation, privacy boundaries, threshold edges,

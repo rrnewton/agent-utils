@@ -2489,9 +2489,15 @@ function renderJumpNewest() {
  */
 function visibleFolds() {
   if (searchOpen && linksOnly) return [];
-  const list = visibleList();
+  // Nor a thread's rows in the right column while it shows the cards: they are not on screen.
+  // `#301 semicolon-expand-cycle`, whose keys work in either column.
+  if (sideActive && columns.side.mode !== "thread") return [];
+  // By the rows of the list, each holding its own fold (`foldable`), not by the list of folds: a view
+  // this page held, drawn again, comes back without its folds in that list, and so, as `#301
+  // semicolon-expand-cycle` found, the chips and the keys had nothing to fold in All after a visit to Main.
+  const rows = /** @type {any[]} */ ([...visibleList().children]);
   // Nor the rows of a collapsed run of read messages, whose text is behind its line. `#221 read-modes`.
-  return liveFolds().filter((entry) => entry.li.parentNode === list && !entry.li.hasAttribute("data-read-run"));
+  return rows.filter((li) => li.foldEntry && !li.hasAttribute("data-read-run")).map((li) => li.foldEntry);
 }
 
 /** How many redraws are under way that pass over the scroll tools once, at their end. `#226`. */
@@ -2576,14 +2582,147 @@ function renderScrollTools() {
  * one-way door at the list level.
  */
 function setAllFolded(folded) {
-  // Only ever the reader's own act, by a button or a key. `#243 filter-keeps-selection`.
+  // Only ever the reader's own act, by a button. `#243 filter-keeps-selection`.
   readerActed();
   preservingScroll(() => {
     for (const entry of visibleFolds()) {
       setFolded(entry, folded);
     }
   });
+  // The chips are two of the steps ; and : go round, and the keys go on from them: over the channel's
+  // lists, where the keys work, and never over the call's transcript. `#301`.
+  if (channelOnScreen()) foldSteps.set(foldStepKey(), folded ? "collapse" : "expand");
   renderScrollTools();
+}
+
+// --- ; and : step round three ways of showing the long messages -------------------------------
+//
+// `#301 semicolon-expand-cycle`. The owner, 2026-10-14: replace the ; and : pair, Expand all and
+// Collapse all, with a rotation on one key — (1) expand all, (2) expand every unread message and
+// collapse every read one, (3) collapse all, then (1) again — each press going on from the step it
+// last applied in that view; : goes round the other way. The two chips stay as they were.
+//
+// WHAT IT COVERS is what the chips cover (`visibleFolds`): the long messages of the list on screen,
+// each folded to its first lines, or under Summaries to its summary. Not the thread cards, which stay
+// contracted but for the one highlighted (`#277 thread-card-focus`), nor the runs of read messages
+// behind their lines under Collapse read, which `h` opens and shuts.
+//
+//   * READ is `rowIsRead`, the one rule Hide read, Collapse read and a thread's landing share: a row is
+//     read when every message it stands for is.
+//   * EACH LIST KEEPS ITS OWN STEP, for the session: Main, All, a thread, the right column's thread, the
+//     Pinned list, each by its pane's own name for it (`foldStepKey`). A press goes on from the step that
+//     list was left at, whatever has been opened or shut by hand since. The FIRST press in a list goes
+//     to the first step its way round — ; to Expand all, : to Collapse all, as the two keys did before —
+//     unless the list is already so, and then to (2), so that no first press does nothing. The chips,
+//     pressed, are (1) and (3) of Main's list (`setAllFolded`).
+//   * IN THE COLUMN THE KEYS ARE IN, as every key on the messages is (`onPageKey`).
+//   * THE READER STAYS PUT (`#280 scroll-stability`): the selected message while any of it shows, else
+//     the first message showing, keeps its top where it was, and is then held as a filter change holds
+//     its message (`placeFilterAnchor`) — the chips changing height under the list, a message arriving,
+//     a reader at the foot of the right column (`footKeeper`) move it no further — until the reader
+//     scrolls or acts in the list. Not the newest line for a reader on it, as `preservingScroll` would:
+//     opening everything under a reader at the foot leaves them on the message they were reading. A
+//     message taller than the screen whose top was above it, folded so short that none of it would
+//     show, comes back under the floating line with its head showing, where reading it starts.
+//   * SAID, briefly and politely, on the status line: "Expanded all", "Expanded unread, collapsed read",
+//     "Collapsed all". A list with no long message in it says so, and keeps its step.
+
+/** The steps, in the order ; goes round them. */
+const FOLD_STEPS = ["expand", "unread", "collapse"];
+
+/** What the status line says once each is applied. */
+const FOLD_STEP_WORDS = {
+  expand: "Expanded all", unread: "Expanded unread, collapsed read", collapse: "Collapsed all",
+};
+
+/** What it says where there is nothing to fold or open. */
+const FOLD_STEP_NONE = "No long messages here to expand or collapse.";
+
+/**
+ * By list (`foldStepKey`), the step last applied there by ; or :, or by a chip. Session-only, one
+ * short entry per list folded, for the reason `expandedIds` gives.
+ *
+ * @type {Map<string, string>}
+ */
+const foldSteps = new Map();
+
+/** The list of the column being worked on, as its pane names it: the column, and what it shows. */
+function foldStepKey() {
+  const pane = sideActive ? sidePane : channelPane;
+  return `${pane.name}|${pane.context()}`;
+}
+
+/** Whether `entry` is open once `step` is applied. */
+const openAtStep = (step, entry) => step === "expand" || (step === "unread" && !rowIsRead(entry.li));
+
+/**
+ * The step a press going `way` round (1 for ;, -1 for :) applies, from `from`, the step the list was
+ * left at, or null for a list it has never been applied in: then the first step that way round, or
+ * past it to (2) when every fold in `folds` is already as that step would leave it.
+ *
+ * @param {string | null} from
+ * @param {number} way
+ * @param {any[]} folds
+ */
+function nextFoldStep(from, way, folds) {
+  if (from !== null) return FOLD_STEPS[(FOLD_STEPS.indexOf(from) + way + FOLD_STEPS.length) % FOLD_STEPS.length];
+  const first = way > 0 ? "expand" : "collapse";
+  return folds.every((entry) => isFolded(entry) !== openAtStep(first, entry)) ? "unread" : first;
+}
+
+/**
+ * The reader's row in the column being worked on, as a filter change's anchor (`anchorAt`): the selected
+ * message while any of it shows, else the first message showing. Its top, never a part of a combined
+ * row inside it, which a fold may cut off. Null with no row showing.
+ */
+function foldStepAnchor() {
+  const pane = sideActive ? sidePane : channelPane;
+  const mark = markOf(pane);
+  const chosen = mark ? paneRowFor(pane, mark.id) : null;
+  const row = chosen && rowInView(pane, chosen) ? chosen : paneRows(pane).find((one) => rowInView(pane, one));
+  return row ? anchorAt(row) : null;
+}
+
+/**
+ * Apply `step` to `folds`, the folds of the list on screen in the column being worked on, the reader's
+ * row kept where it is and held there (see the head of this section).
+ *
+ * @param {string} step
+ * @param {any[]} folds
+ */
+function applyFoldStep(step, folds) {
+  // The reader's own act: whatever an earlier change held is let go, and this measures from here.
+  readerActed();
+  const anchor = foldStepAnchor();
+  for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
+  if (anchor) {
+    placeFilterAnchor(anchor);
+    const row = anchor.row;
+    const head = (sideActive ? sidePane : channelPane).head();
+    if (filterHold !== null && filterHold.row === row && row.getBoundingClientRect().bottom <= head) {
+      const area = el("scroll-area");
+      area.scrollTop += row.getBoundingClientRect().top - head;
+      filterHold = { ...filterHold, at: area.scrollTop,
+        offset: row.getBoundingClientRect().top - area.getBoundingClientRect().top };
+    }
+  }
+  renderScrollTools();
+}
+
+/** ; and :: the next step `way` round (1 or -1) in the list on screen of the column the keys are in. */
+function foldStepFromKeyboard(way) {
+  if (!channelOnScreen()) return false;
+  const folds = visibleFolds();
+  if (folds.length === 0) {
+    setStatus(FOLD_STEP_NONE);
+    return true;
+  }
+  const key = foldStepKey();
+  const step = nextFoldStep(foldSteps.get(key) || null, way, folds);
+  applyFoldStep(step, folds);
+  foldSteps.set(key, step);
+  setStatus(FOLD_STEP_WORDS[step]);
+  return true;
 }
 
 // --- searching what is on screen --------------------------------------------------------------
@@ -7563,13 +7702,6 @@ function filterFromKeyboard(which) {
   return true;
 }
 
-/** ; and :: Expand all and Collapse all, over the list on screen. */
-function foldAllFromKeyboard(folded) {
-  if (!channelOnScreen()) return false;
-  setAllFolded(folded);
-  return true;
-}
-
 /** z: undo the last Done, as the Undo chip does. */
 function undoFromKeyboard() {
   if (!channelOnScreen()) return false;
@@ -8157,17 +8289,21 @@ const KEYMAP = [
     controls: ["author-filter"],
     run: () => filterFromKeyboard("author"),
   },
+  // `#301 semicolon-expand-cycle`. Not the keys of the Expand all and Collapse all chips any more: a press
+  // does what one of them does only one time in three, so neither chip names them.
   {
     group: KEYS_VIEW, chords: [{ key: ";" }],
-    does: "Expand all",
-    controls: ["expand-all"],
-    run: () => foldAllFromKeyboard(false),
+    does: "The long messages, a step a press: expand all, then open the unread and fold the read, then collapse " +
+      "all, and round again. Each list, in either column, goes on from the step it was left at; the first press " +
+      "in one expands all, or opens the unread and folds the read if all are open already. The message you are on " +
+      "stays where it is",
+    run: () => foldStepFromKeyboard(1),
   },
   {
     group: KEYS_VIEW, chords: [{ key: ":" }],
-    does: "Collapse all",
-    controls: ["collapse-all"],
-    run: () => foldAllFromKeyboard(true),
+    does: "The same steps the other way round: the first press in a list collapses all, or opens the unread and " +
+      "folds the read if all are folded already",
+    run: () => foldStepFromKeyboard(-1),
   },
   {
     group: KEYS_WRITING, chords: [{ key: "c" }],

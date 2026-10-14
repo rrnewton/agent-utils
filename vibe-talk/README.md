@@ -5568,7 +5568,7 @@ from, so it cannot name a key the page does not answer.
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
 | `h` | Show read, Collapse read, Hide read, in turn |
 | Shift+P, Shift+L | The Pinned and Links filters |
-| `;`, `:` | Expand all, Collapse all |
+| `;`, `:` | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. See below |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
 | `c` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
 | Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on Settings or Help too. The browser's "Save page" never opens |
@@ -5635,6 +5635,54 @@ failing that uses the Clipboard API or a hidden text box. Cmd+Shift+C (Ctrl+Shif
 because Chrome keeps it for the DevTools element picker. `make -C vibe-talk copy-message-browser`
 presses the keys in a real Chromium at 1280x800, on Linux and in a tab emulating a Mac, and on a
 412x915 phone with a hardware keyboard, and reads the clipboard back after each press.
+
+### `;` and `:` step the long messages round
+
+`#301 semicolon-expand-cycle`. `;` and `:` were Expand all and Collapse all. Now `;` steps the list
+round three ways of showing its long messages, a step a press, and `:` steps it round the other way:
+
+1. **Expanded all**: every long message drawn whole.
+2. **Expanded unread, collapsed read**: the unread ones whole and the read ones folded, so what is
+   left to read is all there and what has been dealt with takes three lines.
+3. **Collapsed all**: every long message folded to its first lines.
+
+Then back to the first. What the keys fold is what the **Expand all** and **Collapse all** chips fold,
+and the chips stay: the long messages of the list on screen, each folded to its opening lines, or under
+**Summaries** to its summary. Not the thread cards, which stay three lines but for the one
+highlighted, and not the runs of read messages behind their lines under Collapse read, which `h` and a
+tap open. Read is the one rule Hide read and Collapse read use: a row is read when every message it
+stands for is Done, read automatically, or your own (with that setting on).
+
+**Each list keeps its own step**, for as long as the page is open: Main, All, a thread, the Pinned list
+and the right column's thread are each stepped on from where that list was left, whatever you have
+opened or folded by hand since. The first press in a list goes to the first step its way round — `;`
+to Expanded all and `:` to Collapsed all, as the two keys did before — unless the list is already
+like that, when it goes on to the second step, so that no first press does nothing. The chips count
+as steps: after **Collapse all** the next `;` expands all, and after **Expand all** it opens the unread
+and folds the read. The keys work wherever the page's single keys do (never while you are typing in a
+box), in either column in two columns, on the list the keys are in; in the call's view they do nothing.
+
+**The message you are on stays where it is.** The selected message while any of it shows, or else the
+first message showing, keeps its place on the screen through every step, even at the newest line:
+everything opening under it does not take the list to its new end. It is then held there as a filter
+change holds its message — the chips changing height, a message arriving and the right column's
+keeping of a reader at its foot leave it alone — until you scroll or act in the list. A message taller
+than the screen that you were reading past the top of, folded so short that none of it would show,
+comes back with its first lines at the top of the list. A list with nothing long in it says so.
+
+The status line says each step for a moment — "Expanded all", "Expanded unread, collapsed read",
+"Collapsed all" — and a screen reader hears it politely. Building this found that a view the page
+held, shown again, came back with its long messages missing from what the chips counted, so after a
+visit to Main the chips offered nothing over All's folded messages; the chips and the keys now read
+the folds from the rows on screen.
+
+`tests/fold_steps_browser.py` (DAG step `fold-steps-browser`, `make -C vibe-talk fold-steps-browser`)
+presses the real keys in Chromium at a 1280x800 desk: `;` four times and `:` three times in one column,
+each step judged by whether each message's text overflows its box, with the status line read, and the
+selected message sampled at every frame for 0.8 s after each press, which must not move it by more than
+a pixel; then `;` at the newest line; then in two columns, the right column's thread at its foot,
+`;` and `;` and a `:` that opens only what is under the reader, Main untouched, and `;` in Main, the
+right column untouched.
 
 ### The reading bookmark
 

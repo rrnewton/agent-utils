@@ -21663,6 +21663,8 @@ test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and t
   const tall = await keyboardPage();
   const folded = () => tall.el("discord-log").children.filter((li) => li.getAttribute("data-collapsed") === "true").length;
   assert.ok(folded() > 0);
+  // `#301 semicolon-expand-cycle`: the first ; in a list expands all, and : goes back round from there to
+  // Collapse all. The rotation itself is tested under that issue below.
   await press(tall, tall.el("scroll-area"), ";");
   assert.equal(folded(), 0, "; did not expand every message");
   await press(tall, tall.el("scroll-area"), ":");
@@ -21677,6 +21679,366 @@ test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and t
   assert.notEqual(dvorak.el("status").textContent, "Nothing to undo.", "; typed on Dvorak's KeyZ was read as z, Undo");
   await press(dvorak, dvorak.el("scroll-area"), ":", { code: "KeyZ", shiftKey: true });
   assert.ok(shut() > 0, ": typed on Dvorak's KeyZ did not collapse them again");
+});
+
+// --- `#301 semicolon-expand-cycle` ------------------------------------------------------------------
+//
+// The owner, 2026-10-14: ; goes round (1) expand all, (2) expand every unread message and collapse
+// every read one, (3) collapse all, and back to (1); : the other way; each press goes on from the step
+// it last applied in that view. The Expand all and Collapse all chips stay.
+
+/** Which of a list's long messages are open and which folded, by id, in the list's order. */
+function foldState(page, list = "discord-log") {
+  const open = [];
+  const shut = [];
+  for (const li of page.el(list).children) {
+    const at = li.getAttribute("data-collapsed");
+    if (at === "true") shut.push(li.getAttribute("data-id"));
+    else if (at === "false") open.push(li.getAttribute("data-id"));
+  }
+  return { open, shut };
+}
+
+/** What the status line says while it shows, else null. */
+const statusSaid = (page) => (page.el("status-line").hidden ? null : page.el("status").textContent);
+
+/** A channel of `count` long messages, the odd ids read (Done on the server), in Show read. */
+async function foldStepPage(count = 12, messages = tallChannel(count)) {
+  const page = newPage();
+  for (const one of messages) if (Number(one.id) % 2 === 1) page.dealtWith.add(String(one.id));
+  await signIn(page);
+  await showDiscord(page, messages);
+  return page;
+}
+
+/** The fold states of `foldStepPage`'s list at each step, and what the status line says of each. */
+function foldSteps(page) {
+  const all = page.el("discord-log").children.map((li) => li.getAttribute("data-id"));
+  const unread = all.filter((id) => Number(id) % 2 === 0);
+  const read = all.filter((id) => Number(id) % 2 === 1);
+  return {
+    all, unread, read,
+    expand: { open: all, shut: [] }, unread_open: { open: unread, shut: read }, collapse: { open: [], shut: all },
+  };
+}
+
+const FOLD_SAID = { expand: "Expanded all", unread: "Expanded unread, collapsed read", collapse: "Collapsed all" };
+
+test("`#301 semicolon-expand-cycle`: ; GOES ROUND expand all, the unread open and the read folded, and collapse all, and : the other way, each step said on the status line", async () => {
+  const page = await foldStepPage();
+  const area = page.el("scroll-area");
+  const steps = foldSteps(page);
+  // The fixture is what it says: half of it read by the page's own rule, and every message folded.
+  assert.deepStrictEqual(steps.all.filter((id) => channelRow(page, id).getAttribute("data-archived") === "true"), steps.read);
+  assert.deepStrictEqual(foldState(page), steps.collapse);
+  const expected = { expand: steps.expand, unread: steps.unread_open, collapse: steps.collapse };
+  const back = { shiftKey: true };
+  for (const [key, fields, step] of [[";", {}, "expand"], [";", {}, "unread"], [";", {}, "collapse"], [";", {}, "expand"],
+    [":", back, "collapse"], [":", back, "unread"], [":", back, "expand"], [":", back, "collapse"], [";", {}, "expand"]]) {
+    const event = await press(page, area, key, fields);
+    assert.equal(event.defaulted, false, `${key} was left to the browser`);
+    assert.deepStrictEqual(foldState(page), expected[step], `${key} did not go to ${step}`);
+    assert.equal(statusSaid(page), FOLD_SAID[step], `${key} to ${step} said ${statusSaid(page)}`);
+  }
+  // Said politely: the status line is the page's polite live region.
+  assert.match(HTML_CODE, /<span id="status" role="status" aria-live="polite">/);
+  // Read is the page's one rule, as it stands now: a message marked Done since is folded by (2) as well.
+  await doneButton(channelRow(page, "2")).click();
+  await page.settle();
+  assert.equal(channelRow(page, "2").getAttribute("data-archived"), "true", "Done did not mark the message read");
+  await press(page, area, ";");
+  assert.deepStrictEqual(foldState(page).shut, ["1", "2", ...steps.read.slice(1)], "(2) opened a message read since");
+  // Negative control: the rule is the read state, not the ids — with nothing read, (2) opens everything.
+  const fresh = newPage();
+  await signIn(fresh);
+  await showDiscord(fresh, tallChannel(12));
+  await press(fresh, fresh.el("scroll-area"), ";");
+  await press(fresh, fresh.el("scroll-area"), ";");
+  assert.equal(statusSaid(fresh), FOLD_SAID.unread);
+  assert.deepStrictEqual(foldState(fresh).shut, [], "(2) folded a message nobody has read");
+});
+
+test("`#301 semicolon-expand-cycle`: THE FIRST PRESS in a list goes to the first step its way round, or past it when the list is so already; a fold by hand is no step, and the chips are steps", async () => {
+  const back = { shiftKey: true };
+  // ; in a list already all open: (2), not a press that changes nothing.
+  let page = await foldStepPage();
+  let steps = foldSteps(page);
+  for (const li of page.el("discord-log").children) await foldButton(li).click();
+  assert.deepStrictEqual(foldState(page), steps.expand, "the fixture did not open every message");
+  await press(page, page.el("scroll-area"), ";");
+  assert.deepStrictEqual(foldState(page), steps.unread_open, "the first ; in a list all open did nothing");
+  assert.equal(statusSaid(page), FOLD_SAID.unread);
+  // : in a list all folded: (2) as well.
+  page = await foldStepPage();
+  steps = foldSteps(page);
+  await press(page, page.el("scroll-area"), ":", back);
+  assert.deepStrictEqual(foldState(page), steps.unread_open, "the first : in a list all folded did nothing");
+  // : in a list part open: Collapse all, as : always did.
+  page = await foldStepPage();
+  steps = foldSteps(page);
+  await foldButton(channelRow(page, "4")).click();
+  await press(page, page.el("scroll-area"), ":", back);
+  assert.deepStrictEqual(foldState(page), steps.collapse, "the first : in a list part open did not collapse all");
+  assert.equal(statusSaid(page), FOLD_SAID.collapse);
+  // A message folded by hand is not a step: after Expand all the reader folds an unread message, and the
+  // next ; goes on to (2), which opens it again. Started again from the list, it would have been (1).
+  page = await foldStepPage();
+  steps = foldSteps(page);
+  await press(page, page.el("scroll-area"), ";");
+  await foldButton(channelRow(page, "4")).click();
+  assert.ok(foldState(page).shut.includes("4"));
+  await press(page, page.el("scroll-area"), ";");
+  assert.deepStrictEqual(foldState(page), steps.unread_open, "a fold by hand started the rotation again");
+  // The chips are steps, and the keys go on from them: from (2), Expand all is (1) and ; goes to (2);
+  // Collapse all is (3) and ; goes to (1). Negative control: had the chip not counted, each ; would have
+  // gone on from (2), to (3).
+  await page.el("expand-all").click();
+  assert.deepStrictEqual(foldState(page), steps.expand);
+  await press(page, page.el("scroll-area"), ";");
+  assert.deepStrictEqual(foldState(page), steps.unread_open, "; did not go on from the Expand all chip");
+  await page.el("collapse-all").click();
+  assert.deepStrictEqual(foldState(page), steps.collapse);
+  await press(page, page.el("scroll-area"), ";");
+  assert.deepStrictEqual(foldState(page), steps.expand, "; did not go on from the Collapse all chip");
+  // Neither chip says a key any more: ; and : press neither, but one time in three.
+  assert.equal(page.el("expand-all").getAttribute("aria-keyshortcuts"), null, "Expand all still says ; is its key");
+  assert.equal(page.el("collapse-all").getAttribute("aria-keyshortcuts"), null, "Collapse all still says : is its key");
+  // A list with nothing long in it says so, takes the key, and changes nothing.
+  const short = newPage();
+  await signIn(short);
+  await showDiscord(short, Array.from({ length: 4 }, (_unused, i) => message({ id: String(i + 1), content: SHORT_MESSAGE })));
+  const event = await press(short, short.el("scroll-area"), ";");
+  assert.equal(event.defaulted, false);
+  assert.equal(statusSaid(short), "No long messages here to expand or collapse.");
+  // On the call's view the keys are not the page's, as before.
+  await short.el("view-switch").click();
+  assert.equal(short.tab(), "voice");
+  assert.equal((await press(short, short.el("scroll-area"), ";")).defaulted, true, "; acted on the call's view");
+});
+
+test("`#301 semicolon-expand-cycle`: EACH LIST KEEPS ITS OWN STEP — All, Main, a thread and the right column — and the keys fold the column they are in", async () => {
+  const page = newPage();
+  // Posts 0 to 3 on the channel, then the thread's first message and eight long replies; the posts with an
+  // even number and the odd replies are read.
+  threadHistory(page, { replies: 8, size: 20, top: 4, content: (i) => longMessage(`reply ${i}`),
+    posted: (i) => longMessage(`post ${i}`) });
+  const posts = page.posts.map((m) => String(m.id));
+  const replies = page.messages.filter((m) => m.thread && !m.thread.is_root).map((m) => String(m.id));
+  for (const id of [...posts.filter((_id, i) => i % 2 === 0), ...replies.filter((_id, i) => i % 2 === 0)]) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  const picker = page.el("thread-select");
+  const area = page.el("scroll-area");
+  const back = { shiftKey: true };
+  const choose = async (key) => {
+    await press(page, area, key, { ctrlKey: true });
+    await page.settle();
+  };
+  const unreadOf = (ids) => ids.filter((id) => !page.dealtWith.has(id));
+  const readOf = (ids) => ids.filter((id) => page.dealtWith.has(id));
+  assert.equal(picker.value, "flat", "the channel did not open in All");
+  // All: ; and ; again, to (2).
+  await press(page, area, ";");
+  await press(page, area, ";");
+  const longInAll = [...posts, ...replies];
+  assert.deepStrictEqual(foldState(page), { open: unreadOf(longInAll), shut: readOf(longInAll) });
+  // Main: its first press. It is part open — its read posts folded by All's (2) — so (1). Had the step been
+  // the page's and not the list's, this would have been (3).
+  await choose("1");
+  assert.equal(picker.value, "main");
+  await press(page, area, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.expand, "Main's first ; went on from All's step");
+  assert.deepStrictEqual(foldState(page), { open: posts, shut: [] });
+  // All again: on from its own (2), to (3). Had it gone on from Main's (1), this would have been (2).
+  await choose("2");
+  assert.equal(picker.value, "flat");
+  // All, drawn again from what the page held, still offers its folds: before, its rows came back without
+  // them in the page's list of folds, and neither the chips nor the keys found anything to fold.
+  assert.equal(page.el("expand-all").hidden, false, "All, shown again, does not offer to expand its read messages");
+  await press(page, area, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.collapse, "All did not go on from where it was left");
+  assert.deepStrictEqual(foldState(page), { open: [], shut: longInAll });
+  // A thread in one column: its own first press, (1); : then goes back round to (3).
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  assert.equal(page.el("thread-heading").hidden, false, "the thread did not open");
+  const inThread = page.el("discord-log").children.map((li) => li.getAttribute("data-id")).filter((id) => replies.includes(id));
+  assert.ok(inThread.length >= 4, `the thread drew ${inThread.length} replies`);
+  await press(page, area, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.expand, "the thread's first ; went on from another list's step");
+  await press(page, area, ":", back);
+  assert.equal(statusSaid(page), FOLD_SAID.collapse);
+  // Main again: on from its (1), to (2).
+  await choose("1");
+  await press(page, area, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.unread, "Main did not go on from where it was left");
+  assert.deepStrictEqual(foldState(page), { open: unreadOf(posts), shut: readOf(posts) });
+  // Two columns, the thread on the right: the right column's list is its own, and the keys fold the
+  // column they are pressed in, never the other.
+  await twoColumns(page);
+  await openerOf(cardRow(page, page.threads[0].id)).click();
+  await page.settle();
+  assert.equal(page.el("side-pane").hidden, false, "the thread did not open on the right");
+  const mainBefore = foldState(page);
+  const side = page.el("side-scroll");
+  const onRight = () => page.el("side-log").children.map((li) => li.getAttribute("data-id")).filter((id) => replies.includes(id));
+  assert.deepStrictEqual(foldState(page, "side-log"), { open: [], shut: onRight() }, "the right column's thread is not folded");
+  await press(page, side, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.expand, "the right column's first ; went on from another list's step");
+  assert.deepStrictEqual(foldState(page, "side-log"), { open: onRight(), shut: [] }, "; on the right did not open the right column");
+  assert.deepStrictEqual(foldState(page), mainBefore, "; on the right folded Main");
+  await press(page, side, ";");
+  assert.deepStrictEqual(foldState(page, "side-log"), { open: unreadOf(onRight()), shut: readOf(onRight()) });
+  assert.deepStrictEqual(foldState(page), mainBefore, "; on the right folded Main");
+  // In Main, beside it: Main's own (2) goes on to (3), and the right column is left as it is.
+  const sideBefore = foldState(page, "side-log");
+  await press(page, area, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.collapse, "Main beside the right column did not go on from its own step");
+  assert.deepStrictEqual(foldState(page), { open: [], shut: posts });
+  assert.deepStrictEqual(foldState(page, "side-log"), sideBefore, "; in Main folded the right column");
+  // And back on the right: on from its own (2), to (3).
+  await press(page, side, ";");
+  assert.deepStrictEqual(foldState(page, "side-log"), { open: [], shut: onRight() }, "the right column did not go on from its own step");
+});
+
+test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: THE READER'S ROW STAYS PUT through every step — the selected message, else the first showing — on the newest line too", async () => {
+  const steps = [[";", {}], [";", {}], [";", {}], [";", {}], [":", { shiftKey: true }], [":", { shiftKey: true }], [":", { shiftKey: true }]];
+  // The selected message, on a reader at the newest line.
+  let page = await foldStepPage(30);
+  let area = page.el("scroll-area");
+  assert.ok(atBottomOf(area), "the channel did not open at its newest message");
+  await press(page, area, "ArrowDown");
+  await pressHere(page, "k");
+  await pressHere(page, "k");
+  const chosen = selectedId(page);
+  assert.ok(/^\d+$/.test(chosen), `nothing was selected: ${chosen}`);
+  const top = channelRow(page, chosen).getBoundingClientRect().top;
+  for (const [key, fields] of steps) {
+    // Pressed where the focus is, on the selected message, as a reader at the keys does.
+    await pressHere(page, key, fields);
+    const now = channelRow(page, chosen).getBoundingClientRect().top;
+    assert.ok(Math.abs(now - top) <= 1, `${key} (${statusSaid(page)}) moved the selected message by ${now - top}px`);
+    assert.equal(selectedId(page), chosen, `${key} moved the selection`);
+  }
+  // Negative control: the Expand all chip keeps the newest line for a reader on it, as every redraw does
+  // (`preservingScroll`), and the same message moves: the check can see a move.
+  page = await foldStepPage(30);
+  area = page.el("scroll-area");
+  await press(page, area, "ArrowDown");
+  await pressHere(page, "k");
+  await pressHere(page, "k");
+  const lit = selectedId(page);
+  const before = channelRow(page, lit).getBoundingClientRect().top;
+  await page.el("expand-all").click();
+  assert.ok(Math.abs(channelRow(page, lit).getBoundingClientRect().top - before) > 1,
+    "the chip at the newest line left the message where it was, so this cannot tell a hold from a follow");
+  // Nothing selected, the list scrolled up: the first message showing, its top at the list's top edge.
+  page = await foldStepPage(30);
+  area = page.el("scroll-area");
+  const first = channelRow(page, "12");
+  area.scrollTop += first.getBoundingClientRect().top;
+  assert.equal(first.getBoundingClientRect().top, 0);
+  for (const [key, fields] of steps) {
+    await press(page, area, key, fields);
+    assert.equal(first.getBoundingClientRect().top, 0, `${key} (${statusSaid(page)}) moved the first message showing`);
+  }
+});
+
+test("`#301 semicolon-expand-cycle`: a message TALLER THAN THE SCREEN, read past its top and folded, comes back with its head showing, and the right column's reader stays put too", async () => {
+  // Message 3 is a wall: open, it runs far past the screen. The reader has scrolled into the middle of it.
+  const messages = tallChannel(8);
+  messages[2] = { ...messages[2], content: `wall: ${"a sentence about the overnight run. ".repeat(200)}` };
+  const page = await foldStepPage(8, messages);
+  const area = page.el("scroll-area");
+  await foldButton(channelRow(page, "3")).click();
+  const wall = channelRow(page, "3");
+  assert.ok(wall.getBoundingClientRect().height > 3 * SCROLL_VIEWPORT_PX, "the wall is not taller than the screen");
+  area.scrollTop += wall.getBoundingClientRect().top + 1000;
+  assert.ok(wall.getBoundingClientRect().top < -900 && wall.getBoundingClientRect().bottom > SCROLL_VIEWPORT_PX);
+  // : in a list part open is Collapse all. Held by its top, the wall would be folded out of sight above
+  // the screen; its head comes to the top of the list, under the floating line, instead.
+  await press(page, area, ":", { shiftKey: true });
+  assert.equal(statusSaid(page), FOLD_SAID.collapse);
+  const head = page.pure("floatingClearance")(area);
+  const box = wall.getBoundingClientRect();
+  assert.equal(box.top, head, `the folded wall is at ${box.top}px, not with its head under the floating line at ${head}px`);
+  assert.ok(box.bottom > head && box.bottom < SCROLL_VIEWPORT_PX);
+
+  // The right column, its thread scrolled to its foot: the reader's row there stays put, and Main does not move.
+  const side = newPage();
+  threadHistory(side, { replies: 10, size: 20, content: (i) => longMessage(`reply ${i}`) });
+  await signIn(side);
+  await showDiscord(side, side.messages);
+  await twoColumns(side);
+  await openerOf(cardRow(side, side.threads[0].id)).click();
+  await side.settle();
+  const scroller = side.el("side-scroll");
+  assert.ok(scroller.scrollHeight > scroller.clientHeight, "the thread on the right does not overflow");
+  scroller.scrollTop = scroller.scrollHeight;
+  await press(side, scroller, "ArrowDown");
+  await pressHere(side, "k");
+  const held = focused(side);
+  assert.ok(held && held.parentNode === side.el("side-log"), `the keys did not select a row on the right: ${focusName(side)}`);
+  const at = held.getBoundingClientRect().top;
+  const mainAt = side.el("scroll-area").scrollTop;
+  for (const [key, fields] of [[";", {}], [";", {}], [";", {}], [":", { shiftKey: true }]]) {
+    await press(side, scroller, key, fields);
+    const now = held.getBoundingClientRect().top;
+    assert.ok(Math.abs(now - at) <= 1, `${key} on the right (${statusSaid(side)}) moved the reader's row by ${now - at}px`);
+    assert.equal(side.el("scroll-area").scrollTop, mainAt, `${key} on the right scrolled Main`);
+  }
+});
+
+test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: AT THE FOOT OF THE RIGHT COLUMN a step that opens only what is under the reader scrolls nothing, and the keeper of the foot does not take them down after it", async () => {
+  // The thread's last three replies read and the rest unread, so at (2) everything above the first read
+  // reply is open and it and the two under it are folded: : back to (1) opens only those, nothing above
+  // the reader changes, and the step scrolls nothing — so no scroll tells the right column's keeper of a
+  // reader at its foot (`#280`) that the reader is no longer there. Chromium showed it taking them to the
+  // new foot a frame later, 679px (tests/fold_steps_browser.py). The step holds its row as a filter
+  // change does, and the keeper leaves a held row alone.
+  const run = async (script) => {
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    threadHistory(page, { replies: 10, size: 20, content: (i) => longMessage(`reply ${i}`) });
+    const replies = page.messages.filter((m) => m.thread && !m.thread.is_root).map((m) => String(m.id));
+    for (const id of replies.slice(-3)) page.dealtWith.add(id);
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    await twoColumns(page);
+    await openerOf(cardRow(page, page.threads[0].id)).click();
+    await page.settle();
+    const side = page.el("side-scroll");
+    const pane = page.el("side-pane");
+    // The keeper's first pass, which notes what the column shows.
+    page.resized(pane);
+    await press(page, side, ";");
+    await press(page, side, ";");
+    assert.equal(statusSaid(page), FOLD_SAID.unread);
+    // The reader at the foot, on the first read reply.
+    await press(page, side, "End");
+    await pressHere(page, "k");
+    await pressHere(page, "k");
+    side.scrollTop = side.scrollHeight;
+    await side.dispatch("scroll");
+    const row = focused(page);
+    assert.equal(selectedId(page), replies[replies.length - 3], "the premise: the first read reply is selected");
+    assert.ok(atBottomOf(side), "the premise: the right column is at its foot");
+    const top = row.getBoundingClientRect().top;
+    const scrolled = side.scrollTop;
+    await pressHere(page, ":", { shiftKey: true });
+    const stepScrolled = side.scrollTop !== scrolled;
+    // What the browser does after the layout the step changed: tells whatever watches the column.
+    page.resized(pane);
+    await page.settle();
+    return { said: statusSaid(page), stepScrolled, moved: row.getBoundingClientRect().top - top };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { said: FOLD_SAID.expand, stepScrolled: false, moved: 0 });
+  // THE CONTROL: the row placed but not held. The keeper takes the reader to the new foot, by the height of
+  // the three replies opened under them.
+  const unheld = await run(brokenScript("    placeFilterAnchor(anchor);\n",
+    "    { const area = el(\"scroll-area\"); area.scrollTop += anchor.row.getBoundingClientRect().top - " +
+    "area.getBoundingClientRect().top - anchor.offset; }\n"));
+  assert.equal(unheld.stepScrolled, false);
+  assert.ok(unheld.moved < -100, `the keeper left an unheld reader at ${unheld.moved}px, so this cannot see it`);
 });
 
 test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chosen from — Main, All or a thread in one column, or two columns — and never to a thread opened from it", async () => {

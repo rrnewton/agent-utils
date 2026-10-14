@@ -719,6 +719,30 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#301 semicolon-expand-cycle` in the browser engine, at a 1280x800 desk with the keys: ; four times and :
+  # three times in one column step the long messages round Expanded all, Expanded unread, collapsed read,
+  # and Collapsed all, each judged by whether every message's text overflows its box (folded) or is drawn
+  # whole, read and unread, with the status line saying the step politely; the selected message, sampled at
+  # every frame for 0.8 s after each press, moves by no more than a pixel, at the newest line too; in two
+  # columns, the right column's thread at its foot, ; there steps it alone and holds its reader — a : that
+  # opens only what is under the reader too, which scrolls nothing and so, unheld, the right column's keeper
+  # of its foot took 679px down a frame later — and ; in Main is Main's own first step. Served through
+  # Playwright's request routing, so it opens no port. Measured on 2026-10-14: about 19s wall, most of it the
+  # 0.8 s watch after each press.
+  - group: check
+    job: fold-steps-browser
+    desc: "the semicolon and colon keys step the long messages round expand all, unread only and collapse all, drawn as said, the reader's row held within a pixel at every frame, in one column and two, in current Chromium at 1280x800"
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/fold_steps_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 19
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release
