@@ -58275,3 +58275,49 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHOSE SCRE
     "  const card = seen.length === 0 ? channelCard() : null;\n", "  const card = channelCard();\n"));
   assert.deepStrictEqual(always, { ...real, byRow: false });
 });
+
+// --- `#303 voice-post-prefix` with `#269 approval-card-inline` and `#270 voice-transcript-markers` --
+//
+// The server puts the owner's tag in front of the voice agent's words before it proposes or posts
+// them, so the tagged text is the one text there is: the card shows it, the read-back says it, Send
+// and a spoken yes restate it, and the frozen card the send leaves shows it, drawn from the server's
+// own copy of what went. Nothing on the page takes the tag off: `agentDraft` is for judging the
+// agent's words for a spoken yes, and never for what is put on screen.
+
+test("`#303 voice-post-prefix`: a tagged draft freezes into a card showing what was posted, tag and all, by tap, by voice and sent without asking", async () => {
+  for (const how of ["tap", "voice"]) {
+    const page = newPage();
+    const pending = taggedDraft("on it, rebasing now", { serial: 7 });
+    const socket = await recordedReadBack(page, `conv_tagged_${how}`, pending);
+    assert.equal(page.el("post-confirm-text").textContent, pending.text, `${how}: the card`);
+    if (how === "tap") {
+      page.expireTimers(2000);
+      await page.el("post-confirm-send").click();
+    } else {
+      hostedHears(socket, "yes please");
+      await settleSpokenYes(page);
+    }
+    await watchTurns(page);
+    assert.deepEqual(page.proposalCommits.map((commit) => [commit.text, commit.confirmed_by]),
+      [[pending.text, how === "tap" ? "ui" : "speaker_turn"]], `${how}: the commit`);
+    const cards = sentCards(page);
+    assert.equal(cards.length, 1, `${how}: the send left no frozen card, or two`);
+    assert.match(wordsOf(cards[0]), how === "tap" ? /approved by tap/ : /approved by voice/);
+    const body = cards[0].children.find((kid) => kid.className === "body");
+    assert.equal(body && body.textContent, pending.text, `${how}: the frozen card does not show what was posted`);
+    assert.ok(body.textContent.startsWith(DEFAULT_POST_PREFIX), `${how}: the frozen card lost the tag`);
+  }
+
+  // A direct send is never proposed: the frozen card is the server's copy alone, tag and all.
+  const page = newPage();
+  page.setClock(1_700_000_100_000);
+  await recordingCall(page);
+  await watchTurns(page);
+  const direct = taggedDraft("rebase onto main", { serial: 21, handle: "dIrEcT" });
+  page.publishSend(direct, "direct");
+  await watchTurns(page);
+  const card = sentCards(page)[0];
+  assert.ok(card, "the direct send left no frozen card");
+  assert.match(wordsOf(card), /sent without asking/);
+  assert.equal(card.children.find((kid) => kid.className === "body").textContent, `${DEFAULT_POST_PREFIX}rebase onto main`);
+});
