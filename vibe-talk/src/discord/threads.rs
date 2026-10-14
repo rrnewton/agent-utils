@@ -56,6 +56,30 @@ struct Inventory {
     threads: Vec<NativeThread>,
 }
 
+/// One page of a native message history, and what Discord itself answered for it.
+struct NativePage {
+    /// The page as [`HttpDiscordClient::native_messages`] answers it.
+    messages: Vec<Message>,
+    /// How many rows Discord answered, a starter whose root is gone included.
+    rows: usize,
+    /// The newest snowflake among those rows.
+    newest: Option<u64>,
+}
+
+/// Whether Discord answered that it has no such message: HTTP 404 with its code 10008, Unknown
+/// Message. Any other 404 (an unknown channel, a bridge's own) proves nothing about the message.
+fn unknown_message(error: &ChatError) -> bool {
+    match error.cause() {
+        ChatError::Status { status: 404, body } => {
+            serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|value| value.get("code").and_then(Value::as_u64))
+                == Some(10_008)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NativeThread {
     id: String,
@@ -623,6 +647,22 @@ impl HttpDiscordClient {
         after: Option<&str>,
         limit: u16,
     ) -> Result<Vec<Message>, ChatError> {
+        Ok(self
+            .native_page(channel, thread, before, after, limit)
+            .await?
+            .messages)
+    }
+
+    /// [`Self::native_messages`], with what Discord itself answered: how many rows, and the
+    /// newest snowflake among them, before a starter whose root is gone was left out.
+    async fn native_page(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&NativeThread>,
+        before: Option<&str>,
+        after: Option<&str>,
+        limit: u16,
+    ) -> Result<NativePage, ChatError> {
         let physical = thread.map_or(channel.as_str(), |thread| thread.id.as_str());
         let cursor = before.map(|value| MessageId(value.to_owned()));
         let forward = after.map(|value| MessageId(value.to_owned()));
@@ -638,6 +678,10 @@ impl HttpDiscordClient {
         let raw = value
             .as_array()
             .ok_or_else(|| shape("message history is not an array"))?;
+        let newest = raw
+            .iter()
+            .filter_map(|value| value.get("id")?.as_str()?.parse::<u64>().ok())
+            .max();
         let mut messages = Vec::with_capacity(raw.len());
         for value in raw {
             if value.get("channel_id").and_then(Value::as_str) != Some(physical) {
@@ -683,7 +727,11 @@ impl HttpDiscordClient {
             }
             messages.push(message);
         }
-        Ok(messages)
+        Ok(NativePage {
+            messages,
+            rows: raw.len(),
+            newest,
+        })
     }
 
     pub(super) async fn native_probe(
@@ -1049,44 +1097,196 @@ impl HttpDiscordClient {
             }
             ThreadApi::Native => {
                 let thread = self.verified_thread(channel, id).await?;
-                native_id(message_id.as_str())?;
-                let value = match self
-                    .read_thread_json(&["channels", id, "messages", message_id.as_str()], &[])
+                self.verified_thread_message(channel, &thread, message_id)
                     .await
-                {
-                    Ok(value) => value,
-                    Err(error)
-                        if message_id.as_str() == id
-                            && matches!(error.cause(), ChatError::Status { status: 404, .. }) =>
-                    {
-                        // A public thread's root belongs to its parent channel. It remains a
-                        // legitimate thread context message even when no starter mirror exists.
-                        self.read_thread_json(&["channels", channel.as_str(), "messages", id], &[])
-                            .await?
-                    }
-                    Err(error) => return Err(error),
-                };
-                let physical = string_field(&value, "channel_id")?;
-                if physical != id && !(message_id.as_str() == id && physical == channel.as_str()) {
-                    return Err(shape("thread lookup returned a different channel"));
-                }
-                let value = if value.get("type").and_then(Value::as_u64) == Some(21) {
-                    value
-                        .get("referenced_message")
-                        .filter(|value| value.is_object())
-                        .unwrap_or(&value)
-                } else {
-                    &value
-                };
-                let mut message = parse_message(value)?;
-                if message.id != *message_id {
-                    return Err(shape("thread lookup returned a different message"));
-                }
-                message.channel_id = channel.clone();
-                message.thread = Some(thread.membership(message.id.as_str() == id));
-                Ok(message)
             }
         }
+    }
+
+    /// One message of a thread already verified to belong to `channel`, from Discord itself.
+    async fn verified_thread_message(
+        &self,
+        channel: &ChannelId,
+        thread: &NativeThread,
+        message_id: &MessageId,
+    ) -> Result<Message, ChatError> {
+        let id = thread.id.as_str();
+        native_id(message_id.as_str())?;
+        let value = match self
+            .read_thread_json(&["channels", id, "messages", message_id.as_str()], &[])
+            .await
+        {
+            Ok(value) => value,
+            Err(error)
+                if message_id.as_str() == id
+                    && matches!(error.cause(), ChatError::Status { status: 404, .. }) =>
+            {
+                // A public thread's root belongs to its parent channel. It remains a
+                // legitimate thread context message even when no starter mirror exists.
+                self.read_thread_json(&["channels", channel.as_str(), "messages", id], &[])
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        let physical = string_field(&value, "channel_id")?;
+        if physical != id && !(message_id.as_str() == id && physical == channel.as_str()) {
+            return Err(shape("thread lookup returned a different channel"));
+        }
+        let value = if value.get("type").and_then(Value::as_u64) == Some(21) {
+            value
+                .get("referenced_message")
+                .filter(|value| value.is_object())
+                .unwrap_or(&value)
+        } else {
+            &value
+        };
+        let mut message = parse_message(value)?;
+        if message.id != *message_id {
+            return Err(shape("thread lookup returned a different message"));
+        }
+        message.channel_id = channel.clone();
+        message.thread = Some(thread.membership(message.id.as_str() == id));
+        Ok(message)
+    }
+
+    /// [`crate::chat::ChatClient::fetch_messages`] against Discord itself. remote-ops-audit W11
+    /// `#287 bulk-reads`.
+    ///
+    /// Snowflakes order as messages were sent, so ids near each other are one page: `after` the
+    /// snowflake before the oldest asked, up to 100. That page holds every message from the oldest
+    /// asked up to the newest it returned, and every later one too when it came back short of a
+    /// full page, so an id in that stretch is on it or proved absent. Any other id is one
+    /// `GET .../messages/{id}`, and absent only when Discord answers Unknown Message (code 10008).
+    /// A thread is checked against the channel once, for every id; its root, which may live in
+    /// the parent channel, is never proved absent by the page and is looked up on its own when the
+    /// page did not have it. One id is one request (two in a thread), as a lookup of one always was.
+    pub(super) async fn native_lookup(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        wanted: &[MessageId],
+    ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
+        use crate::chat::Lookup;
+
+        native_id(channel.as_str())?;
+        let verified = match thread {
+            Some(id) => Some(self.verified_thread(channel, id).await?),
+            None => None,
+        };
+        let root = verified.as_ref().map(|thread| thread.id.as_str());
+        let mut numbers: Vec<u64> = wanted
+            .iter()
+            .filter_map(|id| native_id(id.as_str()).ok())
+            .collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        let mut answers: BTreeMap<u64, Lookup> = BTreeMap::new();
+        if let [first, _, ..] = numbers.as_slice() {
+            let after = first.saturating_sub(1).to_string();
+            let limit = super::DISCORD_MAX_LIMIT;
+            let (messages, reached) = match &verified {
+                Some(thread) => {
+                    let page = self
+                        .native_page(channel, Some(thread), None, Some(&after), limit)
+                        .await?;
+                    let reached = if page.rows < usize::from(limit) {
+                        u64::MAX
+                    } else {
+                        page.newest.unwrap_or(0)
+                    };
+                    (page.messages, reached)
+                }
+                None => {
+                    let value = self
+                        .send(page_request(
+                            &self.api_base,
+                            channel,
+                            limit,
+                            None,
+                            Some(&MessageId(after)),
+                        )?)
+                        .await?;
+                    let messages = super::parse_message_list(&value)?;
+                    if messages
+                        .iter()
+                        .any(|message| message.channel_id != *channel)
+                    {
+                        return Err(shape("message history returned a different channel"));
+                    }
+                    let reached = if messages.len() < usize::from(limit) {
+                        u64::MAX
+                    } else {
+                        messages
+                            .iter()
+                            .filter_map(|message| message.id.as_str().parse::<u64>().ok())
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    (messages, reached)
+                }
+            };
+            for &number in numbers.iter().filter(|number| **number <= reached) {
+                let id = number.to_string();
+                match messages.iter().find(|message| message.id.as_str() == id) {
+                    Some(message) => {
+                        answers.insert(number, Lookup::Found(Box::new(message.clone())));
+                    }
+                    None if root == Some(id.as_str()) => {}
+                    None => {
+                        answers.insert(number, Lookup::Absent);
+                    }
+                }
+            }
+        }
+        for number in numbers {
+            if answers.contains_key(&number) {
+                continue;
+            }
+            let id = MessageId(number.to_string());
+            let looked = match &verified {
+                Some(thread) => self.verified_thread_message(channel, thread, &id).await,
+                None => self.channel_message(channel, &id).await,
+            };
+            let answer = match looked {
+                Ok(message) => Lookup::Found(Box::new(message)),
+                Err(error) if unknown_message(&error) => Lookup::Absent,
+                Err(error) => return Err(error),
+            };
+            answers.insert(number, answer);
+        }
+        Ok(wanted
+            .iter()
+            .map(|id| {
+                native_id(id.as_str())
+                    .ok()
+                    .and_then(|number| answers.get(&number).cloned())
+                    .unwrap_or(Lookup::Unseen)
+            })
+            .collect())
+    }
+
+    /// One of the channel's own messages, from Discord itself, as its message history has it.
+    async fn channel_message(
+        &self,
+        channel: &ChannelId,
+        message_id: &MessageId,
+    ) -> Result<Message, ChatError> {
+        let value = self
+            .read_thread_json(
+                &[
+                    "channels",
+                    channel.as_str(),
+                    "messages",
+                    message_id.as_str(),
+                ],
+                &[],
+            )
+            .await?;
+        let message = parse_message(&value)?;
+        if message.channel_id != *channel || message.id != *message_id {
+            return Err(shape("message lookup returned a different message"));
+        }
+        Ok(message)
     }
 
     pub(super) async fn thread_post(
@@ -2807,5 +3007,246 @@ mod tests {
             );
             assert!(!page.has_more);
         }
+    }
+
+    // remote-ops-audit W11 `#287 bulk-reads`: lookups by id against Discord itself.
+
+    fn lookup_ids(list: &[&str]) -> Vec<MessageId> {
+        list.iter().map(|id| MessageId((*id).to_owned())).collect()
+    }
+
+    fn outcome(answer: &crate::chat::Lookup) -> String {
+        match answer {
+            crate::chat::Lookup::Found(message) => format!("found {}", message.id),
+            crate::chat::Lookup::Absent => "absent".to_owned(),
+            crate::chat::Lookup::Unseen => "unseen".to_owned(),
+        }
+    }
+
+    fn unknown_message_reply() -> (StatusCode, Value) {
+        (
+            StatusCode::NOT_FOUND,
+            json!({"message": "Unknown Message", "code": 10008}),
+        )
+    }
+
+    #[tokio::test]
+    async fn native_lookups_read_ids_near_each_other_as_one_page_after_the_oldest() {
+        let mut routes = Replies::new();
+        ok(&mut routes, "/channels/201", thread("201", "905", "100"));
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=100&after=901",
+            json!([
+                message("201", "905", "e"),
+                message("201", "904", "d"),
+                message("201", "903", "c"),
+                message("201", "902", "b")
+            ]),
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        assert_eq!(
+            mock.client.read_caps(&channel).by_ids,
+            crate::chat::Support::Native
+        );
+        let answers = mock
+            .client
+            .fetch_messages(
+                &channel,
+                Some("201"),
+                &lookup_ids(&["904", "902", "909", "904"]),
+            )
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found 904", "found 902", "absent", "found 904"],
+            "a page short of 100 holds everything after the oldest asked"
+        );
+        let crate::chat::Lookup::Found(found) = &answers[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            found.channel_id.as_str(),
+            "100",
+            "named by its parent channel"
+        );
+        assert_eq!(found.thread.as_ref().expect("membership").id, "201");
+        assert_eq!(
+            *mock.seen.lock().expect("seen"),
+            [
+                "GET /channels/201",
+                "GET /channels/201/messages?limit=100&after=901"
+            ],
+            "the thread checked once and one page, where one at a time was six requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_lookups_ask_for_an_id_past_a_full_page_on_its_own() {
+        let mut routes = Replies::new();
+        ok(&mut routes, "/channels/201", thread("201", "6000", "100"));
+        let page: Vec<Value> = (1000..1100)
+            .rev()
+            .map(|n| message("201", &n.to_string(), "near"))
+            .collect();
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=100&after=999",
+            Value::Array(page),
+        );
+        routes.insert(
+            "GET /channels/201/messages/5000".into(),
+            unknown_message_reply(),
+        );
+        ok(
+            &mut routes,
+            "/channels/201/messages/6000",
+            message("201", "6000", "far"),
+        );
+        let paged = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        let answers = paged
+            .client
+            .fetch_messages(
+                &channel,
+                Some("201"),
+                &lookup_ids(&["1000", "1050", "5000", "6000"]),
+            )
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found 1000", "found 1050", "absent", "found 6000"],
+            "only Unknown Message proves an id past the page absent"
+        );
+        assert_eq!(paged.seen.lock().expect("seen").len(), 4);
+
+        // Any other 404 proves nothing, and fails the lookup as a lookup of one would.
+        let mut routes = Replies::new();
+        ok(&mut routes, "/channels/201", thread("201", "6000", "100"));
+        routes.insert(
+            "GET /channels/201/messages/5000".into(),
+            (
+                StatusCode::NOT_FOUND,
+                json!({"message": "Unknown Channel", "code": 10003}),
+            ),
+        );
+        let refusing = mock(routes, ThreadApi::Native).await;
+        let error = refusing
+            .client
+            .fetch_messages(&channel, Some("201"), &lookup_ids(&["5000"]))
+            .await
+            .expect_err("not proved absent");
+        assert!(matches!(
+            error.cause(),
+            ChatError::Status { status: 404, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_lookups_of_the_channels_own_messages_cost_what_one_lookup_did() {
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/channels/100/messages/850",
+            message("100", "850", "one"),
+        );
+        routes.insert(
+            "GET /channels/100/messages/860".into(),
+            unknown_message_reply(),
+        );
+        ok(
+            &mut routes,
+            "/channels/100/messages?limit=100&after=849",
+            json!([message("100", "852", "three"), message("100", "850", "one")]),
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        for (asked, expected) in [
+            (vec!["850"], vec!["found 850"]),
+            (vec!["860"], vec!["absent"]),
+            (
+                vec!["852", "850", "851"],
+                vec!["found 852", "found 850", "absent"],
+            ),
+        ] {
+            let answers = mock
+                .client
+                .fetch_messages(&channel, None, &lookup_ids(&asked))
+                .await
+                .expect("lookup");
+            assert_eq!(answers.iter().map(outcome).collect::<Vec<_>>(), expected);
+        }
+        assert_eq!(
+            *mock.seen.lock().expect("seen"),
+            [
+                "GET /channels/100/messages/850",
+                "GET /channels/100/messages/860",
+                "GET /channels/100/messages?limit=100&after=849"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_threads_root_is_never_proved_absent_by_a_page_of_its_replies() {
+        let mut routes = inventory_routes();
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=100&after=200",
+            json!([message("201", "902", "reply")]),
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let answers = mock
+            .client
+            .fetch_messages(
+                &ChannelId("100".into()),
+                Some("201"),
+                &lookup_ids(&["201", "902"]),
+            )
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found 201", "found 902"]
+        );
+        let crate::chat::Lookup::Found(root) = &answers[0] else {
+            unreachable!()
+        };
+        assert!(root.thread.as_ref().expect("membership").is_root);
+        assert_eq!(root.content, "first root", "read from the parent channel");
+    }
+
+    #[tokio::test]
+    async fn a_bridge_looks_messages_up_one_at_a_time_as_before() {
+        let mut routes = Replies::new();
+        let mut wire = message("parent", "message-id", "in a thread");
+        wire["thread"] = json!({"id":"opaque/thread","root_message_id":"root-id","is_root":false,"reply_count":1,"reply_count_exact":true});
+        ok(
+            &mut routes,
+            "/channels/parent/threads/opaque%2Fthread/messages/message-id",
+            wire,
+        );
+        let mock = mock(routes, ThreadApi::Bridge).await;
+        let channel = ChannelId("parent".into());
+        assert_eq!(
+            mock.client.read_caps(&channel).by_ids,
+            crate::chat::Support::Emulated
+        );
+        let answers = mock
+            .client
+            .fetch_messages(
+                &channel,
+                Some("opaque/thread"),
+                &lookup_ids(&["message-id", "message-id"]),
+            )
+            .await
+            .expect("lookup");
+        assert_eq!(
+            answers.iter().map(outcome).collect::<Vec<_>>(),
+            ["found message-id", "found message-id"]
+        );
+        assert_eq!(mock.seen.lock().expect("seen").len(), 2, "one each");
     }
 }

@@ -1194,18 +1194,29 @@ impl ChatClient for HttpDiscordClient {
         }
     }
 
-    /// Native only for a bridge configured with `range_reads`. remote-ops-audit W10
-    /// `#287 bulk-reads`. Discord itself has no such request, and is read through the default,
+    /// A range read is native only for a bridge configured with `range_reads`. remote-ops-audit
+    /// W10 `#287 bulk-reads`. Discord itself has no such request, and is read through the default,
     /// which is already one `after=` page of up to 100 per step.
+    ///
+    /// A lookup by id is native against Discord's own threads (`thread_api = "native"`): ids near
+    /// each other are one `after=` page (W11, see `native_lookup`).
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
+        let by_ids = if self.thread_api == crate::threads::ThreadApi::Native {
+            crate::chat::Support::Native
+        } else {
+            crate::chat::Support::Emulated
+        };
         if self.range_reads {
             crate::chat::ReadCaps {
                 range: crate::chat::Support::Native,
+                by_ids,
                 page_rows: BRIDGE_RANGE_ROWS,
-                ..crate::chat::ReadCaps::default()
             }
         } else {
-            crate::chat::ReadCaps::default()
+            crate::chat::ReadCaps {
+                by_ids,
+                ..crate::chat::ReadCaps::default()
+            }
         }
     }
 
@@ -1229,6 +1240,20 @@ impl ChatClient for HttpDiscordClient {
         }
         .await
         .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
+    async fn fetch_messages(
+        &self,
+        channel: &ChannelId,
+        thread: Option<&str>,
+        ids: &[MessageId],
+    ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
+        if self.thread_api != crate::threads::ThreadApi::Native {
+            return crate::chat::emulated_messages(self, channel, thread, ids).await;
+        }
+        self.native_lookup(channel, thread, ids)
+            .await
+            .map_err(|error| error.with_provider(self.provider_name()))
     }
 
     async fn post_message(

@@ -2070,6 +2070,14 @@ Native reply counts are marked approximate because older provider counters may b
 expired cursor reloads the newest history with a fresh continuation. Forum and media channel Main
 views show thread roots; open a thread to post in these thread-only containers.
 
+The native backend looks several messages up by id itself (speech preparation of a thread, a
+thread summary's parts, a message by id): ids near each other are one `after=` page from the
+oldest asked, and the thread is checked once for all of them, so eight replies of a thread cost two
+requests rather than sixteen. An id past that page is one request of its own; a message is reported
+gone only when it falls inside the page's stretch or Discord answers Unknown Message (code 10008),
+and a thread's root, which may live in the parent channel, is never reported gone by a page of its
+replies.
+
 ### A bridge's recent read through Flat
 
 **The problem.** Every read of a channel's most recent messages — the digest, the to-do list, a
