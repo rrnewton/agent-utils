@@ -139,24 +139,32 @@ HEADER_JS = """(root) => {
 }"""
 
 
-# `#289 thread-card-header`, part 2. Every frame from now for `ms`: where the card at the top `card` is
-# drawn, whether it is moving, the thread's scroll position in `area` and how many of its rows `list`
-# draws, the line between the columns, and how opaque the thread's pane `pane` is. Kept in
-# `window.__flight`, with `done` once the time is up, so the press can come after this has started.
-WATCH_JS = """({card, area, list, pane, ms}) => {
+# `#289 thread-card-header`, part 2. Every frame from now: where the card at the top `card` is drawn,
+# whether it is moving, the thread's scroll position in `area` and how many of its rows `list` draws, the
+# line between the columns, and how opaque the thread's pane `pane` is. Kept in `window.__flight`, so
+# the press can come after this has started. It is `done` once the card has been drawn at rest — not
+# moving, the thread no longer fading in — for `REST_FRAMES` frames in a row, counted from when it was
+# drawn, not from when the watch began: a press that waits for its button to be ready, on a loaded
+# machine, opens the thread later than a fixed window starting now would allow for. `ms` only bounds a
+# thread that never opens.
+REST_FRAMES = 20
+WATCH_JS = """({card, area, list, pane, ms, rest}) => {
     const node = document.getElementById(card), scroller = document.getElementById(area);
     const fading = document.getElementById(pane);
     const seen = [];
     window.__flight = {seen, done: false};
     const end = performance.now() + ms;
+    let calm = 0;
     const step = () => {
         const r = node.getBoundingClientRect();
         const path = document.querySelector('#column-links path.column-link');
-        seen.push({shown: node.getClientRects().length > 0 && !node.closest('[hidden]'), top: r.top, left: r.left,
-                   flying: node.hasAttribute('data-flying'), scrollTop: scroller.scrollTop,
+        const shown = node.getClientRects().length > 0 && !node.closest('[hidden]');
+        const flying = node.hasAttribute('data-flying'), arriving = fading.hasAttribute('data-arriving');
+        seen.push({shown, top: r.top, left: r.left, flying, scrollTop: scroller.scrollTop,
                    rows: document.querySelectorAll(`#${list} > li[data-id]`).length,
                    link: path ? path.getAttribute('d') : '', opacity: parseFloat(getComputedStyle(fading).opacity)});
-        if (performance.now() < end) requestAnimationFrame(step); else window.__flight.done = true;
+        calm = shown && !flying && !arriving ? calm + 1 : 0;
+        if (calm < rest && performance.now() < end) requestAnimationFrame(step); else window.__flight.done = true;
     };
     requestAnimationFrame(step);
 }"""
@@ -367,14 +375,15 @@ def at_rest(desk: Desk, card: str, pane: str) -> None:
     desk.settled()
 
 
-def watch(desk: Desk, card: str, area: str, rows: str, pane: str, ms: int = 900) -> None:
-    """Start watching every frame, before the press that opens the thread (`WATCH_JS`)."""
-    desk.page.evaluate(WATCH_JS, {"card": card, "area": area, "list": rows, "pane": pane, "ms": ms})
+def watch(desk: Desk, card: str, area: str, rows: str, pane: str) -> None:
+    """Start watching every frame, before the press that opens the thread (`WATCH_JS`), until the card at
+    the top has been at rest for `REST_FRAMES` frames, or for at most 8 s."""
+    desk.page.evaluate(WATCH_JS, {"card": card, "area": area, "list": rows, "pane": pane, "ms": 8000, "rest": REST_FRAMES})
 
 
 def watched(desk: Desk) -> list[Json]:
-    """Every frame `watch` saw, once its time is up."""
-    desk.wait_for("() => window.__flight && window.__flight.done", "the frames were not all watched")
+    """Every frame `watch` saw, once the card at the top has been at rest for long enough."""
+    desk.wait_for("() => window.__flight && window.__flight.done", "the frames were not all watched", seconds=12)
     found = desk.page.evaluate("() => window.__flight.seen")
     assert isinstance(found, list)
     return [frame for frame in found if isinstance(frame, dict)]
@@ -735,7 +744,7 @@ def reduced_walk(desk: Desk) -> None:
     open_two_columns(desk)
     page.mouse.move(5, desk.height - 5)
     desk.settled()
-    watch(desk, "side-thread-card", "side-scroll", "side-log", "side-pane", 500)
+    watch(desk, "side-thread-card", "side-scroll", "side-log", "side-pane")
     found = open_card(desk, RUNNER)
     check_still(desk, watched(desk), number(part(found, "box"), "top"), "two columns")
     page.click("#side-close")
@@ -746,7 +755,7 @@ def reduced_walk(desk: Desk) -> None:
                   " && document.querySelectorAll('#side-cards > li[data-card]').length === 3",
                   "Ctrl+3 did not show the thread list")
     desk.settled()
-    watch(desk, "thread-card", "scroll-area", "discord-log", "pane-discord", 500)
+    watch(desk, "thread-card", "scroll-area", "discord-log", "pane-discord")
     into_list_thread(desk, RUNNER)
     at_rest(desk, "thread-card", "pane-discord")
     check_still(desk, watched(desk), number(part(wide(desk), "box"), "top"), "from the thread list")
