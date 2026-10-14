@@ -11,11 +11,17 @@
 //! wrong proof is how the cache would come to say a channel is complete when it is not, or erase a
 //! message that still exists. So a proof is given only where the provider gave one:
 //!
-//! - **The start of a scope** only on the provider's own word: a newest Slack or Discord page whose
-//!   `has_more` is false (computed by the client before it drops rows it cannot show), or a recent
-//!   read marked `exhausted`. Never because a read came back shorter than it asked: Slack omits a
-//!   message that has no author, so fifty asked can be forty-nine returned with the channel's start
-//!   nowhere near.
+//! - **The start of a scope** only on the provider's own word: a newest Slack Main page, or a newest
+//!   Discord page, whose `has_more` is false (computed by the client before it drops rows it cannot
+//!   show), or a recent read marked `exhausted`. Never because a read came back shorter than it
+//!   asked: Slack omits a message that has no author, so fifty asked can be forty-nine returned
+//!   with the channel's start nowhere near.
+//! - **Never the start of a Slack thread**, nor of a Slack channel narrowed to one, whose every
+//!   view is a thread read. A thread's `has_more` is only whether the client found more rows than
+//!   the page holds. A thread longer than the client's window of pages is narrowed to one probe
+//!   page, gap-free from the newest end but possibly shorter than asked, and then `has_more` is
+//!   false with older replies still upstream. Its newest page proves `[oldest row, newest]`, as any
+//!   newest page does.
 //! - **The newest end** from a read of the newest page or window, `[oldest row, newest]`.
 //! - **A `/page` walk forward from `since`** that was not cut short and returned at least one row:
 //!   `[since, min(until, newest row + 1))`. An empty one proves nothing, because a provider may
@@ -41,8 +47,8 @@
 //!
 //! | Shape | Listed with a proof | Rows only |
 //! |---|---|---|
-//! | Slack | Main newest; Thread newest; Flat newest only when it holds no thread at all; the poller's walk | Flat otherwise; the thread list |
-//! | Slack, narrowed to one thread | Main (every view) newest, as `main` of that channel; the poller's walk | the thread list |
+//! | Slack | Main newest; Thread newest, from its oldest row; Flat newest only when it holds no thread at all; the poller's walk | Flat otherwise; the thread list |
+//! | Slack, narrowed to one thread | Main (every view) newest, as `main` of that channel, from its oldest row; the poller's walk | the thread list |
 //! | Bridge | Flat newest; a recent read through Flat | Main, Thread, `/messages` windows, `/page`, `/count`, the poller's walk |
 //! | Discord | Main newest; Thread newest; the poller's walk | Flat; the thread list |
 //!
@@ -460,6 +466,9 @@ fn view_scope(shape: Shape, view: TimelineView, thread: Option<&str>) -> Option<
 
 /// The scope a newest page of this view proves, and whether its `has_more` speaks for the start
 /// of that scope; `None` when the page proves nothing.
+///
+/// A Slack thread's `has_more` never does, nor that of a Slack channel narrowed to one thread:
+/// see the module documentation.
 fn listed(
     shape: Shape,
     view: TimelineView,
@@ -468,9 +477,12 @@ fn listed(
 ) -> Option<(Scope, bool)> {
     match (shape, view) {
         (_, TimelineView::Threads) => None,
-        (Shape::SlackThread, _) => Some((Scope::Main, true)),
+        (Shape::SlackThread, _) => Some((Scope::Main, false)),
         (Shape::Slack | Shape::DiscordNative, TimelineView::Main) => Some((Scope::Main, true)),
-        (Shape::Slack | Shape::DiscordNative, TimelineView::Thread) => {
+        (Shape::Slack, TimelineView::Thread) => {
+            thread.map(|thread| (Scope::Thread(thread.to_owned()), false))
+        }
+        (Shape::DiscordNative, TimelineView::Thread) => {
             thread.map(|thread| (Scope::Thread(thread.to_owned()), true))
         }
         (Shape::Slack, TimelineView::Flat) => {
@@ -779,9 +791,12 @@ mod tests {
             (Shape::Slack, Main, None, Forward, delta(main_rows(), false, &[]),
              vec!["rows in=main m100=main,m200=main,m300=thread:m200"]),
             (Shape::Slack, Main, None, Newest, page_of(Vec::new(), false, false), vec![]),
-            // Slack Thread: the root stays home in Main.
+            // Slack Thread: the root stays home in Main. Its `has_more` is no proof of the start:
+            // a long thread narrows to a short page that says there is no more.
             (Shape::Slack, Thread, Some("m200"), Newest, page_of(thread_rows(), false, false),
-             vec!["listing thread:m200 [start,newest) complete=false full=true Read m200=main,m210=thread:m200,m220=thread:m200"]),
+             vec!["listing thread:m200 [+60000,newest) complete=false full=true Read m200=main,m210=thread:m200,m220=thread:m200"]),
+            (Shape::Slack, Thread, Some("m200"), Newest, page_of(thread_rows()[2..].to_vec(), false, false),
+             vec!["listing thread:m200 [+150000,newest) complete=false full=true Read m220=thread:m200"]),
             (Shape::Slack, Thread, Some("m200"), Newest, page_of(thread_rows(), true, false),
              vec!["listing thread:m200 [+60000,newest) complete=false full=true Read m200=main,m210=thread:m200,m220=thread:m200"]),
             (Shape::Slack, Thread, Some("m200"), Before, page_of(thread_rows(), true, false),
@@ -797,9 +812,11 @@ mod tests {
              vec!["rows in=- m100=main,m150=main"]),
             (Shape::Slack, Flat, None, Before, page_of(quiet(), false, false),
              vec!["rows in=- m100=main,m150=main"]),
-            // A channel narrowed to one thread: everything is its own Main.
+            // A channel narrowed to one thread: everything is its own Main, read as a thread is.
             (Shape::SlackThread, Main, None, Newest, page_of(thread_rows(), false, false),
-             vec!["listing main [start,newest) complete=false full=true Read m200=main,m210=main,m220=main"]),
+             vec!["listing main [+60000,newest) complete=false full=true Read m200=main,m210=main,m220=main"]),
+            (Shape::SlackThread, Main, None, Newest, page_of(thread_rows()[2..].to_vec(), false, false),
+             vec!["listing main [+150000,newest) complete=false full=true Read m220=main"]),
             (Shape::SlackThread, Thread, Some("m200"), Newest, page_of(thread_rows(), true, false),
              vec!["listing main [+60000,newest) complete=false full=true Read m200=main,m210=main,m220=main"]),
             (Shape::SlackThread, Flat, None, Before, page_of(thread_rows(), true, false),

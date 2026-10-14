@@ -3698,7 +3698,10 @@ not re-check is deleted within seven days anyway.
     answers again, asked every 10 minutes.
 * **A claim needs the provider's word.** The cache may record a stretch of a channel as complete,
   and so delete what a listing of that stretch no longer carries, only when the provider said so:
-  * a newest page whose `has_more` is false;
+  * a newest page whose `has_more` is false, for where the channel starts. A Slack thread's page,
+    or a page of a Slack channel narrowed to one thread, is never taken as that: the client reads
+    a long thread as one short page from its newest end, which says there is no more while older
+    replies remain. Such a page vouches only for the stretch from its oldest message up;
   * a walk forward that was not cut short and found a message;
   * a `/count` walk that followed its own continuation.
 

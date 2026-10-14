@@ -598,6 +598,16 @@ async fn slack_deployment(
     dir: &TempDir,
     clock: &Arc<ManualClock>,
 ) -> AppState {
+    slack_deployment_of(fake, dir, clock, SLACK_CH).await
+}
+
+/// [`slack_deployment`], answering for `channel` alone.
+async fn slack_deployment_of(
+    fake: &slack_fake::Fake,
+    dir: &TempDir,
+    clock: &Arc<ManualClock>,
+    channel: &str,
+) -> AppState {
     let text = format!(
         r#"
 [auth]
@@ -611,7 +621,7 @@ api_base = "{base}"
 token = "{token}"
 
 [[channels]]
-id = "{SLACK_CH}"
+id = "{channel}"
 label = "team"
 writable = true
 "#,
@@ -708,6 +718,90 @@ async fn a_newest_slack_window_with_an_authorless_row_never_claims_the_channels_
             source: Source::Read,
         }]
     );
+}
+
+#[tokio::test]
+async fn a_long_slack_thread_whose_read_narrows_never_claims_its_start_nor_erases_its_older_replies(
+) {
+    // The thread read as a view of its channel, and as a channel narrowed to that one thread.
+    for narrowed in [false, true] {
+        let mut fixture = slack_fake::FakeState::default();
+        let root_ts = slack_fake::ts(0, 0);
+        let mut root = slack_fake::profiled(&root_ts, "UADA00001", "Ada", "topic");
+        let reply = |j: i64| (slack_fake::ts(100 + j * 10, 0), format!("reply {j}"));
+        let replies: Vec<(String, String)> = (0..30).map(reply).collect();
+        slack_fake::thread(&mut fixture, SLACK_CH, &mut root, &replies);
+        fixture.history.insert(SLACK_CH.to_owned(), vec![root]);
+        // Four rows a page: the client reads a thread through a window of ten pages.
+        let fake = slack_fake::Fake::start(fixture, 4).await;
+        let dir = TempDir::new("cache-fill-slack-long-thread");
+        let clock = ManualClock::at(slack_ms(3_600));
+        let (channel, uri, scope) = if narrowed {
+            let channel = format!("{SLACK_CH}~{root_ts}");
+            let uri = format!("/api/v1/channels/{channel}/timeline?view=main&limit=50");
+            (channel, uri, CacheScope::Main)
+        } else {
+            let uri = format!(
+                "/api/v1/channels/{SLACK_CH}/timeline?view=thread&thread_id={root_ts}&limit=50"
+            );
+            (
+                SLACK_CH.to_owned(),
+                uri,
+                CacheScope::Thread(root_ts.clone()),
+            )
+        };
+        let state = slack_deployment_of(&fake, &dir, &clock, &channel).await;
+        let cache = state.message_cache.cache().expect("installed");
+        let chan = ChanKey::new(SLACK, &channel);
+
+        // Read whole, inside the window: the root and its thirty replies.
+        let first = get(&state, &uri).await;
+        assert_eq!(first["messages"].as_array().expect("messages").len(), 31);
+        assert_eq!(held(&cache), 31);
+
+        // The thread grows past the window, and is read again.
+        fake.with(|state| {
+            let list = state
+                .replies
+                .get_mut(&(SLACK_CH.to_owned(), root_ts.clone()))
+                .expect("the thread");
+            for j in 30..60 {
+                let (ts, text) = reply(j);
+                list.push(serde_json::json!({"type": "message", "ts": ts, "thread_ts": root_ts,
+                    "user": "UREPLIER1", "text": text, "user_profile": {"display_name": "Replier"}}));
+            }
+        });
+        clock.advance(15 * MINUTE);
+        let second = get(&state, &uri).await;
+        let returned = second["messages"].as_array().expect("messages").len();
+        // What the client does with a thread longer than its window: one page, gap-free from the
+        // newest end, shorter than asked, saying there is no more.
+        assert!(
+            returned < 50 && second["has_more"] == false,
+            "narrowed {narrowed}: {returned} rows, has_more {}",
+            second["has_more"]
+        );
+
+        for (ts, _) in &replies {
+            let id = slack_id(ts);
+            assert!(
+                !tombstoned(&cache, &chan, &id),
+                "narrowed {narrowed}: {ts} is still upstream"
+            );
+            assert!(holds(&cache, &chan, &id), "narrowed {narrowed}: {ts}");
+        }
+        assert!(holds(&cache, &chan, &slack_id(&root_ts)), "the root");
+        assert_eq!(held(&cache), 31 + u64::try_from(returned).expect("small"));
+        let claimed = coverage(&cache, &chan, &scope);
+        assert!(
+            !claimed.is_empty(),
+            "narrowed {narrowed}: the reads claimed their spans"
+        );
+        assert!(
+            claimed.iter().all(|interval| interval.t0_ms >= slack_ms(0)),
+            "narrowed {narrowed}: nothing claims the thread from before its root: {claimed:?}"
+        );
+    }
 }
 
 #[tokio::test]
