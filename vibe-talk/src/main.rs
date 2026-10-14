@@ -441,6 +441,35 @@ async fn main() -> anyhow::Result<()> {
     };
 
     run_startup_probe(chat.as_ref(), &config, args.skip_startup_probe).await?;
+    // remote-ops-audit W12 `#287 bulk-reads`. Beside the probe, never instead of it, and in the
+    // background, since a head read that does not work costs calls, not correctness: one call per
+    // provider that reads channel heads natively, none for any other.
+    let skip_env = std::env::var(ENV_SKIP_STARTUP_PROBE).ok();
+    if !args.skip_startup_probe && !probe::env_requests_skip(skip_env.as_deref()) {
+        let providers = Arc::clone(&providers);
+        let channels = config.channels.clone();
+        tokio::spawn(async move {
+            for check in
+                probe::check_heads(&providers, &channels, Some(Duration::from_secs(30))).await
+            {
+                if check.diagnosis.is_failure() {
+                    tracing::warn!(
+                        provider = check.key,
+                        problem = check.diagnosis.headline_for(&check.provider),
+                        detail = check.diagnosis.detail().unwrap_or_default(),
+                        "channel heads do not work for this provider; its channels are read one \
+                         by one as before, at the cost of a wasted head read each time"
+                    );
+                } else {
+                    tracing::info!(
+                        provider = check.key,
+                        detail = check.diagnosis.detail().unwrap_or_default(),
+                        "channel heads answer for this provider"
+                    );
+                }
+            }
+        });
+    }
 
     for channel in &config.channels {
         tracing::info!(

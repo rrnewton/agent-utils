@@ -36,6 +36,17 @@
 //! to say "unavailable" and stop there. The variants below that name no vendor
 //! ([`Diagnosis::Confirmed`], [`Diagnosis::NotConfigured`], [`Diagnosis::TimedOut`]) exist for
 //! exactly that reason.
+//!
+//! # Channel heads are checked, never trusted in place of a read
+//!
+//! A provider that reads channel heads natively (remote-ops-audit W12) can say what each channel's
+//! newest message is in one call, but a head cannot stand in for this probe's read: it does not
+//! show that this bot may read the channel's history, nor that messages arrive with their content.
+//! So the probe still reads one message per channel, and the head read is checked beside it
+//! ([`check_heads`]): one call per provider that reads heads natively, none for any other. What
+//! that catches is a head read that does not work (a bridge configured with `head_reads` that does
+//! not serve it, say), which the poller and a catch-up survive by reading every channel as before,
+//! at the cost of a wasted call each time.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -540,6 +551,100 @@ pub fn classify(error: &ChatError) -> Diagnosis {
             },
         },
     }
+}
+
+/// What one provider's own head read answered: remote-ops-audit W12 `#287 bulk-reads`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadsCheck {
+    /// The provider's configuration key.
+    pub key: String,
+    /// The provider's display name.
+    pub provider: String,
+    /// [`Diagnosis::Confirmed`], saying how many channels were answered and how, when any was;
+    /// otherwise the first failure, classified.
+    pub diagnosis: Diagnosis,
+}
+
+/// Check the head read of every provider that reads heads natively, with one call each for the
+/// channels of `channels` it holds; a provider whose heads are emulated is not asked, since its
+/// head read is the probe's own read again. remote-ops-audit W12 `#287 bulk-reads`. Each call is
+/// given `budget`, when there is one.
+pub async fn check_heads(
+    providers: &crate::providers::ChatRouter,
+    channels: &[ChannelInfo],
+    budget: Option<Duration>,
+) -> Vec<HeadsCheck> {
+    let mut checks = Vec::new();
+    for entry in providers.entries() {
+        let held: Vec<crate::model::ChannelId> = channels
+            .iter()
+            .filter(|channel| {
+                providers.key_for(&channel.id).as_deref() == Some(entry.key.as_str())
+                    && entry.client.read_caps(&channel.id).heads == crate::chat::Support::Native
+            })
+            .map(|channel| channel.id.clone())
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        let provider = entry.client.provider_name().to_owned();
+        let read = entry.client.channel_heads(&held);
+        let diagnosis = match budget {
+            Some(budget) => match tokio::time::timeout(budget, read).await {
+                Ok(answers) => heads_diagnosis(&provider, &answers),
+                Err(_elapsed) => Diagnosis::TimedOut(budget.as_secs()),
+            },
+            None => heads_diagnosis(&provider, &read.await),
+        };
+        checks.push(HeadsCheck {
+            key: entry.key.clone(),
+            provider,
+            diagnosis,
+        });
+    }
+    checks
+}
+
+/// What a head read's answers say about it, in the shared vocabulary.
+fn heads_diagnosis(provider: &str, answers: &crate::chat::HeadAnswers) -> Diagnosis {
+    let heads: Vec<&crate::chat::ChannelHead> = answers
+        .iter()
+        .filter_map(|(_, head)| head.as_ref().ok())
+        .collect();
+    let first_failure = answers.iter().find_map(|(_, head)| head.as_ref().err());
+    if heads.is_empty() {
+        if let Some(error) = first_failure {
+            return classify(error);
+        }
+    }
+    let mut note = format!(
+        "{provider} answered the newest message of {} of {} channel(s) in one head read, so the \
+         live poller skips the pages of its quiet channels",
+        heads.len(),
+        answers.len()
+    );
+    let vouching = heads
+        .iter()
+        .filter(|head| head.is_current() && head.unchanged_since_ms.is_some())
+        .count();
+    if vouching > 0 {
+        note.push_str(&format!(
+            "; {vouching} also vouch that nothing changed since an instant, so a catch-up can \
+             keep its held copy of them"
+        ));
+    }
+    let stale = heads.iter().filter(|head| !head.is_current()).count();
+    if stale > 0 {
+        note.push_str(&format!(
+            "; {stale} came from an older copy, which nothing acts on"
+        ));
+    }
+    if let Some(error) = first_failure {
+        note.push_str(&format!(
+            "; the others are read as before heads, the first because: {error}"
+        ));
+    }
+    Diagnosis::Confirmed(note)
 }
 
 /// Probe every configured channel.

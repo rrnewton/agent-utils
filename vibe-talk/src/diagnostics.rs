@@ -317,6 +317,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
 
     checks.extend(discord_token(state, &deadline).await);
     checks.extend(discord_channels(state, &deadline).await);
+    checks.extend(discord_heads(state, &deadline).await);
 
     checks.push(read_aloud_selection(state));
 
@@ -435,6 +436,35 @@ async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
             .about(outcome.channel.id.as_str())
         })
         .collect()
+}
+
+/// Does each provider that reads channel heads natively answer them? remote-ops-audit W12
+/// `#287 bulk-reads`. One check, and one call, per such provider; none for a provider whose heads
+/// are emulated, so a deployment without native heads sees no new row and no new call. See
+/// [`probe::check_heads`].
+async fn discord_heads(state: &AppState, deadline: &Deadline) -> Vec<Check> {
+    let multi = state.providers.is_multi();
+    probe::check_heads(
+        &state.providers,
+        &state.all_channels(),
+        Some(deadline.budget()),
+    )
+    .await
+    .into_iter()
+    .map(|check| {
+        let row = Check::new(
+            "discord.heads",
+            format!("{} channel heads", check.provider),
+            check.diagnosis,
+        )
+        .for_provider(&check.provider);
+        if multi {
+            row.about(check.key)
+        } else {
+            row
+        }
+    })
+    .collect()
 }
 
 /// Was the ElevenLabs API key accepted, and which account did it reach?

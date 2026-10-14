@@ -1354,6 +1354,7 @@ The checks:
 |---|---|
 | `discord.token` | Discord accepted the bot token, and who it says the bot is |
 | `discord.channel` | **one per configured channel** — readable, or why not |
+| `discord.heads` | **only for a provider that reads channel heads natively** (Discord itself, a bridge with `head_reads`): its head read answers, in one call, and how many heads vouch for edits and deletes; absent, with no call made, for every other provider |
 | `elevenlabs.api_key` | the key was accepted, and which account/workspace it reached |
 | `elevenlabs.agent` | the configured agent exists and reports a voice |
 | `elevenlabs.voice` | a voice resolves — configured explicitly, or borrowed from the agent |
@@ -2288,6 +2289,15 @@ head that failed, came from an older copy (`as_of`), or names an id the poller c
 read as before, and so is every channel of a provider whose heads are emulated (Slack, a bridge
 without `head_reads`): the poller never asks such a provider for heads. A hinted read is never
 gated, since the hint says something changed.
+
+**The startup probe and diagnostics.** A head cannot stand in for the probe's one-message read:
+it does not show that the bot may read the channel's history, nor that messages arrive with their
+content. So both still read every channel, and for each provider that reads heads natively they
+also check the head read itself, in one call: diagnostics as a `discord.heads` row, startup as a
+log line (in the background, and not when the probe is skipped). That is where a bridge with
+`head_reads` that does not serve `/heads` shows up; the poller and a catch-up survive it by reading
+every channel as before, at the cost of a wasted head read each time. A provider whose heads are
+emulated is not asked.
 
 **A voice catch-up, and a call start's warm-up.** A channel whose held window is past its reuse
 period is read again, as before, unless its provider reads heads natively AND its heads can vouch

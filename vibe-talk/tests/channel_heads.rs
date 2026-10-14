@@ -1250,3 +1250,131 @@ async fn a_catch_up_reads_the_channels_when_their_heads_are_late() {
     assert_eq!(asked.len(), 4, "{asked:?}");
     assert!(all_current(&answer), "{answer}");
 }
+
+/// The chat rows of a diagnostics report: id, status, summary and detail.
+async fn chat_checks(router: &axum::Router) -> Vec<(String, String, String, String)> {
+    let (status, body) = get(router, "/api/v1/diagnostics").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .filter(|check| {
+            check["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("discord."))
+        })
+        .map(|check| {
+            let text = |field: &str| check[field].as_str().unwrap_or_default().to_owned();
+            (text("id"), text("status"), text("summary"), text("detail"))
+        })
+        .collect()
+}
+
+/// remote-ops-audit W12, the probe and diagnostics: a provider that reads heads natively has its
+/// head read checked beside the probe, in one call, and the probe still reads every channel,
+/// because a head cannot show that the channel's history and content can be read.
+#[tokio::test]
+async fn diagnostics_check_a_native_head_read_beside_the_probe_in_one_call() {
+    let (_state, router, _fake, headed, counting, _draft, _stray) =
+        catch_up_server(|fake| Headed::new(fake, true).covering_edits());
+    let checks = chat_checks(&router).await;
+    let ids: Vec<&str> = checks.iter().map(|(id, ..)| id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "discord.token",
+            "discord.channel",
+            "discord.channel",
+            "discord.channel",
+            "discord.heads"
+        ]
+    );
+    let (_, status, summary, detail) = checks.last().expect("the heads row");
+    assert_eq!((status.as_str(), summary.as_str()), ("pass", "confirmed"));
+    assert!(
+        detail.contains("3 of 3 channel(s) in one head read"),
+        "{detail}"
+    );
+    assert!(detail.contains("3 also vouch"), "{detail}");
+    assert_eq!(counting.count("channel_heads"), 1);
+    assert_eq!(
+        counting.count("probe_channel"),
+        3,
+        "the probe still reads every channel"
+    );
+    assert_eq!(headed.asked().len(), 1);
+
+    counting.fail_next(
+        "channel_heads",
+        None,
+        ChatError::Transport("connection refused".to_owned()),
+    );
+    let checks = chat_checks(&router).await;
+    let (id, status, summary, _) = checks.last().expect("the heads row");
+    assert_eq!(id, "discord.heads");
+    assert_eq!(status, "fail", "{summary}");
+}
+
+/// The other side: a provider whose heads are emulated gets no new row and no new call, as the
+/// default fixture also pins.
+#[tokio::test]
+async fn diagnostics_ask_nothing_more_of_a_provider_whose_heads_are_emulated() {
+    let (_state, router, _fake, headed, counting, _draft, _stray) =
+        catch_up_server(|fake| Headed::new(fake, false));
+    let checks = chat_checks(&router).await;
+    assert!(
+        checks.iter().all(|(id, ..)| id != "discord.heads"),
+        "{checks:?}"
+    );
+    assert!(headed.asked().is_empty());
+    assert_eq!(counting.count("fetch_recent"), 0);
+}
+
+/// Each provider that reads heads natively is checked once, for its own channels; an emulated
+/// one is not asked at all.
+#[tokio::test]
+async fn the_head_check_asks_each_native_provider_once_and_no_other() {
+    let fake_a = Arc::new(FakeDiscord::new());
+    let fake_b = Arc::new(FakeDiscord::new());
+    fake_a.seed(&channel("A1"), "ada", "a one");
+    fake_a.seed(&channel("A2"), "ada", "a two");
+    fake_b.seed(&channel("B1"), "ada", "b one");
+    let headed_a = Arc::new(Headed::new(fake_a, true));
+    let headed_b = Arc::new(Headed::new(fake_b, false));
+    let counting_b = Arc::new(CountingChat::new(
+        Arc::clone(&headed_b) as Arc<dyn ChatClient>
+    ));
+    let router = ChatRouter::new(
+        vec![
+            ProviderEntry {
+                key: "a".to_owned(),
+                namespace: "a".to_owned(),
+                client: Arc::clone(&headed_a) as Arc<dyn ChatClient>,
+                live_poll_seconds: 0,
+            },
+            ProviderEntry {
+                key: "b".to_owned(),
+                namespace: "b".to_owned(),
+                client: Arc::clone(&counting_b) as Arc<dyn ChatClient>,
+                live_poll_seconds: 0,
+            },
+        ],
+        None,
+    );
+    let channels = [routed("A1", "a"), routed("B1", "b"), routed("A2", "a")];
+    router.replace_routes(&channels);
+    let checks = vibe_talk::probe::check_heads(&router, &channels, None).await;
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].key, "a");
+    assert!(
+        !checks[0].diagnosis.is_failure(),
+        "{:?}",
+        checks[0].diagnosis
+    );
+    assert_eq!(headed_a.asked(), [["A1", "A2"]]);
+    assert!(
+        counting_b.calls().is_empty(),
+        "the emulated provider was not asked"
+    );
+}
