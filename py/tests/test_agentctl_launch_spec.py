@@ -399,3 +399,12 @@ def test_promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_run
     with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
         sessions.promote("worker")
     assert sessions.get("worker").lifecycle == "launch_failed"
+
+
+def test_deliver_while_working_is_refused_by_this_edition(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agentctl import cli
+    assert cli.main(["--registry", str(tmp_path / "registry"), "send", "worker", "--deliver-while-working",
+                     "steer"]) == 2
+    assert "--deliver-while-working is implemented only by the Rust edition" in capsys.readouterr().err

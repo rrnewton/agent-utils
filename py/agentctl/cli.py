@@ -54,6 +54,8 @@ def _delivery(parser: argparse.ArgumentParser) -> None:
         help="interactive only: wait for evidence that input was accepted (default: 30 seconds)")
     parser.add_argument("--max-attempts", type=_bounded_uint, default=3, metavar="COUNT",
         help="interactive only: delivery attempt limit; uncertain input is never replayed automatically (default: 3)")
+    parser.add_argument("--deliver-while-working", action="store_true",
+        help="type into a working Claude Code pane and let it queue the prompt (Rust edition only; this edition refuses)")
 
 
 def _environment_entry(value: str) -> str:
@@ -378,6 +380,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("ready_timeout", "working_timeout", "max_attempts") if hasattr(args, key)}
         result: object
         name = getattr(args, "name", "")
+        if getattr(args, "deliver_while_working", False):
+            raise ValueError(
+                "--deliver-while-working is implemented only by the Rust edition of agentctl; run it with the "
+                "Rust agentctl (for example DAGRUN_ENGINE=rust)"
+            )
         if args.command == "attach-self":
             raise ValueError(
                 "attach-self presents an agentcloud session, which only the Rust edition of "

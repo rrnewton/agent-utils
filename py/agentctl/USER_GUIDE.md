@@ -734,6 +734,14 @@ agentctl send reviewer --file /tmp/follow-up.txt --ready-timeout 0
 agentctl drain reviewer --ready-timeout 0
 ```
 
+To steer a Claude Code agent that is busy, `--deliver-while-working` (Rust
+edition; this edition refuses it) on `send`, `drain`, `start` and `goal` also
+types into a pane that is working, native or behind a root slot relay, and lets
+Claude Code queue the prompt behind its current turn. The composer must be empty
+first and the submission is verified; a prompt Claude Code never accepts is
+taken back out of the composer and stays pending. Slash commands and other
+harnesses still wait for idle or done.
+
 `agentctl wait NAME` returns when the agent is ready for input again, which for
 an interactive agent means its current turn has ended. Read the result with
 `agentctl read`; readiness says nothing about whether a longer goal is done.

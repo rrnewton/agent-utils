@@ -300,7 +300,24 @@ fn promote_refuses_unless_the_launched_harness_is_provably_there() {
 
 /// A Codex harness started behind a root slot relay, its process pinned at launch.
 fn relay_worker() -> (Fixture, AgentRecord) {
+    relay_worker_of("codex")
+}
+
+fn relay_worker_of(harness: &str) -> (Fixture, AgentRecord) {
     let fixture = Fixture::new();
+    *fixture.client.relay_verdict.lock().unwrap() = Some((harness.to_owned(), "idle".to_owned()));
+    // The fake names a pane's harness from its launch, which a relay never makes through Herdr.
+    fixture
+        .client
+        .launches
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), (harness.to_owned(), Vec::new()));
+    // A relayed Claude reports no native session to Herdr.
+    fixture
+        .client
+        .report_session
+        .store(harness == "codex", Ordering::Relaxed);
     let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
     fixture
         .manager()
@@ -314,6 +331,7 @@ fn relay_worker() -> (Fixture, AgentRecord) {
                     executable: Some(executable),
                     ..SlotLaunch::default()
                 }),
+                harness: harness.to_owned(),
                 ..StartOptions::default()
             },
         )
@@ -393,4 +411,50 @@ fn promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs() {
         fixture.manager().load("worker").unwrap().lifecycle,
         "launch_failed"
     );
+}
+
+#[test]
+fn deliver_while_working_queues_behind_a_working_claude_behind_a_root_slot_relay() {
+    let (fixture, _) = relay_worker_of("claude");
+    *fixture.client.relay_verdict.lock().unwrap() =
+        Some(("claude".to_owned(), "working".to_owned()));
+    let waiting = agent::DrainOptions {
+        ready_timeout: Duration::ZERO,
+        working_timeout: Duration::from_secs(1),
+        ..agent::DrainOptions::default()
+    };
+    let refused = fixture
+        .manager()
+        .send("worker", "steer the busy lane", waiting)
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("remains pending")
+            && refused.to_string().contains("last status=working"),
+        "{refused}"
+    );
+    assert!(!fixture
+        .client
+        .runs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|text| text == "steer the busy lane"));
+    let delivered = fixture
+        .manager()
+        .drain(
+            "worker",
+            agent::DrainOptions {
+                deliver_while_working: true,
+                ..waiting
+            },
+        )
+        .unwrap();
+    assert_eq!(delivered.delivered.len(), 1, "{delivered:?}");
+    assert!(fixture
+        .client
+        .runs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|text| text == "steer the busy lane"));
 }

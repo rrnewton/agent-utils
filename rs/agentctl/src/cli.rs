@@ -338,6 +338,9 @@ struct Delivery {
     /// Maximum known-safe submission attempts per message
     #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
     max_attempts: u64,
+    /// Also type into a Claude Code pane that is working (native, or behind a root slot relay), and let Claude Code queue the prompt behind its current turn (default: off, which waits for idle or done up to --ready-timeout). The composer must be empty first and the submission verified; a prompt Claude Code never accepts is taken back out and stays pending. Slash commands and other harnesses still wait
+    #[arg(long)]
+    deliver_while_working: bool,
 }
 impl Delivery {
     fn options(&self) -> DrainOptions {
@@ -345,7 +348,7 @@ impl Delivery {
             ready_timeout: Duration::from_secs_f64(self.ready_timeout),
             working_timeout: Duration::from_secs_f64(self.working_timeout),
             max_attempts: self.max_attempts,
-            deliver_while_working: false,
+            deliver_while_working: self.deliver_while_working,
         }
     }
 }

@@ -3170,7 +3170,12 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             .expect("goal operation lock poisoned") = None;
         if self.record.adapter == "herdr-relay" {
             let status = self.pane_info_with_runtime(pane_id, runtime)?.status;
-            if status != "idle" {
+            // A drain types into a working pane only when the caller allowed it, and then asks
+            // the submission to withdraw a prompt Claude Code never queues.
+            let queue_behind_turn = status == "working"
+                && self.record.harness == "claude"
+                && runtime.withdraw_unaccepted_prompt();
+            if status != "idle" && !queue_behind_turn {
                 return Ok(Submission::NotStaged(format!(
                     "relayed {} in pane {pane_id} is {status}, not idle",
                     self.record.harness
@@ -9984,6 +9989,7 @@ pub(crate) mod tests {
                     terminals: Mutex::new(BTreeMap::new()),
                     harness_pids: Mutex::new(BTreeMap::new()),
                     command_lines: Mutex::new(BTreeMap::new()),
+                    relay_verdict: Mutex::new(None),
                     missing_harness_identity: AtomicBool::new(false),
                     missing_terminal: AtomicBool::new(false),
                     replace_harness_after_pin: AtomicBool::new(false),
@@ -10279,6 +10285,8 @@ pub(crate) mod tests {
         harness_pids: Mutex<BTreeMap<String, u64>>,
         /// `/proc/PID/cmdline` of pinned harness processes, by pid; absent reads fail.
         command_lines: Mutex<BTreeMap<u64, Vec<String>>>,
+        /// `agent explain` verdict for a relay pane, `(kind, state)`; default Codex idle.
+        relay_verdict: Mutex<Option<(String, String)>>,
         missing_harness_identity: AtomicBool,
         missing_terminal: AtomicBool,
         replace_harness_after_pin: AtomicBool,
@@ -11156,7 +11164,10 @@ pub(crate) mod tests {
             Ok(self.started.load(Ordering::Relaxed).then(relay_identity))
         }
         fn explain_agent(&self, _: &str) -> AdapterResult<(Option<String>, String)> {
-            Ok((Some("codex".to_owned()), "idle".to_owned()))
+            Ok(self.relay_verdict.lock().unwrap().clone().map_or(
+                (Some("codex".to_owned()), "idle".to_owned()),
+                |(kind, state)| (Some(kind), state),
+            ))
         }
         fn report_pane_agent(&self, pane: &str, kind: &str, state: &str) -> AdapterResult<()> {
             self.runs
