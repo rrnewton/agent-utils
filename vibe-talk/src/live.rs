@@ -47,7 +47,9 @@
 //! ## What polling costs, stated plainly
 //!
 //! It multiplies this server's Discord request volume by one request per channel per interval,
-//! forever, whether or not anybody is listening. A 429 is no longer simply passed on: the client
+//! forever, whether or not anybody is listening. (A provider that reads channel heads natively,
+//! Discord itself among them, spends one head read per tick on its quiet channels instead, and
+//! pages only the channels that moved: remote-ops-audit W12, see `quiet_channels`.) A 429 is no longer simply passed on: the client
 //! obeys Discord's `Retry-After` within a bounded budget, and only a limit it could not clear
 //! reaches this loop — see [`crate::discord::ratelimit`]. That makes a tick cheaper to get wrong,
 //! not free. So polling is still **off unless configured** (`discord.live_poll_seconds`, default
@@ -908,6 +910,7 @@ async fn poll_loop_with_channels(
     let max_backoff = interval.saturating_mul(MAX_BACKOFF_INTERVALS);
     let mut failures: BTreeMap<ChannelId, u32> = BTreeMap::new();
     let mut behind: BTreeMap<ChannelId, bool> = BTreeMap::new();
+    let mut heads_failing = false;
     let mut remaining = ticks;
     let mut hinted_only: Option<BTreeSet<ChannelId>> = None;
     let mut hint_generation = hint_hub.map(LiveHub::subscribe_hints);
@@ -944,7 +947,25 @@ async fn poll_loop_with_channels(
             None => all_channels,
         };
         let mut wait = interval;
+        // remote-ops-audit W12 `#287 bulk-reads`. Only on a full pass: a hinted read was asked for
+        // because something changed, so it reads.
+        let quiet = if full_reconciliation {
+            quiet_channels(
+                chat,
+                &channels,
+                cursors,
+                &failures,
+                &behind,
+                &mut heads_failing,
+            )
+            .await
+        } else {
+            BTreeSet::new()
+        };
         for channel in &channels {
+            if quiet.contains(channel) {
+                continue;
+            }
             let cursor = cursors.entry(channel.clone()).or_default();
             let failed = failures.entry(channel.clone()).or_insert(0);
             match poll_once(chat, hub, channel, limit, cursor).await {
@@ -1068,6 +1089,72 @@ async fn poll_loop_with_channels(
             }
         }
     }
+}
+
+/// The channels of this pass whose page can be skipped, because their provider read their heads
+/// natively and the newest message of each is not newer than its cursor. remote-ops-audit W12
+/// `#287 bulk-reads`.
+///
+/// **Asked only of a provider that reads heads natively** ([`crate::chat::ReadCaps::heads`]): an
+/// emulated head is a read of the channel, no cheaper than the page it would replace, so such a
+/// provider is never asked and its channels are polled exactly as before. Of those channels, only
+/// ones with a cursor (seeded), not failing (a failing channel keeps being read, so its recovery
+/// and its backoff stay what they were) and not behind its page ceiling are asked about, all in
+/// one call.
+///
+/// **What a skip can hide: nothing this loop would have seen.** A tick reads only what is NEWER
+/// than the cursor, never an edit or a delete, and a head whose newest message is not newer than
+/// the cursor proves nothing newer was added: a message created after it would have taken its
+/// place. A head that cannot prove that is read as before: one that failed, one from a copy older
+/// than now (`as_of`), and one whose id this loop cannot compare (not a snowflake).
+async fn quiet_channels(
+    chat: &dyn ChatClient,
+    channels: &[ChannelId],
+    cursors: &BTreeMap<ChannelId, Option<u64>>,
+    failures: &BTreeMap<ChannelId, u32>,
+    behind: &BTreeMap<ChannelId, bool>,
+    heads_failing: &mut bool,
+) -> BTreeSet<ChannelId> {
+    let candidates: Vec<ChannelId> = channels
+        .iter()
+        .filter(|channel| {
+            chat.read_caps(channel).heads == crate::chat::Support::Native
+                && cursors.get(*channel).copied().flatten().is_some()
+                && failures.get(*channel).copied().unwrap_or(0) == 0
+                && !behind.get(*channel).copied().unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    let heads = chat.channel_heads(&candidates).await;
+    let answered = heads.iter().filter(|(_, head)| head.is_ok()).count();
+    if answered == 0 && !*heads_failing {
+        if let Some((_, Err(error))) = heads.first() {
+            tracing::warn!(
+                %error,
+                "channel heads failed for this provider; every channel is read as it was before \
+                 heads until they answer again"
+            );
+        }
+        *heads_failing = true;
+    } else if answered > 0 && *heads_failing {
+        tracing::info!("channel heads answer again for this provider");
+        *heads_failing = false;
+    }
+    heads
+        .into_iter()
+        .filter_map(|(channel, head)| {
+            let head = head.ok()?;
+            let cursor = cursors.get(&channel).copied().flatten()?;
+            let nothing_newer = match &head.newest_id {
+                None => true,
+                Some(id) => id.numeric().is_some_and(|newest| newest <= cursor),
+            };
+            (head.is_current() && nothing_newer).then_some(channel)
+        })
+        .collect()
 }
 
 /// Wait for either the ordinary reconciliation tick or at least one queued change hint.

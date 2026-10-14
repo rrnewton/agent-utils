@@ -751,3 +751,207 @@ async fn each_provider_refreshes_four_channels_at_a_time_without_waiting_for_ano
     tokio::time::sleep(read).await;
     assert!(discord_channels.iter().all(|id| recent.holds(&channel(id))));
 }
+
+/// A server with ten channels on one provider, reading through `counting` around `headed`.
+fn ten_channel_server(
+    native: bool,
+) -> (AppState, Arc<FakeDiscord>, Arc<Headed>, Arc<CountingChat>) {
+    let extra: String = (0..8)
+        .map(|n| {
+            format!(
+                "[[channels]]\nid = \"333333333{n}\"\nlabel = \"extra {n}\"\nwritable = false\n\n"
+            )
+        })
+        .collect();
+    let toml =
+        vibe_talk::testing::config_toml().replace("[elevenlabs]", &format!("{extra}[elevenlabs]"));
+    let (mut state, fake, _elevenlabs) = vibe_talk::testing::state_from_toml(&toml);
+    for info in state.all_channels() {
+        fake.seed(&info.id, "ada", "already there");
+    }
+    let headed = Arc::new(Headed::new(Arc::clone(&fake), native));
+    let counting = Arc::new(CountingChat::new(Arc::clone(&headed) as Arc<dyn ChatClient>));
+    state.replace_chat(Arc::clone(&counting) as Arc<dyn ChatClient>);
+    (state, fake, headed, counting)
+}
+
+/// The poller as `main` starts it, on the provider's own client (profiled, as in production).
+fn start_poller(state: &AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(vibe_talk::live::poll_forever(
+        state.clone(),
+        None,
+        Arc::clone(&state.providers.entries()[0].client),
+        state.config.chat.default_fetch_limit,
+        POLL,
+    ))
+}
+
+/// What a tick asked of the provider, by method, and forget it.
+fn tick_calls(counting: &CountingChat, seen: &mut usize) -> Vec<&'static str> {
+    let calls = counting.calls();
+    let tick = calls[*seen..].iter().map(|call| call.method).collect();
+    *seen = calls.len();
+    tick
+}
+
+/// remote-ops-audit W12, the poller's proof: with heads read natively, ten quiet channels cost one
+/// head read and no page a tick, where they cost ten pages; a channel whose head moved is read,
+/// and what arrived in it is published.
+#[tokio::test(start_paused = true)]
+async fn a_poller_with_native_heads_reads_one_head_list_and_no_page_for_quiet_channels() {
+    let (state, fake, headed, counting) = ten_channel_server(true);
+    let poller = start_poller(&state);
+    let mut seen = 0;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        ["fetch_recent"; 10],
+        "the first tick seeds each channel, as before: there is no cursor to compare a head with"
+    );
+    for _ in 0..2 {
+        tokio::time::sleep(POLL).await;
+        assert_eq!(
+            tick_calls(&counting, &mut seen),
+            ["channel_heads"],
+            "one head read, and not one page"
+        );
+    }
+    assert_eq!(
+        headed.asked().last().map(Vec::len),
+        Some(10),
+        "every channel in the one call"
+    );
+
+    fake.seed(&channel("3333333334"), "grace", "something new");
+    tokio::time::sleep(POLL).await;
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        ["channel_heads", "fetch_page"]
+    );
+    let page = counting.calls().last().cloned().expect("a call");
+    assert_eq!(
+        page.channel,
+        Some(channel("3333333334")),
+        "only the channel that moved"
+    );
+    let published: Vec<String> = state
+        .live
+        .subscribe(&channel("3333333334"), None)
+        .replay
+        .into_iter()
+        .map(|live| live.message.content)
+        .collect();
+    assert_eq!(published, ["something new"]);
+    poller.abort();
+}
+
+/// The other half of the poller's proof: a provider whose heads are emulated is never asked for
+/// them. Its channels are paged every tick, exactly as before heads existed.
+#[tokio::test(start_paused = true)]
+async fn a_poller_never_asks_for_heads_a_provider_only_emulates() {
+    let (state, _fake, headed, counting) = ten_channel_server(false);
+    let poller = start_poller(&state);
+    let mut seen = 0;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(tick_calls(&counting, &mut seen), ["fetch_recent"; 10]);
+    for _ in 0..2 {
+        tokio::time::sleep(POLL).await;
+        assert_eq!(tick_calls(&counting, &mut seen), ["fetch_page"; 10]);
+    }
+    assert!(
+        headed.asked().is_empty(),
+        "the provider's head read was never called"
+    );
+    poller.abort();
+}
+
+/// A head that cannot prove nothing was added is read as before: one from a copy older than now,
+/// and every channel of a provider whose head read fails.
+#[tokio::test(start_paused = true)]
+async fn a_poller_reads_every_channel_a_head_cannot_vouch_for() {
+    let (state, _fake, headed, counting) = ten_channel_server(true);
+    let poller = start_poller(&state);
+    let mut seen = 0;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tick_calls(&counting, &mut seen);
+
+    *headed.as_of.lock().expect("setting") = Some("2026-10-13T12:00:00Z".to_owned());
+    tokio::time::sleep(POLL).await;
+    let mut expected = vec!["channel_heads"];
+    expected.extend(["fetch_page"; 10]);
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        expected,
+        "a stale head proves nothing"
+    );
+
+    *headed.as_of.lock().expect("setting") = None;
+    counting.fail_next(
+        "channel_heads",
+        None,
+        ChatError::Transport("the head read is down".to_owned()),
+    );
+    tokio::time::sleep(POLL).await;
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        expected,
+        "a failed head read proves nothing"
+    );
+
+    tokio::time::sleep(POLL).await;
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        ["channel_heads"],
+        "and heads again"
+    );
+    poller.abort();
+}
+
+/// A channel whose page failed keeps being read, whatever its head says, so its backoff and its
+/// recovery are what they always were.
+#[tokio::test(start_paused = true)]
+async fn a_failing_channel_is_read_rather_than_skipped_on_its_head() {
+    let (state, fake, headed, counting) = ten_channel_server(true);
+    let poller = start_poller(&state);
+    let mut seen = 0;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tick_calls(&counting, &mut seen);
+
+    fake.seed(
+        &channel(READ_CHANNEL),
+        "grace",
+        "will fail to arrive at first",
+    );
+    counting.fail_next(
+        "fetch_page",
+        None,
+        ChatError::Transport("the page read is down".to_owned()),
+    );
+    tokio::time::sleep(POLL).await;
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        ["channel_heads", "fetch_page"]
+    );
+
+    // Backed off for two intervals, then read again even though nothing newer has arrived since
+    // the failure, and with every other channel still answered by one head read.
+    tokio::time::sleep(POLL * 2).await;
+    assert_eq!(
+        tick_calls(&counting, &mut seen),
+        ["channel_heads", "fetch_page"]
+    );
+    assert_eq!(
+        headed.asked().last().map(Vec::len),
+        Some(9),
+        "the failing channel was not asked about"
+    );
+    let published: Vec<String> = state
+        .live
+        .subscribe(&channel(READ_CHANNEL), None)
+        .replay
+        .into_iter()
+        .map(|live| live.message.content)
+        .collect();
+    assert_eq!(published, ["will fail to arrive at first"]);
+    poller.abort();
+}

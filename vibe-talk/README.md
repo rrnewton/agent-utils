@@ -2279,6 +2279,16 @@ was ADDED. It does not prove that nothing was edited or deleted: Discord's `last
 only on additions. Only `unchanged_since` vouches for edits and deletes too, so nothing that must
 see them acts on a head without it, and nothing acts on a head with an `as_of`.
 
+**The live poller.** On each full pass over a provider that reads heads natively, the poller asks
+for the heads of every channel it has already seeded and that is neither failing nor behind its
+page ceiling, in one call, and skips the page of a channel whose newest message is not newer than
+its cursor. A tick reads only what is newer than the cursor, so a skip hides nothing the tick would
+have seen. Ten quiet channels on Discord cost one request per server a tick instead of ten pages. A
+head that failed, came from an older copy (`as_of`), or names an id the poller cannot compare is
+read as before, and so is every channel of a provider whose heads are emulated (Slack, a bridge
+without `head_reads`): the poller never asks such a provider for heads. A hinted read is never
+gated, since the hint says something changed.
+
 ### A bridge's channel heads
 
 **The problem.** A bridge is asked for each channel's newest messages one channel at a time, and a
