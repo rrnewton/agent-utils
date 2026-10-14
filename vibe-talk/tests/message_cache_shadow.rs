@@ -350,14 +350,28 @@ async fn with_the_cache_off_an_ask_is_counted_off_and_without_a_table_nothing_is
         "{}\n[message_cache]\nenabled = false\n",
         testing::config_toml()
     );
-    let (state, fake, _voice) = testing::state_from_toml(&text);
+    let (mut state, fake, _voice) = testing::state_from_toml(&text);
     fake.seed(&ChannelId(READ_CHANNEL.to_owned()), "Ada", "hello");
+    state.replace_chat(Arc::new(TimelineChat::new(fake.clone())));
     vibe_talk::cache::lifecycle::start(&state.config, &state.message_cache).await;
     state.message_cache.arm();
     state.refresh_routes();
     assert!(state.message_cache.cache().is_none());
     ok(&state, &path(READ_CHANNEL, "/messages"), READ_TOKEN).await;
     ok(&state, &path(READ_CHANNEL, "/count"), READ_TOKEN).await;
+    ok(
+        &state,
+        &path(READ_CHANNEL, "/timeline?view=main"),
+        READ_TOKEN,
+    )
+    .await;
+    // The thread list is never answered from the cache, so it is not a miss of one.
+    ok(
+        &state,
+        &path(READ_CHANNEL, "/timeline?view=threads"),
+        READ_TOKEN,
+    )
+    .await;
     settled(&state).await;
     let messages = counts(&state, "messages");
     assert_eq!(
@@ -366,6 +380,12 @@ async fn with_the_cache_off_an_ask_is_counted_off_and_without_a_table_nothing_is
         "{messages:?}"
     );
     assert_eq!(counts(&state, "count").misses.off, 1);
+    let timeline = counts(&state, "timeline_fallback");
+    assert_eq!(
+        (timeline.asked, timeline.misses.off),
+        (1, 1),
+        "{timeline:?}"
+    );
 
     // No table at all, the default: nothing is evaluated and nothing counted.
     let (state, fake, _voice) = testing::state_from_toml(&testing::config_toml());

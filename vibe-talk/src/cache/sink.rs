@@ -890,31 +890,36 @@ impl Sink {
     ) -> Option<Shadowed> {
         let consumer = ask.consumer();
         let progress = &self.state.shadow;
-        let Some(cache) = self.cache().filter(|cache| cache.is_open()) else {
-            if self
+        let cache = self.cache().filter(|cache| cache.is_open());
+        // No cache and no table: nothing is looked at, nothing counted.
+        if cache.is_none()
+            && !self
                 .lifecycle()
                 .is_some_and(|lifecycle| lifecycle.configured())
-            {
-                progress
-                    .tallies
-                    .decided(consumer, Decision::Miss(Miss::Off));
-            }
+        {
+            return None;
+        }
+        let (route, armed) = {
+            let routes = self.state.routes();
+            (routes.fills.get(channel).cloned(), routes.armed)
+        };
+        // An ask the cache would never answer is not one it could miss, whether or not it is open.
+        let query = match &route {
+            Some(route) => Some(shadow::query(&ask, route.shape, route.recent_via_flat)?),
+            None => None,
+        };
+        let Some(cache) = cache else {
+            progress
+                .tallies
+                .decided(consumer, Decision::Miss(Miss::Off));
             return None;
         };
-        let route = {
-            let routes = self.state.routes();
-            routes
-                .armed
-                .then(|| routes.fills.get(channel).cloned())
-                .flatten()
-        };
-        let Some(route) = route else {
+        let (Some(route), Some(query), true) = (route, query, armed) else {
             progress
                 .tallies
                 .decided(consumer, Decision::Miss(Miss::Blocked));
             return None;
         };
-        let query = shadow::query(&ask, route.shape, route.recent_via_flat)?;
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         let chan = ChanKey::new(route.key, channel.as_str());
         let live_fed = live_fed();
