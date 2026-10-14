@@ -3654,7 +3654,7 @@ it was: a purge never turns the cache on, and never turns it off. Its `purged` l
 | Erase in Settings (`DELETE /api/v1/message-cache`); the storage purge | The open file, replaced by a fresh one while the cache is on. The purge also erases every other cache file this server made |
 | A channel taken off the list: removed or hidden in Settings, or deleted from the configuration | That channel's messages, and the store's summaries of it |
 | At every start, and whenever the list changes: anything not on the list (a channel no longer listed, a hidden one, one under a provider key that no longer exists) | Those channels' messages, and the store's summaries of every channel no longer listed under any provider |
-| A provider refuses a read of a channel or a thread, and the server's own read, ten minutes later, is refused the same way | That channel and the store's summaries of it; or that thread's messages and the store's summaries of them |
+| A provider refuses a read of a channel or a thread (a 403 or 404; from Slack, only `channel_not_found`, `not_in_channel` or `thread_not_found`, never a 403 or 404 that carries no Slack code, which something in front of Slack answered), and the server's own read, ten minutes later, is refused the same way | That channel and the store's summaries of it; or that thread's messages and the store's summaries of them |
 | A provider refuses the credential for 24 hours, or Slack answers `account_inactive` or `token_revoked`; a provider's account is no longer the one the file's messages were read as | Everything held from that provider |
 | A file from an incompatible schema, or a file of ours that SQLite cannot read | The file, rebuilt empty |
 

@@ -1222,7 +1222,10 @@ mod tests {
     /// change to the body's shape fails this test rather than a cache in production.
     #[test]
     fn the_message_cache_reads_back_the_code_a_slack_failure_carries() {
-        use crate::cache::access::{classify, slack_code, Signal};
+        use crate::cache::access::{slack_code, Dialect, Signal};
+        let classify = |op: &str, thread: Option<&str>, error: &ChatError| {
+            crate::cache::access::classify(Dialect::Slack, op, thread, error)
+        };
         let client = client();
         let failure = |method: &str, code: &str| {
             client

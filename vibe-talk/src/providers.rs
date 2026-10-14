@@ -98,7 +98,9 @@ impl ChatRouter {
     }
 
     /// [`ChatRouter::new`], timing each entry's client into `profile` under the entry's key, and
-    /// reporting each outcome to a new [`AccessWatch`] that nothing listens to yet.
+    /// reporting each outcome to a new [`AccessWatch`] that nothing listens to yet. The watch reads
+    /// every entry's failures as a Discord-protocol provider's until told otherwise
+    /// ([`AccessWatch::set_dialect`]), as [`ChatRouter::from_config`] tells it for each provider.
     ///
     /// For a builder that hands the same profile to a provider's own client first, as
     /// [`ChatRouter::from_config`] does for Slack's per-call timings.
@@ -192,6 +194,14 @@ impl ChatRouter {
             });
         }
         let router = Self::with_profile(entries, config.default_provider_key(), profile);
+        // Each provider's failures are read as its configured kind says it speaks, never as their
+        // bodies look: `#208 persistent-cache`, see [`crate::cache::access::Dialect`].
+        for provider in &config.providers {
+            router.access.set_dialect(
+                &provider.key,
+                crate::cache::access::Dialect::of(&provider.kind),
+            );
+        }
         router.replace_routes(&config.channels);
         Ok(router)
     }

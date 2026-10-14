@@ -17,7 +17,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
-use vibe_talk::cache::access::CONFIRM_AFTER;
+use vibe_talk::cache::access::{Dialect, CONFIRM_AFTER};
 use vibe_talk::cache::sink::{
     Verification, CREDENTIAL_GRACE, SUSPENDED_RECHECK, VERIFY_RETRY_FIRST,
 };
@@ -634,6 +634,15 @@ async fn slack_deployment(
     dir: &TempDir,
     clock: &Arc<ManualClock>,
 ) -> AppState {
+    slack_deployment_and_store(fake, dir, clock).await.0
+}
+
+/// [`slack_deployment`], and the store behind it.
+async fn slack_deployment_and_store(
+    fake: &slack_fake::Fake,
+    dir: &TempDir,
+    clock: &Arc<ManualClock>,
+) -> (AppState, Arc<FakeStore>) {
     let text = format!(
         r#"
 [auth]
@@ -654,10 +663,13 @@ writable = true
         base = fake.base,
         token = slack_fake::TOKEN,
     );
-    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let (mut state, _discord, store) = testing::state_with_store_from_toml(&text);
     let router = ChatRouter::from_config(&state.config).expect("providers build");
     state.replace_providers(Arc::new(router));
-    testing::with_message_cache(state, dir.path(), clock.clone()).await
+    (
+        testing::with_message_cache(state, dir.path(), clock.clone()).await,
+        store,
+    )
 }
 
 fn slack_history() -> slack_fake::FakeState {
@@ -822,13 +834,19 @@ async fn each_excluded_failure_leaves_rows_and_serving_unchanged() {
     unchanged("a 403 from a post");
     d.first.heal();
 
-    // A 404 message_not_found, even from a read of the channel.
-    d.first.fail(
-        "fetch_timeline",
-        slack_failure(404, "conversations.history", "message_not_found"),
-    );
-    assert_ne!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
-    unchanged("a 404 message_not_found");
+    // A 404 from one message's lookup: the provider no longer holds that one message.
+    d.first.fail("fetch_thread_message", unknown_channel());
+    assert!(d
+        .state
+        .chat
+        .fetch_thread_message(
+            &id(READ_CHANNEL),
+            seeded(READ_CHANNEL)[2].as_str(),
+            &seeded(READ_CHANNEL)[3]
+        )
+        .await
+        .is_err());
+    unchanged("a 404 from one message's lookup");
     d.first.heal();
 
     // A 404 from moving the provider's read cursor: it no longer holds that one message.
@@ -888,23 +906,104 @@ async fn slacks_excluded_codes_leave_rows_and_serving_unchanged() {
     assert_eq!(held(&cache, &chan), 7, "filled, and served");
     assert!(state.providers.access().suspects().is_empty());
 
-    // A missing_scope 403 from history.
-    fake.with(|state| {
-        state.fail.insert(
+    // A missing_scope 403, and a message_not_found 404, from history: a read of the channel.
+    for code in ["missing_scope", "message_not_found"] {
+        fake.with(|state| {
+            state
+                .fail
+                .insert("conversations.history".to_owned(), code.to_owned());
+        });
+        assert_ne!(read_main(&state, SLACK_CH).await, StatusCode::OK);
+        assert_eq!(held(&cache, &chan), 7, "{code}: still held, still served");
+        assert!(
+            state.providers.access().suspects().is_empty(),
+            "{code}: nothing in doubt, so nothing to confirm"
+        );
+        assert_eq!(
+            state.message_cache.verification(SLACK),
+            Verification::Verified,
+            "{code}"
+        );
+    }
+}
+
+/// Plan section 6.3: on Slack only `channel_not_found`, `not_in_channel` and `thread_not_found`
+/// say access is lost. An HTTP 404 or 403 that carries no Slack code at all was answered by
+/// something in front of Slack (a shim route that is gone or misrouted, an intermediary refusing
+/// the destination, a wrong `api_base`). Seen by a READ-token read, and again by anything the
+/// server reads ten minutes on, it puts nothing in doubt, erases nothing, and deletes none of the
+/// store's summaries.
+async fn a_slack_refusal_with_no_slack_code_changes_nothing(status: u16, body: &str) {
+    let fake = slack_fake::Fake::start(slack_history(), 10).await;
+    let dir = TempDir::new("cache-access-slack-http");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let (state, store) = slack_deployment_and_store(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let chan = ChanKey::new(SLACK, SLACK_CH);
+    assert_eq!(read_main(&state, SLACK_CH).await, StatusCode::OK);
+    assert_eq!(total(&cache), 6, "filled");
+    let key = SummaryKey {
+        channel: id(SLACK_CH),
+        message: MessageId(slack_fake::ts(120, 0)),
+        content_hash: vibe_talk::summarize::content_hash("message 2"),
+        version: state.summary_version.to_string(),
+    };
+    file_summary(&store, &key).await;
+    tokio::time::pause();
+
+    fake.with(|s| {
+        s.http_fail.insert(
             "conversations.history".to_owned(),
-            "missing_scope".to_owned(),
+            (status, body.to_owned()),
         );
     });
-    assert_ne!(read_main(&state, SLACK_CH).await, StatusCode::OK);
-    assert_eq!(held(&cache, &chan), 7, "still held, still served");
+    let (answered, _) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{SLACK_CH}/timeline?view=main&limit=50"),
+        READ_TOKEN,
+    )
+    .await;
+    assert_ne!(answered, StatusCode::OK);
     assert!(
         state.providers.access().suspects().is_empty(),
-        "nothing in doubt, so nothing to confirm"
+        "a Slack {status} with no Slack code put the channel in doubt"
+    );
+    assert!(
+        !blocked(&cache, &chan, &CacheScope::Main),
+        "a Slack {status} with no Slack code blocked the channel"
+    );
+    tokio::time::advance(CONFIRM_AFTER + PAST).await;
+    settle_tasks().await;
+    settle_tasks().await;
+    assert_eq!(
+        total(&cache),
+        6,
+        "a Slack {status} with no Slack code erased the channel"
+    );
+    assert!(
+        kept(&store, &key).await,
+        "a Slack {status} with no Slack code deleted the store's summaries"
     );
     assert_eq!(
         state.message_cache.verification(SLACK),
         Verification::Verified
     );
+}
+
+#[tokio::test]
+async fn a_slack_http_404_with_no_slack_code_never_erases_nor_forgets_summaries() {
+    a_slack_refusal_with_no_slack_code_changes_nothing(
+        404,
+        "<html><body><h1>404 Not Found</h1></body></html>",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_slack_http_403_with_no_slack_code_never_erases_nor_forgets_summaries() {
+    a_slack_refusal_with_no_slack_code_changes_nothing(403, "Forbidden: destination not allowed")
+        .await;
 }
 
 #[tokio::test]
@@ -993,6 +1092,11 @@ async fn thread_not_found_doubts_only_that_thread_and_confirming_it_erases_only_
     }
     let state = testing::with_message_cache(d.state.clone(), dir.path(), clock.clone()).await;
     let d = Deployment { state, ..d };
+    // The first provider fails the way Slack's client does, and is read as Slack.
+    d.state
+        .providers
+        .access()
+        .set_dialect(FIRST, Dialect::Slack);
     let cache = d.cache();
     let thread = CacheScope::Thread(root.as_str().to_owned());
     let thread_uri = format!(
@@ -1125,7 +1229,12 @@ async fn a_revoked_credential_erases_at_once_and_a_refusal_lasting_a_day_erases(
     let cache = d.cache();
     tokio::time::pause();
 
-    // Revoked: erased at once, its account with it.
+    // Revoked: erased at once, its account with it. The first provider fails the way Slack's
+    // client does, and is read as Slack: only Slack says a credential is gone for good.
+    d.state
+        .providers
+        .access()
+        .set_dialect(FIRST, Dialect::Slack);
     let revoked = slack_failure(401, "conversations.history", "token_revoked");
     d.first.fail("fetch_timeline", revoked.clone());
     d.first.answer(Err(revoked));

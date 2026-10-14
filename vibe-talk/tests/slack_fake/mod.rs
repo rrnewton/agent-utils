@@ -68,6 +68,9 @@ pub struct FakeState {
     /// Thread root `ts` → HTTP status answered to every `conversations.replies` request for that
     /// thread, as a bridge answers when its command fails on one thread's content.
     pub fail_threads: HashMap<String, u16>,
+    /// Method → an HTTP status and a plain body that is no Slack answer at all, every time: what a
+    /// shim route that is gone, an intermediary refusing the destination or a wrong address gives.
+    pub http_fail: HashMap<String, (u16, String)>,
     /// One 429 for this method, with this `Retry-After` in seconds.
     pub rate_limit_once: Option<(String, u64)>,
     /// Answer every request with HTTP 500 and a body that echoes the token.
@@ -498,6 +501,9 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
             )
                 .into_response();
         }
+    }
+    if let Some((status, body)) = state.http_fail.get(&method).cloned() {
+        return (StatusCode::from_u16(status).expect("an HTTP status"), body).into_response();
     }
     if method == "chat.postMessage" && state.fail_posts.contains(&state.calls[&method]) {
         return (StatusCode::BAD_GATEWAY, "upstream send timed out").into_response();
