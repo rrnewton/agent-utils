@@ -274,6 +274,37 @@ async fn two_reply_marks_of_one_message_at_once_ask_the_provider_once() {
 }
 
 #[tokio::test]
+async fn a_mark_held_at_the_provider_in_one_channel_does_not_hold_up_another_channel() {
+    let (harness, ids) = harness(2);
+    let other = harness.discord.seed(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "codex-eng",
+        "elsewhere",
+    );
+    let harness = Arc::new(harness);
+    let gate = harness.discord.hold_upstream_read_marks();
+    let first = tokio::spawn({
+        let (harness, target) = (Arc::clone(&harness), ids[1].clone());
+        async move { reply_mark(&harness, &target).await }
+    });
+    assert_eq!(asked_at_least(&harness, 1).await, vec![here(&ids[1])]);
+    let second = tokio::spawn({
+        let (harness, target) = (Arc::clone(&harness), other.0.clone());
+        async move { reply_mark_in(&harness, READ_CHANNEL, &target).await }
+    });
+    // The other channel's mark reaches the provider while the first is still held there.
+    assert_eq!(
+        asked_at_least(&harness, 2).await,
+        vec![here(&ids[1]), format!("{READ_CHANNEL}:{}", other.0)],
+        "a mark in one channel waited on a mark held in another"
+    );
+    gate.add_permits(2);
+    let (one, two) = (first.await.expect("first"), second.await.expect("second"));
+    assert_eq!(one.1["outcome"], "marked", "{}", one.1);
+    assert_eq!(two.1["outcome"], "marked", "{}", two.1);
+}
+
+#[tokio::test]
 async fn floors_are_per_channel() {
     let (harness, ids) = harness(3);
     let other = harness.discord.seed(
