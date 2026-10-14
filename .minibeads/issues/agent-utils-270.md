@@ -1,10 +1,11 @@
 ---
 title: 'voice-transcript-markers: the voice transcript keeps a frozen card for every message the agent sent, and the new-conversation marker says how many words were recapped'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-13T11:49:51.283927429+00:00
-updated_at: 2026-10-13T11:49:51.283927429+00:00
+updated_at: 2026-10-14T03:37:04.120325042+00:00
+closed_at: 2026-10-14T03:37:04.120324932+00:00
 ---
 
 # Description
