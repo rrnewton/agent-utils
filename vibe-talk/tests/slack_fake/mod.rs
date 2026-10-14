@@ -263,6 +263,35 @@ pub fn thread(
         .insert((conversation.to_owned(), root_ts), list);
 }
 
+/// Post a reply in the existing thread rooted on `root` of `conversation`, as somebody else would,
+/// and make its root say what Slack's then says: one more reply, the latest at `ts`.
+pub fn add_reply(state: &mut FakeState, conversation: &str, root: &str, ts: &str, text: &str) {
+    let replies = state
+        .replies
+        .entry((conversation.to_owned(), root.to_owned()))
+        .or_default();
+    replies.push(
+        json!({"type": "message", "ts": ts, "thread_ts": root, "user": "UREPLIER1",
+            "text": text, "user_profile": {"display_name": "Replier"}}),
+    );
+    let count = replies.len();
+    let latest = replies
+        .iter()
+        .map(|reply| reply["ts"].as_str().expect("ts").to_owned())
+        .max_by_key(|ts| micros(ts))
+        .expect("a reply");
+    let message = state
+        .history
+        .get_mut(conversation)
+        .expect("conversation")
+        .iter_mut()
+        .find(|message| message["ts"] == json!(root))
+        .expect("root");
+    message["thread_ts"] = json!(root);
+    message["reply_count"] = json!(count);
+    message["latest_reply"] = json!(latest);
+}
+
 fn micros(ts: &str) -> i64 {
     let (secs, frac) = ts.split_once('.').unwrap_or((ts, "0"));
     let frac = format!("{frac:0<6}");

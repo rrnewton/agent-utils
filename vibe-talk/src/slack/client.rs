@@ -133,6 +133,10 @@ pub struct HttpSlackClient {
     pub(super) flat_memory: Mutex<super::timeline::FlatMemory>,
     /// How long those replies are trusted before a Flat read reads their thread in full again.
     pub(super) flat_reconcile: Duration,
+    /// Where the live poller stands in each thread of each conversation it polls, so each of its
+    /// reads reads only the threads that moved, and only after the newest reply it has had.
+    /// `slack-reply-live`; see `super::live`.
+    pub(super) live_threads: Mutex<HashMap<String, super::live::LiveThreads>>,
     /// The most one post may carry, as Slack is sent it; see [`SlackConfig::post_limit`].
     pub(super) post_limit: crate::chat::PostLimit,
     /// Where each Web API request is timed, by method and outcome, when the client was built with
@@ -191,6 +195,7 @@ impl HttpSlackClient {
             proven: Mutex::new(HashMap::new()),
             flat_memory: Mutex::default(),
             flat_reconcile: super::timeline::FLAT_RECONCILE,
+            live_threads: Mutex::new(HashMap::new()),
             post_limit: config.post_limit(),
             shim_profile: None,
         })
@@ -216,9 +221,9 @@ impl HttpSlackClient {
     /// and one with new replies costs one. An edit to a reply changes nothing on its root, so it
     /// reaches Flat when this period runs out, or on the next Flat read after the thread view has
     /// shown it (the thread view shows it at once). That holds for every reader of Flat, not only
-    /// the page: a summary, or a recent window where `recent_view` is `"flat"`, may also see a
-    /// reply's text as it was up to this long ago. `Duration::ZERO` reads every thread in full on
-    /// every Flat read.
+    /// the page: a summary, or the newest messages read for `/messages` and the voice tools, which
+    /// take their replies from the same memory (`slack-reply-live`), may also see a reply's text as
+    /// it was up to this long ago. `Duration::ZERO` reads every thread in full on every Flat read.
     #[must_use]
     pub fn with_flat_reconcile(mut self, period: Duration) -> Self {
         self.flat_reconcile = period;
@@ -602,6 +607,12 @@ impl Raw {
         self.str_field("thread_ts").and_then(ids::canonical_ts)
     }
 
+    /// Whether this is a thread reply also sent to the conversation (`thread_broadcast`), which
+    /// history lists among the conversation's own messages.
+    pub fn is_broadcast(&self) -> bool {
+        self.str_field("subtype") == Some("thread_broadcast")
+    }
+
     /// Whether this message is the root of a thread with at least one reply.
     pub fn is_thread_root(&self) -> bool {
         self.thread_ts().as_deref() == Some(self.ts.as_str()) && self.reply_count() > 0
@@ -914,6 +925,48 @@ impl ChatClient for HttpSlackClient {
         after: Option<&MessageId>,
     ) -> Result<Vec<Message>, ChatError> {
         self.read_page(channel, limit, before, after)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    /// The conversation's own newest messages, as before replies were read for the newest
+    /// messages: a reachability check needs no thread. `slack-reply-live`.
+    async fn probe_channel(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.read_page(channel, limit, None, None)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    /// The newest messages, thread replies included. `slack-reply-live`; see
+    /// `HttpSlackClient::recent`.
+    async fn fetch_recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.recent(channel, limit)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    /// `conversations.history` lists no thread reply, so the live poller reads a whole
+    /// conversation's replies apart. A channel narrowed to one thread reads them in its own forward
+    /// read. `slack-reply-live`; see `super::live`.
+    fn polls_thread_replies(&self, channel: &ChannelId) -> bool {
+        Self::channel_ref(channel).is_ok_and(|target| target.thread_ts.is_none())
+    }
+
+    async fn fetch_live(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        after: Option<&MessageId>,
+    ) -> Result<crate::chat::LiveRead, ChatError> {
+        self.live(channel, limit, after)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }

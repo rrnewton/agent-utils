@@ -389,6 +389,23 @@ pub struct RecentRead {
     pub exhausted: bool,
 }
 
+/// One read the live poller makes of a channel whose provider reads its thread replies apart.
+/// `slack-reply-live`; see [`ChatClient::fetch_live`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveRead {
+    /// The channel's own messages, oldest first: what [`ChatClient::fetch_page`] with `after`
+    /// answers, or for the read that seeds the poller, the channel's newest messages.
+    pub messages: Vec<Message>,
+    /// Thread replies no earlier read reported, oldest first, each reported once. Their place in
+    /// time says nothing about whether the poller has had them: the provider keeps its own place in
+    /// each thread, so the poller publishes every one, whatever its cursor says.
+    pub replies: Vec<Message>,
+    /// Whether the provider left replies for its next read: more threads moved than one read
+    /// reads, a thread had more new replies than one call returns, or a read of one failed for a
+    /// moment. Not a gap: they are reported by a later read.
+    pub replies_behind: bool,
+}
+
 /// Which messages of a channel a range read covers. remote-ops-audit W10 `#287 bulk-reads`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadScope {
@@ -936,6 +953,52 @@ pub trait ChatClient: Send + Sync {
             messages: self.fetch_recent(channel, limit).await?,
             as_of: None,
             exhausted: false,
+        })
+    }
+
+    /// Whether the live poller reads `channel` with [`ChatClient::fetch_live`] rather than with
+    /// [`ChatClient::fetch_recent`] and [`ChatClient::fetch_page`]. `slack-reply-live`.
+    ///
+    /// True for a provider whose forward read of the channel leaves its thread replies out, so
+    /// that the poller would otherwise never deliver one: Slack, whose `conversations.history`
+    /// lists no reply. False by default: a provider whose forward read already carries them
+    /// (Discord, a compatible bridge), or that has no threads, is polled exactly as before.
+    fn polls_thread_replies(&self, _channel: &ChannelId) -> bool {
+        false
+    }
+
+    /// One read of the live poller, for a channel that [`ChatClient::polls_thread_replies`].
+    /// `slack-reply-live`.
+    ///
+    /// With `after`, [`LiveRead::messages`] is exactly what [`ChatClient::fetch_page`] with that
+    /// `after` answers, and [`LiveRead::replies`] the thread replies posted since the provider's
+    /// previous live read of the channel. Without `after`, the read seeds the poller: `messages`
+    /// holds the channel's newest messages, at most `limit` (the poller keeps only the newest id),
+    /// and the provider notes where each thread stands, reporting no reply. A later seed starts
+    /// again from where the channel stands then.
+    ///
+    /// The provider keeps that place itself, so one poller reads one channel through it at a time,
+    /// as [`crate::live::poll_forever`] does. The default reads exactly what the poller reads
+    /// otherwise, and reports no reply.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the read of the channel's own messages. A read of a thread that fails leaves
+    /// that thread's replies for the next read ([`LiveRead::replies_behind`]) rather than failing
+    /// the channel's own messages.
+    async fn fetch_live(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        after: Option<&MessageId>,
+    ) -> Result<LiveRead, ChatError> {
+        let messages = match after {
+            Some(after) => self.fetch_page(channel, limit, None, Some(after)).await?,
+            None => self.fetch_recent(channel, limit).await?,
+        };
+        Ok(LiveRead {
+            messages,
+            ..LiveRead::default()
         })
     }
 

@@ -191,7 +191,7 @@ pub(super) fn thread_ts(thread_id: &str) -> Result<String, ChatError> {
 }
 
 /// A cursor id from a caller, as an instant.
-fn cursor_micros(id: &MessageId) -> Result<i64, ChatError> {
+pub(super) fn cursor_micros(id: &MessageId) -> Result<i64, ChatError> {
     ids::message_id_micros(id).ok_or_else(|| {
         refused(&format!(
             "{id} is not a message id this Slack backend issued"
@@ -756,6 +756,79 @@ impl HttpSlackClient {
             }),
             ..TimelinePage::default()
         })
+    }
+
+    /// [`crate::chat::ChatClient::fetch_recent`], without the provider label: the newest `limit`
+    /// messages of `channel`, thread replies included. `slack-reply-live`.
+    ///
+    /// The conversation's newest `limit` messages from history, as before, and the replies Flat
+    /// holds ([`Self::flat_replies`]) for the threads rooted on them whose latest reply falls inside
+    /// that stretch, at most [`FLAT_MAX_THREADS`] of them, the most recently active first, merged
+    /// and cut to the newest `limit`. A thread whose latest reply is older than the oldest message
+    /// read has no reply in the window and costs nothing; one whose root has not changed since Flat
+    /// last read it costs no call either, one with new replies one call, and one Flat holds nothing
+    /// for is read in full, as a Flat read does. So the window the voice tools and `/messages` read
+    /// sees a thread reply as Flat does: posted ones at once, an edit within [`FLAT_RECONCILE`].
+    ///
+    /// A thread rooted before the stretch read is not looked at, so its newest replies are not in
+    /// the window: as in Flat, the newest messages are those of the threads that start in it. A
+    /// thread whose replies cannot be read is left out of this answer rather than failing it,
+    /// which is what every read answered before replies were read for it. A channel narrowed to
+    /// one thread is that thread's newest messages, root and replies.
+    pub(super) async fn recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        let target = Self::channel_ref(channel)?;
+        if target.thread_ts.is_some() {
+            return self.read_page(channel, limit, None, None).await;
+        }
+        let conversation = target.conversation.as_str();
+        let want = usize::from(limit.max(1));
+        let run = self.history_newest(conversation, None, want).await?;
+        let mut raws = run.real;
+        if raws.iter().any(Raw::is_thread_root) {
+            self.mark_threaded(conversation);
+        }
+        // How far back the window reaches: to its oldest message when it is full, to where a walk
+        // that ran out of pages stopped, and otherwise to the beginning of the conversation.
+        let reach = if raws.len() >= want {
+            raws.first().map_or(i64::MIN, |raw| raw.micros)
+        } else {
+            run.exhausted_at.unwrap_or(i64::MIN)
+        };
+        let mut roots: Vec<&Raw> = raws
+            .iter()
+            .filter(|raw| raw.is_thread_root() && raw.activity_micros() >= reach)
+            .collect();
+        roots.sort_by_key(|root| std::cmp::Reverse(root.activity_micros()));
+        let reads: Vec<_> =
+            roots
+                .iter()
+                .take(FLAT_MAX_THREADS)
+                .map(|root| async move {
+                    (root.ts.clone(), self.flat_replies(conversation, root).await)
+                })
+                .collect();
+        let replies: Vec<(String, Result<Vec<Raw>, ChatError>)> =
+            stream::iter(reads).buffered(4).collect().await;
+        for (root, read) in replies {
+            match read {
+                Ok(read) => raws.extend(read),
+                Err(error) => tracing::warn!(
+                    conversation,
+                    thread = %root,
+                    %error,
+                    "a Slack thread's replies were left out of the newest messages: they could not \
+                     be read"
+                ),
+            }
+        }
+        raws.sort_by_key(|raw| raw.micros);
+        raws.dedup_by_key(|raw| raw.micros);
+        raws.drain(..raws.len().saturating_sub(want));
+        Ok(self.messages(channel, &raws).await)
     }
 
     /// The newest replies of one thread on a Flat page, read only as far as they changed. `#282

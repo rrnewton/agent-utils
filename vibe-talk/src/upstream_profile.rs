@@ -1117,6 +1117,15 @@ impl Rows for RecentRead {
     }
 }
 
+impl Rows for crate::chat::LiveRead {
+    fn rows(&self) -> usize {
+        self.messages.len() + self.replies.len()
+    }
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter().chain(&self.replies)
+    }
+}
+
 impl Rows for crate::chat::RangeRead {
     fn rows(&self) -> usize {
         self.messages.len()
@@ -1481,6 +1490,24 @@ impl ChatClient for ProfiledClient {
             "fetch_recent_dated",
             Direction::Read,
             self.inner.fetch_recent_dated(channel, limit),
+        )
+        .await
+    }
+
+    fn polls_thread_replies(&self, channel: &ChannelId) -> bool {
+        self.inner.polls_thread_replies(channel)
+    }
+
+    async fn fetch_live(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        after: Option<&MessageId>,
+    ) -> Result<crate::chat::LiveRead, ChatError> {
+        self.timed(
+            "fetch_live",
+            Direction::Read,
+            self.inner.fetch_live(channel, limit, after),
         )
         .await
     }

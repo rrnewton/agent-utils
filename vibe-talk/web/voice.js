@@ -16972,7 +16972,8 @@ function heldUnansweredRoot(id) {
 //
 // WHAT IS NOT HELD BUT IS REPORTED IS NEW. The store holds a reply only once a read of All or of its
 // thread, or the stream, brought it — and while the reader sits on Main only Main is read. Slack's
-// stream carries no thread reply at all, and the Google Chat bridge's carries one without saying
+// stream carries a reply only a poll after it was posted, and only in a thread rooted on the newest
+// page of history (`slack-reply-live`), and the Google Chat bridge's carries one without saying
 // which thread it is in. What Main's own read does carry is each root's count, so the page knows a
 // reply exists before it holds it. A shortfall of the held replies against an exact count is one of
 // two things: replies older than anything read of the thread, which the reader has had every chance

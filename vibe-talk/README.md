@@ -202,8 +202,10 @@ are marked Done here or on another device — Main's own refresh says which, wit
 the thread — and as you answer in the thread, your own words counting as read and the reply you
 answered marked Done. It counts the replies
 the page holds — from **All**, from threads you have opened, and from the live stream — with their
-Done state. While you stay on Main only Main is read, and Slack's live stream carries no thread reply
-at all, so an answer can exist before the page has it: Main's refresh still reports each message's
+Done state. While you stay on Main only Main is read, and the live stream brings a reply only once a
+poll has found it (on Slack, only in a thread rooted on the newest page of the conversation's
+history: see [Live thread replies](#live-thread-replies)), so an answer can exist before the page
+has it: Main's refresh still reports each message's
 reply count, and replies counted there that the page has not brought, posted since it last read the
 thread or All, count as possibly unread. The chip then says **M+ unread** beside what is known, or **N
 new** when nothing the page holds is unread, and the message is kept under both read modes until a
@@ -1119,8 +1121,8 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   new messages arrive through the provider's `live_poll_seconds` authoritative history reads. A
   deployment with a separate Slack event stream can use it as a content-free change hint, waking
   that same cursor immediately while the interval remains its recovery path; see [Live
-  push](#live-push). Replies inside threads are read when a thread, or a channel narrowed to one,
-  is opened.
+  push](#live-push). Each poll also brings the thread replies posted since the last one: see [Live
+  thread replies](#live-thread-replies).
   For the Meta CLI bridge, make the user-token subscription explicit for the whole conversation.
   An ambient `slack.message tail` depends on the token's existing inbox subscriptions and may
   produce no match; the channel-scoped subscription used by the service is:
@@ -1135,6 +1137,17 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   missed, newer creates — including bot posts — and periodic reconciliation covers a stretch with
   no emitted hint. Neither forward path detects an edit or deletion of an already-cursored
   message; change hints do not imply otherwise.
+* **The newest messages include thread replies.** The read behind the voice tools' catch-up and
+  `digest_channel`, `/messages`, and a lookup of a message by its description reads the
+  conversation's newest messages from history, as before, and adds the replies the flat view holds
+  for the threads rooted on them whose latest reply falls inside that stretch, at most 10 threads,
+  the most recently active first, keeping the newest messages of them all. It shares the flat
+  view's memory (below), so a thread whose root has not changed since it was last read costs no
+  call, one with new replies one call (`conversations.replies` with `oldest=`), and one not yet read
+  either way is read in full; a thread whose latest reply is older than the stretch costs nothing.
+  An edit to a reply shows there within fifteen minutes, as in the flat view, and a reply in a
+  thread rooted before the stretch is not among them. A thread whose replies cannot be read is left
+  out of that read rather than failing it. A reachability probe still reads history alone.
 * **Read state.** What you have read is vibe-talk's own record, as on Discord, and there is no
   "Mark read in Slack" on a message. With `upstream_clear` on, Settings can clear a channel's unread
   state in Slack as vibe-talk receives its messages, but never a thread's; see [Clearing unread in
@@ -1199,6 +1212,48 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
 * **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
   that the request fails with a message that names the limit. An author's name never waits: it
   falls back to the user id.
+
+### Live thread replies
+
+`slack-reply-live`. `conversations.history` lists no thread reply, so a poll that only walked it
+forward never delivered one. With `live_poll_seconds` set, each poll of a whole conversation instead
+reads the newest page of its history with no `oldest`: one call, the count of the forward read it
+replaces, and it answers that read too whenever it reaches back to the last message delivered. An
+interval with more new messages than that page holds is then walked forward from the last one
+delivered, as before, so it costs that call as well. Every thread root on that page reports its
+`reply_count` and `latest_reply`, and:
+
+* **A thread whose root's `latest_reply` is no newer than the newest reply the poll has already
+  delivered from it costs no call.** A root that names no `latest_reply` is read when its reply
+  count changes.
+* **A thread that moved costs one `conversations.replies` call**, with `oldest` at the newest reply
+  already delivered, and its new replies go out on the live stream as messages in their thread: to
+  the page, to the voice agent while a call is open, and into the window the voice tools' catch-up
+  reads.
+* **At most four threads are read in one poll.** The rest wait for the next poll, the longest
+  waiting first, and so does a thread with more new replies than one call returns; they are read
+  even after their root has left the newest page. A page the server cut short is never taken for
+  the end of a thread: only `has_more: false` with the root's latest reply among what came back is.
+  Running behind on replies, and catching up, is logged once each at INFO.
+
+So a quiet poll costs one call, as before, and a poll after replies in N threads costs
+1 + min(N, 4). The first poll after a start notes where each thread stands and delivers nothing, as
+it does for every message. A reply also sent to the channel arrives once, from history.
+
+What it does not do:
+
+* **Edits and deletions.** A changed or deleted reply moves nothing on its root, so the poll does not
+  see it; it shows when the thread, the flat view or the newest messages are read again.
+* **Threads rooted before the newest page.** A reply in a thread whose root is further back than
+  that page (200 messages, or fewer when a bridge caps the page, 20 for the bridge this was built
+  against) is not polled, as in the flat view: open the thread, or read All, to read it.
+* **Clearing unread in Slack.** A reply delivered this way is not offered for clearing (below): it
+  was read out of step with the conversation's own messages, so a clear through it could mark read a
+  message vibe-talk had not received yet. The next message of the conversation's own is offered as
+  ever.
+
+A channel narrowed to one thread is polled as before: its forward read is the thread, replies
+included.
 
 ### Clearing unread in Slack
 
@@ -3722,6 +3777,14 @@ Three rules in the loop are correctness, not tuning:
   then moving the cursor to the newest of them drops everything in between the moment a channel
   produces more than one window between two ticks — silently: no gap event, no warning, and a page
   and an agent simply missing lines. Walking forward cannot lose them.
+
+**Thread replies a provider reads apart are published too.** Slack's `conversations.history`
+lists no thread reply, so for a whole Slack conversation the first page of each tick also carries
+the thread replies posted since the previous tick (see [Live thread
+replies](#live-thread-replies)). They are published in time order among that page's messages, and
+they never move the cursor: a reply read a tick late may be older than a message already published,
+and a cursor moved past a message the page did not hold would skip it. Discord and a compatible
+bridge, whose forward reads already carry replies, are polled exactly as before.
 
 **And a bound on catching up, because "read until caught up, whatever it costs" is a request storm
 against a shared rate limit — and obeying `Retry-After` buys time, not quota.** One tick walks at

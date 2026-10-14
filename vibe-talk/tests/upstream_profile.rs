@@ -22,10 +22,10 @@ use serde_json::Value;
 use slack_fake::{profiled, ts, Fake, FakeState, METHODS, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
-    ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, Lookup, PostLimit, RangeOrder,
-    RangeRead, ReadCaps, ReadScope, RecentAnswers, RecentAsk, RecentRead, RegisteredChannel,
-    SourceClaim, Support, ThreadAnswers, ThreadAsk, TimeRange, UpstreamClearOutcome,
-    UpstreamReadScope,
+    ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, LiveRead, Lookup, PostLimit,
+    RangeOrder, RangeRead, ReadCaps, ReadScope, RecentAnswers, RecentAsk, RecentRead,
+    RegisteredChannel, SourceClaim, Support, ThreadAnswers, ThreadAsk, TimeRange,
+    UpstreamClearOutcome, UpstreamReadScope,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -429,6 +429,23 @@ impl ChatClient for Recorder {
             exhausted: false,
         })
     }
+    fn polls_thread_replies(&self, _channel: &ChannelId) -> bool {
+        self.note("polls_thread_replies");
+        true
+    }
+    async fn fetch_live(
+        &self,
+        _channel: &ChannelId,
+        _limit: u16,
+        _after: Option<&MessageId>,
+    ) -> Result<LiveRead, ChatError> {
+        self.note("fetch_live");
+        Ok(LiveRead {
+            messages: Vec::new(),
+            replies: vec![self.message.clone()],
+            replies_behind: true,
+        })
+    }
     fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
         self.note("read_caps");
         ReadCaps {
@@ -705,6 +722,14 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     assert_eq!(dated.as_of.as_deref(), Some("2026-10-12T09:00:00Z"));
     assert_eq!(dated.messages.len(), 1);
     ran("fetch_recent_dated");
+    assert!(client.polls_thread_replies(&channel));
+    ran("polls_thread_replies");
+    let live = client
+        .fetch_live(&channel, 5, Some(&id))
+        .await
+        .expect("live read");
+    assert!(live.replies_behind && live.replies.len() == 1);
+    ran("fetch_live");
     assert_eq!(client.read_caps(&channel).page_rows, 7);
     ran("read_caps");
     let range = client
@@ -879,6 +904,7 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     };
     assert_eq!(rows("fetch_recent"), Some(1));
     assert_eq!(rows("fetch_recent_dated"), Some(1));
+    assert_eq!(rows("fetch_live"), Some(1), "a reply is a row");
     assert_eq!(
         rows("discover_channels"),
         Some(0),
@@ -896,12 +922,12 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         Some(2),
         "one message from each of two threads"
     );
-    // Nine reads each return the one message (a lookup's absent id is no message), and the reads
-    // of two channels and of two threads return it twice each; posts return ours and are not
-    // counted.
+    // Ten reads each return the one message (a lookup's absent id is no message, a live read's
+    // reply is one), and the reads of two channels and of two threads return it twice each; posts
+    // return ours and are not counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 13, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 13 * bytes);
+    assert_eq!(rec.content_bytes.messages, 14, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 14 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),

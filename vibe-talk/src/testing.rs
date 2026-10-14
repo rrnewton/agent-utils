@@ -795,6 +795,23 @@ impl crate::chat::ChatClient for CountingChat {
         .await
     }
 
+    fn polls_thread_replies(&self, channel: &crate::model::ChannelId) -> bool {
+        self.inner.polls_thread_replies(channel)
+    }
+
+    async fn fetch_live(
+        &self,
+        channel: &crate::model::ChannelId,
+        limit: u16,
+        after: Option<&crate::model::MessageId>,
+    ) -> Result<crate::chat::LiveRead, crate::chat::ChatError> {
+        self.counted(
+            call_in("fetch_live", channel),
+            self.inner.fetch_live(channel, limit, after),
+        )
+        .await
+    }
+
     fn read_caps(&self, channel: &crate::model::ChannelId) -> crate::chat::ReadCaps {
         self.inner.read_caps(channel)
     }

@@ -14,7 +14,9 @@
 //! A lookup of several messages by id reads `conversations.history` or `conversations.replies`
 //! a run of timestamps a call (`slack/lookup.rs`). A read of several threads reads each thread's
 //! newest page in one `conversations.replies` window, and after an instant only the threads whose
-//! root moved (`slack/threads.rs`).
+//! root moved (`slack/threads.rs`). The live poller reads the newest page of history, and the new
+//! replies of only the threads whose root moved (`slack/live.rs`); a read of the newest messages
+//! adds the replies Flat holds for the threads active among them (`slack/timeline.rs`).
 //! | `chat.postMessage` | every post, in a conversation or in a thread |
 //! | `users.info` | an author's display name when the message does not carry one |
 //! | `users.conversations` | the channel browser |
@@ -34,8 +36,10 @@
 //! # What it does not do
 //!
 //! There is no Events API or Socket Mode connection: new messages arrive through the server's
-//! ordinary bounded live polling, which reads a conversation's main timeline (thread replies are
-//! read when a thread or a thread-scoped channel is opened).
+//! ordinary bounded live polling, which reads a conversation's main timeline and the new replies of
+//! the threads rooted on its newest page whose root moved (`slack-reply-live`, `slack/live.rs`).
+//! A reply's edit or deletion, and a reply in a thread rooted further back, are read when the
+//! thread, Flat or the newest messages are read.
 //!
 //! There is no manual "Mark read in Slack" on a message. The one upstream write besides posting is
 //! the automatic clear of [`crate::upstream_clear`], off unless the deployment sets
@@ -47,6 +51,7 @@ mod clear;
 mod client;
 mod history;
 pub mod ids;
+mod live;
 mod lookup;
 pub mod mrkdwn;
 mod range;
@@ -55,6 +60,7 @@ mod timeline;
 
 pub use client::{HttpSlackClient, SLACK_MAX_TEXT_CHARS};
 pub use ids::{message_id_from_ts, parse_source, ts_from_message_id};
+pub use live::{LIVE_LAG_READS, LIVE_THREAD_READS};
 
 /// The Slack Web API base used when a deployment does not name a bridge.
 pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";

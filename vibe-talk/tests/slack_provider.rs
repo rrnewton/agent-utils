@@ -562,7 +562,14 @@ async fn the_main_view_pages_back_through_the_whole_conversation() {
     let (state, _) = three_threads();
     let fake = Fake::start(state, 4).await;
     let client = fake.client();
-    let expected = ts_list(&client.fetch_recent(&channel(), 1000).await.expect("all"));
+    // The conversation's own timeline: `fetch_recent` carries thread replies too
+    // (`slack-reply-live`).
+    let expected = ts_list(
+        &client
+            .fetch_page(&channel(), 1000, None, None)
+            .await
+            .expect("all"),
+    );
     assert_eq!(expected.len(), 34);
     let mut request = page_request(TimelineView::Main, 7);
     let mut pages = Vec::new();
@@ -885,7 +892,12 @@ async fn a_message_nobody_has_answered_heads_its_own_empty_thread_which_its_firs
         "a Slack reply is a thread reply"
     );
 
-    let messages = client.fetch_recent(&channel(), 50).await.expect("read");
+    // The conversation's own timeline: `fetch_recent` carries thread replies too
+    // (`slack-reply-live`).
+    let messages = client
+        .fetch_page(&channel(), 50, None, None)
+        .await
+        .expect("read");
     let lone = messages
         .iter()
         .find(|message| message.id == mid(&fresh))

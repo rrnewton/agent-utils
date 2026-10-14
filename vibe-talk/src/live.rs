@@ -115,7 +115,7 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
-use crate::chat::{ChatClient, ChatError};
+use crate::chat::{ChatClient, ChatError, LiveRead};
 use crate::contract::{LiveDeleteEvent, LiveMessageEvent, LiveResetEvent};
 use crate::model::{sort_oldest_first, ChannelId, ChannelInfo, Message, MessageId};
 use crate::state::AppState;
@@ -349,6 +349,26 @@ impl LiveHub {
             self_posted,
         };
         self.publish_inner(channel, live, false);
+    }
+
+    /// Publish one thread reply a provider read apart from the channel's own timeline, and
+    /// remember it for replay. `slack-reply-live`; see [`crate::chat::ChatClient::fetch_live`].
+    ///
+    /// Exactly [`LiveHub::publish`], held windows included, except that the reply is not offered
+    /// for clearing unread at the provider ([`crate::upstream_clear`]). It was read out of step
+    /// with the channel's own messages, so the poller may not yet have every one of those up to
+    /// its instant, and a clear through it could mark read a message vibe-talk never received. The
+    /// next message of the channel's own is offered as ever.
+    pub fn publish_reply(&self, channel: &ChannelId, message: Message) {
+        let self_posted = self.is_self_posted(&message.id);
+        let live = LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind: LiveKind::Create,
+            historical: false,
+            message,
+            self_posted,
+        };
+        self.publish_to_feed(channel, live, false);
     }
 
     /// Publish one event delivered by an external adapter.
@@ -672,6 +692,9 @@ pub struct Tick {
     /// tick; this says the channel is arriving faster than one tick reads it, which is a latency
     /// fact worth a log line and not a loss.
     pub backlog: bool,
+    /// Whether the provider left thread replies for the next tick ([`crate::chat::LiveRead`]).
+    /// `slack-reply-live`. Not a gap either: a later tick publishes them.
+    pub replies_behind: bool,
 }
 
 /// Read one channel once, publishing whatever is newer than `cursor`.
@@ -694,6 +717,16 @@ pub struct Tick {
 /// honest way to place them relative to the cursor, and publishing them on every tick would be a
 /// permanent duplicate.
 ///
+/// **Thread replies a provider reads apart are published as well.** `slack-reply-live`. A channel
+/// whose provider [`ChatClient::polls_thread_replies`] is seeded and stepped with
+/// [`ChatClient::fetch_live`] instead, and the first page of each tick then also carries the thread
+/// replies posted since the provider's previous read ([`crate::chat::LiveRead`]). They are
+/// published in time order among that page's messages, through [`LiveHub::publish_reply`], and
+/// they never move the cursor: a reply read a tick late may be older than a message already
+/// published, and a cursor moved past a message that page did not hold would skip it. The provider
+/// keeps its own place in each thread and reports each reply once; one that is also among the
+/// page's messages (a reply sent to the channel too, say) is published once, as a message.
+///
 /// # Errors
 ///
 /// [`ChatError`] from the fetch. **The cursor is not advanced past anything that was not
@@ -707,8 +740,13 @@ pub async fn poll_once(
     limit: u16,
     cursor: &mut Option<u64>,
 ) -> Result<Tick, ChatError> {
+    let apart = chat.polls_thread_replies(channel);
     let Some(seen) = *cursor else {
-        let messages = chat.fetch_recent(channel, limit).await?;
+        let messages = if apart {
+            chat.fetch_live(channel, limit, None).await?.messages
+        } else {
+            chat.fetch_recent(channel, limit).await?
+        };
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
@@ -726,10 +764,25 @@ pub async fn poll_once(
     let mut published = 0;
     let mut at = seen;
     let mut backlog = false;
+    let mut replies_behind = false;
     for page in 0..MAX_PAGES_PER_TICK {
         let after = MessageId(at.to_string());
-        let mut messages = match chat.fetch_page(channel, limit, None, Some(&after)).await {
-            Ok(messages) => messages,
+        let read = if apart && page == 0 {
+            chat.fetch_live(channel, limit, Some(&after)).await
+        } else {
+            chat.fetch_page(channel, limit, None, Some(&after))
+                .await
+                .map(|messages| LiveRead {
+                    messages,
+                    ..LiveRead::default()
+                })
+        };
+        let LiveRead {
+            mut messages,
+            replies,
+            replies_behind: behind,
+        } = match read {
+            Ok(read) => read,
             Err(error) => {
                 // Whatever went out in an earlier page of this tick really went out. Rewinding to
                 // where the tick started would republish it, and the page cannot tell a
@@ -738,9 +791,12 @@ pub async fn poll_once(
                 return Err(error);
             }
         };
+        replies_behind |= behind;
         sort_oldest_first(&mut messages);
         let full = messages.len() >= page_size;
         let before = at;
+        // Each arrival with its id, and whether it is a reply read apart.
+        let mut arrivals: Vec<(u64, Message, bool)> = Vec::new();
         for message in messages {
             let Some(id) = message.id.numeric() else {
                 continue;
@@ -749,7 +805,24 @@ pub async fn poll_once(
                 continue;
             }
             at = id;
-            hub.publish(channel, message);
+            arrivals.push((id, message, false));
+        }
+        for reply in replies {
+            let Some(id) = reply.id.numeric() else {
+                continue;
+            };
+            if arrivals.iter().any(|(held, _, _)| *held == id) {
+                continue;
+            }
+            arrivals.push((id, reply, true));
+        }
+        arrivals.sort_by_key(|(id, _, _)| *id);
+        for (_, message, reply) in arrivals {
+            if reply {
+                hub.publish_reply(channel, message);
+            } else {
+                hub.publish(channel, message);
+            }
             published += 1;
         }
         // `at == before` means the page held nothing this cursor can move past — an empty answer,
@@ -763,7 +836,11 @@ pub async fn poll_once(
         }
     }
     *cursor = Some(at);
-    Ok(Tick { published, backlog })
+    Ok(Tick {
+        published,
+        backlog,
+        replies_behind,
+    })
 }
 
 /// How long to wait after `failures` consecutive failures on a channel.
@@ -911,6 +988,7 @@ async fn poll_loop_with_channels(
     let max_backoff = interval.saturating_mul(MAX_BACKOFF_INTERVALS);
     let mut failures: BTreeMap<ChannelId, u32> = BTreeMap::new();
     let mut behind: BTreeMap<ChannelId, bool> = BTreeMap::new();
+    let mut replies_behind: BTreeMap<ChannelId, bool> = BTreeMap::new();
     let mut heads_failing = false;
     let mut remaining = ticks;
     let mut hinted_only: Option<BTreeSet<ChannelId>> = None;
@@ -930,6 +1008,7 @@ async fn poll_loop_with_channels(
         cursors.retain(|channel, _| current.contains(channel));
         failures.retain(|channel, _| current.contains(channel));
         behind.retain(|channel, _| current.contains(channel));
+        replies_behind.retain(|channel, _| current.contains(channel));
         let requested = hinted_only.take();
         let full_reconciliation = requested.is_none();
         // A full reconciliation already reads every channel for this provider. Discard hints
@@ -1009,6 +1088,24 @@ async fn poll_loop_with_channels(
                         );
                     }
                     *was_behind = tick.backlog;
+                    // `slack-reply-live`. Thread replies left for the next tick, said once on the
+                    // way in and once on the way out, as the page ceiling is.
+                    let replies_were_behind =
+                        replies_behind.entry(channel.clone()).or_insert(false);
+                    if tick.replies_behind && !*replies_were_behind {
+                        tracing::info!(
+                            channel = %channel,
+                            "live ingestion left thread replies in this channel for the next tick: \
+                             more threads moved than one tick reads, or a read of one failed for a \
+                             moment. Nothing is skipped; they are published by a later tick."
+                        );
+                    } else if !tick.replies_behind && *replies_were_behind {
+                        tracing::info!(
+                            channel = %channel,
+                            "live ingestion caught up with the thread replies in this channel"
+                        );
+                    }
+                    *replies_were_behind = tick.replies_behind;
                 }
                 Err(error) => {
                     // ONCE at WARN, on the transition into failure. A channel that has been
@@ -1100,7 +1197,8 @@ async fn poll_loop_with_channels(
 /// emulated head is a read of the channel, no cheaper than the page it would replace, so such a
 /// provider is never asked and its channels are polled exactly as before. Of those channels, only
 /// ones with a cursor (seeded), not failing (a failing channel keeps being read, so its recovery
-/// and its backoff stay what they were) and not behind its page ceiling are asked about, all in
+/// and its backoff stay what they were), not behind its page ceiling and not one whose thread
+/// replies its provider reads apart ([`ChatClient::polls_thread_replies`]) are asked about, all in
 /// one call.
 ///
 /// **What a skip can hide: nothing this loop would have seen.** A tick reads only what is NEWER
@@ -1123,6 +1221,9 @@ async fn quiet_channels(
         .iter()
         .filter(|channel| {
             chat.read_caps(channel).heads == crate::chat::Support::Native
+                // `slack-reply-live`: a head names the newest of the channel's own messages, and
+                // says nothing of a reply this channel's provider reads apart.
+                && !chat.polls_thread_replies(channel)
                 && cursors.get(*channel).copied().flatten().is_some()
                 && failures.get(*channel).copied().unwrap_or(0) == 0
                 && !behind.get(*channel).copied().unwrap_or(false)
