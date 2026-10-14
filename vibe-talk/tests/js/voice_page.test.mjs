@@ -425,6 +425,11 @@ const FIXTURE_TREE = {
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
   "side-column": ["side-heading", "side-freshness", "side-scroll", "side-reply", "side-tools"],
+  // `#298 thread-card-header`. Over a thread across the window the heading is the thread's card, the X
+  // in it, as at the top of the right column: drawn only while the heading over a thread is.
+  "channel-navigation": ["channel-view-tabs", "thread-heading"],
+  "thread-heading": ["thread-card"],
+  "thread-card": ["thread-card-text", "thread-card-age", "thread-card-count", "thread-back"],
   // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
   "side-heading": ["side-title", "side-unread-only", "side-thread-card"],
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
@@ -3323,13 +3328,25 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   };
   /**
    * `#261 two-column-connectors`. A reader whose system asks for reduced motion: the stylesheet then says
-   * `--column-glide: auto` on #screen-main, which is what the page reads. Its root font size is the
-   * default, as the page assumes where it cannot read one.
+   * `--column-glide: auto` on #screen-main, which is what the page reads — and `#298 thread-card-header`,
+   * `--card-flight: 0ms`. Its root font size is the default, as the page assumes where it cannot read one.
    */
   page.preferReducedMotion = () => {
     context.window.getComputedStyle = () => ({
       fontSize: "16px",
-      getPropertyValue: (name) => (name === "--column-glide" ? "auto" : ""),
+      getPropertyValue: (name) => ({ "--column-glide": "auto", "--card-flight": "0ms" })[name] || "",
+    });
+  };
+  /**
+   * `#298 thread-card-header`. The stylesheet as it is for a reader who has not asked for reduced motion:
+   * `--card-flight: 220ms` on #screen-main, how long the card at the top of a thread takes to move up
+   * from its card in the list, and `--column-glide: smooth`. Left out of the ordinary fixture, whose
+   * stylesheet says nothing, so that no card moves in a test that is not about it.
+   */
+  page.allowCardFlight = () => {
+    context.window.getComputedStyle = () => ({
+      fontSize: "16px",
+      getPropertyValue: (name) => ({ "--column-glide": "smooth", "--card-flight": "220ms" })[name] || "",
     });
   };
   page.resized = (target) => {
@@ -26940,13 +26957,6 @@ test("a thread's summarised display name is what the picker calls it, when the s
 // list. It should show only about one screen worth with an '... Older threads' option that pops up
 // a dedicated paginated selector page."
 
-/** The heading over an open thread, as the picker's option would read with the same name length. */
-const headingLabel = (page) => {
-  const facts = page.el("thread-facts");
-  return facts.hidden ? page.el("thread-title").textContent
-    : `${facts.textContent} · ${page.el("thread-title").textContent}`;
-};
-
 /** The picker's label for one value, or undefined when it does not offer it. */
 const optionLabel = (page, value) => (threadOptions(page).find(([offered]) => offered === value) || [])[1];
 
@@ -26980,11 +26990,11 @@ function agedSummary(page, n, hours, fields = {}) {
   };
 }
 
-test("the heading over an open thread is the picker's option for it, less shortened", async () => {
+test("`#298 thread-card-header` x `#194 thread-picker-polish`: the heading over a thread across the window is its card — what it is about, how long since it moved, its replies — while the picker's option still names it in its own words", async () => {
   const page = newPage();
   const data = threadData();
   page.threadingSupported = true;
-  // Longer than the picker's name, so the two can be told apart and the prefix relation checked.
+  // Longer than the picker's name, so the option's shortening of it can be told apart.
   const long = "First discussion of the rollout plan for the storage tier";
   page.threads = data.threads.map((thread, i) => (i === 0 ? { ...thread, title: long } : thread));
   await signIn(page);
@@ -26993,38 +27003,47 @@ test("the heading over an open thread is the picker's option for it, less shorte
   // its summary carries the long title. The thread itself is drawn from All, with no read.
   await page.el("thread-select").dispatch("pointerdown");
   await page.settle();
+  // Its colour, as its tag in All draws it.
+  const hue = tagOf(rowWithId(page, "201")).hue;
+  assert.notEqual(hue, "", "the tag has no colour to compare with");
   await pickThread(page, `thread:${page.threads[0].id}`);
   const option = optionLabel(page, `thread:${page.threads[0].id}`);
-  assert.equal(page.el("thread-title").textContent, long, "the heading did not give the name its room");
-  assert.equal(page.el("thread-facts").hidden, false, "the heading lost the age and reply count");
-  const facts = page.el("thread-facts").textContent;
-  assert.ok(option.startsWith(`${facts} · `), `the heading says "${facts}" and the option "${option}"`);
-  const short = option.slice(facts.length + " · ".length);
+  const card = wideCard(page);
+  assert.equal(card.shown, true, "no card heads the thread");
+  // A card's words: its first message, there being no summary — the card in the thread list says so too.
+  assert.equal(card.text, "first thread root", "the heading is not the thread's card");
+  assert.equal(card.title, "first thread root", "the card's whole text is not its tooltip");
+  assert.equal(card.count, "1 reply · 1 unread");
+  assert.equal(card.unread, "1 unread", "the unread is not drawn in the accent");
+  assert.equal(card.state, "open");
+  assert.equal(card.hue, hue, "the card is not the thread's colour");
+  // The age is the option's, and the option names the thread in its own words, shortened.
+  const [age, count] = option.split(" · ");
+  assert.equal(card.age, age, `the card says "${card.age}" and the option "${option}"`);
+  assert.equal(count, "1");
+  const short = option.slice(`${age} · ${count} · `.length);
   assert.ok(short.endsWith("…") && long.startsWith(short.slice(0, -1)),
-    `the option's name ${JSON.stringify(short)} is not the heading's, shortened`);
-  assert.ok(headingLabel(page).startsWith(option.slice(0, -1)),
-    `the heading reads "${headingLabel(page)}" and the picker "${option}"`);
+    `the option's name ${JSON.stringify(short)} is not the thread's name, shortened`);
 });
 
-test("a display name that arrives after the thread opened renames the heading and the option together", async () => {
+test("`#298 thread-card-header`: a summary that arrives after the thread opened is drawn on its card across the window, and the option takes the name with it", async () => {
   // A thread read for itself, whose answer names it before any thread list has been read.
   const page = await mainOnlyThreadPage();
   const id = page.threads[0].id;
   await pickThread(page, `thread:${id}`);
-  assert.equal(page.el("thread-title").textContent, "First discussion");
-  assert.equal(headingLabel(page), optionLabel(page, `thread:${id}`));
-  // The summariser names it later; the next read of the thread list carries the name.
-  page.threads[0] = { ...page.threads[0], display_name: "storage-rollout" };
+  assert.equal(wideCard(page).text, "first thread root");
+  assert.match(optionLabel(page, `thread:${id}`), / · First discussion$/);
+  // The summariser names it later; the next read of the thread list carries the name and the summary.
+  page.threads[0] = { ...page.threads[0], display_name: "storage-rollout", summary: "Whether the storage tier moves on Tuesday." };
   await page.el("thread-select").dispatch("pointerdown");
   await page.settle();
-  assert.equal(page.el("thread-title").textContent, "storage-rollout",
-    "the heading kept the name it was opened with");
+  assert.equal(wideCard(page).text, "storage-rollout: Whether the storage tier moves on Tuesday.",
+    "the card kept the words it was opened with");
+  assert.equal(wideCard(page).title, "storage-rollout: Whether the storage tier moves on Tuesday.");
   assert.match(optionLabel(page, `thread:${id}`), / · storage-rollout$/);
-  assert.equal(headingLabel(page), optionLabel(page, `thread:${id}`),
-    "the heading and the picker disagree about the thread on screen");
 });
 
-test("a thread opened from a tag is named at once, as the picker names it, not 'Thread'", async () => {
+test("a thread opened from a tag is named at once, by its card as the picker names it, not 'Thread'", async () => {
   // All draws a thread as a filter of what it holds, with no read, so nothing hands the heading a
   // summary: it used to say "Thread" while the picker beside it named the thread by its root.
   const page = await threadPage();
@@ -27032,10 +27051,11 @@ test("a thread opened from a tag is named at once, as the picker names it, not '
   const row = page.el("discord-log").children.find((li) => li.getAttribute("data-id") === "204");
   await threadBadge(row).click();
   await page.settle();
-  assert.equal(page.el("thread-title").textContent, "second thread root");
+  // `#298 thread-card-header`: by its card, whose words are its first message's.
+  assert.equal(wideCard(page).text, "second thread root");
   const value = "thread:spaces/A/threads/another";
   assert.equal(page.el("thread-select").value, value);
-  assert.equal(headingLabel(page), optionLabel(page, value));
+  assert.match(optionLabel(page, value), / · second thread root$/);
 });
 
 test("ages read as days and hours, never 42h, on one compact scale", async () => {
@@ -27150,15 +27170,20 @@ test("`#281 view-keys`: the thread list pages back on the server's cursor where 
   await page.settle();
   assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "a click on a card left the thread list");
   assert.deepStrictEqual(litCards(page), [old.id], "a click on a card of the thread list did not highlight it");
+  const said = listCardSays(page, old.id);
   await openerOf(cardRow(page, old.id)).click();
   await page.settle();
   assert.equal(page.el("screen-main").hasAttribute("data-columns"), false, "the thread opened inside the list");
   assert.equal(page.tab(), "discord");
   assert.equal(page.el("thread-heading").hidden, false, "the chosen thread did not open");
   assert.equal(page.el("thread-select").value, `thread:${old.id}`);
-  assert.equal(page.el("thread-title").textContent, old.title);
-  assert.equal(headingLabel(page), optionLabel(page, `thread:${old.id}`));
-  assert.equal(page.el("thread-facts").textContent, "3d3h · 15");
+  // `#298 thread-card-header`: under its card, which says what its card in the list said.
+  const card = wideCard(page);
+  assert.deepStrictEqual([card.text, card.age, card.count, card.hue], [said.text, said.age, said.count, said.hue],
+    "the card at the top of the thread is not its card in the list");
+  assert.equal(card.age, "3d3h");
+  assert.match(card.count, /^15 replies/);
+  assert.match(optionLabel(page, `thread:${old.id}`), /^3d3h · 15 · /, "the picker's option lost its age and count");
   assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), old.id);
   // Back: the list again, all twenty cards, with no read of them.
   const listReads = reads().length;
@@ -27863,7 +27888,9 @@ test("Threads is ordered oldest to newest, opens at bottom and returns to its sa
   const reads = page.timelineCalls.length;
   await openerOf(list.children[0], "thread-card-open").click();
   assert.equal(page.el("thread-heading").hidden, false);
-  assert.equal(page.el("thread-title").textContent, "First discussion");
+  // `#298 thread-card-header`: under its card, whose X goes back to the Threads list.
+  assert.equal(wideCard(page).text, "first thread root");
+  assert.equal(page.el("thread-back").getAttribute("title"), "Back to the Threads list");
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["201", "202"]);
   assert.equal(page.el("thread-select").value, `thread:${page.threads[0].id}`);
   // Drawn from All, which the channel opened in and which holds the whole thread: no read.
@@ -28817,13 +28844,13 @@ test("the reply screen's title names the thread it posts into as the picker does
   assert.equal(replyTitle(page), "Reply · Main · the planning room");
   await page.el("reply-cancel").click();
 
-  // Inside the thread: the picker's own label for it, with the name less shortened, exactly as the
-  // heading over the thread reads. The title bar cuts what does not fit; the picker cuts at a count.
+  // Inside the thread: the picker's own label for it, with the name less shortened, as the heading
+  // over the thread read until it became the thread's card (`#298 thread-card-header`). The title bar
+  // cuts what does not fit; the picker cuts at a count.
   await pickThread(page, value);
   const option = optionLabel(page, value);
-  const heading = headingLabel(page);
   assert.match(option, / · 5 · Long discussion of the stor…$/, `the picker's label is not what this test expects: ${option}`);
-  assert.match(heading, / · 5 · Long discussion of the storage migration$/);
+  const heading = `${option.slice(0, option.indexOf(" · Long"))} · Long discussion of the storage migration`;
   await replyButton(rowOf(page, "304")).click();
   assert.equal(replyTitle(page), `Reply · ${heading}`, "the title bar and the heading name the thread differently");
   assert.ok(replyTitle(page).startsWith(`Reply · ${option.slice(0, -1)}`),
@@ -28866,14 +28893,16 @@ test("the reply screen's title gives the name a line of its own, so a phone cuts
   });
   const lines = () => page.el("topbar-title").children.map((part) => [part.className, part.textContent]);
   await pickThread(page, `thread:${data.thread.id}`);
-  const facts = page.el("thread-facts").textContent;
+  // The picker's facts for it, "13h · 5", before its name.
+  const option = optionLabel(page, `thread:${data.thread.id}`);
+  const facts = option.slice(0, option.indexOf(" · Long"));
+  assert.match(facts, /^(now|\d+[mhdwy]|\d+d\d+h) · 5$/, `the picker's label is not what this test expects: ${option}`);
   await replyButton(rowOf(page, "304")).click();
   assert.deepEqual(lines(), [
     ["title-lead", `Reply · ${facts}`],
     ["sr-only", " · "],
     ["title-name", "Long discussion of the storage migration"],
   ]);
-  assert.equal(lines()[2][1], page.el("thread-title").textContent, "the title's name is not the heading's");
   await page.el("reply-cancel").click();
 
   await pickThread(page, "main");
@@ -31245,7 +31274,7 @@ test("one store per channel: every view it covered is drawn after a reload with 
   openerOf(page.el("thread-list").children[0], "thread-card-open").click();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
-  assert.equal(page.el("thread-title").textContent, "First discussion");
+  assert.equal(wideCard(page).text, "first thread root");
   page.el("thread-back").click();
   page.el("channel-view-main").click();
   await page.settle();
@@ -34957,7 +34986,7 @@ test("a reload reopens the channel, the thread and Hide read as the reader left 
   assert.equal(page.tab(), "discord", "the page did not reopen on the channel it was left on");
   assert.equal(page.el("thread-select").value, `thread:${id}`, "the thread was not reopened");
   assert.equal(page.el("thread-heading").hidden, false);
-  assert.equal(page.el("thread-title").textContent, "First discussion", "the reopened thread has no name");
+  assert.equal(wideCard(page).text, "first thread root", "the reopened thread has no card");
   assert.deepStrictEqual(shownIds(page), ["201", "202"], "the thread was not drawn from the device first");
   assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "Hide read came back off");
   assert.deepStrictEqual(readKinds(page), [], "the reopen read before sign-in had answered");
@@ -34965,7 +34994,7 @@ test("a reload reopens the channel, the thread and Hide read as the reader left 
   // Sign-in answers and the stream attaches: the first read is the thread on screen.
   await page.settle();
   assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the first read was not the thread on screen");
-  assert.equal(page.el("thread-title").textContent, "First discussion", "sign-in lost the thread's name");
+  assert.equal(wideCard(page).text, "first thread root", "sign-in lost the thread's card");
   reads.open();
   await page.settle();
   await page.settle();
@@ -35420,7 +35449,7 @@ test("a thread chosen in one channel and Main in another both outlast a reload",
   await pickThread(first, "main");
   assert.deepStrictEqual(await changeChannelTo(first, CHANNEL.id), [`thread:${id}`], "coming back did not read the thread, once");
   assert.equal(first.el("thread-select").value, `thread:${id}`, "the thread chosen here was not reopened");
-  assert.equal(first.el("thread-title").textContent, "First discussion");
+  assert.equal(wideCard(first).text, "first thread root");
   assert.deepStrictEqual(shownIds(first), ["201", "202"]);
   await changeChannelTo(first, OTHER_CHANNEL.id);
   await first.setVisibility("hidden");
@@ -35433,7 +35462,7 @@ test("a thread chosen in one channel and Main in another both outlast a reload",
   assert.deepStrictEqual(await changeChannelTo(page, CHANNEL.id), [`thread:${id}`],
     "the other channel did not reopen its thread with one read");
   assert.equal(page.el("thread-select").value, `thread:${id}`);
-  assert.equal(page.el("thread-title").textContent, "First discussion", "the reopened thread has no name");
+  assert.equal(wideCard(page).text, "first thread root", "the reopened thread has no card");
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
   // Back goes where the thread was opened from: All.
   await page.el("thread-back").click();
@@ -35551,7 +35580,7 @@ test("a record saved before each channel kept its own view is carried forward, n
   });
   assert.equal(page.tab(), "discord", "a v1 record did not reopen the channel");
   assert.equal(page.el("thread-select").value, `thread:${id}`, "the thread a v1 record chose was not reopened");
-  assert.equal(page.el("thread-title").textContent, "First discussion");
+  assert.equal(wideCard(page).text, "first thread root");
   assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "a v1 record's Hide read was lost");
   await reopenedChannel(page);
   assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the reopen read more than the thread");
@@ -35731,7 +35760,7 @@ test("two windows on one channel each reopen in their own view, with the device'
   assert.equal(oneAgain.el("discord-channel").value, CHANNEL.id);
   assert.equal(oneAgain.el("thread-select").value, "main", "a reload opened in the view another window had open");
   assert.equal(twoAgain.el("thread-select").value, `thread:${id}`, "the second window's reload lost its thread");
-  assert.equal(twoAgain.el("thread-title").textContent, "First discussion");
+  assert.equal(wideCard(twoAgain).text, "first thread root");
   // The read mode is the device's, not a place: turned on in one window, a reload of the other has it.
   for (const page of [oneAgain, twoAgain]) {
     assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "the read mode was not the device's");
@@ -42643,28 +42672,32 @@ const readViewsSince = (page, from) => page.timelineCalls.slice(from).map(viewOf
 
 /**
  * What the card at the top of the right column's thread says and how it is drawn, part by part. `#298
- * thread-card-header`. `count` is its replies and unread as drawn, "" while it says neither.
+ * thread-card-header`. `count` is its replies and unread as drawn, "" while it says neither. `id` for
+ * the card at the top of a thread across the window, "thread-card", whose `shown` is its heading's.
  */
-const headerCard = (page) => {
-  const card = page.el("side-thread-card");
-  const button = page.el("side-thread-card-text");
+const headerCard = (page, id = "side-thread-card") => {
+  const card = page.el(id);
+  const button = page.el(`${id}-text`);
   const words = button.children.find((kid) => kid.hasClass("side-card-text"));
-  const count = page.el("side-thread-card-count");
+  const count = page.el(`${id}-count`);
   const part = (name) => count.children.find((kid) => kid.hasClass(name));
   return {
-    shown: !card.hidden,
+    shown: id === "thread-card" ? !page.el("thread-heading").hidden && !page.el("channel-navigation").hidden : !card.hidden,
     thread: card.getAttribute("data-thread"),
     state: card.getAttribute("data-thread-state"),
     hue: card.style.getPropertyValue("--thread-hue"),
     text: words ? words.textContent : null,
     title: button.getAttribute("title"),
-    age: page.el("side-thread-card-age").textContent,
+    age: page.el(`${id}-age`).textContent,
     count: count.hidden ? "" : count.text(),
     unread: part("side-card-unread") ? part("side-card-unread").textContent : "",
     expanded: card.hasAttribute("data-expanded"),
     highlighted: card.hasAttribute("data-highlighted"),
   };
 };
+
+/** The card at the top of a thread across the window, part by part (`headerCard`). `#298 thread-card-header`. */
+const wideCard = (page) => headerCard(page, "thread-card");
 
 /** What a card in the list says beside its text: its facts, its replies button's words, and its colour. */
 const listCardSays = (page, id) => {
@@ -43306,7 +43339,10 @@ test("`#229 desktop-two-column`: leaving two columns returns to the view last ch
   const page = await threadPage("main");
   await pickThread(page, "thread:spaces/A/threads/another");
   assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/another");
-  const name = page.el("thread-title").textContent;
+  // `#298 thread-card-header`: under its card, and named by the picker's option.
+  const said = wideCard(page).text;
+  const name = optionLabel(page, "thread:spaces/A/threads/another").split(" · ").at(-1);
+  assert.equal(said, "second thread root");
   // Into two columns from a thread: Main on the left, that thread on the right.
   await twoColumns(page);
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
@@ -43318,9 +43354,9 @@ test("`#229 desktop-two-column`: leaving two columns returns to the view last ch
   await page.el("column-toggle").click();
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["203", "204"], "the thread selected was forgotten");
-  // Named as one column named it, and under its card (`#298 thread-card-header`).
+  // Named as one column named it, and under the card it was under there (`#298 thread-card-header`).
   assert.equal(page.el("side-scroll").getAttribute("aria-label"), `Thread: ${name}`);
-  assert.equal(headerCard(page).text, "second thread root");
+  assert.equal(headerCard(page).text, said);
 });
 
 test("`#229 desktop-two-column`: a thread selected on the right lands on its first unread message, unfolded, at the head of its column", async () => {
@@ -45600,6 +45636,378 @@ test("`#298 thread-card-header` x `#284 redraw-keeps-pane`: a click on a card's 
   const heading = await run(brokenScript(
     "    if (pane === sidePane && node && nodeWithin(leftEl(\"side-heading\"), node)) return pane;\n", ""));
   assert.equal(heading.fromCard, false, "the negative control closed the thread from its card anyway, so the check above proves nothing");
+});
+
+// --- the card moving up, and the same card over a thread across the window (#298, part 2) -------------
+//
+// The owner: "When we go to single column thread view Cmd-3 an drill in I'd like the same thing. One
+// unified thread list view and one unified intra-thread view." And of the card: "I would like to see the
+// SAME colorful card move up to the top of the screen ... So it just moves up and disgorges its internal
+// messages underneath". tests/thread_card_header_browser.py watches the move in Chromium, frame by frame.
+
+test("`#298 thread-card-header`: a thread across the window is headed by the same card, outside its scroller, with the X in it; two lines of it on a phone; and its move up is the stylesheet's, none under reduced motion", () => {
+  assertMarkupContains("channel-navigation", "thread-heading");
+  assertMarkupContains("thread-heading", "thread-card");
+  assert.ok(!markupHolds("scroll-area", "thread-card"), "the card is inside the scroller, where it would scroll away");
+  for (const part of ["thread-card-text", "thread-card-age", "thread-card-count", "thread-back"]) {
+    assertMarkupContains("thread-card", part);
+  }
+  // The right column's card, part for part: the same classes, so the same rules draw both.
+  const tagOf = (id) => /<[a-z]+\s+id="[^"]+"[^>]*>/.exec(HTML_CODE.slice(HTML_CODE.indexOf(`id="${id}"`) - 12))[0];
+  const classes = (id) => (/class="([^"]*)"/.exec(tagOf(id)) || [])[1];
+  for (const [wide, side] of [["thread-card", "side-thread-card"], ["thread-card-text", "side-thread-card-text"],
+    ["thread-card-age", "side-thread-card-age"], ["thread-card-count", "side-thread-card-count"], ["thread-back", "side-close"]]) {
+    assert.ok(classes(wide), `#${wide} has no classes`);
+    assert.equal(classes(wide), classes(side), `#${wide} is not drawn by #${side}'s rules`);
+  }
+  assert.doesNotMatch(tagOf("thread-card"), /role=|aria-label=/, "the card is a region of its own");
+  assert.match(tagOf("thread-back"), /aria-label="Close thread"/);
+  for (const gone of ["thread-title", "thread-facts"]) {
+    assert.doesNotMatch(HTML_CODE, new RegExp(`id="${gone}"`), `the old heading's #${gone} is still beside the card`);
+  }
+  assert.doesNotMatch(HTML_CODE, /← Back/, "the X is still a button saying Back");
+  // The heading holds the card at its top, so an opened card grows downward, and draws no rule of its
+  // own under the card's border.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#thread-heading"), /align-items:\s*flex-start/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#channel-navigation:has(> #thread-heading:not([hidden]))"), /border-bottom:\s*0/);
+  // On a phone, two lines of it, still a fixed height; opened, all of it.
+  const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card:not([data-expanded]) > .side-card > .side-card-text");
+  assert.match(phone, /-webkit-line-clamp:\s*2/);
+  assert.match(phone, /(^|[^-])height:\s*calc\(2 \* 1\.35em\)/, "the phone's card is not a fixed height");
+  // The move up: a transform from where the card in the list was, for as long as the stylesheet says,
+  // with the thread fading in under it — nothing laid out — and none of it for a reader who asked for
+  // less motion. The script reads the length, and asks no media query.
+  assert.match(CSS_CODE, /#screen-main \{\s*--card-flight: 220ms;\s*\}/);
+  assert.match(CSS_CODE, /@keyframes card-flight \{\s*from \{\s*transform: translate\(var\(--flight-x, 0px\), var\(--flight-y, 0px\)\);\s*\}\s*\}/,
+    "the card does not start where its card in the list was, by a transform alone");
+  assert.match(CSS_CODE, /@keyframes thread-arrive \{\s*from \{\s*opacity: 0;\s*\}\s*\}/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-flying]"), /animation:\s*card-flight var\(--card-flight\)/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#pane-discord[data-arriving]"), /animation:\s*thread-arrive /);
+  assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--card-flight: 0ms;\s*\}\s*\.thread-card-header\[data-flying\],\s*#pane-discord\[data-arriving\],\s*#side-pane\[data-arriving\] \{\s*animation: none;/,
+    "the card moves, or the thread fades, for a reader who asked for less motion");
+  assert.doesNotMatch(SCRIPT_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
+});
+
+test("`#298 thread-card-header`: every way into a thread across the window puts the same card at the top — the thread list's replies button, Thread(N) in Main and in All, the picker — and its X says where it goes and goes there, as Esc and ← do", async () => {
+  const page = await threadPage("main");
+  const first = page.threads[0].id;
+  await pickThread(page, "threads");
+  const said = listCardSays(page, first);
+  assert.equal(said.text, "first thread root");
+  const back = page.el("thread-back");
+  const expect = (way, to) => {
+    const card = wideCard(page);
+    assert.equal(card.shown, true, `${way}: no card at the top of the thread`);
+    assert.deepStrictEqual([card.thread, card.text, card.title, card.age, card.count, card.hue, card.state],
+      [first, said.text, said.text, said.age, said.count, said.hue, "open"], `${way}: the card at the top is not the thread's card`);
+    assert.equal(card.highlighted, false, `${way}: the card carries the highlight that unclamps a card`);
+    assert.equal(back.getAttribute("title"), to, `${way}: the X does not say where it goes`);
+  };
+  // From the thread list: its X, Esc and ← each go back to the list.
+  for (const out of ["the X", "Esc", "←"]) {
+    await openerOf(cardRow(page, first)).click();
+    await page.settle();
+    expect(`the thread list (${out})`, "Back to the thread list");
+    if (out === "the X") await back.click();
+    else await press(page, page.el("scroll-area"), out === "Esc" ? "Escape" : "ArrowLeft");
+    await page.settle();
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", `${out} did not go back to the thread list`);
+  }
+  // Thread(N) in Main, then in All; the picker from Main.
+  await pickThread(page, "main");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  expect("Thread(N) in Main", "Back to Main");
+  await back.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "main", "the X did not go back to Main");
+  await pickThread(page, "flat");
+  await threadBadge(rowWithId(page, "202")).click();
+  await page.settle();
+  expect("Thread(N) in All", "Back to All");
+  await back.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "the X did not go back to All");
+  await pickThread(page, "main");
+  await pickThread(page, `thread:${first}`);
+  expect("the picker", "Back to Main");
+  // Another thread: the card is that one's.
+  await pickThread(page, `thread:${page.threads[1].id}`);
+  assert.equal(wideCard(page).text, "second thread root");
+  assert.equal(wideCard(page).thread, page.threads[1].id);
+});
+
+test("`#298 thread-card-header`: the card across the window counts the thread's replies and unread as they change — a live reply, a Done — and a pass that changes nothing writes nothing to it", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const data = threadData();
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    page.messages = data.messages;
+    const server = forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await pickThread(page, `thread:${data.threads[0].id}`);
+    const counted = [wideCard(page).count];
+    const first = data.messages[1].thread;
+    const reply = server.post(message({ id: "205", content: "a second answer", thread: { ...first, is_root: false } }));
+    await deliver(page, page.stream(), sseMessage(reply));
+    await page.settle();
+    counted.push(wideCard(page).count);
+    await doneButton(rowWithId(page, "202")).click();
+    await page.settle();
+    counted.push(wideCard(page).count);
+    // A poll that brings nothing, and the rows passed over again: nothing written to the card.
+    const count = page.el("thread-card-count");
+    const words = page.el("thread-card-text").children[0];
+    const replace = count.replaceChildren;
+    let writes = 0;
+    count.replaceChildren = (...kids) => {
+      writes += 1;
+      return replace.call(count, ...kids);
+    };
+    const write = FakeElement.prototype.setAttribute;
+    FakeElement.prototype.setAttribute = function counted(name, value) {
+      if ([page.el("thread-card"), page.el("thread-card-text"), page.el("thread-back")].includes(this)) writes += 1;
+      return write.call(this, name, value);
+    };
+    const text = words.textContent;
+    try {
+      page.expireTimers(DISCORD_POLL_MS);
+      await page.settle();
+      await page.el("search-toggle").click();
+      await page.el("search-toggle").click();
+      await page.settle();
+    } finally {
+      FakeElement.prototype.setAttribute = write;
+    }
+    assert.equal(words.textContent, text);
+    return { counted, writes };
+  };
+  const { counted, writes } = await run(SCRIPT);
+  assert.deepStrictEqual(counted, ["1 reply · 1 unread", "2 replies · 2 unread", "2 replies · 1 unread"],
+    "the card across the window did not follow the live reply and the Done");
+  assert.equal(writes, 0, "a pass that changed nothing wrote to the card across the window");
+  // The controls: drawn on every pass, the card is written to by a pass that changes nothing; drawn
+  // only with the heading, it misses the Done.
+  const always = await run(brokenScript("  if (threadCardsDrawn.get(card.id) === signature) return;\n", ""));
+  assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
+  const heading = await run(brokenScript(
+    "  if (!sideActive && channelView === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
+  assert.notDeepStrictEqual(heading.counted, counted, "the negative control counted the Done anyway, so the check above proves nothing");
+});
+
+test("`#298 thread-card-header`: across the window, where the clamp cuts the card's text a press on it opens the card over the list — the heading its own height, the list unmoved — and Esc, a press outside it, or leaving the thread closes it", async () => {
+  const page = await threadPage("main");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const card = page.el("thread-card");
+  const button = page.el("thread-card-text");
+  const heading = page.el("thread-heading");
+  const area = page.el("scroll-area");
+  assert.equal(card.hasAttribute("data-clamped"), true, "the clamped text does not say it can be opened");
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  const place = { top: area.scrollTop, height: area.clientHeight };
+  const tall = heading.getBoundingClientRect().height;
+  assert.ok(tall > 0, "the heading has no height, so this proves nothing");
+  await button.click();
+  assert.equal(wideCard(page).expanded, true, "a press on the clamped text did not open the card");
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.equal(heading.style.height, `${tall}px`, "the heading did not keep its height while the card is open");
+  assert.deepStrictEqual({ top: area.scrollTop, height: area.clientHeight }, place, "opening the card moved the list");
+  // Esc closes it first, and only the next Esc leaves the thread.
+  await press(page, area, "Escape");
+  assert.equal(wideCard(page).expanded, false, "Esc did not close the card");
+  assert.equal(heading.style.height, "");
+  assert.equal(page.el("thread-heading").hidden, false, "Esc left the thread before closing the card");
+  // A press outside it closes it; one on it does not.
+  await button.click();
+  await page.documentEvent("pointerdown", { target: page.el("thread-card-age"), pointerType: "mouse" });
+  assert.equal(wideCard(page).expanded, true, "a press on the card closed it");
+  await page.documentEvent("pointerdown", { target: rowWithId(page, "202"), pointerType: "mouse" });
+  assert.equal(wideCard(page).expanded, false, "a press outside the card did not close it");
+  // Leaving the thread with the card open: it is closed when a thread is next opened.
+  await button.click();
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, true);
+  assert.equal(wideCard(page).expanded, false, "the card stayed open over a list that is not its thread");
+  assert.equal(heading.style.height, "");
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.equal(wideCard(page).expanded, false);
+  assert.equal(wideCard(page).text, "second thread root");
+});
+
+test("`#298 thread-card-header`: a thread opened from its card on screen on the right has its card at the top start where that card was and move up, the thread fading in under it and the line following it a frame at a time, until the animations end or their time is up", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16, (p) => p.allowCardFlight());
+    const header = page.el("side-thread-card");
+    const pane = page.el("side-pane");
+    const area = page.el("side-scroll");
+    const card = threadCard(page, 8);
+    area.scrollTop += card.getBoundingClientRect().top - area.getBoundingClientRect().top - 120;
+    await area.dispatch("scroll");
+    await rootAt(page, 8, 300);
+    const from = card.getBoundingClientRect();
+    assert.ok(from.top > 0 && from.top < area.getBoundingClientRect().top + area.clientHeight, "the card is not on screen, so this proves nothing");
+    await openerOf(card).click();
+    await page.settle();
+    const to = header.getBoundingClientRect();
+    assert.equal(header.hasAttribute("data-flying"), true, "the card at the top did not move up from its card");
+    assert.equal(header.style.getPropertyValue("--flight-x"), `${from.left - to.left}px`);
+    assert.equal(header.style.getPropertyValue("--flight-y"), `${from.top - to.top}px`, "the card at the top does not start where its card was");
+    assert.ok(from.top - to.top > 0, "the card at the top starts above its place, so this proves nothing");
+    assert.equal(pane.hasAttribute("data-arriving"), true, "the thread did not fade in under its card");
+    // The line follows the card up, drawn every frame while it moves: the box a browser gives a moving
+    // card is where its transform has it, which this fixture, laying nothing out, is told frame by frame.
+    const read = header.getBoundingClientRect;
+    const ends = [];
+    try {
+      for (const lower of [90, 45, 10]) {
+        header.getBoundingClientRect = () => ({ ...to, top: to.top + lower, bottom: to.bottom + lower });
+        assert.ok(await page.nextFrame() >= 1, `no frame was asked for with the card ${lower}px from its place`);
+        const [link] = drawnLinks(page);
+        assert.deepStrictEqual(link && [link.thread, link.clip], ["spaces/A/threads/t8", "both"], "the card moving up has no whole line");
+        ends.push(link.line[3] - (to.top + to.bottom) / 2);
+      }
+    } finally {
+      header.getBoundingClientRect = read;
+    }
+    assert.deepStrictEqual(ends, [90, 45, 10], "the line did not follow the card up, frame by frame");
+    // Each part ends with its own animation; another's ending in it is not its own.
+    await header.dispatch("animationend", { target: page.el("side-thread-card-text") });
+    assert.equal(header.hasAttribute("data-flying"), true, "an animation of something in the card ended its move");
+    await header.dispatch("animationend", { target: header });
+    assert.equal(header.hasAttribute("data-flying"), false, "the card's move did not end with its animation");
+    assert.equal(pane.hasAttribute("data-arriving"), true, "the card's move ended the thread's fade with it");
+    await pane.dispatch("animationend", { target: pane });
+    assert.equal(pane.hasAttribute("data-arriving"), false, "the fade did not end with its animation");
+    await page.nextFrame();
+    await page.nextFrame();
+    assert.equal(await page.nextFrame(), 0, "frames went on being asked for once the card had come to rest");
+    assert.equal(page.expireTimers(320), 0, "the fallback outlived the animations it stands in for");
+    // No animation ending, as for a card no longer drawn: the time is up at the length and a little.
+    await page.el("side-close").click();
+    await page.settle();
+    await openerOf(threadCard(page, 8)).click();
+    await page.settle();
+    assert.equal(header.hasAttribute("data-flying"), true);
+    assert.equal(page.expireTimers(320), 1, "no fallback was armed for a move whose animation never ends");
+    assert.equal(header.hasAttribute("data-flying"), false);
+    assert.equal(pane.hasAttribute("data-arriving"), false);
+  } finally {
+    restore();
+  }
+});
+
+test("`#298 thread-card-header`: the card moves up only from a card on screen — Thread(N) on Main with the card showing, yes; the picker with it scrolled away, one thread to another, a stylesheet that gives it no time, or a reader who asked for less motion, no", async () => {
+  const restore = layColumnsOut();
+  try {
+    const showCard = async (page, i) => {
+      const area = page.el("side-scroll");
+      area.scrollTop += threadCard(page, i).getBoundingClientRect().top - area.getBoundingClientRect().top - 120;
+      await area.dispatch("scroll");
+      await page.nextFrame();
+    };
+    const moved = (page) => [page.el("side-thread-card").hasAttribute("data-flying"), page.el("side-pane").hasAttribute("data-arriving")];
+    const run = async (script) => {
+      const { page } = await linkedColumns(16, (p) => p.allowCardFlight(), script);
+      const seen = {};
+      // Thread(N) on Main, its card on screen.
+      await showCard(page, 8);
+      await rootAt(page, 8, 120);
+      await threadBadge(rootRow(page, 8)).click();
+      await page.settle();
+      seen.tag = moved(page);
+      // One thread to another.
+      page.expireTimers(320);
+      await threadBadge(rootRow(page, 9)).click();
+      await page.settle();
+      seen.another = moved(page);
+      // The picker, its card scrolled away.
+      await page.el("side-close").click();
+      await page.settle();
+      const area = page.el("side-scroll");
+      area.scrollTop = area.scrollHeight;
+      await area.dispatch("scroll");
+      await page.nextFrame();
+      assert.ok(threadCard(page, 0).getBoundingClientRect().bottom < area.getBoundingClientRect().top, "the card is on screen, so this proves nothing");
+      page.el("thread-select").value = "thread:spaces/A/threads/t0";
+      await page.el("thread-select").dispatch("change");
+      await page.settle();
+      seen.away = moved(page);
+      return seen;
+    };
+    assert.deepStrictEqual(await run(SCRIPT), { tag: [true, true], another: [false, false], away: [false, false] },
+      "the card moved up from where no card showed, or not from where one did");
+    // The control: asked whether the card shows nowhere, it moves from a card scrolled away.
+    const blind = await run(brokenScript(" || !rowInView(sidePane, row)) return null;", ") return null;"));
+    assert.deepStrictEqual(blind.away, [true, true], "the negative control did not move the card either, so the check above proves nothing");
+    // Reduced motion, and a stylesheet that says nothing: never.
+    for (const arrange of [(p) => p.preferReducedMotion(), null]) {
+      const { page } = await linkedColumns(16, arrange);
+      await showCard(page, 8);
+      await openerOf(threadCard(page, 8)).click();
+      await page.settle();
+      assert.deepStrictEqual(moved(page), [false, false], `the card moved ${arrange ? "for a reader who asked for less motion" : "with no time to do it in"}`);
+      assert.equal(page.el("side-thread-card").hidden, false);
+    }
+    const { page } = await linkedColumns(16, (p) => p.preferReducedMotion(), brokenScript("  if (!(ms > 0)) return;\n", ""));
+    await showCard(page, 8);
+    await openerOf(threadCard(page, 8)).click();
+    await page.settle();
+    assert.equal(page.el("side-thread-card").hasAttribute("data-flying"), true, "the negative control kept still too, so the check above proves nothing");
+  } finally {
+    restore();
+  }
+});
+
+test("`#298 thread-card-header`: from the thread list, the card moves up across layouts — from its place in the list to the top of the window, into the card over the thread — with no line drawn", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script, (p) => {
+      p.allowCardFlight();
+      p.enableAnimationFrames();
+    });
+    const data = threadData();
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await pickThread(page, "threads");
+    // The card at the foot of the list, which has a card above it: below the top of the window.
+    const id = cardIds(page).at(-1);
+    const from = cardRow(page, id).getBoundingClientRect();
+    await openerOf(cardRow(page, id)).click();
+    await page.settle();
+    return { page, from, id };
+  };
+  const { page, from, id } = await run(SCRIPT);
+  const card = page.el("thread-card");
+  assert.equal(page.el("screen-main").hasAttribute("data-columns"), false, "the thread did not open across the window");
+  assert.equal(wideCard(page).shown, true);
+  assert.equal(card.hasAttribute("data-flying"), true, "the card did not move up from the thread list");
+  const to = card.getBoundingClientRect();
+  assert.equal(card.style.getPropertyValue("--flight-y"), `${from.top - to.top}px`, "the card does not start where the list's card was");
+  assert.ok(from.top - to.top > 0, "the list's card is above the top, so this proves nothing");
+  assert.equal(page.el("pane-discord").hasAttribute("data-arriving"), true, "the thread did not fade in under the card");
+  assert.equal(page.el("side-thread-card").hasAttribute("data-flying"), false);
+  await page.nextFrame();
+  assert.deepStrictEqual(page.el("column-links").children, [], "a line was drawn across the window, with no Main to draw it to");
+  await card.dispatch("animationend", { target: card });
+  await page.el("pane-discord").dispatch("animationend", { target: page.el("pane-discord") });
+  assert.equal(card.hasAttribute("data-flying"), false);
+  assert.equal(page.el("pane-discord").hasAttribute("data-arriving"), false);
+  // Back to the list, and in again: it moves again.
+  await page.el("thread-back").click();
+  await page.settle();
+  await openerOf(cardRow(page, id)).click();
+  await page.settle();
+  assert.equal(card.hasAttribute("data-flying"), true, "the card did not move up the second time");
+  // The control: with no place taken from the list, nothing moves.
+  const still = await run(brokenScript("  const from = threadListOnScreen() ? cardFlightStart(String(id)) : null;\n", "  const from = null;\n"));
+  assert.equal(still.page.el("thread-card").hasAttribute("data-flying"), false, "the negative control moved the card anyway");
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------
@@ -48037,9 +48445,12 @@ test("`#252 thread-button-state`: the grey Thread opens the empty thread with no
   await threadBadge(rowOf(page, "210")).click();
   assert.equal(page.el("thread-heading").hidden, false, "the grey Thread opened nothing");
   assert.equal(page.el("thread-select").value, `thread:${data.lone.id}`);
-  // Named by its message, as a new thread is on the reply screen: there is no summary to name it.
-  assert.equal(page.el("thread-title").textContent, "a brand-new message nobody has answered",
+  // Named by its message, as a new thread is on the reply screen: there is no summary to name it. Its
+  // card is grey, nobody having answered it (`#298 thread-card-header`).
+  assert.equal(wideCard(page).text, "a brand-new message nobody has answered",
     "the empty thread is called by no name of its own");
+  assert.equal(wideCard(page).state, "start", "the card of a thread nobody has answered is not grey");
+  assert.equal(wideCard(page).hue, "", "a colour was spent on a thread nobody has answered");
   assert.deepStrictEqual(shownIds(page), ["210"], "the empty thread is not the message alone");
   assert.equal(focused(page), page.el("channel-compose-text"), `the thread's box was not focused: ${focusName(page)}`);
   assert.equal(page.el("channel-compose-text").getAttribute("aria-label"), "Reply in this thread");

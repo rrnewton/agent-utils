@@ -39,7 +39,8 @@ the newest line, and goes when it shrinks under one just above it (`#207 scrollb
 
 Opening a thread whose title is longer than the screen, with a long unbroken token and inline code
 in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
-its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`). With
+its right edge (`#36 thread-view-phone-overflow`); the thread is headed by its card, whose words wrap
+inside it, the long name being the picker's to shorten (`#298 thread-card-header`). With
 every floating chip showing at once and that thread scrolled to its end, no chip covers the reply
 composer's text box or its Send button (`#194 thread-picker-polish`).
 
@@ -913,8 +914,9 @@ GEOMETRY_JS = """() => {""" + f"""
 }"""
 
 # `#36 thread-view-phone-overflow`. `problems` is empty when the page is no wider than the viewport
-# and no shown element of the main screen reaches past its right edge; `clipped` says the thread
-# title is ellipsised, which is what a title longer than the screen should do instead.
+# and no shown element of the main screen reaches past its right edge. `#298 thread-card-header`: the
+# thread is headed by its card (`card`), whose words wrap inside it (`wraps`) — the heading no longer
+# names the thread in a line that would have to be ellipsised.
 WIDTH_JS = """() => {
     const viewport = document.documentElement.clientWidth;
     const problems = [];
@@ -928,8 +930,10 @@ WIDTH_JS = """() => {
             problems.push(`${name} reaches ${Math.round(box.right)}px`);
         }
     }
-    const title = document.getElementById('thread-title');
-    return {problems: problems.slice(0, 8), clipped: title.scrollWidth > title.clientWidth};
+    const card = document.getElementById('thread-card');
+    const words = card.querySelector('.side-card-text');
+    return {problems: problems.slice(0, 8), card: card.getClientRects().length > 0 && !card.closest('[hidden]'),
+            wraps: Boolean(words) && words.scrollWidth <= words.clientWidth + 1};
 }"""
 
 # `#194 thread-picker-polish`. The owner photographed Summaries, Undo, Expand all and Collapse all
@@ -1021,13 +1025,13 @@ SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
     return {problems, rows, count: count.textContent};
 }"""
 
-# In a thread the heading row is above the list; neither floating thing may cover its Back button
-# or title, nor take the Back button's tap.
+# In a thread the heading row is above the list; neither floating thing may cover the card heading it
+# (`#298 thread-card-header`) or its X, nor take the X's tap.
 HEADING_JS = """() => {""" + FLOAT_HELPERS_JS + """
     const problems = [];
     const glass = document.getElementById('search-toggle'), pill = document.getElementById('channel-freshness');
     const back = document.getElementById('thread-back');
-    for (const id of ['thread-back', 'thread-title']) {
+    for (const id of ['thread-back', 'thread-card']) {
         const target = box(document.getElementById(id));
         if (meets(box(glass), target)) problems.push(`the glass covers #${id}`);
         if (shown(pill) && meets(box(pill), target)) problems.push(`the pill covers #${id}`);
@@ -2284,7 +2288,7 @@ def main() -> int:
                   " line with no header strip and a 44px target, the search bar opened by a real tap and"
                   " folded with #scroll-area unmoved, Settings' title bar,"
                   f"{' a pull up past the newest line refreshes in place,' if mobile else ''} no Cache Storage or"
-                  " service worker, a long thread title ellipsised within the viewport, the thread"
+                  " service worker, a long-named thread within the viewport under its card, the thread"
                   " composer clear of every floating chip, sign-out clears,"
                   " a read-scope token reads with no refused request or console error")
             print(f"{reply_walk(playwright.chromium, args, label, width, height, mobile)} {label} at"
@@ -2866,7 +2870,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             workers = page.evaluate("() => navigator.serviceWorker.getRegistrations().then(r => r.length)")
             check(workers == 0, f"{workers} service workers are registered")
 
-            # 6b. A thread named longer than the screen: its title is ellipsised, not the page widened.
+            # 6b. A thread named longer than the screen: the page is not widened, and the thread is
+            # headed by its card, its words wrapped inside it (`#298 thread-card-header`).
             view("threads")
             # The card's replies button goes into the thread; the card itself only highlights (`#277
             # thread-card-focus`).
@@ -2876,7 +2881,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             found = page.evaluate(WIDTH_JS)
             shot("6b-long-thread-title")
             check(not found["problems"], f"{label}, a long-titled thread: {found['problems']}")
-            check(bool(found["clipped"]) or not mobile, f"{label}: the long title was not ellipsised: {found}")
+            check(bool(found["card"]) and bool(found["wraps"]), f"{label}: the thread is not headed by its card, wrapped: {found}")
             heading = page.evaluate(HEADING_JS)
             check(not heading, f"{label}, a thread's heading and the floating line: {heading}")
 

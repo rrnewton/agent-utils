@@ -3095,8 +3095,43 @@ def _act_thread_card_header(driver: Driver) -> None:
     driver.settle(400)
 
 
+def _act_thread_card_header_list(driver: Driver) -> None:
+    """`#298 thread-card-header`: the thread list from the view picker, and the summarised thread opened
+    from its card's replies button, across the window under that card, moved up to the top of the screen."""
+    page = driver.page
+    page.route("**/api/v1/client-config", _threaded_config)
+    page.route("**/api/v1/channels/*/timeline*", _threaded_timeline)
+    driver.load(with_token=True)
+    page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("view-switch")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0 && !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    page.select_option("#thread-select", "threads")
+    page.wait_for_function(
+        "() => document.getElementById('screen-main').getAttribute('data-columns') === 'list' "
+        "&& document.querySelectorAll('#side-cards > li[data-card]').length === 2",
+        timeout=10_000,
+    )
+    driver.settle(300)
+    page.evaluate(
+        f"() => {{ window.__cardText = document.querySelector(\"#side-cards > li[data-id='{THREADED_RUNNER}'] "
+        ".side-card-text\").textContent; }"
+    )
+    page.click(f"#side-cards > li[data-id='{THREADED_RUNNER}'] .side-card-open")
+    page.wait_for_function(
+        f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {THREADED_REPLIES + 1} "
+        f"&& document.getElementById('thread-card').getAttribute('data-thread') === '{THREADED_RUNNER}' "
+        "&& !document.getElementById('thread-card').hasAttribute('data-flying')",
+        timeout=10_000,
+    )
+    driver.settle(400)
+
+
 def _unroute_threaded(driver: Driver) -> None:
-    """Put back the two routes `55-thread-card-header` answered, before the next state."""
+    """Put back the two routes `55-thread-card-header` and `56-thread-card-header-list` answered, before
+    the next state."""
     driver.page.unroute("**/api/v1/client-config", _threaded_config)
     driver.page.unroute("**/api/v1/channels/*/timeline*", _threaded_timeline)
 
@@ -5107,6 +5142,40 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="56-thread-card-header-list",
+        what="the thread list, a thread opened from its card: the same card at the top of the screen, over the thread",
+        act=_act_thread_card_header_list,
+        after=_unroute_threaded,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            (
+                "the thread is across the window under its card, which says what its card in the list said, its X on it",
+                "(() => { const card = document.getElementById('thread-card'); "
+                "const words = card.querySelector('.side-card-text'); "
+                "return window.__visible('thread-card') && !!words && words.textContent === window.__cardText "
+                "&& card.contains(document.getElementById('thread-back')) && window.__visible('thread-back') "
+                "&& !document.getElementById('screen-main').hasAttribute('data-columns'); })()",
+            ),
+            (
+                # THE layout claim: the card heads the screen, outside the list, so it never scrolls away.
+                "the card is above the list, not in it, its edge in its thread's colour, and no line is drawn",
+                "(() => { const c = document.getElementById('thread-card').getBoundingClientRect(); "
+                "const l = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "const e = (getComputedStyle(document.getElementById('thread-card')).borderLeftColor"
+                ".match(/[0-9.]+/g) || []).slice(0, 3).map(Number); "
+                "return c.height > 60 && c.bottom <= l.top + 0.5 && Math.max(...e) - Math.min(...e) >= 90 "
+                "&& document.querySelectorAll('#column-links path').length === 0; })()",
+            ),
+            (
+                "the X is a thumb's size under a finger, and nothing scrolls sideways",
+                "(() => { const b = document.getElementById('thread-back').getBoundingClientRect(); "
+                "const coarse = matchMedia('(pointer: coarse)').matches; "
+                "return (!coarse || (b.width >= 44 && b.height >= 44)) "
+                "&& document.documentElement.scrollWidth <= window.innerWidth; })()",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -5575,6 +5644,9 @@ def check_state_controls() -> list[str]:
         # `#298 thread-card-header`. Two columns exist only at a desk: on a phone the scene would find
         # no layout button, or worse, photograph one column under a name that says two.
         "55-thread-card-header": DESKTOP_PROFILES,
+        # ...and the thread list's thread across the window, at a desk and on the phone's width, where
+        # the X must be a thumb's size; not every phone, whose pictures would show the same column.
+        "56-thread-card-header-list": ("android-412", "laptop-1280"),
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -5761,6 +5833,9 @@ def check_state_controls() -> list[str]:
         # heading that named the thread in its own words, a card inside the scroller, or no line, each
         # satisfies "a thread is open on the right".
         "55-thread-card-header": ("__cardText", "l.top", "tip"),
+        # Pinned to the card saying its list card's words across the window (`__cardText`), above the
+        # list (`l.top`), with no line drawn (`column-links`) and a thumb's X (`44`).
+        "56-thread-card-header-list": ("__cardText", "l.top", "column-links", "44"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
