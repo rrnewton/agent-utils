@@ -426,7 +426,9 @@ const FIXTURE_TREE = {
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
   "side-column": ["side-heading", "side-freshness", "side-scroll", "side-reply", "side-tools"],
-  "side-heading": ["side-facts", "side-title", "side-unread-only", "side-close"],
+  // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
+  "side-heading": ["side-title", "side-unread-only", "side-thread-card"],
+  "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
   "side-scroll": ["side-search-empty", "side-list", "side-pane"],
   "side-list": ["side-list-state", "side-more-threads", "side-cards"],
   "side-pane": [
@@ -43837,6 +43839,42 @@ const cardPart = (page, id, name) => {
 /** The timeline reads made since `from`, as their views: "thread", "main", "flat", "threads". */
 const readViewsSince = (page, from) => page.timelineCalls.slice(from).map(viewOf);
 
+/**
+ * What the card at the top of the right column's thread says and how it is drawn, part by part. `#298
+ * thread-card-header`. `count` is its replies and unread as drawn, "" while it says neither.
+ */
+const headerCard = (page) => {
+  const card = page.el("side-thread-card");
+  const button = page.el("side-thread-card-text");
+  const words = button.children.find((kid) => kid.hasClass("side-card-text"));
+  const count = page.el("side-thread-card-count");
+  const part = (name) => count.children.find((kid) => kid.hasClass(name));
+  return {
+    shown: !card.hidden,
+    thread: card.getAttribute("data-thread"),
+    state: card.getAttribute("data-thread-state"),
+    hue: card.style.getPropertyValue("--thread-hue"),
+    text: words ? words.textContent : null,
+    title: button.getAttribute("title"),
+    age: page.el("side-thread-card-age").textContent,
+    count: count.hidden ? "" : count.text(),
+    unread: part("side-card-unread") ? part("side-card-unread").textContent : "",
+    expanded: card.hasAttribute("data-expanded"),
+    highlighted: card.hasAttribute("data-highlighted"),
+  };
+};
+
+/** What a card in the list says beside its text: its facts, its replies button's words, and its colour. */
+const listCardSays = (page, id) => {
+  const row = cardRow(page, id);
+  return {
+    text: cardPart(page, id, "side-card-text"),
+    age: cardPart(page, id, "side-card-facts"),
+    count: openerOf(row).text(),
+    hue: row.style.getPropertyValue("--thread-hue"),
+  };
+};
+
 /** Two columns: a desk wide enough, and the layout button pressed. */
 async function twoColumns(page) {
   page.wideDesk = true;
@@ -44193,8 +44231,10 @@ test("`#229 desktop-two-column`: every way into a thread selects it on the right
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["201", "202"], "N replies did not select the thread on the right");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "N replies changed the left column");
-  assert.equal(page.el("side-title").textContent, "First discussion", "the heading does not name the thread");
-  assert.match(page.el("side-facts").textContent, /^(now|\d+[mhdwy]|\d+d\d+h) · 1$/);
+  // `#298 thread-card-header`: under its card, which says what its card in the list says.
+  assert.equal(headerCard(page).text, "first thread root", "the heading is not the thread's card");
+  assert.match(headerCard(page).age, /^(now|\d+[mhdwy]|\d+d\d+h)$/);
+  assert.equal(headerCard(page).count, "1 reply · 1 unread");
   assert.equal(page.el("side-close").hidden, false);
   assert.equal(page.el("side-pane").hidden, false);
   assert.equal(page.el("side-list").hidden, true);
@@ -44202,13 +44242,15 @@ test("`#229 desktop-two-column`: every way into a thread selects it on the right
   await threadBadge(rowWithId(page, "203")).click();
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["203", "204"]);
-  assert.equal(page.el("side-title").textContent, "Second discussion");
+  assert.equal(headerCard(page).text, "second thread root");
   // The X: back to the cards, and a card selects.
   await page.el("side-close").click();
   await page.settle();
   assert.equal(page.el("side-list").hidden, false, "the X did not go back to the list");
   assert.equal(page.el("side-close").hidden, true);
+  assert.equal(page.el("side-thread-card").hidden, true, "the thread's card stayed over the cards");
   assert.equal(page.el("side-title").textContent, "Thread list");
+  assert.equal(page.el("side-title").hidden, false);
   const reads = page.timelineCalls.length;
   await openerOf(cardRow(page, first.id)).click();
   await page.settle();
@@ -44474,8 +44516,9 @@ test("`#229 desktop-two-column`: leaving two columns returns to the view last ch
   await page.el("column-toggle").click();
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["203", "204"], "the thread selected was forgotten");
-  // Named as one column named it.
-  assert.equal(page.el("side-title").textContent, name);
+  // Named as one column named it, and under its card (`#298 thread-card-header`).
+  assert.equal(page.el("side-scroll").getAttribute("aria-label"), `Thread: ${name}`);
+  assert.equal(headerCard(page).text, "second thread root");
 });
 
 test("`#229 desktop-two-column`: a thread selected on the right lands on its first unread message, unfolded, at the head of its column", async () => {
@@ -44746,7 +44789,11 @@ test("`#231 two-column-polish`: the right column is one named region, called wha
   await threadBadge(rowWithId(page, "201")).click();
   await page.settle();
   assert.equal(region.getAttribute("aria-label"), "Thread: First discussion", "the region does not name the thread it shows");
-  assert.equal(page.el("side-title").textContent, "First discussion", "the region and the heading name the thread apart");
+  // `#298 thread-card-header`. The heading is the thread's card now, in the card's words; the region,
+  // the one thing a screen reader announces, keeps the thread's name, and the card is no second region.
+  assert.equal(page.el("side-title").hidden, true, "the words \"Thread list\" stayed over a thread");
+  assert.equal(headerCard(page).text, "first thread root");
+  assert.equal(page.el("side-thread-card").getAttribute("role"), null, "the thread's card is a second region");
   await threadBadge(rowWithId(page, "203")).click();
   await page.settle();
   assert.equal(region.getAttribute("aria-label"), "Thread: Second discussion");
@@ -45320,8 +45367,9 @@ const LINK_HEAD_PX = sourceConstant("LINK_HEAD_PX");
 /**
  * Give every box the horizontal place a 1440px desk gives it in two columns, as measured in Chromium:
  * the left column 0-720 with Main's list 12-708 and its rows 12-612, a tag inside a row 420-510, the
- * right column 721-1440 with its cards 753-1428, and the links' SVG over the whole screen. Vertical
- * places are the fixture's own. Returns the function that puts the fixture's own back.
+ * right column 721-1440 with its cards 753-1428 — and the card at the top of a thread there too —
+ * and the links' SVG over the whole screen. Vertical places are the fixture's own. Returns the
+ * function that puts the fixture's own back.
  */
 function layColumnsOut() {
   const read = FakeElement.prototype.getBoundingClientRect;
@@ -45335,6 +45383,8 @@ function layColumnsOut() {
     if (node.id === "side-scroll") return [721, 1440];
     if (node.id === "discord-log" || node.id === "pinned-log") return [12, 708];
     if (within(node, "side-cards")) return [753, 1428];
+    // `#298 thread-card-header`. The card at the top of a thread stands where the cards do.
+    if (within(node, "side-thread-card")) return [753, 1428];
     if (node.parentNode && (node.parentNode.id === "discord-log" || node.parentNode.id === "pinned-log")) return [12, 612];
     if (within(node, "discord-log") || within(node, "pinned-log")) return [420, 510];
     return [0, 0];
@@ -45591,7 +45641,8 @@ test("`#261 two-column-connectors`: the glide waits for nothing once the selecti
     page.expireTimers(COLUMN_GLIDE_MS);
     assert.equal(right.glides, undefined, "the column the reader scrolled was glided anyway");
     assert.equal(right.scrollTop, put);
-    // A thread on the right instead of the cards: no links, and no glide.
+    // A thread on the right instead of the cards: its one link, from its root to the card at the top of
+    // the column (`#298 thread-card-header`), and no glide, the wait for root 0 dropped with the cards.
     ({ page } = await linkedColumns(16));
     page.el("scroll-area").scrollTop = 0;
     await mouseTo(page, rootRow(page, 0), 300, 40);
@@ -45600,7 +45651,9 @@ test("`#261 two-column-connectors`: the glide waits for nothing once the selecti
     await page.nextFrame();
     page.expireTimers(COLUMN_GLIDE_MS);
     assert.equal(page.el("side-scroll").glides, undefined, "a glide ran with a thread on the right");
-    assert.deepStrictEqual(page.el("column-links").children, [], "the links stayed with a thread on the right");
+    assert.equal(page.el("scroll-area").glides, undefined, "a glide ran with a thread on the right");
+    assert.deepStrictEqual(drawnLinks(page).map((link) => [link.thread, link.selected, link.dimmed]),
+      [["spaces/A/threads/t3", true, false]], "the thread on the right is not joined to its root alone");
     // Reduced motion: the same glide, at once.
     ({ page } = await linkedColumns(16, (p) => p.preferReducedMotion()));
     page.el("scroll-area").scrollTop = 0;
@@ -46291,6 +46344,460 @@ test("`#280 scroll-stability` x `#277 thread-card-focus`: a card highlighted by 
   } finally {
     restore();
   }
+});
+
+// --- the card at the top of an open thread (#298 thread-card-header) --------------------------------
+//
+// The owner, 2026-10-14: "When I drill into a given thread card to see the messages inside it, I would
+// like to KEEP that same style ... I would like to see the SAME colorful card move up to the top of the
+// screen and KEEP its connector linkage over to the main channel message on the left column ... We can
+// still sneak in an X button somewhere for a mouse-only exit back to all-threads view." These say what
+// the page does with the card at the top of a thread on the right; tests/thread_card_header_browser.py
+// measures it in Chromium at a desk, where the stylesheet's fixed height and its colours are drawn.
+
+test("`#298 thread-card-header`: the card at the top of a thread is in the right column's heading, outside its scroller, a list card by its classes and its look, with the X in it", () => {
+  assertMarkupContains("side-heading", "side-thread-card");
+  assert.ok(!markupHolds("side-scroll", "side-thread-card"), "the card is inside the scroller, where it would scroll away");
+  for (const part of ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"]) {
+    assertMarkupContains("side-thread-card", part);
+  }
+  const tag = /<div\s+id="side-thread-card"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /class="side-card-row thread-card-header"/, "the card at the top is not drawn by the list card's rules");
+  assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the card ships on screen, over the cards");
+  assert.doesNotMatch(tag, /role=|aria-label=/, "the card is a region of its own beside the column's one");
+  assert.match(/<button\s+id="side-thread-card-text"[^>]*>/.exec(HTML_CODE)[0], /class="side-card"/);
+  assert.match(/<button\s+id="side-close"[^>]*>/.exec(HTML_CODE)[0], /aria-label="Close thread"/);
+  assert.doesNotMatch(HTML_CODE, /id="side-facts"/, "the old facts are still in the heading beside the card");
+  // Ringed and tinted as a highlighted card is — by its own rule, never `data-highlighted`'s, which
+  // unclamps a card's text — and grey for a thread nobody has answered.
+  const look = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row.thread-card-header");
+  const lit = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted]");
+  assert.match(look, /border-color:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\)/, "the card at the top is not ringed in its colour");
+  const background = (rule) => (/(?:^|[;{\s])background:\s*([^;]+);/.exec(rule) || [])[1];
+  assert.ok(background(lit), "the highlighted card has no tint to compare with");
+  assert.equal(background(look), background(lit), "the card at the top is not tinted as a highlighted card");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '.side-card-row.thread-card-header[data-thread-state="start"]'),
+    /border-color:\s*var\(--thread-grey\)/, "a thread nobody has answered spends a colour on its card");
+  assert.deepStrictEqual(cssRules(CSS_CODE, ".thread-card-header[data-highlighted]"), []);
+  // A fixed height: the list card's text, three clamped lines of a fixed height, and an X of a fixed
+  // size on the facts line, which the count beside it is shorter than.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /(^|[^-])height:\s*calc\(3 \* 1\.35em\)/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-close"), /(^|[^-])height:\s*1\.75rem/);
+  // Opened, its text whole over the list, above the links and the line under the heading.
+  const opened = cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-expanded] > .side-card > .side-card-text");
+  assert.match(opened, /-webkit-line-clamp:\s*none/);
+  assert.match(opened, /(^|[^-])height:\s*auto/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-expanded]"), /z-index:\s*3/);
+  assert.equal(tokenValues(CSS_CODE, "--card-shadow").length, 2, "the opened card's shadow is not given in both schemes");
+  // Over a thread the heading gives up its rule and its least height, the card having its border, and
+  // holds the card at its top, so a card opened past it is not centred on it, moving up.
+  const heading = cssBlockOutside(TWO_COLUMN_QUERY, "#side-heading:has(> #side-thread-card:not([hidden]))");
+  assert.match(heading, /border-bottom:\s*0/);
+  assert.match(heading, /align-items:\s*flex-start/);
+  // In two columns it stands where the cards do, for the line from its root.
+  for (const selector of ['#screen-main[data-columns="two"] .thread-card-header', '#screen-main[data-columns="two"] .side-cards']) {
+    assert.match(cssBlockIn(TWO_COLUMN_QUERY, selector), /margin-inline-start:\s*1\.25rem/, `${selector} is not inset for the links' lanes`);
+  }
+});
+
+test("`#298 thread-card-header`: every way into a thread on the right puts its card at the top — its card's replies button, its Thread(N), the picker, → on its card — saying what its card says, in its colour", async () => {
+  const { page, data } = await twoColumnServer((_page, held) => {
+    Object.assign(held.threads[0], { display_name: "runner-wedged", summary: "The overnight runner hung and was restarted by hand." });
+  });
+  const [first, second] = data.threads;
+  const said = listCardSays(page, first.id);
+  assert.equal(said.text, "runner-wedged: The overnight runner hung and was restarted by hand.");
+  assert.equal(headerCard(page).shown, false, "the card at the top is over the cards");
+  const ways = [
+    ["its card's replies button", () => openerOf(cardRow(page, first.id)).click()],
+    ["its Thread(N)", () => threadBadge(rowWithId(page, "201")).click()],
+    ["the picker", async () => {
+      page.el("thread-select").value = `thread:${first.id}`;
+      await page.el("thread-select").dispatch("change");
+    }],
+    ["→ on its card", async () => {
+      await mouseTo(page, cardRow(page, first.id), 900, 60);
+      await press(page, cardRow(page, first.id), "ArrowRight");
+    }],
+  ];
+  for (const [way, enter] of ways) {
+    if (!cardsUp(page)) {
+      await page.el("side-close").click();
+      await page.settle();
+    }
+    await enter();
+    await page.settle();
+    assert.deepStrictEqual(sideIds(page), ["201", "202"], `${way} did not open the thread on the right`);
+    const header = headerCard(page);
+    assert.equal(header.shown, true, `${way}: no card at the top of the thread`);
+    assert.equal(header.thread, first.id);
+    assert.equal(header.text, said.text, `${way}: the card at the top does not say what its card says`);
+    assert.equal(header.title, said.text, `${way}: the whole text is not the card's tooltip`);
+    assert.equal(header.age, said.age, `${way}: the card at the top does not say how long since the thread moved`);
+    assert.equal(header.count, said.count, `${way}: the card at the top does not count what its card counts`);
+    assert.equal(header.unread, "1 unread", `${way}: the unread is not drawn in the accent`);
+    assert.equal(header.hue, said.hue, `${way}: the card at the top is not its card's colour`);
+    assert.equal(header.state, "open");
+    assert.equal(header.highlighted, false, "the card at the top carries the highlight that unclamps a card");
+    assert.equal(page.el("side-title").hidden, true, `${way}: "Thread list" is still over the thread`);
+    assert.equal(page.el("side-close").hidden, false);
+    assert.equal(page.el("side-scroll").getAttribute("aria-label"), "Thread: runner-wedged", `${way}: the region lost the thread's name`);
+  }
+  // From one thread to another: the card says the other's.
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.equal(headerCard(page).thread, second.id);
+  assert.equal(headerCard(page).text, listCardSays(page, second.id).text);
+  assert.equal(headerCard(page).hue, listCardSays(page, second.id).hue);
+  // Back to the cards, and the card goes with the thread.
+  await page.el("side-close").click();
+  await page.settle();
+  assert.equal(headerCard(page).shown, false, "the card at the top stayed over the cards");
+  assert.equal(page.el("side-title").hidden, false);
+});
+
+test("`#298 thread-card-header`: the card at the top counts the thread's replies and unread as they change — a live reply, a Done — and a pass that changes nothing writes nothing to it", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const data = threadData();
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    page.messages = data.messages;
+    const server = forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await twoColumns(page);
+    await openerOf(cardRow(page, data.threads[0].id)).click();
+    await page.settle();
+    const counted = [headerCard(page).count];
+    const first = data.messages[1].thread;
+    const reply = server.post(message({ id: "205", content: "a second answer", thread: { ...first, is_root: false } }));
+    await deliver(page, page.stream(), sseMessage(reply));
+    await page.settle();
+    counted.push(headerCard(page).count);
+    await doneButton(sideRow(page, "202")).click();
+    await page.settle();
+    counted.push(headerCard(page).count);
+    // A poll that brings nothing, and the rows passed over again: nothing written to the card.
+    const count = page.el("side-thread-card-count");
+    const words = page.el("side-thread-card-text").children[0];
+    const replace = count.replaceChildren;
+    let writes = 0;
+    count.replaceChildren = (...kids) => {
+      writes += 1;
+      return replace.call(count, ...kids);
+    };
+    const write = FakeElement.prototype.setAttribute;
+    FakeElement.prototype.setAttribute = function counted(name, value) {
+      if (this === page.el("side-thread-card") || this === page.el("side-thread-card-text")) writes += 1;
+      return write.call(this, name, value);
+    };
+    const text = words.textContent;
+    try {
+      page.expireTimers(DISCORD_POLL_MS);
+      await page.settle();
+      await page.el("search-toggle").click();
+      await page.el("search-toggle").click();
+      await page.settle();
+    } finally {
+      FakeElement.prototype.setAttribute = write;
+    }
+    assert.equal(words.textContent, text);
+    return { counted, writes };
+  };
+  const { counted, writes } = await run(SCRIPT);
+  assert.deepStrictEqual(counted, ["1 reply · 1 unread", "2 replies · 2 unread", "2 replies · 1 unread"],
+    "the card at the top did not follow the live reply and the Done");
+  assert.equal(writes, 0, "a pass that changed nothing wrote to the card at the top");
+  // The control: drawn on every pass, the card is written to by a pass that changes nothing.
+  const always = await run(brokenScript("  if (threadCardsDrawn.get(card.id) === signature) return;\n", ""));
+  assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
+});
+
+test("`#298 thread-card-header`: where the clamp cuts the card's text a press on it opens the card over the list — the heading its own height, the list unmoved — and a second press, Esc, a press outside it or another thread closes it; whole text does not open", async () => {
+  const { page, data } = await twoColumnServer();
+  const [first] = data.threads;
+  await openerOf(cardRow(page, first.id)).click();
+  await page.settle();
+  const card = page.el("side-thread-card");
+  const button = page.el("side-thread-card-text");
+  const heading = page.el("side-heading");
+  const area = page.el("side-scroll");
+  // The fixture lays nothing out: the words hold more than the text box, given no height, shows — as a
+  // clamped card's do.
+  assert.equal(card.hasAttribute("data-clamped"), true, "the clamped text does not say it can be opened");
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  const place = { top: area.scrollTop, height: area.clientHeight };
+  const tall = heading.getBoundingClientRect().height;
+  assert.ok(tall > 0, "the heading has no height, so this proves nothing");
+  await button.click();
+  assert.equal(headerCard(page).expanded, true, "a press on the clamped text did not open the card");
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.equal(heading.style.height, `${tall}px`, "the heading did not keep its height while the card is open");
+  assert.deepStrictEqual({ top: area.scrollTop, height: area.clientHeight }, place, "opening the card moved the list");
+  await button.click();
+  assert.equal(headerCard(page).expanded, false, "a second press did not close the card");
+  assert.equal(heading.style.height, "", "the heading kept a height of its own after the card closed");
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  // Esc closes it first, and only the next Esc closes the thread.
+  await button.click();
+  await press(page, area, "Escape");
+  assert.equal(headerCard(page).expanded, false, "Esc did not close the card");
+  assert.equal(page.el("side-pane").hidden, false, "Esc closed the thread before the card");
+  await press(page, area, "Escape");
+  await page.settle();
+  assert.ok(cardsUp(page), "the second Esc did not close the thread");
+  // A press outside it closes it; one on it does not.
+  await openerOf(cardRow(page, first.id)).click();
+  await page.settle();
+  await button.click();
+  await page.documentEvent("pointerdown", { target: page.el("side-thread-card-age"), pointerType: "mouse" });
+  assert.equal(headerCard(page).expanded, true, "a press on the card closed it");
+  await page.documentEvent("pointerdown", { target: rowWithId(page, "200"), pointerType: "mouse" });
+  assert.equal(headerCard(page).expanded, false, "a press outside the card did not close it");
+  // Another thread: the card closes as it is drawn for that one.
+  await button.click();
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.equal(headerCard(page).expanded, false, "the card stayed open for another thread");
+  assert.equal(heading.style.height, "");
+  // Text the clamp does not cut: not offered, and a press opens nothing.
+  const words = button.children[0];
+  words.clientHeight = words.scrollHeight + LINE_PX;
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.equal(card.hasAttribute("data-clamped"), false, "whole text says it can be opened");
+  assert.equal(button.getAttribute("aria-expanded"), null, "whole text says it is collapsed");
+  await button.click();
+  assert.equal(headerCard(page).expanded, false, "a card whose text is whole opened");
+});
+
+test("`#298 thread-card-header`: over a thread on the right its one link joins its root on Main to the card at the top, as the selection's — whole, or clipped at Main's edge while the root is off it — and the cards' links come back with the cards", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page } = await linkedColumns(16);
+    const left = page.el("scroll-area");
+    const right = page.el("side-scroll");
+    // Another thread's card highlighted in the list: the open thread's link is not greyed beside it.
+    await threadCard(page, 3).children[0].click();
+    await page.settle();
+    assert.deepStrictEqual(litCards(page), ["spaces/A/threads/t3"]);
+    await openerOf(threadCard(page, 8)).click();
+    await page.settle();
+    await rootAt(page, 8, 120);
+    let links = drawnLinks(page);
+    assert.equal(links.length, 1, `over a thread the links are ${JSON.stringify(links.map((one) => one.thread))}, not its one`);
+    let [link] = links;
+    assert.equal(link.thread, "spaces/A/threads/t8");
+    assert.equal(link.selected, true, "the thread's link is not drawn as the selection's");
+    assert.equal(link.dimmed, false);
+    assert.equal(link.clip, "both");
+    const header = page.el("side-thread-card");
+    const box = header.getBoundingClientRect();
+    const row = rootRow(page, 8).getBoundingClientRect();
+    const [fx, fy, lane, ty, end] = link.line;
+    assert.equal(fx, row.right, "the link does not leave its root's right edge");
+    assert.equal(fy, rootLinkY(rootRow(page, 8)), "the link does not leave its root level with its tag");
+    assert.equal(end + LINK_HEAD_PX, box.left, "the link's arrowhead does not reach the card's left edge");
+    assert.equal(link.marks[link.marks.length - 6], box.left, "the arrowhead's point is not on the card's edge");
+    assert.equal(ty, (box.top + box.bottom) / 2, "the link does not arrive at the card's middle");
+    assert.ok(lane > 708 && lane < box.left - LINK_HEAD_PX, `the link's lane at ${lane} is not in the gap`);
+    assert.equal(link.hue, header.style.getPropertyValue("--thread-hue"), "the link is not the card's colour");
+    // Main scrolled until the root is above it, then below it: clipped at its edge, pointing the way.
+    for (const [top, way] of [[left.scrollHeight, "up"], [0, "down"]]) {
+      left.scrollTop = top;
+      await left.dispatch("scroll");
+      await page.nextFrame();
+      assert.ok(!inColumnView(left, rootLinkY(rootRow(page, 8))), `the root is on screen at ${top}, so this proves nothing`);
+      [link] = drawnLinks(page);
+      assert.deepStrictEqual([link.thread, link.clip, link.selected], ["spaces/A/threads/t8", way, true],
+        `with the root ${way === "up" ? "above" : "below"} Main the link does not point ${way} to it`);
+    }
+    // Scrolling the thread moves nothing the link goes to.
+    right.scrollTop = 0;
+    await right.dispatch("scroll");
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).map((one) => one.clip), ["down"]);
+    // Back to the cards: their links, not the thread's.
+    await page.el("side-close").click();
+    await page.settle();
+    left.scrollTop = left.scrollHeight;
+    right.scrollTop = right.scrollHeight;
+    await left.dispatch("scroll");
+    await page.nextFrame();
+    links = drawnLinks(page);
+    assert.ok(links.length > 1, `the cards' links did not come back: ${JSON.stringify(links)}`);
+    assert.ok(links.every((one) => !one.selected || one.thread !== "spaces/A/threads/t8"), "the thread's link outlived it");
+  } finally {
+    restore();
+  }
+});
+
+test("`#298 thread-card-header`: the link to the card at the top goes from a collapsed run's line when the root is in the run, up from Main's top for a root older than Main holds, and nowhere for a root the search hides", async () => {
+  const restore = layColumnsOut();
+  try {
+    // Collapse read, every thread but the newest read: the roots in one run, under its line.
+    const reads = manyThreads(16).messages.slice(0, 30).map((m) => String(m.id));
+    let { page } = await linkedColumns(16, (p) => { p.dealtWith = new Set(reads); });
+    await chooseReadMode(page, "Collapse read");
+    const head = page.el("discord-log").children.find((li) => li.getAttribute("data-read-run") === "head");
+    assert.ok(head && rootRow(page, 3).hidden, "the root is not hidden in a collapsed run, so this proves nothing");
+    page.el("thread-select").value = "thread:spaces/A/threads/t3";
+    await page.el("thread-select").dispatch("change");
+    await page.settle();
+    page.el("scroll-area").scrollTop = 0;
+    await page.el("scroll-area").dispatch("scroll");
+    await page.nextFrame();
+    let [link] = drawnLinks(page);
+    assert.ok(link && link.thread === "spaces/A/threads/t3", "no link from the root in a collapsed run");
+    const line = head.getBoundingClientRect();
+    assert.ok(link.line[1] >= line.top && link.line[1] <= line.bottom, "the link does not leave the run's line");
+    assert.equal(link.line[0], line.right);
+    // The search hiding the root among Main's rows: no link at all; cleared, the link again.
+    ({ page } = await linkedColumns(16));
+    await openerOf(threadCard(page, 8)).click();
+    await page.settle();
+    await rootAt(page, 8, 120);
+    assert.equal(drawnLinks(page).length, 1);
+    await search(page, "thread 9 root");
+    await page.settle();
+    await page.nextFrame();
+    assert.ok(rootRow(page, 8).hasClass("search-hidden"), "the search did not hide the root, so this proves nothing");
+    assert.deepStrictEqual(drawnLinks(page), [], "a root the search hides is joined to the card at the top");
+    await search(page, "");
+    await page.settle();
+    await page.nextFrame();
+    assert.deepStrictEqual(drawnLinks(page).map((one) => one.thread), ["spaces/A/threads/t8"]);
+    // A root older than every row Main holds: a stub from the card up to Main's top.
+    page = newPage(new Map(), SCRIPT, (p) => p.enableAnimationFrames());
+    const old = { id: "spaces/A/threads/old", root_message_id: "290", is_root: true, reply_count: 1, reply_count_exact: true };
+    const oldRoot = message({ id: "290", content: "an old question", thread: old });
+    const data = manyThreads(4);
+    const oldAnswer = message({ id: "399", content: "a late answer", thread: { ...old, is_root: false } });
+    page.threadingSupported = true;
+    page.threads = [...data.threads, { id: old.id, root: oldRoot, title: "Old question", reply_count: 1,
+      reply_count_exact: true, updated_at: oldAnswer.timestamp }];
+    page.messages = [...data.messages, oldAnswer];
+    forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    await twoColumns(page);
+    await page.settle();
+    page.el("thread-select").value = `thread:${old.id}`;
+    await page.el("thread-select").dispatch("change");
+    await page.settle();
+    await page.nextFrame();
+    assert.ok(!shownIds(page).includes("290"), "Main holds the old root, so this proves nothing");
+    assert.equal(headerCard(page).text, "an old question");
+    [link] = drawnLinks(page);
+    assert.ok(link, "no link for a root older than Main holds");
+    assert.deepStrictEqual([link.thread, link.clip, link.selected], [old.id, "up", true],
+      "the link to a root older than Main holds does not point up from Main's top");
+    const top = page.el("scroll-area").getBoundingClientRect().top;
+    assert.equal(link.marks[1], top + 2, "the stub's arrowhead does not point at Main's top edge");
+    // A root Main does not hold has no place to glide Main to.
+    await mouseTo(page, page.el("side-thread-card"), 900, 40);
+    page.expireTimers(COLUMN_GLIDE_MS);
+    assert.equal(page.el("scroll-area").glides, undefined, "Main glided to a root it does not hold");
+  } finally {
+    restore();
+  }
+});
+
+test("`#298 thread-card-header`: the mouse resting on the card at the top glides Main to its root, once each time the thread opens, smoothly or at once under reduced motion; a mouse passing over it glides nothing", async () => {
+  const restore = layColumnsOut();
+  try {
+    for (const reduced of [false, true]) {
+      const { page } = await linkedColumns(16, reduced ? (p) => p.preferReducedMotion() : null);
+      const left = page.el("scroll-area");
+      const header = page.el("side-thread-card");
+      await openerOf(threadCard(page, 8)).click();
+      await page.settle();
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      await page.nextFrame();
+      assert.ok(!inColumnView(left, rootLinkY(rootRow(page, 8))), "the root is on screen, so this proves nothing");
+      // Passing over: on it, and off to the dock before the wait is up.
+      await mouseTo(page, header, 900, 40);
+      await mouseTo(page, page.el("dock"), 600, 780);
+      page.expireTimers(COLUMN_GLIDE_MS);
+      assert.equal(left.glides, undefined, "a mouse passing over the card glided Main");
+      // Resting on it.
+      await mouseTo(page, header, 900, 40);
+      assert.equal(page.expireTimers(COLUMN_GLIDE_MS), 1, "no wait was armed for the mouse resting on the card");
+      assert.deepStrictEqual(left.glides.map((glide) => glide.behavior), [reduced ? "auto" : "smooth"],
+        "Main did not glide to the card's root, as the reader's system asks");
+      const box = header.getBoundingClientRect();
+      assert.equal(rootLinkY(rootRow(page, 8)), glideLevel(left, (box.top + box.bottom) / 2),
+        "the root was not brought level with the card");
+      await left.dispatch("scroll");
+      await page.nextFrame();
+      assert.deepStrictEqual(drawnLinks(page).map((one) => one.clip), ["both"], "the link is not whole once the root is on screen");
+      // Once for this opening.
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      await mouseTo(page, header, 950, 60);
+      page.expireTimers(COLUMN_GLIDE_MS);
+      assert.equal(left.glides.length, 1, "the card glided Main twice in one opening");
+      if (reduced) continue;
+      // ...and once more for the next.
+      await page.el("side-close").click();
+      await page.settle();
+      await openerOf(threadCard(page, 8)).click();
+      await page.settle();
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      await mouseTo(page, header, 900, 40);
+      page.expireTimers(COLUMN_GLIDE_MS);
+      assert.equal(left.glides.length, 2, "the thread opened again did not let the card glide Main again");
+    }
+  } finally {
+    restore();
+  }
+});
+
+test("`#298 thread-card-header` x `#284 redraw-keeps-pane`: a click on a card's replies button gives the keys to its thread on the right, so a redraw of Main leaves them there and Esc closes it; a key pressed on the card at the top acts on the right column", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const data = threadData();
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    page.messages = data.messages;
+    const server = forwardTimeline(page);
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await twoColumns(page);
+    page.el("scroll-area").focus();
+    await openerOf(cardRow(page, data.threads[0].id)).click();
+    await page.settle();
+    const keys = focused(page) !== null && nodeWithinFixture(page.el("side-scroll"), focused(page));
+    const posted = server.post(message({ id: "206", content: "to the channel itself" }));
+    await deliver(page, page.stream(), sseMessage(posted));
+    await page.settle();
+    assert.ok(shownIds(page).includes("206"), "the live message did not redraw Main");
+    await press(page, focused(page), "Escape");
+    await page.settle();
+    const closed = cardsUp(page);
+    // A key on the card at the top, the keys given to Main first.
+    if (!cardsUp(page)) {
+      await page.el("side-close").click();
+      await page.settle();
+    }
+    await openerOf(cardRow(page, data.threads[0].id)).click();
+    await page.settle();
+    await press(page, page.el("side-scroll"), "[");
+    await press(page, page.el("side-thread-card-text"), "Escape");
+    await page.settle();
+    return { keys, closed, fromCard: cardsUp(page) };
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { keys: true, closed: true, fromCard: true },
+    "the keys did not follow a click into the thread on the right, or a key on its card went to Main");
+  // The controls: the keys left where the click found them, and the heading's keys left to Main.
+  const stayed = await run(brokenScript("  if (sideShowing()) focusList(sidePane);\n", ""));
+  assert.equal(stayed.closed, false, "the negative control closed the thread anyway, so the check above proves nothing");
+  const heading = await run(brokenScript(
+    "    if (pane === sidePane && node && nodeWithin(leftEl(\"side-heading\"), node)) return pane;\n", ""));
+  assert.equal(heading.fromCard, false, "the negative control closed the thread from its card anyway, so the check above proves nothing");
 });
 
 // --- clearing unread in the chat service's own app ----------------------------------------------
@@ -49008,6 +49515,37 @@ test("`#252 thread-button-state` x `#229 desktop-two-column`: the grey Thread op
   assert.notEqual(tag.hue, "");
 });
 
+test("`#298 thread-card-header` x `#252 thread-button-state`: the grey Thread opens its empty thread under a grey card joined to nothing, and the first reply colours the card as it colours the tag, and joins it to its root", async () => {
+  const restore = layColumnsOut();
+  try {
+    const { page, data } = await freshMessagePage((p) => p.enableAnimationFrames());
+    await twoColumns(page);
+    await threadBadge(rowWithId(page, "210")).click();
+    await page.settle();
+    await page.nextFrame();
+    const before = headerCard(page);
+    assert.equal(before.shown, true, "no card at the top of the empty thread");
+    assert.equal(before.text, "a brand-new message nobody has answered", "the empty thread's card does not say its message");
+    assert.equal(before.state, "start", "the card of a thread nobody has answered is not grey");
+    assert.equal(before.hue, "", "a colour was spent on a thread nobody has answered");
+    assert.equal(before.count, "", "the card counts replies a thread nobody has answered does not have");
+    assert.deepStrictEqual(drawnLinks(page), [], "a thread nobody has answered is joined to its root, in no colour");
+    page.el("side-compose-text").value = "the first reply, from the right";
+    await page.el("side-send").click();
+    await page.settle();
+    await page.nextFrame();
+    const after = headerCard(page);
+    assert.equal(after.state, "open", "the first reply left the card grey");
+    assert.notEqual(after.hue, "");
+    assert.equal(after.hue, tagOf(rowWithId(page, "210")).hue, "the card and the tag are not coloured alike");
+    assert.match(after.count, /^1 reply/);
+    assert.deepStrictEqual(drawnLinks(page).map((link) => [link.thread, link.selected, link.hue]), [[data.lone.id, true, after.hue]],
+      "the first reply did not join the card to its root");
+  } finally {
+    restore();
+  }
+});
+
 test("`#252 thread-button-state`: → on a message nobody has answered opens its thread with the focus in the box, in one column and in two", async () => {
   for (const two of [false, true]) {
     const { page, data } = await freshMessagePage();
@@ -51701,8 +52239,10 @@ test("`#262 search-load-older`: in two columns the right column's thread walks i
   assert.deepStrictEqual(matchedIds(page, "side-log"), [all[3].id], "the thread's walk did not find its older reply");
   assert.match(page.el("side-search-older-note").textContent, /^Found 1 in \d pages \(\d+ messages\)/);
   assert.equal(page.el("search-older-note").hidden, true, "the left column said what the right one found");
-  // Enter walks the column that holds the keys: the left, which has nothing older to search.
+  // Enter walks the column that holds the keys: the left, given them back by [, which has nothing older
+  // to search. (The card's replies button handed them to the right, `#298 thread-card-header`.)
   const reads = page.olderOptions.length;
+  await press(page, page.el("side-scroll"), "[");
   await press(page, page.el("search-field"), "Enter");
   await settleWalk(page);
   assert.equal(page.olderOptions.length, reads, "Enter walked a column the keys are not in");
