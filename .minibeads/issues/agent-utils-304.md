@@ -1,12 +1,13 @@
 ---
 title: 'back-gesture-in-app: the phone''s back gesture closes the open thread or screen instead of leaving the app'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-14T16:55:08.525568906+00:00
-updated_at: 2026-10-14T16:55:08.525568906+00:00
+updated_at: 2026-10-14T20:42:16.360120466+00:00
+closed_at: 2026-10-14T20:42:16.360120337+00:00
 ---
 
 # Description
