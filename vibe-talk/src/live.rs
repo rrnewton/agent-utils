@@ -49,14 +49,15 @@
 //! It multiplies this server's Discord request volume by one request per channel per interval,
 //! forever, whether or not anybody is listening. (A provider that reads channel heads natively,
 //! Discord itself among them, spends one head read per tick on its quiet channels instead, and
-//! pages only the channels that moved: remote-ops-audit W12, see `quiet_channels`.) A 429 is no longer simply passed on: the client
-//! obeys Discord's `Retry-After` within a bounded budget, and only a limit it could not clear
-//! reaches this loop — see [`crate::discord::ratelimit`]. That makes a tick cheaper to get wrong,
-//! not free. So polling is still **off unless configured** (`discord.live_poll_seconds`, default
-//! 0), the interval still has a floor the configuration refuses to go below, and a failing channel
-//! still backs off rather than hammering — see [`backoff`]. Adapter authentication is separately
-//! opt-in with `ingest.token`; full pushed events remain refused for a provider this server polls,
-//! while content-free hints safely wake that poller without bypassing its backoff.
+//! pages only the channels that moved: remote-ops-audit W12, see `quiet_channels`.) A 429 is no
+//! longer simply passed on: the client obeys Discord's `Retry-After` within a bounded budget, and
+//! only a limit it could not clear reaches this loop — see [`crate::discord::ratelimit`]. That
+//! makes a tick cheaper to get wrong, not free. So polling is still **off unless configured**
+//! (`discord.live_poll_seconds`, default 0), the interval still has a floor the configuration
+//! refuses to go below, and a failing channel still backs off rather than hammering — see
+//! [`backoff`]. Adapter authentication is separately opt-in with `ingest.token`; full pushed
+//! events remain refused for a provider this server polls, while content-free hints safely wake
+//! that poller without bypassing its backoff.
 //!
 //! The two waits nest rather than compete: the client's is the inner, precise one Discord asked
 //! for, and [`backoff`] is the outer one, which never waits LESS than Discord's outstanding

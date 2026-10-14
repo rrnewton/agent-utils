@@ -59,10 +59,11 @@ impl GuildCache {
     }
 }
 
-/// Discord's channel types that carry a message list of their own: text, voice (its text chat),
-/// announcement, the three thread types, and stage. A category, a forum and a media channel do
-/// not; their `last_message_id` is not a message `GET /channels/{id}/messages` would list.
-const MESSAGE_CHANNEL_TYPES: [u64; 7] = [0, 2, 5, 10, 11, 12, 13];
+/// Discord's channel types that carry a message list of their own: text, a direct message, voice
+/// (its text chat), a group direct message, announcement, the three thread types, and stage. A
+/// category, a forum and a media channel do not; their `last_message_id` is not a message
+/// `GET /channels/{id}/messages` would list.
+const MESSAGE_CHANNEL_TYPES: [u64; 9] = [0, 1, 2, 3, 5, 10, 11, 12, 13];
 
 /// Discord's thread channel types, which no server channel list holds.
 const THREAD_TYPES: [u64; 3] = [10, 11, 12];
@@ -689,6 +690,33 @@ mod tests {
             ["GET /channels/401", "GET /guilds/9/channels"],
             "a thread is never looked for in its server's list"
         );
+    }
+
+    #[test]
+    fn a_channel_object_is_read_as_a_head_and_says_where_the_next_one_lives() {
+        let (head, home) =
+            native_head(&text_channel("101", "9", Some("5001")), "101").expect("a text channel");
+        assert_eq!(head.newest_id, Some(MessageId("5001".into())));
+        assert_eq!(home, Home::Server("9".into()));
+        let (head, home) =
+            native_head(&json!({"id": "7", "type": 1, "last_message_id": null}), "7")
+                .expect("a direct message has a message list of its own");
+        assert_eq!(head.newest_id, None);
+        assert_eq!(home, Home::Alone, "no server list holds it");
+        for (value, why) in [
+            (text_channel("102", "9", Some("1")), "another channel"),
+            (json!({"id": "101", "guild_id": "9"}), "no type"),
+            (
+                json!({"id": "101", "type": 4, "guild_id": "9"}),
+                "a category",
+            ),
+            (
+                json!({"id": "101", "type": 0, "last_message_id": "not-a-snowflake"}),
+                "an unreadable last_message_id",
+            ),
+        ] {
+            assert!(native_head(&value, "101").is_err(), "{why}: {value}");
+        }
     }
 
     fn bridge(discord: &mut crate::config::DiscordConfig) {
