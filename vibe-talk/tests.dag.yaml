@@ -513,19 +513,23 @@ steps:
   # colour; the card unmoved as the thread scrolls; the root above Main, the line clipped at Main's top;
   # the mouse crossing the card moving nothing for 2.5 s and resting on it gliding Main to the root; a long
   # question's card three lines and the same height, opened over the list with the list unmoved to the
-  # pixel, Esc closing it and then the thread. Measured on 2026-10-14: about 15s wall, most of it the
-  # glide's waits.
+  # pixel, Esc closing it and then the thread. Part 2: the card moving up, watched every frame from
+  # before the press — first drawn on its card, then only upward through several places, the thread
+  # fading in under it, the line following it and the thread's scroll position fixed; real Ctrl+3 and a
+  # card's replies button: the same card heading the thread across the window, fixed while it scrolls,
+  # the X, Esc and <- back to the list; nothing moving under reduced motion; and on a 412x915 phone by
+  # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall, most of it the glide's waits.
   - group: check
     job: thread-card-header-browser
-    desc: a thread on the right under its card at the top, in the card's words, place, height and colour, joined to its root by one line that a resting mouse glides Main along, and its long text opened over the list with nothing moving, in current Chromium at 1280x800 in both schemes
+    desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, its long text opened over the list with nothing moving, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
     jobs_flag: ""
-    timeout: 90
-    cpu_timeout: 45
+    timeout: 150
+    cpu_timeout: 90
     hint:
       resources: {browser: 1}
-      est_duration_s: 15
+      est_duration_s: 30
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

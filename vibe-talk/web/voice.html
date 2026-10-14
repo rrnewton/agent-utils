@@ -179,13 +179,28 @@
               <button id="channel-view-flat" type="button" aria-pressed="false">All</button>
             </div>
             <!--
-              `#194 thread-picker-polish`. The open thread's identity, in the thread picker's own
-              words — "13h · 16 · its name" — with the name less shortened, because there is room.
+              `#298 thread-card-header`. The open thread's identity is its card, here as at the top of
+              the right column: the owner, "When we go to single column thread view Cmd-3 an drill in
+              I'd like the same thing. One unified thread list view and one unified intra-thread
+              view." So a thread across the window, however it was opened, has the card the thread
+              list drew for it: its words and its colour, how long since it moved, its replies and
+              unread, and the X back to where it was opened from. The same skeleton as
+              #side-thread-card, filled by the same code (`paintThreadCard`), outside the scroller and
+              of a fixed height, so it never scrolls away and nothing it says later moves the list.
+              It replaces `#194 thread-picker-polish`'s "13h · 16 · its name", which the picker still
+              says.
             -->
             <div id="thread-heading" hidden>
-              <button id="thread-back" class="secondary" type="button">← Back</button>
-              <span id="thread-facts" class="thread-facts" hidden></span>
-              <span id="thread-title">Thread</span>
+              <div id="thread-card" class="side-card-row thread-card-header">
+                <button id="thread-card-text" class="side-card" type="button"></button>
+                <span id="thread-card-age" class="side-card-facts"></span>
+                <span id="thread-card-count" class="thread-card-count" hidden></span>
+                <button id="thread-back" class="icon-button thread-card-close" type="button" aria-label="Close thread" title="Back">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <path d="M6 6l12 12M18 6 6 18" />
+                  </svg>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -2053,7 +2068,10 @@
                 of it, and every other card's edge goes grey, until you click another card, the same one
                 again, or press <kbd>Esc</kbd>. The card's <strong>N replies · M unread</strong> opens
                 its thread across the window, and so does <kbd>→</kbd>, on the highlighted card or the
-                one the keys are on; Back, <kbd>Esc</kbd> or <kbd>←</kbd> comes back
+                one the keys are on: the card moves up to the top of the window and stays there, over the
+                thread's messages, as the heading of every thread you open across the window — its
+                words, colour, age and counts, its text opened in full over the messages by a click
+                where it is cut. The <strong>×</strong> on it, <kbd>Esc</kbd> or <kbd>←</kbd> comes back
                 to the list. <kbd>Esc</kbd> on the list itself, once no card is highlighted, goes back to
                 the view you chose it from: Main, All or the thread you were reading, or two columns. The
                 search finds a card by its own words or by the replies already loaded for its thread, and
@@ -2075,7 +2093,8 @@
                 thread's <strong>Thread(N)</strong>, its <strong>N
                 replies</strong> or <strong>M unread</strong>, the view picker and a card's
                 <strong>N replies · M unread</strong> each select the thread on the right; a tap on a message still only opens or folds
-                it. A thread opens under its own card, at the top of the right column: the same words and
+                it. A thread opens under its own card, which moves up to the top of the right column
+                from its place in the list when it was on screen: the same words and
                 colour, how long since it moved, its replies and unread, and still the line to its first
                 message on the left — rest the mouse on the card and Main scrolls to that message. Where
                 the card's text is cut, a click on it shows all of it over the list, and another click or

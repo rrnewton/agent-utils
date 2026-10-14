@@ -169,7 +169,7 @@ let sideActive = false;
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-send" | "side-thread-card-text" | "side-unread-only" | "speaker"
  *   | "summarise" | "talk"
- *   | "thread-back"
+ *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
  *   | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
@@ -16021,6 +16021,8 @@ function renderChannelNavigation() {
   el("channel-view-tabs").hidden = true;
   renderThreadSelect();
   el("thread-heading").hidden = channelView !== "thread";
+  // `#298 thread-card-header`. A card opened over the list goes with its thread.
+  if (channelView !== "thread") collapseThreadCard(leftEl("thread-card"));
   for (const view of ["main", "threads", "flat"]) {
     el(`channel-view-${view}`).setAttribute("aria-pressed", channelView === view ? "true" : "false");
   }
@@ -17005,17 +17007,33 @@ function renderThreadSelect() {
 }
 
 /**
- * The heading over an open thread: the selector's own words for it, with the room to say more.
- * `#194 thread-picker-polish`. The same facts and the same name, less shortened, so the heading and
- * the option read as one identity. Redrawn with the selector, so a display name that arrives after
- * the thread opened renames both at once.
+ * The heading over a thread open across the window: the thread's card (`#298 thread-card-header`), as
+ * the thread list and the top of the right column draw it — its words, its colour, how long since it
+ * moved, its replies and unread — and the X, whose tooltip says where it goes. Redrawn with the
+ * selector, so a summary or a name that arrives after the thread opened is drawn on the card at once;
+ * the picker's option still names the thread in its own words (`#194 thread-picker-polish`). Always
+ * the left column's, whichever column asks.
  */
 function renderThreadHeading() {
-  const open = openThreadChoice();
-  el("thread-title").textContent = open ? threadName(open, Infinity) : "Thread";
-  const facts = open ? threadFacts(open) : "";
-  el("thread-facts").textContent = facts;
-  el("thread-facts").hidden = facts === "";
+  if (sideActive) return inColumn(columns.main, renderThreadHeading);
+  if (channelView !== "thread") return undefined;
+  paintThreadCard(leftEl("thread-card"), openThreadChoice(), replyTally());
+  const back = leftEl("thread-back");
+  const says = threadBackTitle();
+  if (back.getAttribute("title") !== says) back.setAttribute("title", says);
+  return undefined;
+}
+
+/**
+ * Where the X on a thread across the window goes, as its tooltip says it (`closeThread`): back to the
+ * thread list for a thread opened from it, else to the view the thread was opened from.
+ */
+function threadBackTitle() {
+  const to = threadOrigin === "list" && !threadListOffered() ? defaultChannelView() : threadOrigin;
+  if (to === "list") return "Back to the thread list";
+  if (to === "flat") return "Back to All";
+  if (to === "threads") return "Back to the Threads list";
+  return "Back to Main";
 }
 
 /** The reader picked one of the four views, or a thread. */
@@ -21252,8 +21270,10 @@ function renderChannelRows() {
   // the first row shown at or after its message.
   placeBookmarkLine();
   // `#298 thread-card-header`. The card at the top of the right column's thread counts its replies and
-  // unread as the rows' chips do, so it follows the same arrivals, reads and Done, in either column.
+  // unread as the rows' chips do, so it follows the same arrivals, reads and Done, in either column;
+  // and so does the card at the top of a thread across the window.
   paintSideThreadCard(tally);
+  if (!sideActive && channelView === "thread") paintThreadCard(leftEl("thread-card"), openThreadChoice(), tally);
 }
 
 /**
@@ -31688,7 +31708,10 @@ function chooseOneColumn(target) {
  */
 function openThreadFromList(id, summary = null) {
   const known = summary || channelCanon.threads.find((held) => String(held.id) === String(id)) || null;
+  // `#298 thread-card-header`. Its card moves up from the list to the top of the window.
+  const from = threadListOnScreen() ? cardFlightStart(String(id)) : null;
   chooseOneColumn({ view: "thread", thread: String(id), summary: known, origin: "list" });
+  flyThreadCard(leftEl("thread-card"), from, leftEl("pane-discord"));
 }
 
 /**
@@ -32767,6 +32790,140 @@ function paintSideThreadCard(tally = replyTally()) {
   paintThreadCard(leftEl("side-thread-card"), sideThreadChoice(), tally);
 }
 
+// --- the card moving up as its thread opens ----------------------------------------------------------
+//
+// `#298 thread-card-header`. The owner: "I would like to see the SAME colorful card move up to the top
+// of the screen ... So it just moves up and disgorges its internal messages underneath while keeping
+// the visual object of the thread card." A thread opened from its card while that card is on screen —
+// its replies button, → on it, the picker or its Thread(N) on Main while the cards are up on the right,
+// or the same from the thread list across the window — has its card at the top start where the card
+// in the list was, and slide up to its place, while the thread's messages fade in under it.
+//
+//   * FIRST, LAST, INVERT, PLAY. Where the card in the list is, read before the thread is shown; where
+//     the card at the top is, read once it is drawn, the thread laid out under it; the distance between
+//     them written on the card at the top (`--flight-x`, `--flight-y`), and the stylesheet's animation
+//     starting it there and ending it at its place. Only a transform and an opacity move, so nothing
+//     under the card is laid out again and the thread is at its place — its foot, or its first unread —
+//     before it fades in (`#280 scroll-stability`). Across layouts too: from the thread list's card to
+//     the top of the window, the two places measured on the screen.
+//   * The stylesheet says how long (`--card-flight`), and says 0 for a reader whose system asks for less
+//     motion: then nothing moves and nothing fades (`cardFlightMs`). The script asks no media query.
+//   * In two columns the line from the thread's root follows the card up, drawn every frame it moves.
+//   * Never for a thread opened any other way — from a tag in one column, from the picker with its card
+//     off screen, from one thread to another, on a reload — which has no card on screen to come from;
+//     nor back down when the thread closes.
+
+/**
+ * How long the card at the top of a thread takes to move up from its card in the list, in ms: the
+ * stylesheet's `--card-flight` on #screen-main, which is 0 for a reader whose system asks for less
+ * motion, as `--column-glide` is "auto" then. 0 too where the stylesheet says nothing.
+ */
+function cardFlightMs() {
+  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(leftEl("screen-main")) : null;
+  const said = style ? String(style.getPropertyValue("--card-flight")).trim() : "";
+  const parsed = /^(\d+(?:\.\d+)?)(ms|s)$/.exec(said);
+  return parsed ? Number(parsed[1]) * (parsed[2] === "s" ? 1000 : 1) : 0;
+}
+
+/**
+ * Where thread `id`'s card is in the cards on screen — on the right, or in the thread list — while any
+ * of it shows: where the card at the top of its thread starts from. Else null.
+ *
+ * @param {string} id
+ */
+function cardFlightStart(id) {
+  const row = cardRowOnRight(id);
+  if (!row || !rowShown(row) || !rowInView(sidePane, row)) return null;
+  return row.getBoundingClientRect();
+}
+
+/**
+ * The card moving up while it is: the card at the top, the pane fading in under it, and the timer that
+ * ends both should the browser never say their animations ended — a thread closed as it opens, its
+ * card no longer drawn. Null with none.
+ *
+ * @type {{card: HTMLElement, pane: HTMLElement, timer: ReturnType<typeof setTimeout>} | null}
+ */
+let cardFlight = null;
+
+/**
+ * Move `card`, at the top of a thread just opened, up from `from`, where its card in the list was, and
+ * fade in `pane`, the thread under it. Nothing without a place to come from, with no time to do it in
+ * (`cardFlightMs`), with the card not drawn, or with nowhere to go.
+ *
+ * @param {HTMLElement} card
+ * @param {DOMRect | {left: number, top: number} | null} from
+ * @param {HTMLElement} pane
+ */
+function flyThreadCard(card, from, pane) {
+  // A card still moving from the last thread stops where it is going: this one starts afresh.
+  endCardFlight();
+  if (!from || !drawnOnPage(card)) return;
+  const ms = cardFlightMs();
+  if (!(ms > 0)) return;
+  const to = card.getBoundingClientRect();
+  const dx = from.left - to.left;
+  const dy = from.top - to.top;
+  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+  card.style.setProperty("--flight-x", `${dx}px`);
+  card.style.setProperty("--flight-y", `${dy}px`);
+  card.setAttribute("data-flying", "");
+  pane.setAttribute("data-arriving", "");
+  // The fade under it (180 ms after 60) ends inside this too, at the stylesheet's own length.
+  cardFlight = { card, pane, timer: setTimeout(endCardFlight, ms + 100) };
+  // The line from the root follows the card up, each frame it moves.
+  if (!columnLinksShown() || typeof requestAnimationFrame !== "function") return;
+  const follow = () => {
+    if (!card.hasAttribute("data-flying")) return;
+    drawColumnLinks();
+    requestAnimationFrame(follow);
+  };
+  requestAnimationFrame(follow);
+}
+
+/** Whether `node` and everything it is in are drawn: none of them `hidden`. */
+function drawnOnPage(node) {
+  for (let at = node; at; at = /** @type {HTMLElement} */ (at.parentNode)) if (at.hidden) return false;
+  return true;
+}
+
+/**
+ * The browser says `node`'s animation ended: the card at the top is at its place, or the thread has
+ * faded in. Each ends its own part; the second to end ends the flight. An animation of something in it
+ * is not its own.
+ *
+ * @param {HTMLElement} node
+ * @param {any} event
+ */
+function endCardFlightPart(node, event) {
+  const flight = cardFlight;
+  if (!flight || !event || event.target !== node) return;
+  if (node === flight.card) {
+    node.removeAttribute("data-flying");
+    // Drawn once more where the card came to rest.
+    scheduleColumnLinks();
+  } else if (node === flight.pane) {
+    node.removeAttribute("data-arriving");
+  } else {
+    return;
+  }
+  if (!flight.card.hasAttribute("data-flying") && !flight.pane.hasAttribute("data-arriving")) {
+    clearTimeout(flight.timer);
+    cardFlight = null;
+  }
+}
+
+/** End the card's move and the thread's fade, if they are under way, wherever they have got to. */
+function endCardFlight() {
+  const flight = cardFlight;
+  if (!flight) return;
+  cardFlight = null;
+  clearTimeout(flight.timer);
+  flight.card.removeAttribute("data-flying");
+  flight.pane.removeAttribute("data-arriving");
+  scheduleColumnLinks();
+}
+
 /** The right column with no thread selected: its cards, and the thread list read behind them. */
 function showSideList() {
   openSideCards();
@@ -32788,13 +32945,18 @@ function selectSideThread(id, summary = null) {
   const known = summary || channelCanon.threads.find((held) => String(held.id) === thread) || null;
   sideThreads.set(channel, { id: thread, summary: known });
   const was = columns.side.mode;
+  // `#298 thread-card-header`. Where its card is, while the cards show it, for the card at the top to
+  // move up from.
+  const from = was === "list" ? cardFlightStart(thread) : null;
   if (was === "list") rememberCardPlace();
   columns.side.mode = "thread";
   renderSideMode();
-  return inColumn(columns.side, () => {
+  const opened = inColumn(columns.side, () => {
     if (was === "thread" && channelView === "thread" && String(selectedThreadId) === thread) return undefined;
     return changeChannelView("thread", thread, known);
   });
+  flyThreadCard(leftEl("side-thread-card"), from, leftEl("side-pane"));
+  return opened;
 }
 
 /** The X: the thread goes, and the cards come back. Its rows are held, so selecting it again is instant. */
@@ -33356,14 +33518,22 @@ function scheduleColumnLinks() {
   columnLinksDue = true;
   requestAnimationFrame(() => {
     columnLinksDue = false;
-    if (document.hidden) return;
-    if (!columnLinksShown()) {
-      renderColumnLinks([]);
-      return;
-    }
-    const pairs = columnLinkPairs();
-    renderColumnLinks(pairs.length ? planColumnLinks(measureColumnLinks(pairs), chosenLinkPair(pairs), litCardOnRight()) : []);
+    drawColumnLinks();
   });
+}
+
+/**
+ * Draw the links as the page stands now: in the frame `scheduleColumnLinks` asked for, and in each
+ * frame of the card at the top of a thread moving up (`flyThreadCard`, `#298 thread-card-header`).
+ */
+function drawColumnLinks() {
+  if (document.hidden) return;
+  if (!columnLinksShown()) {
+    renderColumnLinks([]);
+    return;
+  }
+  const pairs = columnLinkPairs();
+  renderColumnLinks(pairs.length ? planColumnLinks(measureColumnLinks(pairs), chosenLinkPair(pairs), litCardOnRight()) : []);
 }
 
 /** The selection the links were last told of, as "pane:id", or "". */
@@ -37039,6 +37209,13 @@ el("side-close").addEventListener("click", closeSideByX);
 // `#298 thread-card-header`. The text of the card at the top of the right column's thread opens it over
 // the list where the clamp cuts it, and closes it again.
 leftEl("side-thread-card-text").addEventListener("click", () => toggleThreadCard(leftEl("side-thread-card")));
+// ...and so does the text of the card at the top of a thread across the window.
+leftEl("thread-card-text").addEventListener("click", () => toggleThreadCard(leftEl("thread-card")));
+// The card moving up as its thread opens ends with its animation, or the thread's fading in with its
+// own: each ends its own part (`endCardFlightPart`).
+for (const id of ["thread-card", "side-thread-card", "pane-discord", "side-pane"]) {
+  leftEl(id).addEventListener("animationend", (event) => endCardFlightPart(leftEl(id), event));
+}
 // `#281 view-keys`. The next page of older threads, read where the cards are.
 el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
