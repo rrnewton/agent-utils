@@ -10,11 +10,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
-use slack_fake::{profiled, ts, Fake, FakeState, TOKEN};
+use slack_fake::{profiled, thread, ts, Fake, FakeState, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::providers::ChatRouter;
 use vibe_talk::state::AppState;
 use vibe_talk::testing::WRITE_TOKEN;
+use vibe_talk::upstream_clear::Clearer;
 
 const TEAM: &str = "C0000MAIN1";
 const OTHER: &str = "C0000OTHER";
@@ -236,6 +237,57 @@ async fn clearing_unread_in_slack_is_offered_only_when_the_deployment_turns_it_o
         fake.calls("conversations.mark"),
         0,
         "a dry run marks nothing"
+    );
+}
+
+/// `slack-reply-live`. A Slack read of a channel's newest messages now carries thread replies, but
+/// Settings' "Mark read now" pushes the newest message of the conversation's own, as the live stream
+/// offers them for clearing, never a thread reply newer than all of them, and reads no thread to
+/// find it. Here the newest message roots a thread whose reply is newer, so a read of the newest
+/// message with its thread's replies would answer the reply.
+#[tokio::test]
+async fn mark_read_now_pushes_the_conversations_own_newest_message_never_a_thread_reply() {
+    let mut state = fixture();
+    let mut list = state.history.remove(TEAM).expect("team");
+    let newest = list
+        .iter_mut()
+        .find(|message| message["ts"] == json!(ts(20, 0)))
+        .expect("the newest message");
+    thread(
+        &mut state,
+        TEAM,
+        newest,
+        &[(ts(50, 0), "a reply newer than every message".to_owned())],
+    );
+    state.history.insert(TEAM.to_owned(), list);
+    state.last_read.insert(TEAM.to_owned(), ts(10, 0));
+    let fake = Fake::start(state, 20).await;
+    let state = deployment_with(&fake, "upstream_clear = true\n").await;
+    tokio::spawn(Clearer::for_state(&state).run());
+    // Let the loop read its (empty) settings before any is saved, so that this press is the only
+    // push.
+    tokio::task::yield_now().await;
+    let path = format!("/api/v1/channels/{TEAM}/upstream-clear");
+    let (status, view) = call(&state, "PUT", &path, Some(json!({"mode": "on"}))).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+
+    let (status, answer) = call(&state, "POST", &format!("{path}/now"), None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["outcome"], "pushed", "{answer}");
+    let newest = vibe_talk::slack::message_id_from_ts(&ts(20, 0)).expect("an id");
+    assert_eq!(
+        answer["message_id"].as_str(),
+        Some(newest.as_str()),
+        "the conversation's own newest message, not the reply: {answer}"
+    );
+    assert_eq!(
+        fake.with(|state| state.marks.clone()),
+        vec![(TEAM.to_owned(), ts(20, 0))]
+    );
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        0,
+        "a thread was read to find it"
     );
 }
 

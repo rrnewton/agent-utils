@@ -3282,15 +3282,20 @@ pub async fn upstream_clear_now(
     if candidates.mode(&channel.id) == crate::store::UpstreamClearMode::Off {
         return Err(off());
     }
-    let messages = tokio::time::timeout_at(deadline, state.chat.fetch_recent(&channel.id, 1))
-        .await
-        .map_err(|_elapsed| {
-            ChatError::Transport(format!(
-                "the channel's newest message could not be read within {} s, so nothing was pushed",
-                UPSTREAM_CLEAR_NOW_WAIT.as_secs()
-            ))
-        })??;
-    let newest = messages.last();
+    // `slack-reply-live`: the newest message the live stream would offer, never a thread reply a
+    // provider reads apart.
+    let newest = tokio::time::timeout_at(
+        deadline,
+        crate::upstream_clear::newest_to_push(state.chat.as_ref(), &channel.id),
+    )
+    .await
+    .map_err(|_elapsed| {
+        ChatError::Transport(format!(
+            "the channel's newest message could not be read within {} s, so nothing was pushed",
+            UPSTREAM_CLEAR_NOW_WAIT.as_secs()
+        ))
+    })??;
+    let newest = newest.as_ref();
     let mut attempt = None;
     let outcome = match newest {
         None => Outcome::NoMessage,

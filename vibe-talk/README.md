@@ -1147,7 +1147,9 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   either way is read in full; a thread whose latest reply is older than the stretch costs nothing.
   An edit to a reply shows there within fifteen minutes, as in the flat view, and a reply in a
   thread rooted before the stretch is not among them. A thread whose replies cannot be read is left
-  out of that read rather than failing it. A reachability probe still reads history alone.
+  out of that read rather than failing it. A reachability probe still reads history alone, and so
+  does the check of a channel's newest message when [clearing unread in
+  Slack](#clearing-unread-in-slack) starts or **Mark read now** is pressed.
 * **Read state.** What you have read is vibe-talk's own record, as on Discord, and there is no
   "Mark read in Slack" on a message. With `upstream_clear` on, Settings can clear a channel's unread
   state in Slack as vibe-talk receives its messages, but never a thread's; see [Clearing unread in
@@ -1267,7 +1269,8 @@ What it does not do:
 * **Clearing unread in Slack.** A reply delivered this way is not offered for clearing (below): it
   was read out of step with the conversation's own messages, so a clear through it could mark read a
   message vibe-talk had not received yet. The next message of the conversation's own is offered as
-  ever.
+  ever, and the check of a channel's newest message when clearing starts or **Mark read now** is
+  pressed reads only the conversation's own messages, never a reply.
 
 A channel narrowed to one thread is polled as before: its forward read is the thread, replies
 included.

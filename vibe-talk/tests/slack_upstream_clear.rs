@@ -7,7 +7,8 @@ mod slack_fake;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use slack_fake::{profiled, ts, Fake, FakeState, METHODS};
+use serde_json::Value;
+use slack_fake::{profiled, thread, ts, Fake, FakeState, METHODS};
 use vibe_talk::chat::{ChatClient, ChatError, UpstreamClearOutcome};
 use vibe_talk::model::{ChannelId, MessageId};
 use vibe_talk::slack::message_id_from_ts;
@@ -397,4 +398,42 @@ async fn a_dry_run_through_the_loop_writes_nothing_at_slack() {
     let last = setting.last.as_ref().expect("recorded");
     assert_eq!(last.result, UpstreamClearResult::DryRun);
     assert_eq!(last.previous.as_deref(), Some(instant(10, 0).as_str()));
+}
+
+/// `slack-reply-live`. A Slack read of a channel's newest messages now carries thread replies, but
+/// a clear goes only through a message of the conversation's own, as the live stream offers them:
+/// seeding a channel set to clear pushes the newest of those, never a thread reply newer than all
+/// of them, and reads no thread to find it. Here the newest message roots a thread whose reply is
+/// newer, so a read of the newest message with its thread's replies would answer the reply.
+#[tokio::test]
+async fn the_seed_pushes_the_conversations_own_newest_message_never_a_thread_reply() {
+    let mut state = FakeState::default();
+    let mut list: Vec<Value> = (0..10)
+        .map(|i| profiled(&ts(i * 10, 0), "UADA00001", "Ada", &format!("message {i}")))
+        .collect();
+    thread(
+        &mut state,
+        CH,
+        &mut list[9],
+        &[(ts(200, 0), "a reply newer than every message".to_owned())],
+    );
+    state.history.insert(CH.to_owned(), list);
+    state.last_read.insert(CH.to_owned(), ts(10, 0));
+    let fake = Fake::start(state, 20).await;
+    let store = Arc::new(FakeStore::new());
+    let clearer = clearer(Arc::new(fake.clearing_client()), &store);
+    turn(&clearer, &channel(), UpstreamClearMode::On).await;
+
+    assert_eq!(clearer.seed().await.expect("seeded"), 1);
+    assert!(clearer.push_due().await);
+    assert_eq!(
+        marks(&fake),
+        vec![(CH.to_owned(), ts(90, 0))],
+        "the conversation's own newest message, not the reply"
+    );
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        0,
+        "a thread was read to find it"
+    );
 }

@@ -118,6 +118,32 @@ fn position_of(id: &MessageId, timestamp: &str) -> Option<(i64, u64)> {
     Some((instant.as_millisecond(), id.numeric().unwrap_or(0)))
 }
 
+/// The newest message of `channel` that a push may go through, read for the seed of a channel
+/// set to clear ([`Clearer::seed`]) and for "Mark read now": the newest message the live stream
+/// would offer. `slack-reply-live`.
+///
+/// For a channel whose provider reads its thread replies apart from its own messages
+/// ([`ChatClient::polls_thread_replies`], Slack), that is the newest of its own messages
+/// ([`ChatClient::fetch_page`]), never a thread reply: its newest messages
+/// ([`ChatClient::fetch_recent`]) carry replies too, which the live stream never offers
+/// ([`crate::live::LiveHub::publish_reply`]), and a reading of them costs thread reads as well. For
+/// any other channel it is the newest of its newest messages, as before.
+///
+/// # Errors
+///
+/// The read's.
+pub async fn newest_to_push(
+    chat: &dyn ChatClient,
+    channel: &ChannelId,
+) -> Result<Option<Message>, ChatError> {
+    let messages = if chat.polls_thread_replies(channel) {
+        chat.fetch_page(channel, 1, None, None).await?
+    } else {
+        chat.fetch_recent(channel, 1).await?
+    };
+    Ok(messages.into_iter().next_back())
+}
+
 /// A message waiting to be pushed.
 #[derive(Clone, Debug)]
 struct Pending {
@@ -832,10 +858,10 @@ impl Clearer {
                 setting.channel,
                 self.label_of(&setting.channel),
             );
-            match self.chat.fetch_recent(&setting.channel, 1).await {
-                Ok(messages) => {
-                    if let Some(newest) = messages.last() {
-                        self.candidates.offer(&setting.channel, newest);
+            match newest_to_push(self.chat.as_ref(), &setting.channel).await {
+                Ok(newest) => {
+                    if let Some(newest) = newest {
+                        self.candidates.offer(&setting.channel, &newest);
                     }
                 }
                 Err(error) => tracing::warn!(
