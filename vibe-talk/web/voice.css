@@ -1,7 +1,7 @@
 /*
- * The /voice frame.
+ * The app's frame.
  *
- * style.css gives this page its colours and its shared components; this file makes it behave like
+ * style.css gives this page its colours and its components; this file makes it behave like
  * an application rather than a document. Everything here exists to remove one specific web-page
  * behaviour, and each rule is annotated with which one, because otherwise they look arbitrary and
  * get "cleaned up" by the next person.
@@ -227,8 +227,6 @@ body {
   grid-template-rows: auto 1fr auto;
   /* Constrain the shared overlay anchor to the viewport even when a control's text is wider. */
   grid-template-columns: minmax(0, 1fr);
-  /* style.css leaves room at the bottom for a fixed status strip this page does not have. */
-  padding-bottom: 0;
 }
 
 /*
@@ -4826,9 +4824,6 @@ a.search-hit-link {
  * lit message again. It also keeps the old promise of the pointer query: on a touch screen `:hover`
  * fires on a tap and stays until the next tap somewhere else, a row that looks selected when nothing
  * is; a tap selects silently, and draws nothing.
- *
- * NOT in web/style.css, which the phone app at `/` shares and where `.messages li.selected` means
- * something else entirely.
  */
 #side-log li.discord-message[data-selected="true"],
 #discord-log li.discord-message[data-selected="true"],
@@ -5089,8 +5084,8 @@ a.search-hit-link {
  * The scene now also asserts that the channel does not overflow horizontally, because a rule this
  * easy to lose deserves a check that runs.
  *
- * Scoped to `#discord-log` rather than put on `.meta` in web/style.css: that file is shared with
- * the phone app at `/`, and the transcript's own metadata line has three things on it and fits.
+ * Scoped to the channel's lists rather than put on `.meta` in web/style.css: the transcript's own
+ * metadata line has three things on it and fits.
  */
 #side-log .meta,
 #discord-log .meta,
@@ -5452,15 +5447,11 @@ a.search-hit-link {
   border: none;
 }
 
-/* style.css pins #status to the bottom of the viewport for the OTHER page. Here it is a member of
-   the dock, and being fixed is precisely what put it in the curvature zone. */
+/* A member of the pill, never pinned to the viewport: a status strip fixed to the bottom edge is
+   precisely what put this line in a rounded phone's curvature zone. It takes what the dot and the
+   dismiss button leave, on one line, in the pill's muted ink. */
 #status {
-  position: static;
   flex: 1 1 auto;
-  padding: 0;
-  background: none;
-  border: none;
-  min-height: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

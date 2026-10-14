@@ -1,3 +1,8 @@
+/*
+ * The app's colours and its components. `voice.css`, loaded after this, makes the page a fixed
+ * application frame and holds everything else. This file was shared with an older page at `/`
+ * until `#302 root-is-the-app`; the rules only that page used went with it.
+ */
 :root {
   --bg: #14161a;
   --panel: #1d2026;
@@ -29,7 +34,6 @@ body {
   background: var(--bg);
   color: var(--ink);
   font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-  padding-bottom: 3rem;
 }
 
 header {
@@ -56,36 +60,8 @@ h1 {
   margin: 0.5rem 0;
 }
 
-nav {
-  display: flex;
-  border-bottom: 1px solid var(--edge);
-}
-
-nav button {
-  flex: 1;
-  padding: 0.9rem 0.5rem;
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--muted);
-  font: inherit;
-}
-
-nav button.active {
-  color: var(--ink);
-  border-bottom-color: var(--accent);
-}
-
 main {
   padding: 0.75rem 1rem;
-}
-
-.tab {
-  display: none;
-}
-
-.tab.active {
-  display: block;
 }
 
 .row {
@@ -185,10 +161,6 @@ button[disabled] {
   margin-bottom: 0.5rem;
 }
 
-.messages li.selected {
-  border-color: var(--accent);
-}
-
 .meta {
   display: flex;
   gap: 0.5rem;
@@ -200,24 +172,6 @@ button[disabled] {
 .body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-
-.ambiguous {
-  color: var(--warn);
-  font-size: 0.85rem;
-}
-
-#status {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 0.5rem 1rem;
-  background: var(--panel);
-  border-top: 1px solid var(--edge);
-  color: var(--muted);
-  font-size: 0.85rem;
-  min-height: 2rem;
 }
 
 /* Microphone settings: a disclosure, deliberately quieter than the Start button above it. */

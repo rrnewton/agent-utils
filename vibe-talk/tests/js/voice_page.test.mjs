@@ -82,10 +82,11 @@ const SANITIZED_TAGS = new Set(
     assert.fail("src/render.rs no longer states its TAGS"))[1].matchAll(/"([a-z0-9]+)"/g)].map((m) => m[1])
 );
 const CSS = readFileSync(join(WEB, "voice.css"), "utf8");
-// The SHARED sheet, which this page is layered on and does not own. Read only so that a claim
-// about a colour differing from the resting one can be checked against the resting one, rather
-// than against a restatement of it here — `#56 message-hover-highlight`.
-const SHARED_CSS = readFileSync(join(WEB, "style.css"), "utf8");
+// The BASE sheet, web/style.css: the colours and components voice.css is layered on. Read so that
+// a claim about a colour differing from the resting one can be checked against the resting one,
+// rather than against a restatement of it here — `#56 message-hover-highlight`. It was shared with
+// an older page at `/` until `#302 root-is-the-app`.
+const BASE_CSS = readFileSync(join(WEB, "style.css"), "utf8");
 
 /**
  * The same files with their comments removed.
@@ -5066,7 +5067,7 @@ test("the picker cannot take the width the pack holds for everything else", () =
   // ...and it shrinks rather than clipping, which is what makes a long channel name cost
   // characters instead of costing the buttons beside it.
   assert.match(rule, /min-width:\s*[\d.]+rem/);
-  const shared = cssRules(SHARED_CSS, "select").join("\n");
+  const shared = cssRules(BASE_CSS, "select").join("\n");
   assert.match(shared, /flex:\s*1/, "the rule above is overriding something that is no longer there");
   // Sixteen pixels, the same iOS rule `#compose-text` states: a control smaller than that zooms
   // the whole frame on focus, and this page is a fixed 100dvh grid that cannot scroll back.
@@ -5468,9 +5469,12 @@ test("the status line floats ABOVE the dock rather than reflowing the transcript
   const body = cssBlock("body");
   assert.match(body, /grid-template-rows:\s*auto 1fr auto/);
   assert.doesNotMatch(cssBlock("#dock"), /position:\s*(fixed|absolute)/);
-  // style.css pins #status to the viewport bottom for the OTHER page. Inherited here, that is what
-  // put the line inside the corner curvature of the owner's phone, which ate its first word.
-  assert.match(cssBlock("#status"), /position:\s*static/, "the shared fixed positioning is back");
+  // A status strip pinned to the viewport bottom is what put the line inside the corner curvature
+  // of the owner's phone, which ate its first word. Neither sheet may pin it there again.
+  for (const [sheet, text] of [["web/voice.css", CSS], ["web/style.css", BASE_CSS]]) {
+    assert.doesNotMatch(cssRules(text, "#status").join("\n"), /position:\s*(fixed|absolute|sticky)/,
+      `${sheet} pins #status to the viewport again`);
+  }
   // The control pane relied on the status row for separation from the dock's border; with the row
   // gone it has to say so itself.
   assert.match(cssBlock("#control-pane"), /padding:\s*[\d.]+rem/, "the controls sit on the border");
@@ -9601,7 +9605,7 @@ test("...AND IT IS A RECTANGLE: FOUR SIDES AND SQUARE CORNERS, ON A PHONE AND ON
   // agent's tile at 412 and 1280, and no horizontal scroll at 360 (tests/offline_cache_browser.py).
   // What is checked here is that the hairline is still declared for every row, and that no rule for
   // a channel row, in any media block and in any state, takes a side away again.
-  assert.match(cssRules(SHARED_CSS, ".messages li").join("\n"), /(?<![-\w])border:\s*1px solid var\(--edge\)/,
+  assert.match(cssRules(BASE_CSS, ".messages li").join("\n"), /(?<![-\w])border:\s*1px solid var\(--edge\)/,
     "the hairline every row is drawn with is gone from web/style.css");
   assert.ok(CHANNEL_ROW_RULES.length > 20, "the channel row's rules were not found, so nothing was checked");
   for (const { selectors, body } of CHANNEL_ROW_RULES) {
@@ -10704,11 +10708,11 @@ test("both arrows are drawn as the issue asks, in the stylesheet", () => {
   assert.match(cssBlock('#discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before'),
     /transform:\s*rotate\(45deg\)/, "the run is not at forty-five degrees");
   // ADJACENT: at the top, risen by exactly the gap between two rows — the margin under a row and this
-  // row's own top border, both stated in the shared sheet.
+  // row's own top border, both stated in the base sheet.
   const adjacent = cssBlock('#discord-log .reply-jump[data-reply-style="adjacent"]');
   assert.match(adjacent, /top:\s*0/);
   assert.match(adjacent, /--reply-rise:\s*calc\(0\.5rem \+ 1px\)/, "the rise is not the gap between two rows");
-  const rowRule = cssRules(SHARED_CSS, ".messages li").join("\n");
+  const rowRule = cssRules(BASE_CSS, ".messages li").join("\n");
   assert.match(rowRule, /margin-bottom:\s*0\.5rem/, "the gap the rise crosses has changed under it");
   assert.match(rowRule, /border:\s*1px solid/, "the border the rise crosses has changed under it");
   const mark = cssBlock('#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark');
@@ -12251,8 +12255,8 @@ test("message text is styled as one block family: bullets, hanging indent, parag
     assert.match(cssBlock(third), /list-style-type:\s*square/, `${third} reuses the second level's marker`);
   }
   assert.match(cssBlock(".md ol"), /padding-left:\s*2em/, "a two-digit number would stick out of its gutter");
-  // An item is not a row: the shared sheet's `.messages li` panel must not reach it.
-  assert.match(cssRules(SHARED_CSS, ".messages li").join("\n"), /padding:/, "the row rule this resets moved");
+  // An item is not a row: the base sheet's `.messages li` panel must not reach it.
+  assert.match(cssRules(BASE_CSS, ".messages li").join("\n"), /padding:/, "the row rule this resets moved");
   const item = cssBlock(".md li");
   for (const reset of [/border:\s*0/, /padding:\s*0/, /background:\s*none/, /margin:\s*0/]) {
     assert.match(item, reset, "a bullet point would be drawn as a row's card");
@@ -12785,7 +12789,7 @@ test("...and a row showing a summary is DRAWN differently from one showing the m
   // `#213 row-side-borders`, and a bar no wider than that would read as one more border. It is in
   // place of the hairline and wider than it.
   assert.match(
-    cssRules(SHARED_CSS, ".messages li").join("\n"),
+    cssRules(BASE_CSS, ".messages li").join("\n"),
     /(?<![-\w])border:\s*1px solid/,
     "the fixture for the hairline this bar has to be wider than has changed"
   );
@@ -13278,7 +13282,7 @@ test("...and the red is DRAWN, distinctly, in both colour schemes", async () => 
   // mark — on the coding agent's rows, which are most of a real backlog. The same trap the summary
   // tint had to clear.
   assert.match(
-    cssRules(SHARED_CSS, ".messages li").join("\n"),
+    cssRules(BASE_CSS, ".messages li").join("\n"),
     /(?<![-\w])border:\s*1px solid/,
     "the fixture for the hairline this bar has to be wider than has changed"
   );
@@ -13331,9 +13335,9 @@ test("...and the red is DRAWN, distinctly, in both colour schemes", async () => 
     );
   }
   // ...and specifically not `--warn`, which is web/style.css's orange and already carries two
-  // meanings on this very list: the row being read aloud, and an armed Clear. Read from the SHARED
+  // meanings on this very list: the row being read aloud, and an armed Clear. Read from the BASE
   // sheet rather than restated here, so this compares against the colour that is really in force.
-  const warn = tokenValues(SHARED_CSS, "--warn");
+  const warn = tokenValues(BASE_CSS, "--warn");
   assert.equal(warn.length, 2, "web/style.css no longer declares --warn for both schemes");
   for (const [i, scheme] of ["dark", "light"].entries()) {
     assert.notEqual(
@@ -16047,16 +16051,16 @@ test("the channel row's metadata line can WRAP, because five things do not fit o
   // declaration; `10-discord-view` asserts the pixels.
   const meta = cssBlock("#discord-log .meta");
   assert.match(meta, /flex-wrap:\s*wrap/, "the channel's metadata line cannot wrap again");
-  // NOT on the shared `.meta`: web/style.css belongs to the phone app at `/` as well, and the
-  // transcript's own metadata line has three things on it and fits.
-  assert.doesNotMatch(SHARED_CSS, /flex-wrap/, "the shared sheet was changed to fix this page");
+  // NOT on `.meta` in web/style.css: the transcript's own metadata line has three things on it and
+  // fits.
+  assert.doesNotMatch(BASE_CSS, /flex-wrap/, "the base sheet's `.meta` wraps the transcript's line too");
 });
 
 test("the hovered surface is really a DIFFERENT surface, in both schemes", async () => {
   // Checked against `--panel` as web/style.css declares it, not against a copy of it here: a tint
   // a hair off the resting colour is a rule that runs and cannot be seen, which is the failure
   // mode this treatment actually has.
-  const resting = tokenValues(SHARED_CSS, "--panel");
+  const resting = tokenValues(BASE_CSS, "--panel");
   const hovered = tokenValues(CSS, "--row-hover");
   assert.equal(resting.length, 2, "web/style.css no longer declares --panel for both schemes");
   assert.equal(hovered.length, 2, "--row-hover is missing a colour scheme, so one of them is blank");
@@ -30480,12 +30484,12 @@ test("`#247 reply-continuity`: the reply screen is tinted, in both schemes, and 
   const tint = (text) => (/--reply-tint:\s*(#[0-9a-f]{6})/i.exec(text) || [])[1];
   const page_bg = (text) => (/--bg:\s*(#[0-9a-f]{6})/i.exec(text) || [])[1];
   const lightAt = CSS_CODE.indexOf("@media (prefers-color-scheme: light)");
-  const sharedLightAt = SHARED_CSS.indexOf("@media (prefers-color-scheme: light)");
+  const sharedLightAt = BASE_CSS.indexOf("@media (prefers-color-scheme: light)");
   const dark = tint(CSS_CODE.slice(0, lightAt));
   const light = tint(mediaBody("(prefers-color-scheme: light)"));
   assert.ok(dark && light, "the tint is not declared for both schemes");
-  assert.notEqual(dark, page_bg(SHARED_CSS.slice(0, sharedLightAt)), "the dark tint is the page's own colour");
-  assert.notEqual(light, page_bg(SHARED_CSS.slice(sharedLightAt)), "the light tint is the page's own colour");
+  assert.notEqual(dark, page_bg(BASE_CSS.slice(0, sharedLightAt)), "the dark tint is the page's own colour");
+  assert.notEqual(light, page_bg(BASE_CSS.slice(sharedLightAt)), "the light tint is the page's own colour");
   await page.el("reply-cancel").click();
   assert.equal(page.el("frame-body").getAttribute("data-screen"), "main", "the tint outlived the reply screen");
 });
