@@ -1577,7 +1577,7 @@ fn validate_bridge_forward(
     Ok(())
 }
 
-fn parse_bridge_page(
+pub(super) fn parse_bridge_page(
     mut value: Value,
     channel: &ChannelId,
     request: &TimelineRequest,

@@ -951,3 +951,100 @@ async fn an_emulated_read_of_several_threads_is_timed_and_counted_as_the_thread_
         "one call; a root, and a root with two replies"
     );
 }
+
+/// The whole path, against a loopback bridge configured with `thread_reads`: reading twenty
+/// threads of one channel is ONE request, `GET /channels/{id}/threads` naming all twenty, and each
+/// thread's answer is the bridge's page for it. Real time, not a paused clock: the client's request
+/// timeout must not fire while the loopback server answers.
+///
+/// Thread naming does not read through this (#287 bulk-reads, rebased onto #286 naming-budget):
+/// each thread is named only from a read made at its own turn, one per channel per interval.
+#[tokio::test]
+async fn reading_twenty_threads_of_a_bridge_channel_is_one_request_to_the_bridge() {
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse as _;
+
+    const SPACE: &str = "spaces/A";
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |method: Method, uri: Uri| {
+        let captured = Arc::clone(&captured);
+        async move {
+            captured
+                .lock()
+                .expect("seen")
+                .push(format!("{method} {uri}"));
+            if uri.path() != "/channels/spaces%2FA/threads" {
+                return (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response();
+            }
+            let url = reqwest::Url::parse(&format!("http://bridge{uri}")).expect("a url");
+            let threads: Vec<Value> = url
+                .query_pairs()
+                .filter(|(key, _)| key == "ids")
+                .map(|(_, id)| {
+                    let membership = json!({"id": id, "root_message_id": null, "is_root": false,
+                        "reply_count": 1, "reply_count_exact": true});
+                    json!({"thread_id": id, "page": {
+                        "messages": [{
+                            "id": format!("{id}/messages/1"),
+                            "channel_id": SPACE,
+                            "content": format!("the bridge says hello in {id}"),
+                            "timestamp": iso(BASE_MS),
+                            "author": {"id": "7", "username": "bridge", "bot": false},
+                            "thread": membership,
+                        }],
+                        "threads": [],
+                        "thread": {"id": id, "root": null, "title": id, "reply_count": 1,
+                                   "reply_count_exact": true, "updated_at": iso(BASE_MS)},
+                        "has_threads": true,
+                        "has_more": false,
+                        "next_before": null,
+                    }})
+                })
+                .collect();
+            axum::Json(json!({ "threads": threads })).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server");
+    });
+    let mut config = vibe_talk::testing::config();
+    let discord = config.discord_mut().expect("a discord provider");
+    discord.api_base = format!("http://{address}");
+    discord.thread_api = vibe_talk::threads::ThreadApi::Bridge;
+    discord.thread_reads = true;
+    let client = vibe_talk::discord::http::HttpDiscordClient::new(discord).expect("a client");
+    let space = channel(SPACE);
+    let ids: Vec<String> = (0..20)
+        .map(|n| format!("spaces/A/threads/t{n:02}"))
+        .collect();
+    let asks: Vec<ThreadAsk> = ids
+        .iter()
+        .map(|id| ThreadAsk::newest(id.clone(), 50))
+        .collect();
+    let answers = client.fetch_threads(&space, &asks).await;
+    server.abort();
+
+    let query: String = ids
+        .iter()
+        .map(|id| format!("ids={}&", id.replace('/', "%2F")))
+        .collect();
+    assert_eq!(
+        seen.lock().expect("seen").clone(),
+        [format!("GET /channels/spaces%2FA/threads?{query}limit=50")]
+    );
+    assert_eq!(answers.len(), 20);
+    for (id, (answered, page)) in ids.iter().zip(&answers) {
+        assert_eq!(answered, id);
+        let page = page.as_ref().expect("the bridge's page");
+        assert_eq!(page.messages.len(), 1, "{id}");
+        assert_eq!(
+            page.messages[0].content,
+            format!("the bridge says hello in {id}")
+        );
+    }
+}

@@ -618,6 +618,11 @@ pub struct DiscordConfig {
     /// [`crate::discord::http::recent_request`]. Only `thread_api = "bridge"` accepts it; off by
     /// default.
     pub recent_many_reads: bool,
+    /// Whether the bridge answers a read of the newest messages of several threads of a channel
+    /// itself, with `GET /channels/{id}/threads?ids=&ids=&limit=`. remote-ops-audit W14
+    /// `#287 bulk-reads`; see [`crate::discord::http::threads_request`]. Only
+    /// `thread_api = "bridge"` accepts it; off by default.
+    pub thread_reads: bool,
 }
 
 impl DiscordConfig {
@@ -1059,6 +1064,7 @@ struct FileDiscord {
     id_reads: Option<bool>,
     head_reads: Option<bool>,
     recent_many_reads: Option<bool>,
+    thread_reads: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1094,6 +1100,7 @@ struct FileProvider {
     id_reads: Option<bool>,
     head_reads: Option<bool>,
     recent_many_reads: Option<bool>,
+    thread_reads: Option<bool>,
     // Slack providers only.
     registered_channels_writable: Option<bool>,
     channel_discovery: Option<bool>,
@@ -2475,6 +2482,7 @@ fn legacy_discord_provider<'e>(
             || file.id_reads.is_some()
             || file.head_reads.is_some()
             || file.recent_many_reads.is_some()
+            || file.thread_reads.is_some()
             || get(ENV_DISCORD_OWNER_USER_ID).is_some()
             || get(ENV_LIVE_POLL_SECONDS).is_some();
         if configures_a_provider {
@@ -2539,6 +2547,7 @@ fn legacy_discord_provider<'e>(
             ids: file.id_reads,
             heads: file.head_reads,
             recent_many: file.recent_many_reads,
+            threads: file.thread_reads,
         },
     )?;
     Ok(Some(ProviderConfig {
@@ -2571,6 +2580,7 @@ fn discord_protocol(
         ids: id_reads,
         heads: head_reads,
         recent_many: recent_many_reads,
+        threads: thread_reads,
     } = bridge_reads;
     let channel_registration = channel_registration.unwrap_or(false);
     let api_base = api_base.unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
@@ -2650,6 +2660,16 @@ fn discord_protocol(
                 .to_owned(),
         });
     }
+    // remote-ops-audit W14 `#287 bulk-reads`: likewise. Discord itself reads several threads its
+    // own way (`thread_api = "native"`), with no setting.
+    if thread_reads.is_some() && thread_api != Some(crate::threads::ThreadApi::Bridge) {
+        return Err(ConfigError::Invalid {
+            field: format!("{prefix}.thread_reads"),
+            detail: "applies only with thread_api = \"bridge\": it asks a compatible bridge for \
+                     the newest messages of several threads of a channel in one request"
+                .to_owned(),
+        });
+    }
     Ok(DiscordConfig {
         provider_name,
         thread_api: thread_api.unwrap_or_default(),
@@ -2669,17 +2689,19 @@ fn discord_protocol(
         id_reads: id_reads.unwrap_or(false),
         head_reads: head_reads.unwrap_or(false),
         recent_many_reads: recent_many_reads.unwrap_or(false),
+        thread_reads: thread_reads.unwrap_or(false),
     })
 }
 
-/// Which reads a bridge has said it answers itself: `range_reads`, `id_reads`, `head_reads` and
-/// `recent_many_reads`. remote-ops-audit W10 to W13 `#287 bulk-reads`.
+/// Which reads a bridge has said it answers itself: `range_reads`, `id_reads`, `head_reads`,
+/// `recent_many_reads` and `thread_reads`. remote-ops-audit W10 to W14 `#287 bulk-reads`.
 #[derive(Clone, Copy, Debug, Default)]
 struct BridgeReads {
     range: Option<bool>,
     ids: Option<bool>,
     heads: Option<bool>,
     recent_many: Option<bool>,
+    threads: Option<bool>,
 }
 
 /// The smallest post size an operator may configure. Below it a reopened code fence and its
@@ -2869,6 +2891,7 @@ fn provider_entry<'e>(
                     ids: entry.id_reads,
                     heads: entry.head_reads,
                     recent_many: entry.recent_many_reads,
+                    threads: entry.thread_reads,
                 },
             )?)
         }
@@ -2893,6 +2916,9 @@ fn provider_entry<'e>(
             }
             if entry.recent_many_reads.is_some() {
                 return Err(refuse("recent_many_reads", "slack"));
+            }
+            if entry.thread_reads.is_some() {
+                return Err(refuse("thread_reads", "slack"));
             }
             if entry.upstream_read_marks.is_some() {
                 return Err(refuse("upstream_read_marks", "slack"));
@@ -4844,6 +4870,77 @@ provider = "slack"
             |provider| matches!(&provider.kind, ProviderKind::Discord(d) if d.recent_many_reads),
         );
         assert!(on, "the gchat bridge reads several channels at once");
+    }
+
+    /// remote-ops-audit W14 `#287 bulk-reads`: a bridge reads several threads of a channel itself
+    /// only when the operator says it can, and only a bridge may be told so.
+    #[test]
+    fn a_bridges_thread_reads_are_off_by_default_and_only_a_bridge_may_turn_them_on() {
+        let bridge = |extra: &str| {
+            FULL.replace(
+                "[discord]",
+                &format!(
+                    "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9876\"\n{extra}"
+                ),
+            )
+        };
+        let thread_reads = |text: &str| {
+            Config::from_toml_and_env(text, &env(&[]))
+                .expect("valid")
+                .discord()
+                .expect("discord provider")
+                .thread_reads
+        };
+        assert!(!thread_reads(FULL));
+        assert!(!thread_reads(&bridge("")));
+        assert!(!thread_reads(&bridge("thread_reads = false")));
+        assert!(thread_reads(&bridge("thread_reads = true")));
+        assert!(
+            !thread_reads(&bridge(
+                "range_reads = true\nid_reads = true\nhead_reads = true\nrecent_many_reads = true"
+            )),
+            "the settings are separate"
+        );
+
+        let refused = |text: &str, wanted: &str| match Config::from_toml_and_env(text, &env(&[])) {
+            Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, wanted, "{text}"),
+            other => panic!("expected {wanted} to be refused, got {other:?}"),
+        };
+        refused(
+            &FULL.replace("[discord]", "[discord]\nthread_reads = true"),
+            "discord.thread_reads",
+        );
+        refused(
+            &FULL.replace(
+                "[discord]",
+                "[discord]\nthread_api = \"native\"\nthread_reads = true",
+            ),
+            "discord.thread_reads",
+        );
+        refused(
+            &MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nthread_reads = true",
+            ),
+            "providers.slack.thread_reads",
+        );
+        refused(
+            &MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nthread_reads = true",
+            ),
+            "providers.gchat.thread_reads",
+        );
+        let gchat = MULTI.replace(
+            "thread_api = \"off\"",
+            "thread_api = \"bridge\"\nthread_reads = true",
+        );
+        let config = Config::from_toml_and_env(&gchat, &env(&[])).expect("a bridge may");
+        let on = config
+            .providers
+            .iter()
+            .any(|provider| matches!(&provider.kind, ProviderKind::Discord(d) if d.thread_reads));
+        assert!(on, "the gchat bridge reads several threads at once");
     }
 
     /// `#208 persistent-cache`, milestone `bridge-recent-flat`: a bridge's recent read is
