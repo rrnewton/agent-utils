@@ -2108,7 +2108,11 @@ next catch-up reads every channel afresh. These two are not the only channel tex
 and the purge does not clear the others; "How an operator purges it" lists them. There is exactly
 one store, `src/store/`, and it holds these:
 
-* the app's **conversation transcript** — what you said and what the agent said back;
+* the app's **conversation transcript** — what you said and what the agent said back, and, as
+  rows of their own in the same table, a record of each message the voice agent posted, each draft
+  that was not sent, and each conversation's start: the recap it was sent and how the call before it
+  ended (`#270 voice-transcript-markers`; schema step 17 adds the `turns.detail` column they keep it
+  in, see "Migrations" below for taking a file back to step 16);
 * **read marks** — how far you have been shown each channel;
 * **"dealt with" marks** — which individual messages you have finished with, which is the
   overlay `#50 todo-view` is built on. Two snowflakes and an instant per row, and **no message

@@ -517,9 +517,10 @@ Open the agent in ElevenLabs and start a conversation. Ask, roughly in this orde
 4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. With "Ask me before the
    voice agent sends" on, **it must read the draft back as one fixed sentence — "To lead team:
    I'll look at it tonight. Send it?" — and nothing is posted until you confirm**. On the voice page
-   a card appears with that text and a Send button, and on that page a plain "yes" as your very next
-   answer to a read-back that was exactly that sentence also sends it; the agent says "One moment."
-   and then tells you what the page reports. **In the ElevenLabs console there is no voice page in
+   a card appears as the next message, with that text and a "Send to lead team" button, and on that
+   page a plain "yes" as your very next answer to a read-back that was exactly that sentence also
+   sends it; the agent says "One moment." and then tells you what the page reports. Once it goes,
+   the card stays in the transcript saying "Sent to lead team" and how you approved it. **In the ElevenLabs console there is no voice page in
    the call**, so no card, no spoken yes and no report: a "yes" there gets "One moment." and then
    silence, and the draft lapses after two minutes. That is expected; confirm from a call on the
    voice page. If a message appears in the channel before you confirm, stop: the server is not the

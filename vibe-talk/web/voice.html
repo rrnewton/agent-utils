@@ -2250,6 +2250,12 @@
                 capped by the server; when it does not all fit, the oldest lines are dropped and
                 both you and the agent are told the reconstruction is partial.
               </p>
+              <p class="hint">
+                The line above each new call says what it was sent: <em>412-word recap sent</em>,
+                <em>no recap sent</em> when resuming is on but nothing went (the line says why), or
+                <em>recap unsupported</em> where the voice service has no way to take one. Sent, not
+                heard: neither way of handing one over is acknowledged.
+              </p>
             </details>
 
             <details id="help-live-messages" class="help-entry">
@@ -2326,6 +2332,12 @@
                 speech and any channel text the assistant read out to you. Older conversations are
                 dropped automatically once the server's retention limit is reached.
               </p>
+              <p class="hint">
+                Beside what was said it keeps a record of each message the voice agent posted — what
+                went, where, and the first words of the message it answered, which someone else
+                wrote — of each draft that was not sent, and of what each call was handed as a recap.
+                Forgetting a conversation removes those with it.
+              </p>
             </details>
 
             <details id="help-voice-send" class="help-entry">
@@ -2334,7 +2346,8 @@
                 On, which is how this server ships, the voice agent never posts by itself. When you
                 ask it to send something it drafts the message and reads it back in one fixed
                 form — <em>To lead team: on it, rebasing now. Send it?</em> — and a card shows the
-                exact text. Tap <strong>Send</strong>, or answer with a plain <em>yes</em>,
+                exact text, as the next message at the foot of whatever you are looking at. Tap
+                <strong>Send to lead team</strong>, or answer with a plain <em>yes</em>,
                 <em>yeah</em>, <em>yep</em>, <em>do it</em>, <em>go ahead</em>, <em>sure</em> or
                 <em>please do</em> — one word of filler such as <em>yes please</em> is fine.
                 <em>Send it</em> works too, but not straight after the question, where it could be
@@ -2347,6 +2360,14 @@
                 and so does any answer that starts with one of them. Anything longer — "yes, and
                 tell him I'm late" — sends nothing. Whenever you answer something like a yes, the
                 page then tells the agent, and you, whether it was sent; a typed yes never sends.
+              </p>
+              <p class="hint">
+                A message that went stays in the transcript as the card it was sent from, saying
+                <em>Sent to lead team</em>, when, and whether you tapped or said yes; a yes that sent
+                it is drawn into that card rather than shown as a line of its own, and a reload shows
+                the same card. A draft that did not go leaves a <em>Not sent</em> line saying why. If
+                the call drops without your Hang up, the card stays, and Send still posts it until it
+                lapses; Hang up withdraws it, and the next call does not offer it again.
               </p>
               <p class="hint">
                 It cannot tell your voice from anyone else's: a passenger or the radio saying
