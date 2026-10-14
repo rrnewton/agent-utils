@@ -47,9 +47,11 @@ import os
 import queue
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for, said, thread_of
@@ -88,6 +90,10 @@ class StripApi(ColumnsApi):
                           "reply_count": 0, "reply_count_exact": True}
         self.messages.append(lone)
         self.next_index = 25
+        # Reads of the channel's timeline on the wire, and how many the page made of a live message
+        # (`reason=live`) have been answered (`settle_live`).
+        self.reads_in_flight = 0
+        self.live_answered = 0
 
     def client_config(self, scope: str) -> Json:
         return {**super().client_config(scope), "live_delivery": "push"}
@@ -127,6 +133,21 @@ def handler(api: StripApi) -> type[BaseHTTPRequestHandler]:
     """The fixture's routes, with a live stream that delivers what the check writes into it."""
 
     class Handler(handler_for(api)):  # type: ignore[misc]
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
+            parts = urlsplit(self.path)
+            if not parts.path.endswith("/timeline"):
+                super().do_GET()
+                return
+            live = "live" in parse_qs(parts.query).get("reason", [])
+            with api.lock:
+                api.reads_in_flight += 1
+            try:
+                super().do_GET()
+            finally:
+                with api.lock:
+                    api.reads_in_flight -= 1
+                    api.live_answered += 1 if live else 0
+
         def stream(self) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -336,6 +357,59 @@ def threads_of(api: StripApi) -> dict[str, str]:
     return out
 
 
+# How many frames in a row a state has to hold, after the reads a live message brings are answered, to
+# be taken as the page's settled answer rather than a passing one.
+STEADY_FRAMES = 30
+
+
+def steady(desk: Desk, condition: str) -> bool:
+    """Whether `condition` (a JS function) holds in each of the next `STEADY_FRAMES` frames."""
+    held = desk.page.evaluate(
+        f"""() => new Promise((done) => {{
+            const holds = {condition};
+            let frames = 0;
+            const step = () => {{
+                if (!holds()) return done(false);
+                if (++frames >= {STEADY_FRAMES}) return done(true);
+                requestAnimationFrame(step);
+            }};
+            requestAnimationFrame(step);
+        }})""")
+    return bool(held)
+
+
+def reads_idle(api: StripApi) -> bool:
+    with api.lock:
+        return api.reads_in_flight == 0
+
+
+def push_live(desk: Desk, api: StripApi, message: Json, condition: str, why: str) -> None:
+    """`message` onto the live stream, once no read of the channel is on the wire; then wait for the read
+    the page makes of it (`reason=live`) to have been answered, nothing else to be on the wire, and
+    `condition` to hold steadily (`steady`).
+
+    A read asked before a message existed does not hold it, and its answer, landing after the stream
+    has drawn the message, redraws the list without it for a few frames, until the message's own read
+    puts it back: `#310 stale-live-read-flicker`. So the next message is not pushed while an earlier
+    one's read is on the wire, and no check reads a state that has not held."""
+    deadline = time.monotonic() + 15
+    while not reads_idle(api) and time.monotonic() < deadline:
+        desk.page.wait_for_timeout(25)
+    desk.check(reads_idle(api), f"a read of the channel is still on the wire before the next push: {why}")
+    with api.lock:
+        answered = api.live_answered
+    api.push(message)
+    while time.monotonic() < deadline:
+        with api.lock:
+            read = api.live_answered > answered and api.reads_in_flight == 0
+        if read and steady(desk, condition) and reads_idle(api):
+            return
+        desk.page.wait_for_timeout(25)
+    with api.lock:
+        read = api.live_answered > answered
+    desk.check(False, f"{why} (its read {'answered' if read else 'never answered'})")
+
+
 # --- the walks -----------------------------------------------------------------------------------------
 
 
@@ -468,13 +542,11 @@ def desk_walk(desk: Desk, api: StripApi) -> None:
 
     # Live: a reply of the thread arrives in it, a message of no thread out of it.
     reply = api.add("A reply arriving live in the selected thread.", RUNNER)
-    api.push(reply)
-    desk.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{reply['id']}'][data-thread-in]\")",
-                  "a live reply of the selected thread did not arrive in it")
+    within = f"!!document.querySelector(\"#discord-log > li[data-id='{reply['id']}'][data-thread-in]\")"
+    push_live(desk, api, reply, f"() => {within}", "a live reply of the selected thread did not arrive in it")
     other = api.add("A message arriving live, in no thread.")
-    api.push(other)
-    desk.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{other['id']}']\")", "the live message did not arrive")
-    desk.settled()
+    push_live(desk, api, other, f"() => {within} && !!document.querySelector(\"#discord-log > li[data-id='{other['id']}']\")",
+              "the live message did not arrive, or the reply before it did not stay")
     live = state(desk)
     desk.check(row_by_id(live, str(other["id"]))["rowOpacity"] == "0.3", "a live message of no thread arrived undimmed")
     desk.check(row_by_id(live, str(reply["id"]))["rowOpacity"] == "1", "a live reply of the thread arrived dimmed")
@@ -532,10 +604,8 @@ def desk_walk(desk: Desk, api: StripApi) -> None:
     lone = row_by_id(state(desk), LONE_ROOT)
     desk.check(lone["strip"] is None, "the root nobody has answered has a strip")
     first = api.add("The first answer to the brand-new question.", LONE)
-    api.push(first)
-    desk.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{LONE_ROOT}'] > .thread-strip:not([hidden])\")",
-                  "the first reply gave its root no strip")
-    desk.settled()
+    push_live(desk, api, first, f"() => !!document.querySelector(\"#discord-log > li[data-id='{LONE_ROOT}'] > .thread-strip:not([hidden])\")",
+              "the first reply gave its root no strip")
     now = row_by_id(state(desk), LONE_ROOT)
     desk.check(abs(number(part(now, "meta"), "left") - number(part(lone, "meta"), "left")) < 0.5,
                f"the strip moved its row's words: {lone['meta']} -> {now['meta']}")
