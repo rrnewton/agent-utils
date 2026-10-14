@@ -2081,6 +2081,17 @@ gone only when it falls inside the page's stretch or Discord answers Unknown Mes
 and a thread's root, which may live in the parent channel, is never reported gone by a page of its
 replies.
 
+It also reads the newest message of several channels at once from Discord's own channel lists
+(`ChatClient::channel_heads`, remote-ops-audit W12): a channel's `last_message_id`, from
+`GET /guilds/{guild}/channels`, one request per server for every configured channel of it. Which
+server a channel belongs to is learned the first time, from `GET /channels/{id}`, which is also
+that channel's head, so the first head read costs a request per channel and every later one a
+request per server. A channel missing from its server's list, and a thread, which no server list
+holds, are read on their own; a forum or media channel has no message list of its own and gets no
+head. `last_message_id` moves only when a message is added, never on an edit or a delete, so a
+Discord head is used only by the live poller, which reads only additions (see
+[Channel heads](#channel-heads)).
+
 ### A bridge's recent read through Flat
 
 **The problem.** Every read of a channel's most recent messages — the digest, the to-do list, a
@@ -2239,6 +2250,31 @@ mistaking the newest messages for the ones asked for.
 
 A message named in `missing` is reported gone to whoever asked (a summary of it is a 404, an
 upstream read mark through it is refused), so `missing` must be the service's word, not a guess.
+
+### Channel heads
+
+**The problem.** Several things this server does only need to know whether a channel MOVED: the
+live poller reads every channel every tick to find nothing new in most of them, and a voice
+catch-up reads every channel whose held copy is older than its reuse period, whether or not
+anything was said there since. Each of those is one upstream read per channel.
+
+**What a head is.** `ChatClient::channel_heads(channels)` answers, per channel, the id and instant
+of its newest message, and where the provider knows them, its latest activity (thread replies
+included), an instant after which it KNOWS nothing in the channel changed (`unchanged_since`), and
+`as_of` when it answered from a copy it could not bring up to date. One answer per channel, in the
+order asked, a failure in its own place; the router asks each provider once for its own channels.
+
+**Who answers it natively.** Discord itself (`thread_api = "native"`), from its server channel
+lists, one request per server (see the native backend above). Every other provider answers with
+the trait's default, one read of one message per channel, which costs exactly what reading each
+channel did, and says so (`ReadCaps::heads` is emulated); Slack is one of them, since no Slack call
+answers the newest message of several conversations. A caller that would use heads only because
+they are cheap asks only a provider that reads them natively.
+
+**What a head can prove, and what it cannot.** A newest id that has not moved proves that nothing
+was ADDED. It does not prove that nothing was edited or deleted: Discord's `last_message_id` moves
+only on additions. Only `unchanged_since` vouches for edits and deletes too, so nothing that must
+see them acts on a head without it, and nothing acts on a head with an `as_of`.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 
