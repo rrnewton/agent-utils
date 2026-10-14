@@ -44,10 +44,15 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      call's recap (412 words) and sends it. The line above the new call reads "new conversation" with
      "412-word recap sent" beside it, on one line at 393 wide; at 360 the chip may wrap, but nothing
      runs off the screen, and the newest row is still in view.
+ 10. On the channel the card moves the list no more than a message arriving does (`#280
+     scroll-stability`): a reader on the newest line follows it down and is still at the foot once
+     Send takes it away and, a second later, the box takes back its room; a reader up the list keeps
+     the first row on screen, within a pixel, through the same three, and the jump says "Draft to
+     send".
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
-without the first call's connection banner, and with a short and a 1,500-character draft, and point
-9 once; the docked card alone at 667x375 and 375x330; and point 8 at 1280x800 with a mouse.
+without the first call's connection banner, and with a short and a 1,500-character draft, and points
+9 and 10 once; the docked card alone at 667x375 and 375x330; and point 8 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -985,6 +990,83 @@ def recap_case(page: Page, url: str, hosted: FakeHosted, api: FakeApi, size: tup
         page.screenshot(path=str(screenshots / f"recap-line-{width}x{height}.png"), animations="disabled")
 
 
+# Point 10, read in one go: how far the channel's list runs below what it shows, the first row on
+# screen and its offset, and what the jump to the newest says.
+STILL_JS = """() => {
+  const area = document.getElementById('scroll-area');
+  const top = area.getBoundingClientRect().top;
+  let first = null;
+  for (const row of document.getElementById('discord-log').children) {
+    if (!row.hasAttribute('data-id') || !row.getClientRects().length) continue;
+    const box = row.getBoundingClientRect();
+    if (box.bottom > top) { first = { id: row.getAttribute('data-id'), offset: box.top - top }; break; }
+  }
+  const jump = document.getElementById('jump-newest');
+  return { gap: area.scrollHeight - area.scrollTop - area.clientHeight, first,
+           jump: jump.hidden ? null : document.getElementById('jump-newest-label').textContent };
+}"""
+
+
+def still(page: Page) -> dict[str, object]:
+    measured = page.evaluate(STILL_JS)
+    check(isinstance(measured, dict), "the page measured nothing")
+    assert isinstance(measured, dict)
+    return {str(key): value for key, value in measured.items()}
+
+
+def channel_still_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> None:
+    """Point 10: on the channel the card comes and goes moving the list no more than a message does."""
+    width, height = size
+    where = f"{width}x{height}, channel"
+    open_call(page, url, voice, api, 30, False)
+    page.click("#view-switch")
+    page.wait_for_function("() => document.querySelectorAll('#discord-log > li').length > 0", timeout=10_000)
+    page.wait_for_timeout(300)
+
+    # A reader on the newest line follows the card down, and is still on it once Send has taken the card
+    # away and, a second later, the box its room.
+    page.evaluate(TO_NEWEST_JS)
+    page.wait_for_timeout(200)
+    propose(page, api, 21, SHORT_DRAFT)
+    page.wait_for_timeout(300)
+    for stage in ("the card arriving", "Send", "the box taking back its room"):
+        if stage == "Send":
+            page.wait_for_timeout(HOLD_MS)
+            page.click("#post-confirm-send")
+            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            page.wait_for_timeout(150)
+        elif stage == "the box taking back its room":
+            page.wait_for_timeout(1300)
+        gap = rect(still(page), "gap")
+        check(gap <= 1, f"{where}: after {stage} a reader on the newest line is {gap:.0f}px above the foot")
+
+    # A reader up the list keeps the row they are on, within a pixel, through the same three, and is told
+    # a draft waits below.
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 150; }")
+    page.wait_for_timeout(300)
+    before = still(page)
+    first = before["first"]
+    check(isinstance(first, dict) and rect(before, "gap") > 100, f"{where}: the premise, a reader up the list: {before}")
+    assert isinstance(first, dict)
+    propose(page, api, 22, SHORT_DRAFT)
+    page.wait_for_timeout(300)
+    arrived = still(page)
+    check(arrived["jump"] == "Draft to send", f"{where}: the jump says {arrived['jump']!r}, not that a draft waits")
+    for stage in ("the card arriving", "Send", "the box taking back its room"):
+        if stage == "Send":
+            page.wait_for_timeout(HOLD_MS)
+            # Not a click: Playwright would scroll the card into view first, which is a move the reader made.
+            page.evaluate("() => document.getElementById('post-confirm-send').click()")
+            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            page.wait_for_timeout(150)
+        elif stage == "the box taking back its room":
+            page.wait_for_timeout(1300)
+        now = still(page)["first"]
+        check(isinstance(now, dict) and now["id"] == first["id"] and
+              abs(rect(now, "offset") - rect(first, "offset")) <= 1,
+              f"{where}: {stage} moved the row a reader up the list was on from {first} to {now}")
+
+
 def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
          size: tuple[int, int]) -> str:
     width, height = size
@@ -1016,14 +1098,16 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                     for draft in (SHORT_DRAFT, LONG_DRAFT):
                         lowest = min(lowest, reach_case(page, url, voice, api, size, rows, banner, draft))
             placement_case(page, url, voice, api, size, args.screenshots)
+            channel_still_case(page, url, voice, api, size)
             dock_case(page, url, voice, api, size, args.screenshots)
             frozen_case(page, url, voice, api, size, args.screenshots)
             recap_case(page, url, hosted, api, size, args.screenshots)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
-    return (f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run; the next call's"
-            " line says '412-word recap sent'")
+    return (f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run; on the channel"
+            " the card coming and going left a reader up the list on their row and one at the foot there;"
+            " the next call's line says '412-word recap sent'")
 
 
 def walk_short(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
