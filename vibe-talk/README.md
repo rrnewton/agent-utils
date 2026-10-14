@@ -7553,7 +7553,10 @@ it outside anything a model can call:
 The card is the tentative next message (`#269 approval-card-inline`): the owner's own outgoing tile
 at the foot of the list he is looking at — under the call's transcript or the channel's messages,
 above that list's box, which shrinks to one line under it — and docked at the foot of Reply,
-Threads, Settings and Help. In two columns, where Reply is a box at the foot of a column rather than
+Threads, Settings and Help. It moves the list no more than a message arriving does (`#280
+scroll-stability`): a reader on the newest line follows it down, and anyone else — up the list, on a
+message a filter change holds, or where entering a thread landed them — stays where they are and is
+offered the jump to it. In two columns, where Reply is a box at the foot of a column rather than
 a screen (`#277 reply-in-column`), the card stays the left list's next message, wholly above that
 box. Under Reply, and while a reply is open in either column, the card's Send is outlined, so the
 filled **Send reply** is never taken for it. It names what it answers in words ("replying to Alex:

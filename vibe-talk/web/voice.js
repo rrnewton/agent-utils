@@ -10418,7 +10418,7 @@ function showPostProposal(proposal) {
   // Measured BEFORE the card is put up or its text changes, because putting it up is what changes
   // the answer: a reader at the newest line follows the card down, one scrolled up is not moved.
   // `#269 approval-card-inline`.
-  const pinned = atBottom(leftEl("scroll-area"));
+  const pinned = followsCard();
   const card = leftEl("post-confirm");
   const hadFocus = nodeWithin(card, document.activeElement);
   postWatch.shown = proposal;
@@ -10485,6 +10485,24 @@ function showPostProposal(proposal) {
   // there, and must not move the list he left.
   if (fresh && currentScreen === "main") followIfPinned(pinned, 0, currentView);
   renderJumpNewest();
+}
+
+/**
+ * Whether the reader follows the send card down as it is put up or opened: the reader on the newest
+ * line of the list on screen, asked BEFORE, because the card is what changes the answer. `#269
+ * approval-card-inline`.
+ *
+ * On the channel, by the rule a message arriving live is followed by (`liveFollowers`, `#280
+ * scroll-stability`): the card is the list's tentative next message, and it moves the reader no more
+ * than a message would. Not a reader a filter change holds in place (`#243`), whose message would be
+ * let go and the list moved to the foot; nor one a thread's landing has just put on its first unread
+ * (`#221`), which a short thread leaves within the slack of its foot on purpose, and which the card
+ * would scroll up under the floating line — "something updating underneath". They are told a draft
+ * waits below instead. On the call's view, the transcript's own rule (`followIfPinned`).
+ */
+function followsCard() {
+  if (currentScreen !== "main") return false;
+  return currentView === "discord" ? liveFollowers().main : atBottom(leftEl("scroll-area"));
 }
 
 /**

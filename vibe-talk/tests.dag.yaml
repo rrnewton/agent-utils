@@ -349,11 +349,13 @@ steps:
   # screen, on the three phones and at 667x375 and 375x330. At 1280x800 in two columns the card stays
   # wholly above a reply open at the left column's foot, its Send outlined beside a reply in either
   # column (`#277 reply-in-column`). On the three phones a hosted call sent a 412-word recap says so
-  # on the line above it, on one line at 393 and with nothing off the screen at 360 (`#270`).
-  # Measured on 2026-10-13: about 120s wall, before the recap line.
+  # on the line above it, on one line at 393 and with nothing off the screen at 360 (`#270`), and on
+  # the channel the card arriving, Send and the box taking back its room leave a reader up the list on
+  # their row within a pixel and one at the foot there (`#280 scroll-stability`).
+  # Measured on 2026-10-13: about 120s wall, before the recap line and the channel's stillness.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, and the recap line of a new call, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, and beside a reply open in a column at 1280x800
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, and beside a reply open in a column at 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
