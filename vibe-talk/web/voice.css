@@ -851,10 +851,11 @@ a.search-hit-link {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
   /* `#36 thread-view-phone-overflow`. The implicit column is `auto`, which may not shrink below
-     its widest item's min-content width — and #thread-title is `nowrap`, so that is the whole
-     title. A thread named longer than the phone widened the column, and every message row, the
-     composer and the tabs with it, off the right edge instead of ellipsising the title. The
-     same trap as `min-height: 0` above, sideways. */
+     its widest item's min-content width — and the heading over a thread was a `nowrap` title, so
+     that was the whole title. A thread named longer than the phone widened the column, and every
+     message row, the composer and the tabs with it, off the right edge instead of ellipsising the
+     title. The same trap as `min-height: 0` above, sideways; the card that heads a thread now
+     (`#289 thread-card-header`) wraps, but whatever heads it next must not widen the screen. */
   grid-template-columns: minmax(0, 1fr);
   min-height: 0;
   /* The anchor for #scroll-tools, which floats over the bottom corner of the list. It has to be
@@ -890,37 +891,20 @@ a.search-hit-link {
   color: var(--bg);
 }
 
+/* `#289 thread-card-header`. Over a thread across the window the heading is the thread's card, drawn
+   by the rules of the card at the top of the right column (`.thread-card-header`, with the cards' own
+   below), in the reading column as the thread list's cards are. It holds the card at its top, so a
+   card opened past it grows downward, over the list, rather than out of both its edges. */
 #thread-heading {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   max-width: var(--reading-width);
   margin-inline: auto;
 }
 
-/* The space after Back is the button's own, not a flex gap: a gap would also open between the
-   facts and the name, which `#194 thread-picker-polish` joins with " · " exactly as the picker
-   does, so the heading reads as the picker's option rather than as two separate labels. */
-#thread-back {
-  flex: none;
-  margin-inline-end: 0.75rem;
-}
-
-/* "13h · 16", never shortened: the name beside it is what gives way on a narrow phone. */
-#thread-facts {
-  flex: none;
-  white-space: pre;
-  color: var(--muted);
-}
-
-#thread-facts::after {
-  content: " · ";
-}
-
-#thread-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* The card has its own border: no rule under it as well. */
+#channel-navigation:has(> #thread-heading:not([hidden])) {
+  border-bottom: 0;
 }
 
 .thread-badge,
@@ -7240,6 +7224,75 @@ textarea {
   height: auto;
   min-height: calc(3 * 1.35em);
   max-height: 60vh;
+}
+
+/* On a phone, over a thread across the window, two lines of it rather than three: the card is the
+   screen's heading there, and a third line is a line less of the thread. Still a fixed height. */
+@media (max-width: 599.98px) {
+  #thread-card:not([data-expanded]) > .side-card > .side-card-text {
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    height: calc(2 * 1.35em);
+  }
+
+  #thread-card[data-expanded] > .side-card > .side-card-text {
+    min-height: calc(2 * 1.35em);
+  }
+}
+
+/*
+ * `#289 thread-card-header`. THE CARD MOVES UP. The owner: "I would like to see the SAME colorful card
+ * move up to the top of the screen ... So it just moves up and disgorges its internal messages
+ * underneath". A thread opened from its card while that card is on screen — in the list on the right,
+ * or in the thread list across the window — has its card at the top start where the card in the list
+ * was and slide to its place, and the thread's messages fade in under it. web/voice.js measures both
+ * places and writes the distance between them (`--flight-x`, `--flight-y`) and `data-flying` on the
+ * card and `data-arriving` on the thread's pane; these rules do the moving. Only a transform and an
+ * opacity are animated, so nothing is laid out again and nothing moves in the list under the card
+ * (`#280 scroll-stability`): the thread is already at its place when it fades in.
+ *
+ * How long it takes is said here, and nowhere else, and the script reads it (`cardFlightMs`), as it
+ * reads `--column-glide`; for a reader whose system asks for less motion it is 0, and nothing moves or
+ * fades at all.
+ */
+#screen-main {
+  --card-flight: 220ms;
+}
+
+@keyframes card-flight {
+  from {
+    transform: translate(var(--flight-x, 0px), var(--flight-y, 0px));
+  }
+}
+
+@keyframes thread-arrive {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Over the list it flies across, as an opened card is. */
+.thread-card-header[data-flying] {
+  position: relative;
+  z-index: 3;
+  animation: card-flight var(--card-flight) cubic-bezier(0.2, 0, 0, 1);
+}
+
+#pane-discord[data-arriving],
+#side-pane[data-arriving] {
+  animation: thread-arrive 180ms ease-out 60ms backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #screen-main {
+    --card-flight: 0ms;
+  }
+
+  .thread-card-header[data-flying],
+  #pane-discord[data-arriving],
+  #side-pane[data-arriving] {
+    animation: none;
+  }
 }
 
 #side-more-threads {
