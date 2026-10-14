@@ -1,12 +1,13 @@
 ---
 title: 'slack-reply-live: Slack thread replies arrive live and reach the voice tools'' recent windows'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-14T20:24:13.547842824+00:00
-updated_at: 2026-10-14T20:24:13.547842824+00:00
+updated_at: 2026-10-14T20:45:49.158810147+00:00
+closed_at: 2026-10-14T20:45:49.158810006+00:00
 ---
 
 # Description
