@@ -17096,7 +17096,11 @@ test("EXPAND ALL OPENS EVERY ENTRY AND THEN FOLDS THEM ALL, its word following t
   const all = page.el("fold-help");
   assert.equal(all.textContent, "Expand all");
   await all.click();
-  assert.deepStrictEqual(openHelp(page), HELP_SLUGS, "Expand all left entries folded");
+  // Every entry on the screen: this server has no message cache, so its entry is hidden and stays
+  // out of it (`#208 persistent-cache`).
+  const shown = HELP_SLUGS.filter((slug) => !page.el(`help-${slug}`).hidden);
+  assert.deepStrictEqual(shown, HELP_SLUGS.filter((slug) => slug !== "message-cache"));
+  assert.deepStrictEqual(openHelp(page), shown, "Expand all left entries folded");
   assert.equal(all.textContent, "Fold all");
   // One folded by hand (or by the browser's find opening one, which fires the same event).
   page.el("help-keyboard").open = false;
@@ -54923,7 +54927,8 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
   }
   assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Control bar", "Typing", "Keyboard"]);
-  assert.deepStrictEqual(groupsIn("Storage and connection"), ["Stored conversations", "Token", "Connection status"]);
+  assert.deepStrictEqual(groupsIn("Storage and connection"),
+    ["Stored conversations", "Saved messages on this server", "Token", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.
   const channels = settingsSection("Channels");
   assert.match(channels, /<h2 id="settings-channels-title">Channels<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
@@ -59942,3 +59947,235 @@ for (const placing of ["newest", "delta"]) {
     assert.equal(savedMessage(control.page, "201").content, "first thread root", "the edit survived anyway, so this test cannot see it");
   });
 }
+
+// --- `#208 persistent-cache`: saved messages on this server --------------------------------------
+//
+// The server's own copy of the messages it reads, which the owner may keep, turn off, or erase from
+// Settings. Its status comes from client-config, only from a server whose configuration has the
+// table and only to a write token; both erasing acts ask before anything is sent.
+
+/** Every id inside the Saved messages group, as web/voice.html must declare them. */
+const MESSAGE_CACHE_IDS = [
+  "message-cache-enabled", "message-cache-state", "message-cache-confirm", "message-cache-confirm-text",
+  "message-cache-confirm-yes", "message-cache-confirm-no", "message-cache-erase", "help-link-message-cache",
+];
+
+/** A signed-in page whose server reports `status` (none for null) to a token of `scope`. */
+async function messageCachePage(status = messageCacheStatus(), scope = "write") {
+  const page = newPage();
+  page.messageCache = status === null ? undefined : status;
+  page.tokenScope = scope;
+  await signIn(page);
+  return page;
+}
+
+/** The requests the page made to the switch route, whatever it answered. */
+const messageCacheRequests = (page) => page.requests.filter((r) => r.includes("/api/v1/message-cache"));
+
+test("`#208 persistent-cache`: the Saved messages group and its help entry show only to a write token, and only with a status", async () => {
+  const none = await messageCachePage(null);
+  assert.equal(none.el("message-cache-group").hidden, true, "a server with no message cache shows the group");
+  assert.equal(none.el("help-message-cache").hidden, true, "Help describes a cache this server does not have");
+
+  // A read token is shown nothing, even should a status reach it: it cannot switch the cache.
+  const read = await messageCachePage(messageCacheStatus(), "read");
+  assert.equal(read.el("message-cache-group").hidden, true, "a read token was shown the switch");
+  assert.equal(read.el("help-message-cache").hidden, true);
+
+  const write = await messageCachePage();
+  assert.equal(write.el("message-cache-group").hidden, false, "the write token was not shown the group");
+  assert.equal(write.el("help-message-cache").hidden, false, "the group showed without its help entry");
+  assert.equal(write.el("message-cache-enabled").checked, true);
+  assert.equal(write.el("message-cache-enabled").disabled, false);
+  assert.equal(write.el("message-cache-erase").disabled, false);
+  assert.equal(write.el("message-cache-confirm").hidden, true, "a question was asked before anything was pressed");
+  // Drawing it asks the server nothing: the status came with client-config.
+  for (const page of [none, read, write]) assert.deepStrictEqual(messageCacheRequests(page), []);
+});
+
+test("`#208 persistent-cache`: the line under the switch says what the server holds, or why it holds nothing", async () => {
+  const LIMITS = "It keeps at most 14 days and 256 MB.";
+  for (const [status, line, ticked, locked] of [
+    [messageCacheStatus(),
+      `On: 1,200 messages from 3 channels, 3.4 MB. Complete in places back to Aug 10, Mon. ${LIMITS}`, true, false],
+    [messageCacheStatus({ messages: 1, channels: 1, bytes: 2048, oldest_covered: undefined, max_days: 1, max_megabytes: 16 }),
+      "On: 1 message from 1 channel, 2 KB. It keeps at most 1 day and 16 MB.", true, false],
+    [messageCacheStatus({ messages: 0, channels: 0, bytes: 32768, oldest_covered: undefined }),
+      `On, and nothing is saved yet. ${LIMITS}`, true, false],
+    [messageCacheStatus({ available: false, enabled: false, reason: "switched_off", messages: 0, channels: 0, bytes: 0 }),
+      "Off: you turned it off, and its file was erased. Turn it on to start again with an empty file.", false, false],
+    [messageCacheStatus({ available: false, enabled: false, reason: "config_disabled", messages: 0, channels: 0, bytes: 0 }),
+      "Off in this server's configuration; only its operator can turn it on.", false, true],
+    [messageCacheStatus({ available: false, reason: "locked", messages: 0, channels: 0, bytes: 0 }),
+      "On, but no file is open, so nothing is being saved: another process holds the file.", true, false],
+    // A code this page does not know reads as "not open", as the contract asks.
+    [messageCacheStatus({ available: false, reason: "a_code_from_later", messages: 0, channels: 0, bytes: 0 }),
+      "On, but no file is open, so nothing is being saved.", true, false],
+  ]) {
+    const page = await messageCachePage(status);
+    assert.equal(page.el("message-cache-state").textContent, line);
+    assert.equal(page.el("message-cache-enabled").checked, ticked, line);
+    assert.equal(page.el("message-cache-enabled").disabled, locked, line);
+    // Only an open file can be erased: with none, Erase would erase nothing.
+    assert.equal(page.el("message-cache-erase").disabled, !status.available, line);
+  }
+  // The help entry's limits are this server's, not the figures in the markup.
+  const page = await messageCachePage(messageCacheStatus({ max_days: 30, max_megabytes: 512 }));
+  assert.equal(page.el("message-cache-help-days").textContent, "30 days");
+  assert.equal(page.el("message-cache-help-megabytes").textContent, "512 MB");
+});
+
+test("`#208 persistent-cache`: turning it off sends PUT only once the question is answered yes, and nothing on Keep", async () => {
+  const page = await messageCachePage();
+  await page.el("message-cache-enabled").setChecked(false);
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, [], "unticking erased the file without asking");
+  assert.equal(page.el("message-cache-confirm").hidden, false, "nothing asked before the file is erased");
+  assert.equal(page.el("message-cache-confirm-text").textContent,
+    "Turn saving off and erase the 1,200 saved messages (3.4 MB) now?");
+  assert.equal(page.el("message-cache-confirm-yes").textContent, "Turn off and erase");
+  assert.equal(page.el("message-cache-confirm-no").textContent, "Keep saving");
+  assert.equal(page.el("message-cache-enabled").checked, true, "the box says off while the server still saves");
+  assert.equal(focusName(page), "#message-cache-confirm-no", "the answer waits anywhere but at the safe button");
+
+  await page.el("message-cache-confirm-no").click();
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, [], "Keep saving sent something");
+  assert.deepStrictEqual(messageCacheRequests(page), []);
+  assert.equal(page.el("message-cache-confirm").hidden, true);
+  assert.equal(page.el("message-cache-enabled").checked, true);
+  assert.equal(focusName(page), "#message-cache-enabled", "Keep did not go back to the switch");
+
+  await page.el("message-cache-enabled").setChecked(false);
+  await page.el("message-cache-confirm-yes").click();
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, ['PUT {"enabled":false}']);
+  assert.equal(page.el("message-cache-confirm").hidden, true);
+  assert.equal(page.el("message-cache-enabled").checked, false, "the box was not redrawn from what the server left");
+  assert.equal(page.el("message-cache-erase").disabled, true, "Erase is offered with no file to erase");
+  assert.match(page.el("message-cache-state").textContent, /^Off: you turned it off, and its file was erased\./);
+});
+
+test("`#208 persistent-cache`: turning it on sends at once, and a refused switch keeps what the server last said, and says why", async () => {
+  const page = await messageCachePage(messageCacheStatus({
+    available: false, enabled: false, reason: "switched_off", messages: 0, channels: 0, bytes: 0, oldest_covered: undefined,
+  }));
+  await page.el("message-cache-enabled").setChecked(true);
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, ['PUT {"enabled":true}'], "turning it on asked, or sent nothing");
+  assert.equal(page.el("message-cache-confirm").hidden, true);
+  assert.equal(page.el("message-cache-enabled").checked, true);
+  assert.equal(page.el("message-cache-state").textContent, "On, and nothing is saved yet. It keeps at most 14 days and 256 MB.");
+
+  // Off, refused: the marker could not be written, so nothing was erased, and the box stays on.
+  page.messageCacheFailure = {
+    status: 500, error: "message_cache_switch_unsaved",
+    detail: "the message cache's switch could not be saved beside the store; nothing was erased and nothing changed",
+  };
+  await page.el("message-cache-enabled").setChecked(false);
+  await page.el("message-cache-confirm-yes").click();
+  await page.settle();
+  assert.equal(page.el("message-cache-enabled").checked, true, "a refused off left the box saying off");
+  assert.match(page.el("message-cache-state").textContent,
+    /^The server did not confirm that: the message cache's switch could not be saved beside the store; nothing was erased and nothing changed On, and nothing is saved yet\./);
+
+  // On, refused: the operator's configuration wins, and the box goes back to off.
+  const off = await messageCachePage(messageCacheStatus({
+    available: false, enabled: false, reason: "switched_off", messages: 0, channels: 0, bytes: 0,
+  }));
+  off.messageCacheFailure = { status: 409, error: "message_cache_not_enabled", detail: "only the operator can turn it on" };
+  await off.el("message-cache-enabled").setChecked(true);
+  await off.settle();
+  assert.equal(off.el("message-cache-enabled").checked, false, "a refused on left the box saying on");
+  assert.match(off.el("message-cache-state").textContent, /^The server did not confirm that: only the operator can turn it on Off:/);
+});
+
+test("`#208 persistent-cache`: Erase asks first, then sends DELETE, and the cache stays on", async () => {
+  const page = await messageCachePage();
+  await page.el("message-cache-erase").click();
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, [], "Erase erased without asking");
+  assert.equal(page.el("message-cache-confirm").hidden, false);
+  assert.equal(page.el("message-cache-confirm-text").textContent,
+    "Erase the 1,200 saved messages (3.4 MB) now? Saving carries on in an empty file.");
+  assert.equal(page.el("message-cache-confirm-yes").textContent, "Erase now");
+  assert.equal(page.el("message-cache-confirm-no").textContent, "Keep them");
+  assert.equal(page.el("message-cache-erase").hidden, true, "a third button stands beside the question's two");
+
+  await page.el("message-cache-confirm-no").click();
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, [], "Keep them sent something");
+  assert.equal(page.el("message-cache-erase").hidden, false, "Erase did not come back once the question was answered");
+  assert.equal(focusName(page), "#message-cache-erase", "Keep did not go back to Erase");
+
+  await page.el("message-cache-erase").click();
+  await page.el("message-cache-confirm-yes").click();
+  await page.settle();
+  assert.deepStrictEqual(page.messageCacheCalls, ["DELETE"]);
+  assert.equal(page.el("message-cache-enabled").checked, true, "erasing turned the cache off");
+  assert.equal(page.el("message-cache-state").textContent,
+    "Erased. On, and nothing is saved yet. It keeps at most 14 days and 256 MB.");
+});
+
+test("`#208 persistent-cache`: the ? opens the help entry about saved messages, and the entry says what M5 really does", async () => {
+  const page = await messageCachePage();
+  await page.el("open-settings").click();
+  await page.el("help-link-message-cache").click();
+  assert.equal(page.screen(), "help");
+  assert.deepStrictEqual(openHelp(page), ["message-cache"], "the ? opened some other entry");
+  assert.equal(page.el("help-message-cache").hidden, false);
+  assert.match(settingsGroup("Saved messages on this server"), /data-help="message-cache"/);
+  const entry = helpEntry("message-cache").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  assert.match(entry, /kept unencrypted in a file only this account can read/);
+  assert.match(entry, /Slack included, the next time the server reads that part of the channel/);
+  assert.match(entry, /re-checked for a week is erased anyway/);
+  assert.match(entry, /nothing it shows you is read from it yet/);
+  // No refresher re-reads Slack yet (#208's M7), so the help must not promise one.
+  assert.doesNotMatch(entry, /next refresh|two hours at most/, "the help promises a refresher this server does not run");
+});
+
+test("`#208 persistent-cache`: every id the group uses is declared in the markup, in the Storage section, served hidden", () => {
+  for (const id of ["message-cache-group", ...MESSAGE_CACHE_IDS, "help-message-cache", "message-cache-help-days",
+    "message-cache-help-megabytes"]) {
+    assert.ok(PAGE_IDS.has(id), `web/voice.html does not declare #${id}`);
+  }
+  for (const id of MESSAGE_CACHE_IDS) assertMarkupContains("message-cache-group", id);
+  for (const id of ["message-cache-help-days", "message-cache-help-megabytes"]) assertMarkupContains("help-message-cache", id);
+  assertMarkupContains("settings-storage", "message-cache-group");
+  assert.deepStrictEqual(groupsIn("Storage and connection").slice(0, 2), ["Stored conversations", "Saved messages on this server"],
+    "the group is not straight after Stored conversations");
+  assert.equal(PAGE_ELEMENTS.get("message-cache-group").hidden, true, "the group is served showing");
+  assert.equal(PAGE_ELEMENTS.get("help-message-cache").hidden, true, "the help entry is served showing");
+  assert.equal(PAGE_ELEMENTS.get("message-cache-confirm").hidden, true, "the question is served asked");
+  assert.equal(PAGE_ELEMENTS.get("message-cache-enabled").type, "checkbox");
+  for (const id of ["message-cache-erase", "message-cache-confirm-yes", "message-cache-confirm-no"]) {
+    assert.equal(PAGE_ELEMENTS.get(id).tag, "button", `#${id} is not a button`);
+  }
+  assert.match(HTML, /<p id="message-cache-state" class="hint" aria-live="polite"><\/p>/, "the line is not announced");
+});
+
+test("`#208 persistent-cache`: a help entry hidden with its feature never holds the top button at Expand all", async () => {
+  // A server with no message cache hides that entry. The reader opens every entry they can see,
+  // one by one: the button must offer to fold them, and folding must fold them, not open the
+  // hidden one.
+  const page = await messageCachePage(null);
+  await page.el("open-settings").click();
+  await page.el("open-help").click();
+  const shown = HELP_SLUGS.filter((slug) => !page.el(`help-${slug}`).hidden);
+  assert.ok(!shown.includes("message-cache"));
+  for (const slug of shown) {
+    page.el(`help-${slug}`).open = true;
+    await page.el(`help-${slug}`).dispatch("toggle");
+  }
+  assert.equal(page.el("fold-help").textContent, "Fold all", "a hidden entry kept the button at Expand all");
+  await page.el("fold-help").click();
+  assert.deepStrictEqual(openHelp(page), [], "Fold all opened the hidden entry instead of folding the rest");
+  assert.equal(page.el("fold-help").textContent, "Expand all");
+
+  // With a message cache the entry is on the screen, and Expand all opens it with the rest.
+  const cached = await messageCachePage();
+  await cached.el("open-settings").click();
+  await cached.el("open-help").click();
+  await cached.el("fold-help").click();
+  assert.deepStrictEqual(openHelp(cached), HELP_SLUGS);
+});

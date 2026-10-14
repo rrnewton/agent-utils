@@ -1659,6 +1659,43 @@
                 </button>
               </section>
 
+              <!--
+                `#208 persistent-cache`. The server's own copy of the channel messages it reads,
+                kept in a file of its own beside its store. The SERVER's, like the voice switch:
+                drawn from client-config's `message_cache` and redrawn from what each PUT or DELETE
+                answers, never from the click, so the box never says the file is kept or gone
+                when the server says otherwise.
+
+                HIDDEN as served, and it stays hidden unless client-config carries the status. A
+                server whose configuration has no [message_cache] table sends none, and no server
+                sends it to a read token, which cannot switch it. Its help entry is hidden with it,
+                so Help on such a server describes nothing it lacks.
+
+                Unticking turns saving off AND erases the file, and Erase empties it and carries
+                on, so both ask first, in `#message-cache-confirm`, and only its own button sends.
+                Turning it on sends at once: it erases nothing. Written by `renderServerCache` in
+                web/voice.js; a failed request is said in `#message-cache-state`.
+              -->
+              <section class="settings-group" id="message-cache-group" hidden>
+                <div class="group-head">
+                  <h3>Saved messages on this server</h3>
+                  <button class="help-link" id="help-link-message-cache" type="button" data-help="message-cache" aria-label="About saved messages on this server" title="What is kept, where, and for how long">?</button>
+                </div>
+                <label class="toggle">
+                  <input id="message-cache-enabled" type="checkbox" />
+                  Save the messages this server reads
+                </label>
+                <p id="message-cache-state" class="hint" aria-live="polite"></p>
+                <div id="message-cache-confirm" role="group" aria-labelledby="message-cache-confirm-text" hidden>
+                  <p id="message-cache-confirm-text"></p>
+                  <div class="channel-actions">
+                    <button id="message-cache-confirm-yes" class="secondary" type="button">Erase</button>
+                    <button id="message-cache-confirm-no" class="secondary" type="button">Keep them</button>
+                  </div>
+                </div>
+                <button id="message-cache-erase" class="secondary" type="button">Erase saved messages</button>
+              </section>
+
               <section class="settings-group">
                 <div class="group-head">
                   <h3>Token</h3>
@@ -2389,6 +2426,36 @@
                 with access to that machine's filesystem can read it, and it holds both your own
                 speech and any channel text the assistant read out to you. Older conversations are
                 dropped automatically once the server's retention limit is reached.
+              </p>
+            </details>
+
+            <!--
+              `#208 persistent-cache`. Hidden with its group, by `renderServerCache`, on a server
+              that has no message cache. The limits are the server's, filled from the status it
+              reports; the figures in the markup are only what a fresh deployment is turned on with.
+              Deletions: a message deleted in Slack leaves the file when the server next reads that
+              part of the channel, because nothing re-reads Slack on a timer yet.
+            -->
+            <details id="help-message-cache" class="help-entry" hidden>
+              <summary><h2>Saved messages on this server</h2></summary>
+              <p class="hint">
+                Saved messages are kept unencrypted in a file only this account can read, on the
+                machine this server runs on. They hold text from the channels on your list, for up
+                to <span id="message-cache-help-days">14 days</span> (the server's setting) or
+                <span id="message-cache-help-megabytes">256 MB</span> including its working files.
+                Taking a channel off your list erases its saved messages and their summaries,
+                whether you remove it here or from the server's configuration. A message deleted
+                upstream stops being shown as soon as the server learns of it, and is erased from
+                the file within a minute for Google Chat while its live feed runs, and otherwise,
+                Slack included, the next time the server reads that part of the channel; anything
+                the server has not re-checked for a week is erased anyway. Turning this off deletes
+                the file; the disk may keep fragments for a while, and copies a backup already took
+                are not reached. Summaries are kept separately and are not erased by turning this
+                off; while this is on, a summary is deleted when the server notices its message was
+                edited or deleted.
+              </p>
+              <p class="hint">
+                For now the server only fills this file: nothing it shows you is read from it yet.
               </p>
             </details>
 

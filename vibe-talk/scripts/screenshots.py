@@ -3411,6 +3411,12 @@ SCENES: tuple[Scene, ...] = (
                 "and the explanation itself is not what is being photographed here",
                 "!window.__visible('screen-help')",
             ),
+            (
+                # The throwaway server has no [message_cache] table, so client-config carries no
+                # status and the group stays as it is served: hidden. `#208 persistent-cache`.
+                "no saved-messages switch on a server with no message cache",
+                "!window.__visible('message-cache-group')",
+            ),
         ),
     ),
     Scene(
@@ -5136,10 +5142,12 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 # THE layout claim: a folded entry is its heading alone, a full-size target, with the
-                # browser's triangle in front of it.
+                # browser's triangle in front of it. An entry hidden with the feature it explains is
+                # not on the screen at all, so it is no heading to measure: `#208 persistent-cache`
+                # hides the one about saved messages on a server without a message cache, as here.
                 "every folded entry is one heading at least 44px tall, with its disclosure triangle",
                 "(() => { const folded = [...document.querySelectorAll('#screen-help details.help-entry')]"
-                ".filter((d) => !d.open); "
+                ".filter((d) => !d.open && !d.hidden); "
                 "return folded.length >= 14 && folded.every((d) => { const s = d.querySelector(':scope > summary'); "
                 "const sb = s.getBoundingClientRect(), db = d.getBoundingClientRect(); "
                 "return sb.height >= 43.5 && db.height <= sb.height + 2 "
@@ -5148,6 +5156,12 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the button at the top offers to open them all",
                 "document.getElementById('fold-help').textContent.trim() === 'Expand all'",
+            ),
+            (
+                # This throwaway server has no [message_cache] table, so Help has no entry about
+                # one: the page describes nothing the server lacks. `#208 persistent-cache`.
+                "no entry about saved messages on a server with no message cache",
+                "!window.__visible('help-message-cache')",
             ),
         ),
     ),

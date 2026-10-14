@@ -120,6 +120,7 @@ let sideActive = false;
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
  *   | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
+ *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
  *   | "reply-branch" | "resume-toggle" | "rich-headers" | "search-field" | "single-keys"
@@ -156,9 +157,10 @@ let sideActive = false;
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
  *   | "help-link-speech-prep"
- *   | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
+ *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
+ *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
@@ -1167,6 +1169,7 @@ const HELP_TOPICS = [
   "live-messages",
   "speech-prep",
   "storage",
+  "message-cache",
   "voice-send",
   "voice-instructions",
   "connection",
@@ -1228,14 +1231,21 @@ function helpEntries() {
   );
 }
 
-/** The button at the top: Expand all while any entry is folded, Fold all once none is. */
+/**
+ * The entries on the screen. One hidden with the feature it explains is not, and must not hold the
+ * button at Expand all while every entry the reader can see is open: `#208 persistent-cache` hides
+ * the one about saved messages on a server that has no message cache.
+ */
+const shownHelpEntries = () => helpEntries().filter((entry) => !entry.hidden);
+
+/** The button at the top: Expand all while any entry on the screen is folded, Fold all once none is. */
 function renderHelpFolds() {
-  const entries = helpEntries();
+  const entries = shownHelpEntries();
   el("fold-help").textContent = entries.some((entry) => !entry.open) ? "Expand all" : "Fold all";
 }
 
 el("fold-help").addEventListener("click", () => {
-  const entries = helpEntries();
+  const entries = shownHelpEntries();
   const open = entries.some((entry) => !entry.open);
   for (const entry of entries) entry.open = open;
   renderHelpFolds();
@@ -30555,6 +30565,232 @@ function renderAfterHandOver() {
   }
 }
 
+// --- saved messages on this server -----------------------------------------------------------------
+//
+// `#208 persistent-cache`. The server can keep its own copy of the channel messages it reads, in a
+// file of its own beside its store. That is NOT this browser's saved rows (`readMessageCache`, the
+// reader's offline copy): it is the SERVER's file, switched by the owner and measured by the server.
+// So, like the voice switch, it is drawn from client-config and redrawn from what each PUT or DELETE
+// answered, never from the click.
+//
+//   * SHOWN ONLY WHERE THE SERVER REPORTS IT. A server whose configuration has no [message_cache]
+//     table sends no status, and no server sends one to a read token, which cannot switch it. The
+//     page hides it from anything but a write token as well, so a status that reached one anyway
+//     shows nothing. The help entry is hidden with the group.
+//   * BOTH ERASING ACTS ASK FIRST. Unticking turns saving off and erases the file; Erase empties it
+//     and carries on. Each puts its question in `#message-cache-confirm`, the box goes on showing
+//     what the server holds until the answer, and only the question's own button sends. Keep sends
+//     nothing at all.
+//   * TURNING IT ON SENDS AT ONCE: it erases nothing. The server refuses it where its own
+//     configuration turns the cache off — the operator's word wins — and the line says why.
+
+/**
+ * The status as the server last reported it, or null when it reports none.
+ *
+ * @type {VibeTalk.MessageCacheStatus | null}
+ */
+let serverCache = null;
+
+/** What is on its way to the server — "on", "off" or "erase" — or null, so a second press cannot race it. */
+let serverCacheSending = null;
+
+/** The erasing act the owner is being asked about — "off" or "erase" — or null. */
+let serverCacheAsking = null;
+
+/** The server's codes for a cache that should be open and is not, in the reader's words. */
+const SERVER_CACHE_TROUBLE = {
+  switch_unreadable: "the switch it keeps beside its store could not be read",
+  switch_unwritable: "the switch it keeps beside its store could not be written",
+  sqlite_unsupported: "its SQLite lacks something the file needs",
+  foreign_file: "a file it did not make is where the file should be",
+  locked: "another process holds the file",
+  filesystem: "the file or its directory could not be made, or is not private",
+  sqlite: "SQLite could not open the file",
+};
+
+/** What the line says while a request is out. */
+const SERVER_CACHE_SENDING = {
+  on: "Turning it on…",
+  off: "Turning it off and erasing its file…",
+  erase: "Erasing its file…",
+};
+
+/** The question before each erasing act, and its two buttons. */
+const SERVER_CACHE_ASK = {
+  off: {
+    ask: (what) => `Turn saving off and erase ${what} now?`,
+    yes: "Turn off and erase",
+    no: "Keep saving",
+  },
+  erase: {
+    ask: (what) => `Erase ${what} now? Saving carries on in an empty file.`,
+    yes: "Erase now",
+    no: "Keep them",
+  },
+};
+
+/** The server's megabyte, as its limit counts one. */
+const MEBIBYTE = 1024 * 1024;
+
+/** A count with its thousands marked, in the page's fixed English: 1,200. */
+const groupedCount = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+/** `n` and its noun, singular for exactly one. */
+const nounCount = (n, noun) => `${groupedCount(n)} ${noun}${n === 1 ? "" : "s"}`;
+
+/**
+ * Bytes in the unit the limit beside them uses: megabytes, or kilobytes below one.
+ *
+ * @param {number} bytes
+ */
+function cacheSize(bytes) {
+  if (bytes >= MEBIBYTE) return `${(bytes / MEBIBYTE).toFixed(1)} MB`;
+  return `${bytes === 0 ? 0 : Math.max(1, Math.ceil(bytes / 1024))} KB`;
+}
+
+/**
+ * The one line under the switch: what the server holds, or why it holds nothing.
+ *
+ * @param {VibeTalk.MessageCacheStatus} status
+ */
+function serverCacheLine(status) {
+  if (status.reason === "config_disabled") {
+    return "Off in this server's configuration; only its operator can turn it on.";
+  }
+  if (!status.enabled) {
+    return status.reason === "switched_off"
+      ? "Off: you turned it off, and its file was erased. Turn it on to start again with an empty file."
+      : "Off.";
+  }
+  if (!status.available) {
+    const why = SERVER_CACHE_TROUBLE[status.reason];
+    return `On, but no file is open, so nothing is being saved${why ? `: ${why}` : ""}.`;
+  }
+  const limits = `It keeps at most ${nounCount(status.max_days, "day")} and ${status.max_megabytes} MB.`;
+  if (status.messages === 0) return `On, and nothing is saved yet. ${limits}`;
+  const held =
+    `On: ${nounCount(status.messages, "message")} from ${nounCount(status.channels, "channel")}, ` +
+    `${cacheSize(status.bytes)}.`;
+  // Proven whole from there in at least one channel: not a claim that everything since is held.
+  const since = status.oldest_covered ? new Date(status.oldest_covered) : null;
+  const whole =
+    since && !Number.isNaN(since.getTime()) ? ` Complete in places back to ${dayLabel(since)}.` : "";
+  return `${held}${whole} ${limits}`;
+}
+
+/**
+ * What an erasing act would erase, as its question names it.
+ *
+ * @param {VibeTalk.MessageCacheStatus} status
+ */
+function serverCacheErases(status) {
+  if (!status.available) return "any file it left";
+  if (status.messages === 0) return "its file";
+  return `the ${nounCount(status.messages, "saved message")} (${cacheSize(status.bytes)})`;
+}
+
+/**
+ * Take down what client-config said: the status, or null when it carries none.
+ *
+ * @param {VibeTalk.MessageCacheStatus | null | undefined} status
+ */
+function applyServerCache(status) {
+  serverCache = status && typeof status.enabled === "boolean" ? status : null;
+  serverCacheAsking = null;
+  renderServerCache();
+}
+
+/**
+ * Draw the group, the limits in its help entry, and any question, from `serverCache`. `note` leads
+ * the line: what a request just did, or why it did not.
+ */
+function renderServerCache(note = "") {
+  const shown = serverCache !== null && tokenScope === "write";
+  el("message-cache-group").hidden = !shown;
+  el("help-message-cache").hidden = !shown;
+  if (!shown) {
+    serverCacheAsking = null;
+    el("message-cache-confirm").hidden = true;
+    return;
+  }
+  const status = serverCache;
+  el("message-cache-help-days").textContent = nounCount(status.max_days, "day");
+  el("message-cache-help-megabytes").textContent = `${status.max_megabytes} MB`;
+  const busy = serverCacheSending !== null;
+  const box = el("message-cache-enabled");
+  // Ticked while the server says it is on, the question about turning it off included: nothing has
+  // changed until the owner answers.
+  box.checked = status.enabled;
+  box.disabled = busy || status.reason === "config_disabled";
+  el("message-cache-erase").disabled = busy || !status.available;
+  const line = busy ? SERVER_CACHE_SENDING[serverCacheSending] : serverCacheLine(status);
+  el("message-cache-state").textContent = note ? `${note} ${line}` : line;
+  const asking = busy ? null : serverCacheAsking;
+  el("message-cache-confirm").hidden = asking === null;
+  // While a question is up its own two buttons are the way on; a third that erases would blur it.
+  el("message-cache-erase").hidden = asking !== null;
+  if (asking !== null) {
+    const words = SERVER_CACHE_ASK[asking];
+    el("message-cache-confirm-text").textContent = words.ask(serverCacheErases(status));
+    el("message-cache-confirm-yes").textContent = words.yes;
+    el("message-cache-confirm-no").textContent = words.no;
+  }
+}
+
+/** Ask before an act that erases the file, and wait for the answer at the safe button. */
+function askServerCache(act) {
+  if (serverCache === null || serverCacheSending !== null) return;
+  if (act === "erase" && !serverCache.available) return;
+  serverCacheAsking = act;
+  renderServerCache();
+  el("message-cache-confirm-no").focus();
+}
+
+/** The switch, as the owner's finger left it: on sends at once, off asks first. */
+async function serverCacheSwitched() {
+  if (serverCache === null) return;
+  if (el("message-cache-enabled").checked) {
+    serverCacheAsking = null;
+    await sendServerCache("on");
+    return;
+  }
+  askServerCache("off");
+}
+
+/** The answer to the question: its own button sends; Keep sends nothing and goes back where it asked. */
+async function answerServerCache(yes) {
+  const act = serverCacheAsking;
+  serverCacheAsking = null;
+  if (!yes || act === null) {
+    renderServerCache();
+    el(act === "erase" ? "message-cache-erase" : "message-cache-enabled").focus();
+    return;
+  }
+  await sendServerCache(act);
+}
+
+/** Send one switch, then draw what the server says it LEFT; on failure, what it last said, and why. */
+async function sendServerCache(act) {
+  if (serverCacheSending !== null) return;
+  serverCacheSending = act;
+  renderServerCache();
+  let status = null;
+  try {
+    status = await apiDecoded(
+      "MessageCacheStatus",
+      "/api/v1/message-cache",
+      act === "erase" ? { method: "DELETE" } : { method: "PUT", body: { enabled: act === "on" } }
+    );
+  } catch (error) {
+    serverCacheSending = null;
+    renderServerCache(`The server did not confirm that: ${error.detail || error.message}`);
+    return;
+  }
+  serverCacheSending = null;
+  serverCache = status;
+  renderServerCache(act === "erase" ? "Erased." : "");
+}
+
 // --- replying to a channel message -------------------------------------------------------------
 //
 // Drafts are per target message. Once Send is pressed the captured reply target, destination and
@@ -37977,6 +38213,8 @@ function applyClientConfig(config) {
   applyVoicePrompt(config.voice_prompt);
   // `#303 voice-post-prefix`. After `tokenScope` too, for the same reason.
   applyVoicePostPrefix(config.voice_post_prefix);
+  // `#208 persistent-cache`. After `tokenScope` as well: only a write token is shown the group.
+  applyServerCache(config.message_cache);
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
@@ -38777,6 +39015,11 @@ el("restore-voice-system-prompt").addEventListener("click", guardQuietly(restore
 el("voice-post-prefix").addEventListener("input", renderVoicePostPrefix);
 el("save-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(false)));
 el("reset-voice-post-prefix").addEventListener("click", guardQuietly(() => saveVoicePostPrefix(true)));
+// `#208 persistent-cache`. Off and Erase only ask; the question's own button is what sends.
+el("message-cache-enabled").addEventListener("change", guardQuietly(serverCacheSwitched));
+el("message-cache-erase").addEventListener("click", () => askServerCache("erase"));
+el("message-cache-confirm-yes").addEventListener("click", guardQuietly(() => answerServerCache(true)));
+el("message-cache-confirm-no").addEventListener("click", guardQuietly(() => answerServerCache(false)));
 el("noise-rule-new").addEventListener("keydown", (event) => {
   if (event.key === "Enter") guardQuietly(addNoiseRule)();
 });

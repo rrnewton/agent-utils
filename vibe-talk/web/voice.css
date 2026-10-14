@@ -727,6 +727,25 @@ a.search-hit-link {
   color: var(--warn);
 }
 
+/* `#208 persistent-cache`. The question asked before the server's saved messages are erased: ruled
+   down its edge in the warning colour, as the warning beside the clear-unread choice is, so it reads
+   as a caution rather than as one more hint. The button that erases wears the colour an armed
+   Restore wears; the one that keeps them stays as every other button. */
+#message-cache-confirm {
+  margin: 0.4rem 0 0.6rem;
+  padding-left: 0.5rem;
+  border-left: 3px solid var(--warn);
+}
+
+#message-cache-confirm > p {
+  margin: 0;
+}
+
+#message-cache-confirm-yes {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
 /* The heading and its `?` on one line, the `?` hard right. */
 .group-head {
   display: flex;

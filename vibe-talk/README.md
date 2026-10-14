@@ -6242,7 +6242,7 @@ the groups sit as rows inside a handful of sections, and each section is the car
 | **Messages** | Your own messages, Read automatically, Combining messages, Rich headers, Recently dismissed, How messages are said, Message audio |
 | **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream, who is who |
 | **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
-| **Storage and connection** | Stored conversations, Token, Connection status |
+| **Storage and connection** | Stored conversations, Saved messages on this server (the message cache's switch, its Erase and what it holds; shown only to the write token, and only when client-config carries `message_cache` — `#208 persistent-cache`), Token, Connection status |
 
 A section's title is an `h2` a size up; a group inside it keeps its own small `h3` heading and its
 `?`, with a rule above it. No control, `?` or id changed; only where each one sits. The page suite
