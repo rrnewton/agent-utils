@@ -11101,8 +11101,11 @@ function placeSentCard(turn, conversationId) {
 /**
  * Put a row the page drew — a frozen card, a draft's "Not sent" line — at the end of the transcript
  * for the conversation on screen, or, for one that has ended, in it: just above the boundary that
- * ended it, where a reload draws it too. `turns` is 1 for a message and 0 for a line about one.
- * `#270 voice-transcript-markers`.
+ * ended it, where a reload draws it too. A reload can, because the server stamps a record filed in a
+ * conversation another has been written to since with that conversation's last time, not the time
+ * it arrived (`store::filed_at`): the walk reads it back at the end of its own conversation, and the
+ * listing — whose head the next call resumes from — keeps its order. `turns` is 1 for a message and
+ * 0 for a line about one. `#270 voice-transcript-markers`.
  *
  * @param {HTMLElement} li
  * @param {string | null} conversationId
