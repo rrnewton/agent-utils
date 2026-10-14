@@ -552,7 +552,10 @@ In order, it:
    (`--force` runs it again);
 3. runs `wrkslots image status` once, before any agent starts, because every
    wrkslots command remounts image-backed slots; a mount failure is only a
-   warning with exit status 0, so the report records the warning lines;
+   warning with exit status 0, so the report records the warning lines. After a
+   detected restart it also runs `wrkslots hold SLOT --reason "reboot: agent NAME
+   waits for agentctl restore"` for the slot of every running agent, so no
+   cleanup can retire it while the agent is down;
 4. waits for the Herdr server (`herdr_wait_seconds`, default 300);
 5. revives the coordinator from its launch spec, then makes every registry in
    `also_registered` name its new pane: the same pane has its anchors replaced,
@@ -561,7 +564,11 @@ In order, it:
 6. revives every other dead agent one at a time, waiting
    `startup_delay_seconds` (default 20) after each launch, promotes each live
    `launch_failed` record, and records every refusal with its reason; a live
-   harness is left alone, which is what makes reruns safe;
+   harness is left alone, which is what makes reruns safe. For each revived or
+   promoted agent boxed to a slot it runs `wrkslots transfer-owner` with the new
+   harness's process ID (accepted because that harness runs inside the slot's
+   box) and then releases its own reboot hold; a slot whose agent stays down
+   keeps the hold;
 7. runs `systemctl --user reset-failed` and `start` for each of `units`;
 8. queues one recovery notice for the coordinator (message ID
    `restore-` and the first 8 characters of the boot ID, so it is sent once per

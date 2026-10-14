@@ -627,6 +627,157 @@ fn register_elsewhere<A: ManagedApi + ?Sized>(
     row
 }
 
+/// A running agent boxed to a wrkslots slot: `(agent, slot, project)`.
+#[derive(Clone, Debug)]
+struct SlotAgent {
+    name: String,
+    slot: String,
+    project: PathBuf,
+    /// A running record whose harness may have died; a failed launch is not held.
+    running: bool,
+}
+
+/// The hold restore places on a dead agent's slot until the agent is back and owns it again.
+fn reboot_hold_reason(name: &str) -> String {
+    format!("reboot: agent {name} waits for agentctl restore")
+}
+
+fn slot_agents(registry: &Path, names: &[String], config: &RestoreConfig) -> Vec<SlotAgent> {
+    names
+        .iter()
+        .filter(|name| !config.exclude.contains(name))
+        .filter_map(|name| {
+            let bytes = fs::read(registry.join(name).join("agent.json")).ok()?;
+            let record: Value = serde_json::from_slice(&bytes).ok()?;
+            let lifecycle = record["lifecycle"].as_str()?;
+            matches!(lifecycle, "running" | "launch_failed").then_some(())?;
+            Some(SlotAgent {
+                name: name.clone(),
+                slot: record["slot"].as_str()?.to_owned(),
+                project: PathBuf::from(record["slot_project"].as_str()?),
+                running: lifecycle == "running",
+            })
+        })
+        .collect()
+}
+
+fn wrkslots_argv(wrkslots: &Path, project: &Path, arguments: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        wrkslots.display().to_string(),
+        "--project-root".to_owned(),
+        project.display().to_string(),
+    ];
+    argv.extend(arguments.iter().map(|argument| (*argument).to_owned()));
+    argv
+}
+
+/// The slot's status row, read with `wrkslots status --slot SLOT --format json`.
+fn slot_status(host: &dyn Host, wrkslots: &Path, agent: &SlotAgent) -> Result<Value> {
+    let outcome = host.run(
+        &wrkslots_argv(
+            wrkslots,
+            &agent.project,
+            &["status", "--slot", &agent.slot, "--format", "json"],
+        ),
+        Some(&agent.project),
+        Duration::from_secs(120),
+    );
+    if outcome.status != Some(0) {
+        return Err(fail(format!(
+            "wrkslots status failed: {}",
+            outcome.stderr.trim()
+        )));
+    }
+    let document: Value = serde_json::from_str(&outcome.stdout)
+        .map_err(|error| fail(format!("wrkslots status printed no JSON: {error}")))?;
+    document["active"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["slot"] == agent.slot.as_str()))
+        .cloned()
+        .ok_or_else(|| fail(format!("slot {} is not active", agent.slot)))
+}
+
+/// Hold a dead agent's slot so that no cleanup can retire it before the agent is back.
+fn hold_slot(host: &dyn Host, wrkslots: &Path, agent: &SlotAgent) -> Value {
+    let reason = reboot_hold_reason(&agent.name);
+    let outcome = host.run(
+        &wrkslots_argv(
+            wrkslots,
+            &agent.project,
+            &["hold", &agent.slot, "--reason", &reason],
+        ),
+        Some(&agent.project),
+        Duration::from_secs(120),
+    );
+    json!({
+        "slot": agent.slot,
+        "agent": agent.name,
+        "action": if outcome.status == Some(0) { "held" } else { "failed" },
+        "detail": if outcome.status == Some(0) { json!(outcome.stdout.trim()) } else { json!(outcome.stderr.trim()) },
+    })
+}
+
+/// Make the revived harness the slot's owner, then drop restore's own reboot hold.
+fn transfer_slot<A: ManagedApi + ?Sized>(
+    manager: &ManagedAgents<'_, A>,
+    host: &dyn Host,
+    wrkslots: &Path,
+    agent: &SlotAgent,
+) -> Value {
+    let result = (|| -> Result<Value> {
+        let status = manager.status(&agent.name)?;
+        let pid = ["harness_identity", "custom_process_identity"]
+            .iter()
+            .find_map(|key| status[*key]["pid"].as_u64())
+            .ok_or_else(|| fail("the revived harness has no pinned process"))?;
+        let row = slot_status(host, wrkslots, agent)?;
+        let generation = row["generation"]
+            .as_u64()
+            .ok_or_else(|| fail("wrkslots status gave no generation"))?
+            .to_string();
+        let slot_agent = row["agent"].as_str().unwrap_or(&agent.name).to_owned();
+        let pid_text = pid.to_string();
+        let moved = host.run(
+            &wrkslots_argv(
+                wrkslots,
+                &agent.project,
+                &[
+                    "transfer-owner",
+                    &agent.slot,
+                    "--agent",
+                    &slot_agent,
+                    "--owner-pid",
+                    &pid_text,
+                    "--expected-generation",
+                    &generation,
+                ],
+            ),
+            Some(&agent.project),
+            Duration::from_secs(120),
+        );
+        if moved.status != Some(0) {
+            return Err(fail(format!(
+                "transfer-owner refused: {}",
+                moved.stderr.trim()
+            )));
+        }
+        let mut unheld = false;
+        if row["hold_reason"] == reboot_hold_reason(&agent.name).as_str() {
+            let released = host.run(
+                &wrkslots_argv(wrkslots, &agent.project, &["unhold", &agent.slot]),
+                Some(&agent.project),
+                Duration::from_secs(120),
+            );
+            unheld = released.status == Some(0);
+        }
+        Ok(json!({"action": "transferred", "owner_pid": pid, "unheld": unheld}))
+    })();
+    match result {
+        Ok(value) => value,
+        Err(error) => json!({"action": "refused", "reason": error.to_string()}),
+    }
+}
+
 fn systemctl(host: &dyn Host, verb: &str, unit: &str) -> CommandOutcome {
     host.run(
         &strings(&["systemctl", "--user", verb, unit]),
@@ -846,6 +997,17 @@ pub fn restore<A: ManagedApi + ?Sized>(
     } else {
         remount_slot_images(host, options.wrkslots.as_deref(), project)
     };
+    // After a restart, every running agent boxed to a slot is dead: hold its slot so no
+    // cleanup can retire it before the agent is revived and owns it again.
+    let boxed = slot_agents(registry, &names, config);
+    report["slot_holds"] = match options.wrkslots.as_deref() {
+        Some(wrkslots) if report["restart_detected"] == true && !options.dry_run => json!(boxed
+            .iter()
+            .filter(|agent| agent.running)
+            .map(|agent| hold_slot(host, wrkslots, agent))
+            .collect::<Vec<_>>()),
+        _ => json!([]),
+    };
     report["herdr"] = wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
     let herdr_ready = report["herdr"]["ready"] == true;
     let manager = ManagedAgents::new(client, registry)?;
@@ -880,8 +1042,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 agents.push(json!({"name": name, "action": "excluded", "reason": "listed in restore.json exclude"}));
                 continue;
             }
-            let row = recover_agent(&manager, name, options);
+            let mut row = recover_agent(&manager, name, options);
             let launched = matches!(row["action"].as_str(), Some("revived"));
+            if let (Some(wrkslots), Some(agent), true) = (
+                options.wrkslots.as_deref(),
+                boxed.iter().find(|agent| agent.name == *name),
+                matches!(row["action"].as_str(), Some("revived" | "promoted")),
+            ) {
+                row["slot_owner"] = transfer_slot(&manager, host, wrkslots, agent);
+            }
             agents.push(row);
             if launched && config.startup_delay_seconds > 0 {
                 host.sleep(Duration::from_secs(config.startup_delay_seconds));

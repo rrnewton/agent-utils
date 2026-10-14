@@ -671,3 +671,110 @@ fn a_restore_on_the_boot_its_agents_were_pinned_on_says_no_restart_and_keeps_cro
     assert!(!text.contains("did not survive"), "{text}");
     assert!(!text.contains("The host restarted"), "{text}");
 }
+
+#[test]
+fn after_a_restart_restore_holds_boxed_slots_then_hands_each_to_its_back_agent() {
+    let fixture = Fixture::new();
+    // A dead lane without a slot makes the anchors show an earlier boot.
+    dead_agent(&fixture);
+    // A boxed lane whose launch timed out while its harness came up, at pane "owned-2".
+    fixture
+        .manager()
+        .start(
+            "boxed",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                resume: Some("goal-conversation".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut boxed = fixture.manager().load("boxed").unwrap();
+    boxed.lifecycle = "launch_failed".to_owned();
+    boxed.harness_identity = None;
+    boxed.anchor_rule = None;
+    boxed.terminal_id = None;
+    boxed.session_agent = None;
+    boxed.session_value = None;
+    boxed.slot = Some("boxed-slot".to_owned());
+    boxed.slot_project = Some(fixture.root.display().to_string());
+    boxed.slot_isolation = Some("userns".to_owned());
+    boxed.launch_spec = None;
+    fixture.manager().save(&boxed).unwrap();
+    let host = ScriptedHost::new();
+    let status = json!({"active": [{
+        "slot": "boxed-slot", "agent": "boxed", "generation": 3,
+        "hold_reason": "reboot: agent boxed waits for agentctl restore",
+    }]})
+    .to_string();
+    host.answer("status --slot boxed-slot --format json", 0, &status, "");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(report["restart_detected"], true);
+    // A launch_failed record is not running, so only running boxed agents are held.
+    assert_eq!(report["slot_holds"], json!([]), "{report}");
+    let boxed_row = report["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "boxed")
+        .unwrap()
+        .clone();
+    assert_eq!(boxed_row["action"], "promoted", "{report}");
+    assert_eq!(boxed_row["slot_owner"]["action"], "transferred", "{report}");
+    assert_eq!(boxed_row["slot_owner"]["unheld"], true);
+    let root = fixture.root.display().to_string();
+    let pid = boxed_row["slot_owner"]["owner_pid"].as_u64().unwrap();
+    let commands = host.commands();
+    assert!(commands.contains(&format!(
+        "/opt/wrkslots --project-root {root} transfer-owner boxed-slot --agent boxed --owner-pid {pid} --expected-generation 3"
+    )), "{commands:?}");
+    assert!(commands.contains(&format!(
+        "/opt/wrkslots --project-root {root} unhold boxed-slot"
+    )));
+}
+
+#[test]
+fn after_a_restart_restore_holds_the_slot_of_each_running_boxed_agent() {
+    let fixture = Fixture::new();
+    let mut lane = dead_agent(&fixture);
+    lane.slot = Some("lane-slot".to_owned());
+    lane.slot_project = Some(fixture.root.display().to_string());
+    lane.slot_isolation = Some("userns".to_owned());
+    lane.launch_spec = None;
+    fixture.manager().save(&lane).unwrap();
+    let host = ScriptedHost::new();
+    host.answer(
+        "hold lane-slot",
+        1,
+        "",
+        "slot lane-slot is already held for a different reason: keep",
+    );
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &RestoreOptions {
+            dry_run: false,
+            ..options(Some("/opt/wrkslots"))
+        },
+    )
+    .unwrap();
+    assert_eq!(report["slot_holds"][0]["slot"], "lane-slot", "{report}");
+    assert_eq!(report["slot_holds"][0]["action"], "failed");
+    let root = fixture.root.display().to_string();
+    assert_eq!(
+        host.commands()[1],
+        format!("/opt/wrkslots --project-root {root} hold lane-slot --reason reboot: agent lane waits for agentctl restore")
+    );
+}
