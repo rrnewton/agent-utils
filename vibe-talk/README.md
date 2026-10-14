@@ -3564,7 +3564,8 @@ It is **not encrypted**. Anyone who can read this account's files can read it, a
    `max_days` and `max_megabytes`. A cache that cannot open leaves the server running without one.
    The log says why, and so does the status, as a code (see "Diagnostics and logs" below).
 
-Every key, with its default and range, is in the [Configuration](#configuration) table.
+Every key, with its default and range, is in the "Message cache" row of the table under
+"Configuration" above.
 
 ### Before the first enable: the canary preflight
 
