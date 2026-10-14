@@ -15,15 +15,17 @@
 //! Never on the read path. [`ThreadNames::annotate`] runs on every timeline answer and only READS:
 //! it attaches what is already known and, for a write-scope caller, queues the threads that are
 //! due. The queue is worked in the background one thread at a time — find the thread's messages,
-//! ask the summariser, file the result — so a list of fifty unnamed threads costs fifty model
-//! calls paced by the summariser's rate limit, not fifty calls at once and not a slow page. A name
+//! ask the summariser, file the result — so a list of fifty unnamed threads costs fifty model calls
+//! paced by the summariser's rate limit, not fifty calls at once and not a slow page. A name
 //! produced after a page was read reaches that page on its next refresh, a forward delta included:
 //! a delta of the thread list carries every thread renamed in the last [`RECENT_WINDOW`], as the
-//! newest read of it said (two reads can land out of order, and a page the provider could not bring
-//! up to date never replaces one it could), unless a delta has said the thread left the list and no
-//! current thread list read after that delta has carried it again. That holds for a naming that
-//! was already under way when the delta came, and against a page whose read began before the delta
-//! and lands after it.
+//! newest read of it said, unless a delta has said the thread left the list and no current thread
+//! list read after that delta has carried it again. The newest read is the one whose answer is
+//! complete up to the latest instant: when its read began, for a page the provider had brought up
+//! to date, and no later than its `as_of` for one it had not. Two reads can land out of order, and
+//! a bridge can answer with `as_of` from a rebuild made after another read began. That holds for a
+//! naming that was already under way when the delta came, and against a page whose read began
+//! before the delta and lands after it.
 //!
 //! # What it costs the chat provider
 //!
@@ -39,24 +41,24 @@
 //! * Held rows stand in for a read only when they are what the read would bring, because a name is
 //!   kept for good and a sentence until the next milestone. Nothing about the thread is copied when
 //!   it is queued. When its naming turn comes, its rows are looked up in read-ahead, the root
-//!   included, and checked against the newest summary any page has carried of it since: every
-//!   page refreshes a queued thread's reply count and last activity, whoever reads it, unless that
-//!   page's read began before the one that last did, or the page was not current and that one
-//!   was. The count must be EXACT, at most [`THREAD_FETCH_LIMIT`], read in the last 30 s from a
-//!   page the provider had brought up to date (no `as_of`), and read no earlier than any reply
+//!   included, and checked against the newest summary any page has carried of it since: every page
+//!   refreshes a queued thread's reply count and last activity, whoever reads it, unless that page
+//!   is complete up to an earlier instant than the one that last did. The count must be EXACT, at
+//!   most [`THREAD_FETCH_LIMIT`], read in the last 30 s from a page the provider had brought up to
+//!   date (no `as_of`, however recent its `as_of` would be), and read no earlier than any reply
 //!   held. Nothing the server has been told of since that read may touch the thread
 //!   ([`crate::read_ahead::ThreadChanges`]: a message pushed into it, or pushed into its channel
 //!   with no thread label, or a reply this server posted to it, whether or not the post said it
 //!   arrived). If a delta has said the thread left the list, the count must have been read after
-//!   that delta. Every row, the root included, must come from a page the provider had brought
-//!   up to date: a page with `as_of` can hold a message as it was before an edit pushed earlier,
-//!   which the push's tombstone cannot keep out because the page's read began after it. Exactly
-//!   as many replies as the count must be held, the newest no older than the thread's last
-//!   activity. So an edit or delete pushed while the thread waits (which drops the row from
-//!   read-ahead), a reply pushed or posted here, a reply counted by a page read since, a delta
-//!   saying the thread left the list, or rows that expired while it waited all send the thread to
-//!   the provider. A thread of more than [`THREAD_FETCH_LIMIT`] replies is always read: rows held
-//!   cannot show they are its newest replies rather than an older page of them.
+//!   that delta. Every row, the root included, must come from a page the provider had brought up to
+//!   date: a page with `as_of` can hold a message as it was before an edit pushed earlier, which
+//!   the push's tombstone cannot keep out because the page's read began after it. Exactly as many
+//!   replies as the count must be held, the newest no older than the thread's last activity. So an
+//!   edit or delete pushed while the thread waits (which drops the row from read-ahead), a reply
+//!   pushed or posted here, a reply counted by a page read since, a delta saying the thread left
+//!   the list, or rows that expired while it waited all send the thread to the provider. A thread
+//!   of more than [`THREAD_FETCH_LIMIT`] replies is always read: rows held cannot show they are its
+//!   newest replies rather than an older page of them.
 //! * What that still accepts is a change the server is not told of, inside the 30 s a row is held.
 //!   An edit, to the root or a reply, changes neither the count nor the last activity, so the
 //!   thread is named from the text as the page read it. A delete can go unseen too: a deleted reply
@@ -623,33 +625,64 @@ impl NamesState {
     }
 }
 
-/// When a read of a thread list began, and whether the provider had brought it up to date (it
-/// carried no `as_of`). What two summaries of one thread are ordered by. `#278 naming-throttle`.
+/// When a read of a thread list began, whether the provider had brought it up to date (it carried
+/// no `as_of`), and the instant its answer is complete up to. What two summaries of one thread are
+/// ordered by. `#278 naming-throttle`.
 #[derive(Clone, Copy, Debug)]
 struct Read {
     began: std::time::Instant,
     current: bool,
+    /// The instant the answer is complete up to, on this server's clock: `began` for a current
+    /// page; for one that carried `as_of`, the earlier of `began` and `as_of`. `None` when that
+    /// `as_of` cannot be placed: it does not parse, or it is older than this clock can say.
+    complete: Option<std::time::Instant>,
 }
 
 impl Read {
-    /// When it began, if its counts can be taken as what the thread had then: it was current.
+    /// A read that began at `began` and answered with `as_of`.
+    fn of(began: std::time::Instant, as_of: Option<&str>) -> Self {
+        let complete = match as_of {
+            None => Some(began),
+            Some(as_of) => crate::recent::as_of_age(as_of).and_then(|age| {
+                std::time::Instant::now()
+                    .checked_sub(age)
+                    .map(|at| at.min(began))
+            }),
+        };
+        Self {
+            began,
+            current: as_of.is_none(),
+            complete,
+        }
+    }
+
+    /// When it began, if its counts can be taken as what the thread had then: it was current. A
+    /// page that carried `as_of` never stands in for that, however late it is complete up to: it
+    /// says what the provider had, not that nothing has happened since.
     fn seen(self) -> Option<std::time::Instant> {
         self.current.then_some(self.began)
     }
 
-    /// Whether what this read said of a thread replaces what `held` said: a page that was not
-    /// current never replaces one that was, and otherwise the read that began later says more
-    /// (two reads can land out of order).
+    /// Whether what this read said of a thread replaces what `held` said: the one complete up to
+    /// the later instant says more. Two reads can land out of order, and a bridge can answer one
+    /// with `as_of` from a rebuild made after another read began (a read of another view rebuilt
+    /// the space, and this read's own rebuild failed). At the same instant a current page wins,
+    /// and otherwise the one that landed last. An `as_of` that cannot be placed falls back to the
+    /// rule it would otherwise break: a page that was not current never replaces one that was,
+    /// and otherwise the read that began later wins.
     fn replaces(self, held: Read) -> bool {
-        (self.current, self.began) >= (held.current, held.began)
+        match (self.complete, held.complete) {
+            (Some(mine), Some(theirs)) => (mine, self.current) >= (theirs, held.current),
+            _ => (self.current, self.began) >= (held.current, held.began),
+        }
     }
 }
 
 /// A queued thread, as the newest page that carried it said. `#278 naming-throttle`.
 ///
 /// Refreshed by every page that carries the thread, whoever reads it, until its naming completes,
-/// unless that page's read began before the one that last refreshed it or it was not current and
-/// that one was ([`Read::replaces`]): a thread can wait half an hour for its channel's reads, and
+/// unless that page is complete up to an earlier instant than the one that last refreshed it
+/// ([`Read::replaces`]): a thread can wait half an hour for its channel's reads, and
 /// what it is named from, and what a delta carries once it is named, is decided against the newest
 /// that is known NOW, not what was known when it was queued.
 #[derive(Clone, Debug)]
@@ -775,7 +808,9 @@ impl ThreadNames {
     /// answers with it): what each thread's reply count on the page is compared with, against when
     /// the rows already held of the thread were read ([`held_thread`]), and what orders two pages
     /// that land out of order. A page that carries `as_of` was not current: its counts are never
-    /// taken as what a thread had at `read_began`, and it never replaces what a current page said.
+    /// taken as what a thread had at `read_began`, and it replaces what another page said only when
+    /// it is complete up to a later instant: its `as_of`, placed on this server's clock
+    /// ([`Read::replaces`]).
     /// A forward delta's `removed_threads` are noted as removed as of `read_began`.
     ///
     /// Does nothing at all when the summariser cannot name threads. Queues nothing for a caller
@@ -795,10 +830,7 @@ impl ThreadNames {
         if !deps.summarizer.names_threads() {
             return;
         }
-        let read = Read {
-            began: read_began,
-            current: page.as_of.is_none(),
-        };
+        let read = Read::of(read_began, page.as_of.as_deref());
         let removed: Vec<String> = page
             .delta
             .as_ref()
@@ -915,8 +947,9 @@ impl ThreadNames {
 
     /// Keep what the server holds of a thread as current as the newest read of it: a renamed
     /// thread's record, which rides forward deltas, and a queued thread's summary, which its naming
-    /// is decided against. Two reads can land out of order, and the one that began later says
-    /// more; a page that was not current never replaces one that was ([`Read::replaces`]). A
+    /// is decided against. Two reads can land out of order, and the one complete up to the later
+    /// instant says more: when it began, for a current page, and its `as_of` otherwise
+    /// ([`Read::replaces`]). A
     /// current thread LIST read that began after a delta said the thread left the list
     /// (`in_list`) says it is back. `#278 naming-throttle`.
     fn refresh(&self, channel: &ChannelId, summary: &ThreadSummary, read: Read, in_list: bool) {
@@ -2203,10 +2236,7 @@ mod tests {
         let long_ago = std::time::Instant::now()
             .checked_sub(RECENT_WINDOW + Duration::from_secs(1))
             .expect("the clock has run for more than fifteen minutes");
-        let read = Read {
-            began: long_ago,
-            current: true,
-        };
+        let read = Read::of(long_ago, None);
         let summary = ThreadSummary {
             id: "queued".to_owned(),
             root: None,
@@ -2254,24 +2284,65 @@ mod tests {
     }
 
     #[test]
-    fn a_page_that_was_not_current_never_replaces_one_that_was_and_otherwise_the_later_read_does() {
+    fn reads_are_ordered_by_the_instant_their_answer_is_complete_up_to() {
         let earlier = std::time::Instant::now();
         let later = earlier + Duration::from_secs(1);
-        let read = |began, current| Read { began, current };
-        assert!(read(later, true).replaces(read(earlier, true)));
+        let current = |began| Read::of(began, None);
+        // Began at `began`, answered with an `as_of` complete up to `complete`.
+        let as_of = |began, complete| Read {
+            began,
+            current: false,
+            complete: Some(complete),
+        };
+        assert!(current(later).replaces(current(earlier)));
+        assert!(!current(earlier).replaces(current(later)), "landed late");
         assert!(
-            !read(earlier, true).replaces(read(later, true)),
-            "landed late"
+            current(later).replaces(current(later)),
+            "the same read, or one that landed after it"
         );
-        assert!(!read(later, false).replaces(read(earlier, true)), "stale");
-        assert!(read(earlier, true).replaces(read(later, false)));
-        assert!(read(later, false).replaces(read(earlier, false)));
-        assert!(
-            read(later, true).replaces(read(later, true)),
-            "the same read"
-        );
-        assert_eq!(read(later, false).seen(), None);
-        assert_eq!(read(later, true).seen(), Some(later));
+
+        // A copy older than the current read, whenever its read began: stale.
+        assert!(!as_of(later, earlier).replaces(current(later)));
+        assert!(current(later).replaces(as_of(later, earlier)));
+        // A copy complete up to after the current read began: the bridge rebuilt for another read
+        // after this one, and this read's own rebuild failed. It is the newer.
+        let between = earlier + Duration::from_millis(500);
+        assert!(as_of(later, between).replaces(current(earlier)));
+        assert!(!current(earlier).replaces(as_of(later, between)));
+        // At the same instant a current page says no less, and wins.
+        assert!(current(between).replaces(as_of(later, between)));
+        assert!(!as_of(later, between).replaces(current(between)));
+        // Two copies: by what they are complete up to, not when their reads began.
+        assert!(as_of(earlier, between).replaces(as_of(later, earlier)));
+        assert!(!as_of(later, earlier).replaces(as_of(earlier, between)));
+
+        // An `as_of` that cannot be placed keeps the rule from before as_of was placed.
+        let unplaced = Read::of(later, Some("not an instant"));
+        assert_eq!(unplaced.complete, None);
+        assert!(!unplaced.replaces(current(earlier)), "stale");
+        assert!(current(earlier).replaces(unplaced));
+        assert!(unplaced.replaces(as_of(earlier, earlier)));
+        assert!(!as_of(earlier, between).replaces(unplaced), "began earlier");
+
+        // Placed from the provider's wall clock: an hour ago is an hour before the read began, and
+        // an `as_of` in the future is no later than the read.
+        let hour_ago = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)).to_string();
+        let began = std::time::Instant::now();
+        let placed = Read::of(began, Some(&hour_ago)).complete;
+        if let Some(placed) = placed {
+            let lag = began.duration_since(placed);
+            assert!(
+                lag >= Duration::from_secs(3_599) && lag <= Duration::from_secs(3_601),
+                "{lag:?}"
+            );
+        }
+        let ahead = (jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_string();
+        assert_eq!(Read::of(began, Some(&ahead)).complete, Some(began));
+        assert_eq!(Read::of(began, None).complete, Some(began));
+
+        // Only a current page shows what a thread had when its read began.
+        assert_eq!(as_of(later, later).seen(), None);
+        assert_eq!(current(later).seen(), Some(later));
     }
 
     #[test]

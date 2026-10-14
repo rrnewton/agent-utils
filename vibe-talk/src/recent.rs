@@ -562,16 +562,22 @@ enum Applying {
 /// When a read that began at `started` saw the channel, given the provider's `as_of`: the earlier
 /// of the two. The provider's clock is wall time, so the gap from now to `as_of` is taken off now.
 fn backdated(started: Instant, as_of: Option<&str>) -> Instant {
-    let Some(as_of_ms) = as_of.and_then(crate::clock::instant_ms) else {
-        return started;
-    };
-    let lag_ms = jiff::Timestamp::now().as_millisecond() - as_of_ms;
-    let Ok(lag_ms) = u64::try_from(lag_ms) else {
+    let Some(age) = as_of.and_then(as_of_age) else {
         return started;
     };
     Instant::now()
-        .checked_sub(Duration::from_millis(lag_ms))
+        .checked_sub(age)
         .map_or(started, |at| at.min(started))
+}
+
+/// How long ago the provider's `as_of` was, by the wall clock: what [`backdated`] takes off now,
+/// on whichever monotonic clock the caller keeps its reads by. Zero for an `as_of` in the future,
+/// `None` for one that does not parse. Thread naming orders its reads by it too
+/// (`#278 naming-throttle`).
+pub(crate) fn as_of_age(as_of: &str) -> Option<Duration> {
+    let as_of_ms = crate::clock::instant_ms(as_of)?;
+    let lag_ms = jiff::Timestamp::now().as_millisecond() - as_of_ms;
+    Some(Duration::from_millis(u64::try_from(lag_ms).unwrap_or(0)))
 }
 
 /// Fold one push into a window.

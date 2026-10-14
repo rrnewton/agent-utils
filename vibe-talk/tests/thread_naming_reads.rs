@@ -20,12 +20,12 @@
 //! matched exactly by rows that all came from current pages, the newest reply no older than the
 //! thread's last activity. What changes while a thread waits (an edit or delete pushed, a reply
 //! pushed or posted here, a reply counted by a later page, a delta that removes it) is seen at its
-//! turn; a reply added with nothing pushed is not, unless a page counts it first, and no test here
-//! claims otherwise. Pages that land out of order are ordered by when their reads began, and a page
-//! the provider could not bring up to date never replaces one it could, so a renamed thread rides
-//! a delta as the newest current read showed it, and never once a delta has removed it. Plus two
-//! queue rules: a channel taken off the list is not read or filed for, and one channel's backlog
-//! does not keep another's threads out of the queue.
+//! turn; a reply added with nothing pushed is not, unless a page
+//! counts it first, and no test here claims otherwise. Pages that land out of order are ordered by
+//! the instant their answers are complete up to (when a current read began; no later than an
+//! `as_of`), so a renamed thread rides a delta as the newest read showed it, and never once a delta
+//! has removed it. Plus two queue rules: a channel taken off the list is not read or filed for, and
+//! one channel's backlog does not keep another's threads out of the queue.
 //!
 //! Every test runs on tokio's paused clock, so minutes of budget cost no wall time. Read-ahead
 //! keeps its rows by the wall clock, which these tests barely move, so a row never expires in
@@ -1916,8 +1916,9 @@ async fn an_older_list_landing_late_does_not_undo_what_a_newer_one_said_of_a_wai
 #[tokio::test(start_paused = true)]
 async fn a_list_the_provider_could_not_bring_up_to_date_does_not_replace_a_current_one() {
     // Thread 1 waits; a current list shows its new reply; then the provider falls behind and serves
-    // the list as it was before the reply (`as_of`). Neither while it waits nor once it is named
-    // does that list replace what the current one said: a delta carries the thread with its reply.
+    // the list as it was before the reply, complete only up to an instant before the current
+    // list's read began (`as_of`). Neither while it waits nor once it is named does that list
+    // replace what the current one said: a delta carries the thread with its reply.
     let h = gated_harness(Forum::default().with(WRITE_CHANNEL, 2, 0), 0);
     thread_list(&h, WRITE_CHANNEL).await;
     run_for(1).await;
@@ -1949,6 +1950,38 @@ async fn a_list_the_provider_could_not_bring_up_to_date_does_not_replace_a_curre
         renamed["reply_count"], 1,
         "a stale list replaced a current one on a renamed thread: {renamed}"
     );
+}
+
+// --- third re-review: what a read is complete up to ----------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_list_complete_up_to_after_the_last_current_read_is_what_deltas_carry() {
+    // Thread 0 is named at one reply from a current list. It gains a second, and the next list is
+    // served with `as_of` NOW: the bridge rebuilt the space after the reply (for another read),
+    // and this read's own rebuild failed. That answer is complete up to a later instant than the
+    // current list's, so it is the newer of the two. A later current delta does not send the
+    // thread again (it has not changed since that answer's cursor), so the renamed row is what
+    // the page upserts, and it must not take the thread back to one reply.
+    let h = harness(Forum::default().with(WRITE_CHANNEL, 1, 1));
+    thread_list(&h, WRITE_CHANNEL).await;
+    until_named(&h.names, 1).await;
+    add_reply(&h, 0, "reply 2 in thread 0");
+    // `as_of` is read to the millisecond: keep it clear of the current read's instant.
+    std::thread::sleep(Duration::from_millis(20));
+    *h.forum.list_as_of.lock().unwrap() = Some(jiff::Timestamp::now().to_string());
+    let list = thread_list(&h, WRITE_CHANNEL).await;
+    *h.forum.list_as_of.lock().unwrap() = None;
+    let shown = carried(&list, &write_thread(0)).expect("listed");
+    assert_eq!(shown["reply_count"], 2, "{shown}");
+    let cursor = list["next_after"].as_str().expect("a cursor").to_owned();
+    let delta = thread_delta(&h, &cursor).await;
+    let renamed = carried(&delta, &write_thread(0)).expect("a renamed thread rides the delta");
+    assert_eq!(
+        renamed["reply_count"], 2,
+        "an older current list outranked a newer `as_of` one, and the delta rolled the thread \
+         back: {renamed}"
+    );
+    assert_eq!(renamed["updated_at"], shown["updated_at"], "{renamed}");
 }
 
 fn urlencode(raw: &str) -> String {

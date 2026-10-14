@@ -1510,12 +1510,15 @@ write-scope token queues the threads that are due, and they are named one at a t
 thread's root and newest messages, one call, file the result. A read token is shown names that
 exist but never causes a call. A name produced after a page was read reaches it on its next
 refresh, a forward delta included: for up to fifteen minutes, deltas of the thread list carry the
-thread with its new name, as the newest read of it showed it (reads that land out of order are
-ordered by when they began, and a page the provider could not bring up to date never replaces one
-it could), unless a delta has said it left the list and no up-to-date thread list read after that
-delta has shown it again. A thread whose naming failed is left alone for ten minutes. The
-model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at most 40
-characters); any other answer fails that naming by name rather than being cut into shape.
+thread with its new name, as the newest read of it showed it, unless a delta has said it left the
+list and no up-to-date thread list read after that delta has shown it again. The newest read is
+the one whose answer is complete up to the latest instant: when its read began, for a page the
+provider had brought up to date, and no later than its `as_of` for one it had not. Reads can land
+out of order, and a bridge can answer with `as_of` from a rebuild it made after another read began
+(a read of another view rebuilt the space, and this read's own rebuild failed); that answer is the
+newer one, and a delta carries what it said. A thread whose naming failed is left alone for ten
+minutes. The model must answer a name of two to four lowercase hyphenated words (`[a-z0-9-]`, at
+most 40 characters); any other answer fails that naming by name rather than being cut into shape.
 
 **Naming reads the chat provider as little as it can.** On a provider where one thread read is
 expensive (a bridge that rebuilds a whole space for each read), background naming used to be most
@@ -1529,20 +1532,20 @@ of the thread reads a deployment made. So:
   is kept for good. Nothing is copied when a thread is queued: when its turn comes, its messages,
   root included, are looked up in what was read in the last 30 seconds, and checked against the
   newest reply count any page has shown for it since (every page refreshes a queued thread's
-  count and last activity, unless its read began before the one that last did, or it was not up
-  to date and that one was). That count must be exact, at most 50, read
-  in the last 30 seconds from a page the provider had brought up to date, and read no earlier
-  than any of the replies held, and nothing this server has been told of since may touch the
-  thread: a message pushed into it (or pushed into its channel with no thread label), or a reply
-  you posted to it from here, whether or not the post said it arrived. After a delta saying the
-  thread left the list, only a count read after that delta will do. Every message held must come
-  from a page the provider had brought up to date: one marked `as_of` can still hold a message as
-  it was before an edit that was pushed earlier. Exactly as many replies as the count must be
-  held, and the newest of them must be no older than the thread's last activity. So an edit or
-  delete pushed while the thread waits, a reply pushed or posted here, a reply a later page
-  counts, a delta saying it left the list, or messages that have expired all send it to the
-  provider instead. A thread of more than 50 replies is always read: the replies held might be an
-  older page you scrolled to rather than its newest.
+  count and last activity, unless it is complete up to an earlier instant than the one that last
+  did). That count must be exact, at most 50, read in the last 30 seconds from a page the
+  provider had brought up to date (no `as_of`, however recent), and read no earlier than any of
+  the replies held, and nothing this server has been told of since may touch the thread: a
+  message pushed into it (or pushed into its channel with no thread label), or a reply you posted
+  to it from here, whether or not the post said it arrived. After a delta saying the thread left
+  the list, only a count read after that delta will do. Every message held must come from a page
+  the provider had brought up to date: one marked `as_of` can still hold a message as it was
+  before an edit that was pushed earlier. Exactly as many replies as the count must be held, and
+  the newest of them must be no older than the thread's last activity. So an edit or delete
+  pushed while the thread waits, a reply pushed or posted here, a reply a later page counts, a
+  delta saying it left the list, or messages that have expired all send it to the provider
+  instead. A thread of more than 50 replies is always read: the replies held might be an older
+  page you scrolled to rather than its newest.
 * What this cannot see is a change the server is not told of, within those 30 seconds. An edit,
   to the root or a reply, changes neither the count nor the last activity, so the thread is named
   from the text as the page read it; a deleted reply can still be among the messages a thread is
