@@ -488,6 +488,96 @@ fn every_batch_is_counted_in_the_duration_histogram_the_stats_carry() {
     assert!(json["batch_us"]["octaves_us"].is_array());
 }
 
+#[test]
+fn a_shadow_view_reads_the_head_the_coverage_and_the_rows_and_honours_blocks() {
+    let fx = Fixture::new("cache-shadow-view");
+    let proof = newest_proof(ListStart::At(T0 + STEP));
+    fx.list(vec![m(1), m(2), m(3), m(4)], T0 + 1_000, Some(proof));
+    let applied = fx.cache.applied_seq();
+    let view = |query: &shadow::Query| fx.cache.shadow_view(&fx.chan, query);
+    let ids_of = |rows: &[CachedMessage]| -> Vec<String> {
+        rows.iter().map(|row| row.message.id.0.clone()).collect()
+    };
+
+    let newest = view(&shadow::Query::Newest {
+        scope: Scope::Main,
+        limit: 2,
+    })
+    .served()
+    .expect("served");
+    assert_eq!(
+        newest.head,
+        fx.cache
+            .head(&fx.chan, &Scope::Main)
+            .served()
+            .expect("served")
+    );
+    assert!(newest.head.is_some());
+    assert_eq!(newest.coverage, intervals(&fx, &Scope::Main));
+    assert_eq!(ids_of(&newest.rows), ids(&["m3", "m4"]));
+
+    let span = |from: i64, until: Option<i64>, limit: usize| {
+        view(&shadow::Query::Span {
+            scope: Scope::Main,
+            from_ms: from,
+            until_ms: until,
+            limit,
+        })
+        .served()
+        .expect("served")
+    };
+    let between = span(T0 + 2 * STEP, Some(T0 + 4 * STEP), 10);
+    assert_eq!(
+        ids_of(&between.rows),
+        ids(&["m2", "m3"]),
+        "until is exclusive"
+    );
+    assert_eq!(between.head, newest.head);
+    assert_eq!(ids_of(&span(T0 + 2 * STEP, None, 1).rows), ids(&["m2"]));
+
+    let one = view(&shadow::Query::Message { id: mid("m2") })
+        .served()
+        .expect("served");
+    assert_eq!(ids_of(&one.rows), ids(&["m2"]));
+    assert_eq!(one.home, Some(Scope::Main));
+    assert_eq!(one.coverage, intervals(&fx, &Scope::Main));
+    assert_eq!(
+        view(&shadow::Query::Message { id: mid("absent") }),
+        Read::Served(shadow::View::default())
+    );
+
+    // The scope blocked: neither it nor a message at home in it is read.
+    fx.cache.block_scope(&fx.chan, &Scope::Main);
+    assert_eq!(
+        view(&shadow::Query::Newest {
+            scope: Scope::Main,
+            limit: 2
+        }),
+        Read::Blocked
+    );
+    assert_eq!(
+        view(&shadow::Query::Message { id: mid("m2") }),
+        Read::Blocked
+    );
+    fx.cache.unblock(&fx.chan, Some(&Scope::Main));
+    assert_eq!(fx.cache.blocks(), 0);
+    fx.cache.block_channel(&fx.chan);
+    assert_eq!(fx.cache.blocks(), 1);
+    assert_eq!(
+        view(&shadow::Query::Message { id: mid("m2") }),
+        Read::Blocked
+    );
+    fx.cache.unblock(&fx.chan, None);
+
+    let covered: i64 = intervals(&fx, &Scope::Main)
+        .iter()
+        .map(|interval| interval.t1_ms - interval.t0_ms)
+        .sum();
+    assert!(covered > 0);
+    assert_eq!(fx.cache.covered_ms(), Read::Served(covered));
+    assert_eq!(fx.cache.applied_seq(), applied, "reading wrote nothing");
+}
+
 // ---- the merge rules ---------------------------------------------------------------------------
 
 #[test]

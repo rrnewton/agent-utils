@@ -99,6 +99,7 @@ pub mod rows;
 pub mod schema;
 pub mod search;
 pub mod search_text;
+pub mod shadow;
 pub mod sink;
 mod structure;
 mod writer;
@@ -1643,10 +1644,16 @@ impl MessageCache {
     /// (its rows unreachable) before its rows are deleted, and an offer is applied before the
     /// eviction it may set off. [`MessageCache::quiesce_blocking`] waits for that work too.
     pub fn barrier_blocking(&self, timeout: Duration) -> bool {
+        self.barrier_to_blocking(self.enqueued_seq(), timeout)
+    }
+
+    /// [`MessageCache::barrier_blocking`] for what was offered up to the sequence number `target`,
+    /// noted earlier with [`MessageCache::enqueued_seq`]: what a read that must be current as of
+    /// that moment waits for, and nothing offered since.
+    pub fn barrier_to_blocking(&self, target: u64, timeout: Duration) -> bool {
         if !self.is_open() {
             return false;
         }
-        let target = *lock(&self.shared.seq.enqueued);
         let deadline = Instant::now() + timeout;
         let mut applied = lock(&self.shared.seq.applied);
         if *applied < target {
@@ -1704,6 +1711,12 @@ impl MessageCache {
     #[must_use]
     pub fn applied_seq(&self) -> u64 {
         self.shared.seq.applied()
+    }
+
+    /// The last sequence number handed out: everything offered so far has it or a lower one.
+    #[must_use]
+    pub fn enqueued_seq(&self) -> u64 {
+        *lock(&self.shared.seq.enqueued)
     }
 
     /// Have the writer send its [`WriterEvent`]s to the returned receiver from now on, through a
@@ -2023,6 +2036,45 @@ impl MessageCache {
     #[must_use]
     pub fn counts(&self) -> Read<Counts> {
         self.read(None, reader::counts)
+    }
+
+    /// What a shadow evaluation reads of `chan` ([`shadow::Query`]), all of it in one snapshot of
+    /// the file, so that a batch committed while it runs is either wholly in it or not at all.
+    /// Checked as every read is, and [`Read::Blocked`] while the scope it reads, or the scope the
+    /// message it found belongs to, is.
+    #[must_use]
+    pub fn shadow_view(&self, chan: &ChanKey, query: &shadow::Query) -> Read<shadow::View> {
+        let work = |connection: &rusqlite::Connection| reader::shadow_view(connection, chan, query);
+        let read = match query.scope() {
+            Some(scope) => self.read_scope(chan, &scope.key(), work),
+            None => self.read(Some(chan), work),
+        };
+        if let Read::Served(view) = &read {
+            if view
+                .home
+                .as_ref()
+                .is_some_and(|home| self.scope_blocked(chan, &home.key()))
+            {
+                return Read::Blocked;
+            }
+        }
+        read
+    }
+
+    /// The milliseconds of message time the coverage of every listed channel's own timeline (its
+    /// `main` and `flat` scopes, not its threads) spans, summed over the channels: how much
+    /// history the file has proven it holds whole. For the diagnostics report.
+    #[must_use]
+    pub fn covered_ms(&self) -> Read<i64> {
+        self.read(None, reader::covered_ms)
+    }
+
+    /// How many channels and scopes are blocked now, access to them in doubt. Suspended
+    /// providers are not counted here.
+    #[must_use]
+    pub fn blocks(&self) -> usize {
+        let blocks = lock(&self.shared.blocks);
+        blocks.channels.len() + blocks.scopes.len()
     }
 
     /// The earliest message time any scope's coverage starts at, across the whole file, in

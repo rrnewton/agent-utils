@@ -11,6 +11,7 @@ use rusqlite::{params, Connection, InterruptHandle, OpenFlags, OptionalExtension
 use super::coverage::{Head, Interval, Source};
 use super::rows::{self, CachedMessage, ChanKey, Scope};
 use super::schema::{apply_per_open, sqlite_code};
+use super::shadow::{Query, View};
 use super::{Account, CacheError, Counts, ThreadRecord};
 use crate::model::MessageId;
 
@@ -133,6 +134,91 @@ pub(crate) fn newest(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.reverse();
     Ok(rows)
+}
+
+/// A scope's oldest `limit` messages created in `[from_ms, until_ms)`, oldest first.
+fn span(
+    connection: &Connection,
+    chan: &ChanKey,
+    chan_id: i64,
+    scope_key: &str,
+    (from_ms, until_ms): (i64, i64),
+    limit: usize,
+) -> rusqlite::Result<Vec<CachedMessage>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {MESSAGE_COLUMNS} FROM message_scope s JOIN message m ON m.row_id = s.row_id
+         WHERE s.chan = ?1 AND s.scope_key = ?2 AND s.created_ms >= ?3 AND s.created_ms < ?4
+         ORDER BY s.created_ms, m.numeric_id, m.message_id LIMIT ?5"
+    ))?;
+    let rows = statement
+        .query_map(
+            params![
+                chan_id,
+                scope_key,
+                from_ms,
+                until_ms,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| cached(&chan.channel_id, row),
+        )?
+        .collect();
+    rows
+}
+
+/// What a shadow evaluation reads, in ONE read transaction: every part of it is of the same
+/// moment, so a batch the writer commits meanwhile is either wholly in it or not at all.
+pub(crate) fn shadow_view(
+    connection: &Connection,
+    chan: &ChanKey,
+    query: &Query,
+) -> rusqlite::Result<View> {
+    let snapshot = connection.unchecked_transaction()?;
+    let Some(chan_id) = chan_id(&snapshot, chan)? else {
+        return Ok(View::default());
+    };
+    let view = match query {
+        Query::Newest { scope, limit } => {
+            let key = scope.key();
+            View {
+                head: head(&snapshot, chan, &key)?,
+                coverage: coverage_by_id(&snapshot, chan_id, &key)?,
+                rows: newest(&snapshot, chan, &key, *limit)?,
+                home: None,
+            }
+        }
+        Query::Span {
+            scope,
+            from_ms,
+            until_ms,
+            limit,
+        } => {
+            let key = scope.key();
+            View {
+                head: head(&snapshot, chan, &key)?,
+                coverage: coverage_by_id(&snapshot, chan_id, &key)?,
+                rows: span(
+                    &snapshot,
+                    chan,
+                    chan_id,
+                    &key,
+                    (*from_ms, until_ms.unwrap_or(i64::MAX)),
+                    *limit,
+                )?,
+                home: None,
+            }
+        }
+        Query::Message { id } => match message_and_home(&snapshot, chan, id)? {
+            Some((row, home)) => View {
+                head: None,
+                coverage: coverage_by_id(&snapshot, chan_id, &home)?,
+                rows: vec![row],
+                home: Scope::parse(&home),
+            },
+            None => View::default(),
+        },
+    };
+    snapshot.finish()?;
+    Ok(view)
 }
 
 /// One message, and the `scope_key` of its home scope.
@@ -312,6 +398,18 @@ pub(crate) fn oldest_covered(connection: &Connection) -> rusqlite::Result<Option
     connection.query_row(
         "SELECT MIN(c.t0_ms) FROM coverage c JOIN channel ch ON ch.chan = c.chan
          WHERE ch.provider_key <> ?1",
+        [super::writer::ERASED_PROVIDER],
+        |row| row.get(0),
+    )
+}
+
+/// The milliseconds of message time the coverage of every listed channel's `main` and `flat`
+/// scopes spans, summed. A channel being erased is not counted.
+pub(crate) fn covered_ms(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "SELECT COALESCE(SUM(c.t1_ms - c.t0_ms), 0) FROM coverage c
+         JOIN channel ch ON ch.chan = c.chan
+         WHERE ch.provider_key <> ?1 AND c.scope_key IN ('main', 'flat')",
         [super::writer::ERASED_PROVIDER],
         |row| row.get(0),
     )
