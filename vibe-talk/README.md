@@ -2136,7 +2136,8 @@ server a channel belongs to is learned the first time, from `GET /channels/{id}`
 that channel's head, so the first head read costs a request per channel and every later one a
 request per server. A channel missing from its server's list, and a thread, which no server list
 holds, are read on their own; a forum or media channel has no message list of its own and gets no
-head. `last_message_id` moves only when a message is added, never on an edit or a delete, so a
+head, and neither does a channel object that leaves `last_message_id` out (only `null` says a
+channel has no messages). `last_message_id` moves only when a message is added, never on an edit or a delete, so a
 Discord head is used only by the live poller, which reads only additions (see
 [Channel heads](#channel-heads)).
 
@@ -2242,7 +2243,7 @@ The sections below say what each one means in detail: [A bridge's range reads](#
 | `fetch_messages` | native: a call per run of timestamps | native: one `after=` page for ids near each other, the thread checked once | native with `id_reads` |
 | `channel_heads` | emulated: no Slack call answers several conversations | native: each server's channel list, a call per server; additions only | native with `head_reads`; may vouch for edits and deletes |
 | `fetch_recent_many` | emulated | emulated | native with `recent_many_reads` |
-| `fetch_threads` | native: one `conversations.replies` window per thread instead of two calls; after an instant, no replies read for a thread whose root's `latest_reply` did not move | native: the parent read once for all threads instead of once each; after an instant, a thread whose `last_message_id` did not move costs only its check | native with `thread_reads` |
+| `fetch_threads` | native: one `conversations.replies` window per thread instead of two calls; after an instant, no replies read for a thread whose root's `latest_reply` did not move | native: the parent read once for all threads instead of once each; after an instant, a thread whose `last_message_id` did not move costs only its check, and one that does not say it is read as moved | native with `thread_reads` |
 
 **What a bridge must serve, and the setting that turns each on.** A bridge advertises nothing:
 each request is off until the operator turns its setting on for that provider (`[discord]`, or a
@@ -2625,8 +2626,9 @@ router asks the channel's own provider.
 every thread is still checked against the channel and read on its own, two at a time, but the
 parent channel is read once for all of them rather than once per thread (three requests a thread
 instead of the thread view's four), and after an instant a thread whose `last_message_id` has not
-moved costs that check alone, one that moved one `after=` read more, and a root is read only when
-it is itself newer than the instant. Slack, which has no read of several threads either: a
+moved (or is `null`) costs that check alone, one that moved, or whose object leaves
+`last_message_id` out, one `after=` read more, and a root is read only when it is itself newer than
+the instant. Slack, which has no read of several threads either: a
 thread's newest page is one `conversations.replies` window read, its root the first message of it,
 where the thread view reads the root first and then the window (one call a thread of up to a page
 instead of two; a longer thread is read by the thread view, as before); and after an instant the

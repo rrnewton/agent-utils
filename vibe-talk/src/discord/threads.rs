@@ -85,6 +85,13 @@ struct NativeThread {
     parent: String,
     title: String,
     last_message: u64,
+    /// The newest message the thread object vouches for: its `last_message_id`, or its own id when
+    /// that is `null` (no message was ever sent there). `None` when the object leaves the field
+    /// out (or gives something else), which says nothing about what was added, so a read after an
+    /// instant reads it as a thread that moved. Fix round 3 of remote-ops-audit W14
+    /// `#287 bulk-reads`. [`Self::last_message`] falls back to the thread's own id either way, for
+    /// what it has always been used for.
+    last_said: Option<u64>,
     replies: Option<u64>,
 }
 
@@ -105,6 +112,11 @@ impl NativeThread {
             .map(native_id)
             .transpose()?
             .unwrap_or(numeric);
+        let last_said = match value.get("last_message_id") {
+            Some(Value::String(_)) => Some(last_message),
+            Some(Value::Null) => Some(numeric),
+            _ => None,
+        };
         Ok(Self {
             id,
             parent,
@@ -115,6 +127,7 @@ impl NativeThread {
                 .unwrap_or("Thread")
                 .to_owned(),
             last_message,
+            last_said,
             replies: value.get("message_count").and_then(Value::as_u64),
         })
     }
@@ -1270,11 +1283,12 @@ impl HttpDiscordClient {
     ///   the newest `limit` messages, the root among them where it falls, the summary with its
     ///   root, and the forward cursor. Three requests a thread rather than the view's four.
     /// * An ask with it reads nothing more when the thread's `last_message_id` is not newer than
-    ///   the instant (a message added since would have moved it), and otherwise the messages
-    ///   after the instant (`after=` its snowflake), at most `limit`, the oldest first, with
-    ///   `delta.more` when there were more. Its root is read only when the root itself is newer
-    ///   than the instant: an older root is not news, and the summary then leaves it out. So a
-    ///   quiet thread costs one request and a moved one two.
+    ///   the instant (a message added since would have moved it) or is `null`, and otherwise (a
+    ///   thread object that leaves the field out included) the messages after the instant
+    ///   (`after=` its snowflake), at most `limit`, the oldest first, with `delta.more` when there
+    ///   were more. Its root is read only when the root itself is newer than the instant: an older
+    ///   root is not news, and the summary then leaves it out. So a quiet thread costs one request
+    ///   and a moved one two.
     ///
     /// A thread that cannot be read, or does not belong to the channel, is an error in its own
     /// place.
@@ -1348,7 +1362,9 @@ impl HttpDiscordClient {
         // The newest snowflake of `newer_than_ms`: everything after it was created later.
         let last_at =
             MessageId::at_time_ms(newer_than_ms).numeric().unwrap_or(0) | ((1_u64 << 22) - 1);
-        let mut messages = if thread.last_message > last_at {
+        // A thread object that does not say its last message is read as one that moved: fix round
+        // 3 of remote-ops-audit W14 `#287 bulk-reads`.
+        let mut messages = if thread.last_said.is_none_or(|last| last > last_at) {
             let ask = u16::try_from(limit + 1).unwrap_or(super::DISCORD_MAX_LIMIT);
             self.native_messages(
                 channel,
@@ -3993,5 +4009,70 @@ mod tests {
                 "{at}: a root only when it is news"
             );
         }
+    }
+
+    /// Fix round 3 of remote-ops-audit W14 `#287 bulk-reads`: a thread object that leaves
+    /// `last_message_id` out says nothing about what was added to the thread, so asked for what is
+    /// newer than an instant it is read `after=` the instant, as a thread that moved. Only
+    /// `last_message_id: null` says no message was ever sent there.
+    #[tokio::test]
+    async fn native_thread_reads_after_an_instant_read_a_thread_that_does_not_say_its_last_message()
+    {
+        const BASE_MS: i64 = 1_787_000_000_000;
+        let at = |ms: i64| MessageId::at_time_ms(ms).numeric().expect("a snowflake");
+        let id = |ms: i64| at(ms).to_string();
+        let newer_than_ms = BASE_MS + 10_000;
+        let last_at = at(newer_than_ms) | ((1 << 22) - 1);
+        let (unsaid, empty) = (id(BASE_MS), id(BASE_MS + 1_000));
+        let mut unsaid_thread = thread(&unsaid, &unsaid, "100");
+        unsaid_thread
+            .as_object_mut()
+            .expect("an object")
+            .remove("last_message_id");
+        let mut empty_thread = thread(&empty, &empty, "100");
+        empty_thread["last_message_id"] = Value::Null;
+        let mut routes = Replies::new();
+        ok(&mut routes, &format!("/channels/{unsaid}"), unsaid_thread);
+        ok(&mut routes, &format!("/channels/{empty}"), empty_thread);
+        ok(
+            &mut routes,
+            &format!("/channels/{unsaid}/messages?limit=51&after={last_at}"),
+            json!([message(&unsaid, &id(BASE_MS + 20_000), "added since")]),
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        let ask = |thread: &str| crate::chat::ThreadAsk {
+            id: thread.to_owned(),
+            newer_than_ms: Some(newer_than_ms),
+            limit: 50,
+        };
+        let answers = mock
+            .client
+            .fetch_threads(&channel, &[ask(&unsaid), ask(&empty)])
+            .await;
+        let mut requests = taken(&mock);
+        requests.sort();
+        let mut expected = vec![
+            format!("GET /channels/{unsaid}"),
+            format!("GET /channels/{unsaid}/messages?limit=51&after={last_at}"),
+            format!("GET /channels/{empty}"),
+        ];
+        expected.sort();
+        assert_eq!(
+            requests, expected,
+            "only the thread that says it has no messages is not read"
+        );
+        let contents = |at: usize| -> Vec<String> {
+            answers[at]
+                .1
+                .as_ref()
+                .expect("a page")
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect()
+        };
+        assert_eq!(contents(0), ["added since"]);
+        assert!(contents(1).is_empty());
     }
 }
