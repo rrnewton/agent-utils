@@ -1,0 +1,508 @@
+[
+  {
+    "answer": {
+      "channels": [
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "1111111111",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "build is green"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "2222222222",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "ship it"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "3333333333",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "pager is quiet"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "4444444444",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "tests are flaky"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "5555555555",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "lunch at noon"
+            ]
+          }
+        }
+      ],
+      "newest": [
+        "5555555555",
+        "lunch at noon"
+      ]
+    },
+    "case": "a catch-up of five channels with nothing held",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20",
+      "fetch_recent 4444444444 limit=20",
+      "fetch_recent 5555555555 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "1111111111",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "build is green"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "2222222222",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "ship it"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "3333333333",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "pager is quiet"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "4444444444",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "tests are flaky"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "5555555555",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "lunch at noon"
+            ]
+          }
+        }
+      ],
+      "newest": [
+        "5555555555",
+        "lunch at noon"
+      ]
+    },
+    "case": "a catch-up at once after it",
+    "upstream": []
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "1111111111",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "build is green"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "2222222222",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "ship it tomorrow, edited"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "3333333333",
+          "read": {
+            "complete": true,
+            "counted": 0,
+            "noise": 0,
+            "said": []
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "4444444444",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "tests are flaky"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "5555555555",
+          "read": {
+            "complete": true,
+            "counted": 2,
+            "noise": 0,
+            "said": [
+              "lunch at noon",
+              "something new"
+            ]
+          }
+        }
+      ],
+      "newest": [
+        "5555555555",
+        "something new"
+      ]
+    },
+    "case": "a catch-up after the reuse period, after an edit, a delete and a new message",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20",
+      "fetch_recent 4444444444 limit=20",
+      "fetch_recent 5555555555 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "warming": 5
+    },
+    "case": "a call start's warm-up after the reuse period",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20",
+      "fetch_recent 4444444444 limit=20",
+      "fetch_recent 5555555555 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "1111111111",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "build is green"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "2222222222",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "ship it tomorrow, edited"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "3333333333",
+          "read": {
+            "complete": true,
+            "counted": 0,
+            "noise": 0,
+            "said": []
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "4444444444",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "tests are flaky"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "5555555555",
+          "read": {
+            "complete": true,
+            "counted": 2,
+            "noise": 0,
+            "said": [
+              "lunch at noon",
+              "something new"
+            ]
+          }
+        }
+      ],
+      "newest": [
+        "5555555555",
+        "something new"
+      ]
+    },
+    "case": "a catch-up right after the warm-up",
+    "upstream": []
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "1111111111",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "build is green"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "2222222222",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "ship it tomorrow, edited"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "3333333333",
+          "read": {
+            "complete": true,
+            "counted": 0,
+            "noise": 0,
+            "said": []
+          }
+        },
+        {
+          "as_of": null,
+          "currency": {
+            "failed": "chat_error",
+            "held_seconds": 61
+          },
+          "id": "4444444444",
+          "read": {
+            "complete": true,
+            "counted": 1,
+            "noise": 0,
+            "said": [
+              "tests are flaky"
+            ]
+          }
+        },
+        {
+          "as_of": null,
+          "currency": "current",
+          "id": "5555555555",
+          "read": {
+            "complete": true,
+            "counted": 2,
+            "noise": 0,
+            "said": [
+              "lunch at noon",
+              "something new"
+            ]
+          }
+        }
+      ],
+      "newest": [
+        "5555555555",
+        "something new"
+      ]
+    },
+    "case": "a catch-up while one channel's read fails",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20",
+      "fetch_recent 4444444444 limit=20",
+      "fetch_recent 5555555555 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "activity": {
+        "channels": [
+          {
+            "as_of": null,
+            "currency": "current",
+            "id": "1111111111",
+            "read": {
+              "complete": true,
+              "counted": 1,
+              "noise": 0,
+              "said": [
+                "build is green"
+              ]
+            }
+          },
+          {
+            "as_of": null,
+            "currency": "current",
+            "id": "2222222222",
+            "read": {
+              "complete": true,
+              "counted": 1,
+              "noise": 0,
+              "said": [
+                "ship it tomorrow, edited"
+              ]
+            }
+          },
+          {
+            "as_of": null,
+            "currency": "current",
+            "id": "3333333333",
+            "read": {
+              "complete": true,
+              "counted": 0,
+              "noise": 0,
+              "said": []
+            }
+          },
+          {
+            "as_of": null,
+            "currency": "current",
+            "id": "4444444444",
+            "read": {
+              "complete": true,
+              "counted": 1,
+              "noise": 0,
+              "said": [
+                "tests are flaky"
+              ]
+            }
+          },
+          {
+            "as_of": null,
+            "currency": "current",
+            "id": "5555555555",
+            "read": {
+              "complete": true,
+              "counted": 2,
+              "noise": 0,
+              "said": [
+                "lunch at noon",
+                "something new"
+              ]
+            }
+          }
+        ],
+        "newest": [
+          "5555555555",
+          "something new"
+        ]
+      },
+      "page": {
+        "said": [
+          "ship it tomorrow, edited"
+        ],
+        "status": 200
+      }
+    },
+    "case": "the page reads one channel, then a catch-up",
+    "upstream": [
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 3333333333 limit=20",
+      "fetch_recent 4444444444 limit=20",
+      "fetch_recent 5555555555 limit=20"
+    ]
+  }
+]
