@@ -2317,6 +2317,17 @@ impl StopState {
         if let Some(queue) = self.ack_queue.as_ref() {
             queue.stop();
         }
+        // `wait` holds `lock` from its check of the flag until the wait releases it, so setting
+        // the flag and waking the waiters under `lock` too lands the stop either before the
+        // check, which then sees it, or once the wait has begun, which the wake-up ends. Without
+        // the lock a stop could fall between the two, wake no one, and leave the waiter asleep
+        // for its whole duration, up to 60 s for the provider's reconnect wait (#291
+        // stop-lost-wakeup). Only `stop` and `wait` take `lock`, and neither takes another lock
+        // while holding it.
+        let _waiters = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stopped.store(true, Ordering::SeqCst);
         self.changed.notify_all();
     }
@@ -9815,6 +9826,63 @@ esac
         );
         assert_eq!(extended.duration_since(first), Duration::from_secs(68));
         assert_eq!(stop.shutdown_deadline(), Some(extended));
+    }
+
+    #[test]
+    fn a_stop_cannot_fall_between_a_waiters_check_and_its_wait() {
+        // `StopState::wait` checks the flag and then waits, holding `lock` from the check until
+        // the wait releases it. A stop that set the flag and woke the waiters in between would
+        // wake no one, and the waiter would sleep its whole duration (#291 stop-lost-wakeup).
+        // The test thread stands in for such a waiter: it holds `lock` until well after a stop
+        // has started on another thread, and only then waits.
+        let stop = StopState::default();
+        let stop = &stop;
+        thread::scope(|scope| {
+            let waiter = stop.lock.lock().expect("stop lock");
+            let (started, started_receiver) = mpsc::channel();
+            scope.spawn(move || {
+                started.send(()).expect("report the stop");
+                stop.stop();
+            });
+            started_receiver.recv().expect("the stop started");
+            thread::sleep(Duration::from_millis(100));
+            assert!(
+                !stop.is_stopped(),
+                "the stop sets the flag only once the waiter holding the lock waits"
+            );
+            let (_waiter, wait) = stop
+                .changed
+                .wait_timeout_while(waiter, Duration::from_secs(30), |()| !stop.is_stopped())
+                .expect("wait for the stop");
+            assert!(!wait.timed_out(), "the stop woke the waiter");
+        });
+    }
+
+    #[test]
+    fn a_stop_ends_every_wait_however_it_interleaves_with_the_waiter() {
+        // `StopState::wait` against a stop started at the same moment on another thread, many
+        // times over, so the stop lands at every point of the wait, including between its check
+        // of the flag and the start of its sleep (#291 stop-lost-wakeup). Each wait must end at
+        // the stop, never at its own 60 s timeout.
+        for round in 0..2_000 {
+            let stop = StopState::default();
+            let start = std::sync::Barrier::new(2);
+            let waited = thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
+                    start.wait();
+                    let began = Instant::now();
+                    stop.wait(Duration::from_secs(60));
+                    began.elapsed()
+                });
+                start.wait();
+                stop.stop();
+                waiter.join().expect("waiter")
+            });
+            assert!(
+                waited < Duration::from_secs(30),
+                "round {round}: the stop did not end the wait, which slept {waited:?}"
+            );
+        }
     }
 
     #[test]
