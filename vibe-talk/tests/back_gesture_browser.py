@@ -546,8 +546,9 @@ def installed_walk(desk: Desk) -> None:
     desk.check(navigation(page) == (2, 3), f"fixture: the thread from the list is not two entries over the app's first: "
                f"{navigation(page)}")
     _quiet, reopened = reload_quietly(desk, REOPENED_LIST_THREAD, "the reload did not reopen the thread from the list")
-    # Here the reader touches the page first, so whatever the page still wanted to push is pushed.
-    tap(desk, "#thread-title")
+    # Here the reader touches the page first, so whatever the page still wanted to push is pushed. On the
+    # thread card's age, which acts on nothing (`#298 thread-card-header`: the card is the thread's heading).
+    tap(desk, "#thread-card-age")
     desk.settled()
     back_through_reopened(desk, reopened)
     desk.check(history_index(page) == 0, f"the earlier load left entries under the app's base: the browser is at "
