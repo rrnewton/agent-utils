@@ -18079,10 +18079,27 @@ def _process_uses_slot(
     slot_path: Path,
     *,
     mount_verdicts: _MountTableVerdicts | None = None,
+    unreadable_is_no_evidence: bool = False,
 ) -> list[str]:
+    """Return how ``pid_dir`` uses ``slot_path``: links, descriptors, maps, mounts.
+
+    With ``unreadable_is_no_evidence``, each link, descriptor directory or
+    maps file this user may not read is skipped, as lsof run as this user
+    skips it, and the uses already found are kept.  Other failures still
+    refuse, and the mount table is always read.
+    """
+
+    def link_target(path: Path) -> Path | None:
+        try:
+            return _link_target(path)
+        except Refusal as exc:
+            if unreadable_is_no_evidence and isinstance(exc.__cause__, PermissionError):
+                return None
+            raise
+
     uses: list[str] = []
     for name in ("cwd", "root", "exe"):
-        target = _link_target(pid_dir / name)
+        target = link_target(pid_dir / name)
         if target is not None and _path_is_within(target, slot_path):
             uses.append(f"{name}={target}")
     fd_dir = pid_dir / "fd"
@@ -18091,15 +18108,17 @@ def _process_uses_slot(
     except FileNotFoundError:
         descriptors = []
     except PermissionError as exc:
-        raise Refusal(
-            f"process use is indeterminate because {fd_dir} is unreadable: {exc}"
-        ) from exc
+        if not unreadable_is_no_evidence:
+            raise Refusal(
+                f"process use is indeterminate because {fd_dir} is unreadable: {exc}"
+            ) from exc
+        descriptors = []
     except OSError as exc:
         raise Refusal(
             f"process use is indeterminate because {fd_dir} cannot be read: {exc}"
         ) from exc
     for descriptor in descriptors:
-        target = _link_target(descriptor)
+        target = link_target(descriptor)
         if target is not None and _path_is_within(target, slot_path):
             uses.append(f"fd/{descriptor.name}={target}")
             break
@@ -18109,9 +18128,11 @@ def _process_uses_slot(
     except FileNotFoundError:
         maps = ""
     except PermissionError as exc:
-        raise Refusal(
-            f"process use is indeterminate because {maps_path} is unreadable: {exc}"
-        ) from exc
+        if not unreadable_is_no_evidence:
+            raise Refusal(
+                f"process use is indeterminate because {maps_path} is unreadable: {exc}"
+            ) from exc
+        maps = ""
     except OSError as exc:
         raise Refusal(
             f"process use is indeterminate because {maps_path} cannot be read: {exc}"
@@ -18386,6 +18407,33 @@ class _LsofUseDiagnostic:
     name_excerpt: str | None
 
 
+# PIDFD_THREAD (Linux 6.9): a pidfd for one thread, readable once that thread
+# has exited.  The kernel defines it as O_EXCL.
+_PIDFD_THREAD = os.O_EXCL
+
+
+def _open_exit_pidfd(pid: int) -> int:
+    """Open a descriptor that becomes readable when ``pid`` exits.
+
+    A reported holder may be a surviving thread of an exited leader, walked
+    at its own ID.  A plain pidfd names only a thread-group leader: for a
+    thread's ID it fails (ENOENT on Linux 7.1, EINVAL on older kernels), so
+    such an ID is opened as one thread.  Whether the thread is gone is all
+    the caller then needs: it repeats the whole check, which finds any other
+    thread of the group still holding the slot.  A kernel without
+    PIDFD_THREAD still fails, and the caller refuses at once.
+    """
+
+    try:
+        return os.pidfd_open(pid)
+    except ProcessLookupError:
+        raise
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.EINVAL):
+            raise
+    return os.pidfd_open(pid, _PIDFD_THREAD)
+
+
 @dataclasses.dataclass
 class _LiveUseRecheckBudget:
     """One transaction-wide allowance for an exact process generation to exit."""
@@ -18417,7 +18465,7 @@ class _LiveUseRecheckBudget:
         descriptor = -1
         try:
             try:
-                descriptor = os.pidfd_open(pid)
+                descriptor = _open_exit_pidfd(pid)
             except ProcessLookupError:
                 # A direct /proc observation already read the generation
                 # before inspecting its paths.  An lsof report has no such
@@ -18895,6 +18943,9 @@ def _observe_slot_use_once(
     while pending:
         pid_dir = pending.pop()
         pid = int(pid_dir.name)
+        # The ancestry holds thread-group IDs.  An ancestor whose main thread
+        # has exited is skipped here as a whole, so its threads, which only a
+        # visited leader adds, are never walked as foreign holders.
         if pid == current_pid or pid in invoking_ancestry:
             continue
         start_ticks: int | None = None
@@ -18939,14 +18990,7 @@ def _observe_slot_use_once(
             and filesystem_uid != os.getuid()
         ):
             continue
-        try:
-            threads = _walked_zombie_leader_threads(pid_dir)
-        except Refusal as exc:
-            if indeterminate_use is None:
-                indeterminate_use = exc
-            continue
-        surviving_threads.update(threads)
-        pending.extend(reversed(threads))
+        uses: list[str] | None
         try:
             if direct_use_proven_absent and pid_dir not in surviving_threads:
                 mount_namespace = _mount_namespace(pid_dir)
@@ -18954,29 +18998,35 @@ def _observe_slot_use_once(
                     uses = []
                 else:
                     uses = mount_verdicts.uses(pid_dir)
-            elif direct_use_proven_absent:
-                # lsof never listed this thread, so read what it would have:
-                # a link this user may not read is no evidence, as it is not
-                # to lsof run as this user.  The mount table still is.
-                try:
-                    uses = _process_uses_slot(
-                        pid_dir, slot_path, mount_verdicts=mount_verdicts
-                    )
-                except Refusal as exc:
-                    if not isinstance(exc.__cause__, PermissionError):
-                        raise
-                    uses = mount_verdicts.uses(pid_dir)
             else:
+                # After lsof, a surviving thread is read in full, because
+                # lsof never listed it, but under lsof's rule for this user:
+                # a link, descriptor directory or maps file this user may
+                # not read is no evidence, and the mount table still is.
                 uses = _process_uses_slot(
-                    pid_dir, slot_path, mount_verdicts=mount_verdicts
+                    pid_dir,
+                    slot_path,
+                    mount_verdicts=mount_verdicts,
+                    unreadable_is_no_evidence=direct_use_proven_absent,
                 )
         except Refusal as exc:
             if indeterminate_use is None:
                 indeterminate_use = exc
-            continue
+            uses = None
+        # Read after the process's own entries, so a leader that exited while
+        # they were read, and so showed nothing, still has its threads walked.
+        try:
+            threads = _walked_zombie_leader_threads(pid_dir)
+        except Refusal as exc:
+            if indeterminate_use is None:
+                indeterminate_use = exc
+            threads = ()
+        surviving_threads.update(threads)
+        pending.extend(reversed(threads))
         if uses:
             refusal = Refusal(
-                f"live process {pid} uses slot {slot_path}: {uses[0]}; stop it and retry"
+                f"live {_walked_process_label(pid_dir)} uses slot {slot_path}: "
+                f"{uses[0]}; stop it and retry"
             )
             if not capture_generation:
                 raise refusal
@@ -35224,7 +35274,6 @@ def _agent_batch_fresh_use(
             start_ticks = None if generation is None else generation.start_ticks
         if _process_uids(pid_dir) is None:
             continue
-        pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
         uses: list[str] = []
         if owner_cgroup is not None:
             try:
@@ -35290,11 +35339,15 @@ def _agent_batch_fresh_use(
                         break
         if uses:
             refusal = Refusal(
-                f"live process {pid} uses slot {slot_path}: {uses[0]}; stop it and retry"
+                f"live {_walked_process_label(pid_dir)} uses slot {slot_path}: "
+                f"{uses[0]}; stop it and retry"
             )
             if not capture_generation:
                 raise refusal
             return _LiveUseObservation(pid, start_ticks, proc_root, refusal)
+        # Read after the process's own entries, so a leader that exited while
+        # they were read, and so showed nothing, still has its threads walked.
+        pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
     return None
 
 
@@ -35606,7 +35659,6 @@ def _agent_batch_fenced_use(
             start_ticks = None if generation is None else generation.start_ticks
         if _process_uids(pid_dir) is None:
             continue
-        pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
         if owner_cgroup is not None:
             try:
                 cgroup = _read_process_cgroup(pid_dir)
@@ -35717,11 +35769,15 @@ def _agent_batch_fenced_use(
             break
         if uses:
             refusal = Refusal(
-                f"live process {pid} uses slot {fenced_path}: {uses[0]}; stop it and retry"
+                f"live {_walked_process_label(pid_dir)} uses slot {fenced_path}: "
+                f"{uses[0]}; stop it and retry"
             )
             if not capture_generation:
                 raise refusal
             return _LiveUseObservation(pid, start_ticks, proc_root, refusal)
+        # Read after the process's own entries, so a leader that exited while
+        # they were read, and so showed nothing, still has its threads walked.
+        pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
     return None
 
 
@@ -46712,15 +46768,26 @@ class _AbsentProcessObservation:
     cgroup_path: str
     mount_namespace: str
     kernel_thread: bool = False
+    # Set only when ``pid`` is a surviving thread observed in place of its
+    # thread-group leader, which had exited: that leader's PID and start
+    # ticks.  If the thread calls execve, the kernel moves it to the leader's
+    # PID with the leader's start ticks (de_thread), and ``pid`` vanishes
+    # while the process it became still holds everything the thread held.
+    leader_pid: int | None = None
+    leader_start_ticks: int | None = None
 
 
 _PF_KTHREAD = 0x00200000
+_ZOMBIE_STATES = frozenset({"Z", "X"})
 
 
 @dataclasses.dataclass(frozen=True)
 class _ProcessStat:
     start_ticks: int
     flags: int
+    # The state letter at the moment of the read.  It is not part of the
+    # generation's identity, so two reads of one generation stay equal.
+    state: str = dataclasses.field(default="", compare=False)
 
 
 def _read_process_stat(pid_dir: Path) -> _ProcessStat | None:
@@ -46737,7 +46804,9 @@ def _read_process_stat(pid_dir: Path) -> _ProcessStat | None:
     expected_pid = int(pid_dir.name) if pid_dir.name.isdigit() else None
     if parsed is None or (expected_pid is not None and parsed.pid != expected_pid):
         raise Refusal(f"process generation is invalid for PID {pid_dir.name}")
-    return _ProcessStat(start_ticks=parsed.start_ticks, flags=parsed.flags)
+    return _ProcessStat(
+        start_ticks=parsed.start_ticks, flags=parsed.flags, state=parsed.state
+    )
 
 
 def _process_start_ticks(pid_dir: Path) -> int | None:
@@ -46903,12 +46972,15 @@ def _zombie_leader_has_live_threads(pid_dir: Path) -> bool:
 def _walked_zombie_leader_threads(pid_dir: Path) -> tuple[Path, ...]:
     """Return the threads a /proc walk must also observe for ``pid_dir``.
 
-    The walks that read every process's own entries call this once per
-    process, so it reads the one-line stat record, not status.  Only a leader
-    in State Z or X has any; its own entries then hold nothing, and its
-    surviving threads hold everything it held.  A process that vanished has
-    none.  Unreadable or malformed state refuses: it is not proof that no
-    thread hides behind the process.
+    The walks call this after reading the process's own entries, so a leader
+    that exits while they are read is still caught: its entries then showed
+    nothing, and its state, read here, shows Z.  That ordering is why this
+    reads stat afresh (one extra read per process) rather than taking the
+    State line from the status that the walk read earlier for ownership.
+    Only a leader in State Z or X has threads to add; its surviving threads
+    hold everything it held.  A process that vanished has none.  Unreadable
+    or malformed state refuses: it is not proof that no thread hides behind
+    the process.
     """
 
     try:
@@ -46922,9 +46994,49 @@ def _walked_zombie_leader_threads(pid_dir: Path) -> tuple[Path, ...]:
     parsed = _parse_proc_stat(raw)
     if parsed is None or str(parsed.pid) != pid_dir.name:
         raise Refusal(f"process state is invalid for PID {pid_dir.name}")
-    if parsed.state not in {"Z", "X"}:
+    if parsed.state not in _ZOMBIE_STATES:
         return ()
     return _zombie_leader_thread_dirs(pid_dir)
+
+
+def _walked_process_label(pid_dir: Path) -> str:
+    """Name a walked process in a refusal, saying when it is a hidden thread.
+
+    A surviving thread of an exited leader is walked at PID/task/TID.  ``ps``
+    and ``ls /proc`` list neither it nor, as a process, its TID, so the
+    refusal names the process it belongs to as well.
+    """
+
+    if pid_dir.parent.name == "task":
+        return _thread_label(int(pid_dir.name), int(pid_dir.parent.parent.name))
+    return f"process {pid_dir.name}"
+
+
+def _thread_label(thread: int, leader: int) -> str:
+    return f"thread {thread} of process {leader} (whose main thread has exited)"
+
+
+def _surviving_thread_entries(
+    pid_dir: Path, generation: _ProcessStat,
+) -> list[tuple[Path, tuple[int, int]]]:
+    """Return a zombie leader's surviving threads, each with that leader's identity.
+
+    The identity is the leader's PID and the start ticks of ``generation``,
+    which the snapshot read before deciding the leader is terminal.  The
+    leader's PID cannot be reused while any thread of its group remains, so a
+    changed generation here means the listing may belong to another process.
+    """
+
+    threads = _zombie_leader_thread_dirs(pid_dir)
+    if not threads:
+        return []
+    current = _read_process_stat(pid_dir)
+    if current is not None and current.start_ticks != generation.start_ticks:
+        raise _ProcessEvidenceChanged(
+            f"PID {pid_dir.name} generation changed while listing its threads"
+        )
+    leader = (int(pid_dir.name), generation.start_ticks)
+    return [(thread, leader) for thread in threads]
 
 
 def _absent_validate_process_snapshot(
@@ -46941,15 +47053,17 @@ def _absent_validate_process_snapshot(
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
     # Popped from the end, so the surviving threads of a zombie leader, pushed
-    # back on top, are observed next, in their leader's place.
-    pending = pid_dirs[::-1]
+    # back on top with that leader's identity, are observed next, in its place.
+    pending: list[tuple[Path, tuple[int, int] | None]] = [
+        (pid_dir, None) for pid_dir in reversed(pid_dirs)
+    ]
     while pending:
-        pid_dir = pending.pop()
+        pid_dir, leader = pending.pop()
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
         if _process_generation_is_terminal(pid_dir, generation):
-            pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
+            pending.extend(reversed(_surviving_thread_entries(pid_dir, generation)))
             continue
         try:
             if _process_uid(pid_dir) is None:
@@ -46962,7 +47076,8 @@ def _absent_validate_process_snapshot(
             raise
         if mount_namespace is None:
             if _process_is_zombie(pid_dir):
-                pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
+                # It exited after the terminal check above.
+                pending.extend(reversed(_surviving_thread_entries(pid_dir, generation)))
                 continue
             if _process_start_ticks(pid_dir) is None:
                 continue
@@ -46983,6 +47098,8 @@ def _absent_validate_process_snapshot(
                 cgroup_path=cgroup,
                 mount_namespace=mount_namespace,
                 kernel_thread=bool(generation.flags & _PF_KTHREAD),
+                leader_pid=None if leader is None else leader[0],
+                leader_start_ticks=None if leader is None else leader[1],
             )
         )
     return tuple(observations)
@@ -47721,27 +47838,105 @@ def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
 def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
     """Return whether the observed generation still names a non-zombie process.
 
-    A leader that became a zombie while its other threads still run has not
-    released its files, but its own entries no longer show them.  That
-    evidence changed: the attempt is discarded, and a fresh snapshot observes
-    the threads in its place.
+    Two answers would hide a holder, so they raise _ProcessEvidenceChanged
+    instead and the attempt is discarded: a leader that became a zombie while
+    its other threads still run, and a surviving thread that vanished because
+    it executed a new program under its leader's PID.  A fresh snapshot
+    observes the threads, or the new program, in their place.
     """
 
     pid_dir = Path("/proc") / str(process.pid)
     before = _read_process_stat(pid_dir)
     if before is None or before.start_ticks != process.start_ticks:
+        _assert_thread_kept_its_identity(process)
         return False
     if _process_is_zombie(pid_dir):
-        if _zombie_leader_has_live_threads(pid_dir):
-            current = _read_process_stat(pid_dir)
-            if current is not None and current.start_ticks == process.start_ticks:
-                raise _ProcessEvidenceChanged(
-                    f"PID {process.pid} exited as thread-group leader while its "
-                    "threads still run"
-                )
+        _assert_leader_released_its_threads(process, pid_dir)
         return False
     after = _read_process_stat(pid_dir)
     return after is not None and after.start_ticks == process.start_ticks
+
+
+def _assert_leader_released_its_threads(
+    process: _AbsentProcessObservation, pid_dir: Path,
+) -> None:
+    """Refuse the attempt if the observed zombie ``process`` still has running threads.
+
+    A leader that exits while its other threads run has not released its
+    files, but its own entries no longer show them, and /proc readdir never
+    lists the threads.  The attempt that observed the leader is discarded,
+    and a fresh snapshot observes the threads in its place.
+    """
+
+    if not _zombie_leader_has_live_threads(pid_dir):
+        return
+    current = _read_process_stat(pid_dir)
+    if current is not None and current.start_ticks == process.start_ticks:
+        raise _ProcessEvidenceChanged(
+            f"PID {process.pid} exited as thread-group leader while its threads still run"
+        )
+
+
+def _assert_thread_kept_its_identity(process: _AbsentProcessObservation) -> None:
+    """Refuse the attempt if an observed surviving thread became its leader by execve.
+
+    execve from a thread of a group whose leader has exited moves that
+    thread to the leader's PID with the leader's start ticks (de_thread), so
+    the thread's own ID vanishes while the process it became keeps the
+    thread's working directory and descriptors.  The leader's PID cannot be
+    running again under the leader's generation any other way: the leader
+    stays a zombie until its group is gone, and only then is it reaped.
+    """
+
+    if process.leader_pid is None:
+        return
+    leader = _read_process_stat(Path("/proc") / str(process.leader_pid))
+    if (
+        leader is not None
+        and leader.start_ticks == process.leader_start_ticks
+        and leader.state not in _ZOMBIE_STATES
+    ):
+        raise _ProcessEvidenceChanged(
+            f"thread {process.pid} of exited process {process.leader_pid} executed a "
+            f"new program, which now runs as PID {process.leader_pid}"
+        )
+
+
+def _recheck_thread_group_observations(
+    processes: Sequence[_AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> None:
+    """Discard the attempt if thread-group motion hid evidence from its readers.
+
+    Run after every reader of an attempt, before it is accepted.  Two motions
+    leave every reader looking at entries that show nothing, with no error
+    for its diagnostics to catch:
+
+    - an observed leader calls pthread_exit after the snapshot: its own maps
+      read empty, and a mount census that read another member of its mount
+      namespace never reads it, while its threads still hold its files;
+    - an observed surviving thread calls execve and takes over its leader's
+      PID (see `_assert_thread_kept_its_identity`).
+
+    Each costs one stat read per observation; only a process now in State Z
+    or X is read further.
+    """
+
+    for process in processes:
+        if budget is not None:
+            budget.remaining_seconds()
+        if process.leader_pid is not None:
+            _assert_thread_kept_its_identity(process)
+            continue
+        pid_dir = Path("/proc") / str(process.pid)
+        current = _read_process_stat(pid_dir)
+        if (
+            current is None
+            or current.start_ticks != process.start_ticks
+            or current.state not in _ZOMBIE_STATES
+        ):
+            continue
+        _assert_leader_released_its_threads(process, pid_dir)
 
 
 def _preflight_process_observations(
@@ -47809,20 +48004,41 @@ def _allow_only_vanished_process_diagnostics(
         raise Refusal(f"privileged {program} census diagnostics are undecodable") from exc
     pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
     changed_diagnostic: str | None = None
+    motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
         match = pattern.fullmatch(line)
         process = processes.get(int(match.group("pid"))) if match else None
         if process is None:
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
-        if _process_observation_is_active(process):
+        if _observation_is_active_deferring_motion(process, motion):
             changed_diagnostic = line
     # Validate every diagnostic before classifying motion: an earlier vanished
     # FD must not hide a later permission, malformed, or unknown-path refusal.
     # The enclosing bounded retry discards this entire incomplete census.
+    if motion:
+        raise motion[0]
     if changed_diagnostic is not None:
         raise _ProcessEvidenceChanged(
             f"privileged {program} census produced diagnostics: {changed_diagnostic}"
         )
+
+
+def _observation_is_active_deferring_motion(
+    process: _AbsentProcessObservation, motion: list[_ProcessEvidenceChanged],
+) -> bool:
+    """`_process_observation_is_active`, recording thread-group motion for later.
+
+    The diagnostic validators check every line before reacting to process
+    motion, so a motion found partway through must not stop the check of the
+    lines after it.  A recorded motion counts as active here; the caller
+    raises the first one after its loop.
+    """
+
+    try:
+        return _process_observation_is_active(process)
+    except _ProcessEvidenceChanged as exc:
+        motion.append(exc)
+        return True
 
 
 def _same_uid_indeterminate_processes(
@@ -47854,6 +48070,7 @@ def _same_uid_indeterminate_processes(
     )
     indeterminate: dict[int, _AbsentProcessObservation] = {}
     changed_diagnostic: str | None = None
+    motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
         missing = missing_pattern.fullmatch(line)
         if missing is not None:
@@ -47862,7 +48079,7 @@ def _same_uid_indeterminate_processes(
                 raise Refusal(
                     f"same-UID {program} census produced diagnostics: {line}"
                 )
-            if _process_observation_is_active(process):
+            if _observation_is_active_deferring_motion(process, motion):
                 changed_diagnostic = line
             continue
         denied = permission_pattern.fullmatch(line)
@@ -47871,9 +48088,11 @@ def _same_uid_indeterminate_processes(
         )
         if process is None:
             raise Refusal(f"same-UID {program} census produced diagnostics: {line}")
-        if not _process_observation_is_active(process):
+        if not _observation_is_active_deferring_motion(process, motion):
             continue
         indeterminate[process.pid] = process
+    if motion:
+        raise motion[0]
     if changed_diagnostic is not None:
         raise _ProcessEvidenceChanged(
             f"same-UID {program} census produced diagnostics: {changed_diagnostic}"
@@ -48076,16 +48295,18 @@ def _same_uid_process_observations(
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
     # As in _absent_validate_process_snapshot: a zombie leader's surviving
-    # threads are observed next, in its place.
-    pending = pid_dirs[::-1]
+    # threads are observed next, in its place, with its identity.
+    pending: list[tuple[Path, tuple[int, int] | None]] = [
+        (pid_dir, None) for pid_dir in reversed(pid_dirs)
+    ]
     while pending:
-        pid_dir = pending.pop()
+        pid_dir, leader = pending.pop()
         budget.remaining_seconds()
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
         if _process_generation_is_terminal(pid_dir, generation):
-            pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
+            pending.extend(reversed(_surviving_thread_entries(pid_dir, generation)))
             continue
         filesystem_uid = _process_filesystem_uid(pid_dir)
         if filesystem_uid is None or filesystem_uid != os.getuid():
@@ -48101,7 +48322,8 @@ def _same_uid_process_observations(
             raise
         if mount_namespace is None:
             if _process_is_zombie(pid_dir):
-                pending.extend(reversed(_zombie_leader_thread_dirs(pid_dir)))
+                # It exited after the terminal check above.
+                pending.extend(reversed(_surviving_thread_entries(pid_dir, generation)))
                 continue
             if _process_start_ticks(pid_dir) is None:
                 continue
@@ -48122,6 +48344,8 @@ def _same_uid_process_observations(
                 cgroup_path="",
                 mount_namespace=mount_namespace,
                 kernel_thread=bool(generation.flags & _PF_KTHREAD),
+                leader_pid=None if leader is None else leader[0],
+                leader_start_ticks=None if leader is None else leader[1],
             )
         )
     return tuple(observations)
@@ -48298,6 +48522,7 @@ def _capture_same_uid_process_path_census(
                 *direct_matches,
                 *privileged_matches,
             )
+            _recheck_thread_group_observations(processes, budget)
         except _ProcessEvidenceChanged:
             if attempt < 2:
                 continue
@@ -48348,20 +48573,36 @@ class _ProcessPathCensus:
             raise Refusal(
                 "process census omitted owner-cgroup evidence required for this slot"
             )
+        # A surviving thread observed in place of its exited leader belongs to
+        # that leader's process: it is ignored with it, and named as a thread.
+        leaders = {
+            process.pid: process.leader_pid
+            for process in self.processes
+            if process.leader_pid is not None
+        }
+
+        def holder(pid: int) -> str:
+            leader = leaders.get(pid)
+            return f"process {pid}" if leader is None else _thread_label(pid, leader)
+
+        def is_ignored(pid: int) -> bool:
+            leader = leaders.get(pid)
+            return pid in ignored or (leader is not None and leader in ignored)
+
         if _owner_cgroup_is_evidence(record) and record is not None and record.owner is not None:
             for process in self.processes:
-                if process.pid in ignored:
+                if is_ignored(process.pid):
                     continue
                 if _cgroup_matches(record.owner.cgroup_path, process.cgroup_path):
                     raise Refusal(
-                        f"live process {process.pid} remains in recorded owner cgroup "
+                        f"live {holder(process.pid)} remains in recorded owner cgroup "
                         f"{record.owner.cgroup_path}"
                     )
         label = str(slot_path)
         for pid, slot, kind, detail in self.matches:
-            if slot == label and pid not in ignored:
+            if slot == label and not is_ignored(pid):
                 raise Refusal(
-                    f"live process {pid} uses slot {slot_path}: {kind}={detail}; "
+                    f"live {holder(pid)} uses slot {slot_path}: {kind}={detail}; "
                     "stop it and retry"
                 )
 
@@ -48958,6 +49199,16 @@ def _batch_lsof_fallback(
 ) -> tuple[tuple[int, str, str, str], ...]:
     """Retain the original oracle only for the attributed disconnected cwd."""
 
+    for process in processes:
+        if process.leader_pid is not None:
+            # lsof finds processes by reading /proc, which lists only
+            # thread-group leaders: asked for this thread's ID it prints
+            # nothing and exits 1 (lsof 4.94), which would read as no use.
+            # Its leader has exited and shows nothing either.
+            raise Refusal(
+                f"disconnected cwd lsof fallback cannot inspect "
+                f"{_thread_label(process.pid, process.leader_pid)}"
+            )
     pids = {process.pid: process for process in processes}
     arguments = ["-nP", "-Fpcfn", "-a", "-p", ",".join(map(str, sorted(pids)))]
     for target in targets:
@@ -49174,6 +49425,7 @@ def _capture_lsof_process_path_census(
             unix = _batch_unix_socket_matches(
                 processes, targets, sockets, budget, selected_has_sockets=has_sockets,
             )
+            _recheck_thread_group_observations(processes, budget)
         except _ProcessEvidenceChanged:
             if attempt < 2:
                 continue
@@ -49366,6 +49618,7 @@ def _capture_process_path_census(
             mount_matches = _absent_validate_mount_matches(
                 processes, targets, selected_budget
             )
+            _recheck_thread_group_observations(processes, selected_budget)
         except _ProcessEvidenceChanged:
             if attempt < 2:
                 continue
@@ -49403,6 +49656,7 @@ def _assert_absent_validate_processes_unrelated(
                     f"live process {pid} may still use validation row {slot}: " f"{kind}={detail}"
                 )
             match = _absent_validate_privileged_path_match(processes, targets, budget)
+            _recheck_thread_group_observations(processes, budget)
         except _ProcessEvidenceChanged:
             if attempt < 2:
                 continue
