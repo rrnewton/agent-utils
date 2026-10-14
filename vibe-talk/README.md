@@ -3817,10 +3817,11 @@ places a live message by that record alone. A thread reply pushed into its threa
 ```
 
 A message pushed WITHOUT a thread record is not known to be anywhere. The page draws it on Main,
-where most such messages belong, and once the read behind it is done reads All's newest page to
-place it (`reason=place`); a thread reply pushed that way shows on Main until that read lands, which
-behind a slow chat service can be most of a minute (`#308 live-reply-in-main`). So an adapter that
-can say where a message is should say so in every create and update, not only in its reads.
+where most such messages belong, and once the read behind it is done reads All to place it
+(`reason=place`), after any read of the channel the page gave up on has been answered. A thread reply
+pushed that way shows on Main until that read lands, which behind a slow chat service can be more than
+a minute (`#308 live-reply-in-main`). So an adapter that can say where a message is should say so in
+every create and update, not only in its reads.
 
 Updates use `kind: "update"` with the complete current message. Deletes use
 `{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
@@ -4010,7 +4011,11 @@ after a change, a stream reset and an edit or removal out of the stream's replay
 as before, because each may need what no answer sent before it can carry. A poll put off this way
 leaves no loading line behind. The read given up on is not aborted: if its answer lands later it is
 drawn, unless a live event for its channel has arrived or another read of the channel has been sent
-since, either of which is newer.
+since, either of which is newer. The read of All that places what the live stream delivered without a
+thread record (`place`, `#308 live-reply-in-main`) waits as well: it is not sent while a read of the
+channel the page gave up on may still be answered, and goes when that answer lands or fails. Given up
+on itself, it is kept the same way: its late answer is used, and until it comes the poll of the view
+on screen is put off, since All's answer brings that view up to date too.
 
 **A refresh that brings nothing draws nothing, and a hidden page waits** (`#226
 page-energy-profile`). When a delta changes nothing — no message, deletion, read state, thread,

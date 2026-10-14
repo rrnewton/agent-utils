@@ -58514,7 +58514,7 @@ test("`#308 live-reply-in-main`: the placing read asks only what changed in All 
   }
 });
 
-test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up on is not asked again while the server may still be reading for it", async () => {
+test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up on is not asked again while the server may still be reading for it, and the poll of the view on screen waits for it", async () => {
   const run = async (script) => {
     const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
     const serve = page.timeline;
@@ -58532,10 +58532,19 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up
     await page.settle();
     state.hang = false;
     page.setClock(sent + 30000);
+    const calls = page.timelineCalls.length;
     await pollOnce(page);
-    return { page, placing, sent };
+    const polled = page.timelineCalls.length - calls;
+    // The reader's own act reads at once, as inside any wait, and its end does not ask again.
+    page.el("scroll-area").scrollTop = 0;
+    await pullDown(page, PULL_ARM_PX);
+    await page.settle();
+    await page.settle();
+    return { page, placing, sent, polled, pulled: page.timelineCalls.length - calls - polled };
   };
-  const { page, placing, sent } = await run(SCRIPT);
+  const { page, placing, sent, polled, pulled } = await run(SCRIPT);
+  assert.equal(polled, 0, "the poll of Main went beside a placing read the server may still be answering");
+  assert.ok(pulled >= 1, "a pull to refresh inside the wait did not read");
   assert.equal(placing(), 1, "the placing read given up on was asked again inside the server's bound");
   assert.ok(shownIds(page).includes("300"), "fixture: something else placed the reply");
   page.setClock(sent + SERVER_READ_BOUND_MS + 1000);
@@ -58543,9 +58552,85 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up
   assert.equal(placing(), 2, "the placing read was not asked again once the server's bound had passed");
   assert.ok(!shownIds(page).includes("300"), "the placing read that landed left the reply on Main");
 
-  // THE CONTROL: without the hold the poll's read ending asks again at once.
-  const control = await run(brokenScript(" ||\n      placingHeld(channel)) return;", ") return;"));
-  assert.equal(control.placing(), 2, "the placing read waited without the hold, so this test cannot see it");
+  // THE CONTROLS: without the wait, the pull's read ending asks again at once; held for no view, the
+  // poll of Main goes beside it.
+  const control = await run(brokenScript(" ||\n      placeUnplacedWaits(channel)) return;", ") return;"));
+  assert.equal(control.placing(), 2, "the placing read waited anyway, so this test cannot see it");
+  const unheld = await run(brokenScript("  const key = inColumn(columns.main, readHoldKey);\n", "  const key = \"elsewhere\";\n"));
+  assert.ok(unheld.polled > 0, "the poll of Main waited for a placing read held for no view, so this test cannot see it");
+});
+
+test("`#308 live-reply-in-main` x `remote-ops-audit` W7: the late answer of a placing read given up on places the reply and brings Main current, and the poll waits for it rather than throwing it away", async () => {
+  const run = async (script) => {
+    const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+    const serve = page.timeline;
+    /** @type {Array<() => void>} */
+    const held = [];
+    // Each placing read answered as the server had it when asked, and handed over when the test says.
+    page.timeline = (path, options) => {
+      if (!/reason=place/.test(path)) return serve(path, options);
+      const answer = serve(path, options);
+      return new Promise((resolve) => held.push(() => resolve(answer)));
+    };
+    const { pushed } = bridgeReply(page, server);
+    const sent = page.clock();
+    await deliver(page, page.stream(), sseMessage(pushed));
+    await page.settle();
+    assert.equal(held.length, 1, "no read of All was made to place the reply");
+    page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+    assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the placing read");
+    await page.settle();
+    assert.ok(shownIds(page).includes("300"), "fixture: the placing read was answered before it was given up on");
+    page.setClock(sent + 30000);
+    const calls = page.timelineCalls.length;
+    await pollOnce(page);
+    const polled = page.timelineCalls.length - calls;
+    // The server answers the placing read at forty seconds, as a slow bridge's newest page does.
+    page.setClock(sent + 40000);
+    held[0]();
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    return { page, polled, held };
+  };
+  const { page, polled, held } = await run(SCRIPT);
+  assert.equal(polled, 0, "the poll of Main went beside the placing read, which throws its answer away");
+  assert.equal(held.length, 1, "the placing read was asked again");
+  assert.ok(!shownIds(page).includes("300"), "the late answer of the placing read was thrown away");
+  assert.equal(threadButton(rowOf(page, "201")).textContent, "2 replies", "the root did not count the reply");
+  assertCurrent(page, "All's late answer did not bring Main current");
+  const before = page.timelineCalls.length;
+  await pollOnce(page);
+  assert.deepStrictEqual(readsSince(page, before).map(([view]) => view), ["main"],
+    "the poll of Main did not go once the placing read had answered");
+
+  // THE CONTROLS: a late answer dropped, as round 1 did, leaves the reply on Main; held for no view,
+  // the poll of Main goes beside the placing read and its answer is thrown away.
+  const dropped = await run(brokenScript("(late) => landPlacingRead(late, read),", "() => {},"));
+  assert.ok(shownIds(dropped.page).includes("300"), "the late answer placed the reply anyway, so this test cannot see it");
+  const unheld = await run(brokenScript("  const key = inColumn(columns.main, readHoldKey);\n", "  const key = \"elsewhere\";\n"));
+  assert.ok(unheld.polled > 0 && shownIds(unheld.page).includes("300"),
+    "the poll of Main waited, or the late answer stood beside it, so this test cannot see it");
+});
+
+test("`#308 live-reply-in-main`: a placing read that lands brings Main current, as any read of All does, though Main's own read failed", async () => {
+  const run = async (script) => {
+    const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+    const serve = page.timeline;
+    page.timeline = (path, options) => (/reason=place/.test(path) ? serve(path, options)
+      : errorResponse(502, "chat_error", "history read timed out")());
+    const { pushed } = bridgeReply(page, server);
+    // Later than Main's last read, as any arrival is.
+    page.setClock(page.clock() + 5000);
+    await deliver(page, page.stream(), sseMessage(pushed));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return { page };
+  };
+  const { page } = await run(SCRIPT);
+  assert.ok(!shownIds(page).includes("300"), "the placing read left the reply on Main");
+  assertCurrent(page, "All's answer did not bring Main current");
+
+  const control = await run(brokenScript("  followPlacement();\n  eachColumn(catchUpFromAll);\n", "  followPlacement();\n"));
+  assert.notEqual(freshness(control.page).getAttribute("data-state"), "fresh",
+    "Main was current without All's answer, so this test cannot see it");
 });
 
 test("`#308 live-reply-in-main`: a placing page of All that lands after the stream delivered another message does not take that message away, and is read again", async () => {
@@ -58579,8 +58664,65 @@ test("`#308 live-reply-in-main`: a placing page of All that lands after the stre
     "the placing page took away a message delivered after it was asked, or left the reply on Main");
 
   // THE CONTROL: folded regardless, the page sent before the aside takes it out as deleted.
-  const control = await run(brokenScript("        if ((liveEventsSeen.get(channel) || 0) !== live) {",
-    "        if (false) {"));
+  const control = await run(brokenScript("    if ((liveEventsSeen.get(channel) || 0) !== read.live) return false;", ""));
   assert.ok(!shownIds(control.page).includes("207"),
     "the stale placing page left the aside alone anyway, so this test cannot see it");
 });
+
+// Review round 2. A read of the channel the page gave up on may still be answered (`remote-ops-audit`
+// W7), and its late answer is used only if no read of the channel was sent after it. A placing read
+// sent beside it threw that answer away, and was the second scan W7 exists to prevent. Behind a slow
+// bridge, where newest pages take longer than the page waits for them, that is what happens to every
+// message the stream delivers without a thread record whose Main read was given up on: a thread reply,
+// or a message posted to the channel itself.
+
+for (const kind of ["thread reply", "channel message"]) {
+  for (const answersAt of [35000, 50000]) {
+    test(`\`#308 live-reply-in-main\` x \`remote-ops-audit\` W7: a ${kind} the stream sent without its thread, Main's read given up on and answered at ${answersAt / 1000} s: the late answer lands, the pill is current, and no read went beside it`, async () => {
+      const run = async (script) => {
+        const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+        const placing = () => page.timelineCalls.filter((call) => /reason=place/.test(call)).length;
+        // A message to the channel itself that only the read carries: the stream never delivers it.
+        server.post(message({ id: "450", content: "posted to the channel, and only on its read" }));
+        const minute = answerInAMinute(server);
+        const pushed = kind === "thread reply" ? bridgeReply(page, server).pushed
+          : server.post(message({ id: "460", content: "posted to the channel, and pushed with no thread record" }));
+        const sent = page.clock();
+        await deliver(page, page.stream(), sseMessage(pushed));
+        await page.settle();
+        assert.ok(shownIds(page).includes(pushed.id), "fixture: the pushed message was not drawn on arrival");
+        page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+        assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded Main's read");
+        await page.settle();
+        await page.settle();
+        const beside = placing();
+        assert.ok(!shownIds(page).includes("450"), "fixture: Main's read was answered before it was given up on");
+        // Anything sent at twenty seconds is given up on at forty.
+        if (answersAt > 2 * CHANNEL_READ_TIMEOUT_MS) {
+          page.setClock(sent + 2 * CHANNEL_READ_TIMEOUT_MS);
+          page.expireTimers(CHANNEL_READ_TIMEOUT_MS);
+          await page.settle();
+        }
+        page.setClock(sent + answersAt);
+        minute.release();
+        for (let i = 0; i < 4; i += 1) await page.settle();
+        return { page, beside, placing, pushed };
+      };
+      const { page, beside, placing, pushed } = await run(SCRIPT);
+      assert.equal(beside, 0, "a placing read went beside Main's read while the server was still answering it");
+      assert.ok(shownIds(page).includes("450"), "the late answer of Main's read was thrown away");
+      assertCurrent(page, "the late answer of Main's read did not bring the channel back to current");
+      if (kind === "thread reply") {
+        assert.ok(!shownIds(page).includes(pushed.id), "the reply was not placed once Main's late answer had landed");
+        assert.equal(placing(), 1, "the reply was not placed by one read");
+      } else {
+        assert.ok(shownIds(page).includes(pushed.id), "the message posted to the channel left Main");
+        assert.equal(placing(), 0, "a read of All went for a message Main's late answer had placed");
+      }
+
+      // THE CONTROL: placing as soon as Main's read is given up on, as round 1 did, reads beside it.
+      const control = await run(brokenScript(" ||\n      placeUnplacedWaits(channel)) return;", ") return;"));
+      assert.ok(control.beside > 0, "no placing read went beside Main's read without the wait, so this test cannot see it");
+    });
+  }
+}
