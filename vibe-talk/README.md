@@ -5735,15 +5735,18 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   nothing, as no key does.
 - **A view key shows the view where it is read, and nothing moves it after** (`#281 view-keys`). Ctrl+3
   (Cmd+3 on a Mac) opens the thread list at its foot, as two columns open their cards; Ctrl+1 back to Main
-  finds the reader where they left it, since Main stays laid out behind the list; Ctrl+2 and Ctrl+4 show
-  All and two columns at their newest or the reader's place, and the cards keep theirs between the thread
-  list and two columns. The cards are placed once the view picker says the new view: it is as wide as
-  what it says, and "Thread list" wrapped a desk's dock onto a second row after the cards had been put at
-  their foot, which left the list 43px above it. In the thread list, as on the right, a reader at the foot
-  of the cards stays there as they change size, and as the dock grows under them whenever it does: there
-  the dock is only as wide as the reading column, and on a reload in the thread list its last button came
-  in about 30 ms after the cards were placed and wrapped it, which left the list 43px above its foot for
-  good. The same keeps the cards beside Main at their foot when a channel's longer name wraps the dock.
+  finds the reader where they left it, since Main stays laid out behind the list; Esc or Ctrl+2 back to
+  All, from a list opened from All, finds them where they left All, from the place read as the list came
+  up — Main lacks All's replies, and a place near All's foot taken through Main came back at All's foot;
+  otherwise Ctrl+2 and Ctrl+4 show All and two columns at their newest or the reader's place, and the
+  cards keep theirs between the thread list and two columns. The cards are placed once the view picker
+  says the new view: it is as wide as what it says, and "Thread list" wrapped a desk's dock onto a second
+  row after the cards had been put at their foot, which left the list 43px above it. In the thread list,
+  as on the right, a reader at the foot of the cards stays there as they change size, and as the dock
+  grows under them whenever it does: there the dock is only as wide as the reading column, and on a
+  reload in the thread list its last button came in about 30 ms after the cards were placed and wrapped
+  it, which left the list 43px above its foot for good. The same keeps the cards beside Main at their foot
+  when a channel's longer name wraps the dock.
 
 `tests/scroll_stability_browser.py` (DAG step `scroll-stability-browser`) measures them in Chromium at
 1280x800 in two columns and 412x915 in one: the first row on screen and its offset through live
@@ -7577,8 +7580,13 @@ it; Ctrl+1, Ctrl+2 and, in a window wide enough for two columns, Ctrl+4 put it b
 the channel's list, Main followed down to it by a reader left on its newest line, and offering the
 jump to anyone up it; in a narrower one Ctrl+4 leaves the list and the card where they are, saying
 why. The card going and coming back moves the channel's reader no more than the list coming and
-going does (`#280 scroll-stability`): back from the list, a reader who was at the foot of Main or All
-is at its foot again with Send on screen, and one up the list is on the row they were reading.
+going does (`#280 scroll-stability`): back from the list to the view they left — Main by Ctrl+1, All
+by Ctrl+2, either by Esc where the list was opened from it — a reader who was at its foot is at its
+foot again with Send on screen, and one up the list is on the row they were reading and offered the
+jump to the card below them. A draft arriving while the list is up moves Main behind it no more than
+one arriving on the channel does, though Main's box gives up its room under the card in the same
+moment: a reader at Main's foot follows it, and one up Main stays on their row, there and on the way
+back.
 
 **What happens to a draft when the call ends depends on who ended it.** Hang up retires it: the
 card goes, and the next call on the same page does not offer it again; it lapses on the server. The

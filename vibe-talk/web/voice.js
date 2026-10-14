@@ -10604,6 +10604,14 @@ function postCardWhere(proposal) {
  * move, which leaves a reader up the list where they were. Counted as growth, in Chromium Cmd+3 pulled
  * a reader as far as 380px up Main to its foot behind the cards, and Cmd+1 found them there. A card
  * arriving docked is the dock growing, as before.
+ *
+ * ...but not the dock growing alone. The card COMING UP docked there gives the main screen `data-draft`
+ * as well, which shrinks the message box at the foot of Main's list to one line in the same layout: in
+ * Chromium the channel's box went from 192px to 90px as the card took 246px from under the list. The
+ * keeper reckons a reader within the slack plus the growth of the foot to have been at it, which holds
+ * only when nothing else moved the foot, and so took readers up to 110px up Main for readers at its foot
+ * and pulled them down behind the cards. So where Main's reader was BEFORE either change is noted for
+ * the keeper, which judges by that (`cardCameUnderLists`).
  */
 function placePostCard() {
   const card = leftEl("post-confirm");
@@ -10624,6 +10632,9 @@ function placePostCard() {
   const moving = shown && !card.hidden && currentScreen === "main" && from !== place &&
     (from === "dock" ? card.getAttribute("data-screen") === "main" : place === "dock");
   const under = moving ? heightUnderLists() : 0;
+  const coming = shown && card.hidden && currentScreen === "main" && place === "dock";
+  const main = leftEl("scroll-area");
+  const gap = coming ? main.scrollHeight - main.scrollTop - (main.clientHeight || 0) : 0;
   if (parent && (card.parentNode !== parent || card.nextSibling !== before)) {
     parent.insertBefore(card, before);
   }
@@ -10635,6 +10646,7 @@ function placePostCard() {
   card.hidden = !shown || place === "none";
   if (moving) cardMovedUnderLists(heightUnderLists() - under);
   holdDraftRoom(shown);
+  if (coming) cardCameUnderLists(gap);
   // What the chips and the status pill stand on has just changed.
   placeChipsOverComposer();
 }
@@ -35065,9 +35077,10 @@ let columnsShown = false;
 let threadListShown = false;
 
 /**
- * Where the reader of the left column was as the thread list came up and docked the send card from the
- * foot of that column's list, read by `readerPlace` with the card still in it, on Main or All; and on
- * which channel. Null when no card stood there. `#280 scroll-stability` x `#269 approval-card-inline`.
+ * Where the reader of the left column was as the thread list came up, read by `readerPlace` on Main or
+ * All, with a send card at the foot of that column's list still in it, before it is docked; in which of
+ * the two views, and on which channel. Null when the left column showed neither. `#280 scroll-stability`
+ * x `#269 approval-card-inline`.
  *
  * Main, behind the list, cannot keep that place itself. In Chromium the card stands 396px tall at the
  * foot of a phone's list and 246px docked, so as it goes, a reader nearer the foot than the difference
@@ -35076,7 +35089,13 @@ let threadListShown = false;
  * way in and back in it on the way out. So the place is put back as the card comes back
  * (`leaveThreadList`), before the left column's view is decided.
  *
- * @type {{place: ReturnType<typeof readerPlace>, channel: string} | null}
+ * ...and put back in All as well, card or no card, when it was read in All and All is what the way out
+ * shows: Esc, the list having been chosen from All, or Ctrl+2. All is Main behind the list, and Main
+ * lacks All's replies, so a place near All's foot was clamped at Main's, and the way back read Main's
+ * reader as on its newest line and took All to its foot. In Chromium every reader 30 to 175px up All
+ * came back at its foot without a card, and with one, 200 and 225px up too.
+ *
+ * @type {{place: ReturnType<typeof readerPlace>, view: string, channel: string} | null}
  */
 let listHeldPlace = null;
 
@@ -35729,14 +35748,10 @@ function showOneColumnLeft() {
  */
 function enterThreadList(from = "one") {
   threadListShown = true;
-  // `#280 scroll-stability`. Where the reader of the left column is, read while the card is still at
-  // the foot of its list, for the way out of the list (`listHeldPlace`).
-  listHeldPlace = inColumn(columns.main, () => {
-    const card = leftEl("post-confirm");
-    const inList = postWatch.shown !== null && !card.hidden && card.getAttribute("data-place") === "channel";
-    return inList && (channelView === "main" || channelView === "flat")
-      ? { place: readerPlace(), channel: String(el("discord-channel").value) } : null;
-  });
+  // `#280 scroll-stability`. Where the reader of the left column is, read while a card is still at the
+  // foot of its list, for the way out of the list (`listHeldPlace`).
+  listHeldPlace = inColumn(columns.main, () => (channelView === "main" || channelView === "flat"
+    ? { place: readerPlace(), view: channelView, channel: String(el("discord-channel").value) } : null));
   // `#269 approval-card-inline`. A send card waiting at the foot of the left column, behind the list
   // now, is docked under the cards (`placePostCard`) BEFORE they are opened or put back, so that the
   // foot they are placed at is the one above it.
@@ -35771,6 +35786,12 @@ function leaveThreadList(next = "one") {
   // foot on a phone and 337px at a desk, Send off screen. The place read as the list came up, with the
   // card still in Main's list, is what is put back, where it still holds (`listHeldPlace`): the card's
   // going moved a reader near the foot.
+  //
+  // ...and a place read in All is put back in All as well, card or no card, once the way out has shown
+  // All, where every row the reader could see is. Main lacks All's replies, so a place near All's foot
+  // put back in Main is at Main's foot, and the switch to All took that for a reader on the newest line
+  // and went to All's foot. A reader up All is offered the jump to a card come back below them, as one
+  // up Main is.
   const carded = postWatch.shown !== null;
   const follows = carded && liveFollowers().main;
   const shown = `${channelView}|${selectedThreadId}`;
@@ -35786,7 +35807,10 @@ function leaveThreadList(next = "one") {
     return follows;
   });
   if (next === "one") showOneColumnLeft();
-  if (carded && !followed && `${channelView}|${selectedThreadId}` === shown) {
+  const backInAll = next === "one" && held !== null && held.view === "flat" && inColumn(columns.main, () =>
+    currentScreen === "main" && currentView === "discord" && channelView === "flat" &&
+    String(el("discord-channel").value) === held.channel && keepReaderPlace(held.place));
+  if (carded && (backInAll ? !held.place.pinned : !followed && `${channelView}|${selectedThreadId}` === shown)) {
     inColumn(columns.main, () => followIfPinned(false, 0, "discord"));
   }
   renderSearchInAll();
@@ -41721,9 +41745,11 @@ function heightUnderLists() {
 
 /**
  * What the dock-growth keeper of Main's list (below) noted at its last report: the list's height and
- * `heightUnderLists`. Null before the first.
+ * `heightUnderLists`, and, from a send card that has come up docked under the thread list since, how
+ * far from the foot of Main's list its reader was before it did (`cardCameUnderLists`). Null before the
+ * first.
  *
- * @type {{list: number, dock: number} | null}
+ * @type {{list: number, dock: number, gap?: number} | null}
  */
 let mainUnderLists = null;
 
@@ -41738,6 +41764,18 @@ let mainUnderLists = null;
  */
 function cardMovedUnderLists(px) {
   if (mainUnderLists !== null) mainUnderLists = { ...mainUnderLists, dock: mainUnderLists.dock + px };
+}
+
+/**
+ * `#280 scroll-stability` x `#281 view-keys`. The send card came up docked under the thread list, Main's
+ * reader `gap` px from the foot of its list just before (`placePostCard`). Told to Main's keeper, which
+ * judges whether that reader was at the foot by `gap` at its next report, rather than by how near the
+ * foot they are left: the box at the list's foot shrank in the same layout as the dock grew.
+ *
+ * @param {number} gap
+ */
+function cardCameUnderLists(gap) {
+  if (mainUnderLists !== null) mainUnderLists = { ...mainUnderLists, gap };
 }
 // `#218 desktop-dock`. On a desk the dock is one row of controls or two, and which depends on what
 // is in it — a call going live, a long channel name, a label changing length. When it grows it takes
@@ -41763,7 +41801,10 @@ function cardMovedUnderLists(px) {
 // column's list behind them, exactly as a second row of the dock does, so a reader at either foot is
 // kept on it as the card comes, and as it grows, and More opens it. Not as it MOVES there from the foot
 // of Main's list, or back (`cardMovedUnderLists`): that list loses the card's height as the card takes
-// it from under the list, and a reader up it is exactly where they were.
+// it from under the list, and a reader up it is exactly where they were. And as it COMES, the reader
+// at Main's foot is the one who was within the slack of it before (`cardCameUnderLists`): the box at
+// the list's foot shrinks to one line in the same layout, which leaves a reader up the list nearer the
+// foot than the slack plus the growth, and they are not pulled down to it.
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(() => {
     const area = el("scroll-area");
@@ -41786,6 +41827,10 @@ if (typeof window.ResizeObserver === "function") {
     // box in view rather than letting the list's foot, where the box is, slide under the dock.
     if (shrank && writingToAgent()) {
       keepComposerInView();
+      return;
+    }
+    if (grew > 0 && seen !== null && seen.gap !== undefined) {
+      if (seen.gap <= BOTTOM_SLACK_PX) area.scrollTop = area.scrollHeight;
       return;
     }
     if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
