@@ -1,12 +1,13 @@
 ---
 title: 'dagrun-capture-races: keep a perf acknowledgement that lands as the step finishes, and check wprof''s exit at the window boundary'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - dagrun
 created_at: 2026-10-14T14:48:59.060559836+00:00
-updated_at: 2026-10-14T14:48:59.060559836+00:00
+updated_at: 2026-10-14T16:06:56.446670529+00:00
+closed_at: 2026-10-14T16:06:30.073799752+00:00
 ---
 
 # Description
@@ -16,3 +17,7 @@ updated_at: 2026-10-14T14:48:59.060559836+00:00
 # Acceptance Criteria
 
 Both editions read a pending perf acknowledgement before honouring step completion or the deadline, with a regression test that orders the acknowledgement before completion; the Rust wprof stop controller re-checks exit at the window boundary, with tests; the dagrun differential still agrees; make validate passes.
+
+# Notes
+
+[opus 5.5] Closed: both editions now read a perf acknowledgement that lands as the step finishes (the finish flag and deadline are sampled before each read, with interleaving regression tests in each), and the Rust wprof stop controller now checks the workload and then the profiler's exit at the window boundary in the Python edition's order, with helper and controller tests. Deliberately not done: 565e8325's cgroup teardown, and the editions' differing wprof error wording ("profiling window" in Rust, "selected window" in Python). Unverified: make validate is not green, only because of two failures already present on base 5860c83c in wrkslots files this work does not touch (strict mypy on its tests, and the lifecycle partition count 1958 != 1947). Every check that sees this change passed, including both dagrun differentials.

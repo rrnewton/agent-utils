@@ -2263,10 +2263,23 @@ fn stop_wprof_at_window_boundary(
     profiler: &PinnedProcess,
     cwd: &Path,
     signal_timeout: Duration,
+    workload_finished: &mpsc::Receiver<()>,
+    origin: Instant,
 ) -> WprofStopOutcome {
-    // The profiler can exit after the controller's last in-window poll but before the deadline
-    // branch runs. Observe the pinned identity once more before signaling so an exit that already
-    // happened is not misclassified as a signal or artifact failure.
+    // The workload can finish, or the profiler exit, after the controller's last in-window poll
+    // but before the deadline branch runs. Make the in-window checks once more, in the same order
+    // as the Python edition's last pass (workload finished, then profiler exited, then signal), so
+    // a step that ended at the boundary is reported as ending before the window did and an exit
+    // that already happened is not misclassified as a signal or artifact failure.
+    match workload_finished.try_recv() {
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+            return WprofStopOutcome {
+                workload_elapsed_s: Some(origin.elapsed().as_secs_f64()),
+                ..WprofStopOutcome::default()
+            };
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
     if profiler.exited(Duration::ZERO).unwrap_or(false) {
         return WprofStopOutcome {
             error: "wprof exited before the profiling window ended".to_string(),
@@ -2347,7 +2360,16 @@ fn start_wprof_stop_controller(
                         .min(Duration::from_millis(10)),
                 );
             }
-            stop_wprof_at_window_boundary(&config, &profiler, &cwd, signal_timeout)
+            #[cfg(test)]
+            guest_launch.observe_wprof_control("window-boundary");
+            stop_wprof_at_window_boundary(
+                &config,
+                &profiler,
+                &cwd,
+                signal_timeout,
+                &workload_finished,
+                origin,
+            )
         })
         .map_err(|error| error.to_string())
 }
@@ -3181,10 +3203,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wprof_window_boundary_observes_a_completed_pidfd_before_signaling() {
-        let root = temp_dir("wprof-boundary-exit");
-        let mut child = Command::new("/bin/sh")
+    /// A child that exits as soon as it reads one line on stdin. It stays unreaped until the
+    /// test waits for it, so its pidfd remains an exact identity after the exit.
+    fn spawn_gated_exit() -> (Child, PinnedProcess) {
+        let child = Command::new("/bin/sh")
             .args(["-c", "IFS= read -r gate; exit 0"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -3192,17 +3214,170 @@ mod tests {
             .spawn()
             .unwrap();
         let profiler = pin_process(i32::try_from(child.id()).unwrap(), false).unwrap();
+        (child, profiler)
+    }
 
-        // The pipe release and pidfd poll are an exact happens-before barrier: the child has
-        // exited, but remains unreaped and PID-pinned, before the boundary decision is allowed.
+    /// Release a gated child and wait until its pidfd reports the exit. The pipe write and the
+    /// pidfd poll are an exact happens-before barrier: when this returns, the child has exited.
+    fn exit_gated_child(child: &mut Child, profiler: &PinnedProcess) {
         child.stdin.take().unwrap().write_all(b"go\n").unwrap();
-        assert!(profiler.exited(Duration::from_secs(1)).unwrap());
+        assert!(profiler.exited(Duration::from_secs(10)).unwrap());
+    }
+
+    fn spawn_sleeper() -> (Child, PinnedProcess) {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let profiler = pin_process(i32::try_from(child.id()).unwrap(), false).unwrap();
+        assert!(!profiler.exited(Duration::ZERO).unwrap());
+        (child, profiler)
+    }
+
+    fn reap_sleeper(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn wprof_window_boundary_observes_a_completed_pidfd_before_signaling() {
+        let root = temp_dir("wprof-boundary-exit");
+        let (mut child, profiler) = spawn_gated_exit();
+        let (_workload_sender, workload_finished) = mpsc::sync_channel::<()>(1);
+
+        exit_gated_child(&mut child, &profiler);
         let outcome = stop_wprof_at_window_boundary(
             &CaptureConfig::new(&root),
             &profiler,
             &root,
-            Duration::from_secs(1),
+            Duration::from_secs(10),
+            &workload_finished,
+            Instant::now(),
         );
+        let status = child.wait().unwrap();
+
+        assert!(status.success());
+        assert!(!outcome.sent);
+        assert_eq!(
+            outcome.error,
+            "wprof exited before the profiling window ended"
+        );
+        assert_eq!(outcome.workload_elapsed_s, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wprof_window_boundary_signals_a_still_running_process() {
+        let root = temp_dir("wprof-boundary-running");
+        let (mut child, profiler) = spawn_sleeper();
+        let (_workload_sender, workload_finished) = mpsc::sync_channel::<()>(1);
+
+        let outcome = stop_wprof_at_window_boundary(
+            &CaptureConfig::new(&root),
+            &profiler,
+            &root,
+            Duration::from_secs(10),
+            &workload_finished,
+            Instant::now(),
+        );
+        let status = wait_child(&mut child, Duration::from_secs(10)).unwrap();
+        if status.is_none() {
+            reap_sleeper(&mut child);
+        }
+
+        assert!(outcome.sent, "{}", outcome.error);
+        assert!(outcome.error.is_empty());
+        assert_eq!(
+            status.and_then(|status| status.signal()),
+            Some(libc::SIGINT)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wprof_window_boundary_checks_the_workload_before_the_profiler_exit() {
+        // Python's last pass checks `workload_done` before `_pidfd_exited`, so when both have
+        // happened by the boundary the step is reported as ending before the window, with no
+        // early-exit error and no signal.
+        let root = temp_dir("wprof-boundary-order");
+        let (mut child, profiler) = spawn_gated_exit();
+        let (workload_sender, workload_finished) = mpsc::sync_channel::<()>(1);
+
+        exit_gated_child(&mut child, &profiler);
+        workload_sender.send(()).unwrap();
+        let outcome = stop_wprof_at_window_boundary(
+            &CaptureConfig::new(&root),
+            &profiler,
+            &root,
+            Duration::from_secs(10),
+            &workload_finished,
+            Instant::now(),
+        );
+        let status = child.wait().unwrap();
+
+        assert!(status.success());
+        assert!(!outcome.sent);
+        assert!(outcome.error.is_empty(), "{}", outcome.error);
+        assert!(outcome.workload_elapsed_s.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Start the real stop controller with its window boundary already due, and hold it on the
+    /// boundary until the caller has arranged the state the boundary decision must observe.
+    ///
+    /// The launch is published before the controller starts and the end offset is zero, so the
+    /// in-window loop never runs and the controller goes straight from observing the launch to
+    /// the boundary. The rendezvous observer channel blocks it at both milestones until the test
+    /// receives them, which orders the test's actions exactly between the two.
+    fn controller_held_at_window_boundary(
+        root: &Path,
+        profiler: PinnedProcess,
+    ) -> (
+        thread::JoinHandle<WprofStopOutcome>,
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<&'static str>,
+    ) {
+        let guest_launch = GuestLaunchSignal::default();
+        let (events, observed) = mpsc::sync_channel(0);
+        *guest_launch.state.wprof_control_events.lock().unwrap() = Some(events);
+        guest_launch
+            .notify("build.app", std::process::id(), Instant::now())
+            .unwrap();
+        let (workload_sender, workload_finished) = mpsc::sync_channel(1);
+        let controller = start_wprof_stop_controller(
+            CaptureConfig::new(root),
+            profiler,
+            root.to_path_buf(),
+            guest_launch,
+            0.0,
+            Duration::from_secs(10),
+            workload_finished,
+        )
+        .unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "launch-observed"
+        );
+        (controller, workload_sender, observed)
+    }
+
+    #[test]
+    fn wprof_stop_controller_rechecks_exit_at_the_window_boundary() {
+        let root = temp_dir("wprof-controller-boundary-exit");
+        let (mut child, profiler) = spawn_gated_exit();
+        let watcher = profiler.try_clone().unwrap();
+        let (controller, _workload_sender, observed) =
+            controller_held_at_window_boundary(&root, profiler);
+
+        exit_gated_child(&mut child, &watcher);
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "window-boundary"
+        );
+        let outcome = controller.join().unwrap();
         let status = child.wait().unwrap();
 
         assert!(status.success());
@@ -3215,35 +3390,28 @@ mod tests {
     }
 
     #[test]
-    fn wprof_window_boundary_signals_a_still_running_process() {
-        let root = temp_dir("wprof-boundary-running");
-        let mut child = Command::new("/bin/sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let profiler = pin_process(i32::try_from(child.id()).unwrap(), false).unwrap();
-        assert!(!profiler.exited(Duration::ZERO).unwrap());
+    fn wprof_stop_controller_never_signals_after_the_workload_finished_at_the_boundary() {
+        let root = temp_dir("wprof-controller-boundary-finished");
+        let (mut child, profiler) = spawn_sleeper();
+        let watcher = profiler.try_clone().unwrap();
+        let (controller, workload_sender, observed) =
+            controller_held_at_window_boundary(&root, profiler);
 
-        let outcome = stop_wprof_at_window_boundary(
-            &CaptureConfig::new(&root),
-            &profiler,
-            &root,
-            Duration::from_secs(1),
-        );
-        let status = wait_child(&mut child, Duration::from_secs(1)).unwrap();
-        if status.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        assert!(outcome.sent, "{}", outcome.error);
-        assert!(outcome.error.is_empty());
+        workload_sender.send(()).unwrap();
         assert_eq!(
-            status.and_then(|status| status.signal()),
-            Some(libc::SIGINT)
+            observed.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "window-boundary"
+        );
+        let outcome = controller.join().unwrap();
+        let still_running = !watcher.exited(Duration::ZERO).unwrap();
+        reap_sleeper(&mut child);
+
+        assert!(!outcome.sent);
+        assert!(outcome.error.is_empty(), "{}", outcome.error);
+        assert!(outcome.workload_elapsed_s.is_some());
+        assert!(
+            still_running,
+            "wprof must not be signalled once the step has ended"
         );
         fs::remove_dir_all(root).unwrap();
     }

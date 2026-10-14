@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal
 import stat
 import subprocess
 import threading
@@ -655,6 +656,123 @@ def test_wprof_teardown_kills_profiler_descendants(
     while Path(f"/proc/{descendant_pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not Path(f"/proc/{descendant_pid}").exists()
+
+
+def _spawn_gated_exit() -> tuple[subprocess.Popen[bytes], capture._PinnedProcess]:
+    """A child that exits once it reads a line, left unreaped so its pidfd stays exact."""
+
+    child = subprocess.Popen(
+        ["/bin/sh", "-c", "IFS= read -r gate; exit 0"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    profiler, error = capture._pin_process(child.pid, privileged=False)
+    assert profiler is not None, error
+    return child, profiler
+
+
+def _exit_gated_child(child: subprocess.Popen[bytes], profiler: capture._PinnedProcess) -> None:
+    """Release the gate and wait on the pidfd: when this returns the child has exited."""
+
+    assert child.stdin is not None
+    child.stdin.write(b"go\n")
+    child.stdin.close()
+    assert capture._pidfd_exited(profiler, 10.0)
+
+
+def _spawn_sleeper() -> tuple[subprocess.Popen[bytes], capture._PinnedProcess]:
+    child = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    profiler, error = capture._pin_process(child.pid, privileged=False)
+    assert profiler is not None, error
+    assert not capture._pidfd_exited(profiler, 0.0)
+    return child, profiler
+
+
+def _wprof_stop_at_window_boundary(
+    tmp_path: Path, profiler: capture._PinnedProcess, workload_done: threading.Event
+) -> capture._WprofStopOutcome:
+    """Run the stop controller's decision on the pass that finds the window has ended.
+
+    The launch is already observed and the end offset is zero, so the first pass of the window
+    loop is the boundary pass. It runs on this thread, after the caller arranged its state.
+    """
+
+    controller = capture._WprofStopController(
+        CaptureConfig(output_dir=tmp_path),
+        profiler,
+        capture.GuestLaunchSignal(),
+        0.0,
+        workload_done,
+    )
+    controller.launch = capture.GuestLaunch(
+        step="build.app", pid=os.getpid(), monotonic_s=time.monotonic()
+    )
+    controller._run()
+    return controller.outcome
+
+
+def test_wprof_window_boundary_reports_an_exit_instead_of_signalling(tmp_path: Path) -> None:
+    child, profiler = _spawn_gated_exit()
+    try:
+        _exit_gated_child(child, profiler)
+        outcome = _wprof_stop_at_window_boundary(tmp_path, profiler, threading.Event())
+    finally:
+        profiler.close()
+        returncode = child.wait(timeout=10)
+
+    assert returncode == 0
+    assert not outcome.sent
+    assert outcome.error == "wprof exited before the selected window ended"
+
+
+def test_wprof_window_boundary_signals_a_still_running_profiler(tmp_path: Path) -> None:
+    child, profiler = _spawn_sleeper()
+    try:
+        outcome = _wprof_stop_at_window_boundary(tmp_path, profiler, threading.Event())
+        try:
+            returncode = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            raise
+    finally:
+        profiler.close()
+
+    assert outcome.sent, outcome.error
+    assert outcome.error == ""
+    assert returncode == -signal.SIGINT
+
+
+@pytest.mark.parametrize("profiler_exited", [True, False], ids=["exited", "running"])
+def test_wprof_window_boundary_checks_the_workload_first(
+    tmp_path: Path, profiler_exited: bool
+) -> None:
+    # The workload finishing is checked before the profiler's exit and before the signal, so a
+    # step that ended by the boundary is reported as ending before the window did: no early-exit
+    # error, and a running profiler is never interrupted.
+    child, profiler = _spawn_gated_exit()
+    workload_done = threading.Event()
+    try:
+        if profiler_exited:
+            _exit_gated_child(child, profiler)
+        workload_done.set()
+        outcome = _wprof_stop_at_window_boundary(tmp_path, profiler, workload_done)
+        still_running = not capture._pidfd_exited(profiler, 0.0)
+    finally:
+        profiler.close()
+        if child.stdin is not None and not child.stdin.closed:
+            child.stdin.close()
+        child.wait(timeout=10)
+
+    assert not outcome.sent
+    assert outcome.error == ""
+    assert still_running is not profiler_exited
 
 
 def test_privileged_artifacts_are_reclaimed_by_exact_path_then_made_private(
