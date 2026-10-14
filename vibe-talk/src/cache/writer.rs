@@ -34,6 +34,10 @@
 //!   checkpointer copies the log back concurrently, and this thread only checkpoints it itself
 //!   when it has grown large and the checkpointer has nearly caught up, or to truncate it after
 //!   a deletion.
+//! - **What the store's summaries must follow is sent after the commit.** A message tombstoned
+//!   because it was deleted upstream, a message whose text was replaced by newer text, and an
+//!   erased channel each leave a [`WriterEvent`], held until the transaction that did it commits
+//!   and then sent without waiting; a transaction rolled back sends nothing.
 //! - **Hot statements are prepared once per connection**, in this thread's frame.
 //! - **Every merge rule is in [`crate::cache::merge`]**; this file applies them. It never uses a
 //!   replacing insert: a conflicting row would be deleted without its delete trigger, leaving its
@@ -58,9 +62,9 @@ use super::structure;
 use super::{
     file, lock, CacheError, ChanKey, Envelope, Erasing, Incoming, ListEnd, ListStart, Listing,
     Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp, Stats, ThreadRecord,
-    BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP, TOMBSTONE_KEEP_MS,
+    WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP, TOMBSTONE_KEEP_MS,
 };
-use crate::model::MessageId;
+use crate::model::{ChannelId, MessageId};
 
 /// How often the hourly pass runs.
 const HOURLY: Duration = Duration::from_secs(60 * 60);
@@ -191,6 +195,7 @@ pub(crate) fn run(
                 pace_markers: Pace::new(),
                 pace_rebuild: Pace::new(),
                 since_merge: 0,
+                events: Vec::new(),
             };
             writer.start();
             let _ = started.send(());
@@ -553,6 +558,9 @@ struct Writer<'c> {
     pace_rebuild: Pace,
     /// Background steps since the last merge step.
     since_merge: u32,
+    /// What the transaction under way has done that the store must follow: sent when it commits
+    /// ([`Writer::announce`]), dropped when it rolls back.
+    events: Vec<WriterEvent>,
 }
 
 /// How long one kind of step works before it writes its index entries out, which takes a time
@@ -711,6 +719,7 @@ impl Writer<'_> {
         let mut done: Vec<(ChanKey, Stamp, Box<Observation>, Outcome)> = Vec::new();
         let mut last_seq = first.seq;
         let mut control = None;
+        self.events.clear();
         let began = self.conn.execute_batch("BEGIN IMMEDIATE");
         let mut failed = began.is_err();
         let mut next = Some(first);
@@ -767,6 +776,8 @@ impl Writer<'_> {
             if began.is_ok() {
                 let _ = self.conn.execute_batch("ROLLBACK");
             }
+            // Nothing the batch did stands; each observation applied again says it again.
+            self.events.clear();
             self.unflushed = 0;
             for entry in &mut done {
                 let (chan, stamp, observation) = (&entry.0, entry.1, &entry.2);
@@ -790,6 +801,9 @@ impl Writer<'_> {
             };
             Stats::add(counter, 1);
         }
+        // Sent before the applied mark moves, so a barrier that saw this batch applied sees its
+        // events sent too.
+        self.announce();
         Stats::add(&self.shared.stats.batches, 1);
         Stats::max(&self.shared.stats.batch_max_us, micros(started.elapsed()));
         self.work.merge = true;
@@ -872,22 +886,61 @@ impl Writer<'_> {
             .is_some_and(|routes| routes.allows(chan))
     }
 
-    /// Run `work` in its own transaction, outside any batch.
+    /// Run `work` in its own transaction, outside any batch, and send what it did that the store
+    /// must follow once it has committed.
     fn transaction<T>(
         &mut self,
         work: impl FnOnce(&mut Self) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
+        self.events.clear();
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match work(self) {
             Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    self.events.clear();
+                    return Err(error);
+                }
+                self.announce();
                 Ok(value)
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                self.events.clear();
                 Err(error)
             }
         }
+    }
+
+    /// Send the events of the transaction that has just committed, without waiting: an event
+    /// that finds the subscriber's queue full or gone is dropped and counted. With no
+    /// subscriber, nothing is sent and nothing counted.
+    fn announce(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let sender = lock(&self.shared.events).clone();
+        let Some(sender) = sender else {
+            self.events.clear();
+            return;
+        };
+        for event in self.events.drain(..) {
+            let counter = if sender.try_send(event).is_ok() {
+                &self.shared.stats.orphans_sent
+            } else {
+                &self.shared.stats.orphans_dropped
+            };
+            Stats::add(counter, 1);
+        }
+    }
+
+    /// The store's summaries of a message in `chan` are of text it no longer says: all of them
+    /// when `live_hash` is `None`, any of other text otherwise.
+    fn orphan(&mut self, chan: &ChanKey, message_id: &str, live_hash: Option<u64>) {
+        self.events.push(WriterEvent::SummaryOrphan {
+            channel_id: ChannelId(chan.channel_id.clone()),
+            message_id: MessageId(message_id.to_owned()),
+            live_hash,
+        });
     }
 
     /// Write out the index entries deleted since the last flush, so their cost is paid before
@@ -971,7 +1024,7 @@ impl Writer<'_> {
             }
             Observation::Deleted { ids, observed_ms } => {
                 for id in ids {
-                    self.delete_id(chan_id, id, None, *observed_ms)?;
+                    self.delete_id(chan, chan_id, id, None, *observed_ms)?;
                 }
                 Ok(())
             }
@@ -998,7 +1051,7 @@ impl Writer<'_> {
                     )
                 }
                 Push::Delete { id, created_ms } => {
-                    self.delete_id(chan_id, id, *created_ms, *observed_ms)
+                    self.delete_id(chan, chan_id, id, *created_ms, *observed_ms)
                 }
             },
             Observation::Threads {
@@ -1070,7 +1123,15 @@ impl Writer<'_> {
         let settled = coverage::absence_bound(head.as_ref(), newest, listing.observed_ms);
         let end = until.min(settled);
         if from < end {
-            self.absent(chan_id, &scope_key, from, end, listing.observed_ms, &seen)?;
+            self.absent(
+                chan,
+                chan_id,
+                &scope_key,
+                from,
+                end,
+                listing.observed_ms,
+                &seen,
+            )?;
         }
         let t0 = from.max(cutoff);
         if t0 < end {
@@ -1110,8 +1171,10 @@ impl Writer<'_> {
     }
 
     /// Rule 4: rows of this scope in `[from, to)` that the listing did not carry.
+    #[allow(clippy::too_many_arguments)]
     fn absent(
         &mut self,
+        chan: &ChanKey,
         chan_id: i64,
         scope_key: &str,
         from: i64,
@@ -1144,7 +1207,7 @@ impl Writer<'_> {
                 continue;
             }
             if home_key(&home_scope, thread_id.as_deref()) == scope_key {
-                self.tombstone(chan_id, row_id, &message_id, created_ms, observed_ms)?;
+                self.tombstone(chan, chan_id, row_id, &message_id, created_ms, observed_ms)?;
             } else {
                 self.conn.execute(
                     "DELETE FROM message_scope WHERE chan = ?1 AND scope_key = ?2 AND row_id = ?3",
@@ -1155,9 +1218,11 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Delete a row and leave a tombstone of ids and times only.
+    /// Delete a row, because the message was deleted upstream, and leave a tombstone of ids and
+    /// times only.
     fn tombstone(
         &mut self,
+        chan: &ChanKey,
         chan_id: i64,
         row_id: i64,
         message_id: &str,
@@ -1171,12 +1236,14 @@ impl Writer<'_> {
             .execute(params![chan_id, message_id, created_ms, deleted_ms])?;
         Stats::add(&self.shared.stats.tombstoned, 1);
         self.request_truncate();
+        self.orphan(chan, message_id, None);
         Ok(())
     }
 
     /// A deletion by id, from a push or a complete delta.
     fn delete_id(
         &mut self,
+        chan: &ChanKey,
         chan_id: i64,
         id: &MessageId,
         created_hint: Option<i64>,
@@ -1191,6 +1258,7 @@ impl Writer<'_> {
             // Content set by an observation that started after this deletion was seen stands.
             Some(row) if row.observed_ms > observed_ms => Ok(()),
             Some(row) => self.tombstone(
+                chan,
                 chan_id,
                 row.row_id,
                 id.as_str(),
@@ -1207,6 +1275,8 @@ impl Writer<'_> {
                     created,
                     observed_ms
                 ])?;
+                // The cache never held it, but the store may hold a summary of it.
+                self.orphan(chan, id.as_str(), None);
                 Ok(())
             }
         }
@@ -1445,6 +1515,10 @@ impl Writer<'_> {
                 .execute(params![next.row_id, next.search_text])?;
             self.unflushed += 1;
         }
+        if matches!(verdict, Verdict::Replace { .. }) {
+            let live = crate::summarize::content_hash(&next.content);
+            self.orphan(chan, message.id.as_str(), Some(live));
+        }
         Stats::add(&self.shared.stats.rows_written, 1);
         Ok(())
     }
@@ -1588,12 +1662,16 @@ impl Writer<'_> {
     /// Erase channels, logically and at once: a channel that holds messages has its row renamed
     /// out of every reader's reach ([`ERASED_PROVIDER`]), and its rows are deleted by later
     /// steps; one that holds none is deleted outright, its tombstones, coverage and heads with
-    /// it. A channel the file never held costs nothing.
+    /// it. A channel the file never held costs nothing. Each one the file named is announced as
+    /// erased, so the store can forget its summaries.
     fn detach(&mut self, chans: &[ChanKey]) -> rusqlite::Result<()> {
         for chan in chans {
             let Some(id) = self.find_chan(chan)? else {
                 continue;
             };
+            self.events.push(WriterEvent::ChannelErased {
+                channel_id: ChannelId(chan.channel_id.clone()),
+            });
             let holds: bool = self.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM message WHERE chan = ?1)",
                 [id],

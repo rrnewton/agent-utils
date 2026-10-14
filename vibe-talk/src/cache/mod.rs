@@ -50,6 +50,16 @@
 //! read-scope caller saw: such a caller is never given a stamp to write with, because every fill
 //! begins at the [`Sink`] under a [`FillGrant`] and a read-scope caller has none ([`grant`]).
 //!
+//! # What the durable store must follow
+//!
+//! Summaries are never in the cache: they stay in the store, keyed by the text they summarise.
+//! The cache is where the server learns that such text changed, so once a transaction that
+//! deleted a message because it was deleted upstream, replaced a message's text, or erased a
+//! channel has COMMITTED, the writer sends a [`WriterEvent`] to whoever subscribed
+//! ([`MessageCache::subscribe_events`]), through a bounded queue it never waits on: a full one
+//! drops the event and counts it. Rows the cache itself let go of — aged out, evicted, or erased
+//! with the whole file — send nothing: they say nothing about the message.
+//!
 //! # Privacy
 //!
 //! `secure_delete` on every connection, FTS5 `secure-delete` from creation and on at every commit,
@@ -101,7 +111,7 @@ pub use rows::{CachedMessage, ChanKey, Incoming, Scope};
 pub use search_text::{PlainText, Rendered, SearchTextSource};
 pub use sink::{Fill, Sink};
 
-use crate::model::MessageId;
+use crate::model::{ChannelId, MessageId};
 
 /// The most bytes of queued observations the writer's queue holds before offers are dropped.
 pub const QUEUE_BYTES: usize = 32 * 1024 * 1024;
@@ -464,6 +474,28 @@ impl Observation {
     }
 }
 
+/// Something the writer did that the durable store's summaries must follow, sent once the
+/// transaction that did it has committed. See the module documentation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriterEvent {
+    /// A message was deleted because it was deleted upstream (`live_hash` is `None`), or its text
+    /// was replaced by newer text (`live_hash` is that text's [`crate::summarize::content_hash`]):
+    /// a summary of any other text is of words the message no longer says.
+    SummaryOrphan {
+        /// The channel, by its own id: the store keys summaries without a provider.
+        channel_id: ChannelId,
+        /// The message.
+        message_id: MessageId,
+        /// The hash of the text the message says now, if it still exists.
+        live_hash: Option<u64>,
+    },
+    /// A channel was erased from the file: swept off the route snapshot, or erased by name.
+    ChannelErased {
+        /// The channel, by its own id. The same id may still be listed under another provider.
+        channel_id: ChannelId,
+    },
+}
+
 /// What happened to an offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offered {
@@ -588,6 +620,10 @@ pub struct CacheStats {
     pub integrity_failures: u64,
     /// `TRUNCATE` checkpoints that emptied the write-ahead log.
     pub checkpoints_truncated: u64,
+    /// [`WriterEvent`]s sent to their subscriber.
+    pub orphans_sent: u64,
+    /// [`WriterEvent`]s dropped because their subscriber's queue was full or gone.
+    pub orphans_dropped: u64,
 }
 
 macro_rules! counters {
@@ -633,6 +669,8 @@ counters!(
     compaction_slice_max_us,
     integrity_failures,
     checkpoints_truncated,
+    orphans_sent,
+    orphans_dropped,
 );
 
 impl Stats {
@@ -838,6 +876,9 @@ pub(crate) struct Shared {
     /// Erases the writer could not carry out. What they cover stays blocked until the file is
     /// erased: a cache that cannot forget a channel must not serve it either.
     pub(crate) erase_failed: Mutex<HashSet<Erasing>>,
+    /// Where the writer sends its [`WriterEvent`]s, once something has subscribed. Bounded, and
+    /// only ever `try_send`: the writer never waits on it.
+    pub(crate) events: Mutex<Option<tokio::sync::mpsc::Sender<WriterEvent>>>,
     /// A test's hook into [`MessageCache::read`], run at each [`ReadPoint`].
     #[cfg(test)]
     pub(crate) read_hook: Mutex<Option<ReadHook>>,
@@ -1068,6 +1109,7 @@ impl MessageCache {
             erasing: Mutex::new(HashMap::new()),
             sweep: Mutex::new(None),
             erase_failed: Mutex::new(HashSet::new()),
+            events: Mutex::new(None),
             #[cfg(test)]
             read_hook: Mutex::new(None),
         });
@@ -1391,6 +1433,16 @@ impl MessageCache {
     #[must_use]
     pub fn applied_seq(&self) -> u64 {
         self.shared.seq.applied()
+    }
+
+    /// Have the writer send its [`WriterEvent`]s to the returned receiver from now on, through a
+    /// queue of `capacity` events; a full one drops what does not fit, and counts it
+    /// ([`CacheStats::orphans_dropped`]). A later subscription takes the place of this one.
+    #[must_use]
+    pub fn subscribe_events(&self, capacity: usize) -> tokio::sync::mpsc::Receiver<WriterEvent> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity.max(1));
+        *lock(&self.shared.events) = Some(sender);
+        receiver
     }
 
     /// Whether a channel's head is untrusted because an offer for it was dropped and no read of

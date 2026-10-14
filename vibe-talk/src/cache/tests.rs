@@ -1772,9 +1772,14 @@ fn eviction_converges_below_the_size_limit_in_a_bounded_number_of_chunks() {
             ..Limits::default()
         },
     );
+    let mut events = cache.subscribe_events(64);
     cache.maintain(Maintenance::Bounds);
     assert!(cache.quiesce_blocking(Duration::from_secs(60)));
     let stats = cache.stats();
+    assert!(
+        events.try_recv().is_err(),
+        "rows the cache evicts say nothing about their messages"
+    );
     assert!(
         cache.bytes_on_disk() <= limit,
         "{} > {limit}",
@@ -1840,6 +1845,7 @@ fn the_hourly_pass_expires_old_rows_unrevalidated_rows_and_old_tombstones() {
             observed_ms: T0,
         },
     );
+    let mut events = fx.cache.subscribe_events(64);
     push_delete(&fx, "m3", T0 + 1);
     // Two days on: the one-day channel's row has aged out; nothing else has.
     fx.clock.set(T0 + 2 * DAY_MS);
@@ -1865,6 +1871,13 @@ fn the_hourly_pass_expires_old_rows_unrevalidated_rows_and_old_tombstones() {
     );
     assert_eq!(fx.cache.counts().served().expect("counts").tombstones, 0);
     assert_eq!(fx.cache.stats().integrity_failures, 0);
+    // The deletion was the message's own; the rows the age limit and the week took say nothing
+    // about theirs.
+    assert_eq!(
+        drain(&mut events),
+        [orphan("C1", "m3", None)],
+        "only the deletion is told to the store"
+    );
 }
 
 #[test]
@@ -1881,4 +1894,142 @@ fn revalidation_within_the_week_keeps_rows() {
     fx.cache.maintain(Maintenance::Hourly);
     fx.settle();
     assert_eq!(fx.ids(&Scope::Main), ids(&["m1", "m2"]));
+}
+
+// ---- what the store's summaries must follow -----------------------------------------------------
+
+fn drain(events: &mut tokio::sync::mpsc::Receiver<WriterEvent>) -> Vec<WriterEvent> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+fn orphan(channel: &str, message: &str, live: Option<&str>) -> WriterEvent {
+    WriterEvent::SummaryOrphan {
+        channel_id: ChannelId(channel.to_owned()),
+        message_id: mid(message),
+        live_hash: live.map(crate::summarize::content_hash),
+    }
+}
+
+fn erased(channel: &str) -> WriterEvent {
+    WriterEvent::ChannelErased {
+        channel_id: ChannelId(channel.to_owned()),
+    }
+}
+
+#[test]
+fn a_deletion_and_newer_text_are_told_to_the_store_and_nothing_else_is() {
+    let fx = Fixture::new("cache-events");
+    let mut events = fx.cache.subscribe_events(64);
+    fx.list(
+        vec![m(1), m(2), m(3), m(4)],
+        T0 + DAY_MS,
+        Some(newest_proof(ListStart::At(T0))),
+    );
+    assert_eq!(
+        drain(&mut events),
+        [],
+        "a read of what the cache did not hold"
+    );
+
+    // An edit pushed later: the text it says now.
+    let edited = Message {
+        content: "body number 2, edited".to_owned(),
+        ..m(2)
+    };
+    push(&fx, edited.clone(), true, T0 + DAY_MS + 1);
+    // The same text again, and a snippet of a read's text: nothing changes, nothing is told.
+    push(&fx, m(3), true, T0 + DAY_MS + 2);
+    let cut = Message {
+        content: "body…".to_owned(),
+        ..m(4)
+    };
+    push(&fx, cut, true, T0 + DAY_MS + 3);
+    // Deletions: of a row held, and of one never held.
+    push_delete(&fx, "m1", T0 + DAY_MS + 4);
+    push_delete(&fx, "m99", T0 + DAY_MS + 5);
+    assert_eq!(
+        drain(&mut events),
+        [
+            orphan("C1", "m2", Some("body number 2, edited")),
+            orphan("C1", "m1", None),
+            orphan("C1", "m99", None),
+        ]
+    );
+
+    // A later exhaustive read that lacks m3: gone upstream, and told so. It carries m2 as edited,
+    // which tells nothing new.
+    fx.clock.set(T0 + 2 * DAY_MS);
+    fx.list(
+        vec![edited, m(4), m(40)],
+        T0 + 2 * DAY_MS,
+        Some(newest_proof(ListStart::At(T0))),
+    );
+    assert_eq!(drain(&mut events), [orphan("C1", "m3", None)]);
+    let stats = fx.cache.stats();
+    assert_eq!((stats.orphans_sent, stats.orphans_dropped), (4, 0));
+}
+
+#[test]
+fn an_erased_channel_is_told_once_and_a_channel_the_file_never_named_is_not() {
+    let fx = Fixture::new("cache-events-erase");
+    let mut events = fx.cache.subscribe_events(64);
+    let other = ChanKey::new("p", "C2");
+    fx.list(vec![m(1)], T0, None);
+    // Coverage, and no rows: still a channel the file names.
+    fx.offer(
+        &other,
+        Observation::Listing(Listing {
+            scope: Scope::Main,
+            rows: Vec::new(),
+            observed_ms: T0,
+            proof: None,
+        }),
+    );
+    fx.offer(
+        &other,
+        Observation::Deleted {
+            ids: vec![mid("m50")],
+            observed_ms: T0,
+        },
+    );
+    assert_eq!(drain(&mut events), [orphan("C2", "m50", None)]);
+    fx.cache.retain_only(RouteSnapshot::new(
+        [ChanKey::new("p", "C3")],
+        ["p".to_owned()],
+    ));
+    fx.settle();
+    let mut told = drain(&mut events);
+    told.sort_by_key(|event| format!("{event:?}"));
+    assert_eq!(told, [erased("C1"), erased("C2")]);
+    fx.cache
+        .erase_channels(&[ChanKey::new("p", "C3"), fx.chan.clone()]);
+    fx.settle();
+    assert_eq!(
+        drain(&mut events),
+        [],
+        "nothing left to erase, and nothing told"
+    );
+}
+
+#[test]
+fn a_full_queue_drops_events_and_counts_them_and_a_file_erase_tells_nothing() {
+    let fx = Fixture::new("cache-events-full");
+    let mut events = fx.cache.subscribe_events(1);
+    fx.list(
+        vec![m(1), m(2), m(3)],
+        T0,
+        Some(newest_proof(ListStart::At(T0))),
+    );
+    push_delete(&fx, "m1", T0 + 1);
+    push_delete(&fx, "m2", T0 + 2);
+    let stats = fx.cache.stats();
+    assert_eq!((stats.orphans_sent, stats.orphans_dropped), (1, 1));
+    assert_eq!(drain(&mut events), [orphan("C1", "m1", None)]);
+    fx.cache.erase_file(true).expect("erased and reopened");
+    fx.settle();
+    assert_eq!(
+        drain(&mut events),
+        [],
+        "erasing the file says nothing about any message"
+    );
 }
