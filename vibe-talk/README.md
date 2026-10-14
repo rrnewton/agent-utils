@@ -2213,8 +2213,9 @@ message. Against a slow or rate-limited service, a voice warm-up of five channel
 naming twenty threads that fell due is twenty, preparing eight replies of a thread for speech is
 eight, and a count since an instant walks back a hundred messages at a time from the newest until
 it passes the instant. Wherever a provider can answer in bulk (a window of time, several channels,
-several threads or several ids in one request) this server now asks it to, and the cost is counted
-in upstream calls, not in messages (remote-ops-audit W10 to W14).
+several threads or several ids in one request) this server now asks it to, but for several threads,
+which nothing reads at once yet (see [Reads of several threads](#reads-of-several-threads)), and the
+cost is counted in upstream calls, not in messages (remote-ops-audit W10 to W14).
 
 **Five reads, each with a default that is today's.** Each is a `ChatClient` method whose default
 body is exactly the reads this server made before, at exactly their cost, so a provider that does
@@ -2228,7 +2229,7 @@ only because it is cheap uses it only where it is native.
 | `fetch_messages` | one answer per id: found, proved absent, or not seen | in a thread, one `fetch_thread_message` per id, four at a time; otherwise one recent window, searched | speech preparation of a thread, a thread summary's parts, a message by id (the page's and the `read_message` tool's), the check of a message before an upstream read mark, only where native |
 | `channel_heads` | each channel's newest message id and instant, its latest activity, and where the provider can vouch for it, an instant since which nothing changed | one one-message `fetch_recent` per channel | the live poller, only where native; a voice catch-up or warm-up, only where native and vouching for edits and deletes; the probe and diagnostics check it |
 | `fetch_recent_many` | each channel's newest messages, optionally only those since an instant | one `fetch_recent_dated` per channel, four at a time | a voice catch-up or warm-up, only where native |
-| `fetch_threads` | each thread's newest page, or only the messages added after an instant | one thread view `fetch_timeline` per thread, two at a time | naming the threads that fell due, only where native |
+| `fetch_threads` | each thread's newest page, or only the messages added after an instant | one thread view `fetch_timeline` per thread, two at a time | nothing yet: thread naming reads each thread at its own turn (see [Reads of several threads](#reads-of-several-threads)) |
 
 The sections below say what each one means in detail: [A bridge's range reads](#a-bridges-range-reads),
 [A bridge's lookups by id](#a-bridges-lookups-by-id), [Channel heads](#channel-heads),
@@ -2610,6 +2611,14 @@ anything else that cannot be read fails the request, and vibe-talk reads its cha
 thread's newest page through the thread view, one upstream read per thread, so a channel whose
 twenty threads fell due at once is twenty reads, each of which may itself be several calls.
 
+**Who reads it.** Nothing yet. Thread naming, the case it was made for, still reads one thread at a
+time, and has to: each thread is named only from a read made at its own turn, and a channel is read
+for naming at most once per `summaries.thread_naming_interval_seconds` (`#286 naming-budget`). No
+two threads of a channel ever have their turn at the same moment, so one read of several would name
+every thread but the first from a read made before its turn. The method, each provider's answer to
+it, and the bridge's `thread_reads` request below are in place for a caller that wants several
+threads at once; until one exists, turning `thread_reads` on changes no read this server makes.
+
 **What it is.** `ChatClient::fetch_threads(channel, asks)` reads several threads of one channel at
 once: per thread, how many messages (`limit`) and optionally only those created after an instant
 (`newer_than`). Without `newer_than` the answer is what the thread view's newest page of that size
@@ -2653,11 +2662,12 @@ thread of it from that one copy, often without asking its service at all.
 
 **What you get.** `thread_reads = true` (in `[discord]`, or on a `[[providers]]` entry of kind
 `discord`, only with `thread_api = "bridge"`; off by default, refused anywhere else) asks the bridge
-for the newest messages of several threads of one channel in one request, and lets the callers in
-[Reads of several threads](#reads-of-several-threads) use it. With it off, the bridge is read
-exactly as before. Turn it on only for a bridge that implements this request: one that does not
-answers it with an error or something other than the answer below, which vibe-talk refuses as an
-answer it cannot read, and then reads each thread as it would have without it.
+for the newest messages of several threads of one channel in one request, for a caller of
+[Reads of several threads](#reads-of-several-threads) (none reads it yet; see there). With it off,
+the bridge is read exactly as before. Turn it on only for a bridge that implements this request:
+one that does not answers it with an error or something other than the answer below, which
+vibe-talk refuses as an answer it cannot read, and then reads each thread as it would have without
+it.
 
 **The request.** `GET /channels/{id}/threads?ids=…&ids=…&limit=…`
 
@@ -2680,10 +2690,10 @@ answer it cannot read, and then reads each thread as it would have without it.
   messages, oldest first, each in that thread and that channel; its summary as `thread`; and
   `has_more` with `next_before`. No `next_after` and no `delta`: this is not a forward read.
 * A page may carry `as_of`, as a timeline read may, when it came from a copy the bridge could not
-  bring up to date. Naming does not name a thread from such a page: it reads that thread on its
-  own instead, so an `as_of` costs a wasted entry rather than an older name. Absent means now:
-  answer from a copy only while it is current, for example while the bridge's live feed of the
-  channel is healthy.
+  bring up to date. A caller does not take such a page for now: it reads that thread on its own
+  instead, as it reads one left out, so an `as_of` costs a wasted entry rather than an older
+  answer. Absent means now: answer from a copy only while it is current, for example while the
+  bridge's live feed of the channel is healthy.
 
 vibe-talk never sends a time bound with this request: a caller that wants only the messages newer
 than an instant has each page cut to them here, and such an answer is never taken for the whole

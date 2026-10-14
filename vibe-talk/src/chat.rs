@@ -500,8 +500,9 @@ pub struct ReadCaps {
     pub many_channels: Support,
     /// [`ChatClient::fetch_threads`]: the newest messages of several threads of one channel in
     /// fewer upstream calls than a thread view read of each. A caller that would gather thread
-    /// reads into one only to save calls (naming the threads that fell due) gathers them only when
-    /// this is native. remote-ops-audit W14.
+    /// reads into one only to save calls gathers them only when this is native. None does yet:
+    /// thread naming reads each thread at its own turn (`#286 naming-budget`). remote-ops-audit
+    /// W14.
     pub many_threads: Support,
     /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
     /// 100 unless the provider says otherwise.

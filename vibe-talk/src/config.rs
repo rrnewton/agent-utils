@@ -621,7 +621,9 @@ pub struct DiscordConfig {
     /// Whether the bridge answers a read of the newest messages of several threads of a channel
     /// itself, with `GET /channels/{id}/threads?ids=&ids=&limit=`. remote-ops-audit W14
     /// `#287 bulk-reads`; see [`crate::discord::http::threads_request`]. Only
-    /// `thread_api = "bridge"` accepts it; off by default.
+    /// `thread_api = "bridge"` accepts it; off by default. Nothing reads several threads at once
+    /// yet (thread naming reads each thread at its own turn, `#286 naming-budget`), so on, it
+    /// changes only what diagnostics say the bridge answers.
     pub thread_reads: bool,
 }
 

@@ -8,7 +8,7 @@
 //! cannot be read, and a read token listing due threads. Its fixture was recorded by the code as
 //! it stood BEFORE `ChatClient::fetch_threads` existed, so it is the proof that a provider without
 //! a read of several threads of its own still gets those names byte for byte, at the same cost, in
-//! the same order, once naming knows about it. Rewrite it only for a change that is MEANT to alter
+//! the same order, now that the trait has one. Rewrite it only for a change that is MEANT to alter
 //! what such a provider is asked or answers:
 //! `VIBE_TALK_UPDATE_FIXTURES=1 cargo test --test thread_reads`.
 //!

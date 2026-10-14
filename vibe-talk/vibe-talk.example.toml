@@ -73,6 +73,7 @@ thread_api = "native"
 # With thread_api = "bridge" only: whether the bridge reads the newest messages of several threads
 # of a channel itself, GET /channels/{id}/threads?ids=&ids=&limit= (README, "A bridge's reads of
 # several threads"). Off by default; turn it on only for a bridge that serves that request.
+# Nothing reads several threads at once yet, so for now it changes only what diagnostics say.
 # thread_reads = false
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
