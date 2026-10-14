@@ -1656,3 +1656,100 @@ async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held
         );
     }
 }
+
+#[tokio::test]
+async fn the_hourly_message_cache_line_is_numbers_and_never_an_id_or_a_word() {
+    // `#208 persistent-cache`. One line an hour says what the message cache holds, what its writer
+    // did and what its shadow counted, so a day of a deployed host can be read off the log: every
+    // value a number, and nothing a channel said.
+    use vibe_talk::auth::Scope;
+    // 2026-10-01T00:00:00Z, and the cache's clock an hour later.
+    let written = 1_790_812_800_000;
+    let scratch = vibe_talk::testing::TempDir::new("logging-cache-hourly");
+    let clock = vibe_talk::testing::ManualClock::at(written + 3_600_000);
+    let capture = LogCapture::info_only();
+    let (state, discord) = vibe_talk::testing::state();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let words = "HOURLY-WORDS-THAT-MUST-NOT-REACH-THE-LOG";
+    let author = "Somebody Particular";
+    let ids: Vec<vibe_talk::model::MessageId> = (0..4)
+        .map(|n| {
+            discord.seed_at(
+                &channel,
+                author,
+                &format!("{words} {n}"),
+                written + n * 60_000,
+            )
+        })
+        .collect();
+    let hourly = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains("message cache figures"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // A server that never had a cache says nothing of one.
+    state.message_cache.log_hour().await;
+    assert!(hourly(&capture.text()).is_empty());
+
+    let state = vibe_talk::testing::with_message_cache(state, scratch.path(), clock.clone()).await;
+    vibe_talk::ops::messages(&state, Scope::Write, READ_CHANNEL, Some(50))
+        .await
+        .expect("filled");
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(std::time::Duration::from_secs(20)));
+    clock.advance(5_000);
+    vibe_talk::ops::messages(&state, Scope::Read, READ_CHANNEL, Some(2))
+        .await
+        .expect("read");
+    assert!(
+        state
+            .message_cache
+            .shadow_settled(std::time::Duration::from_secs(20))
+            .await
+    );
+    assert!(cache.quiesce_blocking(std::time::Duration::from_secs(20)));
+    drop(cache);
+
+    state.message_cache.log_hour().await;
+    let lines = hourly(&capture.text());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    for field in [
+        "available=true",
+        "messages=4",
+        "channels=1",
+        "covered_days=",
+        "ops_dropped=0",
+        "batches=",
+        "batch_p50_us=",
+        "batch_p99_us=",
+        "orphans_dropped=0",
+        "providers_verified=1",
+        "providers_suspended=0",
+        "shadow_asked=2",
+        "shadow_would_serve=1",
+        "shadow_extra_rows=0",
+    ] {
+        assert!(
+            line.contains(field),
+            "the hourly line has no {field}: {line}"
+        );
+    }
+    assert!(!line.contains("batches=0"), "{line}");
+    let text = capture.text();
+    for private in [words, author]
+        .into_iter()
+        .chain(ids.iter().map(vibe_talk::model::MessageId::as_str))
+    {
+        assert!(
+            !text.contains(private),
+            "{private:?} reached the INFO log: {text}"
+        );
+    }
+    assert!(
+        !line.contains(READ_CHANNEL),
+        "the hourly line names the channel: {line}"
+    );
+}

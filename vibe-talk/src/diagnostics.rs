@@ -34,8 +34,10 @@
 //!   lock and rolling back, precisely so that a READ-scope caller does not cause a durable write;
 //!   see [`crate::store::StateStore::check_writable`].
 //!
-//! Beside the checks, one section that is not a check: `summaries`, a copy of the summary route's
-//! counters, which are held in memory and are numbers only (`#208 persistent-cache`).
+//! Beside the checks, sections that are not checks: `summaries`, a copy of the summary route's
+//! counters, which are held in memory and are numbers only, and, on a server whose configuration
+//! has a `[message_cache]` table, `message_cache`, the message cache in numbers (`#208
+//! persistent-cache`).
 //!
 //! # What has actually been exercised
 //!
@@ -164,6 +166,13 @@ pub struct DiagnosticsReport {
     /// message or text.
     /// Not a check, and never a failure. `#208 persistent-cache`; see [`crate::upstream_profile`].
     pub upstream: crate::upstream_profile::UpstreamReport,
+    /// The message cache: whether one is open, what the file holds and its writer has done (drops
+    /// and batch durations included), each provider's standing, and what the shadow counted the
+    /// cache would have served. Numbers, provider keys and words this server chooses: no channel
+    /// id, message id or text. Absent on a server whose configuration has no `[message_cache]`
+    /// table. `#208 persistent-cache`; see [`crate::cache::sink::Sink::report`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_cache: Option<crate::cache::sink::CacheReport>,
 }
 
 /// Redact every secret this deployment holds out of a string.
@@ -361,6 +370,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         recent_view_shadow: crate::recent_view::report(state),
         // Read after the checks, so the calls this report just made are counted too.
         upstream: upstream(state),
+        message_cache: state.message_cache.report().await,
     }
 }
 

@@ -209,6 +209,22 @@ impl Lifecycle {
         *self.trouble.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Why no cache is open, in the words the status uses: `config_disabled`, `switched_off`, a
+    /// [`Trouble`] code, or `not_open`. `None` while one is (`available`), or without a table.
+    #[must_use]
+    pub fn reason(&self, available: bool) -> Option<&'static str> {
+        let table = self.table.as_ref()?;
+        if !table.enabled {
+            Some("config_disabled")
+        } else if self.off.load(Ordering::SeqCst) {
+            Some("switched_off")
+        } else if available {
+            None
+        } else {
+            Some(self.trouble().map_or("not_open", Trouble::as_str))
+        }
+    }
+
     fn set_trouble(&self, trouble: Option<Trouble>) {
         *self.trouble.lock().unwrap_or_else(PoisonError::into_inner) = trouble;
     }
@@ -248,19 +264,10 @@ impl Lifecycle {
             .unwrap_or_default(),
             None => (0, Counts::default(), None),
         };
-        let reason = if !table.enabled {
-            Some("config_disabled")
-        } else if self.off.load(Ordering::SeqCst) {
-            Some("switched_off")
-        } else if available {
-            None
-        } else {
-            Some(self.trouble().map_or("not_open", Trouble::as_str))
-        };
         let status = MessageCacheStatus {
             available,
             enabled: self.enabled(),
-            reason,
+            reason: self.reason(available),
             bytes,
             messages: counts.messages,
             channels: counts.channels,

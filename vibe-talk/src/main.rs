@@ -798,6 +798,12 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(vibe_talk::upstream_profile::log_every_hour(Arc::clone(
         providers.profile(),
     )));
+    // `#208 persistent-cache`. One line an hour of the message cache's figures, and of what its
+    // shadow counted it would have served; numbers only, and none without a `[message_cache]`
+    // table.
+    tokio::spawn(vibe_talk::cache::sink::log_every_hour(Arc::clone(
+        &state.message_cache,
+    )));
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

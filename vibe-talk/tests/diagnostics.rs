@@ -803,3 +803,112 @@ async fn the_report_carries_the_summary_routes_counters_as_numbers_only() {
     assert_eq!(summaries["hits"], 1);
     assert_eq!(summaries["hits_without_upstream"], 1);
 }
+
+#[tokio::test]
+async fn a_server_whose_configuration_has_no_message_cache_reports_none() {
+    // `#208 persistent-cache`. The default: no `[message_cache]` table, so the report says nothing
+    // of a cache, exactly as before there was one.
+    let (state, _discord) = vibe_talk::testing::state();
+    vibe_talk::cache::lifecycle::start(&state.config, &state.message_cache).await;
+    let body = report(state).await;
+    assert!(
+        body.get("message_cache").is_none(),
+        "no section without a table: {body:#}"
+    );
+}
+
+#[tokio::test]
+async fn the_message_cache_section_is_numbers_and_never_an_id_or_a_word() {
+    // `#208 persistent-cache`. What the file holds, what its writer did, each provider's standing,
+    // and what the shadow counted, so the milestone's acceptance can be read off a deployed host:
+    // in numbers, provider keys and this server's own words, and nothing a channel said.
+    use vibe_talk::auth::Scope;
+    // 2026-08-18T12:00:00Z, and the cache's clock an hour later.
+    let written = 1_787_054_400_000;
+    let dir = vibe_talk::testing::TempDir::new("diagnostics-message-cache");
+    let clock = vibe_talk::testing::ManualClock::at(written + 3_600_000);
+    let (state, discord) = vibe_talk::testing::state();
+    let channel = ChannelId(vibe_talk::testing::READ_CHANNEL.to_owned());
+    let words = "DIAGNOSTICS-WORDS-THAT-MUST-NOT-BE-REPORTED";
+    let author = "Somebody Particular";
+    let ids: Vec<MessageId> = (0..6)
+        .map(|n| {
+            discord.seed_at(
+                &channel,
+                author,
+                &format!("{words} {n}"),
+                written + n * 60_000,
+            )
+        })
+        .collect();
+    let state = vibe_talk::testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    vibe_talk::ops::messages(&state, Scope::Write, channel.as_str(), Some(50))
+        .await
+        .expect("filled");
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(Duration::from_secs(20)));
+    clock.advance(5_000);
+    vibe_talk::ops::messages(&state, Scope::Read, channel.as_str(), Some(3))
+        .await
+        .expect("read");
+    assert!(
+        state
+            .message_cache
+            .shadow_settled(Duration::from_secs(20))
+            .await
+    );
+    assert!(cache.quiesce_blocking(Duration::from_secs(20)));
+    drop(cache);
+
+    let body = report(state).await;
+    let section = &body["message_cache"];
+    assert_eq!(section["available"], true, "{body:#}");
+    assert_eq!(section["enabled"], true);
+    assert!(section.get("reason").is_none(), "{section:#}");
+    assert_eq!(section["messages"], 6);
+    assert_eq!(section["channels"], 1);
+    assert!(section["bytes"].as_u64().expect("bytes") > 0);
+    assert!(section["covered_days"].as_f64().expect("days") > 0.0);
+    assert_eq!(section["blocked"], 0);
+    assert_eq!(
+        section["providers"],
+        serde_json::json!([{"provider": "discord", "verification": "verified"}])
+    );
+    let stats = &section["stats"];
+    for counter in [
+        "ops_applied",
+        "ops_dropped",
+        "bytes_dropped",
+        "ops_stale",
+        "ops_unrouted",
+        "ops_failed",
+        "orphans_dropped",
+        "batches",
+    ] {
+        assert!(stats[counter].is_u64(), "{counter}: {stats:#}");
+    }
+    assert_eq!(stats["ops_dropped"], 0);
+    assert!(stats["batches"].as_u64().expect("batches") >= 1);
+    assert_eq!(stats["batch_us"]["count"], stats["batches"]);
+    assert!(stats["batch_us"]["p99_us"].is_u64(), "{stats:#}");
+    let shadow = section["shadow"].as_array().expect("shadow counts");
+    assert_eq!(shadow.len(), 10, "every consumer: {section:#}");
+    let messages = shadow
+        .iter()
+        .find(|counts| counts["consumer"] == "messages")
+        .expect("the window's callers");
+    assert_eq!(messages["asked"], 2, "{messages:#}");
+    assert_eq!(messages["would_serve"], 1, "{messages:#}");
+    assert!(messages["misses"]["stale_head"].is_u64());
+
+    let text = section.to_string();
+    for private in [vibe_talk::testing::READ_CHANNEL, words, author]
+        .into_iter()
+        .chain(ids.iter().map(MessageId::as_str))
+    {
+        assert!(
+            !text.contains(private),
+            "the section carries {private:?}: {text}"
+        );
+    }
+}

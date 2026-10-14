@@ -94,6 +94,14 @@
 //! no cache open, nothing is read; the ask is counted, as `off`, only when the configuration has a
 //! `[message_cache]` table, and costs nothing otherwise.
 //!
+//! # What it says about itself
+//!
+//! [`Sink::report`] is the `message_cache` section of the diagnostics report: whether a cache is
+//! open, what the file holds and its writer has done, in numbers, each provider's standing, and the
+//! shadow's counts. [`log_every_hour`] writes the same figures, totals since the process started,
+//! on one `info` line an hour. Both say nothing on a server whose configuration has no
+//! `[message_cache]` table, and neither ever carries a channel id, a message id or a word of text.
+//!
 //! # Who puts a cache behind it
 //!
 //! The server does, at startup, when the configuration enables the cache and the owner has not
@@ -106,6 +114,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use super::access::{AccessListener, Suspect};
 use super::grant::{FillGrant, ServerFill};
@@ -113,7 +122,10 @@ use super::lifecycle::Lifecycle;
 use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
 use super::shadow::{self, Ask, Decision, Miss, Upstream, View};
-use super::{Account, ChanKey, MessageCache, Observation, Read, RouteSnapshot, Scope, Stamp};
+use super::{
+    Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Read, RouteSnapshot, Scope,
+    Stamp,
+};
 use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
 use crate::live::LiveMessage;
@@ -225,6 +237,66 @@ pub enum Verification {
     /// The provider refused the credential: nothing of it is served or filled until its account
     /// is checked again.
     Suspended,
+}
+
+impl Verification {
+    /// The word the diagnostics report uses.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Verified => "verified",
+            Self::Suspended => "suspended",
+        }
+    }
+}
+
+/// The `message_cache` section of `GET /api/v1/diagnostics` ([`Sink::report`]). Numbers, provider
+/// keys, and words this server chooses: never a channel id, a message id or text.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CacheReport {
+    /// Whether a cache file is open.
+    pub available: bool,
+    /// Whether the configuration enables the cache and the owner has not turned it off.
+    pub enabled: bool,
+    /// Why no cache is open, when none is: `config_disabled`, `switched_off`, or a code saying
+    /// what failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Bytes the file occupies, its working files included.
+    pub bytes: u64,
+    /// Messages the file holds.
+    pub messages: u64,
+    /// Channels with anything held.
+    pub channels: u64,
+    /// Deleted messages' tombstones held.
+    pub tombstones: u64,
+    /// Coverage intervals held.
+    pub intervals: u64,
+    /// Days of message time the coverage of each listed channel's own timeline spans (its `main`
+    /// and `flat` scopes, not its threads), summed over channels.
+    pub covered_days: f64,
+    /// What the writer has done since the file opened, drops and batch durations included; absent
+    /// with no file open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<CacheStats>,
+    /// Each provider, and whether its account has been checked against the file, or it refused
+    /// the credential.
+    pub providers: Vec<ProviderStanding>,
+    /// Channels and threads not served while access to them is in doubt.
+    pub blocked: u64,
+    /// What the shadow has counted since the process started, per consumer: what the cache would
+    /// have served ([`super::shadow`]).
+    pub shadow: Vec<shadow::ConsumerCounts>,
+}
+
+/// One provider's standing against the cache file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProviderStanding {
+    /// The provider key, as in the configuration.
+    pub provider: String,
+    /// `verified`, `unverified` or `suspended`: see [`Verification`].
+    pub verification: &'static str,
 }
 
 /// How many of the writer's events the summaries task has followed, against the count the cache
@@ -921,6 +993,121 @@ impl Sink {
         }
     }
 
+    /// The cache as the diagnostics report shows it, or `None` on a server whose configuration has
+    /// no `[message_cache]` table and behind whose sink no cache was put: one that never had a
+    /// cache says nothing of one. What the file holds is measured on the blocking pool.
+    pub async fn report(&self) -> Option<CacheReport> {
+        let lifecycle = self.lifecycle();
+        let behind = self.cache();
+        if !lifecycle.is_some_and(|lifecycle| lifecycle.configured()) && behind.is_none() {
+            return None;
+        }
+        let open = behind.filter(|cache| cache.is_open());
+        let available = open.is_some();
+        let measured = match open {
+            Some(cache) => tokio::task::spawn_blocking(move || {
+                (
+                    cache.bytes_on_disk(),
+                    cache.counts().served().unwrap_or_default(),
+                    cache.covered_ms().served().unwrap_or(0),
+                    cache.stats(),
+                    cache.blocks(),
+                )
+            })
+            .await
+            .ok(),
+            None => None,
+        };
+        let (bytes, counts, covered_ms, stats, blocked) = match measured {
+            Some((bytes, counts, covered_ms, stats, blocked)) => {
+                (bytes, counts, covered_ms, Some(stats), blocked)
+            }
+            None => (0, Counts::default(), 0, None, 0),
+        };
+        let router = self.state.routes().router.clone();
+        let providers = router.map_or_else(Vec::new, |router| {
+            router
+                .entries()
+                .iter()
+                .map(|entry| ProviderStanding {
+                    provider: entry.key.clone(),
+                    verification: self.verification(&entry.key).as_str(),
+                })
+                .collect()
+        });
+        // To the thousandth of a day, about a minute and a half: a figure to read, not to compute
+        // with.
+        let covered_days = (covered_ms as f64 / 86_400.0).round() / 1_000.0;
+        Some(CacheReport {
+            available,
+            enabled: lifecycle.map_or(available, |lifecycle| lifecycle.enabled()),
+            reason: lifecycle.and_then(|lifecycle| lifecycle.reason(available)),
+            bytes,
+            messages: counts.messages,
+            channels: counts.channels,
+            tombstones: counts.tombstones,
+            intervals: counts.intervals,
+            covered_days,
+            stats,
+            providers,
+            blocked: u64::try_from(blocked).unwrap_or(u64::MAX),
+            shadow: self.shadow_counts(),
+        })
+    }
+
+    /// Write one `info` line with [`Sink::report`]'s figures: totals since the process started, and
+    /// the file as it stands. Numbers only. Nothing at all when there is no report.
+    pub async fn log_hour(&self) {
+        let Some(report) = self.report().await else {
+            return;
+        };
+        let stats = report.stats.clone().unwrap_or_default();
+        let shadow = report
+            .shadow
+            .iter()
+            .fold(shadow::ConsumerCounts::default(), |sum, counts| {
+                sum.plus(counts)
+            });
+        let standing = |word: &str| {
+            report
+                .providers
+                .iter()
+                .filter(|provider| provider.verification == word)
+                .count()
+        };
+        tracing::info!(
+            available = report.available,
+            enabled = report.enabled,
+            bytes = report.bytes,
+            messages = report.messages,
+            channels = report.channels,
+            covered_days = report.covered_days,
+            ops_applied = stats.ops_applied,
+            ops_dropped = stats.ops_dropped,
+            bytes_dropped = stats.bytes_dropped,
+            ops_stale = stats.ops_stale,
+            ops_unrouted = stats.ops_unrouted,
+            ops_failed = stats.ops_failed,
+            batches = stats.batches,
+            batch_p50_us = stats.batch_us.quantile_us(0.5),
+            batch_p99_us = stats.batch_us.quantile_us(0.99),
+            orphans_dropped = stats.orphans_dropped,
+            providers_verified = standing("verified"),
+            providers_suspended = standing("suspended"),
+            blocked = report.blocked,
+            shadow_asked = shadow.asked,
+            shadow_would_serve = shadow.would_serve,
+            shadow_needs_existence_check = shadow.needs_existence_check,
+            shadow_late = shadow.late,
+            shadow_compared = shadow.compared,
+            shadow_agreed = shadow.agreed,
+            shadow_missing_rows = shadow.missing_rows,
+            shadow_extra_rows = shadow.extra_rows,
+            shadow_content_differs = shadow.content_differs,
+            "message cache figures since this process started"
+        );
+    }
+
     /// Whether `provider_key`'s account has been checked against the cache behind the sink.
     #[must_use]
     pub fn verification(&self, provider_key: &str) -> Verification {
@@ -1296,6 +1483,18 @@ impl AccessListener for State {
         if let Some(router) = router {
             Self::start_verifying(&state, &cache, &router, provider_key, round);
         }
+    }
+}
+
+/// Write [`Sink::log_hour`] every [`crate::upstream_profile::LOG_INTERVAL`], first one interval
+/// from now. On a server whose configuration has no `[message_cache]` table it writes nothing.
+pub async fn log_every_hour(sink: Arc<Sink>) {
+    let every = crate::upstream_profile::LOG_INTERVAL;
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        sink.log_hour().await;
     }
 }
 
