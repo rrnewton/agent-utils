@@ -45041,6 +45041,185 @@ def test_absent_validate_batch_resumes_each_durable_boundary(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def _absent_batch_refused_after_its_archives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, object]:
+    """Leave an absent-row batch as production did on 2026-10-14.
+
+    Its archives are durable and its second liveness check refuses before the
+    ACTIVE rows go, so each row is both active and archived beside the journal.
+    """
+    project, repository, _remote = make_project(tmp_path)
+    for slot, agent in (("gone-a", "validate-a"), ("gone-b", "validate-b")):
+        made = create(project, slot=slot, agent=agent, branch=None, slot_type="validate")
+        assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    records = [
+        mark_recorded_owner_dead(project, "gone-a"),
+        mark_recorded_owner_dead(project, "gone-b"),
+    ]
+    for record in records:
+        make_validate_row_absent(project, repository, record)
+    input_path = write_absent_validate_input(project, records)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    real_safe = wrkslots._assert_absent_validate_rows_safe
+
+    def refuse_once_archived(config_arg, rows):
+        archived = {
+            entry.get("slot") for entry in wrkslots._load_archive(config_arg).records
+        }
+        if any(row.slot in archived for row in rows):
+            raise wrkslots.Refusal(
+                "user-systemd unit population, identity, state, or jobs changed during "
+                "three bounded enumeration attempts"
+            )
+        real_safe(config_arg, rows)
+
+    monkeypatch.setattr(wrkslots, "_assert_absent_validate_rows_safe", refuse_once_archived)
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 3
+    monkeypatch.setattr(wrkslots, "_assert_absent_validate_rows_safe", real_safe)
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+    with pytest.raises(wrkslots.StateError, match="is active on testhost and archived on"):
+        wrkslots._validate_global_state(config)
+    return project, input_path, config
+
+
+def classify_validate(project: Path, slot: str) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "classify-create-journals",
+            slot,
+            "--slot-type",
+            "validate",
+            "--agent",
+            f"validate-{slot}",
+            "--format",
+            "json",
+        ]
+    )
+
+
+def test_create_and_classification_proceed_beside_an_interrupted_absent_validate_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    capsys.readouterr()
+
+    assert classify_validate(project, "fresh-c") == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    # validate-run admission checks this exact field set.
+    assert set(payload) == {"blocking", "journals", "requested", "schema"}
+    assert payload["blocking"] is False and payload["journals"] == []
+    assert "proceeding beside the interrupted absent-validation-row batch" in captured.err
+    assert "2 row(s) stay active and archived" in captured.err
+
+    made = create(project, slot="fresh-c", agent="validate-fresh-c", branch=None,
+                  slot_type="validate")
+    assert made.returncode == 0, made.stderr
+
+    # The replay still finishes the batch exactly, around the new slot.
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 0
+    assert [row["slot"] for row in active_slots(project)] == ["fresh-c"]
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_a_slot_of_the_interrupted_absent_validate_batch_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    capsys.readouterr()
+
+    assert classify_validate(project, "gone-a") == 3
+    assert "belongs to the interrupted absent-validation-row batch" in capsys.readouterr().err
+    made = create(project, slot="gone-a", agent="validate-gone-a-2", branch=None,
+                  slot_type="validate")
+    assert made.returncode != 0
+    assert "belongs to the interrupted absent-validation-row batch" in made.stderr
+
+
+def test_an_overlap_the_absent_validate_batch_does_not_name_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _input_path, config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    raw = json.loads(journal.read_text())
+    # The batch now names only its first row; the second row's overlap is not its own.
+    raw["items"] = raw["items"][:1]
+    raw["cursor"] = 1
+    monkeypatch.setattr(
+        wrkslots,
+        "_load_journal",
+        lambda _config, *, selected_path=None: (journal, raw),
+    )
+    capsys.readouterr()
+
+    assert classify_validate(project, "fresh-c") != 0
+    assert "is active on testhost and archived on" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("handoff", ("coordinator-writer", "unrelated-writer"))
+def test_host_context_recover_resumes_an_absent_validate_batch_outside_the_coordinator_ancestry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    handoff: str,
+) -> None:
+    """'recover' of an absent-row batch must accept the host-context handoff.
+
+    Host state, 2026-10-14: ci-hub/bin/wrkslots runs 'recover' in a user
+    service that does not descend from the coordinator, and the absent-row
+    branch checked direct ancestry, so it refused every row with "coordinator
+    PID N is not in the invoking process ancestry" and the batch could only be
+    replayed through recover-absent-validate-rows with its exact input. A
+    writer that does not descend from the coordinator must still refuse.
+    """
+
+    project, _input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    before = journal.read_bytes()
+    coordinator, proof_fd = start_host_context_coordinator()
+    unrelated: subprocess.Popen[str] | None = None
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        with pytest.raises(wrkslots.Refusal, match="not in the invoking process ancestry"):
+            wrkslots._assert_caller_process(identity, "coordinator")
+        if handoff == "unrelated-writer":
+            unrelated = subprocess.Popen(["sleep", "60"], text=True)
+            identity = wrkslots._read_process_identity(unrelated.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+        capsys.readouterr()
+        result = wrkslots.main(
+            ["--project-root", str(project), "recover", "--coordinator-pid", str(identity.pid)]
+        )
+        captured = capsys.readouterr()
+    finally:
+        terminate_process(coordinator)
+        if unrelated is not None:
+            terminate_process(unrelated)
+        os.close(proof_fd)
+
+    if handoff == "unrelated-writer":
+        assert result == 3, captured.err
+        assert "no live writer descended from the coordinator" in captured.err
+        assert journal.read_bytes() == before
+        return
+    assert result == 0, captured.err
+    assert "not in the invoking process ancestry" not in captured.err
+    assert not journal.exists()
+    assert active_slots(project) == []
+
+
 def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

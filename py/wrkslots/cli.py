@@ -8155,6 +8155,60 @@ def _validate_global_state(
     return states, archives
 
 
+def _outstanding_absent_validate_batch(
+    config: Config,
+) -> tuple[Path, tuple[AbsentValidateRow, ...]] | None:
+    """This machine's interrupted recover-absent-validate-rows batch, if any.
+
+    The batch makes its archives durable, then checks liveness again before
+    it deletes the ACTIVE rows; when that check refuses, its rows stay both
+    active and archived until the batch is replayed. They are validation
+    slots whose storage is already gone.
+    """
+    path = _journal_path(config)
+    if path not in _outstanding_journals(config):
+        return None
+    loaded, raw = _load_journal(config, selected_path=path)
+    if raw.get("kind") != "recover-absent-validate-rows":
+        return None
+    _cursor, items = _absent_validate_batch_items(config, raw)
+    return loaded, tuple(item for item, _record, _entry in items)
+
+
+def _validate_global_state_beside_absent_batch(
+    config: Config,
+) -> tuple[list[ActiveState], list[ArchiveState], frozenset[Path], frozenset[str]]:
+    """Global state for a create, allowing only an absent-row batch's exact overlap.
+
+    Without an interrupted recover-absent-validate-rows journal this is
+    _validate_global_state. With one, each of its rows may be active and
+    archived on this machine when the archive is that batch's own entry for
+    it (the same exact-overlap rule its replay applies); any other overlap
+    still refuses. Returns the journal path to leave out of create-journal
+    classification and the batch's slot names, which a create must not reuse.
+    """
+    batch = _outstanding_absent_validate_batch(config)
+    if batch is None:
+        states, archives = _validate_global_state(config)
+        return states, archives, frozenset(), frozenset()
+    path, items = batch
+    states, archives = _absent_validate_rows_state(config, items, allow_exact_overlap=True)
+    print(
+        f"wrkslots: proceeding beside the interrupted absent-validation-row batch in "
+        f"{path}: its {len(items)} row(s) stay active and archived until it is replayed",
+        file=sys.stderr,
+    )
+    return states, archives, frozenset({path}), frozenset(item.slot for item in items)
+
+
+def _assert_not_in_absent_batch(slot: str, absent_slots: AbstractSet[str]) -> None:
+    if slot in absent_slots:
+        raise Refusal(
+            f"slot {slot!r} belongs to the interrupted absent-validation-row batch; "
+            "replay it with 'wrkslots recover' first"
+        )
+
+
 def _validate_global_state_for_finish_recovery(
     config: Config, journal: Mapping[str, object]
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
@@ -23004,13 +23058,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # with every sealed path before this create writes anything.
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         _recover_orphaned_validate_batch_seal(config)
-        states, archives = _validate_global_state(config)
+        states, archives, absent_batch_paths, absent_batch_slots = (
+            _validate_global_state_beside_absent_batch(config)
+        )
+        _assert_not_in_absent_batch(args.slot, absent_batch_slots)
         paired_finish_path = _validate_batch_paired_finish_path(config)
         cleanup_exclusions = (
             frozenset({paired_finish_path})
             if paired_finish_path is not None
             else frozenset()
-        )
+        ) | absent_batch_paths
         interrupted_creates = _classify_create_journals(
             config,
             states,
@@ -23220,7 +23277,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
             journal_path=journal_path,
         )
-        after_states, after_archives = _validate_global_state(config)
+        after_states, after_archives, _paths, _slots = (
+            _validate_global_state_beside_absent_batch(config)
+        )
         _assert_only_slot_changed(
             before,
             _global_rows(after_states, after_archives),
@@ -23290,20 +23349,31 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
     slot = _validate_name(args.slot, "slot")
     agent = _validate_name(args.agent, "agent")
     _refuse_partial_state(config, allow_orphaned_validate_batch_seals=True)
-    before_states, before_archives = _validate_global_state(config)
+    before_states, before_archives, absent_paths, absent_slots = (
+        _validate_global_state_beside_absent_batch(config)
+    )
+    _assert_not_in_absent_batch(slot, absent_slots)
     before_rows = _global_rows(before_states, before_archives)
-    before_paths = tuple(_outstanding_journals(config))
-    rows = _classify_create_journals(config, before_states, before_archives)
+    before_paths = tuple(
+        path for path in _outstanding_journals(config) if path not in absent_paths
+    )
+    rows = _classify_create_journals(
+        config, before_states, before_archives, excluded_paths=absent_paths
+    )
     _assert_interrupted_creates_unrelated(
         config, rows, slot=slot, agent=agent, slot_type=slot_type
     )
-    after_states, after_archives = _validate_global_state(config)
+    after_states, after_archives, after_absent_paths, _after_slots = (
+        _validate_global_state_beside_absent_batch(config)
+    )
+    if after_absent_paths != absent_paths:
+        raise Refusal("interrupted absent-validation-row batch changed while classified")
     if before_rows != _global_rows(after_states, after_archives):
         raise Refusal("active registry changed while create journals were classified")
     if before_paths != tuple(row.path for row in rows):
         raise Refusal("recovery journal set changed before it was classified")
     _assert_create_journal_classifications_stable(
-        config, rows, after_states, after_archives
+        config, rows, after_states, after_archives, excluded_paths=absent_paths
     )
     payload = {
         "blocking": False,
@@ -45305,12 +45375,14 @@ def _recover_absent_agent_row(
     path: Path,
     raw: Mapping[str, object],
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     if path != _journal_path(config):
         raise StateError("absent-agent-row journal filename is invalid")
     if raw.get("host_id") != _host_id():
         raise Refusal("absent-agent-row journal belongs to another host identity")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_recovery_processes(coordinator, processes)
     item, recorded, branch_witnesses, planned, archive_entry = (
         _absent_agent_journal_inputs(config, raw)
     )
@@ -50869,6 +50941,7 @@ def _recover_absent_validate_rows(
     coordinator: ProcessIdentity,
     *,
     safety_prechecked: bool = False,
+    processes: _RecoveryProcesses | None = None,
 ) -> tuple[AbsentValidateRow, ...]:
     if path != _journal_path(config):
         raise StateError("absent-validation-row journal filename is invalid")
@@ -50885,7 +50958,10 @@ def _recover_absent_validate_rows(
             "absent-validation-row journal belongs to another host identity; "
             "resume it on the host that created it"
         )
-    _assert_caller_process(coordinator, "coordinator")
+    # Under 'wrkslots recover' the host-context handoff runs this in a fresh
+    # user service, outside the coordinator's ancestry; its captured runner
+    # and handoff writer are the authority there, as for every other removal.
+    _assert_recovery_processes(coordinator, processes)
     cursor, items = _absent_validate_batch_items(config, raw)
     journal = dict(raw)
     states, archives = _absent_validate_rows_state(
@@ -52165,7 +52241,9 @@ def _cmd_recover(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             try:
-                recovered = _recover_absent_validate_rows(config, path, raw, coordinator)
+                recovered = _recover_absent_validate_rows(
+                    config, path, raw, coordinator, processes=processes
+                )
             except Refusal as exc:
                 _emit_absent_validate_outcomes(
                     [(item, "refused", str(exc)) for item, _record, _entry in batch_items],
@@ -52188,7 +52266,9 @@ def _cmd_recover(
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_absent_agent_row(config, path, raw, coordinator)
+            _recover_absent_agent_row(
+                config, path, raw, coordinator, processes=processes
+            )
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
         if seal_journals:
