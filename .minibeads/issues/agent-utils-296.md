@@ -1,12 +1,13 @@
 ---
 title: 'copy-highlighted-message: Cmd-C with no text selected copies the highlighted message'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-14T13:51:56.926524371+00:00
-updated_at: 2026-10-14T13:51:56.926524371+00:00
+updated_at: 2026-10-14T15:53:51.727461468+00:00
+closed_at: 2026-10-14T15:53:51.727461348+00:00
 ---
 
 # Description
