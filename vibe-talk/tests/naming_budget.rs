@@ -26,8 +26,8 @@ use vibe_talk::state::AppState;
 use vibe_talk::summarize::fake::FakeSummarizer;
 use vibe_talk::summarize::threads::{
     name_key, ThreadDeps, ThreadNames, ThreadRequest, CHANNEL_PAUSE,
-    DEFAULT_NAMING_INTERVAL_SECONDS, MAX_QUEUED, MAX_QUEUED_PER_CHANNEL, MAX_QUEUED_WAIT,
-    NAMING_READ_TIMEOUT, OVERDUE_TURNS,
+    DEFAULT_NAMING_INTERVAL_SECONDS, MAX_QUEUED, MAX_QUEUED_PER_CHANNEL, MAX_QUEUED_TURNS,
+    MAX_QUEUED_WAIT, NAMING_READ_TIMEOUT, OVERDUE_TURNS,
 };
 use vibe_talk::testing::{
     self, CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN,
@@ -942,31 +942,73 @@ async fn the_queues_together_hold_at_most_the_global_cap() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_thread_waits_at_most_the_queue_limit_and_a_later_read_queues_it_again() {
-    // A budget of twenty minutes, so the third thread's turn would come at forty: past the limit,
-    // it is dropped unread rather than kept waiting. The owner's next read queues it again.
+async fn at_a_long_interval_a_queued_thread_is_kept_until_its_turn() {
+    // A budget of twenty minutes, so the third of three threads queued at once has its turn at
+    // forty. Before, a thread was dropped unread after thirty minutes whatever the interval, and
+    // the next read queued it again behind everything newer: at a long interval the limit came
+    // before the turn. It now scales with the interval, and is never reached at the budget.
     let interval = Duration::from_secs(20 * 60);
-    assert!(2 * interval > MAX_QUEUED_WAIT);
     let h = harness_with(ThreadNames::with_interval(interval));
     let ids = h.upstream.add(WRITE_CHANNEL, 3);
     h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
     h.at(1).await;
     assert_eq!(h.names.pending(), 2);
-    h.at(45 * 60).await;
+    h.at(40 * 60 + 1).await;
     assert_eq!(
         h.named_reads(WRITE_CHANNEL),
-        [ids[2].clone(), ids[1].clone()],
+        [ids[2].clone(), ids[1].clone(), ids[0].clone()],
+        "a thread was dropped before its turn"
+    );
+    assert_eq!(h.names.pending(), 0);
+    assert_eq!(h.names.named(), 3);
+    assert_eq!(h.names.max_wait(), interval * MAX_QUEUED_TURNS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_its_channel_could_not_read_in_time_is_dropped_and_a_later_read_queues_it_again() {
+    // At the default budget the limit is thirty minutes, more than the order ever makes a thread
+    // wait while the channel is read at its budget. A channel read more slowly can reach it: here
+    // three provider failures in a row pause it for ten minutes each, and the fourth thread, queued
+    // with the rest at the start, has waited thirty minutes when the third pause ends. It is dropped
+    // unread, and the owner's next read queues it again.
+    let h = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    assert_eq!(h.names.max_wait(), MAX_QUEUED_WAIT);
+    let pause = CHANNEL_PAUSE.as_secs();
+    assert_eq!(3 * pause, MAX_QUEUED_WAIT.as_secs());
+    let ids = h.upstream.add(WRITE_CHANNEL, 4);
+    for _ in 0..3 {
+        h.counting
+            .fail_next("fetch_timeline", Some(TimelineView::Thread), bad_gateway());
+    }
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(3 * pause - 1).await;
+    assert_eq!(
+        h.named_reads(WRITE_CHANNEL),
+        [ids[3].clone(), ids[2].clone(), ids[1].clone()],
+        "three failed reads, ten minutes apart"
+    );
+    assert_eq!(h.names.queued(&channel), 1);
+    h.at(3 * pause + 1).await;
+    assert_eq!(h.names.pending(), 0, "a thread waited past the limit");
+    assert_eq!(
+        h.thread_reads(WRITE_CHANNEL),
+        3,
         "the thread past the queue limit was read anyway"
     );
-    assert_eq!(h.names.pending(), 0, "a thread waited past the limit");
 
     h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
-    h.at(45 * 60 + 1).await;
+    h.at(3 * pause + 120).await;
     assert_eq!(
-        h.named_reads(WRITE_CHANNEL),
-        [ids[2].clone(), ids[1].clone(), ids[0].clone()]
+        h.named_reads(WRITE_CHANNEL)[3..],
+        [
+            ids[3].clone(),
+            ids[2].clone(),
+            ids[1].clone(),
+            ids[0].clone()
+        ]
     );
-    assert_eq!(h.names.named(), 3);
+    assert_eq!(h.names.named(), 4);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1251,6 +1293,30 @@ async fn a_waiting_thread_a_later_page_shows_active_again_is_read_by_that_activi
     );
 }
 
+/// A paced run: from second `from` to second `to`, every `step` seconds, `each_step` changes
+/// upstream and a write-scope page then polls the list. Returns, per thread, the seconds at which
+/// it was read in that time, each counted at the first poll that saw it.
+async fn paced(
+    h: &Harness,
+    (from, to, step): (u64, u64, u64),
+    mut each_step: impl FnMut(&Harness, u64),
+) -> HashMap<String, Vec<u64>> {
+    let mut reads: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut seen = h.named_reads(WRITE_CHANNEL).len();
+    for second in (from..=to).step_by(usize::try_from(step).unwrap()) {
+        h.at(second).await;
+        each_step(h, second);
+        h.poll(WRITE_CHANNEL, true).await;
+        tokio::task::yield_now().await;
+        let all = h.named_reads(WRITE_CHANNEL);
+        for thread in &all[seen..] {
+            reads.entry(thread.clone()).or_default().push(second);
+        }
+        seen = all.len();
+    }
+    reads
+}
+
 /// The paced run behind the next tests: from second `from` for `minutes`, `hot` threads each get a
 /// reply every `every` seconds, `each_second` changes anything else, and a write-scope page polls
 /// the list every second. Returns, per thread, the seconds at which it was read in that time.
@@ -1261,25 +1327,15 @@ async fn under_load(
     (from, minutes): (u64, u64),
     mut each_second: impl FnMut(&Harness, u64),
 ) -> HashMap<String, Vec<u64>> {
-    let mut reads: HashMap<String, Vec<u64>> = HashMap::new();
-    let mut seen = h.named_reads(WRITE_CHANNEL).len();
-    for second in from..=from + minutes * 60 {
-        h.at(second).await;
+    paced(h, (from, from + minutes * 60, 1), |h, second| {
         if second > 0 && second % every == 0 {
             for thread in hot {
                 reply_at(h, thread, 3_600 + u32::try_from(second).unwrap());
             }
         }
         each_second(h, second);
-        h.poll(WRITE_CHANNEL, true).await;
-        tokio::task::yield_now().await;
-        let all = h.named_reads(WRITE_CHANNEL);
-        for thread in &all[seen..] {
-            reads.entry(thread.clone()).or_default().push(second);
-        }
-        seen = all.len();
-    }
-    reads
+    })
+    .await
 }
 
 #[tokio::test(start_paused = true)]
@@ -1384,4 +1440,127 @@ async fn a_thread_due_only_a_fresh_sentence_is_read_within_the_overdue_limit_beh
         "the new threads were read too: {} threads",
         reads.len()
     );
+}
+
+/// Intervals from five minutes to the longest the configuration accepts, each with the step a
+/// write-scope page polls at in the runs below.
+const LONG_INTERVALS: [(u64, u64); 5] = [(300, 5), (450, 5), (600, 10), (1_800, 20), (3_600, 20)];
+
+/// At a channel interval of `interval` seconds, one thread is named at 0 seconds and the first of
+/// a new unnamed thread every third of an interval at `interval`, each newer than every thread
+/// before it: three times what the budget reads. One poll later a thread falls due that every new
+/// one goes ahead of until it is overdue — with `named`, the first thread, due a fresh sentence;
+/// otherwise an old thread with no name yet, listed then. Returns the second it falls due, and the
+/// seconds it was read in twelve intervals.
+async fn behind_new_threads(interval: u64, poll: u64, named: bool) -> (u64, Vec<u64>) {
+    let h = harness_with(ThreadNames::with_interval(Duration::from_secs(interval)));
+    let first = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+    h.poll(WRITE_CHANNEL, true).await;
+    h.at(1).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), std::slice::from_ref(&first));
+    let falls_due = interval + poll;
+    let mut waiting = first.clone();
+    let reads = paced(&h, (interval, 12 * interval, poll), |h, second| {
+        let at = 3_600 + u32::try_from(second).unwrap();
+        if (second - interval) % (interval / 3) == 0 {
+            let new = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+            h.upstream.change(&new, |thread| thread.active_second = at);
+        }
+        if second == falls_due {
+            if named {
+                // Four messages after three: due a fresh sentence (1, 2, 4, 8...).
+                reply_at(h, &first, at - 1);
+                reply_at(h, &first, at);
+            } else {
+                waiting = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+                h.upstream
+                    .change(&waiting, |thread| thread.active_second = 1);
+            }
+        }
+    })
+    .await;
+    (falls_due, reads.get(&waiting).cloned().unwrap_or_default())
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_every_interval_a_thread_due_a_fresh_sentence_is_read_within_the_overdue_limit() {
+    // Before, from 450 seconds on the thirty-minute wait limit came no later than OVERDUE_TURNS
+    // intervals: the named thread was dropped and queued afresh before it could be overdue, and
+    // was not read again in twelve intervals. Every read went to the newest thread.
+    for (interval, poll) in LONG_INTERVALS {
+        let (falls_due, reads) = behind_new_threads(interval, poll, true).await;
+        let bound = falls_due + (u64::from(OVERDUE_TURNS) + 1) * interval;
+        assert!(
+            reads.first().is_some_and(|&at| at <= bound),
+            "at {interval}s the named thread due a fresh sentence at {falls_due}s was read again \
+             at {reads:?}, not by {bound}s"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_every_interval_an_old_unnamed_thread_is_read_within_the_overdue_limit() {
+    // Before, at 600 seconds and longer the old thread was never read in hours.
+    for (interval, poll) in LONG_INTERVALS {
+        let (falls_due, reads) = behind_new_threads(interval, poll, false).await;
+        let bound = falls_due + (u64::from(OVERDUE_TURNS) + 1) * interval;
+        assert!(
+            reads.first().is_some_and(|&at| at <= bound),
+            "at {interval}s the old unnamed thread listed at {falls_due}s was read at {reads:?}, \
+             not by {bound}s"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_a_long_interval_hot_threads_share_the_reads_and_a_quiet_one_due_a_sentence_still_gets_one(
+) {
+    // Two named threads replied to all the time, and one old named thread that falls due a fresh
+    // sentence and then goes quiet. Before, at 600 seconds the old thread was never read in four
+    // hours, and at 3600 in twelve, and at 3600 one hot thread had every read: the thirty-minute
+    // limit dropped both hot threads before each turn, the next poll queued them again in page
+    // order, and the tie went to the same one each time.
+    for interval in [600, 3_600] {
+        let h = harness_with(ThreadNames::with_interval(Duration::from_secs(interval)));
+        let old = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+        let hot = h.upstream.add(WRITE_CHANNEL, 2);
+        let step = interval / 60;
+        let named = paced(&h, (0, 2 * interval + step, step), |_, _| {}).await;
+        assert_eq!(named.len(), 3, "each named once, one interval apart");
+
+        let falls_due = 2 * interval + 2 * step;
+        let turns = 10;
+        let reads = paced(
+            &h,
+            (falls_due, falls_due + turns * interval, step),
+            |h, second| {
+                if second == falls_due {
+                    // Seven messages after three, at the thread's old activity.
+                    for _ in 0..4 {
+                        h.upstream
+                            .change(&old, |thread| thread.replies.push("one more".to_owned()));
+                    }
+                }
+                for thread in &hot {
+                    reply_at(h, thread, 3_600 + u32::try_from(second).unwrap());
+                }
+            },
+        )
+        .await;
+        let bound = falls_due + (u64::from(OVERDUE_TURNS) + 1) * interval + step;
+        let again = reads.get(&old).cloned().unwrap_or_default();
+        assert!(
+            again.first().is_some_and(|&at| at <= bound),
+            "at {interval}s the old thread due a fresh sentence at {falls_due}s was read at \
+             {again:?}, not by {bound}s"
+        );
+        let counts: Vec<usize> = hot
+            .iter()
+            .map(|thread| reads.get(thread).map_or(0, Vec::len))
+            .collect();
+        assert!(
+            counts.iter().all(|&count| count >= 4),
+            "at {interval}s the two hot threads had {counts:?} of {turns} reads"
+        );
+    }
 }

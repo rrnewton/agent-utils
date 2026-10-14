@@ -363,10 +363,11 @@ enabled = true
 # HOW OFTEN A CHANNEL IS READ TO NAME ITS THREADS. Each thread naming reads that thread from the chat
 # provider (through a bridge, one read can cost many upstream calls), so at most one such read is
 # made per channel every this many seconds; due threads wait their turn (a thread with no name
-# first, then newest activity, and any that has waited four of these intervals ahead of the rest),
-# and each is named from the read made at its turn. After a provider failure on one of those reads (an
-# HTTP 5xx, a timeout, a rate limit not cleared) that channel is not read for names for ten
-# minutes. Changes when a thread is named, never what, so it is not in the cache key.
+# first, then newest activity, and any that has waited four of these intervals ahead of the rest,
+# so none waits more than 36 of them while the channel is read at this pace), and each is named
+# from the read made at its turn. After a provider failure on one of those reads (an HTTP 5xx, a
+# timeout, a rate limit not cleared) that channel is not read for names for ten minutes. Changes
+# when a thread is named, never what, so it is not in the cache key.
 # thread_naming_interval_seconds = 30   # 0 to 3600; 0 does not space the reads
 
 # [summaries.llm] — SUMMARIES AND THREAD NAMES FROM ONE PLAIN MESSAGES API CALL APIECE.

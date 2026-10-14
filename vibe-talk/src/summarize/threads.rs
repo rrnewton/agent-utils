@@ -32,8 +32,14 @@
 //!   activity a write-scope page has shown, then the first queued — except that a thread that
 //!   has waited [`OVERDUE_TURNS`] intervals goes ahead of every thread that has not, the earliest
 //!   queued first. So however fast threads fall due, once a thread has waited that long no
-//!   thread queued after it is read before it. A thread waits at most [`MAX_QUEUED_WAIT`]; a
-//!   later read that still finds it due queues it again.
+//!   thread queued after it is read before it, and it is read within `OVERDUE_TURNS +
+//!   MAX_QUEUED_PER_CHANNEL` intervals of being queued, at any interval, while its channel is read
+//!   at its budget — unless, before it was overdue, a full queue gave its place to a thread that
+//!   would be read before it. A thread that has waited [`ThreadNames::max_wait`] —
+//!   [`MAX_QUEUED_WAIT`] or [`MAX_QUEUED_TURNS`] intervals, whichever is longer, which that bound
+//!   never reaches — is dropped unread. Only a channel read more slowly than its budget gets
+//!   there: one paused after a provider failure, or waiting for the one naming turn. A later read
+//!   that still finds the thread due queues it again.
 //! * A thread is named ONLY from the read made at its turn. A thread already waiting keeps its
 //!   time in the queue when a later page shows it changed (newer activity moves it up); that
 //!   page's copy is never named from, and the read at its turn sees the change.
@@ -150,9 +156,19 @@ pub const OVERDUE_TURNS: u32 = 4;
 /// The most threads waiting in every channel's queue together. Past it, a thread is left for a
 /// later read to queue.
 pub const MAX_QUEUED: usize = 256;
-/// The longest a thread waits in a queue. Past it, it is dropped unread; a later read that still
-/// finds it due queues it again.
+/// How long a thread may wait in a queue, at the least. One that has waited
+/// [`ThreadNames::max_wait`] — this or [`MAX_QUEUED_TURNS`] of its channel's intervals, whichever
+/// is longer — is dropped unread, and a later read that still finds it due queues it again.
 pub const MAX_QUEUED_WAIT: Duration = Duration::from_secs(30 * 60);
+/// How many of its channel's intervals a thread may wait in a queue before it is dropped unread,
+/// when that is longer than [`MAX_QUEUED_WAIT`] (at an interval of 49 seconds or more). One more
+/// than the most the order makes a thread wait while its channel is read at its budget —
+/// [`OVERDUE_TURNS`] to become overdue, then at most [`MAX_QUEUED_PER_CHANNEL`] turns — so at any
+/// interval only a channel read more slowly than its budget drops a thread. A fixed limit could
+/// not promise that: at 450 seconds and more, thirty minutes was no longer than [`OVERDUE_TURNS`]
+/// intervals, a thread was dropped before it could become overdue, and the next read queued it
+/// afresh behind every newer thread, for ever.
+pub const MAX_QUEUED_TURNS: u32 = OVERDUE_TURNS + MAX_QUEUED_PER_CHANNEL as u32 + 1;
 /// The most thread records held in memory before the cache is dropped and re-read from the store.
 const MAX_KNOWN: usize = 10_000;
 /// What a thread NAME row's id is prefixed with in the summary cache. No provider's message id
@@ -570,7 +586,8 @@ enum Rank {
     /// Waited [`OVERDUE_TURNS`] intervals or more: ahead of every thread that has not, the one
     /// queued earliest first; threads one page read queued together, in the order above. That
     /// bounds every wait however fast threads fall due: no thread queued later is ever ahead of
-    /// an overdue one, at most [`MAX_QUEUED_PER_CHANNEL`] can be, and one is read per interval.
+    /// an overdue one, at most [`MAX_QUEUED_PER_CHANNEL`] can be, one is read per interval, and a
+    /// queue keeps a thread for longer than that takes ([`MAX_QUEUED_TURNS`]).
     Overdue {
         since: Reverse<Instant>,
         unnamed: bool,
@@ -619,8 +636,14 @@ impl NamesState {
     /// When worker `token` may next read in `channel`, or `None` when it should stop: the channel's
     /// queue is empty (and then it is marked unserved, in the same step, so the next thread queued
     /// starts a new worker), or the worker is no longer the one serving it. Threads that have
-    /// waited [`MAX_QUEUED_WAIT`] are dropped first.
-    fn ready_at(&mut self, channel: &ChannelId, token: u64, interval: Duration) -> Option<Instant> {
+    /// waited `max_wait` ([`ThreadNames::max_wait`]) are dropped first.
+    fn ready_at(
+        &mut self,
+        channel: &ChannelId,
+        token: u64,
+        interval: Duration,
+        max_wait: Duration,
+    ) -> Option<Instant> {
         let queue = self.channels.get_mut(channel)?;
         if queue.worker != Some(token) {
             return None;
@@ -628,7 +651,7 @@ impl NamesState {
         let before = queue.waiting.len();
         queue
             .waiting
-            .retain(|_, waiting| waiting.queued_at.elapsed() < MAX_QUEUED_WAIT);
+            .retain(|_, waiting| waiting.queued_at.elapsed() < max_wait);
         if queue.waiting.len() < before {
             tracing::debug!(
                 dropped = before - queue.waiting.len(),
@@ -781,6 +804,14 @@ impl ThreadNames {
     /// How long a thread waits before it is taken ahead of every thread that has waited less.
     fn overdue_after(&self) -> Duration {
         self.interval.saturating_mul(OVERDUE_TURNS)
+    }
+
+    /// How long a thread may wait in a queue before it is dropped unread: [`MAX_QUEUED_WAIT`] or
+    /// [`MAX_QUEUED_TURNS`] intervals, whichever is longer. Longer, at any interval, than the order
+    /// makes a thread wait while its channel is read at its budget.
+    #[must_use]
+    pub fn max_wait(&self) -> Duration {
+        MAX_QUEUED_WAIT.max(self.interval.saturating_mul(MAX_QUEUED_TURNS))
     }
 
     /// How many threads are queued or being named right now, in every channel.
@@ -1138,8 +1169,12 @@ impl ThreadNames {
             channel: channel.clone(),
             token,
         };
+        let max_wait = self.max_wait();
         loop {
-            let Some(ready_at) = self.lock().ready_at(&channel, token, self.interval) else {
+            let Some(ready_at) = self
+                .lock()
+                .ready_at(&channel, token, self.interval, max_wait)
+            else {
                 return;
             };
             tokio::time::sleep_until(ready_at).await;
@@ -1149,7 +1184,7 @@ impl ThreadNames {
             // below is made at once, so the budget is counted from when it really begins.
             let taken = {
                 let mut state = self.lock();
-                match state.ready_at(&channel, token, self.interval) {
+                match state.ready_at(&channel, token, self.interval, max_wait) {
                     None => return,
                     Some(at) if at > Instant::now() => None,
                     Some(_) => state.take_next(&channel, self.overdue_after()),

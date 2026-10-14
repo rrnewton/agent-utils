@@ -1598,16 +1598,21 @@ channel:
   (seconds; default `30`; `0` to `3600`, where `0` spaces them not at all and they are still made
   one at a time). Twenty threads falling due in a minute cost two reads, not twenty.
 * Due threads wait in their channel's queue: at most 32 per channel (when it is full, a thread
-  that would be read before the one that would be read last takes its place) and 256 in all, and
-  none longer than 30 minutes. A thread dropped from a queue is queued again by the next
-  write-token read that finds it still due.
+  that would be read before the one that would be read last takes its place) and 256 in all.
 * They are read **a thread with no name yet before one due only a fresh sentence, then newest
   activity first** — the newest a write-token read has shown, so a waiting thread that gets a new
   reply moves up. **A thread that has waited four intervals (two minutes by default) goes ahead
   of every thread that has not, the earliest queued first**: however fast threads fall due, once a
   thread has waited that long no thread queued after it is read first, so busier threads cannot
-  keep an older or quieter one waiting for ever. With an interval of `0` that is every waiting
-  thread, and the queue is first come first served.
+  keep an older or quieter one waiting for ever. It is read within 36 intervals of being queued
+  (18 minutes by default, and usually at the turn after it is overdue), whatever the interval —
+  unless more than 32 threads wait at once, and a full queue gives its place to one that would
+  be read before it while it is not yet overdue. With an interval of `0` every waiting thread is
+  overdue at once, and the queue is first come first served.
+* That bound holds while the channel is read at its budget. A channel read more slowly — paused
+  after a provider failure (below), or waiting while threads in other channels are named, one at
+  a time — drops a thread that has waited 30 minutes or 37 intervals, whichever is longer, without
+  reading it; the next write-token read that finds it still due queues it again.
 * **A thread is named only from the read made at its turn.** A thread already waiting keeps its
   time in the queue when a later page shows it changed — a reply edited, a reply added — and its
   name is made from what the provider says then, never from a copy the page held. The copy a
