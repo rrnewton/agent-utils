@@ -562,7 +562,6 @@
           -->
           <div id="side-column">
             <div id="side-heading">
-              <span id="side-facts" class="thread-facts" hidden></span>
               <span id="side-title">Thread list</span>
               <!--
                 `#259 thread-list-unread-filter`. The owner: "Some have "N unread" and others are fully
@@ -572,11 +571,31 @@
                 that says "N unread" or "N new" on a card. Kept on this device.
               -->
               <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread only</button>
-              <button id="side-close" class="icon-button" type="button" aria-label="Close thread" title="Back to the list of threads" hidden>
-                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                  <path d="M6 6l12 12M18 6 6 18" />
-                </svg>
-              </button>
+              <!--
+                `#298 thread-card-header`. The owner, of the thread cards: "When I drill into a given
+                thread card to see the messages inside it, I would like to KEEP that same style ... the
+                SAME colorful card move up to the top of the screen and KEEP its connector linkage over
+                to the main channel message on the left column ... We can still sneak in an X button
+                somewhere for a mouse-only exit back to all-threads view." So over a thread the heading
+                IS the thread's card: what the thread is about, in the card's words and its thread's
+                colour, how long since it moved, its replies and how many are unread, and the X at the
+                end of that line. It stands in the heading, outside the scroller, so it never scrolls
+                away and nothing the scroller keeps its reader by has to allow for it; and it is a fixed
+                height, its text clamped as a card's is, so words arriving later move nothing. The
+                text, when the clamp cuts it, opens over the list below rather than pushing it down.
+                web/voice.js fills it (`paintThreadCard`), and draws the line from the thread's first
+                message on the left to it (`columnLinkPairs`).
+              -->
+              <div id="side-thread-card" class="side-card-row thread-card-header" hidden>
+                <button id="side-thread-card-text" class="side-card" type="button"></button>
+                <span id="side-thread-card-age" class="side-card-facts"></span>
+                <span id="side-thread-card-count" class="thread-card-count" hidden></span>
+                <button id="side-close" class="icon-button thread-card-close" type="button" aria-label="Close thread" title="Back to the thread list" hidden>
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <path d="M6 6l12 12M18 6 6 18" />
+                  </svg>
+                </button>
+              </div>
             </div>
             <!--
               `#231 two-column-polish`. How old the right column's rows are, whenever they are not a
@@ -2056,7 +2075,11 @@
                 thread's <strong>Thread(N)</strong>, its <strong>N
                 replies</strong> or <strong>M unread</strong>, the view picker and a card's
                 <strong>N replies · M unread</strong> each select the thread on the right; a tap on a message still only opens or folds
-                it. The <strong>×</strong> at the top of the right column goes back to the list. The
+                it. A thread opens under its own card, at the top of the right column: the same words and
+                colour, how long since it moved, its replies and unread, and still the line to its first
+                message on the left — rest the mouse on the card and Main scrolls to that message. Where
+                the card's text is cut, a click on it shows all of it over the list, and another click or
+                <kbd>Esc</kbd> puts it back. The <strong>×</strong> on the card goes back to the list. The
                 search, Links and the read mode apply to both columns, and <kbd>[</kbd> and
                 <kbd>]</kbd> move the keys between them. <strong>Reply</strong> and <strong>Quote
                 reply</strong> open the reply box at the foot of the column you pressed them in, with

@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -256,6 +256,16 @@ copy-message-browser:
 # keep a PNG of each state.
 back-gesture-browser:
 	python3 tests/back_gesture_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#298 thread-card-header` in a real Chromium at 1280x800 with a mouse, in both schemes: a card's replies
+# button opens its thread on the right under its card at the top of the column — the card's words, place,
+# height and colour, by computed colour and pixels, the X on it — joined to the thread's root on Main by
+# one line, clipped at Main's top while the root is above it, that the mouse resting on the card glides
+# Main along and the mouse crossing it does not; a long question's card the same height, opened over the
+# list with the list unmoved to the pixel, and Esc closing it, then the thread. Pass WEB_ROOT=dir to run it
+# against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
+thread-card-header-browser:
+	python3 tests/thread_card_header_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#280 scroll-stability` in a real Chromium at 1280x800 in two columns (mouse) and 412x915 in one (touch):
 # the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive

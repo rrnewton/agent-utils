@@ -45,7 +45,8 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   at that end; **Older threads…** above the oldest card reads further back. Esc goes back to the view
   it was chosen from.
 * **Two columns**, on a desk at least 1000px wide, put Main on the left and the same thread list on
-  the right, where a thread chosen from it opens.
+  the right, where a thread chosen from it opens under its own card, still in its colour and still
+  joined by its line to the thread's first message on the left; the card's × goes back to the list.
 
 A source added through Settings is always a separate entry in the channel picker, even when that
 source identifies one upstream conversation rather than a whole room. The thread list is a
@@ -6507,17 +6508,23 @@ glide (`#280 scroll-stability`) — and a jump instead of a glide where the read
 `--column-glide`; the script asks no media query). The links are one SVG drawn at most once per
 animation frame, from passive scroll listeners, resizes and redraws, every rectangle read before
 anything is written and only what changed written; nothing is drawn or measured in one column, on a
-phone, over a thread, or while the page is hidden (`#226 page-energy-profile`). Thread(N), the
-unread count, N replies, the view picker and a card's replies button select a thread there, and a plain tap on
-a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
+phone, or while the page is hidden (`#226 page-energy-profile`), and over a thread only its one link.
+A thread on the right opens under its own card at the top of the column (`#298 thread-card-header`):
+the card's words, age, counts and colour, a fixed height outside the scroller so nothing it says moves
+the list, its text opened over the list where the clamp cuts it, and the X on it; its link goes from
+its root on Main to that card, from a collapsed run's line when the root is in one and up from Main's
+top when the root is older than Main holds, and a mouse resting on the card glides Main to the root.
+Thread(N), the unread count, N replies, the view picker and a card's replies button select a thread
+there, and a plain tap on a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
 in for the left column's list. The poll reads Main and the selected thread (two views, one delta
 each), a live reply in that thread is read once as the thread, and a refresh that brings nothing
 draws nothing in either column. The thread is drawn by the same code as a thread in one column: the
 right column's elements stand in for the channel pane's while the code works on that column, and
 its state is swapped in around that work (`COLUMN_IDS`, `COLUMN_STATE` and `inColumn` in
 `web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800,
-and `tests/thread_card_focus_browser.py` the highlight and the grey, by computed colour and by the
-pixels drawn, at 1280x800 and on a 412x915 phone.
+`tests/thread_card_focus_browser.py` the highlight and the grey, by computed colour and by the
+pixels drawn, at 1280x800 and on a 412x915 phone, and `tests/thread_card_header_browser.py` the card at
+the top of a thread, its line and its glide, at 1280x800 in both schemes.
 
 **The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
 Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and
