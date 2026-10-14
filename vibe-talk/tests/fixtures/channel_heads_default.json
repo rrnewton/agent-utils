@@ -1,0 +1,383 @@
+[
+  {
+    "answer": {
+      "1111111111": [],
+      "2222222222": [],
+      "3333333333": []
+    },
+    "case": "the poller's first tick seeds every channel",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "1111111111": [
+        "deploy finished"
+      ],
+      "2222222222": [],
+      "3333333333": []
+    },
+    "case": "a tick after a message arrived in one channel",
+    "upstream": [
+      "fetch_page 1111111111 limit=20 before=- after=<read-1>",
+      "fetch_page 2222222222 limit=20 before=- after=<write-1>",
+      "fetch_page 3333333333 limit=20 before=- after=<third-1>"
+    ]
+  },
+  {
+    "answer": {
+      "1111111111": [
+        "deploy finished"
+      ],
+      "2222222222": [],
+      "3333333333": []
+    },
+    "case": "a quiet tick",
+    "upstream": [
+      "fetch_page 1111111111 limit=20 before=- after=<read-2>",
+      "fetch_page 2222222222 limit=20 before=- after=<write-1>",
+      "fetch_page 3333333333 limit=20 before=- after=<third-1>"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "1111111111",
+          "said": [
+            "build is green",
+            "deploy finished"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "2222222222",
+          "said": [
+            "ship it"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "3333333333",
+          "said": [
+            "pager is quiet"
+          ]
+        }
+      ],
+      "newest": "deploy finished",
+      "status": 200
+    },
+    "case": "a catch-up with nothing held",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "1111111111",
+          "said": [
+            "build is green",
+            "deploy finished"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "2222222222",
+          "said": [
+            "ship it"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "3333333333",
+          "said": [
+            "pager is quiet"
+          ]
+        }
+      ],
+      "newest": "deploy finished",
+      "status": 200
+    },
+    "case": "a catch-up at once after it",
+    "upstream": []
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "1111111111",
+          "said": [
+            "build is green",
+            "deploy finished"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "2222222222",
+          "said": [
+            "ship it"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "3333333333",
+          "said": [
+            "pager is quiet"
+          ]
+        }
+      ],
+      "newest": "deploy finished",
+      "status": 200
+    },
+    "case": "a catch-up after the reuse period, nothing changed",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "1111111111",
+          "said": [
+            "build is green",
+            "deploy finished"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "2222222222",
+          "said": [
+            "ship it",
+            "first draft"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "3333333333",
+          "said": [
+            "pager is quiet"
+          ]
+        }
+      ],
+      "newest": "first draft",
+      "status": 200
+    },
+    "case": "a catch-up after a message arrived",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "1111111111",
+          "said": [
+            "build is green",
+            "deploy finished"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "2222222222",
+          "said": [
+            "ship it",
+            "second draft, edited"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "3333333333",
+          "said": [
+            "pager is quiet",
+            "wrong channel"
+          ]
+        }
+      ],
+      "newest": "wrong channel",
+      "status": 200
+    },
+    "case": "a catch-up after an edit and a message arrived",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "channels": [
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "1111111111",
+          "said": [
+            "build is green",
+            "deploy finished"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 2,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "2222222222",
+          "said": [
+            "ship it",
+            "second draft, edited"
+          ]
+        },
+        {
+          "at_least": false,
+          "counted": 1,
+          "error": null,
+          "held_age_seconds": null,
+          "id": "3333333333",
+          "said": [
+            "pager is quiet"
+          ]
+        }
+      ],
+      "newest": "second draft, edited",
+      "status": 200
+    },
+    "case": "a catch-up after a delete, and nothing added",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "warming": 3
+    },
+    "case": "a call start's warm-up after the reuse period",
+    "upstream": [
+      "fetch_recent 1111111111 limit=20",
+      "fetch_recent 2222222222 limit=20",
+      "fetch_recent 3333333333 limit=20"
+    ]
+  },
+  {
+    "answer": {
+      "warming": 0
+    },
+    "case": "a second warm-up at once",
+    "upstream": []
+  },
+  {
+    "answer": {
+      "failure": false,
+      "report": "startup channel probe (a one-message read per configured channel):\n  [ok] channel 1111111111 (build noise): readable\n  [ok] channel 2222222222 (lead team): readable\n  [ok] channel 3333333333 (night shift): readable\n"
+    },
+    "case": "the startup probe",
+    "upstream": [
+      "fetch_recent 1111111111 limit=1",
+      "fetch_recent 2222222222 limit=1",
+      "fetch_recent 3333333333 limit=1"
+    ]
+  },
+  {
+    "answer": {
+      "chat_checks": [
+        {
+          "id": "discord.token",
+          "status": "pass",
+          "subject": null,
+          "summary": "confirmed"
+        },
+        {
+          "id": "discord.channel",
+          "status": "pass",
+          "subject": "1111111111",
+          "summary": "readable"
+        },
+        {
+          "id": "discord.channel",
+          "status": "pass",
+          "subject": "2222222222",
+          "summary": "readable"
+        },
+        {
+          "id": "discord.channel",
+          "status": "pass",
+          "subject": "3333333333",
+          "summary": "readable"
+        }
+      ],
+      "status": 200
+    },
+    "case": "diagnostics",
+    "upstream": [
+      "identity",
+      "fetch_recent 1111111111 limit=1",
+      "fetch_recent 2222222222 limit=1",
+      "fetch_recent 3333333333 limit=1"
+    ]
+  }
+]
