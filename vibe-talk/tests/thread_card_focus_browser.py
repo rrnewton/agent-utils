@@ -200,7 +200,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, label, width, height)
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             if phone:
                 phone_walk(desk)
                 phone_list_walk(desk)

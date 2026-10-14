@@ -185,7 +185,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             reader = Reader(Desk(page, args.screenshots, label, width, height), context.new_cdp_session(page), api)
-            page.goto(f"{origin}/voice", wait_until="load")
+            page.goto(f"{origin}/", wait_until="load")
             open_all(reader)
             if phone:
                 phone_walk(reader)
@@ -404,7 +404,7 @@ def mac_walk(reader: Reader, context: BrowserContext, origin: str, errors: list[
     cdp = context.new_cdp_session(mac)
     agent = str(reader.page.evaluate("() => navigator.userAgent"))
     cdp.send("Emulation.setUserAgentOverride", {"userAgent": agent, "platform": "MacIntel"})
-    mac.goto(f"{origin}/voice", wait_until="load")
+    mac.goto(f"{origin}/", wait_until="load")
     mac.wait_for_selector("#view-switch", state="visible", timeout=10_000)
     if mac.evaluate("() => document.getElementById('view-switch').getAttribute('aria-checked')") != "true":
         mac.click("#view-switch")

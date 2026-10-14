@@ -207,8 +207,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(204, {})
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (web_root / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (web_root / relative).resolve()
             if web_root not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -318,7 +318,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             device_scale_factor=2.625 if mobile else 1,
         )
         try:
-            origin = url.rsplit("/voice", 1)[0]
+            origin = url.removesuffix("/")
             context.grant_permissions(["microphone"], origin=origin)
             context.route_web_socket(re.compile(r"/ws\?mode=voice$"), voice.accept)
             # Counted from the page's own realm, before a line of it runs: the microphone is the one
@@ -517,7 +517,7 @@ def main() -> int:
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     try:
         lines = []
         with sync_playwright() as playwright:

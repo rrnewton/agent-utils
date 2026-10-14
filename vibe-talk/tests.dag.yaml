@@ -154,12 +154,16 @@ steps:
 
   # Chrome's own installability verdict. Unlike the fake-DOM suite, this exercises manifest
   # parsing, icon loading, secure-origin rules and the selected display mode in the browser engine.
+  # Against the real server since `#302 root-is-the-app`, because what it asks about is the server's:
+  # the app at / is installable, the manifest's id still names the app installed from /voice, and
+  # /voice?x=1#y is a 302 to /?x=1#y, query and fragment kept, inside the scope.
   - group: check
     job: pwa-installability
-    desc: current Chromium CDP installability check with an Android viewport
+    desc: current Chromium CDP installability check with an Android viewport, at / and from /voice, against the real server
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/pwa_installability.py
     jobs_flag: ""
+    deps: [build.release]
     timeout: 60
     cpu_timeout: 30
     hint:

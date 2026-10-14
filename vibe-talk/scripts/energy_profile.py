@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure what the /voice page costs a battery: CPU and memory, scenario by scenario, build by build.
+"""Measure what the app costs a battery: CPU and memory, scenario by scenario, build by build.
 
 `#226 page-energy-profile`. The owner keeps vibe-talk open as an installed app on a desktop and on a
 phone and wants to know it is not draining either. A battery cannot be read from here, so this
@@ -935,6 +935,9 @@ path = "{self.workdir}/state/vibe-talk.sqlite3"
         """Sign in, switch from the Voice pane to the channel, and wait for its rows."""
         cdp = self.cdp
         assert cdp is not None
+        # `/voice`, not `/`, on purpose (#302 root-is-the-app): a profile compares builds, and a
+        # build from before the app moved to `/` serves an older page there. `/voice` opens the app
+        # on both sides of the move, as the page itself or as a forward to `/`.
         url = f"http://127.0.0.1:{self.port}/voice"
         cdp.send("Page.navigate", {"url": url})
         cdp.wait_for("document.readyState === 'complete'", 30)

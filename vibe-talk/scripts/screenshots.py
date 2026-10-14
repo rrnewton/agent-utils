@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Photograph the /voice page in every state that looks different, so an agent can LOOK at it.
+"""Photograph the app at / in every state that looks different, so an agent can LOOK at it.
 
 WHY THIS EXISTS
 ===============
 
-The /voice page has a large behavioural suite (tests/js/voice_page.test.mjs) that drives the real
+The app has a large behavioural suite (tests/js/voice_page.test.mjs) that drives the real
 web/voice.js against a strict fake DOM and asserts that the right properties sit on the right
 selectors. Not one of those assertions can tell you the page LOOKS right, and the suite says so
 itself: the fixture lays nothing out.
@@ -947,7 +947,7 @@ class Driver:
                 + "); } catch (e) {}\n"
             )
         self.page.add_init_script(script)
-        self.page.goto(f"{self.base_url}/voice", wait_until="load")
+        self.page.goto(f"{self.base_url}/", wait_until="load")
 
     def click(self, element_id: str) -> None:
         self.page.click(f"#{element_id}")
@@ -4983,11 +4983,11 @@ def expect_viewport_meta(html: str) -> list[str]:
     problems = []
     if "viewport-fit=cover" not in html:
         problems.append(
-            "the served /voice markup no longer declares viewport-fit=cover, so the page will letterbox "
+            "the served page's markup no longer declares viewport-fit=cover, so the page will letterbox "
             "inside the safe area on a phone with a cutout"
         )
     if "width=device-width" not in html:
-        problems.append("the served /voice markup no longer declares width=device-width")
+        problems.append("the served page's markup no longer declares width=device-width")
     return problems
 
 
@@ -6095,7 +6095,7 @@ def run_self_test(tmp: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="screenshots.py",
-        description="Photograph the /voice page in every state that looks different.",
+        description="Photograph the app, the page at /, in every state that looks different.",
     )
     parser.add_argument("--url", help="base URL of a running vibe-talk (NOT the live one on 8080)")
     parser.add_argument("--channel", help="channel snowflake the Discord tab should read")
@@ -6172,10 +6172,10 @@ def main(argv: list[str]) -> int:
         return EXIT_SERVER_UNREACHABLE
 
     try:
-        with urlopen(f"{args.url.rstrip('/')}/voice", timeout=10) as response:
+        with urlopen(f"{args.url.rstrip('/')}/", timeout=10) as response:
             html = response.read().decode("utf-8", "replace")
     except URLError as error:
-        print(f"screenshots.py: could not read {args.url}/voice ({error})", file=sys.stderr)
+        print(f"screenshots.py: could not read {args.url.rstrip('/')}/ ({error})", file=sys.stderr)
         return EXIT_SERVER_UNREACHABLE
     for problem in expect_viewport_meta(html):
         print(f"screenshots.py: {problem}", file=sys.stderr)

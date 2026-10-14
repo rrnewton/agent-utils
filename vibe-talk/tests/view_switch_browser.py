@@ -282,7 +282,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             def pill() -> str:
                 return str(page.evaluate("() => document.getElementById('channel-freshness').textContent"))
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)

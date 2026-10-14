@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time /voice's read-aloud from tap to audible in real Chromium, against audio streamed at speaking pace.
+"""Time the app's read-aloud from tap to audible in real Chromium, against audio streamed at speaking pace.
 
 A prepared read reaches the page as a WAV the server writes while the agent is still speaking, so
 it arrives at playback speed: 24 kHz, 16-bit, mono is 48 KB a second. Chromium's `<audio>` element
@@ -303,8 +303,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 read.closed = time.monotonic()
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (web_root / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (web_root / relative).resolve()
             if web_root not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -417,7 +417,7 @@ def main() -> int:
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 

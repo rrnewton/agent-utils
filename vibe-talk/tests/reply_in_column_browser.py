@@ -290,7 +290,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, f"reply-column-{WIDTH}", WIDTH, HEIGHT)
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_columns(desk)
             for column, how, close, message_id in RUNS:
                 reply_run(desk, api, column, how, close, message_id)

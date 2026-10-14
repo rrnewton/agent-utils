@@ -229,8 +229,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(204, {})
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (web_root / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (web_root / relative).resolve()
             if web_root not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -436,7 +436,7 @@ def main() -> int:
                 page = context.pages[0]
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
-                page.goto(f"{origin}/voice", wait_until="load")
+                page.goto(f"{origin}/", wait_until="load")
                 summary = walk(page, api, voice)
                 check(not errors, f"the page threw: {errors}")
                 browser_version = context.browser.version if context.browser else "Chromium"

@@ -364,7 +364,7 @@ def main() -> int:
                 page = context.pages[0]
                 errors: list[str] = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
-                page.goto(f"http://127.0.0.1:{port}/voice", wait_until="load")
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
                 page.fill("#api-token", WRITE_TOKEN)
                 page.click("#save-token")
                 page.wait_for_selector("#view-switch", state="visible", timeout=10_000)

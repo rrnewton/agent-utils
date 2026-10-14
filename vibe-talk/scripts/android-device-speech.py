@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Capture vibe-talk device speech on Android and judge what the phone actually emitted.
 
-This is an opt-in physical-device regression, not a browser mock.  It drives the served /voice
-page through Android Chrome's DevTools socket, records Android playback, converts that recording
+This is an opt-in physical-device regression, not a browser mock.  It drives the served app (the
+page at /) through Android Chrome's DevTools socket, records Android playback, converts that recording
 to mono PCM, and requires both an audible-signal check and an STT language/text check to pass.
 
 The write token is read only from VIBE_TALK_WRITE_TOKEN.  The transcriber is an adapter executable
@@ -473,18 +473,28 @@ def connect_android_chrome(playwright: Playwright, serial: str) -> tuple[Browser
     return browser, port
 
 
+def app_path(path: str) -> str:
+    """The page a path opens: the app's old address, /voice, is forwarded to / (#302 root-is-the-app)."""
+    trimmed = path.rstrip("/")
+    return "" if trimmed == "/voice" else trimmed
+
+
+def same_page(current_url: str, wanted_url: str) -> bool:
+    """Whether a tab at current_url is the page wanted_url opens, an old /voice URL included."""
+    current, wanted = urlparse(current_url), urlparse(wanted_url)
+    return (
+        current.scheme == wanted.scheme
+        and current.netloc == wanted.netloc
+        and app_path(current.path) == app_path(wanted.path)
+    )
+
+
 def find_page(browser: Browser, wanted_url: str, timeout_seconds: float = 20.0) -> Page:
-    wanted = urlparse(wanted_url)
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         for context in browser.contexts:
             for page in context.pages:
-                current = urlparse(page.url)
-                if (
-                    current.scheme == wanted.scheme
-                    and current.netloc == wanted.netloc
-                    and current.path.rstrip("/") == wanted.path.rstrip("/")
-                ):
+                if same_page(page.url, wanted_url):
                     return page
         time.sleep(0.2)
     raise HarnessError("the requested vibe-talk page did not open in Android Chrome", EXIT_BROWSER)
@@ -652,6 +662,9 @@ def self_test() -> int:
     for suffix in (".mp4", ".wav"):
         capture, wav_path, _ = artifact_paths(Path("out"), suffix)
         check(capture != wav_path, f"a {suffix} capture shares its path with the converted WAV")
+    check(same_page("https://h.example/?x=1", "https://h.example/voice"), "an old /voice URL finds no tab")
+    check(same_page("https://h.example/", "https://h.example"), "the app at / is not its own page")
+    check(not same_page("https://h.example/api/v1/channels", "https://h.example/"), "another path passed")
     try:
         joined = subprocess.run(
             [
@@ -678,7 +691,7 @@ def self_test() -> int:
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return EXIT_SELF_TEST
-    print("android device-speech self-test: 12 controls passed")
+    print("android device-speech self-test: 15 controls passed")
     return EXIT_OK
 
 
@@ -689,7 +702,10 @@ def parser() -> argparse.ArgumentParser:
             "silence, corrupt levels, the wrong language, or unrelated recognised words."
         )
     )
-    result.add_argument("--url", help="served /voice URL; required except with --self-test")
+    result.add_argument(
+        "--url",
+        help="served app URL, the page at / (an old /voice URL is forwarded there); required except with --self-test",
+    )
     result.add_argument("--serial", help="adb serial; required only when more than one device is connected")
     result.add_argument("--channel", help="channel id to select; defaults to the page's current channel")
     result.add_argument("--message-id", help="loaded message id to read; mutually exclusive with --message-index")

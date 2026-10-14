@@ -94,7 +94,7 @@ def record_of(row: Json) -> Json:
 
 @dataclass
 class FakeApi:
-    """The routes /voice reads and the reply route, over one Google Chat space, keeping what is posted
+    """The routes the page reads and the reply route, over one Google Chat space, keeping what is posted
     as the service does: a post into a thread is a reply in it, and the thread's root counts it."""
 
     stopping: threading.Event = field(default_factory=threading.Event)
@@ -207,8 +207,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (web_root / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (web_root / relative).resolve()
             if web_root not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -490,7 +490,7 @@ def serve(api: FakeApi, web_root: Path) -> tuple[ThreadingHTTPServer, threading.
     server.daemon_threads = True
     thread_ = threading.Thread(target=server.serve_forever, daemon=True)
     thread_.start()
-    return server, thread_, f"http://127.0.0.1:{server.server_port}/voice"
+    return server, thread_, f"http://127.0.0.1:{server.server_port}/"
 
 
 def arguments() -> argparse.Namespace:

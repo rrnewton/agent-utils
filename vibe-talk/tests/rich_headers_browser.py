@@ -183,8 +183,8 @@ def handler(stopping: threading.Event) -> type[BaseHTTPRequestHandler]:
             self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (WEB_ROOT / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (WEB_ROOT / relative).resolve()
             if WEB_ROOT not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -547,7 +547,7 @@ def main() -> int:
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     try:
         with sync_playwright() as playwright:
             for label, width, height, mobile in PROFILES:

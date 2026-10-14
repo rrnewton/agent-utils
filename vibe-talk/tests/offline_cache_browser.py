@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise /voice's saved-message snapshot in real Chromium at a phone's size.
+"""Exercise the app's saved-message snapshot in real Chromium at a phone's size.
 
 The fake-DOM suite (tests/js/voice_page.test.mjs) covers every branch of the snapshot. This covers
 what only a browser engine can: real localStorage, a real reload, real fetch failures, the Cache
@@ -252,7 +252,7 @@ def thread_of(row: Json) -> Json:
 
 
 class FakeApi:
-    """The routes /voice reads, answering from one mutable little store."""
+    """The routes the page reads, answering from one mutable little store."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -721,8 +721,8 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
                 self.json(200, api.pin(found.group(1), body))
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (WEB_ROOT / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (WEB_ROOT / relative).resolve()
             if WEB_ROOT not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -2353,7 +2353,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     platform = "Linux; Android 15; Pixel 7" if mobile else "X11; Linux x86_64"
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
@@ -2944,7 +2944,7 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     platform = "Linux; Android 15; Pixel 7" if mobile else "X11; Linux x86_64"
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
@@ -3119,7 +3119,7 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-tiles-") as profile:
             context = chromium.launch_persistent_context(
@@ -3241,7 +3241,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     heights: dict[str, float] = {}
     # Where the view switch is drawn in each state measured in the default column.
     switches: dict[str, DockBox] = {}
@@ -3513,7 +3513,7 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     platform = "Linux; Android 15; Pixel 7" if mobile else "X11; Linux x86_64"
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
@@ -3836,7 +3836,7 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                                                 f" ({menu['items']})")
                     return hidden
 
-                page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+                page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                 page.fill("#api-token", TOKEN)
                 page.click("#save-token")
                 page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -3916,7 +3916,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
                 return [str(row) for row in page.eval_on_selector_all(
                     f"#{list_id} > li[data-id]", "items => items.map(i => i.getAttribute('data-id'))")]
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -4048,7 +4048,7 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{label}: {why}")
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -4107,7 +4107,8 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             opened_page = tab.value
             opened_page.wait_for_load_state()
             check(opened_page.url == "https://example.org/diff/7", f"{label}: the tap opened {opened_page.url}")
-            check(page.url.endswith("/voice"), f"{label}: the tap navigated the app itself to {page.url}")
+            check(page.url == f"http://127.0.0.1:{server.server_port}/",
+                  f"{label}: the tap navigated the app itself to {page.url}")
             opened_page.close()
             after = page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id=\"200\"]');"
                                   " return [row.getAttribute('data-collapsed'), row.getAttribute('data-links-view'),"
@@ -4183,7 +4184,7 @@ def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, 
                                       ".getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; }")
                 page.touchscreen.tap(float(found[0]), float(found[1]))
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -4313,7 +4314,7 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             def counted(chips: list[list[str]]) -> int:
                 return sum(int(chip[2] or 0) for chip in chips)
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -4487,7 +4488,7 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
                 cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
                 page.wait_for_timeout(300)
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -4586,7 +4587,7 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 return bool(page.evaluate("() => { const a = document.getElementById('scroll-area');"
                                           " return a.scrollHeight - a.scrollTop - a.clientHeight <= 24; }"))
 
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -4646,7 +4647,7 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{server.server_port}/voice"
+    url = f"http://127.0.0.1:{server.server_port}/"
     listed_first, listed_second = str(LONG_CHANNEL["id"]), str(CHANNEL["id"])
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-windows-") as profile:

@@ -90,7 +90,7 @@ LONG_MESSAGES: list[Json] = [
 
 
 class FakeApi:
-    """The routes /voice reads, for one channel of messages from an agent, and its Done."""
+    """The routes the page reads, for one channel of messages from an agent, and its Done."""
 
     def __init__(self, web_root: Path, messages: list[Json] = MESSAGES) -> None:
         self.web_root = web_root
@@ -101,7 +101,7 @@ class FakeApi:
         request = route.request
         path = unquote(urlsplit(request.url).path)
         if not path.startswith("/api/"):
-            relative = "voice.html" if path == "/voice" else path.lstrip("/")
+            relative = "voice.html" if path == "/" else path.lstrip("/")
             target = (self.web_root / relative).resolve()
             if self.web_root not in target.parents or not target.is_file():
                 route.fulfill(status=404, body="")
@@ -327,7 +327,7 @@ def open_channel(browser: Browser, api: FakeApi, *, reduced: bool = False, schem
     context.route("**/*", api.route)
     page = context.new_page()
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(f"{ORIGIN}/voice", wait_until="load")
+    page.goto(f"{ORIGIN}/", wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)

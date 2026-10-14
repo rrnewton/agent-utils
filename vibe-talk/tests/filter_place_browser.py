@@ -341,7 +341,7 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
               "the Pinned list does not show the five pins")
         settled()
 
-    page.goto(f"http://127.0.0.1:{port}/voice", wait_until="load")
+    page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)

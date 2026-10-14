@@ -505,7 +505,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             reader = Reader(page, api, args.screenshots, label, touch)
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_main(reader)
             main_walk(reader)
             if not touch:
@@ -514,7 +514,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             if not touch:
                 cards_walk(reader)
             thread_walk(reader)
-            reload_walk(reader, f"http://127.0.0.1:{server.server_port}/voice")
+            reload_walk(reader, f"http://127.0.0.1:{server.server_port}/")
             view_keys_walk(reader)
             if not touch:
                 highlight_walk(reader)

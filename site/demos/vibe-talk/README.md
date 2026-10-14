@@ -168,7 +168,7 @@ changed. The five committed GIFs total about 3.6 MB; the largest is 1.4 MB.
   device-pixel rendering. The phone GIFs are therefore 412 px wide, 1:1 with CSS pixels. A wider
   phone GIF would be upscaled and soft. Use `page.screenshot` in a loop (about 10-15 frames a
   second at 824x1830) if a larger GIF is ever needed.
-* **Voice is not shown.** `/voice` call states depend on sound and a vendor connection. The clips
+* **Voice is not shown.** The app's call states depend on sound and a vendor connection. The clips
   stay on the channel view.
 * **What the mock does not implement.** Forward cursors (`next_after`; vibe-talk falls back to
   its generic cursor), channel registration and discovery, upstream read marks, `recent_view =

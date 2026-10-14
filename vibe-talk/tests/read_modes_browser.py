@@ -104,7 +104,7 @@ def message(index: int, message_id: str, content: str, who: Json, thread: Json |
 
 @dataclass
 class FakeApi:
-    """The routes /voice reads, answering from one fixed channel.
+    """The routes the page reads, answering from one fixed channel.
 
     `all_window`, when set, makes All's newest page the channel's last that many messages, with more
     before them; `thread_gate`, when set, holds a thread's read until the walk opens the gate, for at
@@ -230,8 +230,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             self.json(404, {"error": "not_found", "detail": "not served by this check"})
 
         def asset(self, request_path: str) -> None:
-            relative = "voice.html" if request_path == "/voice" else request_path.lstrip("/")
-            target = (web_root / (relative or "index.html")).resolve()
+            relative = "voice.html" if request_path == "/" else request_path.lstrip("/")
+            target = (web_root / relative).resolve()
             if web_root not in target.parents or not target.is_file():
                 self.send_error(404)
                 return
@@ -786,7 +786,7 @@ def serve(api: FakeApi, web_root: Path) -> tuple[ThreadingHTTPServer, threading.
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, thread, f"http://127.0.0.1:{server.server_port}/voice"
+    return server, thread, f"http://127.0.0.1:{server.server_port}/"
 
 
 def main() -> int:

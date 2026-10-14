@@ -10,7 +10,7 @@
 #   5. Removes a leftover STOPPED container, proves the host directory for durable state is
 #      writable by the container's own user, then runs the new one detached with it mounted.
 #
-# DURABLE STATE. The server keeps the /voice transcript, its own read marks and its summary cache
+# DURABLE STATE. The server keeps the app's transcript, its own read marks and its summary cache
 # in a SQLite file. That file must live OUTSIDE the container: this script replaces the container
 # on every launch, so anything written into the image's writable layer is destroyed by the next
 # deploy, silently. VIBE_TALK_DATA_DIR (default: ${XDG_DATA_HOME:-$HOME/.local/share}/vibe-talk)
@@ -82,7 +82,7 @@
 #                  question from the ordinary run: does the vendor actually act on a replayed
 #                  transcript (#46 conversation-replay)? Conversation A states a nonce and its
 #                  turns are recorded through this server's own transcript API, exactly as the
-#                  /voice page records them; conversation B opens WITH that record and must return
+#                  app records them; conversation B opens WITH that record and must return
 #                  the nonce; conversation C is the CONTROL — same question, no record — and must
 #                  NOT be able to answer. Without C the run would prove the agent is fluent rather
 #                  than that it remembers, so all three are reported separately.
@@ -97,7 +97,7 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in all thirty-six states that look different, so an
+#   --screenshots  Photograph the app at / in all thirty-six states that look different, so an
 #                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
@@ -111,7 +111,7 @@
 #                  a working summariser; the other wedges the same mock and photographs the red
 #                  failed row. Still offline, still free, still nothing billed.
 #
-#                  Why it exists: the /voice page's own suite drives the real script and asserts
+#                  Why it exists: the app's own suite drives the real script and asserts
 #                  that the right properties sit on the right selectors, but it lays NOTHING out,
 #                  so it cannot tell you the page looks right. One photograph of a phone showed
 #                  three defects the whole suite had passed over. This is the check that can see.
@@ -362,20 +362,20 @@ fi
 
 if [ -n "$SHOTS_THEME" ] && [ "$SCREENSHOTS" != 1 ]; then
     die "--theme only means something together with --screenshots.
-It picks the colour scheme the /voice page is photographed in. On its own there is nothing to
+It picks the colour scheme the app is photographed in. On its own there is nothing to
 photograph, and accepting it silently would leave you believing you had chosen a theme for a run
 that never took a picture."
 fi
 
 if [ -n "$SHOTS_OUT" ] && [ "$SCREENSHOTS" != 1 ]; then
     die "--out only means something together with --screenshots.
-It names the directory the /voice screenshots are written to. On its own there is nothing to
+It names the directory the app's screenshots are written to. On its own there is nothing to
 write, and accepting it silently would leave you believing you had chosen an output directory for
 a run that never took a picture."
 fi
 
 # ---------------------------------------------------------------------------------------------
-# Screenshots of the /voice page. FREE, offline, and deliberately self-contained.
+# Screenshots of the app. FREE, offline, and deliberately self-contained.
 #
 # It is handled HERE, before any configuration is loaded, because it needs NONE of the owner's
 # configuration and must never read it: it stands up its own throwaway server with its own
@@ -451,7 +451,7 @@ choose another port with --port."
     done
 
     command -v cargo >/dev/null 2>&1 || die "--screenshots needs cargo, and it is not on PATH.
-The /voice page is compiled INTO the server binary (web/voice.html and web/voice.js are
+The app is compiled INTO the server binary (web/voice.html and web/voice.js are
 include_str! constants), so a stale binary serves last build's markup. Install Rust, or build
 the binary yourself and re-run."
 
@@ -558,7 +558,7 @@ EOF
         *) die "--theme must be dark, light or both; got: $SHOTS_THEME" ;;
     esac
 
-    step "Screenshots of /voice — free, offline, no vendor conversation and no microphone."
+    step "Screenshots of the app at / — free, offline, no vendor conversation and no microphone."
     note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
     note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
     note "vendor:    vibe-talk-mock-elevenlabs on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (mint + control)"

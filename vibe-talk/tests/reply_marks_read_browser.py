@@ -185,7 +185,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, f"reply-marks-{WIDTH}", WIDTH, HEIGHT)
-            page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_columns(desk)
             docked_reply(desk, api, "left", LEFT_TARGET)
             docked_reply(desk, api, "right", RIGHT_TARGET)
