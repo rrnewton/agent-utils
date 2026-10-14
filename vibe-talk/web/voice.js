@@ -15800,10 +15800,11 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
  *
  * ...and when nothing says the thread has outgrown what is held. `#222 unread-replies`: a root's
  * count, as Main last read it, can be ahead of All's read, by replies nothing has brought — Slack's
- * stream carries none. All does not answer for that thread, so it is read too (`threadOutrunsStore`).
- * Nor for one whose older replies All's page did not bring — Slack's brings those of ten threads,
- * and the newest fifty of each: drawn from All, it showed its root and none of them, until the poll
- * (`storeLacksReplies`).
+ * stream brings a reply a poll late, and none in a thread rooted before the newest page of history
+ * (`#307 slack-reply-live`). All does not answer for that thread, so it is read too
+ * (`threadOutrunsStore`). Nor for one whose older replies All's page did not bring — Slack's brings
+ * those of ten threads, and the newest fifty of each: drawn from All, it showed its root and none
+ * of them, until the poll (`storeLacksReplies`).
  *
  * SO IS MAIN, and always from where All starts: every message posted to the channel itself, thread
  * roots included, is a row of All. `#220 view-switch-instant`. Main is covered wherever All is, and

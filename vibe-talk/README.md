@@ -1326,8 +1326,8 @@ is what one push does at Slack:
 |---|---|
 | `auth.test` | — |
 | `conversations.info` | `channel`; with `upstream_clear` on, its `channel` must carry `last_read` |
-| `conversations.history` | `channel`, `limit`, `cursor`, `oldest`, `latest`, `inclusive` |
-| `conversations.replies` | `channel`, `ts`, `limit`, `cursor`, `oldest`, `latest`, `inclusive` |
+| `conversations.history` | `channel`, `limit`, `cursor`, `oldest`, `latest`, `inclusive`; with `live_poll_seconds` set, each poll reads the newest page with no `oldest`, and a thread's new replies arrive live only when its root there carries `thread_ts` and `reply_count`, and its thread is read when the root's `latest_reply` moves (or, for a root that names none, when its count changes); see [Live thread replies](#live-thread-replies) |
+| `conversations.replies` | `channel`, `ts`, `limit`, `cursor`, `oldest`, `latest`, `inclusive`; with `live_poll_seconds` set, also read by each poll for at most four threads whose root moved, with `oldest` at the newest reply already delivered |
 | `chat.postMessage` | `channel`, `text`, `thread_ts` |
 | `users.info` | `user` |
 | `users.conversations` | `types`, `limit`, `cursor`, `exclude_archived` |

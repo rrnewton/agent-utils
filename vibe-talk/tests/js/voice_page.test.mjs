@@ -41661,7 +41661,8 @@ const viewsRead = (page) => page.timelineCalls.map((call) => new URL(call, "http
 
 /**
  * The agent answers question B again and question C a third time, and nothing brings the answers:
- * Slack's stream carries no thread reply, so only Main's read sees them, in its roots' counts.
+ * the stream has not brought them (Slack's brings a reply a poll late, `#307 slack-reply-live`), so
+ * only Main's read sees them, in its roots' counts.
  * Answers the two new replies.
  */
 function answeredUnseen(page, messages) {
