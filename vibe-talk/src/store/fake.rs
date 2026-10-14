@@ -275,9 +275,12 @@ impl StateStore for FakeStore {
                 started_at_ms: turns.first().map_or(0, |t| t.at_ms),
                 last_at_ms: turns.last().map_or(0, |t| t.at_ms),
                 turns: u32::try_from(turns.len()).unwrap_or(u32::MAX),
+                // The first turn that offers one, as the real store's upsert keeps it.
                 preview: turns
-                    .first()
-                    .map_or_else(String::new, |t| super::preview_of(&t.text)),
+                    .iter()
+                    .map(super::preview_for)
+                    .find(|preview| !preview.is_empty())
+                    .unwrap_or_default(),
             })
             .collect();
         out.sort_by(|a, b| {
@@ -302,6 +305,7 @@ impl StateStore for FakeStore {
         &self,
         limit: u16,
         before: Option<&TranscriptCursor>,
+        records: bool,
     ) -> Result<TranscriptPage, StoreError> {
         let limit = usize::from(limit.clamp(1, MAX_TRANSCRIPT_PAGE));
         let mut state = self.lock();
@@ -324,6 +328,14 @@ impl StateStore for FakeStore {
                         seq: i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
                         turn: turn.clone(),
                     })
+            })
+            // Left out before the limit, as the real store leaves them out in its read.
+            .filter_map(|mut entry| {
+                if records {
+                    return Some(entry);
+                }
+                entry.turn = entry.turn.without_records()?;
+                Some(entry)
             })
             .collect();
         let key = |entry: &RecordedTurn| {
@@ -1200,6 +1212,7 @@ mod tests {
                         speaker: Speaker::You,
                         text: n.to_owned(),
                         at_ms: at,
+                        detail: None,
                     },
                 )
                 .await
