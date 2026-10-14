@@ -969,6 +969,29 @@ pub(crate) fn bounded_output(command: Command, timeout: Duration) -> io::Result<
     bounded_output_with_cancellation(command, timeout, &|| false)
 }
 
+/// The failure of a control command that its caller's cancel check stopped, once its process
+/// group was shut down. A cancellation whose cleanup is uncertain carries that uncertainty in
+/// its message instead, and so is not this.
+#[derive(Debug)]
+struct ControlCommandCancelled;
+
+impl std::fmt::Display for ControlCommandCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("control command was cancelled")
+    }
+}
+
+impl std::error::Error for ControlCommandCancelled {}
+
+/// Whether a control command failed only because its caller cancelled it: not on an
+/// interrupted system call, a timeout, a failure to start, or a cancellation whose process
+/// cleanup is uncertain.
+fn is_clean_cancellation(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ControlCommandCancelled>())
+}
+
 fn bounded_output_with_cancellation(
     command: Command,
     timeout: Duration,
@@ -1008,7 +1031,7 @@ fn bounded_output_with_cancellation_and_shutdown(
             // setsid descendants can retain their copies of these pipes, but dropping our readers
             // below is nonblocking and does not wait for their EOF.
             let primary = if was_cancelled {
-                io::Error::new(io::ErrorKind::Interrupted, "control command was cancelled")
+                io::Error::new(io::ErrorKind::Interrupted, ControlCommandCancelled)
             } else {
                 io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -1340,8 +1363,19 @@ impl HerdrClient {
         let executable = resolve_executable(&self.executable)?;
         let mut command = Command::new(executable);
         command.args(args);
-        let output = bounded_output_with_cancellation(command, timeout, cancelled)
-            .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
+        let output =
+            bounded_output_with_cancellation(command, timeout, cancelled).map_err(|error| {
+                let message = format!("cannot invoke Herdr: {error}");
+                // Only the cancellation itself fails a call as cancelled, so that a service that
+                // is stopping can take it for the stop (#291 stop-lost-wakeup). A call that runs
+                // out of time, cannot start, or leaves its process cleanup uncertain while its
+                // caller is cancelling still fails as an unavailable Herdr.
+                if is_clean_cancellation(&error) {
+                    AdapterError::cancelled(message)
+                } else {
+                    AdapterError::unavailable(message)
+                }
+            })?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -4266,7 +4300,89 @@ mod tests {
                 "{message}"
             );
             assert!(message.contains("injected shutdown failure"), "{message}");
+            // A cancellation that leaves its process behind is reported, not taken for a clean
+            // stop (#291 stop-lost-wakeup).
+            assert!(!is_clean_cancellation(&error), "{message}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_herdr_call_its_caller_cancels_fails_as_a_cancellation_and_one_out_of_time_does_not() {
+        // A service that stops cancels the Herdr calls it is making, and tells the failures that
+        // follow apart from any other by their kind (#291 stop-lost-wakeup). The message is
+        // unchanged.
+        let fixture = FakeExecutable::new("{}");
+        let client = fixture.client();
+        let cancelled = client
+            .read_with_cancellation("pane", "visible", None, &|| true)
+            .expect_err("a cancelled read fails");
+        assert_eq!(
+            cancelled.kind(),
+            crate::error::AdapterErrorKind::Cancelled,
+            "{cancelled}"
+        );
+        assert_eq!(
+            cancelled.to_string(),
+            "cannot invoke Herdr: control command was cancelled"
+        );
+        let timed_out = client
+            .invoke_with_timeout_and_cancellation(
+                &strings(&["pane", "read", "pane"]),
+                Duration::ZERO,
+                &|| false,
+            )
+            .expect_err("a call out of time fails");
+        assert_eq!(
+            timed_out.kind(),
+            crate::error::AdapterErrorKind::Unavailable,
+            "{timed_out}"
+        );
+        assert!(
+            timed_out.to_string().contains("control command timed out"),
+            "{timed_out}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_herdr_call_that_cannot_start_while_its_caller_cancels_is_not_a_cancellation() {
+        // Only the cancellation itself fails a call as cancelled. A call that fails for another
+        // reason while its caller is cancelling, here because Herdr cannot start, reports that
+        // failure, so a service that is stopping does not take it for the stop (#291
+        // stop-lost-wakeup).
+        let fixture = FakeExecutable::new("{}");
+        fs::write(fixture.root.join("herdr"), "#!/nonexistent/interpreter\n").unwrap();
+        let failed = fixture
+            .client()
+            .read_with_cancellation("pane", "visible", None, &|| true)
+            .expect_err("a call that cannot start fails");
+        assert_eq!(
+            failed.kind(),
+            crate::error::AdapterErrorKind::Unavailable,
+            "{failed}"
+        );
+        assert!(
+            failed.to_string().contains("cannot invoke Herdr"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn only_the_runners_own_cancellation_is_a_clean_cancellation() {
+        // An `Interrupted` error from anywhere else, such as a system call that a signal
+        // interrupted, is not the caller's cancellation (#291 stop-lost-wakeup).
+        assert!(is_clean_cancellation(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            ControlCommandCancelled
+        )));
+        assert!(!is_clean_cancellation(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        assert!(!is_clean_cancellation(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "control command was cancelled"
+        )));
     }
 
     #[cfg(target_os = "linux")]

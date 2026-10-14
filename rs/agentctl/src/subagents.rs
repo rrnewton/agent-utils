@@ -1040,7 +1040,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::cancelled(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -1060,7 +1060,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::cancelled(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -1079,7 +1079,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<String> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::cancelled(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -1103,7 +1103,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::cancelled(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -2046,7 +2046,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             );
         }
         if runtime.cancelled() {
-            return Err(AdapterError::unavailable(
+            return Err(AdapterError::cancelled(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -3277,7 +3277,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             loop {
                 if runtime.cancelled() {
-                    return Err(crate::error::AdapterError::unavailable(
+                    return Err(crate::error::AdapterError::cancelled(
                         "Herdr control operation was cancelled",
                     ));
                 }
@@ -3630,7 +3630,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::cancelled(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -3688,7 +3688,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let staged = loop {
             if runtime.cancelled() {
-                return Err(crate::error::AdapterError::unavailable(
+                return Err(crate::error::AdapterError::cancelled(
                     "Herdr control operation was cancelled",
                 ));
             }
@@ -9781,6 +9781,95 @@ pub(crate) mod tests {
             .expect_err("cancel contended lifecycle lock");
         assert!(error.to_string().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_herdr_control_operation_its_caller_cancelled_reports_the_cancellation() {
+        // A service that stops cancels the Herdr operations it is making, and tells the failures
+        // that follow apart from any other by their kind (#291 stop-lost-wakeup). Each place that
+        // gives up on an operation because its runtime is cancelled is tried here.
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let runtime = CancelLifecycleWait {
+            cancelled: AtomicBool::new(true),
+        };
+        let client = &fixture.client;
+        let record = fixture.manager().load("worker").expect("worker record");
+        let workspace = |record| WorkspaceClient {
+            client,
+            record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(Some(CustomPaneSubmission {
+                staged_screen: String::new(),
+                text: "text".to_owned(),
+                prior_transcript_count: 0,
+            })),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: None,
+            readback: None,
+        };
+        let mut pane_muse = record.clone();
+        pane_muse.harness = "muse".to_owned();
+        pane_muse.adapter = "herdr-pane".to_owned();
+        let mut foreign_muse = pane_muse.clone();
+        foreign_muse.adapter = "herdr-foreign".to_owned();
+        let failures = [
+            (
+                "agent pane",
+                client.agent_pane_with_runtime("worker", &runtime).err(),
+            ),
+            (
+                "send keys",
+                client
+                    .send_keys_with_runtime("owned", "Enter", &runtime)
+                    .err(),
+            ),
+            (
+                "send text",
+                client
+                    .send_text_with_runtime("owned", "text", &runtime)
+                    .err(),
+            ),
+            (
+                "verify harness",
+                client
+                    .verify_custom_harness_with_runtime("owned", "muse", None, &runtime)
+                    .err(),
+            ),
+            (
+                "run",
+                workspace(&record)
+                    .run_with_runtime("owned", "text", &runtime)
+                    .err(),
+            ),
+            (
+                "wait for a Muse prompt to start",
+                workspace(&pane_muse)
+                    .wait_agent_status_with_runtime("owned", "working", 1_000, &runtime)
+                    .err(),
+            ),
+            (
+                "verify an adopted Muse process",
+                workspace(&foreign_muse)
+                    .verify_muse_process_with_runtime("owned", &runtime)
+                    .err(),
+            ),
+        ];
+        for (operation, error) in failures {
+            let error = error
+                .unwrap_or_else(|| panic!("{operation} went ahead after its caller cancelled"));
+            assert_eq!(
+                error.kind(),
+                AdapterErrorKind::Cancelled,
+                "{operation}: {error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "Herdr control operation was cancelled",
+                "{operation}"
+            );
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {

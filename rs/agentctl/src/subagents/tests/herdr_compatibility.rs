@@ -327,6 +327,51 @@ fn herdr_093_foreign_muse_current_yolo_mode_refuses_input_even_with_historical_a
     no_input(&fixture);
 }
 
+/// A runtime whose caller cancels it once text has been pasted into a pane, as a service stop
+/// that lands between pasting a Muse prompt and pressing Enter does.
+struct CancelAfterPaste<'a>(&'a Fake);
+
+impl agent::AgentRuntime for CancelAfterPaste<'_> {
+    fn monotonic(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn sleep(&self, _duration: Duration) {}
+
+    fn cancelled(&self) -> bool {
+        !self.0.literal_pastes.lock().unwrap().is_empty()
+    }
+}
+
+#[test]
+fn a_foreign_muse_prompt_its_caller_cancels_once_the_text_is_pasted_reports_the_cancellation() {
+    // A stop can land while the prompt waits for its pasted text to show in the composer,
+    // before Enter, and the prompt then fails as cancelled (#291 stop-lost-wakeup).
+    let fixture = Fixture::new();
+    let options = prepare_muse(&fixture, true);
+    let manager = fixture.manager();
+    manager.adopt("foreign", options).unwrap();
+    let record = manager.load("foreign").unwrap();
+    let error = manager
+        .workspace_client(&record)
+        .run_with_runtime(
+            "owned",
+            "guarded prompt",
+            &CancelAfterPaste(&fixture.client),
+        )
+        .expect_err("the prompt went ahead after its caller cancelled");
+    assert_eq!(error.kind(), AdapterErrorKind::Cancelled, "{error}");
+    assert_eq!(
+        fixture.client.literal_pastes.lock().unwrap().len(),
+        1,
+        "the text was pasted once, before the stop"
+    );
+    assert!(
+        fixture.client.keys_sent.lock().unwrap().is_empty(),
+        "nothing was pressed after the stop"
+    );
+}
+
 #[test]
 fn herdr_093_foreign_muse_refuses_changed_saved_anchors_before_input_and_quarantines_effect_races()
 {

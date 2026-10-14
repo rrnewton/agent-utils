@@ -22,6 +22,9 @@ pub enum AdapterErrorKind {
     /// Input reached the wrong program, which was interrupted and told to ignore it;
     /// the message was not delivered to its recipient and may be retried.
     MisrouteRecovered,
+    /// The caller cancelled the runtime call before it finished, as a stopping service does.
+    /// It means for input what an unavailable runtime does.
+    Cancelled,
 }
 /// Adapter failure with a stable process exit code.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +56,10 @@ impl AdapterError {
     /// Record input that reached the wrong program, which was told to ignore it.
     pub fn misroute_recovered(message: impl Into<String>) -> Self {
         Self::with_kind(AdapterErrorKind::MisrouteRecovered, message)
+    }
+    /// Record a runtime call that its caller cancelled before it finished.
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::with_kind(AdapterErrorKind::Cancelled, message)
     }
     fn with_kind(kind: AdapterErrorKind, message: impl Into<String>) -> Self {
         Self {
