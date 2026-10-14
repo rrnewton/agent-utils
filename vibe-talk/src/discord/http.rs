@@ -144,6 +144,100 @@ pub fn page_request(
 /// The most messages one bridge range read asks for. remote-ops-audit W10 `#287 bulk-reads`.
 pub const BRIDGE_RANGE_ROWS: u16 = 200;
 
+/// How long a bridge that showed it does not serve a range read or a lookup by id, though
+/// configured to, is read as before without being asked for one. Fix round 1 of remote-ops-audit
+/// W10 and W11 `#287 bulk-reads`.
+pub const UNSERVED_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a bridge's failure of a range read or a lookup by id says it does not serve that read
+/// at all, rather than that the read failed: `404`, `405` or `501`, as an adapter without the
+/// route (one rolled back to an older version, say) answers. Fix round 1 of remote-ops-audit W10
+/// and W11 `#287 bulk-reads`.
+///
+/// A `404` can also be a channel or a thread the bridge does not know. The read made instead then
+/// fails as it always did, and nothing is remembered: see [`Unserved`].
+fn unserved(error: &ChatError) -> bool {
+    matches!(
+        error.cause(),
+        ChatError::Status {
+            status: 404 | 405 | 501,
+            ..
+        }
+    )
+}
+
+/// A bulk read a bridge may show it does not serve. Fix round 1 of remote-ops-audit W10 and W11
+/// `#287 bulk-reads`.
+#[derive(Clone, Copy, Debug)]
+enum BulkRead {
+    /// A range read, `range_reads`.
+    Range,
+    /// A lookup by id, `id_reads`.
+    Ids,
+}
+
+impl BulkRead {
+    fn setting(self) -> &'static str {
+        match self {
+            Self::Range => "range_reads",
+            Self::Ids => "id_reads",
+        }
+    }
+}
+
+/// The bulk reads a bridge showed it does not serve, though configured to, each with the instant
+/// until which it is read as before without being asked for one. Fix round 1 of remote-ops-audit
+/// W10 and W11 `#287 bulk-reads`.
+///
+/// Noted only once the read made instead succeeded, so a channel or a thread the bridge does not
+/// know (a `404` too) is not taken for a bridge without the route. While noted,
+/// [`HttpDiscordClient::read_caps`] says the read is emulated, so callers read the bridge exactly
+/// as they do with the setting off and diagnostics show it; after [`UNSERVED_RETRY`] the bridge is
+/// asked again, so an adapter brought back up to date is used without a restart.
+#[derive(Debug, Default)]
+pub(super) struct Unserved {
+    range: std::sync::Mutex<Option<std::time::Instant>>,
+    ids: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Unserved {
+    fn slot(&self, read: BulkRead) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        match read {
+            BulkRead::Range => &self.range,
+            BulkRead::Ids => &self.ids,
+        }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `read` is to be made as before just now.
+    fn holds(&self, read: BulkRead) -> bool {
+        self.slot(read)
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// Make `read` as before for [`UNSERVED_RETRY`].
+    fn note(&self, read: BulkRead, provider: &str) {
+        let mut slot = self.slot(read);
+        if slot.is_none_or(|until| std::time::Instant::now() >= until) {
+            tracing::warn!(
+                provider,
+                setting = read.setting(),
+                "the bridge does not serve this read; reading it as before for ten minutes \
+                 (turn the setting off if the bridge will not serve it)"
+            );
+        }
+        *slot = Some(std::time::Instant::now() + UNSERVED_RETRY);
+    }
+
+    /// Forget every miss, as [`UNSERVED_RETRY`] does.
+    #[cfg(test)]
+    fn forget(&self) {
+        *self.slot(BulkRead::Range) = None;
+        *self.slot(BulkRead::Ids) = None;
+    }
+}
+
 /// Build a compatible bridge's range read: one step through the messages of a channel created
 /// inside `range`, from the end `order` names. remote-ops-audit W10 `#287 bulk-reads`.
 ///
@@ -199,9 +293,10 @@ const MAX_RANGE_CURSOR_LEN: usize = 2048;
 /// Read a bridge's answer to [`range_request`]. remote-ops-audit W10 `#287 bulk-reads`.
 ///
 /// Strict, because the request is sent only on the operator's word that the bridge serves it: a
-/// bridge that does not would answer with a plain message list, and that must fail the read rather
-/// than pass the newest messages off as the span. Messages outside the window are dropped, as
-/// Slack's answers are bounded here as well as upstream.
+/// bridge that does not would answer with a plain message list, and that must never pass the
+/// newest messages off as the span. [`HttpDiscordClient`] makes the read it made without
+/// `range_reads` instead of reading such an answer at all. Messages outside the window are
+/// dropped, as Slack's answers are bounded here as well as upstream.
 ///
 /// # Errors
 ///
@@ -253,6 +348,7 @@ pub fn parse_range_read(
         next,
         exhausted,
         as_of,
+        emulated: false,
     })
 }
 
@@ -303,8 +399,9 @@ pub fn ids_request(
 /// remote-ops-audit W11 `#287 bulk-reads`.
 ///
 /// Strict, because the request is sent only on the operator's word that the bridge serves it: a
-/// bridge that does not would answer with a plain message list, and that must fail the lookup
-/// rather than pass the newest messages off as the ones asked for. Every message must be one
+/// bridge that does not would answer with a plain message list, and that must never pass the
+/// newest messages off as the ones asked for. [`HttpDiscordClient`] makes the lookups it made
+/// without `id_reads` instead of reading such an answer at all. Every message must be one
 /// asked for, in the channel (and the thread) asked about, answered once; every id in `missing`
 /// one asked for and not also answered. An answer that carries `as_of` came from a copy older
 /// than now, which may lack an edit or a deletion since: everything in it is
@@ -950,6 +1047,9 @@ pub struct HttpDiscordClient {
     /// every later head read of a server's channels is one request. remote-ops-audit W12
     /// `#287 bulk-reads`; see `heads`.
     guilds: heads::GuildCache,
+    /// The bulk reads the bridge showed it does not serve, though configured to. Fix round 1 of
+    /// remote-ops-audit W10 and W11 `#287 bulk-reads`.
+    unserved: Unserved,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -1010,6 +1110,7 @@ impl HttpDiscordClient {
             recent_many_reads: config.recent_many_reads,
             thread_reads: config.thread_reads,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         })
     }
@@ -1384,6 +1485,9 @@ impl ChatClient for HttpDiscordClient {
     /// asks for all of them at once ([`threads_request`], W14), and against Discord itself, which
     /// checks the parent once for all of them and reads only the threads that moved after a
     /// `newer_than` (see `native_threads`).
+    ///
+    /// A bridge that showed it does not serve range reads or lookups by id (`Unserved`) has them
+    /// emulated until it is asked again.
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
         let native_or = |on: bool| {
             if on {
@@ -1394,7 +1498,9 @@ impl ChatClient for HttpDiscordClient {
         };
         let discord_itself = self.thread_api == crate::threads::ThreadApi::Native;
         let caps = crate::chat::ReadCaps {
-            by_ids: native_or(discord_itself || self.id_reads),
+            by_ids: native_or(
+                discord_itself || (self.id_reads && !self.unserved.holds(BulkRead::Ids)),
+            ),
             heads: native_or(discord_itself || self.head_reads),
             // A bridge's head may say `unchanged_since`; Discord's `last_message_id` never can.
             heads_cover_edits: !discord_itself && self.head_reads,
@@ -1402,7 +1508,7 @@ impl ChatClient for HttpDiscordClient {
             many_threads: native_or(discord_itself || self.thread_reads),
             ..crate::chat::ReadCaps::default()
         };
-        if self.range_reads {
+        if self.range_reads && !self.unserved.holds(BulkRead::Range) {
             crate::chat::ReadCaps {
                 range: crate::chat::Support::Native,
                 page_rows: BRIDGE_RANGE_ROWS,
@@ -1426,13 +1532,32 @@ impl ChatClient for HttpDiscordClient {
             return crate::chat::emulated_range(self, channel, scope, range, order, limit, cursor)
                 .await;
         }
-        async {
+        // With `range_reads`, a cursor is the bridge's own. A step the bridge does not serve is
+        // the read `/page?since=` always made, from the window's edge, marked `emulated` so the
+        // caller starts over as it reads a provider without range reads.
+        if self.unserved.holds(BulkRead::Range) {
+            return crate::chat::emulated_range(self, channel, scope, range, order, limit, None)
+                .await;
+        }
+        let served = async {
             let request = range_request(&self.api_base, channel, range, order, limit, cursor)?;
-            let value = self.send(request).await?;
-            parse_range_read(&value, range)
+            match self.send(request).await {
+                // A plain message list: a bridge that ignored the window and answered `/messages`.
+                Ok(value) if !value.is_object() => Ok(None),
+                Ok(value) => parse_range_read(&value, range).map(Some),
+                Err(error) if unserved(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
         }
         .await
-        .map_err(|error| error.with_provider(self.provider_name()))
+        .map_err(|error| error.with_provider(self.provider_name()))?;
+        if let Some(read) = served {
+            return Ok(read);
+        }
+        let read =
+            crate::chat::emulated_range(self, channel, scope, range, order, limit, None).await?;
+        self.unserved.note(BulkRead::Range, self.provider_name());
+        Ok(read)
     }
 
     async fn fetch_messages(
@@ -1441,14 +1566,26 @@ impl ChatClient for HttpDiscordClient {
         thread: Option<&str>,
         ids: &[MessageId],
     ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
-        let looked = if self.thread_api == crate::threads::ThreadApi::Native {
-            self.native_lookup(channel, thread, ids).await
-        } else if self.id_reads {
-            self.bridge_lookup(channel, thread, ids).await
-        } else {
+        if self.thread_api == crate::threads::ThreadApi::Native {
+            return self
+                .native_lookup(channel, thread, ids)
+                .await
+                .map_err(|error| error.with_provider(self.provider_name()));
+        }
+        if !self.id_reads || self.unserved.holds(BulkRead::Ids) {
             return crate::chat::emulated_messages(self, channel, thread, ids).await;
-        };
-        looked.map_err(|error| error.with_provider(self.provider_name()))
+        }
+        let served = self
+            .bridge_lookup(channel, thread, ids)
+            .await
+            .map_err(|error| error.with_provider(self.provider_name()))?;
+        if let Some(answers) = served {
+            return Ok(answers);
+        }
+        // A bridge that does not serve lookups by id: the lookups it was configured to replace.
+        let answers = crate::chat::emulated_messages(self, channel, thread, ids).await?;
+        self.unserved.note(BulkRead::Ids, self.provider_name());
+        Ok(answers)
     }
 
     /// Discord itself reads heads from its server channel lists, and a bridge with `head_reads`
@@ -1917,6 +2054,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
         client
@@ -1946,6 +2084,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         }
     }
@@ -2147,6 +2286,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
         let registered = client
@@ -2215,6 +2355,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -2272,6 +2413,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -2333,6 +2475,7 @@ mod tests {
                 recent_many_reads: false,
                 thread_reads: false,
                 guilds: heads::GuildCache::default(),
+                unserved: Unserved::default(),
                 limiter: RateLimiter::new(),
             };
             let error = client
@@ -2387,6 +2530,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
         let error = client
@@ -2467,6 +2611,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
         client

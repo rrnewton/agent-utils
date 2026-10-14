@@ -455,6 +455,7 @@ impl ChatClient for Recorder {
             next: Some("next".to_owned()),
             exhausted: true,
             as_of: None,
+            emulated: false,
         })
     }
     async fn fetch_messages(

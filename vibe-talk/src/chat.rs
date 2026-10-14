@@ -447,6 +447,15 @@ pub struct RangeRead {
     /// served a copy it could not bring up to date just now. `None` means now. As
     /// [`RecentRead::as_of`].
     pub as_of: Option<String>,
+    /// Whether [`emulated_range`] answered this step, the read `/page?since=` always made, rather
+    /// than a range read of the provider's own: always for a provider without one, and for one
+    /// that has one but could not serve it just now (a bridge rolled back to a version without
+    /// it, say). A caller reads such a step exactly as it reads a provider whose
+    /// [`ReadCaps::range`] is emulated, whatever that said when it asked: a short step is then the
+    /// provider's word for nothing, and a caller walking a window by a provider's own cursors
+    /// starts over the way it reads a provider without a range read. Fix round 1 of
+    /// remote-ops-audit W10 `#287 bulk-reads`.
+    pub emulated: bool,
 }
 
 /// Whether a provider answers a bulk read itself, or the trait's default answers it with
@@ -1188,7 +1197,8 @@ pub trait ChatClient: Send + Sync {
 ///
 /// `next` is the id of the last message the page reached, unless the page already reached past
 /// the window's far end. Never `exhausted`: a page that came back short, or one that reached past
-/// the window, is the provider's word for it, not a proof this server can stamp.
+/// the window, is the provider's word for it, not a proof this server can stamp. Always
+/// [`RangeRead::emulated`].
 ///
 /// # Errors
 ///
@@ -1249,6 +1259,7 @@ pub async fn emulated_range<C: ChatClient + ?Sized>(
         next,
         exhausted: false,
         as_of: None,
+        emulated: true,
     })
 }
 

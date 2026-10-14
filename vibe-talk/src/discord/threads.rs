@@ -1393,12 +1393,16 @@ impl HttpDiscordClient {
     /// [`super::BRIDGE_LOOKUP_IDS`] of them, with the time a thread read is allowed: a bridge may
     /// have to ask its service for some of them. What it answers is read strictly
     /// ([`super::parse_id_lookup`]); an id it does not mention is [`crate::chat::Lookup::Unseen`].
+    ///
+    /// `None` when the bridge showed it does not serve lookups by id: `404`, `405` or `501`
+    /// ([`super::unserved`]), or a plain message list where the answer object belongs. The caller
+    /// then makes the lookups it was configured to replace.
     pub(super) async fn bridge_lookup(
         &self,
         channel: &ChannelId,
         thread: Option<&str>,
         wanted: &[MessageId],
-    ) -> Result<Vec<crate::chat::Lookup>, ChatError> {
+    ) -> Result<Option<Vec<crate::chat::Lookup>>, ChatError> {
         let mut seen = HashSet::new();
         let distinct: Vec<MessageId> = wanted
             .iter()
@@ -1408,18 +1412,25 @@ impl HttpDiscordClient {
         let mut answers = std::collections::HashMap::new();
         for chunk in distinct.chunks(super::BRIDGE_LOOKUP_IDS) {
             let request = super::ids_request(&self.api_base, channel, thread, chunk)?;
-            let value = self.send_with_timeout(request, TIMELINE_TIMEOUT).await?;
+            let value = match self.send_with_timeout(request, TIMELINE_TIMEOUT).await {
+                Ok(value) if !value.is_object() => return Ok(None),
+                Ok(value) => value,
+                Err(error) if super::unserved(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
             answers.extend(super::parse_id_lookup(&value, channel, thread, chunk)?);
         }
-        Ok(wanted
-            .iter()
-            .map(|id| {
-                answers
-                    .get(id)
-                    .cloned()
-                    .unwrap_or(crate::chat::Lookup::Unseen)
-            })
-            .collect())
+        Ok(Some(
+            wanted
+                .iter()
+                .map(|id| {
+                    answers
+                        .get(id)
+                        .cloned()
+                        .unwrap_or(crate::chat::Lookup::Unseen)
+                })
+                .collect(),
+        ))
     }
 
     /// One of the channel's own messages, from Discord itself, as its message history has it.
@@ -3583,6 +3594,114 @@ mod tests {
             .iter()
             .all(|answer| *answer == crate::chat::Lookup::Absent));
         assert_eq!(mock.seen.lock().expect("seen").len(), 3, "50, 50 and 20");
+    }
+
+    /// Fix round 1 of remote-ops-audit W11 `#287 bulk-reads`: a bridge configured with `id_reads`
+    /// whose adapter does not serve them answers `404`, `405` or `501`, or the plain message list.
+    /// The lookup is then made as it is with the setting off, one thread lookup per id, rather
+    /// than fail; and the bridge is not asked for one again while that is remembered.
+    #[tokio::test]
+    async fn a_bridge_that_does_not_serve_lookups_by_id_is_looked_up_as_before() {
+        let channel = ChannelId("parent".into());
+        let ids_route = "GET /channels/parent/messages?ids=m1&ids=m2&thread=t1";
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/channels/parent/threads/t1/messages/m1",
+            in_thread("m1", "t1"),
+        );
+        ok(
+            &mut routes,
+            "/channels/parent/threads/t1/messages/m2",
+            in_thread("m2", "t1"),
+        );
+        let off = mock_with(routes.clone(), |discord| {
+            discord.thread_api = ThreadApi::Bridge;
+        })
+        .await;
+        let today = off
+            .client
+            .fetch_messages(&channel, Some("t1"), &lookup_ids(&["m1", "m2"]))
+            .await
+            .expect("lookup");
+        assert_eq!(
+            today.iter().map(outcome).collect::<Vec<_>>(),
+            ["found m1", "found m2"]
+        );
+
+        for refusal in [
+            (StatusCode::NOT_FOUND, json!({"detail": "Not Found"})),
+            (StatusCode::METHOD_NOT_ALLOWED, json!({})),
+            (StatusCode::NOT_IMPLEMENTED, json!({})),
+            (StatusCode::OK, json!([in_thread("m9", "t1")])),
+        ] {
+            let mut routes = routes.clone();
+            routes.insert(ids_route.into(), refusal.clone());
+            let on = id_reading_bridge(routes).await;
+            assert_eq!(
+                on.client.read_caps(&channel).by_ids,
+                crate::chat::Support::Native
+            );
+            let answers = on
+                .client
+                .fetch_messages(&channel, Some("t1"), &lookup_ids(&["m1", "m2"]))
+                .await
+                .expect("looked up as before");
+            assert_eq!(answers, today, "{refusal:?}");
+            let mut asked = taken(&on);
+            asked.sort();
+            assert_eq!(
+                asked,
+                [
+                    ids_route,
+                    "GET /channels/parent/threads/t1/messages/m1",
+                    "GET /channels/parent/threads/t1/messages/m2"
+                ],
+                "{refusal:?}"
+            );
+            assert_eq!(
+                on.client.read_caps(&channel).by_ids,
+                crate::chat::Support::Emulated,
+                "{refusal:?}: remembered, so callers look ids up as they did without the setting"
+            );
+            on.client
+                .fetch_messages(&channel, Some("t1"), &lookup_ids(&["m1"]))
+                .await
+                .expect("lookup");
+            assert_eq!(
+                taken(&on),
+                ["GET /channels/parent/threads/t1/messages/m1"],
+                "{refusal:?}: not asked again"
+            );
+            // Once the memory lapses, the bridge is asked again.
+            on.client.unserved.forget();
+            assert_eq!(
+                on.client.read_caps(&channel).by_ids,
+                crate::chat::Support::Native
+            );
+        }
+
+        // A thread the bridge does not know fails as the lookup it replaced does, and proves
+        // nothing about the bridge: nothing is remembered.
+        let mut routes = Replies::new();
+        routes.insert(
+            ids_route.into(),
+            (StatusCode::NOT_FOUND, json!({"detail": "Not Found"})),
+        );
+        let on = id_reading_bridge(routes).await;
+        let error = on
+            .client
+            .fetch_messages(&channel, Some("t1"), &lookup_ids(&["m1", "m2"]))
+            .await
+            .expect_err("the thread lookup fails");
+        assert!(
+            matches!(error.cause(), ChatError::Status { status: 404, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            on.client.read_caps(&channel).by_ids,
+            crate::chat::Support::Native
+        );
     }
 
     #[test]

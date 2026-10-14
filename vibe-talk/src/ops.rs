@@ -1324,6 +1324,12 @@ pub async fn page(
                     None,
                 )
                 .await?;
+            if read.emulated {
+                // The read this route always made, answered as it always was, even where the
+                // provider said it reads by time and then could not just now. Fix round 1 of
+                // remote-ops-audit W10 `#287 bulk-reads`.
+                native = false;
+            }
             if native && read.as_of.is_some() {
                 // An answer from a copy the provider could not bring up to date never stands in
                 // for the read this route always made: that one is made instead, at the cost of
@@ -1571,7 +1577,9 @@ const MAX_COUNT_STEPS: usize = 16;
 ///
 /// `None` when a step answered from a copy the provider could not bring up to date
 /// ([`crate::chat::RangeRead::as_of`]): such a count could miss what was said since, so the caller
-/// counts the way it always did instead.
+/// counts the way it always did instead. `None` too when a step was not the provider's own range
+/// read after all ([`crate::chat::RangeRead::emulated`], a bridge that could not serve one): it
+/// proves nothing, and the caller counts the way it always did.
 async fn count_range(
     state: &AppState,
     channel: &ChannelInfo,
@@ -1603,7 +1611,7 @@ async fn count_range(
                 cursor.as_deref(),
             )
             .await?;
-        if read.as_of.is_some() {
+        if read.as_of.is_some() || read.emulated {
             return Ok(None);
         }
         if newest_seen.is_none() {

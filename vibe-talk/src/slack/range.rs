@@ -214,6 +214,7 @@ impl HttpSlackClient {
             next,
             exhausted,
             as_of: None,
+            emulated: false,
         })
     }
 

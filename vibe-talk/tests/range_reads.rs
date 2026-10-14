@@ -1303,3 +1303,218 @@ async fn a_bridge_window_from_an_older_copy_is_read_again_as_it_always_was() {
         "then the page after `since` it always was: {asked:?}"
     );
 }
+
+/// How a loopback bridge without range reads answers one.
+#[derive(Clone, Copy, Debug)]
+enum Unserved {
+    /// The HTTP status of an adapter that has no such route, or refuses the method.
+    Status(u16),
+    /// The plain message list of an adapter that ignored the window and answered `/messages`.
+    PlainList,
+    /// A channel the bridge does not know: `404` to every read of it, range read or not.
+    UnknownChannel,
+}
+
+/// A loopback bridge that serves the plain message list as it always did, and answers a range read
+/// as `unserved` says. Records every request it is sent.
+async fn unserving_range_bridge(
+    messages: Vec<Value>,
+    unserved: Unserved,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    use axum::response::IntoResponse as _;
+
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let messages = messages.clone();
+        async move {
+            let asked = uri.to_string();
+            log.lock().expect("log").push(asked.clone());
+            match unserved {
+                Unserved::Status(status) if asked.contains("since=") => (
+                    StatusCode::from_u16(status).expect("status"),
+                    axum::Json(json!({"detail": "Not Found"})),
+                )
+                    .into_response(),
+                Unserved::UnknownChannel => (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({"detail": "Unknown Channel"})),
+                )
+                    .into_response(),
+                _ => axum::Json(Value::Array(messages)).into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (base, seen)
+}
+
+/// What `/count?since=` and `/page?since=` answered, the fields a caller reads.
+async fn count_and_page(router: &axum::Router, since: i64) -> (Value, Value) {
+    let (status, count) = get(
+        router,
+        &format!("/api/v1/channels/{READ_CHANNEL}/count?since={}", iso(since)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{count}");
+    let (status, page) = get(
+        router,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=10",
+            iso(since)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let ids = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id").to_owned())
+            .collect()
+    };
+    (
+        json!({
+            "counted": count["counted"],
+            "at_least": count["at_least"],
+            "newest_seen": count["newest_seen"],
+            "oldest_seen": count["oldest_seen"],
+        }),
+        json!({
+            "ids": ids(&page["messages"]),
+            "has_more": page["has_more"],
+            "next_since": page["next_since"],
+        }),
+    )
+}
+
+/// Fix round 1 of remote-ops-audit W10 `#287 bulk-reads`: a bridge configured with `range_reads`
+/// whose adapter does not serve them (rolled back, say) answers `404`, `405` or `501`, or the plain
+/// message list. `/count` and `/page` then answer exactly what they answer with the setting off,
+/// from the reads they always made, rather than fail. The bridge is not asked for a range read
+/// again while that is remembered, so the next reads cost what they cost with the setting off.
+#[tokio::test]
+async fn a_bridge_that_does_not_serve_range_reads_is_read_as_before() {
+    let since = BASE_MS + 10 * MINUTE_MS;
+    let messages = vec![
+        bridge_wire(since - MINUTE_MS, "before"),
+        bridge_wire(since, "on the edge"),
+        bridge_wire(since + MINUTE_MS, "newest"),
+    ];
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+
+    let (base, seen) = unserving_range_bridge(messages.clone(), Unserved::Status(404)).await;
+    let state = bridge_deployment(&base, "");
+    assert_eq!(state.chat.read_caps(&channel).range, Support::Emulated);
+    let router = vibe_talk::http::router(state);
+    let today = count_and_page(&router, since).await;
+    assert_eq!(today.0["counted"], 2, "{today:?}");
+    let today_asked = std::mem::take(&mut *seen.lock().expect("log"));
+    assert!(today_asked.iter().all(|asked| !asked.contains("since=")));
+
+    for unserved in [
+        Unserved::Status(404),
+        Unserved::Status(405),
+        Unserved::Status(501),
+        Unserved::PlainList,
+    ] {
+        let (base, seen) = unserving_range_bridge(messages.clone(), unserved).await;
+        let state = bridge_deployment(&base, "range_reads = true");
+        let chat = Arc::clone(&state.chat);
+        assert_eq!(chat.read_caps(&channel).range, Support::Native);
+        let router = vibe_talk::http::router(state);
+        assert_eq!(
+            count_and_page(&router, since).await,
+            today,
+            "{unserved:?}: the answers made without the setting"
+        );
+        let asked = std::mem::take(&mut *seen.lock().expect("log"));
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|asked| asked.contains("since="))
+                .count(),
+            1,
+            "{unserved:?}: asked once, then remembered: {asked:?}"
+        );
+        assert!(asked[0].contains("since="), "{unserved:?}: {asked:?}");
+        assert_eq!(
+            chat.read_caps(&channel).range,
+            Support::Emulated,
+            "{unserved:?}: diagnostics say the bridge's range reads are emulated meanwhile"
+        );
+
+        // Remembered: the same reads again cost exactly what they cost without the setting.
+        assert_eq!(count_and_page(&router, since).await, today, "{unserved:?}");
+        let again = std::mem::take(&mut *seen.lock().expect("log"));
+        assert_eq!(again, today_asked, "{unserved:?}");
+    }
+}
+
+/// Fix round 1 of remote-ops-audit W10 `#287 bulk-reads`: only a bridge that shows it lacks the
+/// route is read as before. A channel it does not know fails as it does with the setting off, and
+/// proves nothing about the bridge, so nothing is remembered. A step that continued the bridge's
+/// own cursor and was not served starts from the window's edge, never handing the bridge's cursor
+/// to `/messages`, and says it is emulated so its caller starts over.
+#[tokio::test]
+async fn only_a_bridge_without_the_route_has_its_range_reads_made_as_before() {
+    let since = BASE_MS + 10 * MINUTE_MS;
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let messages = vec![bridge_wire(since, "on the edge")];
+    let count = format!("/api/v1/channels/{READ_CHANNEL}/count?since={}", iso(since));
+
+    let (base, _seen) = unserving_range_bridge(messages.clone(), Unserved::UnknownChannel).await;
+    let today = get(
+        &vibe_talk::http::router(bridge_deployment(&base, "")),
+        &count,
+    )
+    .await;
+    assert_eq!(today.0, StatusCode::BAD_GATEWAY, "{today:?}");
+    let state = bridge_deployment(&base, "range_reads = true");
+    let chat = Arc::clone(&state.chat);
+    let unknown = get(&vibe_talk::http::router(state), &count).await;
+    assert_eq!(unknown, today, "fails as it does with the setting off");
+    assert_eq!(
+        chat.read_caps(&channel).range,
+        Support::Native,
+        "an unknown channel proves nothing about the bridge"
+    );
+
+    let (base, seen) = unserving_range_bridge(messages, Unserved::Status(404)).await;
+    let state = bridge_deployment(&base, "range_reads = true");
+    let read = state
+        .chat
+        .fetch_range(
+            &channel,
+            &ReadScope::Main,
+            TimeRange {
+                since_ms: since,
+                until_ms: None,
+            },
+            RangeOrder::NewestFirst,
+            50,
+            Some("the-bridges-own-cursor"),
+        )
+        .await
+        .expect("read as before");
+    assert!(read.emulated, "{read:?}");
+    assert_eq!(contents(&read), ["on the edge"]);
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(
+        asked[0].contains("cursor=the-bridges-own-cursor"),
+        "{asked:?}"
+    );
+    assert_eq!(
+        asked[1],
+        format!("/channels/{READ_CHANNEL}/messages?limit=50"),
+        "from the window's edge"
+    );
+}

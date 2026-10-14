@@ -2241,11 +2241,17 @@ The sections below say what each one means in detail: [A bridge's range reads](#
 each request is off until the operator turns its setting on for that provider (`[discord]`, or a
 `[[providers]]` entry of kind `discord`, only with `thread_api = "bridge"`; refused anywhere else).
 With a setting off, the bridge is read exactly as before. With it on and a bridge that does not
-serve the request, the answer is refused as unreadable: a range read or a lookup fails as a read
-does, and a head read, a read of several channels or of several threads falls back to reading each
-channel or thread as before, at the cost of the wasted request. All five are `GET` requests
-relative to `discord.api_base`, with the bot token, answering JSON in the message and timeline wire
-formats the other endpoints use:
+serve the request (an adapter rolled back to a version without it, say), every read falls back to
+the read it made before, at the cost of the wasted request, and never fails or answers less for
+it. A range read or a lookup by id that the bridge answers `404`, `405` or `501`, or with the plain
+message list `/messages` answers, is made exactly as it is with the setting off; the bridge is then
+not asked for that read again for ten minutes, during which diagnostics show it `emulated` and a
+warning names the setting in the log. When the read made instead fails too (a `404` for a channel
+or a thread the bridge does not know, say), that failure is the answer, as it always was, and
+nothing is remembered. A head read, a read of several channels or of several threads that the
+bridge does not serve reads each channel or thread as before. All five are `GET` requests relative
+to `discord.api_base`, with the bot token, answering JSON in the message and timeline wire formats
+the other endpoints use:
 
 | Setting | Request | Answer | Exhaustive, or not | `as_of` |
 |---|---|---|---|---|
@@ -2294,9 +2300,10 @@ one request, and say whether it is complete.
 `discord`, only with `thread_api = "bridge"`; off by default, refused anywhere else) reads those
 spans with the request below. A count since an instant then reads only the window, newest first,
 and is exact only when the bridge says the window is exhausted. With it off, the bridge is read
-exactly as before. Turn it on only for a bridge that implements this request: one that does not
-answers it with a plain message list, which vibe-talk refuses as an answer it cannot read rather
-than mistaking the newest messages for the span.
+exactly as before. Turn it on only for a bridge that implements this request. One that does not
+answers it `404`, `405` or `501`, or with a plain message list, which vibe-talk never mistakes for
+the span: `/page` and `/count` then make the read they make with the setting off, and the bridge is
+not asked for a range read again for ten minutes.
 
 **The request.** `GET /channels/{id}/messages?since=…&until=…&order=oldest|newest&limit=…&cursor=…`
 
@@ -2346,9 +2353,10 @@ service at all.
 message a caller needs in one request. Preparing eight messages of a thread is one request where it
 was eight. A message the bridge does not mention is looked up one at a time, as before, so nothing
 is lost to a bridge that answers only part of a lookup. With it off, the bridge is read exactly as
-before. Turn it on only for a bridge that implements this request: one that does not answers it
-with a plain message list, which vibe-talk refuses as an answer it cannot read rather than
-mistaking the newest messages for the ones asked for.
+before. Turn it on only for a bridge that implements this request. One that does not answers it
+`404`, `405` or `501`, or with a plain message list, which vibe-talk never mistakes for the ones
+asked for: the messages are then looked up as they are with the setting off, and the bridge is not
+asked for a lookup by id again for ten minutes.
 
 **The request.** `GET /channels/{id}/messages?ids=…&ids=…&thread=…`
 
