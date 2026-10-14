@@ -614,15 +614,6 @@ async fn main() -> anyhow::Result<()> {
         &summary_version,
     )
     .await;
-    // `#208 persistent-cache`. The table is read and checked, so a bad overlay is refused here
-    // rather than by the build that first opens the cache; this build opens none.
-    if let Some(cache) = &config.message_cache {
-        tracing::info!(
-            enabled = cache.enabled,
-            "[message_cache] is read and valid; this build does not open a message cache"
-        );
-    }
-
     // `#44 live-push`. Say the ingestion posture out loud in both directions, for the same reason
     // the MCP path and the access log are announced: a page waiting on a stream that nobody
     // publishes to is indistinguishable from a quiet channel, and the setting that causes it is
@@ -746,6 +737,10 @@ async fn main() -> anyhow::Result<()> {
     state
         .message_cache
         .attach_summaries(vibe_talk::cache::orphans::Summaries::of(&state));
+    // `#208 persistent-cache`. The `[message_cache]` table and the owner's switch beside the store
+    // decide whether a cache file is opened, left, or erased. After the summaries are attached, so
+    // a cache opened here is followed from its first erase, and before the sink is armed below.
+    vibe_talk::cache::lifecycle::start(&state.config, &state.message_cache).await;
     // CHANNELS THE OWNER ADDED FROM INSIDE THE APP, brought back into the allowlist before the
     // server answers anything. They were probed when they were added; they are not probed again
     // here, because a channel the bot has since been removed from should fail the request that

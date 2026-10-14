@@ -85,8 +85,11 @@
 //! are on the server's list under no provider at all ([`super::orphans`]). With no cache, there is
 //! no task, and no summary is ever deleted on the cache's account.
 //!
-//! In this build nothing installs a cache outside the tests, so the slot stays empty and every
-//! fill is refused.
+//! # Who puts a cache behind it
+//!
+//! The server does, at startup, when the configuration enables the cache and the owner has not
+//! turned it off ([`super::lifecycle`]). Otherwise the slot stays empty and every fill is
+//! refused.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,6 +100,7 @@ use async_trait::async_trait;
 
 use super::access::{AccessListener, Suspect};
 use super::grant::{FillGrant, ServerFill};
+use super::lifecycle::Lifecycle;
 use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
 use super::{Account, ChanKey, MessageCache, Observation, Read, RouteSnapshot, Scope, Stamp};
@@ -126,6 +130,9 @@ pub const CREDENTIAL_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct Sink {
     /// Shared with the tasks the sink starts, and listened through: see the module documentation.
     state: Arc<State>,
+    /// What opens, switches and erases the cache file behind the sink, once the server has
+    /// started it ([`super::lifecycle::start`]). Never in a test that installs a cache itself.
+    lifecycle: OnceLock<Arc<Lifecycle>>,
 }
 
 impl Default for Sink {
@@ -135,6 +142,7 @@ impl Default for Sink {
                 me: me.clone(),
                 ..State::default()
             }),
+            lifecycle: OnceLock::new(),
         }
     }
 }
@@ -387,6 +395,18 @@ impl Sink {
     #[must_use]
     pub fn off() -> Self {
         Self::default()
+    }
+
+    /// Attach what opens, switches and erases the cache file: once per sink, by
+    /// [`super::lifecycle::start`].
+    pub(crate) fn attach_lifecycle(&self, lifecycle: Arc<Lifecycle>) {
+        let _ = self.lifecycle.set(lifecycle);
+    }
+
+    /// What opens, switches and erases the cache file, once the server has started it.
+    #[must_use]
+    pub fn lifecycle(&self) -> Option<&Arc<Lifecycle>> {
+        self.lifecycle.get()
     }
 
     /// Have the store's summaries kept in step with every cache installed from now on: see

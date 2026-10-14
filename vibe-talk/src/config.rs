@@ -173,10 +173,9 @@ pub struct Config {
     /// The `[message_cache]` table, read and checked. `#208 persistent-cache`.
     ///
     /// `None` when the table is ABSENT, which is not the same as `enabled = false`: absent means
-    /// "this configuration says nothing about a cache", and a later build treats a cache file it
-    /// finds in that state differently from one it was told to turn off. This build reads the
-    /// table and refuses a bad one at startup, but opens no cache: the cache library is not
-    /// called from the request path yet.
+    /// "this configuration says nothing about a cache", and a cache file found in that state is
+    /// left alone for a week, where one the configuration turned off is erased at once. See
+    /// [`crate::cache::lifecycle`].
     pub message_cache: Option<MessageCacheConfig>,
 }
 

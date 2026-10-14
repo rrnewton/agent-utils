@@ -435,10 +435,11 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
     use vibe_talk::store::{StateStore as _, SummaryKey};
 
     let dir = std::env::temp_dir().join(format!("vibe-talk-startup-{}-rekey", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    private_dir(&dir);
     let file = dir.join("rekey-state.sqlite3");
     let _ = std::fs::remove_file(&file);
-    // `[message_cache]` rides along: it must be read, said to be unopened, and change nothing.
+    // `[message_cache]` rides along: a cache is opened beside the store, and changes nothing the
+    // store holds.
     let config = dir.join("vibe-talk.toml");
     std::fs::write(
         &config,
@@ -513,10 +514,8 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
          wording:\n{first}"
     );
     assert!(
-        first.contains(
-            "[message_cache] is read and valid; this build does not open a message cache"
-        ),
-        "the table was not said to be left unopened:\n{first}"
+        first.contains("the message cache is open"),
+        "the table's cache was not opened:\n{first}"
     );
     // Numbers only: no summary text, no message id, no content hash, no key.
     for secret in [
@@ -608,7 +607,11 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
         "a restart with only the threshold and deadline changed re-keyed or swept something:\n\
          {second}"
     );
-    assert!(!second.contains("[message_cache] is read"), "{second}");
+    // The table is gone, so the cache the first start made is left, unused, and said to be.
+    assert!(
+        !second.contains("the message cache is open") && second.contains("present and unused"),
+        "{second}"
+    );
     let store =
         vibe_talk::store::sqlite::SqliteStore::open(&file, vibe_talk::store::Retention::default())
             .expect("reopen");
@@ -623,4 +626,69 @@ async fn the_first_start_re_keys_summaries_and_no_later_start_asks_for_one_again
         );
     }
     let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fresh directory only this account can enter, as a store's directory is and as the message
+/// cache requires of the one it is created in.
+fn private_dir(dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).expect("temp dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("private");
+    }
+}
+
+#[test]
+fn the_binary_opens_the_message_cache_its_table_enables_and_erases_it_when_disabled() {
+    // `#208 persistent-cache`. The library's startup decisions are tested against the library;
+    // this proves the binary makes them, in both directions, before it serves anything.
+    let dir = std::env::temp_dir().join(format!("vibe-talk-startup-{}-cache", std::process::id()));
+    private_dir(&dir);
+    let store = dir.join("cache-state.sqlite3");
+    let storage = [(
+        "VIBE_TALK_STORAGE_PATH",
+        store.to_string_lossy().into_owned(),
+    )];
+    let config = dir.join("vibe-talk.toml");
+    let cache = vibe_talk::cache::file::default_path(&store, &vibe_talk::cache::file::host_name());
+
+    std::fs::write(
+        &config,
+        config_text() + "\n[message_cache]\nenabled = true\nmax_days = 14\n",
+    )
+    .expect("write config");
+    let on = without_colour(&run_until_listening(&config, &storage));
+    assert!(on.contains("the message cache is open"), "{on}");
+    assert!(
+        cache.exists(),
+        "no cache file at {}:\n{on}",
+        cache.display()
+    );
+    let sidecar = vibe_talk::cache::marker::sidecar_path(&store);
+    assert_eq!(
+        vibe_talk::cache::marker::load(&sidecar)
+            .expect("the sidecar")
+            .paths,
+        vec![cache.clone()]
+    );
+
+    std::fs::write(
+        &config,
+        config_text() + "\n[message_cache]\nenabled = false\n",
+    )
+    .expect("rewrite config");
+    let off = without_colour(&run_until_listening(&config, &storage));
+    assert!(
+        off.contains("every message cache file this server made has been erased"),
+        "{off}"
+    );
+    assert!(!off.contains("the message cache is open"), "{off}");
+    assert!(
+        !cache.exists(),
+        "a disabled cache survived the start:\n{off}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

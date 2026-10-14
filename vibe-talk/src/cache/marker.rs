@@ -140,11 +140,10 @@ pub fn startup_action(
     }
 }
 
-/// Erase every registered cache path, and every file in `default_dir` named like a cache whose
-/// header says it is one. Returns the bytes removed.
-#[must_use]
-pub fn erase_registered(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
-    let mut doomed: Vec<PathBuf> = sidecar.paths.clone();
+/// Every cache file this server made that may still be on disk: each registered path, and each file
+/// in `default_dir` named like a cache whose header says it is one.
+fn candidates(sidecar: &Sidecar, default_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = sidecar.paths.clone();
     if let Some(dir) = default_dir {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -155,14 +154,50 @@ pub fn erase_registered(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
                     .is_some_and(|n| n.contains(".message-cache-") && n.ends_with(".sqlite3"));
                 if named_like_one
                     && schema::read_header(&path).is_ok_and(|h| h == schema::Header::Ours)
-                    && !doomed.contains(&path)
+                    && !found.contains(&path)
                 {
-                    doomed.push(path);
+                    found.push(path);
                 }
             }
         }
     }
-    doomed.iter().map(|path| erase_one(path)).sum()
+    found
+}
+
+/// Erase every registered cache path, and every file in `default_dir` named like a cache whose
+/// header says it is one. Returns the bytes removed.
+#[must_use]
+pub fn erase_registered(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
+    erase_registered_except(sidecar, default_dir, None)
+}
+
+/// [`erase_registered`], leaving `except` alone: the file a cache handle in this process holds,
+/// which that handle erases itself.
+#[must_use]
+pub fn erase_registered_except(
+    sidecar: &Sidecar,
+    default_dir: Option<&Path>,
+    except: Option<&Path>,
+) -> u64 {
+    candidates(sidecar, default_dir)
+        .iter()
+        .filter(|path| except.is_none_or(|kept| kept != path.as_path()))
+        .map(|path| erase_one(path))
+        .sum()
+}
+
+/// The bytes the files [`erase_registered`] would erase hold now: what a cache left from an
+/// earlier configuration occupies while the configuration says nothing about one.
+#[must_use]
+pub fn present_bytes(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
+    candidates(sidecar, default_dir)
+        .iter()
+        .filter(|path| match schema::read_header(path) {
+            Ok(header) => matches!(header, schema::Header::Ours | schema::Header::Empty),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        })
+        .map(|path| file::bytes_on_disk(path))
+        .sum()
 }
 
 /// Erase one cache file and its working files, if it is still ours to erase: what is at the path
@@ -209,6 +244,11 @@ pub struct Reconciled {
     pub action: StartupAction,
     /// Bytes erased.
     pub erased_bytes: u64,
+    /// When the action is [`StartupAction::Leave`], the bytes the files left from an earlier
+    /// configuration hold: present, and unused. Zero otherwise.
+    pub present_bytes: u64,
+    /// Whether the sidecar records the owner's "off".
+    pub off: bool,
 }
 
 /// Apply [`startup_action`]: erase when it says so, and keep `absent_since_ms` current.
@@ -237,10 +277,58 @@ pub fn reconcile_at_start(
         sidecar.absent_since_ms = absent_since;
         store(sidecar_file, &sidecar)?;
     }
+    let present_bytes = if action == StartupAction::Leave {
+        present_bytes(&sidecar, default_dir)
+    } else {
+        0
+    };
     Ok(Reconciled {
         action,
         erased_bytes,
+        present_bytes,
+        off: sidecar.off,
     })
+}
+
+/// Record `path` as a cache this server opens, BEFORE it is opened: a file the registry does not
+/// name is one a later "off" could not find. Writes the sidecar only when the path is new.
+///
+/// # Errors
+///
+/// When the sidecar cannot be read or written; the caller then opens nothing.
+pub fn register(sidecar_file: &Path, path: &Path) -> Result<(), String> {
+    let mut sidecar = load(sidecar_file)?;
+    if sidecar.register(path) {
+        store(sidecar_file, &sidecar)?;
+    }
+    Ok(())
+}
+
+/// The owner's "on": clear the marker, and register the path about to be opened, in one write.
+///
+/// # Errors
+///
+/// When the sidecar cannot be read or written; the caller then opens nothing.
+pub fn switch_on(sidecar_file: &Path, path: &Path) -> Result<(), String> {
+    let mut sidecar = load(sidecar_file)?;
+    sidecar.off = false;
+    sidecar.off_at_ms = None;
+    sidecar.register(path);
+    store(sidecar_file, &sidecar)
+}
+
+/// The owner's "off" with no cache open to erase: write the marker, and hand back the registry so
+/// the caller can erase what it names.
+///
+/// # Errors
+///
+/// When the sidecar cannot be read or written; the caller then erases nothing.
+pub fn mark_off(sidecar_file: &Path, now_ms: i64) -> Result<Sidecar, String> {
+    let mut sidecar = load(sidecar_file)?;
+    sidecar.off = true;
+    sidecar.off_at_ms = Some(now_ms);
+    store(sidecar_file, &sidecar)?;
+    Ok(sidecar)
 }
 
 /// The owner's "off": write the marker first, then erase the file and leave it closed.
@@ -356,11 +444,38 @@ mod tests {
     }
 
     #[test]
+    fn what_is_present_is_counted_as_it_would_be_erased_and_the_open_one_can_be_spared() {
+        let scratch = crate::testing::TempDir::new("cache-marker-present");
+        let dir = scratch.path().join("c");
+        file::ensure_private_dir(&dir).expect("dir");
+        let foreign = dir.join("x.message-cache-h.sqlite3");
+        std::fs::write(&foreign, b"their notes").expect("write");
+        let kept = dir.join("kept.message-cache-h.sqlite3");
+        drop(MessageCache::open(crate::cache::CacheOptions::new(&kept)).expect("make one"));
+        let gone = dir.join("gone.message-cache-h.sqlite3");
+        drop(MessageCache::open(crate::cache::CacheOptions::new(&gone)).expect("make one"));
+        let mut sidecar = Sidecar::default();
+        sidecar.register(&foreign);
+        let both = file::bytes_on_disk(&kept) + file::bytes_on_disk(&gone);
+        assert!(both > 0);
+        assert_eq!(
+            present_bytes(&sidecar, Some(&dir)),
+            both,
+            "a foreign file was counted"
+        );
+        assert_eq!(present_bytes(&Sidecar::default(), None), 0);
+        let erased = erase_registered_except(&sidecar, Some(&dir), Some(&kept));
+        assert!(erased > 0);
+        assert!(kept.exists() && !gone.exists() && foreign.exists());
+    }
+
+    #[test]
     fn an_absent_table_is_remembered_and_erases_only_after_the_grace_period() {
         let scratch = crate::testing::TempDir::new("cache-absent");
         let marker = scratch.path().join("m.json");
         let first = reconcile_at_start(None, &marker, None, 5_000).expect("first");
         assert_eq!(first.action, StartupAction::Leave);
+        assert_eq!((first.present_bytes, first.off), (0, false));
         assert_eq!(load(&marker).expect("load").absent_since_ms, Some(5_000));
         let later = reconcile_at_start(None, &marker, None, 6_000).expect("later");
         assert_eq!(later.action, StartupAction::Leave);

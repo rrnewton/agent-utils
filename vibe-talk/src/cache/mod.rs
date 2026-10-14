@@ -1,9 +1,10 @@
 //! The message cache: a disposable on-disk copy of channel messages. `#208 persistent-cache`.
 //!
-//! **Not opened yet.** The read sites offer what write-scope and server-owned reads see to the
-//! server's [`Sink`] (milestone `cache-fill`, under way), but nothing outside the tests installs a
-//! cache behind it, nothing reads one back, and a server behaves exactly as it did before the cache
-//! existed. Later milestones open it and serve from it.
+//! **Filled, not served yet.** The read sites offer what write-scope and server-owned reads see to
+//! the server's [`Sink`] (milestone `cache-fill`, under way). A server opens a cache behind it
+//! only when its configuration's `[message_cache]` table says `enabled = true` and the owner has
+//! not turned it off ([`lifecycle`]); nothing reads one back yet, so what a caller is answered is
+//! exactly what it was before the cache existed. Later milestones serve from it.
 //!
 //! # A separate file, never tables in the store
 //!
@@ -88,6 +89,7 @@ mod checkpoint;
 pub mod coverage;
 pub mod file;
 pub mod grant;
+pub mod lifecycle;
 pub mod marker;
 pub mod merge;
 pub mod observe;
