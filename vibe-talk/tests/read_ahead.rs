@@ -85,6 +85,13 @@ struct SlowChat {
     /// How much longer than [`FETCH`] the next timeline read takes, once: a read sent before
     /// another that lands after it.
     stall_next_timeline: Mutex<Duration>,
+    /// How long the next timeline read waits before it reads the channel, once: a read sent first
+    /// that a bridge holds back (serving another read first, or waiting out a rate limit), so it
+    /// reads last.
+    read_late_next_timeline: Mutex<Duration>,
+    /// What the next timeline read answers at once, once, without reading: a bridge serving a copy
+    /// it could not bring up to date, with its `as_of`.
+    stale_next_timeline: Mutex<Option<TimelinePage>>,
 }
 
 impl SlowChat {
@@ -180,6 +187,11 @@ impl ChatClient for SlowChat {
                 ..TimelinePage::default()
             });
         }
+        if let Some(stale) = self.stale_next_timeline.lock().unwrap().take() {
+            return Ok(stale);
+        }
+        let read_late = std::mem::take(&mut *self.read_late_next_timeline.lock().unwrap());
+        tokio::time::sleep(read_late).await;
         let messages = match request.thread_id.as_deref() {
             Some(THREAD) => Self::thread(),
             Some(_) => {
@@ -919,10 +931,12 @@ async fn a_purge_while_the_page_is_fetching_leaves_nothing_behind_when_the_fetch
     );
 }
 
-/// `remote-ops-audit`, read-ahead keeps the newer copy. Two reads of the channel overlap: the first is
-/// sent before an edit nobody pushed and is slow, the second is sent after the edit and lands first.
-/// When the first lands, its copy from before the edit must not replace the newer one, or speech
-/// preparation (and a summary's window) serves the old words for as long as the memory holds them.
+/// `remote-ops-audit`, read-ahead keeps no copy two overlapping reads disagree about. The first read
+/// is sent before an edit nobody pushed and is slow, the second is sent after the edit and lands
+/// first. When the first lands, its copy from before the edit must not replace the newer one, or
+/// speech preparation (and a summary's window) serves the old words for as long as the memory holds
+/// them. Nothing can tell which of the two read later (see the next test), so neither is kept, and
+/// preparation fetches the message.
 #[tokio::test(start_paused = true)]
 async fn an_older_read_that_lands_after_a_newer_one_does_not_put_the_old_text_back() {
     let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
@@ -957,13 +971,104 @@ async fn an_older_read_that_lands_after_a_newer_one_does_not_put_the_old_text_ba
     let (status, body) = call(&app, "POST", &prepare_path(), Some(json!({"ids": ["102"]}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        chat.windows.load(Ordering::SeqCst),
-        0,
-        "fixture: preparation fetched instead of reading what the reads left in memory"
-    );
-    assert_eq!(
         play(&app, &body).await,
         "the words as edited",
         "the older read put the text from before the edit back over the newer copy"
+    );
+    assert_eq!(
+        chat.windows.load(Ordering::SeqCst),
+        1,
+        "preparation did not fetch the message two overlapping reads disagreed about"
+    );
+}
+
+/// Two overlapping reads of the channel, and the one sent FIRST reads last: the bridge holds it back
+/// (it serves another read first and runs this one again afterwards; a rate limit does the same), so
+/// it reads after an edit nobody pushed, while the read sent second read the old text at once and
+/// landed first. A rule that keeps the copy from the fetch that began later keeps the old words here.
+/// Neither copy is kept, and preparation fetches the edit.
+#[tokio::test(start_paused = true)]
+async fn a_read_sent_first_that_reads_last_leaves_no_older_copy_to_speak() {
+    let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    let path = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main");
+    *chat.read_late_next_timeline.lock().unwrap() = FETCH * 2;
+    let first = call(&app, "GET", &path, None);
+    let second = async {
+        tokio::time::sleep(FETCH / 5).await;
+        call(&app, "GET", &path, None).await
+    };
+    let edit = async {
+        // After the second read has read, before the first does.
+        tokio::time::sleep(FETCH / 2).await;
+        chat.edit("102", "the words as edited");
+    };
+    let ((first_status, first_body), (second_status, second_body), ()) =
+        tokio::join!(first, second, edit);
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(second_status, StatusCode::OK, "{second_body}");
+    assert_eq!(
+        first_body["messages"][1]["content"], "the words as edited",
+        "fixture: the read sent first was meant to read after the edit"
+    );
+    assert_eq!(
+        second_body["messages"][1]["content"], "words of message 102",
+        "fixture: the read sent second was meant to read before the edit"
+    );
+
+    let (status, body) = call(&app, "POST", &prepare_path(), Some(json!({"ids": ["102"]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        play(&app, &body).await,
+        "the words as edited",
+        "the copy from the read sent second, older than the edit, was spoken"
+    );
+}
+
+/// The same with a bridge's stale copy: the read sent first goes to the service and lands with an
+/// edit nobody pushed; the read sent second is answered at once from a copy the bridge could not
+/// bring up to date (`as_of`), older than the instant it was sent. Its copy must not stand in the way
+/// of the fresh one.
+#[tokio::test(start_paused = true)]
+async fn a_stale_copy_a_bridge_served_with_as_of_does_not_outlast_a_fresh_read() {
+    let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    let path = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main");
+    *chat.read_late_next_timeline.lock().unwrap() = FETCH * 2;
+    let first = call(&app, "GET", &path, None);
+    let second = async {
+        tokio::time::sleep(FETCH / 5).await;
+        *chat.stale_next_timeline.lock().unwrap() = Some(TimelinePage {
+            messages: chat.window(),
+            as_of: Some("2026-10-12T00:59:00Z".to_owned()),
+            ..TimelinePage::default()
+        });
+        call(&app, "GET", &path, None).await
+    };
+    let edit = async {
+        tokio::time::sleep(FETCH / 2).await;
+        chat.edit("102", "the words as edited");
+    };
+    let ((first_status, first_body), (second_status, second_body), ()) =
+        tokio::join!(first, second, edit);
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(second_status, StatusCode::OK, "{second_body}");
+    assert_eq!(
+        first_body["messages"][1]["content"], "the words as edited",
+        "fixture: the read sent first was meant to land with the edit"
+    );
+    assert_eq!(
+        second_body["messages"][1]["content"], "words of message 102",
+        "fixture: the bridge was meant to answer the second read from its stale copy"
+    );
+    assert!(
+        second_body["as_of"].is_string(),
+        "fixture: the stale answer did not say it was stale: {second_body}"
+    );
+
+    let (status, body) = call(&app, "POST", &prepare_path(), Some(json!({"ids": ["102"]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        play(&app, &body).await,
+        "the words as edited",
+        "the bridge's stale copy kept the fresh read's edit out of read-aloud"
     );
 }

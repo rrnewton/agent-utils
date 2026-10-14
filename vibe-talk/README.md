@@ -1837,12 +1837,13 @@ the page and the tools read channels from the chat provider. Two short-lived cop
 exceptions. Both are in MEMORY only, they are kept apart, and both are gone when the process
 restarts. Messages fetched for the page in the last 30 seconds are kept so that preparing them
 for read-aloud does not fetch them again (`#191 read-aloud-first-lag`, `src/read_ahead.rs`).
-Nothing else reads them, a pushed edit or deletion drops the message, a read that was sent before
-another and lands after it never replaces the newer copy (`remote-ops-audit`), and the storage purge
-clears them. Each channel's newest window is kept so the voice agent's catch-up can answer while the
-provider is slow (`#210 voice-catchup-speed`, `src/recent.rs`): the last read of each listed
-channel plus the changes pushed to it since. Its last 200 pushed changes are kept beside it, so a
-read that lands after one of them does not undo it. The storage purge clears the windows and those
+Nothing else reads them, a pushed edit or deletion drops the message, two reads that overlap and
+disagree about a message keep neither copy, since neither can be shown to be the newer, so the
+message is fetched again (`remote-ops-audit`), and the storage purge clears them. Each channel's
+newest window is kept so the voice agent's catch-up can answer while the provider is slow
+(`#210 voice-catchup-speed`, `src/recent.rs`): the last read of each listed channel plus the changes
+pushed to it since. Its last 200 pushed changes are kept beside it, so a read that lands after one of
+them does not undo it. The storage purge clears the windows and those
 changes too, and a read that was already running when it came keeps nothing when it lands, so the
 next catch-up reads every channel afresh. These two are not the only channel text held in memory,
 and the purge does not clear the others; "How an operator purges it" lists them. There is exactly
