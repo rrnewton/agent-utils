@@ -1,18 +1,33 @@
 //! `#208 persistent-cache`: what decides whether the message cache file exists — the
 //! `[message_cache]` table, the owner's switch beside the store, and the erases that follow
-//! them — exercised through the server's own startup.
+//! them — exercised through the server's own startup and its routes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt as _;
+use serde_json::{json, Value};
+use tower::ServiceExt as _;
 use vibe_talk::cache::lifecycle::{self, Started, Trouble};
-use vibe_talk::cache::{file, marker, CacheOptions, MessageCache};
+use vibe_talk::cache::{
+    file, marker, CacheOptions, ChanKey, Incoming, MessageCache, Observation, Scope as CacheScope,
+};
+use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{self, LogCapture, ManualClock, TempDir};
+use vibe_talk::testing::{
+    self, LogCapture, ManualClock, TempDir, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN,
+};
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const MINUTE: i64 = 60_000;
 /// 2026-10-01T00:00:00Z.
 const T0: i64 = 1_790_812_800_000;
+const WAIT: Duration = Duration::from_secs(20);
+/// The provider key a single-provider test deployment names its provider by.
+const LEGACY: &str = vibe_talk::config::LEGACY_DISCORD_PROVIDER_KEY;
 
 /// The store's file. Its directory is private, as the real store makes it.
 fn store_path(dir: &Path) -> PathBuf {
@@ -228,4 +243,336 @@ async fn a_cache_whose_path_cannot_be_registered_first_is_not_opened() {
         state.message_cache.lifecycle().and_then(|l| l.trouble()),
         Some(Trouble::SwitchUnwritable)
     );
+}
+
+/// A message of the read-only channel really written at `at_ms`.
+fn message(at_ms: i64, text: &str) -> Message {
+    Message {
+        edited_timestamp: None,
+        mentions: Vec::new(),
+        thread: None,
+        id: MessageId::at_time_ms(at_ms),
+        channel_id: ChannelId(READ_CHANNEL.to_owned()),
+        author: "Ada".to_owned(),
+        author_id: UserId("7".to_owned()),
+        author_is_bot: false,
+        timestamp: vibe_talk::clock::iso_from_ms(at_ms),
+        spoken_time: String::new(),
+        reply_to: None,
+        content: text.to_owned(),
+        spoken_content: String::new(),
+        content_html: String::new(),
+        noise: false,
+        reactions: None,
+        heading: None,
+    }
+}
+
+/// Offer `count` rows of the read-only channel straight to the cache, as a read of it would, and
+/// wait until they are applied.
+fn fill(cache: &MessageCache, count: i64, now_ms: i64) {
+    let chan = ChanKey::new(LEGACY, READ_CHANNEL);
+    let rows = (0..count)
+        .map(|n| {
+            Incoming::new(
+                message(T0 + n * MINUTE, &format!("row {n}")),
+                CacheScope::Main,
+            )
+        })
+        .collect();
+    cache.offer(
+        chan.clone(),
+        cache.stamp(&chan),
+        Observation::Rows {
+            rows,
+            scope: None,
+            observed_ms: now_ms,
+        },
+    );
+    assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+}
+
+/// Every message the file holds, once the writer has finished what it was asked.
+fn held(cache: &MessageCache) -> u64 {
+    assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+    cache.counts().served().expect("counts").messages
+}
+
+/// A server with the cache on, its accounts checked, and `count` rows in it.
+async fn filled_server(dir: &Path, count: i64) -> (AppState, Arc<ManualClock>) {
+    let clock = ManualClock::at(T0 + 60 * MINUTE);
+    let (state, started) = server(dir, Some(ON), &clock).await;
+    assert_eq!(started, Started::Opened);
+    assert!(state.message_cache.identities_verified(WAIT).await);
+    let cache = state.message_cache.cache().expect("open");
+    fill(&cache, count, clock.now());
+    assert_eq!(held(&cache), u64::try_from(count).expect("small"));
+    (state, clock)
+}
+
+async fn send(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"));
+    let request = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    }
+    .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn switch(state: &AppState, enabled: bool) -> (StatusCode, Value) {
+    send(
+        state,
+        "PUT",
+        "/api/v1/message-cache",
+        WRITE_TOKEN,
+        Some(json!({ "enabled": enabled })),
+    )
+    .await
+}
+
+async fn erase(state: &AppState) -> (StatusCode, Value) {
+    send(state, "DELETE", "/api/v1/message-cache", WRITE_TOKEN, None).await
+}
+
+/// Make every write of the sidecar fail, whoever runs the test: it is written through a temporary
+/// file beside it, and a directory stands in that file's place. Returns what to remove to undo it.
+fn block_the_sidecar(dir: &Path) -> PathBuf {
+    let mut temporary = sidecar(dir).into_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    std::fs::create_dir(&temporary).expect("block the write");
+    temporary
+}
+
+#[tokio::test]
+async fn off_writes_the_marker_before_it_erases_and_a_marker_it_cannot_write_erases_nothing() {
+    let scratch = TempDir::new("cache-switch-off");
+    let dir = scratch.path();
+    let (state, clock) = filled_server(dir, 5).await;
+    let cache = state.message_cache.cache().expect("open");
+
+    let blocked = block_the_sidecar(dir);
+    let (status, body) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "message_cache_switch_unsaved");
+    assert!(cache.is_open(), "the file was erased without its marker");
+    assert_eq!(held(&cache), 5, "rows went without the marker");
+    assert!(state.message_cache.cache().is_some());
+    assert!(!marker::load(&sidecar(dir)).expect("load").off);
+    std::fs::remove_dir(&blocked).expect("unblock");
+
+    let (status, body) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], false);
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["reason"], "switched_off");
+    assert_eq!(body["bytes"], 0);
+    assert_eq!(body["max_days"], 14);
+    assert!(!cache.is_open());
+    drop(cache);
+    assert!(state.message_cache.cache().is_none());
+    assert!(!default_cache(dir).exists(), "the file outlived the switch");
+    assert!(marker::load(&sidecar(dir)).expect("load").off);
+    stop(state);
+
+    // The switch outlives the process: the next start erases and opens nothing.
+    let (state, started) = server(dir, Some(ON), &clock).await;
+    assert!(matches!(started, Started::Erased { .. }), "{started:?}");
+    assert!(state.message_cache.cache().is_none());
+    assert!(!default_cache(dir).exists());
+}
+
+#[tokio::test]
+async fn on_is_refused_unless_the_configuration_enables_the_cache() {
+    let scratch = TempDir::new("cache-switch-refused");
+    let dir = scratch.path();
+    let clock = ManualClock::at(T0);
+    let (state, _) = server(dir, None, &clock).await;
+    for (method, body) in [
+        ("PUT", Some(json!({ "enabled": true }))),
+        ("PUT", Some(json!({ "enabled": false }))),
+        ("DELETE", None),
+    ] {
+        let (status, answer) =
+            send(&state, method, "/api/v1/message-cache", WRITE_TOKEN, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method}: {answer}");
+        assert_eq!(answer["error"], "message_cache_not_configured");
+    }
+    stop(state);
+
+    let (state, _) = server(dir, Some("enabled = false"), &clock).await;
+    let (status, body) = switch(&state, true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "message_cache_not_enabled");
+    assert!(state.message_cache.cache().is_none());
+    assert!(!default_cache(dir).exists(), "a disabled cache was opened");
+    assert!(
+        std::fs::symlink_metadata(sidecar(dir)).is_err(),
+        "a refused switch wrote the marker"
+    );
+    // Off is the configuration's word too, and is answered as it stands.
+    let (status, body) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["reason"], "config_disabled");
+    // Neither is open to a read token.
+    for (method, body) in [("PUT", Some(json!({ "enabled": true }))), ("DELETE", None)] {
+        let (status, _) = send(&state, method, "/api/v1/message-cache", READ_TOKEN, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn on_after_off_opens_a_fresh_empty_file_and_checks_the_accounts_again() {
+    let scratch = TempDir::new("cache-switch-on");
+    let dir = scratch.path();
+    let (state, _clock) = filled_server(dir, 5).await;
+    let (status, body) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = switch(&state, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true, "{body}");
+    assert_eq!(body["enabled"], true);
+    assert!(body.get("reason").is_none(), "{body}");
+    assert_eq!(body["messages"], 0, "{body}");
+    assert!(!marker::load(&sidecar(dir)).expect("load").off);
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.is_open() && default_cache(dir).exists());
+    assert_eq!(held(&cache), 0, "the fresh file holds something");
+    // The account table went with the old file: nothing of the provider is filled until it has
+    // been asked again, and the answer written to the new one.
+    assert!(state.message_cache.identities_verified(WAIT).await);
+    let recorded = tokio::task::spawn_blocking(move || {
+        assert!(cache.barrier_blocking(WAIT));
+        cache.account(LEGACY).served().flatten()
+    })
+    .await
+    .expect("read");
+    assert!(recorded.is_some(), "the account was not checked again");
+    // On again is nothing new.
+    let (status, body) = switch(&state, true).await;
+    assert_eq!(
+        (status, body["available"].clone()),
+        (StatusCode::OK, json!(true))
+    );
+}
+
+#[tokio::test]
+async fn erase_keeps_the_cache_on_with_a_fresh_empty_file_and_erases_nothing_while_it_is_off() {
+    let scratch = TempDir::new("cache-switch-erase");
+    let dir = scratch.path();
+    let (state, _clock) = filled_server(dir, 7).await;
+    let before = state.message_cache.cache().expect("open");
+
+    let (status, body) = erase(&state).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true, "{body}");
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["messages"], 0, "{body}");
+    let after = state.message_cache.cache().expect("still behind the sink");
+    assert!(Arc::ptr_eq(&before, &after) && after.is_open());
+    assert_eq!(held(&after), 0);
+    assert!(
+        !marker::load(&sidecar(dir)).expect("load").off,
+        "erase turned it off"
+    );
+    assert!(state.message_cache.identities_verified(WAIT).await);
+    drop((before, after));
+
+    let (status, _) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = erase(&state).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], false);
+    assert_eq!(body["reason"], "switched_off");
+    assert!(
+        !default_cache(dir).exists(),
+        "an erase while off made a file"
+    );
+}
+
+#[tokio::test]
+async fn no_tool_reaches_the_switch_whatever_the_credential() {
+    let scratch = TempDir::new("cache-switch-tools");
+    let dir = scratch.path();
+    let clock = ManualClock::at(T0);
+    let (state, _) = server(dir, Some(ON), &clock).await;
+    for tool in [
+        vibe_talk::send_approval::Approval::Ask,
+        vibe_talk::send_approval::Approval::Direct,
+    ]
+    .into_iter()
+    .flat_map(|approval| vibe_talk::mcp::tool_manifest(&[], approval))
+    {
+        assert!(
+            !tool.path.contains("message-cache") && !tool.name.contains("cache"),
+            "{} reaches the message cache's switch",
+            tool.name
+        );
+    }
+    for token in [READ_TOKEN, WRITE_TOKEN] {
+        let (status, body) = send(
+            &state,
+            "POST",
+            "/mcp",
+            token,
+            Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tools = body["result"]["tools"].as_array().expect("tools");
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let name = tool["name"].as_str().expect("name");
+            assert!(!name.contains("cache"), "{name} is offered to a model");
+        }
+    }
+    for invented in ["set_message_cache", "erase_message_cache", "message_cache"] {
+        let (_, body) = send(
+            &state,
+            "POST",
+            "/mcp",
+            WRITE_TOKEN,
+            Some(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": invented, "arguments": { "enabled": false } },
+            })),
+        )
+        .await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("unknown tool")),
+            "{invented} was not refused: {body}"
+        );
+    }
+    assert!(state.message_cache.cache().is_some_and(|c| c.is_open()));
+    assert!(!marker::load(&sidecar(dir)).expect("load").off);
 }

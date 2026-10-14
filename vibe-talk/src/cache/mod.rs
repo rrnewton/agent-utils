@@ -1950,6 +1950,13 @@ impl MessageCache {
     pub fn counts(&self) -> Read<Counts> {
         self.read(None, reader::counts)
     }
+
+    /// The earliest message time any scope's coverage starts at, across the whole file, in
+    /// milliseconds since the Unix epoch: for the status Settings shows. `None` with no coverage.
+    #[must_use]
+    pub fn oldest_covered(&self) -> Read<Option<i64>> {
+        self.read(None, reader::oldest_covered)
+    }
 }
 
 impl Drop for MessageCache {

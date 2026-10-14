@@ -203,6 +203,21 @@ impl From<StoreError> for ApiError {
     }
 }
 
+impl From<crate::cache::lifecycle::SwitchError> for ApiError {
+    fn from(value: crate::cache::lifecycle::SwitchError) -> Self {
+        use crate::cache::lifecycle::SwitchError;
+        let (status, code) = match value {
+            SwitchError::NotConfigured => (StatusCode::CONFLICT, "message_cache_not_configured"),
+            SwitchError::NotEnabled => (StatusCode::CONFLICT, "message_cache_not_enabled"),
+            SwitchError::Unsaved => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "message_cache_switch_unsaved",
+            ),
+        };
+        Self::new(status, code, value.to_string())
+    }
+}
+
 fn require(headers: &HeaderMap, state: &AppState, scope: Scope) -> Result<Scope, ApiError> {
     let header = headers
         .get(header::AUTHORIZATION)
@@ -3065,6 +3080,58 @@ pub async fn purge_storage(
         "detail": "every durable record this server holds has been erased; the store is still \
                    open and usable",
     }))))
+}
+
+/// The cache's switch, for a server that has none started: there is no table to switch.
+fn message_cache_lifecycle(
+    state: &AppState,
+) -> Result<&std::sync::Arc<crate::cache::lifecycle::Lifecycle>, ApiError> {
+    state
+        .message_cache
+        .lifecycle()
+        .ok_or_else(|| ApiError::from(crate::cache::lifecycle::SwitchError::NotConfigured))
+}
+
+/// `PUT /api/v1/message-cache` — the owner's switch for the message cache. `#208
+/// persistent-cache`.
+///
+/// `{"enabled": false}` writes the off marker beside the store FIRST and then erases every cache
+/// file this server made; a marker that cannot be written erases nothing and answers 500
+/// `message_cache_switch_unsaved`. `{"enabled": true}` clears the marker and opens a fresh, empty
+/// file, and is refused 409 `message_cache_not_enabled` while the configuration does not enable
+/// the cache: the operator's configuration wins. Both answer 409 `message_cache_not_configured`
+/// when the configuration has no `[message_cache]` table, and otherwise the
+/// [`crate::contract::MessageCacheStatus`] they left.
+///
+/// WRITE scope, and — as with [`set_voice_settings`] — NO TOOL reaches it: the cache is the
+/// owner's to keep or throw away. See [`crate::cache::lifecycle`].
+pub async fn set_message_cache(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<crate::contract::MessageCacheRequest>,
+) -> Result<Response, ApiError> {
+    let lifecycle = message_cache_lifecycle(&state)?;
+    let status = if request.enabled {
+        lifecycle.switch_on(&state.message_cache).await?
+    } else {
+        lifecycle.switch_off(&state.message_cache).await?
+    };
+    Ok(no_store(Json(status)))
+}
+
+/// `DELETE /api/v1/message-cache` — erase the message cache and keep it on. `#208
+/// persistent-cache`.
+///
+/// The open file is erased and a fresh, empty one opened in its place. With the cache off nothing
+/// is erased, and the answer is the status as it is. 409 `message_cache_not_configured` without a
+/// `[message_cache]` table. WRITE scope, NO TOOL, as [`set_message_cache`].
+pub async fn erase_message_cache(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+) -> Result<Response, ApiError> {
+    let lifecycle = message_cache_lifecycle(&state)?;
+    let status = lifecycle.erase_now(&state.message_cache).await?;
+    Ok(no_store(Json(status)))
 }
 
 /// This server's own inbox state.

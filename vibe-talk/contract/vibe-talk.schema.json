@@ -659,6 +659,87 @@
       ],
       "type": "object"
     },
+    "MessageCacheRequest": {
+      "description": "`PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.\n\nAn unknown field is ignored, as everywhere in the contract: a page may send one a later server\nreads without an older one refusing the switch.",
+      "properties": {
+        "enabled": {
+          "description": "False turns the cache off and erases its file. True turns it on again with a fresh, empty\nfile, and only where the server's configuration enables it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "MessageCacheStatus": {
+      "description": "The message cache, as Settings shows it: whether it is on, why it is not, and how much it\nholds. `#208 persistent-cache`.\n\nThe body `PUT` and `DELETE /api/v1/message-cache` answer with, and `message_cache` in\nclient-config. Numbers, dates and codes only: no path, no channel, nothing of a message.",
+      "properties": {
+        "available": {
+          "description": "Whether a cache file is open, so what write-token and server reads see is being saved.",
+          "type": "boolean"
+        },
+        "bytes": {
+          "description": "Bytes the file occupies, its working files included; 0 while none is open.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "channels": {
+          "description": "Channels it holds anything of.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "description": "Whether the cache is switched on: the configuration enables it and the owner has not\nturned it off. True while `available` is false means it should be open and is not, and\n`reason` says why.",
+          "type": "boolean"
+        },
+        "max_days": {
+          "description": "The server's age limit, in days: nothing older is kept.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_megabytes": {
+          "description": "The server's size limit, in megabytes, the working files included.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "messages": {
+          "description": "Messages it holds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "oldest_covered": {
+          "description": "The earliest message time from which some part of a channel is proven to be held whole,\nas an RFC 3339 instant in UTC. Absent while nothing is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why no cache is open, as a code, when none is: `config_disabled` (the server's\nconfiguration turns it off, and only the operator can turn it on), `switched_off` (the\nowner turned it off), or what stopped the file opening — `switch_unreadable`,\n`switch_unwritable`, `sqlite_unsupported`, `foreign_file`, `locked`, `filesystem`,\n`sqlite` or `not_open`. A string rather than a closed set, so a code added later does not\nmake an older page refuse client-config; a page reads one it does not know as \"not open\".\nAbsent while a cache is open.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "available",
+        "enabled",
+        "bytes",
+        "messages",
+        "channels",
+        "max_days",
+        "max_megabytes"
+      ],
+      "type": "object"
+    },
     "MessageId": {
       "description": "A Discord message snowflake, as a string.",
       "type": "string"
@@ -2342,6 +2423,12 @@
     },
     {
       "$ref": "#/$defs/VoicePostPrefix"
+    },
+    {
+      "$ref": "#/$defs/MessageCacheStatus"
+    },
+    {
+      "$ref": "#/$defs/MessageCacheRequest"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

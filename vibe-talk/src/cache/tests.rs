@@ -1118,6 +1118,41 @@ fn only_a_proof_stamps_and_an_empty_listing_stamps_nothing() {
 }
 
 #[test]
+fn the_oldest_coverage_is_where_the_earliest_proof_starts_and_goes_with_its_channel() {
+    let fx = Fixture::new("cache-oldest-covered");
+    assert_eq!(fx.cache.oldest_covered().served().expect("served"), None);
+    fx.list(vec![m(1), m(2), m(3)], T0 + 300, None);
+    assert_eq!(
+        fx.cache.oldest_covered().served().expect("served"),
+        None,
+        "rows without a proof cover nothing"
+    );
+    fx.list(
+        vec![m(4), m(5), m(6)],
+        T0 + 400,
+        Some(newest_proof(ListStart::At(T0 + 4 * STEP))),
+    );
+    fx.list(
+        vec![m(2), m(3)],
+        T0 + 500,
+        Some(Proof {
+            from: ListStart::At(T0 + 2 * STEP),
+            until: ListEnd::Before(T0 + 4 * STEP),
+            complete: true,
+            full: true,
+            source: Source::Range,
+        }),
+    );
+    assert_eq!(
+        fx.cache.oldest_covered().served().expect("served"),
+        Some(T0 + 2 * STEP)
+    );
+    fx.cache.erase_channels(std::slice::from_ref(&fx.chan));
+    fx.settle();
+    assert_eq!(fx.cache.oldest_covered().served().expect("served"), None);
+}
+
+#[test]
 fn coverage_stays_out_of_the_unsettled_band_until_a_later_read_settles_it() {
     let fx = Fixture::new("cache-band");
     let proof = newest_proof(ListStart::At(T0 + STEP));

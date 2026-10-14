@@ -256,6 +256,14 @@ fn routes(state: AppState) -> Router {
         // The operator's erase, and the only COMPLETE one over HTTP: the conversation routes
         // clear transcripts and say so, this one clears everything the store holds.
         .route("/api/v1/storage", axum::routing::delete(api::purge_storage))
+        // `#208 persistent-cache`. The owner's switch for the message cache: PUT turns it off
+        // (marker first, then the erase) or on again, DELETE erases it and keeps it on. WRITE scope
+        // both, and NO MCP TOOL for either — the saved copy is the owner's to keep or throw away,
+        // for the `#39` reason below. Its status rides on client-config.
+        .route(
+            "/api/v1/message-cache",
+            axum::routing::put(api::set_message_cache).delete(api::erase_message_cache),
+        )
         .route("/api/v1/inbox", get(api::inbox))
         // `#50 todo-view`. The channel filtered down to what has not been dealt with, and the two
         // acts that change that. READ scope to look, WRITE scope to change — the same split every

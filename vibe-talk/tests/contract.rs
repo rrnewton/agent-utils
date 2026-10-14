@@ -15,11 +15,12 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
-    LiveDelivery, LiveMessageEvent, LiveResetEvent, MessagesResponse, NoiseRules, PendingPost,
-    PendingPostResponse, PinChangeResponse, PinsResponse, ProviderDescription, ReplyDismissals,
-    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
-    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSettings,
+    LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheRequest, MessageCacheStatus,
+    MessagesResponse, NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse,
+    PinsResponse, ProviderDescription, ReplyDismissals, TimelineResponse, TokenScope,
+    TranscriptRole, UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
+    UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
+    VoicePromptSettings, VoiceSettings,
 };
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
@@ -284,6 +285,22 @@ fn post_prefix(saved: Option<&str>, changeable: bool) -> VoicePostPrefix {
         custom: saved.is_some(),
         max_chars: 100,
         changeable,
+    }
+}
+
+/// The message cache's status, open and holding something, or switched off. `#208
+/// persistent-cache`.
+fn message_cache_status(open: bool) -> MessageCacheStatus {
+    MessageCacheStatus {
+        available: open,
+        enabled: open,
+        reason: (!open).then_some("switched_off"),
+        bytes: if open { 1_048_576 } else { 0 },
+        messages: if open { 1_200 } else { 0 },
+        channels: if open { 3 } else { 0 },
+        oldest_covered: open.then(|| "2026-10-01T00:00:00Z".into()),
+        max_days: 14,
+        max_megabytes: 256,
     }
 }
 
@@ -890,6 +907,16 @@ fn samples() -> Value {
                 as_of: Some("2026-10-12T09:00:00Z".into()),
                 untrusted_content_notice: "third-party text",
             }),
+        ],
+        // `#208 persistent-cache`: an open cache with coverage, and one switched off, so `reason`
+        // and `oldest_covered` are each seen present and omitted.
+        "MessageCacheStatus": [
+            to(&message_cache_status(true)),
+            to(&message_cache_status(false)),
+        ],
+        "MessageCacheRequest": [
+            to(&MessageCacheRequest { enabled: false }),
+            to(&MessageCacheRequest { enabled: true }),
         ],
         "VibeTalkV1ClientFrame": [
             to(&VibeTalkV1ClientFrame::AudioStart),

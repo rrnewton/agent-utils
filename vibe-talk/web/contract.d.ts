@@ -705,6 +705,75 @@ declare namespace VibeTalk {
   }
 
   /**
+   * `PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.
+   *
+   * An unknown field is ignored, as everywhere in the contract: a page may send one a later server
+   * reads without an older one refusing the switch.
+   */
+  interface MessageCacheRequest {
+    /**
+     * False turns the cache off and erases its file. True turns it on again with a fresh, empty
+     * file, and only where the server's configuration enables it.
+     */
+    enabled: boolean;
+  }
+
+  /**
+   * The message cache, as Settings shows it: whether it is on, why it is not, and how much it
+   * holds. `#208 persistent-cache`.
+   *
+   * The body `PUT` and `DELETE /api/v1/message-cache` answer with, and `message_cache` in
+   * client-config. Numbers, dates and codes only: no path, no channel, nothing of a message.
+   */
+  interface MessageCacheStatus {
+    /**
+     * Whether a cache file is open, so what write-token and server reads see is being saved.
+     */
+    available: boolean;
+    /**
+     * Bytes the file occupies, its working files included; 0 while none is open.
+     */
+    bytes: number;
+    /**
+     * Channels it holds anything of.
+     */
+    channels: number;
+    /**
+     * Whether the cache is switched on: the configuration enables it and the owner has not
+     * turned it off. True while `available` is false means it should be open and is not, and
+     * `reason` says why.
+     */
+    enabled: boolean;
+    /**
+     * The server's age limit, in days: nothing older is kept.
+     */
+    max_days: number;
+    /**
+     * The server's size limit, in megabytes, the working files included.
+     */
+    max_megabytes: number;
+    /**
+     * Messages it holds.
+     */
+    messages: number;
+    /**
+     * The earliest message time from which some part of a channel is proven to be held whole,
+     * as an RFC 3339 instant in UTC. Absent while nothing is.
+     */
+    oldest_covered?: string | null;
+    /**
+     * Why no cache is open, as a code, when none is: `config_disabled` (the server's
+     * configuration turns it off, and only the operator can turn it on), `switched_off` (the
+     * owner turned it off), or what stopped the file opening — `switch_unreadable`,
+     * `switch_unwritable`, `sqlite_unsupported`, `foreign_file`, `locked`, `filesystem`,
+     * `sqlite` or `not_open`. A string rather than a closed set, so a code added later does not
+     * make an older page refuse client-config; a page reads one it does not know as "not open".
+     * Absent while a cache is open.
+     */
+    reason?: string | null;
+  }
+
+  /**
    * A Discord message snowflake, as a string.
    */
   type MessageId = string;
@@ -1782,6 +1851,8 @@ declare namespace VibeTalk {
     MessagesResponse: MessagesResponse;
     VoicePromptSettings: VoicePromptSettings;
     VoicePostPrefix: VoicePostPrefix;
+    MessageCacheStatus: MessageCacheStatus;
+    MessageCacheRequest: MessageCacheRequest;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

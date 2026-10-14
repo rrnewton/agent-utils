@@ -531,6 +531,36 @@
       "timestamp": "2026-09-25T12:00:00+00:00"
     }
   ],
+  "MessageCacheRequest": [
+    {
+      "enabled": false
+    },
+    {
+      "enabled": true
+    }
+  ],
+  "MessageCacheStatus": [
+    {
+      "available": true,
+      "bytes": 1048576,
+      "channels": 3,
+      "enabled": true,
+      "max_days": 14,
+      "max_megabytes": 256,
+      "messages": 1200,
+      "oldest_covered": "2026-10-01T00:00:00Z"
+    },
+    {
+      "available": false,
+      "bytes": 0,
+      "channels": 0,
+      "enabled": false,
+      "max_days": 14,
+      "max_megabytes": 256,
+      "messages": 0,
+      "reason": "switched_off"
+    }
+  ],
   "MessagesResponse": [
     {
       "channel": {

@@ -305,6 +305,18 @@ pub(crate) fn account(
         .optional()
 }
 
+/// The earliest time any coverage interval of a channel still on the file's list starts at: how
+/// far back the cache has proven it holds a scope's whole listing, somewhere. `None` with no
+/// coverage. A channel being erased is not counted: no read can reach it any more.
+pub(crate) fn oldest_covered(connection: &Connection) -> rusqlite::Result<Option<i64>> {
+    connection.query_row(
+        "SELECT MIN(c.t0_ms) FROM coverage c JOIN channel ch ON ch.chan = c.chan
+         WHERE ch.provider_key <> ?1",
+        [super::writer::ERASED_PROVIDER],
+        |row| row.get(0),
+    )
+}
+
 pub(crate) fn counts(connection: &Connection) -> rusqlite::Result<Counts> {
     let number = |sql: &str| -> rusqlite::Result<u64> {
         connection

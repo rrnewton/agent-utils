@@ -339,6 +339,55 @@ pub struct VoiceSettings {
     pub changeable: bool,
 }
 
+/// The message cache, as Settings shows it: whether it is on, why it is not, and how much it
+/// holds. `#208 persistent-cache`.
+///
+/// The body `PUT` and `DELETE /api/v1/message-cache` answer with, and `message_cache` in
+/// client-config. Numbers, dates and codes only: no path, no channel, nothing of a message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MessageCacheStatus {
+    /// Whether a cache file is open, so what write-token and server reads see is being saved.
+    pub available: bool,
+    /// Whether the cache is switched on: the configuration enables it and the owner has not
+    /// turned it off. True while `available` is false means it should be open and is not, and
+    /// `reason` says why.
+    pub enabled: bool,
+    /// Why no cache is open, as a code, when none is: `config_disabled` (the server's
+    /// configuration turns it off, and only the operator can turn it on), `switched_off` (the
+    /// owner turned it off), or what stopped the file opening — `switch_unreadable`,
+    /// `switch_unwritable`, `sqlite_unsupported`, `foreign_file`, `locked`, `filesystem`,
+    /// `sqlite` or `not_open`. A string rather than a closed set, so a code added later does not
+    /// make an older page refuse client-config; a page reads one it does not know as "not open".
+    /// Absent while a cache is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// Bytes the file occupies, its working files included; 0 while none is open.
+    pub bytes: u64,
+    /// Messages it holds.
+    pub messages: u64,
+    /// Channels it holds anything of.
+    pub channels: u64,
+    /// The earliest message time from which some part of a channel is proven to be held whole,
+    /// as an RFC 3339 instant in UTC. Absent while nothing is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_covered: Option<String>,
+    /// The server's age limit, in days: nothing older is kept.
+    pub max_days: u16,
+    /// The server's size limit, in megabytes, the working files included.
+    pub max_megabytes: u32,
+}
+
+/// `PUT /api/v1/message-cache`: the owner's switch. `#208 persistent-cache`.
+///
+/// An unknown field is ignored, as everywhere in the contract: a page may send one a later server
+/// reads without an older one refusing the switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MessageCacheRequest {
+    /// False turns the cache off and erases its file. True turns it on again with a fresh, empty
+    /// file, and only where the server's configuration enables it.
+    pub enabled: bool,
+}
+
 /// The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.
 ///
 /// Also the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the
@@ -950,6 +999,10 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<VoicePromptSettings>(),
         // `#303 voice-post-prefix`. Appended, for the same reason.
         generator.subschema_for::<VoicePostPrefix>(),
+        // `#208 persistent-cache`: the owner's switch and what it answers. Appended, for the same
+        // reason.
+        generator.subschema_for::<MessageCacheStatus>(),
+        generator.subschema_for::<MessageCacheRequest>(),
     ]
 }
 

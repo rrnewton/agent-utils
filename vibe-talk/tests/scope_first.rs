@@ -232,6 +232,14 @@ fn inventory() -> Vec<Route> {
         ),
         route("GET", "/api/v1/transcript", Write, limit),
         route("DELETE", "/api/v1/storage", Write, Nothing),
+        // `#208 persistent-cache`: the owner's switch for the message cache, write scope both ways.
+        route(
+            "PUT",
+            "/api/v1/message-cache",
+            Write,
+            Json(r#"{"enabled":false}"#),
+        ),
+        route("DELETE", "/api/v1/message-cache", Write, Nothing),
         route("GET", "/api/v1/inbox", Read, Nothing),
         route(
             "POST",

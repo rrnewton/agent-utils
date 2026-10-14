@@ -1551,3 +1551,98 @@ async fn a_read_says_why_it_was_made_and_a_reason_the_page_does_not_send_is_othe
         hourly[0]
     );
 }
+
+#[tokio::test]
+async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held() {
+    // `#208 persistent-cache`. Opening the cache, turning it off and on, and erasing it are each
+    // logged at INFO — and none of those lines may carry a channel id, a message id or a word of
+    // what the file held.
+    use vibe_talk::cache::{ChanKey, Incoming, Observation, Scope};
+    use vibe_talk::model::{Message, MessageId, UserId};
+    let scratch = vibe_talk::testing::TempDir::new("logging-cache-switch");
+    let store = scratch.path().join("state").join("store.sqlite3");
+    vibe_talk::cache::file::ensure_private_dir(store.parent().expect("a directory"))
+        .expect("a private store directory");
+    let text = format!(
+        "{}\n[storage]\npath = \"{}\"\n\n[message_cache]\nenabled = true\nmax_days = 14\n",
+        vibe_talk::testing::config_toml(),
+        store.display()
+    );
+    let capture = LogCapture::info_only();
+    let (state, discord, _store) = vibe_talk::testing::state_with_store_from_toml(&text);
+    // 2026-10-01T00:00:00Z, and the cache's clock an hour later.
+    let written = 1_790_812_800_000;
+    let clock = vibe_talk::testing::ManualClock::at(written + 3_600_000);
+    vibe_talk::cache::lifecycle::start_with(&state.config, &state.message_cache, clock).await;
+    state.message_cache.arm();
+    state.refresh_routes();
+    assert!(
+        state
+            .message_cache
+            .identities_verified(std::time::Duration::from_secs(20))
+            .await
+    );
+    let cache = state.message_cache.cache().expect("open");
+    let id = MessageId::at_time_ms(written);
+    let held = Message {
+        edited_timestamp: None,
+        mentions: Vec::new(),
+        thread: None,
+        id: id.clone(),
+        channel_id: ChannelId(READ_CHANNEL.to_owned()),
+        author: "Ada".to_owned(),
+        author_id: UserId("7".to_owned()),
+        author_is_bot: false,
+        timestamp: vibe_talk::clock::iso_from_ms(written),
+        spoken_time: String::new(),
+        reply_to: None,
+        content: "CACHED-WORDS-THAT-MUST-NOT-REACH-THE-LOG".to_owned(),
+        spoken_content: String::new(),
+        content_html: String::new(),
+        noise: false,
+        reactions: None,
+        heading: None,
+    };
+    let chan = ChanKey::new(vibe_talk::config::LEGACY_DISCORD_PROVIDER_KEY, READ_CHANNEL);
+    cache.offer(
+        chan.clone(),
+        cache.stamp(&chan),
+        Observation::Rows {
+            rows: vec![Incoming::new(held, Scope::Main)],
+            scope: None,
+            observed_ms: written + 3_600_000,
+        },
+    );
+    assert!(cache.quiesce_blocking(std::time::Duration::from_secs(20)));
+    drop(cache);
+    let harness = Harness {
+        router: router(state.clone()),
+        discord,
+    };
+    for (method, body) in [
+        ("DELETE", None),
+        ("PUT", Some(json!({ "enabled": false }))),
+        ("PUT", Some(json!({ "enabled": true }))),
+    ] {
+        let (status, answer) = json_call(&harness, method, "/api/v1/message-cache", body).await;
+        assert_eq!(status, StatusCode::OK, "{method}: {answer}");
+    }
+    let text = capture.text();
+    assert!(
+        text.contains("the message cache is open")
+            && text.contains("erased the message cache")
+            && text.contains("turned the message cache off")
+            && text.contains("turned the message cache on"),
+        "the switches were not logged, so the absences below prove nothing: {text}"
+    );
+    for secret in [
+        READ_CHANNEL,
+        id.as_str(),
+        "CACHED-WORDS-THAT-MUST-NOT-REACH-THE-LOG",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "{secret} reached the INFO log: {text}"
+        );
+    }
+}

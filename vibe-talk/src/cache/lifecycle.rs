@@ -15,6 +15,24 @@
 //! A cache that cannot be opened leaves the server running without one, and says why in a code
 //! with no path in it.
 //!
+//! # The owner's switch
+//!
+//! While the server runs, the owner may turn the cache off, turn it on again, or erase it and keep
+//! it on (`PUT` and `DELETE /api/v1/message-cache`, write scope, no MCP tool):
+//!
+//! - **off** writes the marker FIRST and erases second ([`marker::switch_off`]): a marker that
+//!   cannot be written erases nothing and is reported as a failure, and a crash after it erases at
+//!   the next start. Every other file the registry names goes too, and the cache leaves the sink;
+//! - **on** is refused while the configuration does not enable the cache — the operator's word
+//!   wins — and otherwise clears the marker and opens a fresh file, whose providers' accounts are
+//!   checked again before anything is filled ([`Sink::install`]);
+//! - **erase** erases the open file and opens a fresh one in its place, and the accounts are
+//!   checked again. With no cache open it erases nothing.
+//!
+//! One switch runs at a time. Each answers the [`MessageCacheStatus`] it left, which is also what
+//! client-config carries: measured on the blocking pool, and kept for [`STATUS_FRESH_FOR`] in
+//! between, since counting the file's rows costs a scan.
+//!
 //! Everything here that touches a file or SQLite runs on tokio's blocking pool, never on a
 //! runtime worker: an open checks and may rebuild the file, and an erase waits for the writer and
 //! for reads in flight.
@@ -22,11 +40,33 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use super::marker::{self, StartupAction};
 use super::sink::Sink;
-use super::{CacheError, CacheOptions, Clock, Limits, MessageCache, SearchTextSource, SystemClock};
+use super::{
+    CacheError, CacheOptions, Clock, Counts, Limits, MessageCache, SearchTextSource, SystemClock,
+};
 use crate::config::{Config, MessageCacheConfig};
+use crate::contract::MessageCacheStatus;
+
+/// How long a measured status is answered again before the file is measured afresh. A switch
+/// measures afresh at once.
+pub const STATUS_FRESH_FOR: Duration = Duration::from_secs(30);
+
+/// Why a switch of the cache was refused, or failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SwitchError {
+    /// The configuration has no `[message_cache]` table: there is no cache to switch.
+    #[error("this server's configuration has no [message_cache] table, so there is no message cache to switch")]
+    NotConfigured,
+    /// Turning it on, while the configuration turns it off.
+    #[error("the server's configuration turns the message cache off ([message_cache] enabled = false); only the operator can turn it on")]
+    NotEnabled,
+    /// The marker beside the store could not be written: nothing was erased, and nothing changed.
+    #[error("the message cache's switch could not be saved beside the store; nothing was erased and nothing changed")]
+    Unsaved,
+}
 
 /// Why a cache the configuration enables is not open. A code, never a sentence with a path in it:
 /// it is shown to the owner, and logged.
@@ -122,6 +162,18 @@ pub struct Lifecycle {
     /// Why no cache is open although the configuration enables one and the owner has not turned
     /// it off.
     trouble: Mutex<Option<Trouble>>,
+    /// Held across each switch, an erase and the purge's erase: one at a time.
+    serial: tokio::sync::Mutex<()>,
+    /// The last status measured, and when.
+    memo: Mutex<Memo>,
+}
+
+/// The last status measured. `round` moves whenever what it says may have changed, so a
+/// measurement that started before a switch is answered once but never kept.
+#[derive(Debug, Default)]
+struct Memo {
+    round: u64,
+    kept: Option<(tokio::time::Instant, MessageCacheStatus)>,
 }
 
 impl std::fmt::Debug for Lifecycle {
@@ -155,6 +207,233 @@ impl Lifecycle {
 
     fn set_trouble(&self, trouble: Option<Trouble>) {
         *self.trouble.lock().unwrap_or_else(PoisonError::into_inner) = trouble;
+    }
+
+    fn memo(&self) -> std::sync::MutexGuard<'_, Memo> {
+        self.memo.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cache as Settings shows it, or `None` when the configuration has no table. Measured at
+    /// most once per [`STATUS_FRESH_FOR`], on the blocking pool.
+    pub async fn status(&self, sink: &Sink) -> Option<MessageCacheStatus> {
+        let table = self.table.as_ref()?;
+        Some(self.status_of(sink, table).await)
+    }
+
+    async fn status_of(&self, sink: &Sink, table: &MessageCacheConfig) -> MessageCacheStatus {
+        let round = {
+            let memo = self.memo();
+            if let Some((at, status)) = &memo.kept {
+                if at.elapsed() < STATUS_FRESH_FOR {
+                    return status.clone();
+                }
+            }
+            memo.round
+        };
+        let open = sink.cache().filter(|cache| cache.is_open());
+        let available = open.is_some();
+        let (bytes, counts, oldest) = match open {
+            Some(cache) => tokio::task::spawn_blocking(move || {
+                (
+                    cache.bytes_on_disk(),
+                    cache.counts().served().unwrap_or_default(),
+                    cache.oldest_covered().served().flatten(),
+                )
+            })
+            .await
+            .unwrap_or_default(),
+            None => (0, Counts::default(), None),
+        };
+        let reason = if !table.enabled {
+            Some("config_disabled")
+        } else if self.off.load(Ordering::SeqCst) {
+            Some("switched_off")
+        } else if available {
+            None
+        } else {
+            Some(self.trouble().map_or("not_open", Trouble::as_str))
+        };
+        let status = MessageCacheStatus {
+            available,
+            enabled: self.enabled(),
+            reason,
+            bytes,
+            messages: counts.messages,
+            channels: counts.channels,
+            oldest_covered: oldest.map(crate::clock::iso_from_ms),
+            max_days: table.max_days,
+            max_megabytes: table.max_megabytes,
+        };
+        let mut memo = self.memo();
+        if memo.round == round {
+            memo.kept = Some((tokio::time::Instant::now(), status.clone()));
+        }
+        status
+    }
+
+    /// Measure afresh at the next [`Lifecycle::status`], and keep nothing measured before now.
+    fn forget_status(&self) {
+        let mut memo = self.memo();
+        memo.round += 1;
+        memo.kept = None;
+    }
+
+    /// The status a switch answers, measured afresh now that it is done.
+    async fn switched(&self, sink: &Sink, table: &MessageCacheConfig) -> MessageCacheStatus {
+        self.forget_status();
+        self.status_of(sink, table).await
+    }
+
+    /// The owner's "on". See the module documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`SwitchError::NotConfigured`] without a table, [`SwitchError::NotEnabled`] when the
+    /// configuration turns the cache off, and [`SwitchError::Unsaved`] when the marker could not
+    /// be cleared. A file that then fails to open is not an error: the status says why.
+    pub async fn switch_on(&self, sink: &Sink) -> Result<MessageCacheStatus, SwitchError> {
+        let table = self.table.as_ref().ok_or(SwitchError::NotConfigured)?;
+        let Some(files) = self.files.clone().filter(|_| table.enabled) else {
+            return Err(SwitchError::NotEnabled);
+        };
+        let _serial = self.serial.lock().await;
+        let cleared =
+            tokio::task::spawn_blocking(move || marker::switch_on(&files.sidecar, &files.cache))
+                .await
+                .unwrap_or_else(|_| Err("the write did not finish".to_owned()));
+        if let Err(error) = cleared {
+            tracing::warn!(
+                %error,
+                "the message cache could not be turned on: its switch beside the store cannot be \
+                 saved"
+            );
+            return Err(SwitchError::Unsaved);
+        }
+        let was_off = self.off.swap(false, Ordering::SeqCst);
+        match sink.cache() {
+            Some(cache) if cache.is_open() => {}
+            // Behind the sink but closed: a fresh file failed to open after an erase. Try again.
+            Some(cache) => drop(self.erase_and_reopen(sink, cache).await),
+            None => drop(self.open(sink).await),
+        }
+        if was_off {
+            tracing::info!(
+                opened = sink.cache().is_some_and(|cache| cache.is_open()),
+                "the owner turned the message cache on"
+            );
+        }
+        Ok(self.switched(sink, table).await)
+    }
+
+    /// The owner's "off". See the module documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`SwitchError::NotConfigured`] without a table, and [`SwitchError::Unsaved`] when the
+    /// marker could not be written, in which case nothing was erased.
+    pub async fn switch_off(&self, sink: &Sink) -> Result<MessageCacheStatus, SwitchError> {
+        let table = self.table.as_ref().ok_or(SwitchError::NotConfigured)?;
+        let _serial = self.serial.lock().await;
+        // With no store nothing can be open, and there is nowhere to keep a marker.
+        if let Some(files) = self.files.clone() {
+            let now_ms = self.clock.now_ms();
+            let cache = sink.cache();
+            let erased = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+                // Read first: a registry that cannot be read is a marker that cannot be written.
+                let registry = marker::load(&files.sidecar)?;
+                let held = cache.as_ref().map(|cache| cache.path().to_owned());
+                let mut bytes = match &cache {
+                    Some(cache) => {
+                        marker::switch_off(cache, &files.sidecar, now_ms)
+                            .map_err(|error| error.to_string())?
+                            .bytes
+                    }
+                    None => marker::mark_off(&files.sidecar, now_ms).map(|_| 0)?,
+                };
+                // The marker is written: from here on nothing is reported as a failure.
+                bytes += marker::erase_registered_except(
+                    &registry,
+                    files.default_dir.as_deref(),
+                    held.as_deref(),
+                );
+                Ok(bytes)
+            })
+            .await
+            .unwrap_or_else(|_| Err("the erase did not finish".to_owned()));
+            match erased {
+                Ok(bytes) => {
+                    drop(sink.uninstall());
+                    self.off.store(true, Ordering::SeqCst);
+                    self.set_trouble(None);
+                    tracing::info!(
+                        bytes,
+                        "the owner turned the message cache off; every message cache file this \
+                         server made has been erased"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "the message cache could not be turned off: its switch beside the store \
+                         cannot be saved, so nothing was erased"
+                    );
+                    return Err(SwitchError::Unsaved);
+                }
+            }
+        }
+        Ok(self.switched(sink, table).await)
+    }
+
+    /// The owner's "erase now": erase the open file and open a fresh one. See the module
+    /// documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`SwitchError::NotConfigured`] without a table.
+    pub async fn erase_now(&self, sink: &Sink) -> Result<MessageCacheStatus, SwitchError> {
+        let table = self.table.as_ref().ok_or(SwitchError::NotConfigured)?;
+        let _serial = self.serial.lock().await;
+        if let Some(cache) = sink.cache() {
+            if let Some(bytes) = self.erase_and_reopen(sink, cache).await {
+                tracing::info!(
+                    bytes,
+                    "the owner erased the message cache; a fresh, empty file is open"
+                );
+            }
+        }
+        Ok(self.switched(sink, table).await)
+    }
+
+    /// Erase the cache behind the sink and open a fresh file in its place, then check every
+    /// provider's account against it again. The bytes erased, or `None` when the fresh file could
+    /// not be opened: the old one is erased all the same, the server runs without a cache, and
+    /// [`Lifecycle::trouble`] says why.
+    async fn erase_and_reopen(&self, sink: &Sink, cache: Arc<MessageCache>) -> Option<u64> {
+        let erased = tokio::task::spawn_blocking(move || cache.erase_file(true))
+            .await
+            .unwrap_or_else(|_| {
+                Err(CacheError::Filesystem(
+                    "the erase did not finish".to_owned(),
+                ))
+            });
+        match erased {
+            Ok(report) => {
+                self.set_trouble(None);
+                sink.reverify();
+                Some(report.bytes)
+            }
+            Err(error) => {
+                let trouble = Trouble::of(&error);
+                tracing::warn!(
+                    %error,
+                    reason = trouble.as_str(),
+                    "the message cache was erased and a fresh one cannot be opened; the server \
+                     runs without one"
+                );
+                self.set_trouble(Some(trouble));
+                None
+            }
+        }
     }
 
     /// Register the cache's path, open it, and put it behind `sink`. On failure the server runs
@@ -256,6 +535,8 @@ pub async fn start_with(config: &Config, sink: &Sink, clock: Arc<dyn Clock>) -> 
         clock: Arc::clone(&clock),
         off: AtomicBool::new(false),
         trouble: Mutex::new(None),
+        serial: tokio::sync::Mutex::new(()),
+        memo: Mutex::new(Memo::default()),
     });
     sink.attach_lifecycle(Arc::clone(&lifecycle));
     let Some(files) = files else {
