@@ -601,8 +601,8 @@ a.search-hit-link {
      exact behaviour this whole file removes. */
   min-height: 0;
   display: grid;
-  /* The third row is the send card's when it is docked under a screen other than the main one
-     (`#269 approval-card-inline`); empty, it takes no room. */
+  /* The third row is the send card's when it is docked under a screen other than the main one, or
+     under the thread list (`#269 approval-card-inline`, `#281 view-keys`); empty, it takes no room. */
   grid-template-rows: auto 1fr auto;
   padding: 0;
 }
@@ -5769,9 +5769,11 @@ a.search-hit-link {
   border: 1px solid var(--accent);
 }
 
-/* Docked at the foot of Reply, Threads, Settings or Help: its own row of the body, under the screen,
-   so the screen above it still scrolls and nothing is covered. Never a scroll box of its own: only
-   its words scroll (above), so its buttons are always laid out on screen.
+/* Docked at the foot of Reply, the thread list, Settings or Help: its own row of the body, under the
+   screen, so the screen above it still scrolls and nothing is covered. Never a scroll box of its own:
+   only its words scroll (above), so its buttons are always laid out on screen. The thread list
+   (`#281 view-keys`) docks it because it has no box of its own to stand on, as the Threads screen it
+   replaced did not, and the left column's box is behind it, out of sight.
 
    EVERY inset, the bottom one included. Off the main screen the control pane, which carries the
    bottom inset everywhere else, is hidden, and this card is the last thing on the screen: on a phone
@@ -5784,6 +5786,18 @@ a.search-hit-link {
   border-radius: 0.5rem 0.5rem 0 0;
   padding: 0.6rem calc(0.75rem + env(safe-area-inset-right)) calc(0.6rem + env(safe-area-inset-bottom))
     calc(0.75rem + env(safe-area-inset-left));
+}
+
+/* Under the thread list, the main screen's: the control bar is under the card and carries the bottom
+   inset, so the card does not carry it again. And it is as wide as the reading column the cards and
+   the dock stand in, which is the whole of a phone: at a desk, across the window, its Send was a bar a
+   metre long under a column of cards a third as wide. */
+#frame-body > #post-confirm[data-screen="main"] {
+  justify-self: center;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--reading-width);
+  padding-bottom: 0.6rem;
 }
 
 /* Docked under Reply, whose own filled "Send reply" is the screen's purpose and goes to the same

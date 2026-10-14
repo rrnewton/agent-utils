@@ -49,10 +49,22 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      Send takes it away and, a second later, the box takes back its room; a reader up the list keeps
      the first row on screen, within a pixel, through the same three, and the jump says "Draft to
      send".
+ 11. The thread list (`#281 view-keys`), whose cards have no box to stand on and cover the left
+     column: Cmd+3 (Ctrl+3 at the desk) with the keys on the card's own Send shows the list, its cards
+     at their foot, and docks the card under them, over the control bar, whole on screen, the newest
+     thread's card above it, Send at a thumb's reach on the phone and the card as wide as the column
+     of cards at the desk; nothing moves for a second after. Cmd+4 on Don't send keeps the list on the phone, saying two columns need a wider window,
+     and at the desk shows two columns, the card back at the foot of Main and on screen, the cards
+     still at their foot; Ctrl+3 docks it again. Not one key posts or withdraws the draft. More opens
+     the docked draft upward with the cards still at their foot. A draft arriving keeps a reader at
+     the foot of the cards there, and Main behind them on its newest line, the status pill standing
+     on the card, and a reader up the cards on the very card, within a pixel; and Cmd+1 brings it
+     back on screen at the foot of Main.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
-9 and 10 once; the docked card alone at 667x375 and 375x330; and point 8 at 1280x800 with a mouse.
+9 and 10 once; the docked card alone at 667x375 and 375x330; point 11 at 393x852; and points 8 and
+11 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -106,6 +118,17 @@ def channel_message(n: int, author: str, content: str) -> Json:
             "content": content}
 
 
+def older_thread(n: int) -> Json:
+    """Point 11: an older thread, started earlier in the day by a message Main's page does not hold."""
+    thread_id = f"11100000000000004{n:02d}"
+    root = {**channel_message(n, "codex", f"older thread {n}: the cache keys are versioned and green"),
+            "id": f"11100000000000005{n:02d}", "timestamp": f"2026-10-13T09:{n:02d}:00Z"}
+    root["thread"] = {"id": thread_id, "root_message_id": root["id"], "is_root": True, "reply_count": 1,
+                      "reply_count_exact": True}
+    return {"id": thread_id, "root": root, "title": f"older thread {n}", "reply_count": 1,
+            "reply_count_exact": True, "updated_at": f"2026-10-13T10:{n:02d}:00Z"}
+
+
 @dataclass
 class FakeApi:
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -123,6 +146,8 @@ class FakeApi:
     log: list[str] = field(default_factory=list)
     # Point 8: a channel with a thread, which is what offers two columns on a desk.
     threaded: bool = False
+    # Point 11: that many older threads besides it, so that the thread list runs past the screen.
+    older_threads: int = 0
     # Point 9: the hosted protocol, with resuming on, so a new call is sent a recap.
     hosted: bool = False
     replay: bool = False
@@ -173,6 +198,10 @@ class FakeApi:
                 else [] if view == "threads"
                 else messages)
         threads = [thread] if view == "threads" else []
+        if view == "threads":
+            # Point 11: older threads, each started by a message from earlier in the day, oldest first.
+            threads = [older_thread(n) for n in range(1, self.older_threads + 1)]
+            threads.append(thread)
         return {"channel": CHANNEL, "messages": rows, "threads": threads,
                 "thread": thread if view == "thread" else None, "has_threads": True, "has_more": False,
                 "next_before": None, "notice": None, "dismissed": [], "view": view, "limit": 50,
@@ -1102,12 +1131,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             dock_case(page, url, voice, api, size, args.screenshots)
             frozen_case(page, url, voice, api, size, args.screenshots)
             recap_case(page, url, hosted, api, size, args.screenshots)
+            listed = ""
+            if size == PHONES[0]:
+                listed = "; " + thread_list_case(page, url, voice, api, size, True, args.screenshots)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
     return (f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run; on the channel"
             " the card coming and going left a reader up the list on their row and one at the foot there;"
-            " the next call's line says '412-word recap sent'")
+            f" the next call's line says '412-word recap sent'{listed}")
 
 
 def walk_short(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
@@ -1289,8 +1321,210 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
     return f"{where}: the card above a reply open in the left column, its Send outlined beside either"
 
 
+# Point 11, read in one go: the card, the thread list's column and cards, the dock and what floats.
+THREAD_LIST_JS = """() => {
+  const box = (id) => { const n = document.getElementById(id); if (!n || n.hidden) return null;
+    const s = getComputedStyle(n); const r = n.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0 ? r : null; };
+  const card = document.getElementById('post-confirm');
+  const side = document.getElementById('side-scroll');
+  const main = document.getElementById('scroll-area');
+  const top = side.getBoundingClientRect().top;
+  const rows = [...document.querySelectorAll('#side-cards > li[data-id]')].filter((row) => row.getClientRects().length);
+  const firstRow = rows.find((row) => row.getBoundingClientRect().bottom > top);
+  const last = rows.length ? rows[rows.length - 1] : null;
+  return {
+    innerHeight: window.innerHeight, innerWidth: window.innerWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+    layout: document.getElementById('screen-main').getAttribute('data-columns'),
+    parent: card.parentElement ? card.parentElement.id : '',
+    next: card.nextElementSibling ? card.nextElementSibling.id : '',
+    place: card.getAttribute('data-place'), screen: card.getAttribute('data-screen'),
+    card: box('post-confirm'), send: box('post-confirm-send'), cancel: box('post-confirm-cancel'),
+    where: box('post-confirm-where'), side: box('side-scroll'), dock: box('dock'),
+    pill: box('status-line'), jump: box('jump-newest'),
+    sideGap: side.scrollHeight - side.scrollTop - side.clientHeight,
+    sideRuns: side.scrollHeight - side.clientHeight,
+    mainGap: main.scrollHeight - main.scrollTop - main.clientHeight,
+    lastCard: last ? last.getBoundingClientRect() : null,
+    first: firstRow ? { id: firstRow.getAttribute('data-id'), offset: firstRow.getBoundingClientRect().top - top } : null,
+    status: document.getElementById('status').textContent,
+  };
+}"""
+
+
+def thread_list_measure(page: Page) -> dict[str, object]:
+    measured = page.evaluate(THREAD_LIST_JS)
+    check(isinstance(measured, dict), "the page measured nothing over the thread list")
+    assert isinstance(measured, dict)
+    return {str(key): value for key, value in measured.items()}
+
+
+def view_key(page: Page, mod: str, digit: int, focus: str | None, layout: str | None) -> None:
+    """A view key (`#281 view-keys`), pressed with the focus on `focus`, then the layout `layout` (none
+    for one column) waited for, and a moment for anything that would move after it."""
+    if focus:
+        page.focus(focus)
+    page.keyboard.press(f"{mod}+{digit}")
+    want = "null" if layout is None else f"'{layout}'"
+    page.wait_for_function(f"() => document.getElementById('screen-main').getAttribute('data-columns') === {want}",
+                           timeout=10_000)
+    page.wait_for_timeout(400)
+
+
+def docked_under_list(m: dict[str, object], where: str, phone: bool) -> None:
+    """The card docked under the thread list: on screen whole, under the cards and over the control bar,
+    the newest thread's card above it with the list at its foot, and Send within a thumb's reach."""
+    inner_height = float(str(m["innerHeight"]))
+    inner_width = float(str(m["innerWidth"]))
+    check(m["layout"] == "list", f"{where}: the thread list is not up ({m['layout']})")
+    check(m["parent"] == "frame-body" and m["place"] == "dock" and m["screen"] == "main",
+          f"{where}: the card is not docked under the thread list: #{m['parent']}, {m['place']}, {m['screen']}")
+    for part in ("card", "where", "cancel", "send"):
+        check(m[part] is not None and inside(m[part], inner_height, inner_width),
+              f"{where}: the card's {part} is not on screen")
+    check(rect(m["card"], "top") >= rect(m["side"], "bottom") - 0.5,
+          f"{where}: the card at {rect(m['card'], 'top'):.1f} covers the cards' column, which ends at "
+          f"{rect(m['side'], 'bottom'):.1f}")
+    check(rect(m["card"], "bottom") <= rect(m["dock"], "top") + 0.5,
+          f"{where}: the card runs under the control bar ({rect(m['card'], 'bottom'):.1f} > {rect(m['dock'], 'top'):.1f})")
+    check(float(str(m["sideRuns"])) > 100, f"{where}: the cards do not run past the column, so this proves nothing")
+    check(float(str(m["sideGap"])) <= 1, f"{where}: the thread list is {float(str(m['sideGap'])):.0f}px above its foot")
+    check(rect(m["lastCard"], "bottom") <= rect(m["card"], "top") + 0.5,
+          f"{where}: the newest thread's card is under the send card")
+    check(rect(m["send"], "height") >= 43.5, f"{where}: Send is {rect(m['send'], 'height'):.0f}px tall")
+    if phone:
+        centre = (rect(m["send"], "top") + rect(m["send"], "bottom")) / 2 / inner_height
+        check(centre >= REACH, f"{where}: Send's centre is at {centre:.3f} of the screen, above the thumb's {REACH}")
+    else:
+        # As wide as the column of cards it stands under, not the window.
+        mid = (rect(m["card"], "left") + rect(m["card"], "right")) / 2
+        cards_mid = (rect(m["lastCard"], "left") + rect(m["lastCard"], "right")) / 2
+        check(rect(m["card"], "width") <= rect(m["lastCard"], "width") + 1 and abs(mid - cards_mid) <= 2,
+              f"{where}: the card ({rect(m['card'], 'left'):.0f} to {rect(m['card'], 'right'):.0f}) is not the "
+              f"column of cards ({rect(m['lastCard'], 'left'):.0f} to {rect(m['lastCard'], 'right'):.0f})")
+    for floating in ("pill", "jump"):
+        check(not overlaps(m["send"], m[floating]), f"{where}: the {floating} is drawn over the card's Send")
+    check(float(str(m["scrollWidth"])) <= inner_width + 0.5, f"{where}: the page is wider than the window")
+
+
+def thread_list_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int], phone: bool,
+                     screenshots: Path | None) -> str:
+    """Point 11: the card under the thread list, and the view keys pressed while it is up."""
+    width, height = size
+    where = f"{width}x{height}, thread list"
+    mod = "Meta" if phone else "Control"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        propose(page, api, 31, LONG_DRAFT)
+        page.wait_for_timeout(HOLD_MS + 200)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+
+        # Cmd-3 (Ctrl+3 at the desk) with the keys on the card's own Send: the thread list, its cards at
+        # their foot, the card docked under them; nothing posted, nothing withdrawn.
+        view_key(page, mod, 3, "#post-confirm-send", "list")
+        page.wait_for_function("() => document.querySelectorAll('#side-cards > li[data-id]').length > 10",
+                               timeout=10_000)
+        page.wait_for_timeout(400)
+        docked = thread_list_measure(page)
+        docked_under_list(docked, f"{where}, {mod}+3 on the card's Send", phone)
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: {mod}+3 on the card posted or withdrew it ({api.commits}, {api.cancels})")
+        page.wait_for_timeout(1000)
+        later = thread_list_measure(page)
+        check(float(str(later["sideGap"])) <= 1 and later["first"] == docked["first"],
+              f"{where}: the thread list moved after {mod}+3: {docked['first']} to {later['first']}")
+        if screenshots:
+            page.screenshot(path=str(screenshots / f"card-thread-list-{width}x{height}.png"), animations="disabled")
+        # More opens the long draft upward, and the cards stay at their foot above it; Less folds it again.
+        page.click("#post-confirm-more")
+        page.wait_for_timeout(400)
+        opened = thread_list_measure(page)
+        check(rect(opened["card"], "height") > rect(docked["card"], "height") + 20,
+              f"{where}: More did not open the docked draft")
+        docked_under_list(opened, f"{where}, after More", phone)
+        page.click("#post-confirm-more")
+        page.wait_for_timeout(400)
+        docked_under_list(thread_list_measure(page), f"{where}, after Less", phone)
+
+        # Cmd-4 with the keys on Don't send.
+        if phone:
+            view_key(page, mod, 4, "#post-confirm-cancel", "list")
+            narrow = thread_list_measure(page)
+            check("wider window" in str(narrow["status"]), f"{where}: {mod}+4 on a phone said {narrow['status']!r}")
+            docked_under_list(narrow, f"{where}, {mod}+4 on a phone", phone)
+        else:
+            view_key(page, mod, 4, "#post-confirm-cancel", "two")
+            two = thread_list_measure(page)
+            inner_height = float(str(two["innerHeight"]))
+            inner_width = float(str(two["innerWidth"]))
+            check(two["parent"] == "pane-discord" and two["next"] == "channel-composer",
+                  f"{where}: {mod}+4 did not put the card back at the foot of Main: #{two['parent']}")
+            check(float(str(two["mainGap"])) <= 1, f"{where}: Main is {float(str(two['mainGap'])):.0f}px above the card")
+            for part in ("card", "send"):
+                check(two[part] is not None and inside(two[part], inner_height, inner_width),
+                      f"{where}: after {mod}+4 the card's {part} is not on screen")
+            check(rect(two["send"], "right") <= rect(two["side"], "left") + 0.5,
+                  f"{where}: after {mod}+4 the card crosses into the right column")
+            check(float(str(two["sideGap"])) <= 1, f"{where}: {mod}+4 took the cards off their foot")
+            view_key(page, mod, 3, "#post-confirm-send", "list")
+            docked_under_list(thread_list_measure(page), f"{where}, {mod}+3 from two columns", phone)
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: {mod}+4 posted or withdrew the draft ({api.commits}, {api.cancels})")
+
+        # A draft arriving under the list, the reader at the foot of the cards and Main behind them on its
+        # newest line: both stay at their foot, and the status pill stands on the card. Then a reader up
+        # the cards keeps the very card through another.
+        api.settle()
+        page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+        page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+        page.wait_for_timeout(300)
+        propose(page, api, 32, LONG_DRAFT)
+        page.wait_for_timeout(400)
+        arrived = thread_list_measure(page)
+        docked_under_list(arrived, f"{where}, a draft arriving at the foot of the cards", phone)
+        check(float(str(arrived["mainGap"])) <= 1,
+              f"{where}: a draft arriving left Main behind the list {float(str(arrived['mainGap'])):.0f}px above its foot")
+        check(arrived["pill"] is not None and rect(arrived["pill"], "bottom") <= rect(arrived["card"], "top") + 0.5,
+              f"{where}: the status pill does not stand on the docked card")
+        api.settle()
+        page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+        page.evaluate("() => { const s = document.getElementById('side-scroll'); s.scrollTop = s.scrollHeight - s.clientHeight - 160; }")
+        page.wait_for_timeout(300)
+        before = thread_list_measure(page)["first"]
+        check(isinstance(before, dict), f"{where}: no card on screen up the list")
+        propose(page, api, 33, SHORT_DRAFT)
+        page.wait_for_timeout(400)
+        up = thread_list_measure(page)
+        now = up["first"]
+        check(isinstance(now, dict) and isinstance(before, dict) and now["id"] == before["id"] and
+              abs(rect(now, "offset") - rect(before, "offset")) <= 1,
+              f"{where}: a draft arriving moved the card a reader up the list was on from {before} to {now}")
+
+        # Cmd-1 with Main at its newest behind the list: the card at its foot, on screen.
+        page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+        page.wait_for_timeout(200)
+        view_key(page, mod, 1, "#post-confirm-send", None)
+        main = thread_list_measure(page)
+        check(main["parent"] == "pane-discord" and float(str(main["mainGap"])) <= 1 and main["send"] is not None and
+              inside(main["send"], float(str(main["innerHeight"])), float(str(main["innerWidth"]))),
+              f"{where}: {mod}+1 did not bring the card back on screen at the foot of Main: {main['parent']}, "
+              f"{main['mainGap']}")
+        check(not api.commits and not api.cancels, f"{where}: a view key posted or withdrew the draft")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: {mod}+3 and {mod}+4 on the card's buttons posted nothing; docked under the cards, at their"
+            " foot, Send on screen; a reader at the foot or up the cards kept as a draft arrived")
+
+
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Point 8 on a desk with a mouse, where two columns are offered."""
+    """Points 8 and 11 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -1304,6 +1538,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             line = columns_case(page, url, voice, api, args.screenshots)
+            line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
