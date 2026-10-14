@@ -607,9 +607,11 @@ this at boot, rendering absolute paths for this executable (`--agentctl`), Herdr
 login shell, `KillMode=process` so a server restart keeps agents running),
 `agent-restore.service` (a oneshot after the server that runs `restore --boot`),
 `agent-watch.service`, and, with `--bridge-unit UNIT`, a drop-in that orders the
-bridge after the server with a start limit that survives a slow boot (one try
-every 10 seconds for up to 15 minutes), named `zz-agentctl-after-herdr.conf` so it
-sorts after numbered drop-ins that set their own start limits. It refuses to replace a file that
+bridge after the server (`After=`, `Wants=`) and restarts it on failure every 10
+seconds, named `zz-agentctl-after-herdr.conf` so it sorts after numbered drop-ins.
+It sets no start limit: a low burst in the bridge's own policy keeps a
+crash-looping bridge from re-sending replies, and ordering after the server is
+what fixes the boot race. It refuses to replace a file that
 differs unless `--force`, supports `--dry-run`, and never enables, starts, or
 reloads anything; its output lists the `systemctl --user` commands to run after
 review. Keep `resume_agents_on_restore = false` in Herdr's configuration: Herdr

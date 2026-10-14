@@ -86,8 +86,8 @@ pub fn rendered(options: &InstallOptions) -> Result<Vec<(PathBuf, String)>> {
                 "--bridge-unit must be a .service unit name: {unit}"
             )));
         }
-        // Drop-ins apply in file-name order and a later StartLimit*= wins, so the name sorts
-        // after the usual numbered drop-ins.
+        // Drop-ins apply in file-name order, so the name sorts after the usual numbered ones; the
+        // drop-in sets no start limit, which stays with the bridge's own policy.
         files.push((
             PathBuf::from(format!("{unit}.d")).join("zz-agentctl-after-herdr.conf"),
             BRIDGE_AFTER_HERDR.to_owned(),
@@ -225,7 +225,13 @@ mod tests {
         assert!(files[1].1.contains("After=herdr-server.service"));
         assert!(files[2].1.contains("watch\n"));
         assert!(!files[2].1.contains("After=herdr-server.service"));
-        assert!(files[3].1.contains("StartLimitBurst=90"));
+        assert!(files[3].1.contains("After=herdr-server.service"));
+        assert!(files[3].1.contains("Restart=on-failure"));
+        // A crash-looping bridge must not get a higher start burst than its own policy allows.
+        assert!(!files[3]
+            .1
+            .lines()
+            .any(|line| line.starts_with("StartLimit")));
     }
 
     #[test]
