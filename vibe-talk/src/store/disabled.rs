@@ -43,7 +43,7 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
-    async fn append_turn(&self, _: &ConversationId, _: &Turn) -> Result<(), StoreError> {
+    async fn append_turn(&self, _: &ConversationId, _: &Turn) -> Result<i64, StoreError> {
         refuse()
     }
 
