@@ -122,6 +122,10 @@ pub struct AppState {
     /// see [`crate::post_lanes`]. Every post goes through [`crate::ops::reply_scoped`], which takes
     /// its destination's turn here.
     pub post_lanes: Arc<crate::post_lanes::PostLanes>,
+    /// Per channel, the newest message whose provider read marker this server has moved through,
+    /// so that a reply to it, or to anything before it, does not ask the provider again. `#300
+    /// reply-marks-read`; see [`crate::reply_read`]. In memory, ids only.
+    pub reply_reads: Arc<crate::reply_read::ReplyReads>,
     /// Caps the lines `POST /api/v1/voice-health` writes, across every caller. Per process rather
     /// than per call because the server has no call id to count by, by design.
     pub voice_health_budget: Arc<crate::voice_health::LogBudget>,

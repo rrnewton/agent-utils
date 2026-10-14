@@ -2014,8 +2014,13 @@ pub async fn commit_proposal(
     )
     .await
     {
-        Ok((_channel, posted, parts)) => {
+        Ok((channel, posted, parts)) => {
             log_gate_step("committed", &proposal, None, Some(confirmed_by));
+            // `#300 reply-marks-read`. Posted whole, so what it answers is read, as the Reply
+            // button's send marks it. Not on a partial post or a failure, below.
+            if let Some(target) = binding.reply_to.as_deref() {
+                crate::reply_read::after_voice_send(state, &channel, target).await;
+            }
             Ok((proposal.serial, posted, parts))
         }
         Err(error) => {

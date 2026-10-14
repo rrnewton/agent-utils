@@ -3088,6 +3088,21 @@ pub struct MarkReadResponse {
     pub read_state_notice: &'static str,
 }
 
+/// How far to move the source provider's read cursor, and why.
+#[derive(Debug, Deserialize)]
+pub struct UpstreamReadRequest {
+    /// The message to move it through.
+    pub message_id: String,
+    /// Selected thread, when the message came from a thread timeline: checked to hold it.
+    pub thread_id: Option<String>,
+    /// The page asks because a reply it sent answered this message, not because the owner pressed
+    /// **Mark read in**. `#300 reply-marks-read`: such a mark is not asked of the provider again for
+    /// a message this server has marked through already, nor for one before it. See
+    /// [`crate::reply_read`].
+    #[serde(default)]
+    pub after_reply: bool,
+}
+
 /// The result of moving the source provider's read cursor.
 #[derive(Debug, Serialize)]
 pub struct UpstreamReadResponse {
@@ -3097,6 +3112,10 @@ pub struct UpstreamReadResponse {
     pub through: MessageId,
     /// The contract common to every provider implementation.
     pub upstream_read_notice: &'static str,
+    /// For a mark asked `after_reply`, what it came to: `marked`, or `already_marked` and `behind`
+    /// when this server had marked that message, or a later one, already and asked nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<crate::reply_read::UpstreamMark>,
 }
 
 /// What a successful source-provider read mark means.
@@ -3107,7 +3126,7 @@ pub async fn mark_read_upstream(
     State(state): State<AppState>,
     _scope: WriteScope,
     Path(channel_id): Path<String>,
-    Json(request): Json<MarkReadRequest>,
+    Json(request): Json<UpstreamReadRequest>,
 ) -> Result<Response, ApiError> {
     let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
     let through = MessageId(request.message_id);
@@ -3115,11 +3134,30 @@ pub async fn mark_read_upstream(
         ops::message_by_id_scoped(&state, &channel_id, through.as_str(), None, Some(thread_id))
             .await?;
     }
-    state.chat.mark_read_upstream(&channel.id, &through).await?;
+    let outcome = if request.after_reply {
+        // Refused exactly as the provider refuses the owner's own mark, so the route has one answer
+        // for a provider that cannot move its marker, whoever asks.
+        let marked = crate::reply_read::mark_upstream(&state, &channel.id, &through).await?;
+        if marked == crate::reply_read::UpstreamMark::Unsupported {
+            return Err(OpError::Chat(crate::chat::ChatError::Refused(
+                "the configured chat provider does not support upstream read marks".to_owned(),
+            ))
+            .into());
+        }
+        Some(marked)
+    } else {
+        // The owner's own mark always asks: it can name any message, and the provider's check,
+        // read fresh, is what keeps it forward. What it moved is noted, so that a reply to it
+        // later, or to anything before it, does not ask again.
+        state.chat.mark_read_upstream(&channel.id, &through).await?;
+        state.reply_reads.note_marked(&channel.id, &through).await;
+        None
+    };
     Ok(no_store(Json(UpstreamReadResponse {
         channel,
         through,
         upstream_read_notice: UPSTREAM_READ_NOTICE,
+        outcome,
     })))
 }
 
