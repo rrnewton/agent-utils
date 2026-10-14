@@ -535,6 +535,477 @@ function refusalSentence(error) {
     : "that token was refused — paste the write-scope token";
 }
 
+// --- the phone's back gesture, and the browser's Back -----------------------------------------
+//
+// `#304 back-gesture-in-app`. The owner, 2026-10-14: on the installed Android app the system back
+// gesture inside a thread left the app for the home screen; only the on-screen Back closed the
+// thread. The page had never made a history entry of its own, so the browser's Back — which is what
+// the gesture is — had nothing of the page's to go back through, and went back out of it.
+//
+// WHAT OPENS OVER THE CHANNEL, and how each closed before this:
+//
+//   * a thread in one column, from its Thread(N), a reply count or the picker: ← Back, a swipe
+//     right, Esc and ←; a thread opened from the thread list goes back to the list the same ways;
+//   * the thread list (the picker's "Thread list", Ctrl/Cmd+3): Esc, to the view it was chosen from,
+//     or the picker and the view keys;
+//   * the right column's thread, in two columns: its X, and Esc or ← in that column;
+//   * the reply screen: its Back, Cancel, Esc in an empty box, and Send; a reply open at the foot of a
+//     column, in two columns: Cancel, Esc in an empty box, and Send;
+//   * Settings and Help: their Back, Esc and ",";
+//   * the ⋯ menu of a message, the reading-pace popover and the prompts tray: Esc, a tap outside the
+//     ⋯ menu, and the buttons that open the other two.
+//
+// Not screens, and given no entry: the call's view and the channel's, one switch with two positions;
+// Main, All and two columns, which are views (`#281 view-keys`); the search, a filter over the list,
+// which Esc closes; a message's details sheet, part of its row; a highlighted card; the agent's
+// proposal to post, which a Back must never answer; and the sign-in screen, the app's own first
+// screen. There is no image viewer or preview overlay: a picture or a link opens in the browser.
+//
+// THE HISTORY MIRRORS WHAT IS OPEN. `backLevels` reads from the page's own state what a Back would
+// close, the first-opened first, and the page keeps one history entry above its own for each: at the
+// page's own URL, so the address never changes and a reload, `/` beside `/voice` (`#302`) and the
+// browser's Back on a desk are all as they were; each tagged with what it stands for, how deep it is,
+// and this page load's own name (`BACK_SESSION`). `syncBackStack` puts the history in step after
+// anything opens or closes: an entry pushed for each thing opened, the top entry replaced where one
+// thing gives way to another at the same depth (another thread, the thread list over a thread), and
+// entries gone back through where things closed by other means. A view switch at the top pushes
+// nothing, the top has no entry of the page's above it, and Back there leaves the app as it always did.
+//
+// THE GESTURE CLOSES WHAT THE BUTTON CLOSES. A popstate — the gesture, the browser's Back, a mouse's
+// back button — closes from the top down to the depth of the entry it lands on, each thing through
+// `closeBackLevel`, which calls just what its own Back or Esc calls: `leaveThread`, `threadListBack`,
+// the X's `closeSideByX`, `closeReply`, `closeSettings`, `closeHelp`, a menu's Escape. So the focus
+// and the reader's place (`#280 scroll-stability`) come back exactly as they do there.
+//
+// ...AND THE BUTTON GOES BACK THROUGH THE HISTORY. The on-screen Back, the X, Esc and the rest close at
+// once, in the press's own task, as before — so the keys, the scroll rules and every check that presses
+// them see no gap — and the entry their screen pushed is then gone back through with `history.back()`,
+// leaving the gesture after them nothing stale to undo. The popstate that follows closes nothing more:
+// it closes only down to its entry's depth, the page is already there, and `backTraversal` tells it
+// from a reader's own Back. Where the entry is gone — never pushed, or the browser holds another — the
+// close stands alone and nothing is gone back through.
+//
+// A RELOAD STARTS AGAIN. An entry from before a reload carries another page load's name, so it is
+// never taken for one of this page's: the page makes the entry it opens on its own base, at depth
+// nought, and pushes again for whatever it reopened (`#189 restore-ui-state`). Chromium's back button
+// skips an entry a page pushed before the reader ever touched it, against pages that trap the button,
+// so an entry wanted that early waits for the reader's first touch (`backDeferred`). The browser keeps
+// the earlier load's entries, and lands on them as on any of the page's (measured in Chromium 149: a
+// popstate, not a load), but the screens they stood for went with that load: a Back at the top onto
+// one closes nothing there, and goes on back through the rest of them, and past that load's own base,
+// in the same press (`leaveEarlierLoad`) — where the Navigation API says the reader went back rather
+// than forward. Without it each costs a press that changes nothing on screen.
+//
+// MENUS HAVE A CLOSE WATCHER. Where the browser has `CloseWatcher` (Chrome 120 on), an open ⋯ menu,
+// pace popover or prompts tray has one: the gesture closes the menu without touching the history, and
+// Esc, which the page takes first, never reaches it. Elsewhere each open menu is one more level on top,
+// its entry pushed and gone back through as a screen's is.
+
+/** The key the page's own history entries keep their facts under, in `history.state`. */
+const BACK_STATE_KEY = "vibeTalkBack";
+/** This page load's own name for the entries it makes: an entry with another is from before a reload. */
+const BACK_SESSION = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
+/** How long a going-back the page asked for may take to land before the page stops waiting for it. */
+const BACK_TRAVERSAL_MS = 2000;
+
+/** Whether the page keeps its history in step yet: from the end of the script, once every part is defined. */
+let backStarted = false;
+/** What the page's entries above its base stand for, the first-opened first: as many as the entry it is on is deep. */
+let backTags = /** @type {string[]} */ ([]);
+/** A going-back the page asked for and has not yet seen land: the depth it goes to, and the timer that stops waiting. */
+let backTraversal = /** @type {{target: number, timer: any} | null} */ (null);
+/** A going-back never landed: none is asked for again until the browser's history moves. */
+let backTraversalStuck = false;
+/** The levels, as `backLevels` says them, that a Back could not close: nothing is pushed for them again until they change. */
+let backRefused = /** @type {string | null} */ (null);
+/** An entry is wanted, but the reader has not touched the page yet: it is pushed at their first touch. */
+let backDeferred = false;
+/** Whether a `syncBackStack` is already due at the end of this task. */
+let backSyncDue = false;
+/** Where the browser was in the tab's history when the page last looked (`historyIndex`), to tell a Back from a Forward. */
+let backIndex = /** @type {number | null} */ (null);
+/**
+ * One close watcher per open menu, by its level's name, where the browser has them.
+ *
+ * @type {Map<string, CloseWatcher>}
+ */
+const menuWatchers = new Map();
+
+/** The window's history, where it can be written; null in a host without one. */
+function backHistory() {
+  const history = typeof window === "object" && window ? window.history : null;
+  if (!history || typeof history.pushState !== "function" || typeof history.replaceState !== "function" ||
+      typeof history.back !== "function" || typeof history.go !== "function") return null;
+  return history;
+}
+
+/** The state of the page's entry at `depth`, standing for `tag`. */
+function backEntry(depth, tag) {
+  return { [BACK_STATE_KEY]: { session: BACK_SESSION, depth, tag } };
+}
+
+/** The facts of an entry this page load made, or null: no state, somebody else's, or one from before a reload. */
+function liveBackEntry(state) {
+  const facts = state && typeof state === "object" ? state[BACK_STATE_KEY] : null;
+  if (!facts || typeof facts !== "object" || facts.session !== BACK_SESSION) return null;
+  return Number.isInteger(facts.depth) && facts.depth >= 0 ? facts : null;
+}
+
+/** The facts of an entry an earlier load of the page made — another load's name — or null. */
+function earlierLoadEntry(state) {
+  const facts = state && typeof state === "object" ? state[BACK_STATE_KEY] : null;
+  if (!facts || typeof facts !== "object" || typeof facts.session !== "string" || facts.session === BACK_SESSION) return null;
+  return Number.isInteger(facts.depth) && facts.depth >= 0 ? facts : null;
+}
+
+/** Where the browser is in the tab's history, by the Navigation API where it has one; null elsewhere. */
+function historyIndex() {
+  const navigation = typeof window === "object" && window ? window.navigation : null;
+  const entry = navigation ? navigation.currentEntry : null;
+  return entry && Number.isInteger(entry.index) && entry.index >= 0 ? entry.index : null;
+}
+
+/**
+ * A Back at the top landed on an entry an earlier load of the page made, `facts.depth` deep: go on back
+ * through the rest of that load's entries and past its base, which stood for screens that load took
+ * with it, so the one press leaves the app as a Back at the top does. Where that base was the tab's
+ * first entry there is nowhere further to go, the browser does nothing, and the next Back is the
+ * system's, which closes an installed app.
+ */
+function leaveEarlierLoad(history, facts) {
+  history.go(-(Math.min(facts.depth, 64) + 1));
+}
+
+/** `backTags` cut or padded to `depth`: what the page knows of the entries up to the one it is on. */
+function fitBackTags(depth) {
+  const tags = backTags.slice(0, depth);
+  while (tags.length < depth) tags.push("");
+  return tags;
+}
+
+/** The browser's close watcher, where it has one. */
+function closeWatcherClass() {
+  const Watcher = typeof window === "object" && window ? window.CloseWatcher : undefined;
+  return typeof Watcher === "function" ? Watcher : null;
+}
+
+/** Whether the page may push an entry now: not before the reader has ever touched it, where the browser says. */
+function mayPushHistory() {
+  const activation = typeof navigator === "object" && navigator ? navigator.userActivation : null;
+  return !activation || activation.hasBeenActive !== false;
+}
+
+/** The menus open now, as levels, in the order Escape closes them. */
+function openMenus() {
+  const open = [];
+  if (openRowMenu) open.push("menu:row");
+  if (!el("speed-popover").hidden) open.push("menu:pace");
+  if (promptsOpen) open.push("menu:prompts");
+  return open;
+}
+
+/**
+ * Close menu `name` as Escape closes it, and say whether it was open. The ⋯ menu gives the focus back
+ * to the ⋯ that opened it when the focus was inside it — an item just hidden is a focus on nothing —
+ * and the pace popover and the prompts tray give it to their buttons.
+ */
+function closeOpenMenu(name) {
+  if (name === "menu:row" && openRowMenu) {
+    const { root, close, button } = openRowMenu;
+    const inside = nodeWithin(root, document.activeElement);
+    close();
+    if (inside && button && typeof button.focus === "function") button.focus({ preventScroll: true });
+    return true;
+  }
+  if (name === "menu:pace" && !el("speed-popover").hidden) {
+    closeSpeedPopover();
+    el("read-speed").focus();
+    return true;
+  }
+  if (name === "menu:prompts" && promptsOpen) {
+    setPromptsOpen(false);
+    el("prompts-open").focus();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * What a Back would close now, the first-opened first: the levels the page keeps an entry for. Read
+ * in the left column, whose state is the page's (`COLUMN_STATE`).
+ *
+ * @returns {string[]}
+ */
+function backLevels() {
+  if (sideActive) return inColumn(columns.main, backLevels);
+  const levels = screenLevels(currentScreen);
+  if (!closeWatcherClass()) levels.push(...openMenus());
+  return levels;
+}
+
+/**
+ * The levels of screen `name`, with those of the screen it covers under it: Settings over the screen
+ * it was opened from, Help over Settings or over where "?" was pressed (`helpReturn`), Reply over the
+ * channel. The sign-in screen is the bottom of everything, with none.
+ *
+ * @returns {string[]}
+ */
+function screenLevels(name, depth = 0) {
+  if (depth > 2) return [];
+  if (name === "main") return channelLevels();
+  if (name === "reply") return [...channelLevels(), "reply"];
+  if (name === "settings") return [...screenLevels(screenBeforeSettings, depth + 1), "settings"];
+  if (name === "help") return [...screenLevels(helpReturn, depth + 1), "help"];
+  return [];
+}
+
+/**
+ * What is open over the channel's own view: the right column's thread in two columns; the thread list,
+ * over what Esc on it goes back to; a thread in one column, over the thread list it was opened from;
+ * and a reply open at the foot of a column. Nothing on the call's view, which waits in front of them.
+ *
+ * @returns {string[]}
+ */
+function channelLevels() {
+  if (currentView !== "discord") return [];
+  const levels = [];
+  if (columnsShown) {
+    if (columns.side.mode === "thread") levels.push("side");
+  } else if (threadListShown) {
+    levels.push(...underThreadList(), "list");
+  } else if (channelView === "thread") {
+    if (threadOrigin === "list" && threadListOffered()) levels.push(...underThreadList(), "list");
+    levels.push("thread");
+  }
+  if (replyDocked) levels.push("reply");
+  return levels;
+}
+
+/**
+ * What Esc on the thread list goes back to, where that is itself something a Back closes: a thread in
+ * one column, or two columns with a thread on the right (`threadListBack`). So the list chosen over a
+ * thread is one entry more, and its Back finds the thread's entry still there.
+ *
+ * @returns {string[]}
+ */
+function underThreadList() {
+  const channel = String(el("discord-channel").value || "");
+  if (listBefore.layout === "two") return columnsFit && sideThreads.has(channel) ? ["side"] : [];
+  const thread = listBefore.layout === "one" && listBefore.channel === channel && listBefore.view === "thread";
+  return thread && listBefore.thread ? ["thread"] : [];
+}
+
+/** The X of the right column: its thread goes and the cards come back, the keys going to them if they had none. */
+function closeSideByX() {
+  closeSideThread();
+  // The X has gone with the thread: the keys go to the cards.
+  if (document.activeElement === el("side-close") || focusLost()) focusList(sidePane);
+}
+
+/** Close level `tag` as its own Back, X or Escape closes it. */
+function closeBackLevel(tag) {
+  if (tag.startsWith("menu:")) closeOpenMenu(tag);
+  else if (tag === "help") closeHelp();
+  else if (tag === "settings") closeSettings();
+  else if (tag === "reply") closeReply();
+  else if (tag === "side") closeSideByX();
+  else if (tag === "list") threadListBack();
+  else if (tag === "thread") leaveThread();
+}
+
+/**
+ * Close from the top until no more than `target` levels are open. A level its close leaves open is
+ * noted (`backRefused`) and the closing stops: pushing an entry for it again would make a Back that
+ * never gets out.
+ */
+function closeBackLevelsTo(target) {
+  for (let step = 0; step < 16; step += 1) {
+    const levels = backLevels();
+    if (levels.length <= target) return;
+    const said = levels.join(" ");
+    try {
+      closeBackLevel(levels[levels.length - 1]);
+    } catch (error) {
+      showError(error && error.message ? error.message : String(error));
+    }
+    if (backLevels().join(" ") === said) {
+      backRefused = said;
+      return;
+    }
+  }
+}
+
+/** Put the history in step with what is open, at the end of the task that changed it. */
+function scheduleBackSync() {
+  if (!backStarted || backSyncDue) return;
+  backSyncDue = true;
+  Promise.resolve().then(() => {
+    try {
+      syncBackStack();
+    } catch (_error) {
+      // A browser that refuses a history call leaves the page as it was, with no entry to go back to.
+      backSyncDue = false;
+    }
+  });
+}
+
+/**
+ * Put the history in step with `backLevels`: an entry pushed for each level opened, the top one
+ * replaced for a level that gave way to another, and entries gone back through for levels closed.
+ * The depth is read from the browser's entry each time, never only from what the page remembers, so a
+ * push the browser ignored is not counted, and nothing is ever gone back through below the page's own
+ * entry: the page never takes the reader out of the app.
+ */
+function syncBackStack() {
+  backSyncDue = false;
+  if (!backStarted) return;
+  syncMenuWatchers();
+  const history = backHistory();
+  if (!history || backTraversal) return;
+  const levels = backLevels();
+  const said = levels.join(" ");
+  if (backRefused !== null && backRefused !== said) backRefused = null;
+  const entry = liveBackEntry(history.state);
+  if (!entry) {
+    history.replaceState(backEntry(0, "top"), "");
+    backTags = [];
+  } else if (entry.depth !== backTags.length) {
+    backTags = fitBackTags(entry.depth);
+  }
+  const depth = backTags.length;
+  const wanted = backRefused === null ? levels.length : Math.min(levels.length, depth);
+  if (wanted < depth) {
+    if (!backTraversalStuck) goBackThrough(history, depth - wanted);
+    return;
+  }
+  backDeferred = wanted > depth && !mayPushHistory();
+  if (wanted > depth && !backDeferred) {
+    for (let at = depth; at < wanted; at += 1) {
+      history.pushState(backEntry(at + 1, levels[at]), "");
+      const now = liveBackEntry(history.state);
+      // A push the browser ignored (it throttles a flood of them) is not counted.
+      if (!now || now.depth !== at + 1) break;
+      backTags.push(levels[at]);
+    }
+    backTraversalStuck = false;
+  }
+  const top = backTags.length;
+  if (top > 0 && levels[top - 1] !== undefined && backTags[top - 1] !== levels[top - 1]) {
+    history.replaceState(backEntry(top, levels[top - 1]), "");
+    backTags[top - 1] = levels[top - 1];
+  }
+  backIndex = historyIndex();
+}
+
+/** Go back through the page's top `count` entries, for levels already closed, and wait for it to land. */
+function goBackThrough(history, count) {
+  const target = backTags.length - count;
+  backTags = backTags.slice(0, target);
+  backTraversal = { target, timer: setTimeout(backTraversalLost, BACK_TRAVERSAL_MS) };
+  if (count === 1) history.back();
+  else history.go(-count);
+}
+
+/** A going-back that never landed: the page believes the browser's entry, and asks for no more until it moves. */
+function backTraversalLost() {
+  if (!backTraversal) return;
+  backTraversal = null;
+  backTraversalStuck = true;
+  const history = backHistory();
+  const entry = history ? liveBackEntry(history.state) : null;
+  backTags = fitBackTags(entry ? entry.depth : 0);
+  scheduleBackSync();
+}
+
+/**
+ * The browser went back (or forward) to another entry: close down to its depth, as the Back of each
+ * level closed would. The page's own going-back, for levels it had already closed, lands here too,
+ * and closes nothing more.
+ *
+ * @param {PopStateEvent} event
+ */
+function onBackPop(event) {
+  if (!backStarted) return;
+  const history = backHistory();
+  if (!history) return;
+  const state = event ? event.state : null;
+  const entry = liveBackEntry(state);
+  const target = entry ? entry.depth : 0;
+  const awaited = backTraversal;
+  if (awaited) {
+    clearTimeout(awaited.timer);
+    backTraversal = null;
+  }
+  backTraversalStuck = false;
+  const index = historyIndex();
+  const wentBack = index !== null && backIndex !== null && index < backIndex;
+  const earlier = earlierLoadEntry(state);
+  const wasOpen = backLevels().length;
+  // An entry this page load did not make — one from before a reload — is its base from here on.
+  if (!entry) history.replaceState(backEntry(0, "top"), "");
+  backTags = fitBackTags(target);
+  if (!awaited || target !== awaited.target) closeBackLevelsTo(target);
+  if (earlier && wasOpen === 0 && wentBack) {
+    backIndex = index;
+    leaveEarlierLoad(history, earlier);
+    return;
+  }
+  syncBackStack();
+}
+
+/** A close watcher for each open menu, and none for a closed one, where the browser has them. */
+function syncMenuWatchers() {
+  const Watcher = closeWatcherClass();
+  if (!Watcher) return;
+  const open = openMenus();
+  for (const [name, watcher] of [...menuWatchers]) {
+    if (open.includes(name)) continue;
+    menuWatchers.delete(name);
+    watcher.destroy();
+  }
+  for (const name of open) {
+    if (menuWatchers.has(name)) continue;
+    try {
+      const watcher = new Watcher();
+      watcher.onclose = () => {
+        if (menuWatchers.get(name) !== watcher) return;
+        menuWatchers.delete(name);
+        closeOpenMenu(name);
+        scheduleBackSync();
+      };
+      menuWatchers.set(name, watcher);
+    } catch (_error) {
+      // A watcher refused leaves this menu to Escape and a tap outside it, as before.
+    }
+  }
+}
+
+/**
+ * Keep the history in step from here on. The entry the page opened on becomes its base, whatever it
+ * held before a reload; the browser is told not to move the document on a Back, the lists keeping
+ * their own places (`#280 scroll-stability`); and an entry put off until the reader's first touch is
+ * pushed then.
+ */
+function startBackStack() {
+  backStarted = true;
+  const history = backHistory();
+  if (history) {
+    try {
+      history.scrollRestoration = "manual";
+    } catch (_error) {
+      // A host whose history will not take it moves nothing on a Back anyway: the page does not scroll.
+    }
+    history.replaceState(backEntry(0, "top"), "");
+    backIndex = historyIndex();
+    window.addEventListener("popstate", onBackPop);
+  }
+  const touched = () => {
+    if (backDeferred) scheduleBackSync();
+  };
+  for (const type of ["pointerup", "keydown", "click"]) document.addEventListener(type, touched, true);
+  scheduleBackSync();
+}
+
 // --- screens ----------------------------------------------------------------------------------
 //
 // Three screens, no router and no framework: they are three sections stacked in one grid cell and
@@ -626,6 +1097,8 @@ function showScreen(name) {
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
   if (name === "settings" && previous !== "settings") renderDismissedSends();
   if (name !== previous || focusLost()) settleFocus();
+  // `#304 back-gesture-in-app`. A screen opened has an entry to go back through, and one left has none.
+  scheduleBackSync();
 }
 
 /**
@@ -946,6 +1419,8 @@ function showView(name) {
   // the next Space as another press and switched straight back. Only on the main screen: a view
   // changed behind Settings must not take the focus from the control the reader is on there.
   if (leaving !== name && currentScreen === "main") settleFocus();
+  // `#304 back-gesture-in-app`. The call's view waits in front of whatever the channel had open.
+  scheduleBackSync();
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -8013,16 +8488,8 @@ function closeDetailsOn(target) {
  */
 function onEscape(event, target) {
   if (closeRowMenuOnEscape(event)) return true;
-  if (!el("speed-popover").hidden) {
-    closeSpeedPopover();
-    el("read-speed").focus();
-    return true;
-  }
-  if (promptsOpen) {
-    setPromptsOpen(false);
-    el("prompts-open").focus();
-    return true;
-  }
+  // The pace popover and the prompts tray, as the back gesture closes them (`#304 back-gesture-in-app`).
+  if (closeOpenMenu("menu:pace") || closeOpenMenu("menu:prompts")) return true;
   if (closeDetailsOn(target)) return true;
   if (searchOpen && currentScreen === "main") {
     setSearchOpen(false);
@@ -8828,6 +9295,8 @@ function setPromptsOpen(open) {
   promptsOpen = open === true;
   el("prompts-tray").hidden = !promptsOpen;
   el("prompts-open").setAttribute("aria-expanded", promptsOpen ? "true" : "false");
+  // `#304 back-gesture-in-app`. An open tray has a close watcher, or else an entry.
+  scheduleBackSync();
 }
 
 // --- the server ------------------------------------------------------------------------------
@@ -15166,6 +15635,8 @@ function openChannelView() {
   if (summary && !channelCanon.threads.some((held) => String(held.id) === String(summary.id))) {
     upsertThreadSummary(summary);
   }
+  // `#304 back-gesture-in-app`. A thread reopened has an entry to go back through, as one entered has.
+  scheduleBackSync();
 }
 
 /** The channel and view a measured place belongs to. */
@@ -15716,6 +16187,8 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   }
   uiStateSettled = true;
   saveUiState();
+  // `#304 back-gesture-in-app`. A thread entered has an entry to go back through; Main and All have none.
+  scheduleBackSync();
   // Main and All are one conversation, so a switch between them — or into one from a thread no place
   // of theirs is held for — keeps the reader on the message they were reading, where both show it.
   // A thread opens at its newest, and Back returns to the place its view was left at, as before.
@@ -24893,6 +25366,8 @@ function discordNode(messages) {
     } else if (openRowMenu && openRowMenu.close === closeMenu) {
       openRowMenu = null;
     }
+    // `#304 back-gesture-in-app`. An open menu has a close watcher, or else an entry.
+    scheduleBackSync();
   };
   const closeMenu = () => setMenu(false);
   moreButton.addEventListener("click", inThisColumn(() => setMenu(menu.hidden)));
@@ -25069,12 +25544,9 @@ function closeRowMenuOutside(event) {
  * item is a focus on nothing, where the scroll keys would have nowhere to go.
  */
 function closeRowMenuOnEscape(event) {
-  if (!openRowMenu || !event || event.key !== "Escape") return false;
-  const { root, close, button } = openRowMenu;
-  const inside = nodeWithin(root, document.activeElement);
-  close();
-  if (inside && button && typeof button.focus === "function") button.focus({ preventScroll: true });
-  return true;
+  if (!event || event.key !== "Escape") return false;
+  // The one way a menu closes, which the back gesture's takes too (`#304 back-gesture-in-app`).
+  return closeOpenMenu("menu:row");
 }
 
 /**
@@ -29666,6 +30138,8 @@ function dockReply(from) {
   replyDocked = true;
   renderReplyingMarks();
   placeToolsOverReply();
+  // `#304 back-gesture-in-app`. A reply open in a column is a level, as the reply screen is.
+  scheduleBackSync();
   if (!from || !from.parentNode || !shownNode(from)) return;
   // Where the box covers the row: up by as much as shows its foot over the box and the chips standing
   // on it, but never so far that its top goes under the head of the column.
@@ -29686,6 +30160,7 @@ function undockReply() {
   replyDocked = false;
   renderReplyingMarks();
   placeToolsOverReply();
+  scheduleBackSync();
 }
 
 /**
@@ -30942,6 +31417,8 @@ function renderColumns() {
   }
   // `#261 two-column-connectors`. The links between the columns, drawn or taken away with them.
   scheduleColumnLinks();
+  // `#304 back-gesture-in-app`. The thread list is a level, and two columns are not.
+  scheduleBackSync();
 }
 
 /**
@@ -31173,6 +31650,8 @@ function showOneColumnView(target, record) {
   if (same && !(record && pinnedOnly)) {
     if (target.origin) threadOrigin = target.origin;
     if (record) recordViewChoice();
+    // `#304 back-gesture-in-app`. A thread's way back can be the thread list now, a level more.
+    scheduleBackSync();
     return;
   }
   const show = () => changeChannelView(target.view, thread, target.summary, target.origin);
@@ -31332,6 +31811,8 @@ function renderSideMode() {
   renderSideUnreadToggle();
   renderSideColumn();
   scheduleColumnLinks();
+  // `#304 back-gesture-in-app`. A thread on the right is a level; the cards are not.
+  scheduleBackSync();
 }
 
 /**
@@ -35929,12 +36410,15 @@ el("talk").addEventListener("click", onTalk);
 function closeSpeedPopover() {
   el("speed-popover").hidden = true;
   el("read-speed").setAttribute("aria-expanded", "false");
+  scheduleBackSync();
 }
 
 el("read-speed").addEventListener("click", () => {
   const open = el("speed-popover").hidden;
   el("speed-popover").hidden = !open;
   el("read-speed").setAttribute("aria-expanded", open ? "true" : "false");
+  // `#304 back-gesture-in-app`. An open popover has a close watcher, or else an entry.
+  scheduleBackSync();
 });
 
 el("mark-own-read").addEventListener("change", () => {
@@ -36167,11 +36651,8 @@ el("scroll-area").addEventListener("pointercancel", () => { threadBackGesture = 
 // `#229 desktop-two-column`. The layout button, and the right column's own controls: each acts in
 // the right column, as its counterpart in #pane-discord acts in the left.
 el("column-toggle").addEventListener("click", toggleColumns);
-el("side-close").addEventListener("click", () => {
-  closeSideThread();
-  // The X has gone with the thread: the keys go to the cards.
-  if (document.activeElement === el("side-close") || focusLost()) focusList(sidePane);
-});
+// The X's one act, which the back gesture's is too (`#304 back-gesture-in-app`).
+el("side-close").addEventListener("click", closeSideByX);
 // `#281 view-keys`. The next page of older threads, read where the cards are.
 el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
@@ -36843,3 +37324,6 @@ if (token()) {
 } else {
   showScreen("signin");
 }
+// `#304 back-gesture-in-app`. Last, with every part of the page defined: the history kept in step with
+// what is open, from the screen the page opened on.
+startBackStack();

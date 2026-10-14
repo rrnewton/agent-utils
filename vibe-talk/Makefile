@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser copy-message-browser fold-steps-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -243,6 +243,15 @@ thread-card-focus-browser:
 # keep a PNG of each state.
 copy-message-browser:
 	python3 tests/copy_message_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#304 back-gesture-in-app` in a real Chromium at a 412x915 Android phone in standalone mode: the browser's
+# Back -- what the phone's back gesture sends -- closes a thread in the same document with the reader's place
+# kept, the thread list and a thread opened from it are two entries closed in turn by history.back() and the
+# browser's Back, the ⋯ menu is no entry, the on-screen Back goes back through its entry so the browser's Back
+# at the top leaves the app, and a page reloaded in a thread pushes its entry at the first touch. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
+back-gesture-browser:
+	python3 tests/back_gesture_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#280 scroll-stability` in a real Chromium at 1280x800 in two columns (mouse) and 412x915 in one (touch):
 # the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive

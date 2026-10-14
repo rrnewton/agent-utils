@@ -4,6 +4,25 @@
 interface Window {
   /** Safari's prefixed Web Audio constructor, used when `AudioContext` is absent. */
   webkitAudioContext?: typeof AudioContext;
+  /** `#304 back-gesture-in-app`. The close watcher's constructor, where the browser has one (Chrome 120 on). */
+  CloseWatcher?: new (options?: { signal?: AbortSignal }) => CloseWatcher;
+  /**
+   * `#304 back-gesture-in-app`. The Navigation API (Chrome 102 on), of which the page reads only where in
+   * the tab's history it is, to tell a Back from a Forward. Not yet in TypeScript's DOM library.
+   */
+  navigation?: { readonly currentEntry: NavigationHistoryEntry | null };
+}
+
+/**
+ * `#304 back-gesture-in-app`. A close watcher: the back gesture, or Esc the page did not take, closes
+ * the newest one, firing its `close`. Not yet in TypeScript's DOM library.
+ */
+interface CloseWatcher extends EventTarget {
+  onclose: ((event: Event) => void) | null;
+  oncancel: ((event: Event) => void) | null;
+  requestClose(): void;
+  close(): void;
+  destroy(): void;
 }
 
 interface HTMLLIElement {

@@ -73,6 +73,34 @@ the message: every message on Google Chat and on Slack (whose thread is the mess
 created in Discord, so a Discord message heading none has no tag. On a read-only channel the grey tag
 is not shown, since nothing could be posted to start the thread.
 
+**The back gesture stays in the app** (`#304 back-gesture-in-app`). The phone's back gesture — in the
+installed Android app above all — and the browser's Back, or a mouse's back button, close what is open
+over the channel, one thing per press, exactly as its own **Back**, **X** or Esc closes it, with the
+focus and your place in the list coming back as they do there:
+
+* a thread, in one column, opened from the thread list (the gesture goes back to the list), or on the
+  right in two columns;
+* the thread list, back to the view it was chosen from — a thread, if it was chosen over one;
+* the reply screen, or a reply open at the foot of a column, its words kept as a draft;
+* Settings, and Help, back to Settings or to wherever **?** was pressed;
+* a message's **⋯** menu, the reading-pace popover and the prompts tray.
+
+With nothing open the gesture leaves the app, as it always did. Main, All and two columns are views,
+not screens, so choosing among them (the picker, Ctrl+1, Ctrl+2, Ctrl+4) adds nothing to go back
+through; the thread list is one thing more. The call's view, the search, a message's details sheet,
+a highlighted card and the agent's proposal to post are not screens either, and the gesture never
+answers a proposal. The page keeps one browser history entry for each thing open, all at the page's
+own address — the URL never changes, so a reload, and `/` beside `/voice`, are as before. The
+on-screen ways out still close at once, and then go back through their entry with `history.back()`,
+so the next gesture never lands on a stale one. Where the browser has close watchers (Chrome 120 and
+later), an open menu has one instead of an entry. A reload starts afresh: entries made before it
+carry another page load's name and are never taken for this one's; whatever the page reopened (see
+[Reopening where you left off](#reopening-where-you-left-off)) gets its entry at your first touch,
+because Chromium's back button skips an entry a page pushed before it was touched; and a Back at the
+top onto the earlier load's entries goes on back past them in the same press, where the browser has
+the Navigation API to say it was a Back. Elsewhere each of those costs one press that changes nothing.
+`make -C vibe-talk back-gesture-browser` walks this in a real Chromium at an Android phone's size.
+
 **Reply answers a message where it is.** Replying to a thread message posts in that thread, from
 any view, including **All**. Replying to a main-channel message posts in the main channel as a reply
 to it: a quote on Google Chat, a reply link on Discord. (Slack has neither, so its backend posts
