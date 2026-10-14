@@ -252,6 +252,16 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn forget_summaries_for(
+        &self,
+        _: &str,
+        _: &ChannelId,
+        _: &MessageId,
+        _: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        refuse()
+    }
+
     async fn forget_summaries_except(&self, _: &str) -> Result<u64, StoreError> {
         refuse()
     }

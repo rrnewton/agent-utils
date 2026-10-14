@@ -1056,6 +1056,28 @@ impl StateStore for FakeStore {
         Ok((before - state.summaries.len()) as u64)
     }
 
+    async fn forget_summaries_for(
+        &self,
+        version: &str,
+        channel: &ChannelId,
+        message: &MessageId,
+        keep_hash: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let keep = keep_hash.map(|hash| format!("{hash:016x}"));
+        let before = state.summaries.len();
+        state
+            .summaries
+            .retain(|(held_version, held_channel, held_message, hash), _| {
+                held_version != version
+                    || held_channel != channel.as_str()
+                    || held_message != message.as_str()
+                    || keep.as_ref() == Some(hash)
+            });
+        Ok((before - state.summaries.len()) as u64)
+    }
+
     async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;

@@ -1806,6 +1806,28 @@ pub trait StateStore: Send + Sync {
     /// write failure.
     async fn forget_channel_summaries(&self, channel: &ChannelId) -> Result<u64, StoreError>;
 
+    /// Delete one message's cached summaries filed under the policy `version` whose content hash
+    /// is not `keep_hash`, or every one of them when `keep_hash` is `None`, and answer how many
+    /// went. `#208 persistent-cache`.
+    ///
+    /// Called when the message cache learns that a message was edited, with `keep_hash` the hash
+    /// of its new text ([`crate::summarize::content_hash`]), or deleted, with `None`: a summary of
+    /// text the message no longer says is a copy of words that are gone, and it is unreachable by
+    /// key in any case. Nothing else is touched: entries under another version, and thread names
+    /// and sentences, which are filed under keys of their own.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn forget_summaries_for(
+        &self,
+        version: &str,
+        channel: &ChannelId,
+        message: &MessageId,
+        keep_hash: Option<u64>,
+    ) -> Result<u64, StoreError>;
+
     /// Delete every cached summary produced under a policy other than `version`, returning how
     /// many went. Entries under [`KEPT_VERSION`] belong to no policy and are never deleted here.
     ///

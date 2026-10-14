@@ -2078,6 +2078,32 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn forget_summaries_for(
+        &self,
+        version: &str,
+        channel: &ChannelId,
+        message: &MessageId,
+        keep_hash: Option<u64>,
+    ) -> Result<u64, StoreError> {
+        let version = version.to_owned();
+        let channel = channel.clone();
+        let message = message.clone();
+        // The hash in the column's own spelling, so `<>` compares like with like.
+        let keep = keep_hash.map(hex);
+        self.with_connection(move |connection| {
+            let removed = connection
+                .execute(
+                    "DELETE FROM summaries
+                     WHERE version = ?1 AND channel_id = ?2 AND message_id = ?3
+                       AND (?4 IS NULL OR content_hash <> ?4)",
+                    rusqlite::params![version, channel.as_str(), message.as_str(), keep],
+                )
+                .map_err(backend)?;
+            Ok(removed as u64)
+        })
+        .await
+    }
+
     async fn forget_summaries_except(&self, version: &str) -> Result<u64, StoreError> {
         let version = version.to_owned();
         self.with_connection(move |connection| {
@@ -5490,6 +5516,121 @@ mod tests {
         assert!(matches!(
             disabled
                 .forget_channel_summaries(&ChannelId("1111111111".to_owned()))
+                .await,
+            Err(StoreError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_stores_agree_on_forgetting_one_messages_summaries_but_the_live_text() {
+        // One script, every store. The message edited is `...100`: under the current version it
+        // has a summary of its old text and one of its new; under an older version, one of the old.
+        // Another message, another channel, and a thread sentence and name sit beside it.
+        async fn script(store: &dyn StateStore) -> Vec<String> {
+            let channel = ChannelId("1111111111".to_owned());
+            let edited = MessageId("1000000000000000100".to_owned());
+            let deleted = MessageId("1000000000000000101".to_owned());
+            let keys = [
+                summary_key("1000000000000000100", 1),
+                summary_key("1000000000000000100", 2),
+                SummaryKey {
+                    version: "older".to_owned(),
+                    ..summary_key("1000000000000000100", 1)
+                },
+                summary_key("1000000000000000101", 1),
+                summary_key("1000000000000000101", 3),
+                SummaryKey {
+                    channel: ChannelId("2222222222".to_owned()),
+                    ..summary_key("1000000000000000100", 1)
+                },
+                summary_key("thread-sentence:1000000000000000100", 0),
+                SummaryKey {
+                    version: KEPT_VERSION_FOR_TESTS.to_owned(),
+                    ..summary_key("thread-name:1000000000000000100", 0)
+                },
+            ];
+            for key in &keys {
+                store.cache_summary(key, "text", None).await.expect("file");
+            }
+            let mut said = vec![
+                // Edited to the text whose hash is 2: the summary of 1 goes.
+                format!(
+                    "{:?}",
+                    store
+                        .forget_summaries_for("current", &channel, &edited, Some(2))
+                        .await
+                ),
+                // Again: nothing left to forget.
+                format!(
+                    "{:?}",
+                    store
+                        .forget_summaries_for("current", &channel, &edited, Some(2))
+                        .await
+                ),
+                // Deleted: every summary of it under the version goes.
+                format!(
+                    "{:?}",
+                    store
+                        .forget_summaries_for("current", &channel, &deleted, None)
+                        .await
+                ),
+                // A message nothing was filed for.
+                format!(
+                    "{:?}",
+                    store
+                        .forget_summaries_for(
+                            "current",
+                            &channel,
+                            &MessageId("1000000000000000999".to_owned()),
+                            None
+                        )
+                        .await
+                ),
+            ];
+            for key in &keys {
+                let kept = store.cached_summary(key).await.expect("read").is_some();
+                said.push(format!(
+                    "{} {} {} {:x} {kept}",
+                    key.version,
+                    key.channel.as_str(),
+                    key.message.as_str(),
+                    key.content_hash
+                ));
+            }
+            said
+        }
+        let dir = TempDir::new("sqlite-summary-forget-one");
+        let real = script(&store(&dir, Retention::default())).await;
+        assert_eq!(
+            real,
+            [
+                "Ok(1)",
+                "Ok(0)",
+                "Ok(2)",
+                "Ok(0)",
+                "current 1111111111 1000000000000000100 1 false",
+                "current 1111111111 1000000000000000100 2 true",
+                "older 1111111111 1000000000000000100 1 true",
+                "current 1111111111 1000000000000000101 1 false",
+                "current 1111111111 1000000000000000101 3 false",
+                "current 2222222222 1000000000000000100 1 true",
+                "current 1111111111 thread-sentence:1000000000000000100 0 true",
+                "kept 1111111111 thread-name:1000000000000000100 0 true",
+            ]
+        );
+        assert_eq!(
+            real,
+            script(&crate::store::fake::FakeStore::new()).await,
+            "the fake answers as the real store does"
+        );
+        assert!(matches!(
+            crate::store::disabled::DisabledStore
+                .forget_summaries_for(
+                    "current",
+                    &ChannelId("1111111111".to_owned()),
+                    &MessageId("1000000000000000100".to_owned()),
+                    None
+                )
                 .await,
             Err(StoreError::Unavailable(_))
         ));
