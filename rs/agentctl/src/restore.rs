@@ -1,0 +1,1317 @@
+//! Bring a coordinator team back after the host restarts, in one idempotent command.
+//!
+//! `agentctl restore` runs these steps in order and writes what each one did to a JSON report
+//! named for the boot:
+//!
+//! 1. Hold `<registry>/.restore.lock`, so a boot unit and a manual run never overlap: the
+//!    second waits for the first, then finds its completed report.
+//! 2. Stop early, successfully, when this boot's report already says the restore completed.
+//! 3. Run the project's slot manager once (`wrkslots image status`), which remounts every
+//!    image-backed slot before any agent starts in one.
+//! 4. Wait for the Herdr server to answer.
+//! 5. Revive the coordinator from its launch spec, then register its new pane in every other
+//!    registry that names it (for example a chat bridge's).
+//! 6. Revive every other dead agent one at a time with a startup delay; promote a live
+//!    `launch_failed` record; record every refusal with its reason.
+//! 7. `systemctl --user reset-failed` and `start` each configured unit (the chat bridge).
+//! 8. Queue one deterministic recovery notice for the coordinator, once per boot.
+//!
+//! A live harness is skipped and a published revive is never repeated, so a rerun only does
+//! what is still missing. The configuration is `<registry>/restore.json`.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::agent::{AgentError, DrainOptions};
+use crate::subagents::{AdoptOptions, ManagedAgents, ManagedApi, StopOptions};
+
+/// File name of the restore configuration inside the agent registry.
+pub const CONFIG_FILE: &str = "restore.json";
+/// Schema of the restore configuration.
+pub const CONFIG_SCHEMA: &str = "agentctl-restore/v1";
+/// Schema of the per-boot report.
+pub const REPORT_SCHEMA: &str = "agentctl-restore-report/v1";
+
+type Result<T> = std::result::Result<T, AgentError>;
+
+fn fail(message: impl Into<String>) -> AgentError {
+    AgentError::Delivery(message.into())
+}
+
+/// Another registry that names the coordinator, such as a chat bridge's.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AlsoRegistered {
+    /// The other agent registry directory.
+    pub registry: PathBuf,
+    /// The coordinator's name in that registry.
+    pub name: String,
+}
+
+/// A timer the watch keeps firing.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TimerWatch {
+    /// The user timer unit, for example `health-tick.timer`.
+    pub unit: String,
+    /// Alarm when the timer last fired longer ago than this many seconds.
+    pub max_age_seconds: u64,
+}
+
+fn default_startup_delay() -> u64 {
+    20
+}
+
+fn default_herdr_wait() -> u64 {
+    300
+}
+
+/// `<registry>/restore.json`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreConfig {
+    /// Always `agentctl-restore/v1`.
+    pub schema: String,
+    /// The coordinator's name in this registry; revived first.
+    #[serde(default)]
+    pub coordinator: Option<String>,
+    /// Other registries that name the coordinator.
+    #[serde(default)]
+    pub also_registered: Vec<AlsoRegistered>,
+    /// User units to reset and start after the agents, for example the chat bridge.
+    #[serde(default)]
+    pub units: Vec<String>,
+    /// Seconds between two lane launches (default 20).
+    #[serde(default = "default_startup_delay")]
+    pub startup_delay_seconds: u64,
+    /// Seconds to wait for the Herdr server (default 300).
+    #[serde(default = "default_herdr_wait")]
+    pub herdr_wait_seconds: u64,
+    /// Directory for per-boot reports (default `$XDG_STATE_HOME/agentctl/restore`).
+    #[serde(default)]
+    pub report_dir: Option<PathBuf>,
+    /// The unit that runs the Herdr server, which the watch starts when Herdr is down.
+    #[serde(default)]
+    pub herdr_unit: Option<String>,
+    /// Timers the watch keeps firing.
+    #[serde(default)]
+    pub timers: Vec<TimerWatch>,
+}
+
+impl RestoreConfig {
+    /// Read and validate `<registry>/restore.json`; an absent file is an empty configuration.
+    pub fn load(registry: &Path) -> Result<Self> {
+        let path = registry.join(CONFIG_FILE);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::empty());
+            }
+            Err(error) => {
+                return Err(fail(format!("cannot read {}: {error}", path.display())));
+            }
+        };
+        let config: Self = serde_json::from_str(&text)
+            .map_err(|error| fail(format!("invalid {}: {error}", path.display())))?;
+        config.validate(&path)?;
+        Ok(config)
+    }
+
+    fn empty() -> Self {
+        Self {
+            schema: CONFIG_SCHEMA.to_owned(),
+            coordinator: None,
+            also_registered: Vec::new(),
+            units: Vec::new(),
+            startup_delay_seconds: default_startup_delay(),
+            herdr_wait_seconds: default_herdr_wait(),
+            report_dir: None,
+            herdr_unit: None,
+            timers: Vec::new(),
+        }
+    }
+
+    fn validate(&self, path: &Path) -> Result<()> {
+        let invalid = |detail: &str| fail(format!("invalid {} ({detail})", path.display()));
+        if self.schema != CONFIG_SCHEMA {
+            return Err(invalid("schema must be agentctl-restore/v1"));
+        }
+        if self
+            .coordinator
+            .as_deref()
+            .is_some_and(|name| !agent_name(name))
+        {
+            return Err(invalid("coordinator is not an agent name"));
+        }
+        if self
+            .also_registered
+            .iter()
+            .any(|other| !agent_name(&other.name) || !other.registry.is_absolute())
+        {
+            return Err(invalid(
+                "also_registered needs an absolute registry and an agent name",
+            ));
+        }
+        if self
+            .units
+            .iter()
+            .chain(self.herdr_unit.iter())
+            .chain(self.timers.iter().map(|timer| &timer.unit))
+            .any(|unit| !unit_name(unit))
+        {
+            return Err(invalid("a unit name is not a plain systemd unit name"));
+        }
+        if self
+            .timers
+            .iter()
+            .any(|timer| !timer.unit.ends_with(".timer") || timer.max_age_seconds == 0)
+        {
+            return Err(invalid(
+                "timers need a .timer unit and a positive max_age_seconds",
+            ));
+        }
+        if self.startup_delay_seconds > 600 || self.herdr_wait_seconds > 3600 {
+            return Err(invalid(
+                "startup_delay_seconds is at most 600 and herdr_wait_seconds at most 3600",
+            ));
+        }
+        if self
+            .report_dir
+            .as_ref()
+            .is_some_and(|dir| !dir.is_absolute())
+        {
+            return Err(invalid("report_dir must be absolute"));
+        }
+        Ok(())
+    }
+}
+
+fn agent_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && value != "archive"
+}
+
+/// A unit name systemctl takes literally: no path, option, or glob.
+pub(crate) fn unit_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.starts_with('-')
+        && value.contains('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@._-:\\".contains(&byte))
+}
+
+/// What a command printed and how it ended.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CommandOutcome {
+    /// Exit status, or `None` when it could not run or ran out of time.
+    pub status: Option<i32>,
+    /// Captured standard output.
+    pub stdout: String,
+    /// Captured standard error, or why the command could not run.
+    pub stderr: String,
+}
+
+/// The host facts and effects restore and watch use, injectable for tests.
+pub trait Host {
+    /// `/proc/sys/kernel/random/boot_id`.
+    fn boot_id(&self) -> Result<String>;
+    /// The kernel boot time in Unix seconds (`btime` in `/proc/stat`).
+    fn boot_time(&self) -> Option<u64>;
+    /// Seconds since the Unix epoch.
+    fn now(&self) -> f64;
+    /// Pause.
+    fn sleep(&self, duration: Duration);
+    /// Run a program with a deadline, never through a shell.
+    fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome;
+}
+
+/// The real host.
+pub struct SystemHost;
+
+impl Host for SystemHost {
+    fn boot_id(&self) -> Result<String> {
+        let text = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| fail(format!("cannot read the boot id: {error}")))?;
+        let value = text.trim();
+        if value.len() == 36
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            Ok(value.to_owned())
+        } else {
+            Err(fail("the boot id is malformed"))
+        }
+    }
+
+    fn boot_time(&self) -> Option<u64> {
+        fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("btime ")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+    }
+
+    fn now(&self) -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+
+    fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
+        let Some((program, arguments)) = argv.split_first() else {
+            return CommandOutcome {
+                stderr: "empty command".to_owned(),
+                ..CommandOutcome::default()
+            };
+        };
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return CommandOutcome {
+                    stderr: format!("cannot run {program}: {error}"),
+                    ..CommandOutcome::default()
+                }
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return CommandOutcome {
+                        stderr: format!("{program} did not finish within {}s", timeout.as_secs()),
+                        ..CommandOutcome::default()
+                    };
+                }
+            }
+        }
+        match child.wait_with_output() {
+            Ok(output) => CommandOutcome {
+                status: output.status.code(),
+                stdout: bounded_text(&output.stdout),
+                stderr: bounded_text(&output.stderr),
+            },
+            Err(error) => CommandOutcome {
+                stderr: format!("cannot read {program}: {error}"),
+                ..CommandOutcome::default()
+            },
+        }
+    }
+}
+
+/// Keep reports bounded: the last 16 KiB of a command's output.
+fn bounded_text(bytes: &[u8]) -> String {
+    const LIMIT: usize = 16 << 10;
+    let start = bytes.len().saturating_sub(LIMIT);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+/// How restore was asked to run.
+#[derive(Clone, Debug, Default)]
+pub struct RestoreOptions {
+    /// Run even when this boot's report says a restore completed.
+    pub force: bool,
+    /// Report the plan without reviving, promoting, registering, starting units, or notifying.
+    pub dry_run: bool,
+    /// Startup deadline for each revived harness.
+    pub startup_timeout: Duration,
+    /// The slot manager, when the project configures one (see `profiles.json` `wrkslots`).
+    pub wrkslots: Option<PathBuf>,
+}
+
+/// The default report directory: `$XDG_STATE_HOME/agentctl/restore`, else under the home.
+pub fn default_report_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .map(|state| state.join("agentctl/restore"))
+}
+
+fn report_path(config: &RestoreConfig, boot_id: &str) -> Result<PathBuf> {
+    let directory = config
+        .report_dir
+        .clone()
+        .or_else(default_report_dir)
+        .ok_or_else(|| {
+            fail("no report directory: set report_dir in restore.json, XDG_STATE_HOME, or HOME")
+        })?;
+    Ok(directory.join(format!("{boot_id}.json")))
+}
+
+/// Read a previous report for this boot, if one exists and parses.
+pub fn read_report(path: &Path) -> Option<Value> {
+    let mut text = String::new();
+    File::open(path)
+        .ok()?
+        .take(1 << 20)
+        .read_to_string(&mut text)
+        .ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_report(path: &Path, report: &Value) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| fail("report path has no directory"))?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .map_err(|error| fail(format!("cannot create {}: {error}", directory.display())))?;
+    let temporary = directory.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("report"),
+        std::process::id()
+    ));
+    let mut bytes = serde_json::to_vec_pretty(report).map_err(|error| fail(error.to_string()))?;
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| fail(format!("cannot write {}: {error}", temporary.display())))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| fail(format!("cannot write {}: {error}", temporary.display())))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| fail(format!("cannot publish {}: {error}", path.display())))
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+/// `wrkslots image status`: every wrkslots command remounts unmounted image slots on load.
+fn remount_slot_images(host: &dyn Host, wrkslots: Option<&Path>, project: &Path) -> Value {
+    let Some(wrkslots) = wrkslots else {
+        return json!({"action": "skipped", "reason": "no wrkslots configured or on PATH"});
+    };
+    let argv = vec![
+        wrkslots.display().to_string(),
+        "image".to_owned(),
+        "status".to_owned(),
+    ];
+    let outcome = host.run(&argv, Some(project), Duration::from_secs(120));
+    let mounted = outcome
+        .stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("wrkslots: mounted "))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // A failed mount is only a warning with exit status 0, so read the warning itself.
+    let warnings = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.contains("slot image not mounted"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    json!({
+        "action": if outcome.status == Some(0) && warnings.is_empty() { "ran" } else { "failed" },
+        "command": argv,
+        "status": outcome.status,
+        "mounted": mounted,
+        "warnings": warnings,
+        "detail": if outcome.status == Some(0) { Value::Null } else { json!(outcome.stderr.trim()) },
+    })
+}
+
+fn wait_for_herdr<A: ManagedApi + ?Sized>(client: &A, host: &dyn Host, wait: Duration) -> Value {
+    let started = host.now();
+    loop {
+        match client.panes() {
+            Ok(_) => {
+                return json!({"ready": true, "waited_seconds": (host.now() - started).round()});
+            }
+            Err(error) => {
+                if host.now() - started >= wait.as_secs_f64() {
+                    return json!({
+                        "ready": false,
+                        "waited_seconds": (host.now() - started).round(),
+                        "detail": error.to_string(),
+                    });
+                }
+                host.sleep(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+/// Bring one agent back: revive it when dead, promote it when its failed launch runs.
+fn recover_agent<A: ManagedApi + ?Sized>(
+    manager: &ManagedAgents<'_, A>,
+    name: &str,
+    options: &RestoreOptions,
+) -> Value {
+    let status = manager.status(name).ok();
+    let lifecycle = status
+        .as_ref()
+        .and_then(|value| value["lifecycle"].as_str().map(str::to_owned));
+    if lifecycle.as_deref() == Some("launch_failed") {
+        if options.dry_run {
+            return json!({"name": name, "action": "promote", "dry_run": true});
+        }
+        let token = status
+            .as_ref()
+            .and_then(|value| value["token"].as_str().map(str::to_owned));
+        return match manager.promote(name, token.as_deref()) {
+            Ok(result) => json!({"name": name, "action": "promoted", "pane_id": result["pane_id"]}),
+            Err(error) => json!({"name": name, "action": "refused", "reason": error.to_string()}),
+        };
+    }
+    let plan = match manager.revive(name, true, None, options.startup_timeout) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return json!({"name": name, "action": "refused", "reason": error.to_string()});
+        }
+    };
+    match plan["action"].as_str().unwrap_or_default() {
+        "revive" | "recover" if options.dry_run => {
+            json!({"name": name, "action": "revive", "dry_run": true})
+        }
+        "revive" | "recover" => {
+            let token = plan["token"].as_str().map(str::to_owned);
+            match manager.revive(name, false, token.as_deref(), options.startup_timeout) {
+                Ok(result) => json!({
+                    "name": name,
+                    "action": "revived",
+                    "pane_id": result["pane_id"],
+                    "workspace_id": result["workspace_id"],
+                }),
+                Err(error) => {
+                    json!({"name": name, "action": "refused", "reason": error.to_string()})
+                }
+            }
+        }
+        "skip" => json!({"name": name, "action": "skipped", "reason": plan["reason"]}),
+        _ => json!({"name": name, "action": "refused", "reason": plan["reason"]}),
+    }
+}
+
+/// Point another registry's record for the coordinator at the coordinator's live pane.
+///
+/// The same pane only needs its anchors replaced. A record pinned to a pane the revive left
+/// behind is an adopted record whose harness is dead: it is retired (bound to its exact token
+/// and bytes) and the live pane adopted under the same name.
+fn register_elsewhere<A: ManagedApi + ?Sized>(
+    client: &A,
+    other: &AlsoRegistered,
+    coordinator: &Value,
+    dry_run: bool,
+) -> Value {
+    let pane = coordinator["pane_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let result = (|| -> Result<Value> {
+        let manager = ManagedAgents::new(client, &other.registry)?;
+        let record_path = other.registry.join(&other.name).join("agent.json");
+        let existing = match fs::read(&record_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot read {}: {error}",
+                    record_path.display()
+                )))
+            }
+        };
+        if let Some(bytes) = existing.as_ref() {
+            let record: Value = serde_json::from_slice(bytes)
+                .map_err(|error| fail(format!("invalid {}: {error}", record_path.display())))?;
+            if record["pane_id"] == pane.as_str() {
+                if dry_run {
+                    return Ok(json!({"action": "anchor", "dry_run": true}));
+                }
+                manager.anchor(&other.name, true, None)?;
+                return Ok(json!({"action": "anchored"}));
+            }
+            if dry_run {
+                return Ok(json!({"action": "re-adopt", "dry_run": true}));
+            }
+            let token = record["token"].as_str().map(str::to_owned);
+            manager.stop_with_options(
+                &other.name,
+                StopOptions {
+                    expected_token: token,
+                    retire_dead_adoption: true,
+                    expected_record_sha256: Some(format!("{:x}", Sha256::digest(bytes))),
+                    ..StopOptions::default()
+                },
+            )?;
+        } else if dry_run {
+            return Ok(json!({"action": "adopt", "dry_run": true}));
+        }
+        let workspace = coordinator["workspace_id"].as_str().unwrap_or_default();
+        let label = client.workspace_label(workspace)?;
+        manager.adopt(
+            &other.name,
+            AdoptOptions {
+                pane_id: pane.clone(),
+                expected_workspace: label,
+                cwd: PathBuf::from(coordinator["cwd"].as_str().unwrap_or_default()),
+                harness: coordinator["harness"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                session: None,
+            },
+        )?;
+        Ok(json!({"action": "adopted"}))
+    })();
+    let mut row = match result {
+        Ok(value) => value,
+        Err(error) => json!({"action": "refused", "reason": error.to_string()}),
+    };
+    row["registry"] = json!(other.registry);
+    row["name"] = json!(other.name);
+    row["pane_id"] = json!(pane);
+    row
+}
+
+fn systemctl(host: &dyn Host, verb: &str, unit: &str) -> CommandOutcome {
+    host.run(
+        &strings(&["systemctl", "--user", verb, unit]),
+        None,
+        Duration::from_secs(90),
+    )
+}
+
+/// The registered names, sorted; restore's own files never look like names.
+fn registered_names(registry: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    match fs::read_dir(registry) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| fail(error.to_string()))?;
+                if let Some(name) = entry.file_name().to_str() {
+                    if agent_name(name) && entry.path().join("agent.json").is_file() {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(fail(format!("cannot list {}: {error}", registry.display()))),
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Every boot id the registry's anchors were pinned under.
+fn anchored_boots(registry: &Path, names: &[String]) -> Vec<String> {
+    let mut boots = names
+        .iter()
+        .filter_map(|name| {
+            let bytes = fs::read(registry.join(name).join("agent.json")).ok()?;
+            let record: Value = serde_json::from_slice(&bytes).ok()?;
+            record["harness_identity"]["boot_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    boots.sort();
+    boots.dedup();
+    boots
+}
+
+fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
+    let rows = |key: &str| report[key].as_array().cloned().unwrap_or_default();
+    let mut agents = rows("agents");
+    if !report["coordinator"].is_null() {
+        agents.insert(0, report["coordinator"].clone());
+    }
+    let list = |action: &str, detail: &dyn Fn(&Value) -> String| {
+        let items = agents
+            .iter()
+            .filter(|row| row["action"] == action)
+            .map(|row| {
+                let name = row["name"].as_str().unwrap_or("?");
+                match detail(row) {
+                    text if text.is_empty() => name.to_owned(),
+                    text => format!("{name} {text}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            "none".to_owned()
+        } else {
+            items.join("; ")
+        }
+    };
+    let pane = |row: &Value| format!("-> {}", row["pane_id"].as_str().unwrap_or("?"));
+    let reason = |row: &Value| {
+        format!(
+            "({})",
+            row["reason"].as_str().unwrap_or("no reason recorded")
+        )
+    };
+    let units = rows("units")
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {}",
+                row["unit"].as_str().unwrap_or("?"),
+                row["action"].as_str().unwrap_or("?")
+            )
+        })
+        .collect::<Vec<_>>();
+    let images = &report["slot_images"];
+    let mounted = images["mounted"].as_array().map_or(0, Vec::len);
+    let warnings = images["warnings"].as_array().map_or(0, Vec::len);
+    let registered = rows("also_registered")
+        .iter()
+        .map(|row| {
+            format!(
+                "{} in {} {}",
+                row["name"].as_str().unwrap_or("?"),
+                row["registry"].as_str().unwrap_or("?"),
+                row["action"].as_str().unwrap_or("?")
+            )
+        })
+        .collect::<Vec<_>>();
+    let lines = [
+        format!(
+            "[agentctl restore] The host restarted: boot {}{}.",
+            report["boot_id"].as_str().unwrap_or("?"),
+            boot_time.map_or_else(String::new, |time| format!(
+                ", kernel boot at Unix time {time}"
+            ))
+        ),
+        format!("Revived: {}.", list("revived", &pane)),
+        format!("Promoted: {}.", list("promoted", &pane)),
+        format!("Refused: {}.", list("refused", &reason)),
+        format!(
+            "Left as they were: {}.",
+            list("skipped", &|_| String::new())
+        ),
+        format!(
+            "Coordinator registered elsewhere: {}.",
+            if registered.is_empty() {
+                "none".to_owned()
+            } else {
+                registered.join("; ")
+            }
+        ),
+        format!(
+            "Units: {}.",
+            if units.is_empty() {
+                "none".to_owned()
+            } else {
+                units.join("; ")
+            }
+        ),
+        format!(
+            "Slot images: {} {mounted} remounted, {warnings} not mounted.",
+            images["action"].as_str().unwrap_or("?")
+        ),
+        "Session crons and background shells did not survive; re-create them from your notes."
+            .to_owned(),
+        format!("Report: {}", path.display()),
+    ];
+    lines.join("\n")
+}
+
+/// Run the restore and return its report; the report is also written unless `dry_run`.
+pub fn restore<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &RestoreOptions,
+) -> Result<Value> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(registry)
+        .map_err(|error| fail(format!("cannot create {}: {error}", registry.display())))?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(registry.join(".restore.lock"))
+        .map_err(|error| fail(format!("cannot open the restore lock: {error}")))?;
+    // A second restore waits for the first, then finds its completed report and stops.
+    lock.lock_exclusive()
+        .map_err(|error| fail(format!("cannot take the restore lock: {error}")))?;
+    let boot_id = host.boot_id()?;
+    let path = report_path(config, &boot_id)?;
+    if !options.force && !options.dry_run {
+        if let Some(previous) = read_report(&path) {
+            if previous["complete"] == true {
+                return Ok(json!({
+                    "schema": REPORT_SCHEMA,
+                    "boot_id": boot_id,
+                    "action": "already-restored",
+                    "report": path,
+                }));
+            }
+        }
+    }
+    let names = registered_names(registry)?;
+    let boots = anchored_boots(registry, &names);
+    let mut report = json!({
+        "schema": REPORT_SCHEMA,
+        "boot_id": boot_id,
+        "boot_time": host.boot_time(),
+        "previous_boots": boots.iter().filter(|boot| **boot != boot_id).collect::<Vec<_>>(),
+        "started_at": host.now(),
+        "dry_run": options.dry_run,
+        "report": path,
+    });
+    let project = registry.parent().unwrap_or(registry);
+    report["slot_images"] = if options.dry_run {
+        json!({"action": "skipped", "reason": "dry run"})
+    } else {
+        remount_slot_images(host, options.wrkslots.as_deref(), project)
+    };
+    report["herdr"] = wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
+    let herdr_ready = report["herdr"]["ready"] == true;
+    let manager = ManagedAgents::new(client, registry)?;
+    let mut coordinator_ok = config.coordinator.is_none();
+    if herdr_ready {
+        if let Some(name) = config.coordinator.as_deref() {
+            let row = if names.iter().any(|known| known == name) {
+                recover_agent(&manager, name, options)
+            } else {
+                json!({"name": name, "action": "refused", "reason": "the coordinator is not registered"})
+            };
+            coordinator_ok = matches!(
+                row["action"].as_str(),
+                Some("revived" | "promoted" | "skipped" | "revive" | "promote")
+            );
+            report["coordinator"] = row;
+            if coordinator_ok {
+                let live = manager.status(name).unwrap_or(Value::Null);
+                report["also_registered"] = json!(config
+                    .also_registered
+                    .iter()
+                    .map(|other| register_elsewhere(client, other, &live, options.dry_run))
+                    .collect::<Vec<_>>());
+            }
+        }
+        let mut agents = Vec::new();
+        for name in names
+            .iter()
+            .filter(|name| config.coordinator.as_deref() != Some(name.as_str()))
+        {
+            let row = recover_agent(&manager, name, options);
+            let launched = matches!(row["action"].as_str(), Some("revived"));
+            agents.push(row);
+            if launched && config.startup_delay_seconds > 0 {
+                host.sleep(Duration::from_secs(config.startup_delay_seconds));
+            }
+        }
+        report["agents"] = json!(agents);
+    }
+    let mut units = Vec::new();
+    for unit in &config.units {
+        if options.dry_run {
+            units.push(json!({"unit": unit, "action": "start", "dry_run": true}));
+            continue;
+        }
+        let _ = systemctl(host, "reset-failed", unit);
+        let started = systemctl(host, "start", unit);
+        units.push(json!({
+            "unit": unit,
+            "action": if started.status == Some(0) { "started" } else { "failed" },
+            "detail": if started.status == Some(0) { Value::Null } else { json!(started.stderr.trim()) },
+        }));
+    }
+    report["units"] = json!(units);
+    let refused = report["agents"].as_array().map_or(0, |rows| {
+        rows.iter().filter(|row| row["action"] == "refused").count()
+    });
+    report["refused"] = json!(refused);
+    report["complete"] = json!(herdr_ready && coordinator_ok && !options.dry_run);
+    report["notice"] = Value::Null;
+    if !options.dry_run && herdr_ready && coordinator_ok {
+        if let Some(name) = config.coordinator.as_deref() {
+            let text = notice_text(&report, host.boot_time(), &path);
+            let message_id = format!("restore-{}", &boot_id[..8.min(boot_id.len())]);
+            let options = DrainOptions {
+                ready_timeout: Duration::from_secs(60),
+                deliver_while_working: true,
+                ..DrainOptions::default()
+            };
+            report["notice"] = match manager.send_identified(
+                name,
+                &text,
+                options,
+                Some(&message_id),
+            ) {
+                Ok(result) => {
+                    json!({"message_id": message_id, "outcome": json!(result)["outcome"]})
+                }
+                Err(error) => {
+                    json!({"message_id": message_id, "outcome": "not-queued", "detail": error.to_string()})
+                }
+            };
+        }
+    }
+    report["finished_at"] = json!(host.now());
+    if !options.dry_run {
+        write_report(&path, &report)?;
+    }
+    drop(lock);
+    Ok(report)
+}
+
+/// How `agentctl watch` was asked to run.
+#[derive(Clone, Debug)]
+pub struct WatchOptions {
+    /// Seconds between two passes.
+    pub interval: Duration,
+    /// Run one pass, print it, and exit.
+    pub once: bool,
+    /// Report only: start, restart, reset, and remount nothing.
+    pub check_only: bool,
+    /// The slot manager, when the project configures one.
+    pub wrkslots: Option<PathBuf>,
+    /// Where `health.json` is written (default `$XDG_STATE_HOME/agentctl/watch`).
+    pub state_dir: Option<PathBuf>,
+}
+
+/// Seconds a finding waits before the coordinator is told about it again.
+const REALERT_SECONDS: f64 = 3600.0;
+/// Seconds after boot before a missing restore report is a finding.
+const RESTORE_GRACE_SECONDS: u64 = 900;
+
+fn finding(
+    check: &str,
+    subject: &str,
+    ok: bool,
+    detail: impl Into<String>,
+    repair: Value,
+) -> Value {
+    json!({"check": check, "subject": subject, "ok": ok, "detail": detail.into(), "repair": repair})
+}
+
+/// Parse `systemctl show --timestamp=unix` `KEY=VALUE` lines.
+fn properties(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn show(host: &dyn Host, unit: &str, keys: &[&str]) -> BTreeMap<String, String> {
+    let mut argv = strings(&["systemctl", "--user", "show", unit, "--timestamp=unix"]);
+    for key in keys {
+        argv.push("-p".to_owned());
+        argv.push((*key).to_owned());
+    }
+    properties(&host.run(&argv, None, Duration::from_secs(30)).stdout)
+}
+
+/// Why a timer is not keeping its schedule, or `None` when it is.
+fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> Option<String> {
+    let state = show(
+        host,
+        &timer.unit,
+        &[
+            "ActiveState",
+            "NextElapseUSecRealtime",
+            "NextElapseUSecMonotonic",
+            "LastTriggerUSec",
+        ],
+    );
+    let active = state.get("ActiveState").map(String::as_str).unwrap_or("");
+    if active != "active" {
+        return Some(format!(
+            "timer is {}",
+            if active.is_empty() { "unknown" } else { active }
+        ));
+    }
+    let scheduled = |key: &str| {
+        state
+            .get(key)
+            .is_some_and(|value| !value.is_empty() && value != "infinity" && value != "0")
+    };
+    if !scheduled("NextElapseUSecRealtime") && !scheduled("NextElapseUSecMonotonic") {
+        return Some("timer is active but will never fire again (no next elapse)".to_owned());
+    }
+    let last = state
+        .get("LastTriggerUSec")
+        .and_then(|value| value.strip_prefix('@'))
+        .and_then(|value| value.parse::<f64>().ok());
+    match last {
+        Some(last) if host.now() - last > timer.max_age_seconds as f64 => Some(format!(
+            "last fired {:.0} seconds ago, more than {}",
+            host.now() - last,
+            timer.max_age_seconds
+        )),
+        None if host
+            .boot_time()
+            .is_some_and(|boot| host.now() - boot as f64 > timer.max_age_seconds as f64) =>
+        {
+            Some("has not fired since boot".to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// One pass of checks, repairs, and findings.
+pub fn watch_once<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &WatchOptions,
+) -> Vec<Value> {
+    let mut findings = Vec::new();
+    let herdr_up = client.panes().is_ok();
+    if herdr_up {
+        findings.push(finding("herdr", "server", true, "answers", Value::Null));
+    } else {
+        let repair = config.herdr_unit.as_deref().filter(|_| !options.check_only).map(|unit| {
+            let outcome = systemctl(host, "start", unit);
+            json!({"action": format!("systemctl --user start {unit}"), "status": outcome.status})
+        });
+        let recovered = repair.is_some() && client.panes().is_ok();
+        findings.push(finding(
+            "herdr",
+            "server",
+            recovered,
+            if recovered {
+                "was down; started"
+            } else {
+                "does not answer"
+            },
+            repair.unwrap_or(Value::Null),
+        ));
+    }
+    for unit in &config.units {
+        let active = |host: &dyn Host| {
+            show(host, unit, &["ActiveState"])
+                .get("ActiveState")
+                .map(String::as_str)
+                == Some("active")
+        };
+        if active(host) {
+            findings.push(finding("unit", unit, true, "active", Value::Null));
+            continue;
+        }
+        if options.check_only {
+            findings.push(finding("unit", unit, false, "not active", Value::Null));
+            continue;
+        }
+        let _ = systemctl(host, "reset-failed", unit);
+        let started = systemctl(host, "start", unit);
+        let recovered = active(host);
+        findings.push(finding(
+            "unit",
+            unit,
+            recovered,
+            if recovered { "was not active; started".to_owned() } else { format!("not active: {}", started.stderr.trim()) },
+            json!({"action": format!("systemctl --user reset-failed {unit} && systemctl --user start {unit}"), "status": started.status}),
+        ));
+    }
+    for timer in &config.timers {
+        let Some(problem) = timer_problem(host, timer) else {
+            findings.push(finding(
+                "timer",
+                &timer.unit,
+                true,
+                "keeps its schedule",
+                Value::Null,
+            ));
+            continue;
+        };
+        if options.check_only {
+            findings.push(finding("timer", &timer.unit, false, problem, Value::Null));
+            continue;
+        }
+        let _ = systemctl(host, "restart", &timer.unit);
+        let mut repair = vec![format!("systemctl --user restart {}", timer.unit)];
+        let mut remaining = timer_problem(host, timer);
+        if remaining.is_some() {
+            // A timer whose only trigger counts from its service's last run has no base until
+            // that service runs once in this service manager.
+            if let Some(service) = show(host, &timer.unit, &["Triggers"])
+                .get("Triggers")
+                .filter(|value| unit_name(value))
+            {
+                let _ = systemctl(host, "start", service);
+                repair.push(format!("systemctl --user start {service}"));
+                remaining = timer_problem(host, timer);
+            }
+        }
+        findings.push(finding(
+            "timer",
+            &timer.unit,
+            remaining.is_none(),
+            match remaining {
+                None => format!("{problem}; repaired"),
+                Some(still) => still,
+            },
+            json!({"actions": repair}),
+        ));
+    }
+    let project = registry.parent().unwrap_or(registry);
+    // Any wrkslots command remounts, so a check-only pass leaves slot images alone.
+    if let Some(wrkslots) = options.wrkslots.as_deref().filter(|_| !options.check_only) {
+        let images = remount_slot_images(host, Some(wrkslots), project);
+        let ok = images["action"] == "ran";
+        findings.push(finding(
+            "slot-images",
+            "wrkslots",
+            ok,
+            if ok {
+                format!(
+                    "{} remounted",
+                    images["mounted"].as_array().map_or(0, Vec::len)
+                )
+            } else {
+                format!("{}", images["warnings"])
+            },
+            images,
+        ));
+    }
+    if let Ok(boot_id) = host.boot_id() {
+        let complete = report_path(config, &boot_id)
+            .ok()
+            .and_then(|path| read_report(&path))
+            .is_some_and(|report| report["complete"] == true);
+        let early = host
+            .boot_time()
+            .is_some_and(|boot| host.now() - (boot as f64) < RESTORE_GRACE_SECONDS as f64);
+        if config.coordinator.is_some() {
+            findings.push(finding(
+                "restore",
+                &boot_id,
+                complete || early,
+                if complete {
+                    "this boot's restore completed"
+                } else if early {
+                    "boot is recent; restore may still run"
+                } else {
+                    "no completed restore report for this boot"
+                },
+                Value::Null,
+            ));
+        }
+    }
+    if let (Some(name), true) = (config.coordinator.as_deref(), herdr_up) {
+        if let Ok(manager) = ManagedAgents::new(client, registry) {
+            let plan = manager.revive(name, true, None, Duration::from_secs(30));
+            let alive = plan.as_ref().is_ok_and(|plan| {
+                plan["action"] == "skip"
+                    && plan["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("alive"))
+            });
+            findings.push(finding(
+                "coordinator",
+                name,
+                alive,
+                match &plan {
+                    Ok(plan) if alive => "harness alive".to_owned(),
+                    Ok(plan) => format!(
+                        "{}: {}",
+                        plan["action"].as_str().unwrap_or("?"),
+                        plan["reason"].as_str().unwrap_or("dead")
+                    ),
+                    Err(error) => error.to_string(),
+                },
+                Value::Null,
+            ));
+        }
+    }
+    findings
+}
+
+fn health_path(options: &WatchOptions) -> Option<PathBuf> {
+    options
+        .state_dir
+        .clone()
+        .or_else(|| {
+            default_report_dir().and_then(|dir| dir.parent().map(|parent| parent.join("watch")))
+        })
+        .map(|dir| dir.join("health.json"))
+}
+
+/// Tell the coordinator about failing findings, each at most once an hour, when it can hear.
+fn alert<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    config: &RestoreConfig,
+    host: &dyn Host,
+    findings: &[Value],
+    alerted: &mut BTreeMap<String, f64>,
+) -> Value {
+    let now = host.now();
+    let due = findings
+        .iter()
+        .filter(|row| row["ok"] == false)
+        .filter(|row| {
+            let key = format!(
+                "{}:{}",
+                row["check"].as_str().unwrap_or(""),
+                row["subject"].as_str().unwrap_or("")
+            );
+            alerted
+                .get(&key)
+                .is_none_or(|last| now - last >= REALERT_SECONDS)
+        })
+        .collect::<Vec<_>>();
+    if due.is_empty() {
+        return json!({"sent": false, "reason": "nothing new to report"});
+    }
+    let coordinator_alive = findings
+        .iter()
+        .any(|row| row["check"] == "coordinator" && row["ok"] == true);
+    let Some(name) = config.coordinator.as_deref().filter(|_| coordinator_alive) else {
+        return json!({"sent": false, "reason": "the coordinator cannot hear: Herdr is down, it is dead, or none is configured"});
+    };
+    let lines = due
+        .iter()
+        .map(|row| {
+            format!(
+                "- {} {}: {}",
+                row["check"].as_str().unwrap_or("?"),
+                row["subject"].as_str().unwrap_or("?"),
+                row["detail"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>();
+    let text = format!(
+        "[agentctl watch] {} problem(s) it could not repair:\n{}",
+        due.len(),
+        lines.join("\n")
+    );
+    let message_id = format!("watch-{}", now as u64);
+    let result = ManagedAgents::new(client, registry).and_then(|manager| {
+        manager.send_identified(
+            name,
+            &text,
+            DrainOptions {
+                ready_timeout: Duration::from_secs(30),
+                deliver_while_working: true,
+                ..DrainOptions::default()
+            },
+            Some(&message_id),
+        )
+    });
+    for row in &due {
+        let key = format!(
+            "{}:{}",
+            row["check"].as_str().unwrap_or(""),
+            row["subject"].as_str().unwrap_or("")
+        );
+        alerted.insert(key, now);
+    }
+    match result {
+        Ok(result) => {
+            json!({"sent": true, "message_id": message_id, "outcome": json!(result)["outcome"]})
+        }
+        Err(error) => json!({"sent": false, "message_id": message_id, "reason": error.to_string()}),
+    }
+}
+
+/// Run the watch: one pass with `once`, otherwise forever, one pass per interval.
+pub fn watch<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &WatchOptions,
+) -> Result<Value> {
+    let path = health_path(options);
+    let mut alerted: BTreeMap<String, f64> = path
+        .as_deref()
+        .and_then(read_report)
+        .and_then(|previous| serde_json::from_value(previous["alerted"].clone()).ok())
+        .unwrap_or_default();
+    let mut pass: u64 = 0;
+    loop {
+        // Every wrkslots command loads the whole slot registry, so slot images are checked on
+        // the first pass and then every tenth.
+        let pass_options = WatchOptions {
+            wrkslots: options.wrkslots.clone().filter(|_| pass % 10 == 0),
+            ..options.clone()
+        };
+        pass += 1;
+        let findings = watch_once(client, registry, host, config, &pass_options);
+        let notice = if options.check_only {
+            json!({"sent": false, "reason": "check only"})
+        } else {
+            alert(client, registry, config, host, &findings, &mut alerted)
+        };
+        for row in findings.iter().filter(|row| row["ok"] == false) {
+            eprintln!(
+                "agentctl watch: {} {}: {}",
+                row["check"].as_str().unwrap_or("?"),
+                row["subject"].as_str().unwrap_or("?"),
+                row["detail"].as_str().unwrap_or("")
+            );
+        }
+        let health = json!({
+            "schema": "agentctl-watch-health/v1",
+            "checked_at": host.now(),
+            "boot_id": host.boot_id().ok(),
+            "ok": findings.iter().all(|row| row["ok"] == true),
+            "findings": findings,
+            "notice": notice,
+            "alerted": alerted,
+        });
+        if let Some(path) = path.as_deref() {
+            if let Err(error) = write_report(path, &health) {
+                eprintln!("agentctl watch: {error}");
+            }
+        }
+        if options.once {
+            return Ok(health);
+        }
+        host.sleep(options.interval);
+    }
+}

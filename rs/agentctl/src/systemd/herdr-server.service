@@ -1,0 +1,22 @@
+# Installed by `agentctl install-units`. The Herdr terminal server, started at boot.
+#
+# With lingering enabled (`loginctl enable-linger`), this starts without a login. The server
+# reloads its saved layout; it never restarts agents itself (keep `resume_agents_on_restore =
+# false` in Herdr's config.toml), because `agentctl restore` replays each agent's exact launch.
+[Unit]
+Description=Herdr terminal server for agent panes
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# A login shell gives the server, and every pane it starts, the account's ordinary environment
+# instead of the service manager's minimal one.
+ExecStart=/bin/bash -lc 'exec "$$0" server' @HERDR@
+# A server restart must not kill the agents running in its panes.
+KillMode=process
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

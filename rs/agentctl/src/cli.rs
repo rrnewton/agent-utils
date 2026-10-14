@@ -95,6 +95,21 @@ enum Commands {
     /// Mark a launch_failed record running when its harness is in fact live: Herdr reports the launched harness in the recorded pane, tab, workspace and cwd, the Herdr agent name still points there, and the harness is the pane's only foreground process. Pins that process and terminal; never touches the tab, pane, or process. Use it when a readiness wait timed out on a harness that runs fine
     #[command(after_help = "Example: agentctl promote reviewer")]
     Promote(Promote),
+    /// Bring the coordinator team back after the host restarts: remount slot images, wait for Herdr, revive the coordinator and then every dead agent from its launch spec, register the coordinator's new pane in other registries, start the configured units, and queue one recovery notice. Idempotent; writes a JSON report for the boot
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator, also_registered\n([{registry, name}]), units, startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, and timers (used by watch).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal, 75 otherwise; every step and refusal is in the report."
+    )]
+    Restore(Restore),
+    /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr with start limits that survive a slow boot. Never enables, starts, or reloads anything
+    #[command(
+        after_help = "Example:\n  agentctl --registry ~/project/.agentctl --herdr-bin ~/bin/herdr install-units --dest ~/.config/systemd/user --bridge-unit chat-bridge.service --dry-run\n\nPaths are rendered absolute: --agentctl (default: this executable), --herdr-bin (looked up on PATH\nwhen it is a bare name), and --registry. A file that exists with different contents is refused\nunless --force. The output lists the files and the systemctl commands an operator runs next."
+    )]
+    InstallUnits(InstallUnits),
+    /// Check and repair, every interval: the Herdr server (start herdr_unit), each configured unit (reset-failed and start), each configured timer (restart it; start its service when it still never fires), slot images (wrkslots image status, on the first pass and every tenth), this boot's restore, and the coordinator's harness. Writes health.json and tells the coordinator, at most hourly per problem, about anything it could not repair
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n\nConfiguration is REGISTRY/restore.json (herdr_unit, units, timers [{unit, max_age_seconds}],\ncoordinator). health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch). With --once,\nexit 0 when every check passed and 1 otherwise. Without it the watch runs until stopped."
+    )]
+    Watch(Watch),
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
@@ -177,6 +192,57 @@ enum Commands {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+struct Restore {
+    /// Mark the report as the boot hook's run (agent-restore.service passes it)
+    #[arg(long)]
+    boot: bool,
+    /// Run even when this boot's report already says the restore completed
+    #[arg(long)]
+    force: bool,
+    /// Report what would be done without reviving, promoting, registering, starting units, notifying, or writing a report
+    #[arg(long)]
+    dry_run: bool,
+    /// Startup-readiness deadline for each revived harness in seconds, greater than 0 and at most 300 (default: 30)
+    #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
+    startup_timeout: f64,
+}
+
+#[derive(Args)]
+struct InstallUnits {
+    /// Directory to write the units into, normally ~/.config/systemd/user (required)
+    #[arg(long, value_name = "DIR")]
+    dest: PathBuf,
+    /// The agentctl executable the units run (default: this executable)
+    #[arg(long, value_name = "PATH")]
+    agentctl: Option<PathBuf>,
+    /// The chat bridge unit to order after the Herdr server; writes UNIT.d/zz-agentctl-after-herdr.conf, named to sort after numbered drop-ins
+    #[arg(long, value_name = "UNIT")]
+    bridge_unit: Option<String>,
+    /// List what would be written without writing
+    #[arg(long)]
+    dry_run: bool,
+    /// Replace existing files whose contents differ
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct Watch {
+    /// Seconds between passes, from 10 to 3600 (default: 60)
+    #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
+    interval: u64,
+    /// Run one pass, print it as JSON, and exit
+    #[arg(long)]
+    once: bool,
+    /// Report only: start, restart, reset-failed, and remount nothing, and send no alert
+    #[arg(long)]
+    check_only: bool,
+    /// Directory for health.json (default: $XDG_STATE_HOME/agentctl/watch)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -1152,6 +1218,86 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             )
             .map_err(Failure::Inbox);
         }
+        Commands::Restore(value) => {
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
+                .map_err(AgentError::from)?;
+            let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            let mut report = crate::restore::restore(
+                &client,
+                &args.registry,
+                &crate::restore::SystemHost,
+                &config,
+                &crate::restore::RestoreOptions {
+                    force: value.force,
+                    dry_run: value.dry_run,
+                    startup_timeout: Duration::from_secs_f64(value.startup_timeout),
+                    wrkslots: crate::subagents::project_wrkslots(&args.registry),
+                },
+            )?;
+            report["trigger"] = json!(if value.boot { "boot" } else { "manual" });
+            write_json(&report).map_err(Failure::Output)?;
+            let done = report["action"] == "already-restored"
+                || (report["complete"] == true && report["refused"] == 0);
+            return Ok(if done || value.dry_run { 0 } else { 75 });
+        }
+        Commands::Watch(value) => {
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
+                .map_err(AgentError::from)?;
+            let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            let health = crate::restore::watch(
+                &client,
+                &args.registry,
+                &crate::restore::SystemHost,
+                &config,
+                &crate::restore::WatchOptions {
+                    interval: Duration::from_secs(value.interval),
+                    once: value.once,
+                    check_only: value.check_only,
+                    wrkslots: crate::subagents::project_wrkslots(&args.registry),
+                    state_dir: value.state_dir,
+                },
+            )?;
+            write_json(&health).map_err(Failure::Output)?;
+            return Ok(if health["ok"] == true { 0 } else { 1 });
+        }
+        Commands::InstallUnits(value) => {
+            let absolute = |path: &Path| {
+                std::path::absolute(path).map_err(|error| Failure::Usage(error.to_string()))
+            };
+            let herdr = if args.herdr_bin.components().count() == 1 {
+                std::env::var_os("PATH")
+                    .and_then(|path| {
+                        std::env::split_paths(&path)
+                            .map(|directory| directory.join(&args.herdr_bin))
+                            .find(|candidate| candidate.is_file())
+                    })
+                    .ok_or_else(|| {
+                        Failure::Usage(format!(
+                            "{} is not on PATH; pass --herdr-bin with an absolute path",
+                            args.herdr_bin.display()
+                        ))
+                    })?
+            } else {
+                absolute(&args.herdr_bin)?
+            };
+            let agentctl = match value.agentctl {
+                Some(path) => absolute(&path)?,
+                None => {
+                    std::env::current_exe().map_err(|error| Failure::Usage(error.to_string()))?
+                }
+            };
+            write_json(&crate::units::install(&crate::units::InstallOptions {
+                dest: value.dest,
+                agentctl,
+                herdr,
+                registry: absolute(&args.registry)?,
+                bridge_unit: value.bridge_unit,
+                dry_run: value.dry_run,
+                force: value.force,
+            })?)
+            .map_err(Failure::Output)?;
+            return Ok(0);
+        }
         Commands::Profiles(value) => {
             let root = crate::profiles::configuration_root(&value.cwd, &args.registry, true)?;
             let (path, profiles, workspace) = crate::profiles::load_configuration(&root, true)?;
@@ -1538,7 +1684,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Inbox(_)
         | Commands::Profiles(_)
         | Commands::Skill(_)
-        | Commands::CodexGoal(_) => {
+        | Commands::CodexGoal(_)
+        | Commands::Restore(_)
+        | Commands::InstallUnits(_)
+        | Commands::Watch(_) => {
             unreachable!()
         }
     };

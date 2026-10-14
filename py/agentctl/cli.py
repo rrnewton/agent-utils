@@ -232,6 +232,15 @@ def parser() -> argparse.ArgumentParser:
     attach_self.add_argument("--workspace-id", metavar="ID", help="existing Herdr workspace ID")
     attach_self.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="viewer startup deadline, greater than 0 and at most 300 seconds (default: 30)")
+    for rust_only, purpose, example in (
+        ("restore", "Bring the coordinator team back after the host restarts (Rust edition only; this edition refuses).",
+         "agentctl --registry ~/project/.agentctl restore --dry-run"),
+        ("install-units", "Write the user units that restore the team at boot (Rust edition only; this edition refuses).",
+         "agentctl install-units --dest ~/.config/systemd/user --dry-run"),
+        ("watch", "Check and repair Herdr, configured units and timers, and slot images (Rust edition only; this "
+         "edition refuses).", "agentctl watch --once --check-only"),
+    ):
+        command(rust_only, purpose, example)
     for name, purpose in (
         ("attach", "Focus the session's terminal for direct inspection and interaction."),
         ("pause", "Pause automated input while allowing an active turn to finish."),
@@ -296,6 +305,10 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
     return [str(item) for item in value]
 
 
+#: Commands only the Rust edition implements; this edition refuses them with exit status 2.
+_RUST_ONLY = ("restore", "install-units", "watch")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the unified interface with explicit outcome exit statuses."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -316,6 +329,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings.error("--herdr-bin applies to session commands; Chat uses its configured target adapter")
         from agentctl.chat import run_cli as chat_main
         return chat_main(arguments[command_index + 1:], default_state=Path(prefix.registry) / ".chat")
+    if (command_index < len(arguments) and arguments[command_index] in _RUST_ONLY
+            and not {"-h", "--help"} & set(arguments[command_index + 1:])):
+        print(f"agentctl: {arguments[command_index]} is implemented only by the Rust edition of agentctl; "
+              "run it with the Rust agentctl (for example DAGRUN_ENGINE=rust)", file=sys.stderr)
+        return 2
     root = parser()
     args = root.parse_args(arguments)
     if args.userguide or args.command == "userguide":

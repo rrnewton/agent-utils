@@ -1,0 +1,17 @@
+# Installed by `agentctl install-units`. Restores the coordinator team once per boot.
+#
+# `agentctl restore` is idempotent: it exits at once when this boot's report already says the
+# restore completed, revives only dead agents, and queues one recovery notice per boot.
+[Unit]
+Description=Restore the agentctl coordinator team after boot
+Requires=herdr-server.service
+After=herdr-server.service
+
+[Service]
+Type=oneshot
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ restore --boot
+# Reviving each agent can take its startup deadline plus the configured delay between agents.
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=default.target

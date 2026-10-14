@@ -529,6 +529,98 @@ marks the record `running`; it never touches the tab, pane, or process. A
 harness busy running a tool has several foreground processes; rerun at a quiet
 moment.
 
+### Restore a team after the host restarts (Rust edition)
+
+After a reboot every harness is gone, the Herdr server may not be running, and
+a chat bridge that started before Herdr may have given up. `agentctl restore`
+brings a coordinator and its agents back in one idempotent command:
+
+```sh
+agentctl --registry ~/project/.agentctl restore --dry-run
+agentctl --registry ~/project/.agentctl restore
+```
+
+In order, it:
+
+1. holds `REGISTRY/.restore.lock`, so a boot unit and a manual run never overlap:
+   the second waits for the first, then finds its completed report;
+2. exits 0 at once when this boot's report already says the restore completed
+   (`--force` runs it again);
+3. runs `wrkslots image status` once, before any agent starts, because every
+   wrkslots command remounts image-backed slots; a mount failure is only a
+   warning with exit status 0, so the report records the warning lines;
+4. waits for the Herdr server (`herdr_wait_seconds`, default 300);
+5. revives the coordinator from its launch spec, then makes every registry in
+   `also_registered` name its new pane: the same pane has its anchors replaced,
+   and an adopted record left on the old pane is retired (bound to its exact
+   token and bytes) and the live pane adopted under the same name;
+6. revives every other dead agent one at a time, waiting
+   `startup_delay_seconds` (default 20) after each launch, promotes each live
+   `launch_failed` record, and records every refusal with its reason; a live
+   harness is left alone, which is what makes reruns safe;
+7. runs `systemctl --user reset-failed` and `start` for each of `units`;
+8. queues one recovery notice for the coordinator (message ID
+   `restore-` and the first 8 characters of the boot ID, so it is sent once per
+   boot): what was revived and where, what was promoted or refused and why, the
+   units, the slot images, and the report path.
+
+The report is `REPORT_DIR/BOOT_ID.json` (default
+`$XDG_STATE_HOME/agentctl/restore`). Exit status is 0 when the restore completed
+with no refusal, 75 otherwise. `--boot` marks the report as the boot unit's run.
+
+The configuration is `REGISTRY/restore.json`; every key is optional except the
+schema:
+
+```json
+{
+  "schema": "agentctl-restore/v1",
+  "coordinator": "coordinator",
+  "also_registered": [{"registry": "/home/me/.local/state/bridge/registry", "name": "coordinator"}],
+  "units": ["chat-bridge.service"],
+  "startup_delay_seconds": 20,
+  "herdr_wait_seconds": 300,
+  "report_dir": "/home/me/.local/state/agentctl/restore",
+  "herdr_unit": "herdr-server.service",
+  "timers": [{"unit": "health-tick.timer", "max_age_seconds": 5400}]
+}
+```
+
+Session-scoped crons and background shells do not survive a restart; the notice
+says so, and the coordinator re-creates them.
+
+`agentctl install-units --dest ~/.config/systemd/user` writes the units that run
+this at boot, rendering absolute paths for this executable (`--agentctl`), Herdr
+(`--herdr-bin`), and the registry: `herdr-server.service` (the Herdr server in a
+login shell, `KillMode=process` so a server restart keeps agents running),
+`agent-restore.service` (a oneshot after the server that runs `restore --boot`),
+`agent-watch.service`, and, with `--bridge-unit UNIT`, a drop-in that orders the
+bridge after the server with a start limit that survives a slow boot (one try
+every 10 seconds for up to 15 minutes), named `zz-agentctl-after-herdr.conf` so it
+sorts after numbered drop-ins that set their own start limits. It refuses to replace a file that
+differs unless `--force`, supports `--dry-run`, and never enables, starts, or
+reloads anything; its output lists the `systemctl --user` commands to run after
+review. Keep `resume_agents_on_restore = false` in Herdr's configuration: Herdr
+knows each agent's kind and session, never its flags.
+
+`agentctl watch` runs as a service and, every `--interval` seconds (default 60),
+checks and repairs:
+
+| check | repair |
+|---|---|
+| the Herdr server answers | `systemctl --user start` the `herdr_unit` |
+| each of `units` is active | `reset-failed`, then `start` |
+| each of `timers` is active, will fire again, and fired within `max_age_seconds` | `restart` the timer; if it still never fires, start the service it triggers once, which gives a timer that counts from its service's last run a base again |
+| slot images are mounted (first pass, then every tenth) | `wrkslots image status` |
+| this boot's restore completed (after 15 minutes of uptime) | none |
+| the coordinator's harness is alive | none; reviving is restore's job |
+
+Each pass writes `health.json` (default `$XDG_STATE_HOME/agentctl/watch`) and
+logs every unrepaired finding to standard error, which the service journal
+keeps. When the coordinator can hear, the watch also queues it one message per
+pass listing unrepaired findings it has not reported in the last hour.
+`--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
+`--check-only` repairs, remounts, and sends nothing.
+
 ### Adopt an existing Herdr agent
 
 An agent that is already running in Herdr can join the same named registry

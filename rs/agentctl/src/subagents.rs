@@ -3874,6 +3874,15 @@ const RELAY_WORKING_MARKER: &str = "esc to interrupt";
 /// Environment variable naming the wrkslots executable, overriding `PATH`.
 pub const WRKSLOTS_BIN_ENV: &str = "AGENTCTL_WRKSLOTS_BIN";
 
+/// The project's slot manager: `AGENTCTL_WRKSLOTS_BIN`, then the `wrkslots` key of the project's
+/// `.agentctl/profiles.json`, then `wrkslots` on PATH.
+pub(crate) fn project_wrkslots(registry: &Path) -> Option<PathBuf> {
+    revive::configured_wrkslots(registry)
+        .ok()
+        .flatten()
+        .or_else(wrkslots_executable)
+}
+
 fn wrkslots_executable() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os(WRKSLOTS_BIN_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(value));
@@ -15942,6 +15951,8 @@ pub(crate) mod tests {
     mod nested;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
+    /// `agentctl restore` and `agentctl watch` against the fake Herdr and a scripted host.
+    mod restore;
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;
     /// Trusted stop refusals and generation-bound recovery advice.

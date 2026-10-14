@@ -1,0 +1,18 @@
+# Installed by `agentctl install-units`. Keeps the Herdr server, the configured units (the chat
+# bridge), slot images, and the configured timers alive, and raises an alarm about anything it
+# cannot repair.
+#
+# Deliberately not ordered after herdr-server.service: the watch must run, and report, while the
+# Herdr server is down.
+[Unit]
+Description=Watch and repair the agentctl coordinator environment
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ watch
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

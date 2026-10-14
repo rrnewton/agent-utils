@@ -148,6 +148,35 @@ that a restart loses nothing. It deliberately stores notices only. Detecting
 idle workers and choosing work for them stay with the caller: a watcher, the
 coordinator, or a person.
 
+## Restoring a team after a restart
+
+Reviewed 2026-10-14 for `agentctl restore`, `install-units`, and `watch`, from
+public documentation; the licenses were not re-checked for this section.
+
+- [tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) and
+  [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum) save tmux
+  windows, panes, and working directories, and restore them after a restart.
+  Restarting the programs inside the panes is opt-in per program, from the
+  command line `ps` reports, and continuum can start tmux at boot. They restore
+  a layout; they know nothing about a program's conversation identity or whether
+  the program that comes back is the one that was there.
+- systemd itself: user units with lingering start without a login,
+  `After=`/`Wants=` order a client after its server, `StartLimitIntervalSec=` and
+  `StartLimitBurst=` bound restarts, and `WatchdogSec=` restarts a service that
+  stops pinging. A timer whose only trigger is `OnUnitInactiveSec=` has no base
+  after the service manager restarts until its service runs once, and an empty
+  assignment to any monotonic trigger resets all of them (`systemd.timer(5)`).
+- [Monit](https://mmonit.com/monit/) and supervisord check processes, files and
+  services on an interval, restart what failed, and alert when a restart does
+  not help or keeps happening.
+
+**Implication:** a layout restore is not enough for agents, because a revived
+harness must resume the same conversation with the same flags, and nothing in a
+terminal layout records either. `restore` therefore replays each agent's launch
+spec and proves the old process dead first, and the watch follows the Monit
+model (check, repair, then alert) for the services around the agents, including
+the timer failure systemd's own semantics make silent.
+
 ## Lifecycle guarantees and component boundaries
 
 `agentctl` separates the caller (CLI, MCP, or Chat), the named-session manager,

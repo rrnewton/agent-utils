@@ -18,10 +18,12 @@ pub mod legacy_cli;
 pub mod plugins;
 pub(crate) mod profiles;
 pub(crate) mod prompt_time;
+pub mod restore;
 pub(crate) mod skill_install;
 pub mod stale_composer;
 pub mod subagents;
 pub mod submission;
+pub mod units;
 
 /// Reference for the canonical command and its supported adapters.
 pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");
