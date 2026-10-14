@@ -27,13 +27,16 @@
 //! # A read that fails
 //!
 //! A thread whose read fails waits for the next read, with every thread behind it, and is read
-//! again from the same place, so a failure loses no reply. A thread that is gone (`404`) is
-//! forgotten. Slack answers a failure on its side (`internal_error`, `request_timeout`,
-//! `service_unavailable`, ...) as HTTP 200 with `ok: false`, as it answers a refusal, and a bridge
-//! answers a command that failed or timed out the same way, so any failure is retried. Only a
-//! thread whose reads fail [`LIVE_FAILED_READS`] times in a row, other than for a moment (a lost
-//! connection, a rate limit, a 5xx), is given up: taken as read to what its root said, its replies
-//! left to the thread's and Flat's own reads.
+//! again from the same place, so a failure loses no reply and repeats none. Slack answers a failure
+//! on its side (`internal_error`, `request_timeout`, `service_unavailable`, ...) as HTTP 200 with
+//! `ok: false`, as it answers a refusal, and a bridge answers a command that failed or timed out the
+//! same way, so any failure is retried. A thread that reads as gone (`404`: `thread_not_found`,
+//! `channel_not_found`, `message_not_found`) is no exception, since a bridge may answer so for a
+//! command that failed for another reason; forgetting its place would read it again from the
+//! seeding read and report every reply since then a second time. Only a thread whose reads fail
+//! [`LIVE_FAILED_READS`] times in a row, other than for a moment (a lost connection, a rate limit,
+//! a 5xx), is given up: taken as read to what its root said, its replies left to the thread's and
+//! Flat's own reads.
 //!
 //! # What it does not report
 //!
@@ -367,16 +370,14 @@ impl HttpSlackClient {
                     }
                     held.settle(&thread);
                 }
-                Err(error) if matches!(error.cause(), ChatError::Status { status: 404, .. }) => {
-                    // The thread is gone: there is nothing more to read in it.
-                    held.places.remove(&thread.root);
-                }
                 Err(error) => {
                     // Slack answers a failure on its side (`internal_error`, `request_timeout`,
                     // ...) as HTTP 200 with `ok: false`, and so does a bridge for a command that
                     // failed or timed out, so a failure that does not read as a moment may be one.
-                    // The thread waits for the next read either way; only one that keeps failing
-                    // so is given up.
+                    // A `404` is no proof either: a bridge may answer `thread_not_found` for a
+                    // command that failed for another reason. The thread waits for the next read
+                    // either way, keeping its place, so no reply is reported twice; only one that
+                    // keeps failing so is given up.
                     let place = held
                         .places
                         .get_mut(&thread.root)

@@ -491,6 +491,108 @@ async fn a_thread_whose_replies_reads_keep_failing_is_given_up_after_a_bounded_r
     assert_eq!(poll.replies[0]["oldest"], ts(110, 0));
 }
 
+/// A `404` on a replies read (`thread_not_found`, or another code the client reads as one) does
+/// not prove the thread gone: a bridge may answer so for a command that failed for another reason.
+/// The thread keeps its place and is read again on the next poll from where the failed read
+/// started, so a reply delivered before the `404` is not delivered again, and none after it is
+/// lost.
+#[tokio::test]
+async fn a_replies_read_answered_404_once_neither_repeats_nor_loses_a_reply() {
+    for code in ["thread_not_found", "channel_not_found", "message_not_found"] {
+        let (state, root) = one_thread();
+        let fake = Fake::start(state, PAGE_CAP).await;
+        let client = fake.client();
+        let mut poller = Poller::new();
+        poller.poll(&fake, &client).await;
+        fake.with(|state| add_reply(state, CH, &root, &ts(100, 0), "delivered"));
+        let poll = poller.poll(&fake, &client).await;
+        assert_eq!(poll.texts(), ["delivered"], "{code}");
+
+        fake.with(|state| {
+            add_reply(state, CH, &root, &ts(110, 0), "after the 404");
+            state
+                .fail
+                .insert("conversations.replies".to_owned(), code.to_owned());
+        });
+        let failed = poller.poll(&fake, &client).await;
+        assert!(failed.published.is_empty(), "{code}");
+        assert_eq!(failed.replies.len(), 1, "{code}: the read was made");
+        assert!(
+            failed.tick.replies_behind,
+            "{code}: the thread waits for the next poll, and the tick says so"
+        );
+
+        fake.with(|state| state.fail.remove("conversations.replies"));
+        let next = poller.poll(&fake, &client).await;
+        assert_eq!(
+            next.texts(),
+            ["after the 404"],
+            "{code}: the reply after the 404 once, and the one before it not again"
+        );
+        assert_eq!(next.replies.len(), 1, "{code}");
+        assert_eq!(
+            next.replies[0]["oldest"],
+            ts(100, 0),
+            "{code}: read again from the reply last delivered"
+        );
+        assert!(!next.tick.replies_behind, "{code}");
+
+        let quiet = poller.poll(&fake, &client).await;
+        assert!(quiet.published.is_empty(), "{code}: published once");
+        assert!(quiet.replies.is_empty(), "{code}: and read once");
+    }
+}
+
+/// A thread whose replies reads keep answering `404` while its root is still on the newest page is
+/// given up after `LIVE_FAILED_READS` reads in a row, as any failure that does not read as a moment
+/// is, rather than read on every poll for as long as its root is listed. A later reply in it is
+/// read from where the poller stood, so nothing delivered before goes out again.
+#[tokio::test]
+async fn a_thread_whose_replies_reads_keep_answering_404_is_given_up_after_a_bounded_run() {
+    let (state, root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+    fake.with(|state| add_reply(state, CH, &root, &ts(100, 0), "delivered"));
+    assert_eq!(poller.poll(&fake, &client).await.texts(), ["delivered"]);
+
+    fake.with(|state| {
+        add_reply(state, CH, &root, &ts(110, 0), "missed by the live stream");
+        state.fail.insert(
+            "conversations.replies".to_owned(),
+            "thread_not_found".to_owned(),
+        );
+    });
+    let mut calls = Vec::new();
+    for n in 1..=2 * LIVE_FAILED_READS {
+        let poll = poller.poll(&fake, &client).await;
+        assert!(poll.published.is_empty(), "poll {n} publishes nothing");
+        assert_eq!(
+            poll.tick.replies_behind,
+            n < LIVE_FAILED_READS,
+            "poll {n}: waiting until the last read"
+        );
+        calls.push(poll.replies.len());
+    }
+    let bound = usize::try_from(LIVE_FAILED_READS).expect("a small bound");
+    let mut expected = vec![1; bound];
+    expected.resize(2 * bound, 0);
+    assert_eq!(
+        calls, expected,
+        "one replies call a poll up to the bound, then none while the root stays as it was"
+    );
+
+    fake.with(|state| {
+        state.fail.remove("conversations.replies");
+        add_reply(state, CH, &root, &ts(120, 0), "later");
+    });
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(poll.texts(), ["later"]);
+    assert_eq!(poll.replies.len(), 1);
+    assert_eq!(poll.replies[0]["oldest"], ts(110, 0));
+}
+
 /// A Slack deployment of one channel, whose messages are minutes old, so a catch-up of the last
 /// day sees them.
 mod voice {

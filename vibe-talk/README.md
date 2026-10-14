@@ -1241,7 +1241,9 @@ delivered, as before, so it costs that call as well. Every thread root on that p
   refusal, and a bridge answers a command that failed or timed out the same way, so every failure is
   retried. Only a thread whose reads fail three times in a row, other than for a moment (a lost
   connection, a rate limit, a 5xx), is given up, with a warning, and the replies those reads missed
-  show when the thread or the flat view is read. A thread that is gone is forgotten.
+  show when the thread or the flat view is read. An answer that the thread is gone (`404`,
+  `thread_not_found`) is treated the same way, since a bridge may give it for a command that failed
+  for another reason: the thread keeps its place, so no reply already delivered goes out again.
 
 So a quiet poll costs one call, as before, and a poll after replies in N threads costs
 1 + min(N, 4). The first poll after a start notes where each thread stands and delivers nothing, as
