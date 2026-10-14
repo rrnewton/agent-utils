@@ -2435,7 +2435,10 @@ cannot read, and then reads each channel as it would have without it.
   `GET /channels/{id}/messages?limit=` would give now (thread replies included where that list has
   them), in the message wire format `/messages` uses, each message once, every one's `channel_id`
   the channel asked about. Order does not matter; vibe-talk sorts them oldest first. vibe-talk keeps
-  only the newest `limit`, and drops any created before `since`.
+  only the newest `limit`, and drops any created before `since`. Never answer fewer than
+  `/messages` would: a catch-up takes a list shorter than `limit` to be the whole channel, exactly
+  as it takes a short `/messages` answer, so a copy that does not reach back far enough must leave
+  the channel out (vibe-talk then reads it on its own) rather than answer what it has.
 * `exhausted` (optional): `true` only when the bridge KNOWS these messages reach back to the
   channel's first message. A short list is not that; vibe-talk never infers it from one.
 * `as_of` (optional): present only when the answer came from a copy the bridge could not bring up
