@@ -349,6 +349,11 @@ struct Route {
 ///
 /// A fill begun before the provider's account was checked against the file offers deletions
 /// alone ([`Fill::writes_rows`]): see the module documentation.
+///
+/// It holds the cache it was begun on weakly. A read can take a long time (a `/count` walk, a
+/// poller's seed), and the owner may turn the cache off and on again meanwhile: the handle the
+/// fill began on must then go, and its lock on the file with it, or the fresh file could not
+/// open. A fill whose cache has gone offers nothing; its stamp was for that file anyway.
 #[derive(Debug)]
 pub struct Fill {
     grant: FillGrant,
@@ -356,7 +361,7 @@ pub struct Fill {
     chan: ChanKey,
     stamp: Stamp,
     observed_ms: i64,
-    cache: Arc<MessageCache>,
+    cache: Weak<MessageCache>,
     shape: Shape,
     recent_via_flat: bool,
     rows: bool,
@@ -393,10 +398,10 @@ impl Fill {
         self.observed_ms
     }
 
-    /// The cache the fill offers to.
+    /// The cache the fill offers to, while it is still installed or held elsewhere.
     #[must_use]
-    pub fn cache(&self) -> &Arc<MessageCache> {
-        &self.cache
+    pub fn cache(&self) -> Option<Arc<MessageCache>> {
+        self.cache.upgrade()
     }
 
     /// How the channel's provider lists it.
@@ -496,11 +501,14 @@ impl Fill {
     /// A fill that writes no rows offers deletions alone. Anything else it leaves out marks the
     /// channel suspect, as a full queue's drop does: it may have been an edit the file now lacks.
     fn offer(self, observations: Vec<Observation>) {
+        let Some(cache) = self.cache.upgrade() else {
+            return;
+        };
         for observation in observations {
             if self.rows || observation.removes_only() {
-                self.cache.offer(self.chan.clone(), self.stamp, observation);
+                cache.offer(self.chan.clone(), self.stamp, observation);
             } else {
-                self.cache.mark_suspect(&self.chan);
+                cache.mark_suspect(&self.chan);
             }
         }
     }
@@ -869,7 +877,7 @@ impl Sink {
             chan,
             stamp,
             observed_ms,
-            cache,
+            cache: Arc::downgrade(&cache),
             shape: route.shape,
             recent_via_flat: route.recent_via_flat,
             rows,

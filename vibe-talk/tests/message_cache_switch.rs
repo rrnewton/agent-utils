@@ -489,6 +489,38 @@ async fn on_after_off_opens_a_fresh_empty_file_and_checks_the_accounts_again() {
     );
 }
 
+/// The owner turns the cache off and on again while a write-scope read (a long count walk, a
+/// poller's seed) is still in flight, holding its fill. The fill holds the old cache weakly, so the
+/// old handle and its lock on the file go when the switch lets go of it, and the fresh file opens.
+/// What the old fill saw reaches nothing: its stamp was for the file that was erased.
+#[tokio::test]
+async fn off_then_on_while_a_fill_is_in_flight_still_opens_a_fresh_file() {
+    let scratch = TempDir::new("cache-switch-in-flight");
+    let dir = scratch.path();
+    let (state, _clock) = filled_server(dir, 5).await;
+    let in_flight = state
+        .message_cache
+        .begin_for(
+            vibe_talk::auth::Scope::Write,
+            &ChannelId(READ_CHANNEL.to_owned()),
+        )
+        .expect("a fill begins");
+    let (status, body) = switch(&state, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = switch(&state, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["available"], true,
+        "on after off, with a fill in flight: {body}"
+    );
+    assert!(body.get("reason").is_none(), "{body}");
+    assert!(in_flight.cache().is_none(), "the old handle is gone");
+    in_flight.offer_walk(&[message(T0 + 30 * 60_000, "seen by the old fill")]);
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.is_open());
+    assert_eq!(held(&cache), 0, "the old fill reached the fresh file");
+}
+
 #[tokio::test]
 async fn erase_keeps_the_cache_on_with_a_fresh_empty_file_and_erases_nothing_while_it_is_off() {
     let scratch = TempDir::new("cache-switch-erase");
