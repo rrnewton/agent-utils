@@ -33,6 +33,10 @@
 //! * A thread is named ONLY from the read made at its turn. A thread already waiting keeps its
 //!   place when a later page shows it changed; that page's copy is never named from, and the read
 //!   at its turn sees the change.
+//! * The copy of the thread a forward delta then carries with the name is the one the read at its
+//!   turn returned, or, when that read says it is behind (`as_of`), the newer of it and what pages
+//!   showed while the thread waited; after it, each later page that shows the thread. An answer
+//!   that lands after a newer one never takes the copy back while the thread waits.
 //! * After a naming read meets a provider failure — an HTTP 5xx, a read that never completed or
 //!   outlasted [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out — no thread
 //!   in that CHANNEL is read for [`CHANNEL_PAUSE`]. Other channels go on as before.
@@ -466,7 +470,7 @@ struct NamesState {
     /// Each channel's queue and read budget.
     channels: HashMap<ChannelId, ChannelQueue>,
     /// The threads taken from a queue and not yet settled: being read, named or filed.
-    naming: HashSet<Key>,
+    naming: HashMap<Key, InFlight>,
     failed: HashMap<Key, Instant>,
     recent: VecDeque<Recent>,
     named: usize,
@@ -494,10 +498,10 @@ struct ChannelQueue {
 
 /// A thread waiting for its turn, and what it was queued with.
 ///
-/// Nothing in here is named from. The snapshot is the newest copy of the thread a write-scope page
-/// showed: its id says what to read, its reply count says how many messages the sentence was
-/// written at, and, once the thread is named, it is the copy a forward delta carries with the
-/// name attached. What the thread is ABOUT comes only from the read at its turn.
+/// Nothing in here is named from. The snapshot is the newest copy of the thread any page has shown
+/// while it waits ([`not_older`]; an answer that lands after a newer one does not replace it): its
+/// id says what to read, and it stands in for the read at the turn where that read says too
+/// little. What the thread is ABOUT comes only from the read at its turn.
 struct Waiting {
     deps: ThreadDeps,
     snapshot: ThreadSummary,
@@ -513,6 +517,19 @@ impl Waiting {
     fn order(&self) -> (jiff::Timestamp, std::cmp::Reverse<u64>) {
         (self.activity, std::cmp::Reverse(self.sequence))
     }
+}
+
+/// A thread taken from its queue and not yet settled.
+#[derive(Debug)]
+struct InFlight {
+    /// The copy of the thread a forward delta carries once it is named. Until the read at its turn
+    /// answers, the newest a page has shown, as while it waited. That read then supplies it — or,
+    /// when it says it is behind, the newer of it and this. From then on every later page that
+    /// shows the thread replaces it, as one already renamed is kept current
+    /// ([`ThreadNames::refresh_copies`]).
+    copy: ThreadSummary,
+    /// Whether the read at its turn has answered.
+    read: bool,
 }
 
 impl std::fmt::Debug for Waiting {
@@ -585,7 +602,13 @@ impl NamesState {
             .map(|(thread, _)| thread.clone())?;
         let waiting = queue.waiting.remove(&thread)?;
         queue.last_read = Some(Instant::now());
-        self.naming.insert((channel.clone(), thread.clone()));
+        self.naming.insert(
+            (channel.clone(), thread.clone()),
+            InFlight {
+                copy: waiting.snapshot.clone(),
+                read: false,
+            },
+        );
         Some((thread, waiting))
     }
 
@@ -781,7 +804,7 @@ impl ThreadNames {
                             super::cut_for_serving(&sentence.summary, deps.sentence_chars)
                         });
                     }
-                    self.refresh_recent(channel, summary);
+                    self.refresh_copies(channel, summary);
                     if !may_write {
                         continue;
                     }
@@ -795,7 +818,7 @@ impl ThreadNames {
                 }
                 Lookup::Unknown(name) => {
                     summary.display_name = name;
-                    self.refresh_recent(channel, summary);
+                    self.refresh_copies(channel, summary);
                 }
             }
         }
@@ -870,8 +893,11 @@ impl ThreadNames {
         Lookup::Known(record)
     }
 
-    /// Keep a renamed thread's snapshot as current as the newest read of it.
-    fn refresh_recent(&self, channel: &ChannelId, summary: &ThreadSummary) {
+    /// Keep every copy of a thread a forward delta may carry as current as the pages that show it,
+    /// whoever's they are: a renamed thread's, replaced by each later page; a waiting thread's,
+    /// replaced by a copy that is not older ([`not_older`]); and one being named, either way,
+    /// according to whether the read at its turn has answered (see [`InFlight`]).
+    fn refresh_copies(&self, channel: &ChannelId, summary: &ThreadSummary) {
         let mut state = self.lock();
         if let Some(recent) = state
             .recent
@@ -879,6 +905,20 @@ impl ThreadNames {
             .find(|recent| recent.channel == *channel && recent.thread.id == summary.id)
         {
             recent.thread = summary.clone();
+        }
+        if let Some(waiting) = state
+            .channels
+            .get_mut(channel)
+            .and_then(|queue| queue.waiting.get_mut(&summary.id))
+        {
+            if not_older(summary, &waiting.snapshot) {
+                waiting.snapshot = summary.clone();
+            }
+        }
+        if let Some(in_flight) = state.naming.get_mut(&(channel.clone(), summary.id.clone())) {
+            if in_flight.read || not_older(summary, &in_flight.copy) {
+                in_flight.copy = summary.clone();
+            }
         }
     }
 
@@ -938,8 +978,9 @@ impl ThreadNames {
 
     /// Queue a due thread in its channel, and start the channel's worker if none is serving it.
     ///
-    /// A thread already waiting keeps its place: only the copy it will be filed against is brought
-    /// up to date. A thread being named now, or one whose naming failed recently, is not queued.
+    /// A thread already waiting keeps its place: its record and the copy it waits with are brought
+    /// up to date, a copy only by one not older. A thread being named now, or one whose naming
+    /// failed recently, is not queued.
     fn enqueue(
         self: &Arc<Self>,
         deps: &ThreadDeps,
@@ -953,7 +994,7 @@ impl ThreadNames {
             .failed
             .get(&key)
             .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE);
-        if recently_failed || state.naming.contains(&key) {
+        if recently_failed || state.naming.contains_key(&key) {
             return;
         }
         if !state.channels.contains_key(channel) {
@@ -966,7 +1007,11 @@ impl ThreadNames {
         let token = state.tokens;
         let queue = state.channels.entry(channel.clone()).or_default();
         if let Some(waiting) = queue.waiting.get_mut(&key.1) {
-            waiting.snapshot = snapshot;
+            // An answer that lands after a newer one can be older, and does not take the copy
+            // back.
+            if not_older(&snapshot, &waiting.snapshot) {
+                waiting.snapshot = snapshot;
+            }
             waiting.prior = prior;
             waiting.deps = deps.clone();
             return;
@@ -1053,12 +1098,14 @@ impl ThreadNames {
     ) {
         let key = (channel.clone(), thread);
         let mut state = self.lock();
-        state.naming.remove(&key);
+        let in_flight = state.naming.remove(&key);
         let failure = match outcome {
             Ok(Some(record)) => {
                 state.failed.remove(&key);
                 state.named += 1;
-                let mut renamed = waiting.snapshot;
+                // The read at its turn, or anything newer since: never the copy it was queued
+                // with, which a page may have shown out of date long before its turn.
+                let mut renamed = in_flight.map_or(waiting.snapshot, |in_flight| in_flight.copy);
                 renamed.display_name = Some(record.name.clone());
                 renamed.summary = record.sentence.as_ref().map(|sentence| {
                     super::cut_for_serving(&sentence.summary, waiting.deps.sentence_chars)
@@ -1178,6 +1225,26 @@ impl ThreadNames {
             // rather than with a 404.
             return Err(TurnFailure::Gone);
         }
+        // The thread as this read found it: the copy a delta carries once it is named.
+        let read_copy = page
+            .thread
+            .clone()
+            .filter(|thread| thread.id == snapshot.id);
+        if let Some(in_flight) = self
+            .lock()
+            .naming
+            .get_mut(&(channel.clone(), snapshot.id.clone()))
+        {
+            if let Some(read_copy) = &read_copy {
+                // Begun after every page that showed the thread while it waited had landed, so
+                // newer than each of them — unless it says it is behind (a bridge serving a copy
+                // it could not bring up to date), and then only if it is not older.
+                if page.as_of.is_none() || not_older(read_copy, &in_flight.copy) {
+                    in_flight.copy = read_copy.clone();
+                }
+            }
+            in_flight.read = true;
+        }
         let mut messages: Vec<Message> = Vec::new();
         if let Some(root) = page.thread.and_then(|thread| thread.root) {
             messages.push(root);
@@ -1202,15 +1269,23 @@ impl ThreadNames {
             .map_err(TurnFailure::Other)?;
         let renamed = kept.is_none();
         let cut_at = naming.cut_at;
+        // How many messages the thread had in the read the sentence was written from. Only when
+        // that read gives no count, the copy it was queued with, or as many as the read held if
+        // that is more.
+        let at = match read_copy.as_ref().and_then(|thread| thread.reply_count) {
+            Some(replies) => replies.saturating_add(1),
+            None => snapshot
+                .reply_count
+                .map_or(0, |replies| replies.saturating_add(1))
+                .max(messages.len() as u64),
+        };
         let record = ThreadRecord {
             // A thread that already has a name keeps it, whatever the model offered this time.
             name: kept.unwrap_or(naming.slug),
             touched: now_seconds(),
             sentence: Some(FiledSentence {
                 summary: naming.sentence,
-                at: snapshot
-                    .reply_count
-                    .map_or(messages.len() as u64, |replies| replies.saturating_add(1)),
+                at,
             }),
             sentence_below_cap: super::cut_below_cap(cut_at, deps.sentence_chars),
         };
@@ -1265,6 +1340,14 @@ fn activity_of(snapshot: &ThreadSummary) -> jiff::Timestamp {
         .updated_at
         .parse::<jiff::Timestamp>()
         .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+}
+
+/// Whether `arriving` is at least as new as `held`: later activity, or the same activity and at
+/// least as many replies. An answer can land after a newer one — two reads under way at once, a
+/// read sent again, a bridge serving a copy it could not bring up to date — and must not take a
+/// copy back.
+fn not_older(arriving: &ThreadSummary, held: &ThreadSummary) -> bool {
+    (activity_of(arriving), arriving.reply_count) >= (activity_of(held), held.reply_count)
 }
 
 /// Whether a thread needs a name, or a fresh sentence.

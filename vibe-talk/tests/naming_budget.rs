@@ -3,7 +3,8 @@
 //! A thread is named only from a read of it made at its turn. These tests are about WHEN and HOW
 //! OFTEN those reads happen: at most one per channel per thirty seconds by default, newest activity
 //! first, none in a channel for ten minutes after a provider failure there, none from a read token,
-//! and no queue that grows without bound, waits for ever, or outlives its channel.
+//! and no queue that grows without bound, waits for ever, or outlives its channel; and about the
+//! copy of a thread a forward delta carries once it is named.
 //!
 //! Every test runs on a paused clock, through the HTTP routes, with every upstream call counted by
 //! [`CountingChat`]. Nothing here reaches a model provider or a chat service.
@@ -39,8 +40,8 @@ struct FakeThread {
     id: String,
     root: String,
     replies: Vec<String>,
-    /// Its last activity, in minutes after 08:00.
-    active_minute: u32,
+    /// Its last activity, in seconds after 08:00.
+    active_second: u32,
     deleted: bool,
 }
 
@@ -55,6 +56,9 @@ struct Upstream {
     returned: Mutex<Vec<(String, Vec<Message>)>>,
     /// Answer a read of a thread that is gone with an empty page rather than a 404.
     gone_reads_empty: Mutex<bool>,
+    /// Threads whose reads are answered from an older copy, with the `as_of` a bridge sends when
+    /// it serves a copy it could not bring up to date.
+    behind: Mutex<HashMap<String, (FakeThread, String)>>,
 }
 
 fn thread_id(channel: &str, n: usize) -> String {
@@ -82,7 +86,7 @@ fn message(channel: &str, id: &str, content: &str) -> Message {
 }
 
 fn summary_of(channel: &str, thread: &FakeThread) -> ThreadSummary {
-    let minute = thread.active_minute;
+    let second = thread.active_second;
     ThreadSummary {
         id: thread.id.clone(),
         root: Some(message(
@@ -93,7 +97,12 @@ fn summary_of(channel: &str, thread: &FakeThread) -> ThreadSummary {
         title: thread.root.clone(),
         reply_count: Some(thread.replies.len() as u64),
         reply_count_exact: true,
-        updated_at: format!("2026-10-13T{:02}:{:02}:00Z", 8 + minute / 60, minute % 60),
+        updated_at: format!(
+            "2026-10-13T{:02}:{:02}:{:02}Z",
+            8 + second / 3_600,
+            (second / 60) % 60,
+            second % 60
+        ),
         display_name: None,
         summary: None,
     }
@@ -115,7 +124,8 @@ impl Upstream {
                     format!("reply 0 in thread {n}"),
                     format!("reply 1 in thread {n}"),
                 ],
-                active_minute: u32::try_from(n).unwrap(),
+                // A minute apart.
+                active_second: 60 * u32::try_from(n).unwrap(),
                 deleted: false,
             });
             added.push(id);
@@ -215,6 +225,11 @@ impl ChatClient for Upstream {
                             .find(|thread| thread.id == id && !thread.deleted)
                             .cloned()
                     });
+                let behind = self.behind.lock().unwrap().get(&id).cloned();
+                let (found, as_of) = match behind {
+                    Some((copy, as_of)) => (Some(copy), Some(as_of)),
+                    None => (found, None),
+                };
                 let Some(thread) = found else {
                     if *self.gone_reads_empty.lock().unwrap() {
                         return Ok(TimelinePage::default());
@@ -238,6 +253,7 @@ impl ChatClient for Upstream {
                     messages: replies,
                     thread: Some(summary),
                     has_threads: true,
+                    as_of,
                     ..TimelinePage::default()
                 })
             }
@@ -348,6 +364,98 @@ impl Harness {
         self.counting
             .timeline_reads(&ChannelId(channel.to_owned()), TimelineView::Thread)
     }
+
+    /// A forward delta of `channel`'s thread list, read with `token`.
+    async fn delta(&self, channel: &str, after: &str, token: &str) -> Value {
+        let (status, body) = self
+            .send(
+                "GET",
+                &format!(
+                    "/api/v1/channels/{channel}/timeline?view=threads&after={}",
+                    urlencode(after)
+                ),
+                token,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["delta"].is_object(), "this is a delta: {body}");
+        body
+    }
+
+    /// What naming needs, reading through the counting client.
+    fn deps(&self) -> ThreadDeps {
+        ThreadDeps {
+            chat: self.counting.clone(),
+            ..ThreadDeps::from_state(&self.state)
+        }
+    }
+
+    /// Read `channel`'s thread list and annotate it as a page's read is, without the HTTP routes:
+    /// for the long runs below, and for answers a test lands out of order.
+    async fn poll(&self, channel: &str, may_write: bool) -> TimelinePage {
+        let id = ChannelId(channel.to_owned());
+        let mut page = self
+            .counting
+            .fetch_timeline(&id, &list_request())
+            .await
+            .expect("a list");
+        self.annotate(channel, &mut page, may_write).await;
+        page
+    }
+
+    /// Annotate a thread-list answer that was read earlier, as if it landed now.
+    async fn annotate(&self, channel: &str, page: &mut TimelinePage, may_write: bool) {
+        self.names
+            .annotate(
+                &self.deps(),
+                &ChannelId(channel.to_owned()),
+                &list_request(),
+                page,
+                may_write,
+            )
+            .await;
+    }
+
+    /// What a read token's forward delta of `channel`'s thread list carries when upstream changed
+    /// nothing: the threads renamed lately, as this server holds them.
+    async fn carried(&self, channel: &str) -> Vec<ThreadSummary> {
+        let request = TimelineRequest {
+            after: Some("a forward cursor".to_owned()),
+            ..list_request()
+        };
+        let mut page = TimelinePage {
+            has_threads: true,
+            ..TimelinePage::default()
+        };
+        self.names
+            .annotate(
+                &self.deps(),
+                &ChannelId(channel.to_owned()),
+                &request,
+                &mut page,
+                false,
+            )
+            .await;
+        page.threads
+    }
+}
+
+fn list_request() -> TimelineRequest {
+    TimelineRequest {
+        view: TimelineView::Threads,
+        thread_id: None,
+        before: None,
+        after: None,
+        limit: 50,
+    }
+}
+
+fn find<'a>(body: &'a Value, id: &str) -> Option<&'a Value> {
+    body["threads"]
+        .as_array()
+        .expect("threads")
+        .iter()
+        .find(|thread| thread["id"].as_str() == Some(id))
 }
 
 fn bad_gateway() -> ChatError {
@@ -439,7 +547,7 @@ async fn every_name_is_made_from_exactly_what_the_read_at_its_turn_returned() {
         thread
             .replies
             .push("A THIRD REPLY, shown by a later page".to_owned());
-        thread.active_minute = 30;
+        thread.active_second = 30 * 60;
     });
     let page = h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
     assert!(thread_ids(&page).contains(&older));
@@ -917,4 +1025,139 @@ async fn taking_a_channel_off_the_list_drops_its_queue_and_files_nothing_in_flig
     h.at(301).await;
     assert_eq!(h.thread_reads(READ_CHANNEL), 2);
     assert_eq!(h.names.named(), 1);
+}
+
+// --- the copy a forward delta carries -----------------------------------------------------------
+
+/// Change `thread` as one more reply at `second` (after 08:00) does.
+fn reply_at(h: &Harness, thread: &str, second: u32) {
+    h.upstream.change(thread, |thread| {
+        thread.replies.push(format!("a reply at {second}s"));
+        thread.active_second = second;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_page_that_saw_a_thread_change_while_it_waited_is_not_given_the_older_copy_back() {
+    // Three threads are queued at once, so the oldest waits sixty seconds for its turn. Five
+    // seconds in it gets a third reply, and a read token's delta shows it. Once it is named, the
+    // next delta carries it, named — and must not carry the copy the owner's page queued it with:
+    // the page replaces its copy whole and re-sorts by last activity, so the reply count, the
+    // last activity and the order would all go back.
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 3);
+    let oldest = ids[0].clone();
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    let first = h.list(WRITE_CHANNEL, READ_TOKEN).await;
+    let after = first["next_after"].as_str().expect("a cursor").to_owned();
+
+    h.at(5).await;
+    reply_at(&h, &oldest, 10 * 60);
+    h.at(6).await;
+    let delta = h.delta(WRITE_CHANNEL, &after, READ_TOKEN).await;
+    let seen = find(&delta, &oldest).expect("the changed thread is on the delta");
+    assert_eq!(seen["reply_count"], 3, "{seen}");
+    let after = delta["next_after"].as_str().expect("a cursor").to_owned();
+
+    h.at(95).await;
+    assert_eq!(
+        h.named_reads(WRITE_CHANNEL),
+        [ids[2].clone(), ids[1].clone(), oldest.clone()]
+    );
+    let delta = h.delta(WRITE_CHANNEL, &after, READ_TOKEN).await;
+    let carried = find(&delta, &oldest).expect("the renamed thread rides the delta");
+    assert!(carried["display_name"].is_string(), "{carried}");
+    assert_eq!(
+        carried["reply_count"], 3,
+        "the delta took back a reply the page had shown: {carried}"
+    );
+    assert_eq!(
+        carried["updated_at"], "2026-10-13T08:10:00Z",
+        "the delta took back the thread's last activity: {carried}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_answer_landing_after_a_newer_one_while_a_thread_waits_is_not_what_a_delta_carries(
+) {
+    // Answers can land out of order: two reads under way at once, a read sent again. `older`
+    // waits behind a newer thread; a page showing it with a third reply lands, and then one read
+    // before that reply, without it. Neither is named from, and neither may take the copy a delta
+    // carries back, nor the message count its sentence is filed at.
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 2);
+    let (older, newer) = (ids[0].clone(), ids[1].clone());
+    let mut stale = h.poll(WRITE_CHANNEL, true).await;
+    h.at(1).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), std::slice::from_ref(&newer));
+
+    reply_at(&h, &older, 10 * 60);
+    h.poll(WRITE_CHANNEL, true).await;
+    h.annotate(WRITE_CHANNEL, &mut stale, true).await;
+
+    h.at(40).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), [newer.clone(), older.clone()]);
+    let carried = h.carried(WRITE_CHANNEL).await;
+    let carried = carried
+        .iter()
+        .find(|thread| thread.id == older)
+        .expect("the renamed thread rides the delta");
+    assert!(carried.display_name.is_some());
+    assert_eq!(
+        (carried.reply_count, carried.updated_at.as_str()),
+        (Some(3), "2026-10-13T08:10:00Z"),
+        "an older answer reached the delta"
+    );
+
+    // The read at its turn held four messages, so the sentence is filed at four, and a page
+    // showing those four does not make the thread due again.
+    h.at(45).await;
+    h.poll(WRITE_CHANNEL, true).await;
+    h.at(100).await;
+    assert_eq!(
+        h.named_reads(WRITE_CHANNEL),
+        [newer, older],
+        "the sentence was filed at fewer messages than its read held, and cost another read"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_at_the_turn_that_says_it_is_behind_does_not_take_back_a_newer_copy() {
+    // A bridge answers from a copy it keeps, and says with `as_of` when it could not bring that
+    // copy up to date. Such a read at a thread's turn can be older than what a page has already
+    // shown. The name is still made from that read alone; the copy a delta carries is the newer.
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 2);
+    let (older, newer) = (ids[0].clone(), ids[1].clone());
+    let before = h.upstream.channels.lock().unwrap()[WRITE_CHANNEL][0].clone();
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(1).await;
+
+    reply_at(&h, &older, 10 * 60);
+    h.upstream
+        .behind
+        .lock()
+        .unwrap()
+        .insert(older.clone(), (before, "2026-10-13T08:05:00Z".to_owned()));
+    let page = h.list(WRITE_CHANNEL, READ_TOKEN).await;
+    assert_eq!(find(&page, &older).expect("listed")["reply_count"], 3);
+
+    h.at(31).await;
+    assert_eq!(h.named_reads(WRITE_CHANNEL), [newer.clone(), older.clone()]);
+    let prompts = h.summarizer.thread_prompts();
+    assert!(
+        !prompts[1].contains("a reply at 600s"),
+        "named from something other than the read at its turn: {}",
+        prompts[1]
+    );
+    let carried = h.carried(WRITE_CHANNEL).await;
+    let carried = carried
+        .iter()
+        .find(|thread| thread.id == older)
+        .expect("the renamed thread rides the delta");
+    assert_eq!(
+        (carried.reply_count, carried.updated_at.as_str()),
+        (Some(3), "2026-10-13T08:10:00Z"),
+        "a read that said it was behind took back a newer copy"
+    );
 }
