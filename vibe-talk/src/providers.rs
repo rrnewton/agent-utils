@@ -18,13 +18,16 @@
 //!
 //! Every provider's client is wrapped in a [`ProfiledClient`] as the router is built, so each
 //! operation is timed whoever calls it, including the live poller, which holds a provider's
-//! client directly. `#208 persistent-cache`; see [`crate::upstream_profile`].
+//! client directly. `#208 persistent-cache`; see [`crate::upstream_profile`]. The same wrapper
+//! reports each outcome to the router's one [`AccessWatch`] ([`ChatRouter::access`]), which the
+//! message cache listens to while one is open: see [`crate::cache::access`].
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
+use crate::cache::access::AccessWatch;
 use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel, SourceClaim};
 use crate::config::{Config, ProviderKind};
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
@@ -61,6 +64,7 @@ pub struct ChatRouter {
     routes: RwLock<BTreeMap<ChannelId, usize>>,
     display_name: String,
     profile: Arc<UpstreamProfile>,
+    access: Arc<AccessWatch>,
 }
 
 impl std::fmt::Debug for ChatRouter {
@@ -93,7 +97,8 @@ impl ChatRouter {
         Self::with_profile(entries, default_key, Arc::new(UpstreamProfile::new()))
     }
 
-    /// [`ChatRouter::new`], timing each entry's client into `profile` under the entry's key.
+    /// [`ChatRouter::new`], timing each entry's client into `profile` under the entry's key, and
+    /// reporting each outcome to a new [`AccessWatch`] that nothing listens to yet.
     ///
     /// For a builder that hands the same profile to a provider's own client first, as
     /// [`ChatRouter::from_config`] does for Slack's per-call timings.
@@ -111,9 +116,14 @@ impl ChatRouter {
             !entries.is_empty(),
             "a chat router needs at least one provider"
         );
+        let access = Arc::new(AccessWatch::new());
         for entry in &mut entries {
             let recorder = profile.provider(&entry.key, entry.client.provider_name());
-            entry.client = Arc::new(ProfiledClient::new(Arc::clone(&entry.client), recorder));
+            entry.client = Arc::new(ProfiledClient::with_access(
+                Arc::clone(&entry.client),
+                recorder,
+                Arc::clone(&access),
+            ));
         }
         let default = match entries.len() {
             1 => Some(0),
@@ -126,6 +136,7 @@ impl ChatRouter {
             routes: RwLock::new(BTreeMap::new()),
             display_name,
             profile,
+            access,
         }
     }
 
@@ -189,6 +200,13 @@ impl ChatRouter {
     #[must_use]
     pub fn profile(&self) -> &Arc<UpstreamProfile> {
         &self.profile
+    }
+
+    /// What every provider's operations have said about access to what they read: the watch
+    /// the message cache listens to. `#208 persistent-cache`; see [`crate::cache::access`].
+    #[must_use]
+    pub fn access(&self) -> &Arc<AccessWatch> {
+        &self.access
     }
 
     /// Every provider, in configuration order.

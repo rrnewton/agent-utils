@@ -1215,4 +1215,98 @@ mod tests {
             None
         );
     }
+
+    /// `#208 persistent-cache`: the message cache reads Slack's code back out of the failure this
+    /// client makes ([`crate::cache::access::classify`]) to decide whether access to a channel or
+    /// a thread is lost, or the credential refused. The two sides are pinned together here, so a
+    /// change to the body's shape fails this test rather than a cache in production.
+    #[test]
+    fn the_message_cache_reads_back_the_code_a_slack_failure_carries() {
+        use crate::cache::access::{classify, slack_code, Signal};
+        let client = client();
+        let failure = |method: &str, code: &str| {
+            client
+                .slack_error(
+                    method,
+                    code,
+                    &serde_json::json!({"ok": false, "error": code, "needed": "channels:history"}),
+                )
+                .with_provider("Slack")
+        };
+        for code in UNAUTHORIZED
+            .iter()
+            .chain(FORBIDDEN.iter())
+            .chain(NOT_FOUND.iter())
+            .chain(["invalid_cursor"].iter())
+        {
+            let error = failure("conversations.history", code);
+            let ChatError::Status { body, .. } = error.cause() else {
+                panic!("{code}: a status");
+            };
+            assert_eq!(slack_code(body), Some(*code), "{body}");
+        }
+
+        for (code, revoked) in [
+            ("not_authed", false),
+            ("invalid_auth", false),
+            ("token_expired", false),
+            ("account_inactive", true),
+            ("token_revoked", true),
+        ] {
+            assert_eq!(
+                classify("post_message", None, &failure("chat.postMessage", code)),
+                Signal::CredentialRefused { revoked },
+                "{code}"
+            );
+        }
+        let lost = |thread: Option<&str>| Signal::ChannelLost {
+            thread: thread.map(str::to_owned),
+        };
+        assert_eq!(
+            classify(
+                "fetch_timeline",
+                None,
+                &failure("conversations.history", "channel_not_found")
+            ),
+            lost(None)
+        );
+        assert_eq!(
+            classify(
+                "fetch_page",
+                None,
+                &failure("conversations.history", "not_in_channel")
+            ),
+            lost(None)
+        );
+        let root = "1700000000.000100";
+        assert_eq!(
+            classify(
+                "fetch_timeline",
+                Some(root),
+                &failure("conversations.replies", "thread_not_found")
+            ),
+            lost(Some(root))
+        );
+        for code in [
+            "message_not_found",
+            "user_not_found",
+            "missing_scope",
+            "not_allowed_token_type",
+            "restricted_action",
+            "is_archived",
+            "access_denied",
+            "no_permission",
+            "invalid_cursor",
+        ] {
+            assert_eq!(
+                classify(
+                    "fetch_timeline",
+                    None,
+                    &failure("conversations.history", code)
+                ),
+                Signal::Excluded,
+                "{code}"
+            );
+        }
+    }
 }

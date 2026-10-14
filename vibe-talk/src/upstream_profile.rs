@@ -72,6 +72,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::cache::access::AccessWatch;
 use crate::chat::{
     ChatClient, ChatError, ChatIdentity, PostLimit, RecentRead, RegisteredChannel, SourceClaim,
 };
@@ -1175,16 +1176,73 @@ enum Direction {
 /// in `src/chat.rs` and fails when a method is missing here.
 ///
 /// Only methods that may reach the provider are timed; capability questions answer from memory.
+///
+/// Every outcome is also reported, with the channel and thread it concerned, to the router's
+/// [`AccessWatch`] when the client was built with one: the one place every read of a provider
+/// passes, the live poller's included. `#208 persistent-cache`; see [`crate::cache::access`].
 pub struct ProfiledClient {
     inner: Arc<dyn ChatClient>,
     profile: Arc<ProviderProfile>,
+    access: Option<Arc<AccessWatch>>,
+}
+
+/// What one operation was about: the channel it named, and the thread when it read one thread.
+#[derive(Clone, Copy, Default)]
+struct About<'a> {
+    channel: Option<&'a ChannelId>,
+    thread: Option<&'a str>,
+}
+
+impl<'a> About<'a> {
+    fn channel(channel: &'a ChannelId) -> Self {
+        Self {
+            channel: Some(channel),
+            thread: None,
+        }
+    }
+
+    fn thread(channel: &'a ChannelId, thread: &'a str) -> Self {
+        Self {
+            channel: Some(channel),
+            thread: Some(thread),
+        }
+    }
+
+    /// A timeline read is of one thread only in the thread view.
+    fn timeline(channel: &'a ChannelId, request: &'a crate::threads::TimelineRequest) -> Self {
+        Self {
+            channel: Some(channel),
+            thread: (request.view == crate::threads::TimelineView::Thread)
+                .then_some(request.thread_id.as_deref())
+                .flatten(),
+        }
+    }
 }
 
 impl ProfiledClient {
     /// Time `inner` into `profile`.
     #[must_use]
     pub fn new(inner: Arc<dyn ChatClient>, profile: Arc<ProviderProfile>) -> Self {
-        Self { inner, profile }
+        Self {
+            inner,
+            profile,
+            access: None,
+        }
+    }
+
+    /// Time `inner` into `profile`, and report every outcome to `access` under the profile's
+    /// provider key.
+    #[must_use]
+    pub fn with_access(
+        inner: Arc<dyn ChatClient>,
+        profile: Arc<ProviderProfile>,
+        access: Arc<AccessWatch>,
+    ) -> Self {
+        Self {
+            inner,
+            profile,
+            access: Some(access),
+        }
     }
 
     /// The profile this client records into.
@@ -1279,6 +1337,7 @@ impl ProfiledClient {
         &self,
         operation: &'static str,
         direction: Direction,
+        about: About<'_>,
         work: F,
     ) -> Result<T, ChatError>
     where
@@ -1300,6 +1359,15 @@ impl ProfiledClient {
             Err(error) => {
                 timer.finish(Outcome::of(error), 0);
             }
+        }
+        if let Some(access) = &self.access {
+            access.report(
+                self.profile.key(),
+                operation,
+                about.channel,
+                about.thread,
+                result.as_ref().map(drop),
+            );
         }
         result
     }
@@ -1339,6 +1407,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_timeline",
             Direction::Read,
+            About::timeline(channel, request),
             self.inner.fetch_timeline(channel, request),
         )
         .await
@@ -1353,6 +1422,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_timeline_since",
             Direction::Read,
+            About::timeline(channel, request),
             self.inner.fetch_timeline_since(channel, request, since),
         )
         .await
@@ -1368,6 +1438,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "post_in_thread",
             Direction::Other,
+            About::thread(channel, thread_id),
             self.inner
                 .post_in_thread(channel, thread_id, content, reply_to),
         )
@@ -1383,6 +1454,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_thread_message",
             Direction::Read,
+            About::thread(channel, thread_id),
             self.inner
                 .fetch_thread_message(channel, thread_id, message_id),
         )
@@ -1401,6 +1473,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "register_channel",
             Direction::Other,
+            About::default(),
             self.inner.register_channel(source, label),
         )
         .await
@@ -1410,6 +1483,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "unregister_channel",
             Direction::Other,
+            About::channel(channel),
             self.inner.unregister_channel(channel),
         )
         .await
@@ -1426,6 +1500,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "discover_channels",
             Direction::Other,
+            About::default(),
             self.inner.discover_channels(request),
         )
         .await
@@ -1436,8 +1511,13 @@ impl ChatClient for ProfiledClient {
     }
 
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
-        self.timed("identity", Direction::Other, self.inner.identity())
-            .await
+        self.timed(
+            "identity",
+            Direction::Other,
+            About::default(),
+            self.inner.identity(),
+        )
+        .await
     }
 
     async fn fetch_page(
@@ -1450,6 +1530,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_page",
             Direction::Read,
+            About::channel(channel),
             self.inner.fetch_page(channel, limit, before, after),
         )
         .await
@@ -1463,6 +1544,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "probe_channel",
             Direction::Read,
+            About::channel(channel),
             self.inner.probe_channel(channel, limit),
         )
         .await
@@ -1476,6 +1558,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_recent",
             Direction::Read,
+            About::channel(channel),
             self.inner.fetch_recent(channel, limit),
         )
         .await
@@ -1489,6 +1572,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_recent_dated",
             Direction::Read,
+            About::channel(channel),
             self.inner.fetch_recent_dated(channel, limit),
         )
         .await
@@ -1507,6 +1591,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "fetch_live",
             Direction::Read,
+            About::channel(channel),
             self.inner.fetch_live(channel, limit, after),
         )
         .await
@@ -1533,9 +1618,14 @@ impl ChatClient for ProfiledClient {
             crate::chat::Support::Native => "fetch_range",
             crate::chat::Support::Emulated => "fetch_page",
         };
+        let about = match scope {
+            crate::chat::ReadScope::Thread(thread) => About::thread(channel, thread),
+            crate::chat::ReadScope::Main | crate::chat::ReadScope::Flat => About::channel(channel),
+        };
         self.timed(
             operation,
             Direction::Read,
+            about,
             self.inner
                 .fetch_range(channel, scope, range, order, limit, cursor),
         )
@@ -1555,9 +1645,14 @@ impl ChatClient for ProfiledClient {
         // remote-ops-audit W11 `#287 bulk-reads`.
         match self.inner.read_caps(channel).by_ids {
             crate::chat::Support::Native => {
+                let about = match thread {
+                    Some(thread) => About::thread(channel, thread),
+                    None => About::channel(channel),
+                };
                 self.timed(
                     "fetch_messages",
                     Direction::Read,
+                    about,
                     self.inner.fetch_messages(channel, thread, ids),
                 )
                 .await
@@ -1643,6 +1738,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "post_message",
             Direction::Other,
+            About::channel(channel),
             self.inner.post_message(channel, content, reply_to),
         )
         .await
@@ -1662,6 +1758,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "post_message_keyed",
             Direction::Other,
+            About::channel(channel),
             self.inner
                 .post_message_keyed(channel, content, reply_to, key),
         )
@@ -1679,6 +1776,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "post_in_thread_keyed",
             Direction::Other,
+            About::thread(channel, thread_id),
             self.inner
                 .post_in_thread_keyed(channel, thread_id, content, reply_to, key),
         )
@@ -1701,6 +1799,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "mark_read_upstream",
             Direction::Other,
+            About::channel(channel),
             self.inner.mark_read_upstream(channel, through),
         )
         .await
@@ -1714,6 +1813,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "upstream_read_scope",
             Direction::Read,
+            About::channel(channel),
             self.inner.upstream_read_scope(channel),
         )
         .await
@@ -1732,6 +1832,7 @@ impl ChatClient for ProfiledClient {
         self.timed(
             "clear_upstream_through",
             Direction::Other,
+            About::channel(channel),
             self.inner.clear_upstream_through(channel, through, dry_run),
         )
         .await
