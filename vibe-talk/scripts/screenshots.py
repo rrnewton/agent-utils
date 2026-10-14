@@ -625,6 +625,8 @@ STUB_JS = r"""
           included: 3,
           dropped: 5,
           truncated: true,
+          // `#270 voice-transcript-markers`: the words of what it holds, as the server counts them.
+          words: 23,
           policy: { max_chars: 6000, max_turns: 40 },
           transport: "contextual_update",
           enabled: true,
@@ -4087,6 +4089,15 @@ SCENES: tuple[Scene, ...] = (
                 "the transcript seam stops saying the agent remembers nothing above the line",
                 "[...document.querySelectorAll('#transcript > li.seam')]"
                 ".some((n) => /read the lines above back to it/.test(n.textContent || ''))",
+            ),
+            (
+                # `#270 voice-transcript-markers`. The line above the resumed call says what that
+                # call was sent, and, inside it, that the oldest lines did not fit.
+                "the line above the resumed call says a recap went, and that older lines did not fit",
+                "[...document.querySelectorAll('#transcript .seam-recap')]"
+                ".some((n) => /^[\\d,]+-word recap sent$/.test(n.textContent || ''))"
+                " && [...document.querySelectorAll('#transcript .seam-recap-detail')]"
+                ".some((n) => /older lines did not fit/.test(n.textContent || ''))",
             ),
         ),
     ),
