@@ -122,7 +122,7 @@ def is_read(index: int) -> bool:
 
 
 class FakeApi:
-    """The routes /voice reads, for one channel with one thread."""
+    """The routes the page reads, for one channel with one thread."""
 
     def __init__(self, web_root: Path) -> None:
         self.web_root = web_root
@@ -137,7 +137,7 @@ class FakeApi:
         parts = urlsplit(request.url)
         path = unquote(parts.path)
         if not path.startswith("/api/"):
-            relative = "voice.html" if path == "/voice" else path.lstrip("/")
+            relative = "voice.html" if path == "/" else path.lstrip("/")
             target = (self.web_root / relative).resolve()
             if self.web_root not in target.parents or not target.is_file():
                 route.fulfill(status=404, body="")
@@ -155,7 +155,7 @@ class FakeApi:
                 "threading_supported": True, "channel_registration_supported": False,
                 "read_aloud": {"backend": "browser", "label": "Browser voice", "playback": "browser",
                                "local_only": True},
-                "elevenlabs_agent_id": None, "conversational_voice": {"name": "Test voice provider"},
+                "conversational_voice": {"name": "Test voice provider"},
                 "replay_enabled": False, "self_author_id": None, "owner_author_id": None,
                 "channel_discovery_supported": False, "upstream_read_mark_supported": False,
                 "speech_prep_enabled": False,
@@ -447,7 +447,7 @@ def open_desk(browser: Browser, api: FakeApi, storage: dict[str, str]) -> tuple[
     context.route("**/*", api.route)
     page = context.new_page()
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(f"{ORIGIN}/voice", wait_until="load")
+    page.goto(f"{ORIGIN}/", wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
