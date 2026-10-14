@@ -10185,7 +10185,7 @@ test("...and the arrow does not recede with its row: a reply's state is drawn on
   assert.match(veil, /color-mix\(in srgb, var\(--bg\) calc\(\(1 - var\(--row-opacity, 1\)\) \* 100%\)/,
     "a reply's box no longer fades by its state's amount");
   assert.match(veil, /pointer-events:\s*none/, "the veil takes the taps meant for the reply's buttons");
-  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather)'),
+  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather)'),
     /filter:\s*var\(--row-filter, none\)/, "a reply's content is not greyed with its state");
   assert.match(reply, /background-blend-mode:\s*saturation/, "a reply's tint is not drained with its state");
   // A lit reply is at full strength, and the landing's own wash takes the pseudo-element: the same
@@ -40280,7 +40280,7 @@ test("ON MAIN a root whose thread holds unread replies says how many, beside N r
   // The cue is the accent, as the jump to news below wears it, and is not faded with its read root.
   assert.match(cssBlock(".thread-unread"), /color:\s*var\(--accent\)/);
   assert.match(cssBlock(".thread-unread"), /border:\s*1px solid var\(--accent\)/);
-  assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.reply-jump):not(.reply-bridge):not(.reply-ungather)"),
+  assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather)"),
     /z-index:\s*1[\s\S]*filter:\s*none/);
   assert.match(cssBlock("#discord-log li.discord-message[data-unread-replies] > .thread-replies"), /display:\s*inline-block/);
   // The reader's own words turned unread in Settings count as unread replies too.
@@ -42564,7 +42564,7 @@ test("THE CIRCLE IS DRAWN AS THE ARROWHEAD IS: its size, its blue, on the corner
   assert.match(cssBlock("#discord-log li.discord-message[data-reply-marker]::after"),
     /color-mix\(in srgb, var\(--bg\) calc\(\(1 - var\(--row-opacity, 1\)\) \* 100%\)/,
     "a row with a circle no longer recedes in its box");
-  assert.match(CSS, /li\.discord-message\[data-reply-marker\] > :not\(\.reply-marker\)/,
+  assert.match(CSS, /li\.discord-message\[data-reply-marker\] > :not\(\.thread-strip\):not\(\.reply-marker\)/,
     "the circle is greyed with the row it is on");
   // The agent's tile meets the screen's edge on a phone, where half a disc on its corner would be cut
   // off: there the disc stands just inside the corner. A desk holds the tile in the column, and the
@@ -48836,6 +48836,324 @@ test("`#252 thread-button-state`: → on a message nobody has answered opens its
     await page.el(two ? "side-send" : "channel-send").click();
     await page.settle();
     assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "typed straight after →", thread_id: data.lone.id });
+  }
+});
+
+// --- a thread's strip in All, and selecting a thread there (#290 all-thread-strip) -----------------------
+//
+// The owner, 2026-10-14: "In the interleaved All view I would like a little color strip along the left
+// edge of the rectangular messages that are messages in threads ... Somewhat thicker than the normal
+// border so it is clickable. But when this border is clicked instead of drilling INTO the thread ... I
+// want it to just SELECT that thread, dimming all messages that are not part of the thread but keeping
+// us in the global view." tests/all_thread_strip_browser.py measures and photographs it in Chromium.
+
+/** A row's strip as drawn: shown, its name, pressed, colour and keys; null with none. */
+const stripOf = (row) => {
+  const strip = row.children.find((kid) => kid.hasClass("thread-strip"));
+  return strip ? {
+    shown: !strip.hidden, label: strip.getAttribute("aria-label"), pressed: strip.getAttribute("aria-pressed"),
+    hue: strip.style.getPropertyValue("--thread-hue"), keys: strip.getAttribute("aria-keyshortcuts"), strip,
+  } : null;
+};
+
+/** The ids of All's rows whose strip shows. */
+const stripedIds = (page) => page.el("discord-log").children
+  .filter((row) => { const strip = stripOf(row); return strip !== null && strip.shown; })
+  .map((row) => row.getAttribute("data-id"));
+
+/** The ids of the rows drawn in the selected thread, and the thread the list says is selected. */
+const focusOf = (page) => ({
+  thread: page.el("discord-log").getAttribute("data-focus-thread"),
+  rows: page.el("discord-log").children.filter((row) => row.hasAttribute("data-thread-in")).map((row) => row.getAttribute("data-id")),
+  pressed: page.el("discord-log").children.filter((row) => stripOf(row) && stripOf(row).pressed === "true").map((row) => row.getAttribute("data-id")),
+});
+
+const NO_FOCUS = { thread: null, rows: [], pressed: [] };
+
+test("`#290 all-thread-strip`: the stylesheet — a strip a hit area wide over the row's left border, its bar five times a border in its thread's colour, the lane kept on every row of All, the rest dimmed and drained around a selected thread, and a read row keeping its strip's colour", () => {
+  // The sizes: a hit area 16px wide, a bar of 5px, and under a finger 22px and 6px.
+  const root = cssRules(CSS_UNCONDITIONAL, ":root").join("\n");
+  assert.match(root, /--strip-hit:\s*16px/);
+  assert.match(root, /--strip-bar:\s*5px/);
+  assert.match(CSS_CODE, /@media \(pointer: coarse\) \{\s*:root \{\s*--strip-hit: 22px;\s*--strip-bar: 6px;\s*\}\s*\}/,
+    "a finger gets the desk's strip");
+  // The lane, on every row of All whether it has a strip or not, and the agent's tile keeping a notch's inset.
+  assert.match(cssBlock('#discord-log[data-view="flat"] > li.discord-message[data-who]'), /padding-left:\s*calc\(var\(--strip-hit\) \+ 0\.35rem\)/);
+  assert.match(cssBlock('#discord-log[data-view="flat"] > li.discord-message[data-who="coder"]'),
+    /padding-left:\s*calc\(var\(--strip-hit\) \+ 0\.35rem \+ env\(safe-area-inset-left\)\)/);
+  // After every rule that sets a row's own padding, so it is not undone by the speaker's or a reply's.
+  assert.ok(CSS_CODE.lastIndexOf('[data-who="coder"] {\n  padding-left: 0.4rem;') < CSS_CODE.indexOf('#discord-log[data-view="flat"] > li.discord-message[data-who] {'),
+    "a rule after the lane takes it back on some rows");
+  // The strip: over the left border, the row's full height, a hit area wide, a pointer, above the veil.
+  const strip = cssBlock("#discord-log > li.discord-message > .thread-strip");
+  for (const [property, value] of [["position", "absolute"], ["top", "-1px"], ["bottom", "-1px"], ["left", "-1px"],
+    ["z-index", "1"], ["width", "var(--strip-hit)"], ["cursor", "pointer"], ["background", "none"], ["border", "0"]]) {
+    assert.equal(declaredIn(strip, property), value, `the strip's ${property}`);
+  }
+  // ...drawn as a straight bar in the thread's colour, the formula its tag and its card are edged in.
+  const bar = cssBlock("#discord-log > li.discord-message > .thread-strip::before");
+  assert.equal(declaredIn(bar, "width"), "var(--strip-bar)");
+  assert.equal(declaredIn(bar, "background"), "hsl(var(--thread-hue, 210) 55% 50%)");
+  assert.match(cssBlock("#discord-log > li.discord-message > .thread-strip:focus-visible"), /outline:\s*2px solid var\(--accent\)/,
+    "the keys get no ring on the strip");
+  // A resting mouse widens it, only where a pointer hovers and not while the keys are in use.
+  assert.match(cssBlockIn(HOVER_QUERY, ':root:not([data-input="keys"]) #discord-log .thread-strip:hover::before'),
+    /width:\s*calc\(var\(--strip-bar\) \+ 2px\)/);
+  // A read row recedes in its box, the strip left out of every rule over its parts and over the veil.
+  assert.match(cssBlock("#discord-log li.discord-message[data-thread-strip][data-who]"), /opacity:\s*1[\s\S]*filter:\s*none/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-thread-strip]::after"),
+    /color-mix\(in srgb, var\(--bg\) calc\(\(1 - var\(--row-opacity, 1\)\) \* 100%\)/);
+  assert.match(cssBlock("#discord-log li.discord-message[data-thread-strip] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather)"),
+    /filter:\s*var\(--row-filter, none\)/);
+  const parts = CSS_CODE.match(/li\.discord-message\[[^\]]+\] > :not\([^{,]*/g) || [];
+  assert.ok(parts.length >= 15, `only ${parts.length} rules over a row's parts were found`);
+  for (const part of parts.filter((one) => !one.includes("data-read-run"))) {
+    assert.match(part, /> :not\(\.thread-strip\)/, `${part.trim()} greys the strip with its row`);
+  }
+  // Selected: the rest at 0.3 and drained, their strips grey; the thread's own at full strength; a row
+  // the keys, the mouse, the focus, the voice or a reply is on comes back. Amounts only: no size, no transition.
+  const rest = cssBlock('#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who]:not([data-thread-in])');
+  assert.equal(declaredIn(rest, "--row-opacity"), "0.3");
+  assert.equal(declaredIn(rest, "--row-filter"), "grayscale(1)");
+  assert.equal(declaredIn(rest, "--row-grey"), "1");
+  assert.equal(declaredIn(cssBlock('#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who][data-thread-in]'), "--row-opacity"), "1");
+  assert.equal(declaredIn(cssBlock('#discord-log[data-view="flat"][data-focus-thread] > li.discord-message:not([data-thread-in]) > .thread-strip::before'), "background"),
+    "var(--thread-grey)");
+  assert.match(CSS_CODE, /\[data-focus-thread\] > li\.discord-message\[data-who\]:not\(\[data-thread-in\]\):is\(\[data-selected="true"\], :focus-within, \[data-reading="true"\], \[data-replying\], \[data-pending="true"\]\) \{\s*--row-opacity: 1;\s*--row-filter: none;\s*--row-grey: 0;\s*\}/,
+    "a row the reader is on stays dimmed out of the selected thread");
+  for (const block of CSS_CODE.match(/[^{}]*data-focus-thread[^{}]*\{[^{}]*\}/g) || []) {
+    assert.doesNotMatch(block, /transition|font-size|padding|margin|height|width/, `the selection changes more than paint: ${block.trim()}`);
+  }
+});
+
+test("`#290 all-thread-strip`: in All every row of a thread somebody has answered has its strip — root, replies, in its thread's colour, named and not pressed — and nothing else does: not a row in no thread, not Main, not a thread", async () => {
+  const page = await threadPage();
+  assert.equal(page.el("thread-select").value, "flat", "the channel did not open in All, so this proves nothing");
+  assert.equal(page.el("discord-log").getAttribute("data-view"), "flat", "the list does not say it is All's, so it keeps no lane");
+  assert.deepStrictEqual(stripedIds(page), ["201", "202", "203", "204"]);
+  assert.equal(stripOf(rowWithId(page, "200")), null, "a row in no thread has a strip");
+  for (const id of ["201", "202", "203", "204"]) {
+    const row = rowWithId(page, id);
+    const strip = stripOf(row);
+    assert.deepStrictEqual([strip.label, strip.pressed], ["Select this thread", "false"], `${id}: the strip's name or state`);
+    assert.equal(strip.hue, tagOf(row).hue, `${id}: the strip is not its tag's colour`);
+    assert.notEqual(strip.hue, "");
+    assert.equal(strip.keys, "T", `${id}: the strip does not say its key`);
+    assert.equal(row.hasAttribute("data-thread-strip"), true, `${id}: the row does not recede in its box`);
+    // After a reply's arrow, where there is one; else the row's first part.
+    assert.equal(row.children[0].hasClass("thread-strip") || row.children[1].hasClass("thread-strip"), true);
+  }
+  assert.notEqual(stripOf(rowWithId(page, "201")).hue, stripOf(rowWithId(page, "203")).hue, "two threads, one colour");
+  // Main, and a thread: no strip shows.
+  await pickThread(page, "main");
+  assert.deepStrictEqual(stripedIds(page), [], "Main has strips");
+  assert.equal(page.el("discord-log").getAttribute("data-view"), "main");
+  assert.equal(page.el("discord-log").children.some((row) => row.hasAttribute("data-thread-strip")), false);
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  assert.deepStrictEqual(stripedIds(page), [], "a thread has strips");
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(stripedIds(page), ["201", "202", "203", "204"], "back in All, the strips did not come back");
+});
+
+test("`#290 all-thread-strip`: a thread nobody has answered has no strip, and gets one live when its first reply arrives — its row no taller", async () => {
+  const { page, data } = await freshMessagePage();
+  await pickThread(page, "flat");
+  const root = rowOf(page, "210");
+  assert.equal(stripOf(root), null, "a colour was spent on a thread nobody has answered");
+  const tall = root.getBoundingClientRect().height;
+  const answer = message({ id: "211", content: "an answer from someone else", author: "bob", author_id: "1000000000000000077",
+    author_is_bot: false, thread: { ...data.lone, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.messages = [...page.messages.map((held) => (held.id === "210" ? { ...held, thread: { ...data.lone, reply_count: 1 } } : held)), answer];
+  await deliver(page, page.stream(), sseMessage(answer));
+  await page.settle();
+  const now = rowOf(page, "210");
+  assert.equal(stripOf(now) && stripOf(now).shown, true, "the first reply gave the root no strip");
+  assert.equal(stripOf(now).hue, tagOf(now).hue);
+  assert.equal(stripOf(rowOf(page, "211")).shown, true, "the first reply has no strip");
+  // The strip itself takes no room in the row: it lies over the row's left border, in the lane every
+  // row of All keeps (the stylesheet test above; tests/all_thread_strip_browser.py measures the words).
+  assert.equal(stripOf(now).strip.getBoundingClientRect().height, 0, "the strip takes room in its row");
+  assert.ok(tall > 0);
+});
+
+test("`#290 all-thread-strip`: a press on a strip selects its thread in All — only attributes: its rows marked, its strips pressed, the list unmoved, still All, nothing read or sent — and says so; again lets go, another thread's strip moves it, Esc lets go", async () => {
+  const page = await threadPage();
+  const area = page.el("scroll-area");
+  const [first, second] = page.threads;
+  const place = area.scrollTop;
+  const tops = page.el("discord-log").children.map((row) => row.getBoundingClientRect().top);
+  const requests = page.requests.length;
+  const rows = page.el("discord-log").children;
+  const drawn = rows.map((row) => row);
+  await stripOf(rowWithId(page, "202")).strip.click();
+  assert.deepStrictEqual(focusOf(page), { thread: first.id, rows: ["201", "202"], pressed: ["201", "202"] });
+  assert.equal(page.el("thread-select").value, "flat", "a press on a strip left All");
+  assert.equal(area.scrollTop, place, "a press on a strip scrolled the list");
+  assert.deepStrictEqual(page.el("discord-log").children.map((row) => row.getBoundingClientRect().top), tops, "a row moved");
+  assert.deepStrictEqual(page.el("discord-log").children, drawn, "the rows were drawn again");
+  assert.equal(page.requests.length, requests, `a press on a strip sent ${page.requests.slice(requests).join(", ")}`);
+  assert.deepStrictEqual(page.dismissCalls, [], "a press on a strip marked something read");
+  assert.match(page.el("status").textContent, /^Thread selected: first thread root — 2 of 5 messages here\. Esc clears it\.$/);
+  // Another thread's strip moves it; its own again lets go.
+  await stripOf(rowWithId(page, "203")).strip.click();
+  assert.deepStrictEqual(focusOf(page), { thread: second.id, rows: ["203", "204"], pressed: ["203", "204"] });
+  await stripOf(rowWithId(page, "204")).strip.click();
+  assert.deepStrictEqual(focusOf(page), NO_FOCUS, "a second press did not let go");
+  assert.equal(page.el("status").textContent, "Thread selection cleared.");
+  // Esc lets go, and stays in All; the next Esc is All's own.
+  await stripOf(rowWithId(page, "201")).strip.click();
+  await press(page, area, "Escape");
+  assert.deepStrictEqual(focusOf(page), NO_FOCUS, "Esc did not let go of the thread");
+  assert.equal(page.el("thread-select").value, "flat");
+  // ...after the search has had its Esc.
+  await stripOf(rowWithId(page, "201")).strip.click();
+  await page.el("search-toggle").click();
+  await press(page, page.el("search-field"), "Escape");
+  assert.equal(focusOf(page).thread, first.id, "the search's Esc let go of the thread");
+  await press(page, area, "Escape");
+  assert.deepStrictEqual(focusOf(page), NO_FOCUS);
+  // The control: with no Esc step, Esc leaves the thread selected.
+  const blind = newPage(new Map(), brokenScript("  if (clearAllThreadFocus()) return true;\n", ""));
+  const data = threadData();
+  blind.threadingSupported = true;
+  blind.threads = data.threads;
+  await signIn(blind);
+  await showDiscord(blind, data.messages);
+  await stripOf(rowWithId(blind, "201")).strip.click();
+  await press(blind, blind.el("scroll-area"), "Escape");
+  assert.equal(focusOf(blind).thread, first.id, "the negative control let go too, so the check above proves nothing");
+});
+
+test("`#290 all-thread-strip`: the selection lives on — a live reply of the thread arrives in it and any other message out of it; the read mode, Hide read, the search, Thread(N) and back keep it; another channel has its own", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => {
+    p.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  });
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  const [first] = data.threads;
+  await stripOf(rowWithId(page, "201")).strip.click();
+  // A live reply of the thread, and a message of no thread.
+  const reply = server.post(message({ id: "205", content: "a second answer", thread: { ...data.messages[1].thread, is_root: false } }));
+  await deliver(page, page.stream(), sseMessage(reply));
+  await page.settle();
+  const other = server.post(message({ id: "206", content: "something else entirely" }));
+  await deliver(page, page.stream(), sseMessage(other));
+  await page.settle();
+  assert.deepStrictEqual(focusOf(page), { thread: first.id, rows: ["201", "202", "205"], pressed: ["201", "202", "205"] },
+    "a live reply of the thread did not arrive in it");
+  assert.equal(rowWithId(page, "206").hasAttribute("data-thread-in"), false, "a message of no thread arrived in the thread");
+  // The read mode, Hide read and the search keep it.
+  await press(page, page.el("scroll-area"), "h");
+  await page.settle();
+  assert.equal(focusOf(page).thread, first.id, "the read mode let go of the thread");
+  await press(page, page.el("scroll-area"), "h");
+  await press(page, page.el("scroll-area"), "h");
+  await page.settle();
+  await search(page, "answer");
+  await page.settle();
+  assert.equal(focusOf(page).thread, first.id, "the search let go of the thread");
+  await page.el("search-toggle").click();
+  await page.settle();
+  // Thread(N) opens the thread; Back to All finds it still selected.
+  await threadBadge(rowWithId(page, "202")).click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${first.id}`, "Thread(N) on a row with a strip did not open the thread");
+  assert.equal(page.el("discord-log").hasAttribute("data-focus-thread"), false, "the thread view is dimmed by All's selection");
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(focusOf(page).thread, first.id, "back in All, the thread was no longer selected");
+  // Another channel: none selected there; coming back, this one's is.
+  await changeChannelTo(page, OTHER_CHANNEL.id);
+  assert.equal(page.el("discord-log").hasAttribute("data-focus-thread"), false, "another channel came up with this one's selection");
+  await changeChannelTo(page, CHANNEL.id);
+  assert.equal(focusOf(page).thread, first.id, "coming back, the channel's selection was gone");
+});
+
+test("`#290 all-thread-strip`: t presses the selected message's strip — selects its thread, again lets go, on another thread's message moves it — and does nothing on a message of no thread, outside All, or with single keys off; Esc order: a card left open on the right is not Esc's", async () => {
+  const page = await threadPage();
+  const [first, second] = page.threads;
+  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE)[1];
+  assert.match(table, /chords: \[\{ key: "t" \}\],\s*does: "In All, select its thread[^]*?rowControls: \["thread-strip"\],\s*run: \(event, target\) => threadStripFromKeyboard\(target\)/,
+    "t is not the strip's key in the keymap");
+  assert.match(page.el("keyboard-keys").text(), /In All, select its thread, as a click on the colour strip at its left edge does/);
+  let event = await press(page, rowWithId(page, "202"), "t");
+  assert.equal(event.defaulted, false, "t was left to the browser");
+  assert.equal(focusOf(page).thread, first.id, "t did not select the message's thread");
+  await press(page, rowWithId(page, "204"), "t");
+  assert.equal(focusOf(page).thread, second.id, "t on another thread's message did not move the selection");
+  await press(page, rowWithId(page, "203"), "t");
+  assert.deepStrictEqual(focusOf(page), NO_FOCUS, "t again did not let go");
+  // On a message on screen, so the key is not spent on selecting the first one showing.
+  page.el("scroll-area").scrollTop = 0;
+  event = await press(page, rowWithId(page, "200"), "t");
+  assert.equal(event.defaulted, true, "t on a message of no thread was taken from the browser");
+  assert.deepStrictEqual(focusOf(page), NO_FOCUS);
+  await pickThread(page, "main");
+  page.el("scroll-area").scrollTop = 0;
+  event = await press(page, rowWithId(page, "201"), "t");
+  assert.equal(event.defaulted, true, "t in Main was taken from the browser");
+  await pickThread(page, "flat");
+  await page.el("open-settings").click();
+  await page.el("single-keys").setChecked(false);
+  await page.el("close-settings").click();
+  await page.settle();
+  event = await press(page, rowWithId(page, "201"), "t");
+  assert.deepStrictEqual(focusOf(page), NO_FOCUS, "t worked with single keys off");
+  assert.equal(stripOf(rowWithId(page, "201")).keys, null, "the strip still says t with single keys off");
+
+  // `#289` x `#281`: the card at the top of the right column's thread opened, Ctrl+2 to All, a thread
+  // selected there: Esc lets go of it, and is not spent on the card left behind out of sight.
+  const { page: wide, data } = await twoColumnServer();
+  await openerOf(cardRow(wide, data.threads[0].id)).click();
+  await wide.settle();
+  await wide.el("side-thread-card-text").click();
+  await press(wide, wide.el("side-scroll"), "2", { ctrlKey: true });
+  await wide.settle();
+  assert.equal(wide.el("thread-select").value, "flat");
+  await stripOf(rowWithId(wide, "203")).strip.click();
+  await press(wide, wide.el("scroll-area"), "Escape");
+  assert.deepStrictEqual(focusOf(wide), NO_FOCUS, "Esc in All was spent on the card left open on the right");
+});
+
+test("`#290 all-thread-strip`: neither selecting nor letting go reads, marks or redraws a row — read rows keep their state; and a finger resting or sliding on a strip neither archives its message nor opens its details", async () => {
+  const page = await threadPage();
+  await doneButton(rowWithId(page, "202")).click();
+  await page.settle();
+  const before = page.el("discord-log").children.map((row) => [row.getAttribute("data-id"), row.getAttribute("data-archived"), row.getAttribute("data-own-read")]);
+  const reads = page.timelineCalls.length;
+  const dismissed = page.dismissCalls.length;
+  await stripOf(rowWithId(page, "201")).strip.click();
+  await stripOf(rowWithId(page, "201")).strip.click();
+  assert.deepStrictEqual(page.el("discord-log").children.map((row) => [row.getAttribute("data-id"), row.getAttribute("data-archived"), row.getAttribute("data-own-read")]),
+    before, "selecting a thread changed a row's read state");
+  assert.equal(page.timelineCalls.length, reads, "selecting a thread read the channel");
+  assert.equal(page.dismissCalls.length, dismissed, "selecting a thread marked something read");
+  // A finger on the strip: no swipe follows it and no hold opens the details.
+  for (const run of [SCRIPT, brokenScript("    if (li.threadStrip && nodeWithin(li.threadStrip, event.target)) {\n      return;\n    }\n", "")]) {
+    const probe = newPage(new Map(), run);
+    const data = threadData();
+    probe.threadingSupported = true;
+    probe.threads = data.threads;
+    await signIn(probe);
+    await showDiscord(probe, data.messages);
+    const row = rowWithId(probe, "204");
+    const strip = stripOf(row).strip;
+    await row.dispatch("pointerdown", { target: strip, pointerType: "touch", clientX: 4, clientY: 40 });
+    probe.expireTimers(HOLD_MS);
+    await probe.settle();
+    const opened = row.descendants().some((node) => node.hasClass("msg-details"));
+    if (run === SCRIPT) {
+      assert.equal(opened, false, "a finger resting on the strip opened the message's details");
+      assert.notEqual(row.style.transition, "none", "a finger on the strip started the row's swipe");
+    } else {
+      assert.equal(opened, true, "the negative control opened no details either, so the check above proves nothing");
+    }
   }
 });
 

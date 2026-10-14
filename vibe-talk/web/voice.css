@@ -1923,6 +1923,11 @@ a.search-hit-link {
  * the circle is the other end of an arrow, and is drawn at the arrow's strength. Most such rows
  * recede — a message with a reply is an answered one (`data-replied`) — and it is on exactly those
  * that a faded circle would be the faint mark the owner called useless.
+ *
+ * `#290 all-thread-strip`. And so is a row of All with its thread's strip on its left edge: the strip
+ * is the thread's colour, and on a read row drained grey every read message of every thread would
+ * look like a thread selected away before anything was selected. Every rule over a row's parts below
+ * leaves the strip out (`:not(.thread-strip)`), and the strip stands over the veil.
  */
 #side-log li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who],
@@ -1939,36 +1944,39 @@ a.search-hit-link {
 #pinned-log li.discord-message[data-seam][data-who],
 #side-log li.discord-message[data-seam-below][data-who],
 #discord-log li.discord-message[data-seam-below][data-who],
-#pinned-log li.discord-message[data-seam-below][data-who] {
+#pinned-log li.discord-message[data-seam-below][data-who],
+#discord-log li.discord-message[data-thread-strip][data-who] {
   opacity: 1;
   filter: none;
   background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
   background-blend-mode: saturation;
 }
 
-#side-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-stack-under] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > :not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-reply-marker] > :not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#discord-log li.discord-message[data-bookmark] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#side-log li.discord-message[data-seam] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#discord-log li.discord-message[data-seam] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#pinned-log li.discord-message[data-seam] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#side-log li.discord-message[data-seam-below] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#discord-log li.discord-message[data-seam-below] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
-#pinned-log li.discord-message[data-seam-below] > :not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam) {
+#side-log li.discord-message[data-is-reply="true"] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-is-reply="true"] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-bookmark] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-bookmark] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-log li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#pinned-log li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-log li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#pinned-log li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#discord-log li.discord-message[data-thread-strip] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: var(--row-filter, none);
 }
 
 /* The unread count, over the veil and in its own colour. Weighed above the rule over a reply's
-   parts, for a root that is also a reply. */
-#side-log li.discord-message[data-unread-replies] > .thread-unread:not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+   parts, for a root that is also a reply. (`:not(.thread-strip)` is weight only, as on the rules over
+   a row's parts above, which `#290 all-thread-strip` gave it.) */
+#side-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   position: relative;
   z-index: 1;
   filter: none;
@@ -1993,7 +2001,8 @@ a.search-hit-link {
 #pinned-log li.discord-message[data-seam]::after,
 #side-log li.discord-message[data-seam-below]::after,
 #discord-log li.discord-message[data-seam-below]::after,
-#pinned-log li.discord-message[data-seam-below]::after {
+#pinned-log li.discord-message[data-seam-below]::after,
+#discord-log li.discord-message[data-thread-strip]::after {
   --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
   content: "";
   position: absolute;
@@ -2273,9 +2282,10 @@ a.search-hit-link {
 }
 
 /* At full strength on a receding row, as the arrow is: weighed above the rule over a reply's parts,
-   for a row that is a reply and has replies of its own. */
-#side-log li.discord-message[data-reply-marker] > .reply-marker:not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-reply-marker] > .reply-marker:not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+   for a row that is a reply and has replies of its own. (`:not(.thread-strip)` is weight only, the
+   weight every rule over a row's parts gained with `#290 all-thread-strip`.) */
+#side-log li.discord-message[data-reply-marker] > .reply-marker:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-reply-marker] > .reply-marker:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: none;
 }
 
@@ -4998,6 +5008,16 @@ a.search-hit-link {
   :root:not([data-input="keys"]) #discord-log .reply-marker:hover::before {
     box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
   }
+
+  /* `#290 all-thread-strip`. A thread's strip in All widens under a resting mouse, and while another
+     thread is selected shows its own colour again: the way to select its thread instead. */
+  :root:not([data-input="keys"]) #discord-log .thread-strip:hover::before {
+    width: calc(var(--strip-bar) + 2px);
+  }
+
+  :root:not([data-input="keys"]) #discord-log[data-focus-thread] > li:not([data-thread-in]) > .thread-strip:hover::before {
+    background: hsl(var(--thread-hue, 210) 55% 50%);
+  }
 }
 
 /* A touch screen keeps what it had: a row holding the focus (a finger on one of its controls focuses
@@ -7449,4 +7469,108 @@ textarea {
   flex: 0 0 auto;
   min-height: 2.75rem;
   min-width: 4rem;
+}
+
+/*
+ * `#290 all-thread-strip`. THE THREAD'S STRIP ON A ROW OF ALL. The owner, 2026-10-14: "In the
+ * interleaved All view I would like a little color strip along the left edge of the rectangular
+ * messages that are messages in threads. Not the curved style of the thread cards, just the normal
+ * message view but with a color accent on the left. Somewhat thicker than the normal border so it is
+ * clickable. But when this border is clicked ... I want it to just SELECT that thread, dimming all
+ * messages that are not part of the thread but keeping us in the global view."
+ *
+ *   * THE LANE, kept on EVERY row of All (`data-view="flat"` on the list, written by web/voice.js), a
+ *     strip or none: a strip that comes with a thread's first reply moves no word of its row. The
+ *     agent's tile, which meets the screen's edge on a phone, keeps the notch's inset as well.
+ *   * THE STRIP is a button over the row's left border, the row's full height and a hit area wide
+ *     (16px; 22px under a finger), drawn as a straight bar in the thread's colour, by the formula its
+ *     tag and its card are edged in: five times a border (six under a finger), widening under a
+ *     resting mouse, and ringed in the accent for the keys. Over the read row's veil, and in no filter
+ *     (above): a read message's strip is its thread's colour too.
+ *   * SELECTED, the rows not in the thread recede further than a read row and lose their colour, and
+ *     their strips go grey; the thread's own come to full strength, a read one keeping its drained
+ *     tint. Only amounts are changed, never a size, so nothing moves; and with no transition, so a row
+ *     arriving dimmed does not flash. A row the keys or the mouse are on, the focus is in, or that is
+ *     being read aloud, answered or asked for comes back, as a read row does.
+ */
+:root {
+  --strip-hit: 16px;
+  --strip-bar: 5px;
+}
+
+@media (pointer: coarse) {
+  :root {
+    --strip-hit: 22px;
+    --strip-bar: 6px;
+  }
+}
+
+#discord-log[data-view="flat"] > li.discord-message[data-who] {
+  padding-left: calc(var(--strip-hit) + 0.35rem);
+}
+
+#discord-log[data-view="flat"] > li.discord-message[data-who="coder"] {
+  padding-left: calc(var(--strip-hit) + 0.35rem + env(safe-area-inset-left));
+}
+
+#discord-log > li.discord-message > .thread-strip {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  left: -1px;
+  z-index: 1;
+  width: var(--strip-hit);
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: inherit;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#discord-log > li.discord-message[data-who="coder"] > .thread-strip {
+  left: calc(-1px + env(safe-area-inset-left));
+}
+
+#discord-log > li.discord-message > .thread-strip::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--strip-bar);
+  border-radius: inherit;
+  background: hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+#discord-log > li.discord-message > .thread-strip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* A thread selected: the rest recede and drain, and their strips go grey (a resting mouse still shows
+   a strip's own colour, the way to select its thread instead: in the pointer's block, above). */
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who]:not([data-thread-in]) {
+  --row-opacity: 0.3;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
+}
+
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who][data-thread-in] {
+  --row-opacity: 1;
+}
+
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message:not([data-thread-in]) > .thread-strip::before {
+  background: var(--thread-grey);
+}
+
+#discord-log[data-view="flat"][data-focus-thread] > li.discord-message[data-who]:not([data-thread-in]):is([data-selected="true"], :focus-within, [data-reading="true"], [data-replying], [data-pending="true"]) {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
 }

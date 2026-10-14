@@ -3129,9 +3129,59 @@ def _act_thread_card_header_list(driver: Driver) -> None:
     driver.settle(400)
 
 
+# `#290 all-thread-strip`. A reply of the summarised thread, read, in the middle of All.
+THREADED_STRIP_ROW = "8800000000000000106"
+
+
+def _open_threaded_all(driver: Driver) -> None:
+    """The threaded channel in All, a reply of the summarised thread in the middle of the screen."""
+    page = driver.page
+    page.route("**/api/v1/client-config", _threaded_config)
+    page.route("**/api/v1/channels/*/timeline*", _threaded_timeline)
+    driver.load(with_token=True)
+    page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("view-switch")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0 && !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    if page.evaluate("() => document.getElementById('thread-select').value") != "flat":
+        page.select_option("#thread-select", "flat")
+    page.wait_for_function(
+        "() => document.getElementById('discord-log').getAttribute('data-view') === 'flat' "
+        "&& document.querySelectorAll('#discord-log > li > .thread-strip:not([hidden])').length > 0",
+        timeout=10_000,
+    )
+    page.evaluate(
+        f"() => document.querySelector(\"#discord-log > li[data-id='{THREADED_STRIP_ROW}']\")"
+        ".scrollIntoView({ block: 'center' })"
+    )
+    driver.settle(400)
+
+
+def _act_all_thread_strip(driver: Driver) -> None:
+    """`#290 all-thread-strip`: All, every message of an answered thread with a strip in its colour on its
+    left edge, the summarised thread's read replies included."""
+    _open_threaded_all(driver)
+
+
+def _act_all_thread_selected(driver: Driver) -> None:
+    """`#290 all-thread-strip`: the summarised thread selected by a click on a reply's strip, in All: the
+    rest dimmed and drained, nothing scrolled."""
+    page = driver.page
+    _open_threaded_all(driver)
+    page.evaluate("() => { window.__beforeTop = document.getElementById('scroll-area').scrollTop; }")
+    page.click(f"#discord-log > li[data-id='{THREADED_STRIP_ROW}'] > .thread-strip")
+    page.wait_for_function(
+        f"() => document.getElementById('discord-log').getAttribute('data-focus-thread') === '{THREADED_RUNNER}'",
+        timeout=10_000,
+    )
+    driver.settle(300)
+
+
 def _unroute_threaded(driver: Driver) -> None:
-    """Put back the two routes `55-thread-card-header` and `56-thread-card-header-list` answered, before
-    the next state."""
+    """Put back the two routes the threaded states (`55-thread-card-header`, `56-thread-card-header-list`,
+    `58-all-thread-strip`, `59-all-thread-selected`) answered, before the next state."""
     driver.page.unroute("**/api/v1/client-config", _threaded_config)
     driver.page.unroute("**/api/v1/channels/*/timeline*", _threaded_timeline)
 
@@ -5176,6 +5226,63 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="58-all-thread-strip",
+        what="All: every message of an answered thread has a strip in its thread's colour on its left edge",
+        act=_act_all_thread_strip,
+        after=_unroute_threaded,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            (
+                "every row whose tag is a thread's coloured Thread(N) has a strip, and no other row has one",
+                "(() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]; "
+                "const strip = (li) => [...li.children].find((kid) => kid.classList.contains('thread-strip') && !kid.hidden); "
+                "const open = (li) => !!li.querySelector('.thread-badge[data-thread-state=\"open\"]'); "
+                "return rows.some(open) && rows.every((li) => Boolean(strip(li)) === open(li)); })()",
+            ),
+            (
+                # THE look: a bar thicker than a border, in the thread's colour, on a read reply too.
+                "each strip's bar is at least 5px wide and its thread's colour, a hit area at least 16px wide and the row's height",
+                "(() => { const strips = [...document.querySelectorAll('#discord-log > li > .thread-strip:not([hidden])')]; "
+                "return strips.length > 0 && strips.every((s) => { const bar = getComputedStyle(s, '::before'); "
+                "const c = (bar.backgroundColor.match(/[0-9.]+/g) || []).slice(0, 3).map(Number); "
+                "const r = s.getBoundingClientRect(), row = s.parentElement.getBoundingClientRect(); "
+                "return parseFloat(bar.width) >= 5 && Math.max(...c) - Math.min(...c) >= 90 "
+                "&& r.width >= 16 && r.height >= row.height; }); })()",
+            ),
+            (
+                "nothing scrolls sideways",
+                "document.documentElement.scrollWidth <= window.innerWidth",
+            ),
+        ),
+    ),
+    Scene(
+        name="59-all-thread-selected",
+        what="All with the summarised thread selected by its strip: every other message dimmed and drained",
+        act=_act_all_thread_selected,
+        after=_unroute_threaded,
+        profiles=("android-412", "laptop-1280"),
+        expect=(
+            (
+                "still All, the thread selected, and nothing scrolled",
+                "document.getElementById('thread-select').value === 'flat' "
+                "&& document.getElementById('scroll-area').scrollTop === window.__beforeTop",
+            ),
+            (
+                # THE claim: the thread's own rows at full strength, every other row at about 0.3.
+                "the thread's rows are drawn at full strength and every other row at about 0.3",
+                "(() => { const drawn = (li) => { const after = getComputedStyle(li, '::after'); "
+                "const v = String(after.backgroundColor).match(/[0-9.]+/g) || []; "
+                "const alpha = after.content === 'none' ? 0 : v.length >= 4 ? Number(v[3]) : v.length === 3 ? 1 : 0; "
+                "return parseFloat(getComputedStyle(li).opacity) * (1 - alpha); }; "
+                "const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".filter((li) => li.getClientRects().length > 0 && li.getAttribute('data-read-run') !== 'head'); "
+                "const mine = rows.filter((li) => li.hasAttribute('data-thread-in')); "
+                "return mine.length > 0 && mine.length < rows.length "
+                "&& rows.every((li) => Math.abs(drawn(li) - (li.hasAttribute('data-thread-in') ? 1 : 0.3)) < 0.02); })()",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -5647,6 +5754,9 @@ def check_state_controls() -> list[str]:
         # ...and the thread list's thread across the window, at a desk and on the phone's width, where
         # the X must be a thumb's size; not every phone, whose pictures would show the same column.
         "56-thread-card-header-list": ("android-412", "laptop-1280"),
+        # `#290 all-thread-strip`. All at a desk and at a phone's width, where the strip is a finger's.
+        "58-all-thread-strip": ("android-412", "laptop-1280"),
+        "59-all-thread-selected": ("android-412", "laptop-1280"),
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -5836,6 +5946,10 @@ def check_state_controls() -> list[str]:
         # Pinned to the card saying its list card's words across the window (`__cardText`), above the
         # list (`l.top`), with no line drawn (`column-links`) and a thumb's X (`44`).
         "56-thread-card-header-list": ("__cardText", "l.top", "column-links", "44"),
+        # Pinned to a strip on exactly the coloured threads' rows, its bar's width and colour (`::before`),
+        # and, selected, the drawn strength of every row (`data-thread-in`, 0.3) with nothing scrolled.
+        "58-all-thread-strip": ("thread-strip", "::before", "data-thread-state"),
+        "59-all-thread-selected": ("data-thread-in", "0.3", "__beforeTop"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
