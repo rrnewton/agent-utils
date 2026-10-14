@@ -583,6 +583,38 @@ mod tests {
         assert!(head.is_current());
     }
 
+    /// remote-ops-audit §4.1 `#287 bulk-reads`: every request this client sends is counted against
+    /// the operation that sent it, which is how diagnostics tell a native head read (a request per
+    /// server) from the reads it replaces (a request per channel).
+    #[tokio::test]
+    async fn each_request_a_head_read_sends_is_counted_against_it() {
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/channels/101",
+            text_channel("101", "9", Some("5001")),
+        );
+        ok(&mut routes, "/channels/102", text_channel("102", "9", None));
+        ok(
+            &mut routes,
+            "/guilds/9/channels",
+            json!([
+                text_channel("101", "9", Some("5002")),
+                text_channel("102", "9", Some("6001")),
+            ]),
+        );
+        let mock = mock(routes, native).await;
+        let channels = ids(&["101", "102"]);
+        let (_, first) =
+            crate::upstream_profile::counting_calls(mock.client.channel_heads(&channels)).await;
+        assert_eq!(mock.take().len(), 2);
+        assert_eq!(first, 2, "a request per channel never seen");
+        let (_, second) =
+            crate::upstream_profile::counting_calls(mock.client.channel_heads(&channels)).await;
+        assert_eq!(mock.take(), ["GET /guilds/9/channels"]);
+        assert_eq!(second, 1, "then one request for the server");
+    }
+
     #[tokio::test]
     async fn a_channel_missing_from_its_servers_list_is_read_on_its_own() {
         let mut routes = Replies::new();

@@ -1044,6 +1044,9 @@ impl HttpDiscordClient {
         let body = request.body.as_ref();
         self.limiter
             .run(request.method, url, || async {
+                // Each attempt is one request to the far end, counted against the operation
+                // sending it; the limiter calls this only for a request it lets go.
+                crate::upstream_profile::count_call();
                 let mut builder = self
                     .client
                     .request(method.clone(), url)

@@ -293,6 +293,8 @@ impl HttpSlackClient {
         method: &str,
         params: &[(&str, String)],
     ) -> Result<Outcome, ChatError> {
+        // One request to the far end, counted against the operation sending it.
+        upstream_profile::count_call();
         let response = self
             .client
             .post(url)

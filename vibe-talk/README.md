@@ -1398,9 +1398,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
     {
       "provider": "slack", "name": "Slack",   // the key from the configuration, and its name
       "operations": [                         // one row per operation and outcome
-        { "name": "fetch_recent", "outcome": "ok", "count": 41, "rows": 2050,
+        { "name": "fetch_recent", "outcome": "ok", "count": 41, "rows": 2050, "calls": 43,
           "mean_ms": 910.4, "p50_ms": 812.5, "p90_ms": 1937.5, "p99_ms": 3875, "max_ms": 4102,
-          "octaves_ms": [[256, 3], [512, 22], [1024, 14], [2048, 2]] }
+          "octaves_ms": [[256, 3], [512, 22], [1024, 14], [2048, 2]] },
+        { "name": "fetch_range", "outcome": "ok", "count": 2, "rows": 300, "calls": 16, "…": "…" }
       ],
       "shim_calls": [                         // one row per Web API method and outcome
         { "name": "conversations.history", "outcome": "rate_limited", "count": 2, "…": "…" }
@@ -1438,6 +1439,15 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   own client, so the live poller and this report's own token check count as well as the page and
   the voice agent. Questions a provider answers from memory, such as whether it supports threads,
   are not counted. `rows` is what the operations returned, in total.
+* **`calls`** on an operation row is how many HTTP requests those operations sent upstream, in
+  total: Slack Web API calls, Discord requests, or requests to a compatible bridge, each one sent
+  again after a rate limit included (remote-ops-audit §4.1). It is what an operation cost the far
+  end, and it is how a native bulk read is told from its emulation: a native one is one operation
+  of a few calls (`channel_heads` of ten Discord channels on one server, `count: 1, calls: 1`; a
+  Slack `fetch_range` over 150 messages, `count: 1, calls: 8`), where the trait's default is many
+  operations of a call or more each (ten `fetch_recent`, `count: 10, calls: 10`). An operation the
+  caller abandoned keeps the calls it had already sent. A request a provider's client sends
+  outside every operation is on no row (Slack's shim calls still list it).
 * **Shim calls** are the HTTP requests the Slack client sends, by Web API method. One operation can
   be several: a flat read is about eleven, and each author lookup is one more. A request answered
   with a 429 and then sent again counts twice, as the far end's own log counts it (a compatible
@@ -1479,7 +1489,7 @@ is a number: no channel, no message id, no author, no text.
 hour after the server starts. Its target is `vibe_talk::upstream_profile`:
 
 ```text
-INFO vibe_talk::upstream_profile: upstream timings for the last hour provider="slack" seconds=3600 operations=88 operations_failed=1 operation_timings="fetch_recent ok n=60 p50_ms=812.5 p90_ms=1937.5 max_ms=4102; fetch_recent transport n=1 p50_ms=10000 p90_ms=10000 max_ms=10000; …" shim_calls=402 shim_calls_failed=2 shim_call_timings="conversations.history ok n=300 p50_ms=687.5 p90_ms=1437.5 max_ms=3010; …" reasons="fetch_recent_dated poll=50 recent=10; …" content_messages=1900 content_bytes_p50=140 content_bytes_p90=610 content_bytes_max=11800
+INFO vibe_talk::upstream_profile: upstream timings for the last hour provider="slack" seconds=3600 operations=88 operations_failed=1 operation_calls=402 operation_timings="fetch_recent ok n=60 calls=62 p50_ms=812.5 p90_ms=1937.5 max_ms=4102; fetch_recent transport n=1 calls=1 p50_ms=10000 p90_ms=10000 max_ms=10000; …" shim_calls=402 shim_calls_failed=2 shim_call_timings="conversations.history ok n=300 p50_ms=687.5 p90_ms=1437.5 max_ms=3010; …" reasons="fetch_recent_dated poll=50 recent=10; …" content_messages=1900 content_bytes_p50=140 content_bytes_p90=610 content_bytes_max=11800
 ```
 
 ## Summaries

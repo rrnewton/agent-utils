@@ -29,6 +29,18 @@
 //!   Counted when the read is asked, so one its caller gave up on still counts. Counted only:
 //!   nothing here or anywhere else decides anything by it.
 //!
+//! # Upstream requests per operation
+//!
+//! Each operation row also says how many HTTP requests those operations sent upstream (`calls`),
+//! whatever the provider: every provider client calls [`count_call`] once per request it sends,
+//! and [`ProfiledClient`] counts them against the operation it is timing, through a task-local
+//! counter. That is what tells a native bulk read from its emulation (remote-ops-audit §4.1
+//! `#287 bulk-reads`): a native `channel_heads` of ten Discord channels on one server is one
+//! operation and one call, where the default's ten one-message reads are ten `fetch_recent`
+//! operations and ten calls; a Slack `fetch_range` over 150 messages is one operation and eight
+//! calls. A request a provider sends from a task it spawned is not counted; neither client spawns
+//! one.
+//!
 //! # Histograms
 //!
 //! Latency is bucketed in powers of two from 1 ms to 128 s (2^17 ms), with one bucket below and
@@ -52,6 +64,8 @@
 //! outcome word; and numbers. Memory only: a restart starts again from zero.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -74,6 +88,40 @@ const LATENCY_OCTAVES: u32 = 17;
 const SIZE_OCTAVES: u32 = 20;
 /// How often [`log_every_hour`] writes.
 pub const LOG_INTERVAL: Duration = Duration::from_secs(3600);
+
+tokio::task_local! {
+    /// The upstream requests of whatever is being counted on this task now: the operation a
+    /// [`Timer`] is running, or the work [`counting_calls`] wraps. See [`count_call`].
+    static CALLS: Arc<AtomicU64>;
+}
+
+/// Count one HTTP request sent upstream against the operation running now, if one is counted.
+///
+/// Every provider client calls this once per request it sends, immediately before sending it, a
+/// request answered with a rate limit and sent again included, so an operation's `calls` is what
+/// it cost the far end. A request sent outside any counted operation is counted nowhere (Slack's
+/// shim calls still list it). remote-ops-audit §4.1 `#287 bulk-reads`.
+pub fn count_call() {
+    let _ = CALLS.try_with(|calls| calls.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Run `work`, and say how many upstream requests it sent ([`count_call`]), its timed operations'
+/// included. Those requests count towards an enclosing count as well.
+pub async fn counting_calls<F: Future>(work: F) -> (F::Output, u64) {
+    let calls = Arc::new(AtomicU64::new(0));
+    let output = within(&calls, work).await;
+    (output, calls.load(Ordering::Relaxed))
+}
+
+/// Run `work` with its upstream requests counted into `calls`, and once it is done pass them on to
+/// the count around it, if any, so a count of a larger piece of work includes this one's.
+async fn within<F: Future>(calls: &Arc<AtomicU64>, work: F) -> F::Output {
+    let before = calls.load(Ordering::Relaxed);
+    let output = CALLS.scope(Arc::clone(calls), work).await;
+    let sent = calls.load(Ordering::Relaxed).saturating_sub(before);
+    let _ = CALLS.try_with(|outer| outer.fetch_add(sent, Ordering::Relaxed));
+    output
+}
 
 /// How one upstream operation or call ended, in the words the report and the log use.
 ///
@@ -331,6 +379,9 @@ struct Tally {
     hour: Histogram,
     rows_total: u64,
     rows_hour: u64,
+    /// Upstream requests the operations sent ([`count_call`]); always 0 for shim calls.
+    calls_total: u64,
+    calls_hour: u64,
 }
 
 impl Tally {
@@ -340,6 +391,8 @@ impl Tally {
             hour: Histogram::latency(),
             rows_total: 0,
             rows_hour: 0,
+            calls_total: 0,
+            calls_hour: 0,
         }
     }
 }
@@ -398,19 +451,21 @@ impl ProviderProfile {
         self.tallies.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Start timing one operation or call. Finish it with [`Timer::finish`]; a timer dropped
-    /// unfinished records [`Outcome::Abandoned`] with the time waited.
+    /// Start timing one operation or call. Run the work through [`Timer::run`] to count the
+    /// upstream requests it sends, and finish it with [`Timer::finish`]; a timer dropped
+    /// unfinished records [`Outcome::Abandoned`] with the time waited and the requests sent.
     pub fn start(&self, series: Series, name: &'static str) -> Timer<'_> {
         Timer {
             profile: self,
             series,
             name,
             started: Instant::now(),
+            calls: Arc::new(AtomicU64::new(0)),
             finished: false,
         }
     }
 
-    /// Record one finished operation or call.
+    /// Record one finished operation or call that sent no upstream request this server counted.
     pub fn record(
         &self,
         series: Series,
@@ -418,6 +473,19 @@ impl ProviderProfile {
         outcome: Outcome,
         elapsed: Duration,
         rows: usize,
+    ) {
+        self.record_with_calls(series, name, outcome, elapsed, rows, 0);
+    }
+
+    /// Record one finished operation, with the upstream requests it sent.
+    fn record_with_calls(
+        &self,
+        series: Series,
+        name: &'static str,
+        outcome: Outcome,
+        elapsed: Duration,
+        rows: usize,
+        calls: u64,
     ) {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let rows = u64::try_from(rows).unwrap_or(u64::MAX);
@@ -431,6 +499,8 @@ impl ProviderProfile {
         tally.hour.record(micros);
         tally.rows_total = tally.rows_total.saturating_add(rows);
         tally.rows_hour = tally.rows_hour.saturating_add(rows);
+        tally.calls_total = tally.calls_total.saturating_add(calls);
+        tally.calls_hour = tally.calls_hour.saturating_add(calls);
     }
 
     /// Count one read operation asked for `reason`.
@@ -467,6 +537,7 @@ impl ProviderProfile {
                 .iter()
                 .map(|(&(name, outcome), tally)| {
                     TimingReport::of(name, outcome, &tally.total, Some(tally.rows_total))
+                        .with_calls(tally.calls_total)
                 })
                 .collect(),
             shim_calls: tallies
@@ -487,19 +558,26 @@ impl ProviderProfile {
         let mut tallies = self.lock();
         let seconds = tallies.hour_started.elapsed().as_secs();
         tallies.hour_started = Instant::now();
-        let take = |map: &mut BTreeMap<(&'static str, Outcome), Tally>, rows: bool| {
+        // `operation` rows carry their rows and their upstream requests; shim calls carry neither.
+        let take = |map: &mut BTreeMap<(&'static str, Outcome), Tally>, operation: bool| {
             let mut out = Vec::new();
             for (&(name, outcome), tally) in map.iter_mut() {
                 if tally.hour.count() > 0 {
-                    out.push(TimingReport::of(
+                    let row = TimingReport::of(
                         name,
                         outcome,
                         &tally.hour,
-                        rows.then_some(tally.rows_hour),
-                    ));
+                        operation.then_some(tally.rows_hour),
+                    );
+                    out.push(if operation {
+                        row.with_calls(tally.calls_hour)
+                    } else {
+                        row
+                    });
                 }
                 tally.hour = Histogram::latency();
                 tally.rows_hour = 0;
+                tally.calls_hour = 0;
             }
             out
         };
@@ -529,16 +607,30 @@ pub struct Timer<'p> {
     series: Series,
     name: &'static str,
     started: Instant,
+    /// The upstream requests the work run through [`Timer::run`] sent.
+    calls: Arc<AtomicU64>,
     finished: bool,
 }
 
 impl Timer<'_> {
+    /// Run `work` as this operation: every upstream request it sends ([`count_call`]) is counted
+    /// against it, and against an enclosing count as well ([`counting_calls`]).
+    pub async fn run<F: Future>(&self, work: F) -> F::Output {
+        within(&self.calls, work).await
+    }
+
     /// Record how this one ended, and return how long it took.
     pub fn finish(mut self, outcome: Outcome, rows: usize) -> Duration {
         self.finished = true;
         let elapsed = self.started.elapsed();
-        self.profile
-            .record(self.series, self.name, outcome, elapsed, rows);
+        self.profile.record_with_calls(
+            self.series,
+            self.name,
+            outcome,
+            elapsed,
+            rows,
+            self.calls.load(Ordering::Relaxed),
+        );
         elapsed
     }
 }
@@ -546,12 +638,13 @@ impl Timer<'_> {
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.profile.record(
+            self.profile.record_with_calls(
                 self.series,
                 self.name,
                 Outcome::Abandoned,
                 self.started.elapsed(),
                 0,
+                self.calls.load(Ordering::Relaxed),
             );
         }
     }
@@ -716,6 +809,13 @@ pub struct TimingReport {
     /// Rows the operations returned, in total. Absent for shim calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
+    /// HTTP requests the operations sent upstream, in total, each one sent again after a rate
+    /// limit included: what they cost the far end. A native bulk read is one operation of a few
+    /// calls where its emulation is many operations of a call or more each. 0 for a provider
+    /// client that counts no requests (a test double). Absent for shim calls, each of which is one
+    /// request. remote-ops-audit §4.1 `#287 bulk-reads`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calls: Option<u64>,
     /// Mean latency, milliseconds.
     pub mean_ms: f64,
     /// Median latency, milliseconds, read off the histogram.
@@ -743,6 +843,7 @@ impl TimingReport {
             outcome,
             count: histogram.count(),
             rows,
+            calls: None,
             mean_ms: millis(histogram.mean()),
             p50_ms: millis(histogram.quantile(0.5)),
             p90_ms: millis(histogram.quantile(0.9)),
@@ -754,6 +855,12 @@ impl TimingReport {
                 .map(|[from, count]| [from / LATENCY_FLOOR_MICROS, count])
                 .collect(),
         }
+    }
+
+    /// This row, saying its operations sent `calls` upstream requests.
+    const fn with_calls(mut self, calls: u64) -> Self {
+        self.calls = Some(calls);
+        self
     }
 }
 
@@ -831,12 +938,16 @@ fn reasons_text(rows: &[ReasonCount]) -> String {
     out.join("; ")
 }
 
-/// `fetch_recent ok n=3 p50_ms=12 p90_ms=40; …`: names, outcome words and numbers.
+/// `fetch_recent ok n=3 calls=3 p50_ms=12 p90_ms=40; …`: names, outcome words and numbers.
+/// `calls=` only on operation rows.
 fn timings_text(rows: &[TimingReport]) -> String {
     rows.iter()
         .map(|row| {
+            let calls = row
+                .calls
+                .map_or_else(String::new, |calls| format!(" calls={calls}"));
             format!(
-                "{} {} n={} p50_ms={} p90_ms={} max_ms={}",
+                "{} {} n={}{calls} p50_ms={} p90_ms={} max_ms={}",
                 row.name,
                 row.outcome.as_str(),
                 row.count,
@@ -862,6 +973,15 @@ impl HourReport {
         self.shim_calls.iter().map(|row| row.count).sum()
     }
 
+    /// Upstream requests the operations sent this hour, every outcome.
+    #[must_use]
+    pub fn operation_call_count(&self) -> u64 {
+        self.operations
+            .iter()
+            .map(|row| row.calls.unwrap_or(0))
+            .sum()
+    }
+
     fn failed(rows: &[TimingReport]) -> u64 {
         rows.iter()
             .filter(|row| row.outcome != Outcome::Ok)
@@ -877,6 +997,7 @@ impl HourReport {
             seconds = self.seconds,
             operations = self.operation_count(),
             operations_failed = Self::failed(&self.operations),
+            operation_calls = self.operation_call_count(),
             operation_timings = timings_text(&self.operations).as_str(),
             shim_calls = self.shim_call_count(),
             shim_calls_failed = Self::failed(&self.shim_calls),
@@ -1019,7 +1140,7 @@ impl ProfiledClient {
             return Vec::new();
         }
         let timer = self.profile.start(Series::Operation, "channel_heads");
-        let answers = self.inner.channel_heads(channels).await;
+        let answers = timer.run(self.inner.channel_heads(channels)).await;
         let answered = answers.iter().filter(|(_, head)| head.is_ok()).count();
         match answers.iter().find_map(|(_, head)| head.as_ref().err()) {
             Some(error) if answered == 0 => timer.finish(Outcome::of(error), 0),
@@ -1039,7 +1160,7 @@ impl ProfiledClient {
             return Vec::new();
         }
         let timer = self.profile.start(Series::Operation, "fetch_recent_many");
-        let answers = self.inner.fetch_recent_many(asks).await;
+        let answers = timer.run(self.inner.fetch_recent_many(asks)).await;
         let reads: Vec<&RecentRead> = answers
             .iter()
             .filter_map(|(_, read)| read.as_ref().ok())
@@ -1068,7 +1189,7 @@ impl ProfiledClient {
             return Vec::new();
         }
         let timer = self.profile.start(Series::Operation, "fetch_threads");
-        let answers = self.inner.fetch_threads(channel, asks).await;
+        let answers = timer.run(self.inner.fetch_threads(channel, asks)).await;
         let pages: Vec<&crate::threads::TimelinePage> = answers
             .iter()
             .filter_map(|(_, page)| page.as_ref().ok())
@@ -1099,7 +1220,7 @@ impl ProfiledClient {
             self.profile.record_reason(operation, ReadReason::current());
         }
         let timer = self.profile.start(Series::Operation, operation);
-        let result = work.await;
+        let result = timer.run(work).await;
         match &result {
             Ok(value) => {
                 timer.finish(Outcome::Ok, value.rows());
@@ -1665,6 +1786,128 @@ mod tests {
         assert!(
             Arc::ptr_eq(&slack, &profile.provider("slack", "ignored")),
             "one provider key is one profile"
+        );
+    }
+
+    /// remote-ops-audit §4.1 `#287 bulk-reads`: an operation's row says how many upstream requests
+    /// it sent, a shim call's says nothing, and an operation its caller stopped waiting for keeps
+    /// the requests it had already sent.
+    #[tokio::test]
+    async fn an_operation_counts_the_upstream_requests_it_sent_even_when_abandoned() {
+        let profile = UpstreamProfile::new();
+        let slack = profile.provider("slack", "Slack");
+        let timer = slack.start(Series::Operation, "fetch_range");
+        timer
+            .run(async {
+                count_call();
+                tokio::task::yield_now().await;
+                count_call();
+            })
+            .await;
+        let _took = timer.finish(Outcome::Ok, 40);
+        let _took = slack
+            .start(Series::ShimCall, "conversations.history")
+            .finish(Outcome::Ok, 0);
+
+        let abandoned = slack.start(Series::Operation, "fetch_threads");
+        let hung = abandoned.run(async {
+            count_call();
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), hung)
+                .await
+                .is_err(),
+            "the work never finishes"
+        );
+        drop(abandoned);
+
+        let report = slack.report();
+        let calls: Vec<(&str, Outcome, Option<u64>)> = report
+            .operations
+            .iter()
+            .map(|row| (row.name, row.outcome, row.calls))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("fetch_range", Outcome::Ok, Some(2)),
+                ("fetch_threads", Outcome::Abandoned, Some(1)),
+            ]
+        );
+        assert_eq!(report.shim_calls[0].calls, None, "a shim call is one call");
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["operations"][0]["calls"], 2);
+        assert!(json["shim_calls"][0].get("calls").is_none(), "{json}");
+    }
+
+    /// Two operations polled on one task, as a `join!` polls them, each count only their own
+    /// requests; a count around both sees every request once; and a request sent outside any
+    /// count is counted nowhere, without failing.
+    #[tokio::test]
+    async fn operations_on_one_task_count_their_own_requests_and_an_enclosing_count_sees_all() {
+        let profile = UpstreamProfile::new();
+        let discord = profile.provider("discord", "Discord");
+        let sends = |n: usize| async move {
+            for _ in 0..n {
+                count_call();
+                tokio::task::yield_now().await;
+            }
+        };
+        count_call();
+        let ((), total) = counting_calls(async {
+            let heads = discord.start(Series::Operation, "channel_heads");
+            let recent = discord.start(Series::Operation, "fetch_recent");
+            tokio::join!(heads.run(sends(1)), recent.run(sends(3)));
+            let _took = heads.finish(Outcome::Ok, 1);
+            let _took = recent.finish(Outcome::Ok, 3);
+            count_call();
+        })
+        .await;
+        assert_eq!(total, 5, "1 + 3 inside the operations, and 1 beside them");
+        let calls: Vec<(&str, Option<u64>)> = discord
+            .report()
+            .operations
+            .iter()
+            .map(|row| (row.name, row.calls))
+            .collect();
+        assert_eq!(
+            calls,
+            [("channel_heads", Some(1)), ("fetch_recent", Some(3))]
+        );
+    }
+
+    /// The hourly line says how many upstream requests each operation sent that hour, and in all.
+    #[tokio::test]
+    async fn the_hour_counts_each_operations_upstream_requests() {
+        let profile = UpstreamProfile::new();
+        let discord = profile.provider("discord", "Discord");
+        let timer = discord.start(Series::Operation, "channel_heads");
+        timer
+            .run(async {
+                count_call();
+                count_call();
+            })
+            .await;
+        let _took = timer.finish(Outcome::Ok, 10);
+        let hour = profile.take_hour();
+        assert_eq!(hour[0].operations[0].calls, Some(2));
+        assert_eq!(hour[0].operation_call_count(), 2);
+        let text = timings_text(&hour[0].operations);
+        assert!(
+            text.starts_with("channel_heads ok n=1 calls=2 p50_ms="),
+            "{text}"
+        );
+        let next = profile.take_hour();
+        assert_eq!(
+            next[0].operation_call_count(),
+            0,
+            "the next hour starts empty"
+        );
+        assert_eq!(
+            profile.report().providers[0].operations[0].calls,
+            Some(2),
+            "diagnostics keep the total since start"
         );
     }
 

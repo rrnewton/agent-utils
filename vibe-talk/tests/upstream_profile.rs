@@ -1358,3 +1358,189 @@ async fn an_emulated_read_of_several_channels_is_timed_and_counted_as_the_reads_
     assert_eq!(counting.count("fetch_recent_dated"), 2);
     assert_eq!(counting.count("fetch_recent_many"), 0);
 }
+
+/// A provider that sends one upstream request per page it reads ([`FakeDiscord`] underneath), and,
+/// when `native_heads`, reads the heads of every channel asked about in one request more.
+struct Billed {
+    fake: Arc<FakeDiscord>,
+    native_heads: bool,
+}
+
+#[async_trait]
+impl ChatClient for Billed {
+    fn provider_name(&self) -> &str {
+        "Billed"
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        vibe_talk::upstream_profile::count_call();
+        self.fake.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        vibe_talk::upstream_profile::count_call();
+        self.fake.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        vibe_talk::upstream_profile::count_call();
+        self.fake.post_message(channel, content, reply_to).await
+    }
+
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            heads: if self.native_heads {
+                Support::Native
+            } else {
+                Support::Emulated
+            },
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn channel_heads(&self, channels: &[ChannelId]) -> HeadAnswers {
+        if !self.native_heads {
+            return vibe_talk::chat::emulated_heads(self, channels).await;
+        }
+        vibe_talk::upstream_profile::count_call();
+        let mut answers = Vec::new();
+        for channel in channels {
+            let newest = self.fake.fetch_recent(channel, 1).await.map(|messages| {
+                let newest = messages.last();
+                ChannelHead {
+                    newest_id: newest.map(|message| message.id.clone()),
+                    newest_at_ms: newest.and_then(|message| message.id.created_at_ms()),
+                    ..ChannelHead::default()
+                }
+            });
+            answers.push((channel.clone(), newest));
+        }
+        answers
+    }
+}
+
+/// remote-ops-audit §4.1 `#287 bulk-reads`: diagnostics tell a native bulk read from its emulation.
+/// The same heads of three channels are one `channel_heads` operation and one upstream request
+/// from a provider that reads heads itself, and three `fetch_recent` operations of a request each
+/// from one that does not; each operation's row says how many requests it sent.
+#[tokio::test]
+async fn a_native_bulk_read_and_its_emulation_differ_in_operations_and_upstream_calls() {
+    let fake = Arc::new(FakeDiscord::new());
+    let channels: Vec<ChannelId> = ["C1", "C2", "C3"]
+        .iter()
+        .map(|id| ChannelId((*id).to_owned()))
+        .collect();
+    for channel in &channels {
+        fake.seed(channel, "ada", "words");
+    }
+    let mut answers = Vec::new();
+    let mut rows = Vec::new();
+    for native_heads in [true, false] {
+        let profile = UpstreamProfile::new();
+        let profiled = ProfiledClient::new(
+            Arc::new(Billed {
+                fake: Arc::clone(&fake),
+                native_heads,
+            }),
+            profile.provider("billed", "Billed"),
+        );
+        let heads = profiled.channel_heads(&channels).await;
+        answers.push(
+            heads
+                .into_iter()
+                .map(|(channel, head)| (channel, head.expect("a head").newest_id))
+                .collect::<Vec<_>>(),
+        );
+        rows.push(
+            profile.report().providers[0]
+                .operations
+                .iter()
+                .map(|row| (row.name, row.count, row.calls))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(answers[0], answers[1], "the same heads either way");
+    assert_eq!(rows[0], [("channel_heads", 1, Some(1))], "native");
+    assert_eq!(rows[1], [("fetch_recent", 3, Some(3))], "emulated");
+}
+
+/// Slack's requests are counted against the operation that sent them: a `/count` since an
+/// instant with 150 messages after it is one native `fetch_range` of eight
+/// `conversations.history` calls; a read that met one 429 is one operation of two calls; and
+/// every request the far end saw is on exactly one operation.
+#[tokio::test]
+async fn each_slack_request_is_counted_against_the_operation_that_sent_it() {
+    let mut fixture = FakeState::default();
+    let mut history = Vec::new();
+    for i in 0..400 {
+        history.push(profiled(&ts(i, 0), "UADA00001", "Ada", &format!("old {i}")));
+    }
+    for i in 0..150 {
+        history.push(profiled(
+            &ts(10_000 + i, 0),
+            "UADA00001",
+            "Ada",
+            &format!("in {i}"),
+        ));
+    }
+    fixture.history.insert(TEAM.to_owned(), history);
+    let fake = Fake::start(fixture, 20).await;
+    let state = slack_deployment(&fake).await;
+    let router = vibe_talk::http::router(state.clone());
+    let since =
+        vibe_talk::clock::iso_from_ms((slack_fake::BASE_SECS + 10_000) * 1000).replace(':', "%3A");
+    let (status, body) = get(
+        &router,
+        &format!("/api/v1/channels/{TEAM}/count?since={since}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 150, "{body}");
+    assert_eq!(fake.calls("conversations.history"), 8);
+    let row = |name: &str| {
+        let report = state.providers.profile().report();
+        report.providers[0]
+            .operations
+            .iter()
+            .find(|row| row.name == name && row.outcome == Outcome::Ok)
+            .map(|row| (row.count, row.calls))
+    };
+    assert_eq!(
+        row("fetch_range"),
+        Some((1, Some(8))),
+        "one operation, eight calls"
+    );
+
+    fake.with(|state| state.rate_limit_once = Some(("conversations.history".to_owned(), 0)));
+    state
+        .chat
+        .fetch_recent(&ChannelId(TEAM.to_owned()), 10)
+        .await
+        .expect("read after a rate limit");
+    assert_eq!(
+        row("fetch_recent"),
+        Some((1, Some(2))),
+        "the 429 and the retry"
+    );
+
+    let report = state.providers.profile().report();
+    let slack = &report.providers[0];
+    let on_operations: u64 = slack.operations.iter().filter_map(|row| row.calls).sum();
+    let at_the_far_end: usize = METHODS.iter().map(|method| fake.calls(method)).sum();
+    assert_eq!(
+        on_operations, at_the_far_end as u64,
+        "every request is on one operation: {:#?}",
+        slack.operations
+    );
+}
