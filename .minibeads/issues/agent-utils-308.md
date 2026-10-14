@@ -1,12 +1,13 @@
 ---
 title: 'live-reply-in-main: a threaded reply arriving live is drawn in Main and missing from its thread until a reload'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T20:38:33.599591765+00:00
-updated_at: 2026-10-14T20:38:33.599591765+00:00
+updated_at: 2026-10-15T04:37:22.766900771+00:00
+closed_at: 2026-10-15T04:37:22.766900651+00:00
 ---
 
 # Description
