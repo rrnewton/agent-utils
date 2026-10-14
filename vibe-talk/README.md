@@ -3104,6 +3104,17 @@ more than two minutes old makes the freshness pill say the service is slow, with
 of claiming the list is current. An edit or removal replayed from the tail is answered only by a
 newest page or a complete delta.
 
+**A read given up on is not sent again while the server is still reading it** (`remote-ops-audit`
+W7). The page stops waiting for a read of the channel after twenty seconds and says the service is
+slow, but the server's own read of the provider runs on to fifty, and behind a bridge that read is a
+scan of the whole space. So nothing the reader did not ask for — the poll, the re-read after a live
+message or a replay, the page shown again, a stream reset — reads that view again until fifty seconds
+after the read given up on was sent, or until a live event for its channel arrives. A pull to
+refresh, entering a channel or a view (coming back to the channel tab included), and a re-read after
+a change (a live edit or removal, or the reader's own) read at once, as before. The read given up on
+is not aborted: if its answer lands later it is drawn, unless a live event for its channel has
+arrived or another read of the channel has been sent since, either of which is newer.
+
 **A refresh that brings nothing draws nothing, and a hidden page waits** (`#226
 page-energy-profile`). When a delta changes nothing — no message, deletion, read state, thread,
 count or notice — and every row on screen is the one a redraw would build, the rows stay as they

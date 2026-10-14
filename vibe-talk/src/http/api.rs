@@ -2597,10 +2597,12 @@ mod tests {
             VOICE_JS,
             // Both pickers again, the head of the channel on each of its three writers, and the
             // head of the to-do list. The older-page writer is `loadOlderPage`: `loadOlder` only
-            // hands out the step in flight since `#204 reply-arrow`.
+            // hands out the step in flight since `#204 reply-arrow`. The newest page is drawn by
+            // `drawChannelPage`, for `loadDiscord` and for the late answer of a read it gave up on
+            // (`remote-ops-audit` W7).
             &[
                 "function fillChannelSelect(",
-                "function loadDiscord(",
+                "function drawChannelPage(",
                 "function loadOlderPage(",
                 "function restateChannelSeam(",
                 "function todoSummary(",
