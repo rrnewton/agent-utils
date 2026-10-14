@@ -1016,6 +1016,99 @@ async fn a_slack_page_walk_with_no_end_never_stops_short_of_the_newest_message()
     assert_eq!(walked, expected);
 }
 
+/// A Slack `ts` for an instant in milliseconds since the epoch.
+fn slack_ts_at(ms: i64) -> String {
+    format!("{}.{:06}", ms.div_euclid(1000), ms.rem_euclid(1000) * 1000)
+}
+
+/// Fix round 1 of remote-ops-audit W10 `#287 bulk-reads`: a window with no end runs to Slack's now,
+/// not this host's. With Slack's clock 20 s ahead, the newest message is stamped 20 s past this
+/// host's present. A recent read, which names no `latest`, has it; the range read, the count since
+/// an instant and the walk through a span must have it too, rather than drop it and still call the
+/// window exhausted.
+#[tokio::test]
+async fn a_slack_window_with_no_end_keeps_a_message_stamped_ahead_of_this_hosts_clock() {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let mut state = FakeState::default();
+    state.history.insert(
+        SLACK_CH.to_owned(),
+        vec![
+            profiled(
+                &slack_ts_at(now - 120_000),
+                "UADA00001",
+                "Ada",
+                "two minutes ago",
+            ),
+            profiled(
+                &slack_ts_at(now - 30_000),
+                "UADA00001",
+                "Ada",
+                "thirty seconds ago",
+            ),
+            profiled(
+                &slack_ts_at(now + 20_000),
+                "UADA00001",
+                "Ada",
+                "just now, by Slack's clock",
+            ),
+        ],
+    );
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+    let since = now - 60_000;
+    let expected = ["thirty seconds ago", "just now, by Slack's clock"];
+    let recent: Vec<String> = client
+        .fetch_recent(&slack_channel(), 50)
+        .await
+        .expect("recent")
+        .into_iter()
+        .map(|m| m.content)
+        .collect();
+    assert!(
+        recent.iter().any(|c| c == expected[1]),
+        "a recent read has it: {recent:?}"
+    );
+    for order in [RangeOrder::NewestFirst, RangeOrder::OldestFirst] {
+        let read = client
+            .fetch_range(
+                &slack_channel(),
+                &ReadScope::Main,
+                TimeRange {
+                    since_ms: since,
+                    until_ms: None,
+                },
+                order,
+                50,
+                None,
+            )
+            .await
+            .expect("range read");
+        assert_eq!(contents(&read), expected, "{order:?}");
+        assert!(read.exhausted, "{order:?}");
+    }
+
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let base = format!("/api/v1/channels/{SLACK_CH}");
+    let (status, body) = get(&router, &format!("{base}/count?since={}", iso(since))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["counted"], 2, "{body}");
+    assert_eq!(body["at_least"], false, "{body}");
+    let (status, body) = get(
+        &router,
+        &format!("{base}/page?since={}&limit=10", iso(since)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let paged: Vec<&str> = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| m["content"].as_str().expect("content"))
+        .collect();
+    assert_eq!(paged, expected, "{body}");
+    assert_eq!(body["has_more"], false, "{body}");
+}
+
 /// A loopback bridge that serves range reads of one channel from a fixed list, and records every
 /// request it is sent.
 async fn range_bridge(messages: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {

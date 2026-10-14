@@ -1111,13 +1111,15 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
   at once.
 * **Reads by time.** `/count` (and the `count_messages` tool) since an instant, or over the last
   `hours`, reads only that window: `conversations.history` with `oldest` at its start, `latest`
-  pinned at the moment the count began, and `inclusive`, newest first, one call per page of
-  messages the window holds, following Slack's cursor. The count is exact only when Slack answers
-  `has_more: false`; the cap still stops it, and then says "at least". `/page` with `since` and
-  `until` reads that span and nothing after it. A span with no end runs to now: a step forward
-  from `since` still reads from there to now, as it always did, and when that is more than ten
-  pages it narrows by time to the messages next to `since`; such a step answers `has_more: true`
-  unless Slack proved the span ends, so a walk never stops short.
+  pinned when the count began, and `inclusive`, newest first, one call per page of messages the
+  window holds, following Slack's cursor. A window with no end runs to Slack's now, not this
+  host's: `latest` is pinned an hour past this host's clock, as every other read with no upper
+  bound names one, so a host clock behind Slack's never cuts off the newest messages. The count
+  is exact only when Slack answers `has_more: false`; the cap still stops it, and then says "at
+  least". `/page` with `since` and `until` reads that span and nothing after it. A span with no
+  end runs to now: a step forward from `since` still reads from there to now, as it always did,
+  and when that is more than ten pages it narrows by time to the messages next to `since`; such a
+  step answers `has_more: true` unless Slack proved the span ends, so a walk never stops short.
 * **Lookups by id.** A message's id is its `ts`, so the messages speech preparation, a thread
   summary or a lookup of one message asks for are read a run of timestamps a call:
   `conversations.replies` (in a thread) or `conversations.history`, with `oldest` and `latest` a

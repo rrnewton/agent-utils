@@ -21,7 +21,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use super::client::{refused, shape, HttpSlackClient, Raw};
-use super::history::{advance, nearest, Feed, Narrowed, Toward, MAX_WINDOW_PAGES, SCAN_PAGE_LIMIT};
+use super::history::{
+    advance, far_future_micros, nearest, Feed, Narrowed, Toward, MAX_WINDOW_PAGES, SCAN_PAGE_LIMIT,
+};
 use super::ids;
 use crate::chat::{ChatError, RangeOrder, RangeRead, ReadScope, TimeRange};
 use crate::model::ChannelId;
@@ -41,7 +43,8 @@ struct RangeCursor {
     u: Option<i64>,
     o: char,
     /// The window's newest instant, inclusive microseconds, pinned by the first step so every
-    /// later one reads the same window even when it runs to "now".
+    /// later one reads the same window even when it runs to "now" (an hour past this host's
+    /// present then, so Slack's clock decides what "now" holds).
     l: i64,
     /// Slack's own cursor, for a walk in feed order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,11 +104,6 @@ impl Read<'_> {
     }
 }
 
-/// Now, in microseconds since the Unix epoch.
-fn now_micros() -> i64 {
-    jiff::Timestamp::now().as_microsecond()
-}
-
 impl HttpSlackClient {
     /// [`crate::chat::ChatClient::fetch_range`], without the provider label.
     pub(super) async fn read_range(
@@ -156,7 +154,10 @@ impl HttpSlackClient {
             .ok_or_else(|| refused("the window starts outside the range of time Slack can name"))?
             .max(0);
         // Inclusive: Slack's `inclusive` applies to both bounds, so the window's exclusive end
-        // is the microsecond before it.
+        // is the microsecond before it. A window with no end runs to Slack's now, not this
+        // host's: a clock behind Slack's would otherwise cut off the newest messages and still
+        // call the window exhausted. So it is named as no upper bound is elsewhere, an hour past
+        // the present, and pinned in the cursor so every later step reads the same window.
         let latest = match (range.until_ms, &cursor) {
             (Some(until), _) => {
                 until.checked_mul(1000).ok_or_else(|| {
@@ -164,7 +165,7 @@ impl HttpSlackClient {
                 })? - 1
             }
             (None, Some(cursor)) => cursor.l,
-            (None, None) => now_micros(),
+            (None, None) => far_future_micros(),
         };
         if latest < oldest {
             // Nothing can have been created inside an empty window.
