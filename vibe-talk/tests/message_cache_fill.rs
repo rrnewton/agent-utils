@@ -1116,3 +1116,143 @@ async fn a_message_this_server_posts_is_written_to_the_cache() {
     // A post proves nothing about the rest of the channel.
     assert!(coverage(&d.cache, &chan, &CacheScope::Main).is_empty());
 }
+
+// ---- the live poller ----------------------------------------------------------------------------
+
+use vibe_talk::live::{poll_once, Tick};
+
+#[tokio::test]
+async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_it() {
+    let clock = ManualClock::at(T0 + HOUR);
+    // Discord's own API, ten messages a minute apart from T0.
+    let d = deployment(false, 10, &clock);
+    let channel = id(READ_CHANNEL);
+    let mut cursor = None;
+
+    // The seeding read: fifty asked, ten returned, and still no word on where the channel starts.
+    let seeded = poll_once(d.fake.as_ref(), &d.state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("seeded");
+    assert_eq!(seeded, Tick::default(), "the seed publishes nothing");
+    assert_eq!(held(&d.cache), 10);
+    let seed = Interval {
+        t0_ms: T0,
+        t1_ms: T0 + 9 * MINUTE - SETTLE_MS,
+        listed_ms: clock.now(),
+        full_ms: Some(clock.now()),
+        complete: true,
+        source: Source::Read,
+    };
+    assert_eq!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main),
+        [seed],
+        "from its oldest row, never from the channel's start"
+    );
+
+    // Three written since; one page, shorter than asked: the walk ran out of messages.
+    for n in 10..13 {
+        d.fake
+            .seed_at(&channel, "Ada", &format!("message {n}"), T0 + n * MINUTE);
+    }
+    clock.advance(MINUTE);
+    let walked_at = clock.now();
+    let tick = poll_once(d.fake.as_ref(), &d.state.live, &channel, 5, &mut cursor)
+        .await
+        .expect("polled");
+    assert_eq!(
+        tick,
+        Tick {
+            published: 3,
+            backlog: false,
+            replies_behind: false,
+        }
+    );
+    assert_eq!(held(&d.cache), 13);
+    let walk = Interval {
+        // After the cursor, which was the newest message the seed saw.
+        t0_ms: T0 + 9 * MINUTE + 1,
+        t1_ms: T0 + 12 * MINUTE - SETTLE_MS,
+        listed_ms: walked_at,
+        full_ms: Some(walked_at),
+        complete: true,
+        source: Source::Poll,
+    };
+    assert_eq!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main),
+        [seed, walk]
+    );
+    let head = d
+        .cache
+        .head(&read_chan(), &CacheScope::Main)
+        .served()
+        .flatten()
+        .expect("a head");
+    assert_eq!(
+        head.head_ms,
+        T0 + 12 * MINUTE,
+        "the walk reached the newest end"
+    );
+    // What the walk published reached the cache as pushes too; the walk's listing confirmed them.
+    assert!(
+        !cached(
+            &d.cache,
+            &read_chan(),
+            &MessageId::at_time_ms(T0 + 11 * MINUTE)
+        )
+        .content_partial
+    );
+
+    // Twenty more, and pages of two: the page bound stops the walk after eight.
+    for n in 13..33 {
+        d.fake
+            .seed_at(&channel, "Ada", &format!("message {n}"), T0 + n * MINUTE);
+    }
+    clock.advance(MINUTE);
+    let tick = poll_once(d.fake.as_ref(), &d.state.live, &channel, 2, &mut cursor)
+        .await
+        .expect("polled");
+    assert_eq!(
+        tick,
+        Tick {
+            published: 8,
+            backlog: true,
+            replies_behind: false,
+        }
+    );
+    assert_eq!(held(&d.cache), 21, "what it read is kept");
+    assert_eq!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main),
+        [seed, walk],
+        "a walk its page bound stopped claims nothing"
+    );
+
+    // The next tick runs out of messages again, and claims what it walked.
+    clock.advance(MINUTE);
+    let caught_up_at = clock.now();
+    let tick = poll_once(d.fake.as_ref(), &d.state.live, &channel, 50, &mut cursor)
+        .await
+        .expect("polled");
+    assert_eq!(
+        tick,
+        Tick {
+            published: 12,
+            backlog: false,
+            replies_behind: false,
+        }
+    );
+    assert_eq!(
+        coverage(&d.cache, &read_chan(), &CacheScope::Main),
+        [
+            seed,
+            walk,
+            Interval {
+                t0_ms: T0 + 20 * MINUTE + 1,
+                t1_ms: T0 + 32 * MINUTE - SETTLE_MS,
+                listed_ms: caught_up_at,
+                full_ms: Some(caught_up_at),
+                complete: true,
+                source: Source::Poll,
+            }
+        ]
+    );
+}

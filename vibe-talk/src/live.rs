@@ -762,6 +762,12 @@ pub struct Tick {
 /// published, and a cursor moved past a message that page did not hold would skip it. The provider
 /// keeps its own place in each thread and reports each reply once; one that is also among the
 /// page's messages (a reply sent to the channel too, say) is published once, as a message.
+/// **What it reads is offered to the message cache** (`#208 persistent-cache`), under the poller's
+/// own grant, when the hub has a cache attached: the seeding read as a recent window, which never
+/// says where the channel starts however short it came back, and the walk as a listing of what lay
+/// between the cursor and the newest message it saw, but only when the walk ran out of messages
+/// rather than into [`MAX_PAGES_PER_TICK`]. See [`crate::cache::observe::forward`]. What it
+/// publishes reaches the cache through the hub as well, as every published change does.
 ///
 /// # Errors
 ///
@@ -777,12 +783,22 @@ pub async fn poll_once(
     cursor: &mut Option<u64>,
 ) -> Result<Tick, ChatError> {
     let apart = chat.polls_thread_replies(channel);
+    // Begun before the read, as every fill is: see `crate::cache::sink`.
+    let fill = hub.message_cache().and_then(|sink| {
+        sink.begin(
+            &crate::cache::FillGrant::server(crate::cache::ServerFill::Poller),
+            channel,
+        )
+    });
     let Some(seen) = *cursor else {
         let messages = if apart {
             chat.fetch_live(channel, limit, None).await?.messages
         } else {
             chat.fetch_recent(channel, limit).await?
         };
+        if let Some(fill) = fill {
+            fill.offer_recent(&messages);
+        }
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
@@ -801,6 +817,11 @@ pub async fn poll_once(
     let mut at = seen;
     let mut backlog = false;
     let mut replies_behind = false;
+    // Every message the walk's pages returned, for the cache, and whether the walk ran out of
+    // messages: a page shorter than asked for, rather than the page bound or a page it could not
+    // move past.
+    let mut walked: Vec<Message> = Vec::new();
+    let mut ran_out = false;
     for page in 0..MAX_PAGES_PER_TICK {
         let after = MessageId(at.to_string());
         let read = if apart && page == 0 {
@@ -831,6 +852,9 @@ pub async fn poll_once(
         sort_oldest_first(&mut messages);
         let full = messages.len() >= page_size;
         let before = at;
+        if fill.is_some() {
+            walked.extend(messages.iter().cloned());
+        }
         // Each arrival with its id, and whether it is a reply read apart.
         let mut arrivals: Vec<(u64, Message, bool)> = Vec::new();
         for message in messages {
@@ -865,6 +889,7 @@ pub async fn poll_once(
         // or one made entirely of ids that do not parse. Walking again would fetch the same page
         // forever.
         if !full || at == before {
+            ran_out = !full;
             break;
         }
         if page + 1 == MAX_PAGES_PER_TICK {
@@ -872,6 +897,14 @@ pub async fn poll_once(
         }
     }
     *cursor = Some(at);
+    if let Some(fill) = fill {
+        let after_ms = MessageId(seen.to_string()).created_at_ms();
+        fill.offer_forward(
+            &walked,
+            after_ms.unwrap_or(i64::MAX),
+            ran_out && after_ms.is_some(),
+        );
+    }
     Ok(Tick {
         published,
         backlog,

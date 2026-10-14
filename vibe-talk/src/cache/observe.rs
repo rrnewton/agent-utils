@@ -22,6 +22,10 @@
 //!   answer a stretch with an empty page that is not its last.
 //! - **A `/count` walk**, which follows its own continuation from the newest page down: the union
 //!   of its pages, `[oldest row seen, newest]`.
+//! - **The live poller's walk forward from its cursor**, when it ended on a page shorter than it
+//!   asked for rather than at its page bound, and found a row: `(cursor, newest row seen]`, and
+//!   on Discord's own API, where that shorter page is the channel's newest end, up to the newest
+//!   end. Its first read, which seeds the cursor, is a recent window like any other.
 //!
 //! Everything else gives rows only: a page a caller stepped `before` to (nothing joins it to the
 //! page above it), a page carrying a `notice` (the provider says it left something out), a delta
@@ -37,10 +41,10 @@
 //!
 //! | Shape | Listed with a proof | Rows only |
 //! |---|---|---|
-//! | Slack | Main newest; Thread newest; Flat newest only when it holds no thread at all | Flat otherwise; the thread list |
-//! | Slack, narrowed to one thread | Main (every view) newest, as `main` of that channel | the thread list |
-//! | Bridge | Flat newest; a recent read through Flat | Main, Thread, `/messages` windows, `/page`, `/count` |
-//! | Discord | Main newest; Thread newest | Flat; the thread list |
+//! | Slack | Main newest; Thread newest; Flat newest only when it holds no thread at all; the poller's walk | Flat otherwise; the thread list |
+//! | Slack, narrowed to one thread | Main (every view) newest, as `main` of that channel; the poller's walk | the thread list |
+//! | Bridge | Flat newest; a recent read through Flat | Main, Thread, `/messages` windows, `/page`, `/count`, the poller's walk |
+//! | Discord | Main newest; Thread newest; the poller's walk | Flat; the thread list |
 //!
 //! **Slack Flat.** It is the Main page plus the replies of at most ten of its threads, merged, and
 //! nothing in the merged rows tells a reply also sent to the channel (which IS in Main) from one
@@ -375,6 +379,52 @@ pub fn posted(
     )
     .into_iter()
     .collect()
+}
+
+/// What the live poller's walk forward from its cursor tells the cache: every message its pages
+/// returned, all of them newer than `after_ms`, the provider time of the cursor it walked from.
+///
+/// A walk forward reads the oldest messages after its cursor, page after page, each page starting
+/// after the last message the one before it returned, so what it read is every message between
+/// the cursor and the newest one it saw: a listing of `main` over `(after_ms, newest]`, when
+/// `reached_end` says the walk ended on a page shorter than it asked for rather than at its page
+/// bound, and at least one message came back. On Discord's own API that shorter page is the
+/// channel's newest end, so the listing runs to it. A Slack client drops a message that has no
+/// author, so its shorter page is no proof of the end and the listing stops at the newest message
+/// seen. A bridge's walk reads its `/messages`, which is not proven to be its Flat list: rows only,
+/// as is a walk that ended for any other reason.
+#[must_use]
+pub fn forward(
+    shape: Shape,
+    rows_read: &[Message],
+    after_ms: i64,
+    reached_end: bool,
+    observed_ms: i64,
+) -> Vec<Observation> {
+    let Some(newest) = newest(rows_read) else {
+        return Vec::new();
+    };
+    if shape == Shape::Bridge || !reached_end {
+        let listed_in = (shape != Shape::Bridge).then_some(Scope::Main);
+        return rows(shape, rows_read, None, listed_in, observed_ms)
+            .into_iter()
+            .collect();
+    }
+    let until = if shape == Shape::DiscordNative {
+        ListEnd::Newest
+    } else {
+        ListEnd::Before(newest.saturating_add(1))
+    };
+    vec![listing(
+        shape,
+        Scope::Main,
+        rows_read,
+        None,
+        observed_ms,
+        ListStart::At(after_ms.saturating_add(1)),
+        until,
+        Source::Poll,
+    )]
 }
 
 /// The scope a row belongs to by nature. `thread_view` is the thread a Thread view read, when the
@@ -1025,6 +1075,41 @@ mod tests {
         for (shape, message, thread, expected) in cases {
             let got = posted(shape, message, thread, OBSERVED);
             assert_eq!(describe(&got), [expected], "{shape:?} {thread:?}");
+            every_observation_is_at(&got, OBSERVED);
+        }
+    }
+
+    #[test]
+    fn the_pollers_walk_proves_its_span_only_when_it_ended_short_and_found_a_row() {
+        let rows = vec![
+            root("m100", T + 60_000, 0),
+            reply("m300", "m200", "sent to the channel too", T + 300_000),
+        ];
+        #[rustfmt::skip]
+        let cases: Vec<(Shape, Vec<Message>, bool, Vec<&str>)> = vec![
+            // Discord's shorter page is the newest end.
+            (Shape::DiscordNative, rows.clone(), true,
+             vec!["listing main [+1,newest) complete=true full=true Poll m100=main,m300=thread:m200"]),
+            // A Slack client drops a message with no author: up to the newest row seen.
+            (Shape::Slack, rows.clone(), true,
+             vec!["listing main [+1,+300001) complete=false full=true Poll m100=main,m300=thread:m200"]),
+            (Shape::SlackThread, rows.clone(), true,
+             vec!["listing main [+1,+300001) complete=false full=true Poll m100=main,m300=main"]),
+            // Stopped by its page bound: rows only.
+            (Shape::DiscordNative, rows.clone(), false, vec!["rows in=main m100=main,m300=thread:m200"]),
+            (Shape::Slack, rows.clone(), false, vec!["rows in=main m100=main,m300=thread:m200"]),
+            // A bridge's `/messages` is not its Flat list.
+            (Shape::Bridge, rows.clone(), true, vec!["rows in=- m100=flat,m300=flat"]),
+            // Nothing new: nothing to say.
+            (Shape::DiscordNative, Vec::new(), true, vec![]),
+        ];
+        for (shape, rows, reached_end, expected) in cases {
+            let got = forward(shape, &rows, T, reached_end, OBSERVED);
+            assert_eq!(
+                describe(&got),
+                expected,
+                "{shape:?} reached_end={reached_end}"
+            );
             every_observation_is_at(&got, OBSERVED);
         }
     }

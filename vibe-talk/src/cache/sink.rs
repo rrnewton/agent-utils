@@ -202,6 +202,20 @@ impl Fill {
         self.offer(vec![observation]);
     }
 
+    /// Offer what the live poller's walk forward from its cursor read: every message its pages
+    /// returned, `after_ms` the provider time of the cursor it walked from, and `reached_end`
+    /// whether it ended on a page shorter than it asked for, rather than at its page bound.
+    pub fn offer_forward(self, messages: &[Message], after_ms: i64, reached_end: bool) {
+        let observations = observe::forward(
+            self.shape,
+            messages,
+            after_ms,
+            reached_end,
+            self.observed_ms,
+        );
+        self.offer(observations);
+    }
+
     /// Offer one message this server posted, into the thread `thread_id` when it went to one.
     pub fn offer_posted(self, message: &Message, thread_id: Option<&str>) {
         let observations = observe::posted(self.shape, message, thread_id, self.observed_ms);
