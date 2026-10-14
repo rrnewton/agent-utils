@@ -1348,7 +1348,7 @@ pub struct PageQuery {
     pub limit: Option<u16>,
     /// Step back from this message id, exclusive.
     pub before: Option<String>,
-    /// Start of a time span, inclusive, ISO-8601.
+    /// Start of a time span, inclusive, ISO-8601, or a `next_since` handed back unchanged.
     pub since: Option<String>,
     /// End of a time span, exclusive, ISO-8601. Requires `since`.
     pub until: Option<String>,
@@ -1388,7 +1388,8 @@ pub struct PageResponse {
     pub has_more: bool,
     /// Hand this back as `before` to take the next step back. Absent when there is nothing more.
     pub next_before: Option<String>,
-    /// Hand this back as `since` to take the next step of a range walk.
+    /// Hand this back as `since`, unchanged, to take the next step of a range walk: usually the
+    /// instant of this step's newest message, `~` and its id ([`ops::Page::next_since`]).
     pub next_since: Option<String>,
     /// Which of `messages` the reader has ARCHIVED, so the view can dim them.
     ///

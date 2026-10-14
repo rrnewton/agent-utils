@@ -1946,3 +1946,370 @@ async fn the_docs_say_what_a_slack_span_step_answers_when_no_range_read_can_cros
         );
     }
 }
+
+/// One message of a bridge fixture: numeric id, created ms, content.
+type Wired = (u64, i64, &'static str);
+
+/// A channel in which two messages, `c` and `d`, were created in the same millisecond, `d` a
+/// moment after `c` and so with the later id, oldest first. `d`'s id has sequence bits, as a real
+/// snowflake's has; the others have none.
+fn same_millisecond_channel() -> Vec<Wired> {
+    let at = |ms: i64| MessageId::at_time_ms(ms).numeric().expect("snowflake");
+    vec![
+        (at(BASE_MS - MINUTE_MS), BASE_MS - MINUTE_MS, "before"),
+        (at(BASE_MS), BASE_MS, "a"),
+        (at(BASE_MS + 1), BASE_MS + 1, "b"),
+        (at(BASE_MS + 2), BASE_MS + 2, "c"),
+        (at(BASE_MS + 2) + 1, BASE_MS + 2, "d"),
+        (at(BASE_MS + 3), BASE_MS + 3, "e"),
+        (at(BASE_MS + 4), BASE_MS + 4, "f"),
+        (at(BASE_MS + 5), BASE_MS + 5, "g"),
+    ]
+}
+
+/// Every message of [`same_millisecond_channel`] from `a` on, in order.
+const FROM_A: [&str; 7] = ["a", "b", "c", "d", "e", "f", "g"];
+
+fn query_value(asked: &str, key: &str) -> Option<String> {
+    asked.split_once('?').and_then(|(_, query)| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{key}=")).map(str::to_owned))
+    })
+}
+
+/// A loopback bridge over `channel` that answers range reads as the README allows, at most three
+/// messages a step (fewer than asked, with a `next`, and not exhausted), and
+/// `/messages?after=&limit=` as Discord does. It serves the first `serves` range reads and answers
+/// every later one `404`, as a bridge rolled back to a version without them would. Records every
+/// request it is sent.
+async fn same_millisecond_bridge(
+    channel: Vec<Wired>,
+    serves: usize,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    use axum::response::IntoResponse as _;
+
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let log = Arc::clone(&log);
+        let all = channel.clone();
+        async move {
+            let asked = uri.to_string();
+            let served = {
+                let mut log = log.lock().expect("log");
+                log.push(asked.clone());
+                log.iter().filter(|asked| asked.contains("since=")).count()
+            };
+            let limit: usize = query_value(&asked, "limit")
+                .and_then(|limit| limit.parse().ok())
+                .unwrap_or(50);
+            let wire = |(id, ms, content): &Wired| {
+                json!({
+                    "id": id.to_string(),
+                    "channel_id": READ_CHANNEL,
+                    "content": content,
+                    "timestamp": vibe_talk::clock::iso_from_ms(*ms),
+                    "author": { "id": "7", "username": "bridge", "bot": false }
+                })
+            };
+            if let Some(since) = query_value(&asked, "since") {
+                if served > serves {
+                    return (StatusCode::NOT_FOUND, "no such route").into_response();
+                }
+                let since =
+                    vibe_talk::clock::instant_ms(&since.replace("%3A", ":")).expect("since");
+                let window: Vec<&Wired> = all.iter().filter(|(_, ms, _)| *ms >= since).collect();
+                // This bridge's cursors are `p3`, `p6`, …: how far into the window it got.
+                let offset: usize = query_value(&asked, "cursor")
+                    .and_then(|cursor| cursor.strip_prefix('p').and_then(|n| n.parse().ok()))
+                    .unwrap_or(0);
+                let page: Vec<Value> = window
+                    .iter()
+                    .skip(offset)
+                    .take(limit.min(3))
+                    .map(|message| wire(message))
+                    .collect();
+                let reached = offset + page.len();
+                return axum::Json(if reached >= window.len() {
+                    json!({"messages": page, "next": null, "exhausted": true})
+                } else {
+                    json!({"messages": page, "next": format!("p{reached}"), "exhausted": false})
+                })
+                .into_response();
+            }
+            let after: u64 = query_value(&asked, "after")
+                .and_then(|after| after.parse().ok())
+                .unwrap_or(0);
+            axum::Json(Value::Array(
+                all.iter()
+                    .filter(|(id, _, _)| *id > after)
+                    .take(limit)
+                    .map(wire)
+                    .collect(),
+            ))
+            .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (base, seen)
+}
+
+/// A whole walk through the span from `since`, each step from the `next_since` the one before
+/// handed back: every message it returned, and every `next_since`.
+async fn span_walk(
+    router: &axum::Router,
+    channel: &str,
+    since: i64,
+    limit: u16,
+) -> (Vec<String>, Vec<String>) {
+    let mut since = iso(since);
+    let (mut said, mut resumes) = (Vec::new(), Vec::new());
+    for _ in 0..30 {
+        let (status, body) = get(
+            router,
+            &format!("/api/v1/channels/{channel}/page?since={since}&limit={limit}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        said.extend(
+            body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|m| m["content"].as_str().expect("content").to_owned()),
+        );
+        if body["has_more"] != json!(true) {
+            return (said, resumes);
+        }
+        let next = body["next_since"].as_str().expect("a place to resume");
+        resumes.push(next.to_owned());
+        since = next.replace(':', "%3A");
+    }
+    panic!("the walk did not end: {said:?}");
+}
+
+/// A walk of `channel` from `a` through a bridge configured with `setting`, at `limit`: what it
+/// returned, its `next_since`s and every request the bridge was sent.
+async fn bridge_walk(
+    channel: Vec<Wired>,
+    setting: &str,
+    limit: u16,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (base, seen) = same_millisecond_bridge(channel, usize::MAX).await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, setting));
+    let (said, resumes) = span_walk(&router, READ_CHANNEL, BASE_MS, limit).await;
+    let asked = seen.lock().expect("log").clone();
+    (said, resumes, asked)
+}
+
+/// Fix round 1 of remote-ops-audit W10-W14 `#287 bulk-reads`: a walk through a span never loses a
+/// message created in the millisecond a step ended in. A bridge may answer a range read with
+/// fewer messages than asked, and its short step here ends on `c`, created in the same millisecond
+/// as `d`; a page size can end a step there too, with range reads or without. Before, every such
+/// step resumed at the next millisecond, and `d` was skipped for good: with `range_reads` the walk
+/// at `limit=5` lost it where today's walk showed it, and today's walk lost it at `limit=3`. Now
+/// a step hands back the millisecond and `c`, and the next one reads the millisecond again and
+/// leaves out what was returned. And today's walk resumed at the next millisecond with `after` the
+/// id of the one before, so a step after `d`, whose id has sequence bits, read `d` again, dropped
+/// it, and took the page one short for the walk's end: at `limit=1` it ended at `e`.
+#[tokio::test]
+async fn a_bridge_span_walk_never_loses_a_message_created_in_the_millisecond_a_step_ended_in() {
+    // The case as it was found: a bridge's short step at `limit=5` ends on `c`.
+    let (today, _, today_asked) = bridge_walk(same_millisecond_channel(), "", 5).await;
+    let (native, resumes, asked) =
+        bridge_walk(same_millisecond_channel(), "range_reads = true", 5).await;
+    assert_eq!(today, FROM_A, "today's walk: {today_asked:?}");
+    assert_eq!(native, today, "{resumes:?} {asked:?}");
+    let c = MessageId::at_time_ms(BASE_MS + 2);
+    assert_eq!(
+        resumes.first(),
+        Some(&format!(
+            "{}~{}",
+            vibe_talk::clock::iso_from_ms(BASE_MS + 2),
+            c.as_str()
+        )),
+        "the fixture is the case: the first step is the bridge's three, ending on `c`: {asked:?}"
+    );
+    assert!(
+        asked.iter().all(|asked| asked.contains("since=")),
+        "{asked:?}"
+    );
+
+    // Every page size, with range reads and without.
+    let mut lost = Vec::new();
+    for setting in ["", "range_reads = true"] {
+        for limit in 1..=7 {
+            let (said, resumes, asked) =
+                bridge_walk(same_millisecond_channel(), setting, limit).await;
+            if said != FROM_A {
+                lost.push(format!(
+                    "{setting:?} limit={limit}: {said:?} {resumes:?} {asked:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "every message once, in order:\n{}",
+        lost.join("\n")
+    );
+}
+
+/// Fix round 1 of remote-ops-audit W10-W14 `#287 bulk-reads`: the read `/page` makes without range
+/// reads starts `after` the id of the millisecond before `since`, which lets through a message
+/// created in that millisecond whose id has sequence bits, as a real snowflake's has. It is
+/// dropped, and before, the page it took a place in was one short of the over-fetch, so the walk
+/// ended there: from `a` at `limit=5` it never reached `f`. Now the page reads on after it for the
+/// places such messages took.
+#[tokio::test]
+async fn todays_span_walk_is_not_cut_short_by_a_message_in_the_millisecond_before_since() {
+    let mut channel = same_millisecond_channel();
+    let at = MessageId::at_time_ms(BASE_MS - 1)
+        .numeric()
+        .expect("snowflake");
+    channel.insert(1, (at + 5, BASE_MS - 1, "just before"));
+    let mut lost = Vec::new();
+    for setting in ["", "range_reads = true"] {
+        for limit in 1..=7 {
+            let (said, resumes, asked) = bridge_walk(channel.clone(), setting, limit).await;
+            if said != FROM_A {
+                lost.push(format!(
+                    "{setting:?} limit={limit}: {said:?} {resumes:?} {asked:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "every message once, in order:\n{}",
+        lost.join("\n")
+    );
+
+    // The fixture is the case: the first page read `after` the millisecond before `a`, and read on
+    // after its last message for the place `just before` took.
+    let (_, _, asked) = bridge_walk(channel, "", 5).await;
+    let edge = MessageId::at_time_ms(BASE_MS - 1);
+    assert_eq!(
+        asked[..2],
+        [
+            format!(
+                "/channels/{READ_CHANNEL}/messages?limit=6&after={}",
+                edge.as_str()
+            ),
+            format!(
+                "/channels/{READ_CHANNEL}/messages?limit=1&after={}",
+                MessageId::at_time_ms(BASE_MS + 3).as_str()
+            ),
+        ],
+        "{asked:?}"
+    );
+}
+
+/// Fix round 1 of remote-ops-audit W10-W14 `#287 bulk-reads`, on Slack: a `ts` is microseconds, so
+/// two messages can share a millisecond there too, and a span step ends between them whenever the
+/// page size falls there. The walk returns every message once, in order, at every page size.
+#[tokio::test]
+async fn a_slack_span_walk_never_loses_a_message_created_in_the_millisecond_a_step_ended_in() {
+    let mut state = FakeState::default();
+    let mut list = vec![profiled(&ts(1, 0), "UADA00001", "Ada", "before")];
+    for (micros, content) in [
+        (0, "a"),
+        (1_000, "b"),
+        (2_000, "c"),
+        (2_500, "d"),
+        (3_000, "e"),
+        (4_000, "f"),
+        (5_000, "g"),
+    ] {
+        list.push(profiled(&ts(10_000, micros), "UADA00001", "Ada", content));
+    }
+    state.history.insert(SLACK_CH.to_owned(), list);
+    let fake = Fake::start(state, 20).await;
+    let router = vibe_talk::http::router(slack_deployment(&fake));
+    let (mut lost, mut at_three) = (Vec::new(), Vec::new());
+    for limit in 1..=7 {
+        let (said, resumes) = span_walk(&router, SLACK_CH, slack_ms(10_000), limit).await;
+        if said != FROM_A {
+            lost.push(format!("limit={limit}: {said:?} {resumes:?}"));
+        }
+        if limit == 3 {
+            at_three = resumes;
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "every message once, in order:\n{}",
+        lost.join("\n")
+    );
+    // The fixture is the case: at `limit=3` the page size ends the first step on `c`.
+    let c = vibe_talk::slack::message_id_from_ts(&ts(10_000, 2_000)).expect("encodable");
+    assert_eq!(
+        at_three.first(),
+        Some(&format!(
+            "{}~{}",
+            vibe_talk::clock::iso_from_ms(slack_ms(10_000) + 2),
+            c.as_str()
+        )),
+    );
+}
+
+/// Fix round 1 of remote-ops-audit W10-W14 `#287 bulk-reads`: a step that resumes after a message,
+/// and that a bridge which served range reads until then does not serve, is the read `/page` makes
+/// without them, from just after that message. The bridge's own fallback reads from the window's
+/// edge, the millisecond of that message, and here that brings back three messages already
+/// returned; counted, they would take the page short of its over-fetch, and the walk would end
+/// before `d`.
+#[tokio::test]
+async fn a_resumed_span_step_a_bridge_stops_serving_is_read_from_after_its_message() {
+    let at = |ms: i64| MessageId::at_time_ms(ms).numeric().expect("snowflake");
+    let channel: Vec<Wired> = vec![
+        (at(BASE_MS), BASE_MS, "a"),
+        (at(BASE_MS + 1), BASE_MS + 1, "b1"),
+        (at(BASE_MS + 1) + 1, BASE_MS + 1, "b2"),
+        (at(BASE_MS + 1) + 2, BASE_MS + 1, "b3"),
+        (at(BASE_MS + 2), BASE_MS + 2, "c"),
+        (at(BASE_MS + 3), BASE_MS + 3, "d"),
+        (at(BASE_MS + 4), BASE_MS + 4, "e"),
+    ];
+    let (base, seen) = same_millisecond_bridge(channel, 2).await;
+    let router = vibe_talk::http::router(bridge_deployment(&base, "range_reads = true"));
+    let (said, resumes) = span_walk(&router, READ_CHANNEL, BASE_MS, 2).await;
+    let asked = seen.lock().expect("log").clone();
+    assert_eq!(
+        said,
+        ["a", "b1", "b2", "b3", "c", "d", "e"],
+        "{resumes:?} {asked:?}"
+    );
+    // The fixture is the case: the third range read is refused, the bridge's fallback reads from
+    // the millisecond of `b3`, and the step is read again from just after `b3`.
+    let b3 = at(BASE_MS + 1) + 2;
+    assert_eq!(
+        resumes[..2],
+        [
+            format!(
+                "{}~{}",
+                vibe_talk::clock::iso_from_ms(BASE_MS + 1),
+                at(BASE_MS + 1)
+            ),
+            format!("{}~{b3}", vibe_talk::clock::iso_from_ms(BASE_MS + 1)),
+        ],
+        "{asked:?}"
+    );
+    assert!(asked[2].contains("since="), "{asked:?}");
+    assert!(
+        asked[3].starts_with(&format!("/channels/{READ_CHANNEL}/messages?limit=")),
+        "{asked:?}"
+    );
+    assert_eq!(
+        asked[4],
+        format!("/channels/{READ_CHANNEL}/messages?limit=3&after={b3}"),
+        "{asked:?}"
+    );
+}

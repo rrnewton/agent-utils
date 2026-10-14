@@ -2224,7 +2224,7 @@ only because it is cheap uses it only where it is native.
 
 | Read | What it answers | The default (emulated) | Who uses it |
 |---|---|---|---|
-| `fetch_range` | the messages created in `[since, until)`, oldest first, from whichever end of the window the caller asks, a step at a time with the provider's own cursor; `exhausted` only where the provider proved the window holds no more | one `fetch_page` from the window's edge (after the millisecond before `since`, or before `until`), trimmed to the window, never exhausted | `/page` through a span; `/count` since an instant, only where native (elsewhere it walks back as before) |
+| `fetch_range` | the messages created in `[since, until)`, oldest first, from whichever end of the window the caller asks, a step at a time with the provider's own cursor; `exhausted` only where the provider proved the window holds no more | one `fetch_page` from the window's edge (after the millisecond before `since`, or before `until`), trimmed to the window, never exhausted; when messages of the millisecond before `since` took places in a full page, as many more after it | `/page` through a span; `/count` since an instant, only where native (elsewhere it walks back as before) |
 | `fetch_messages` | one answer per id: found, proved absent, or not seen | in a thread, one `fetch_thread_message` per id, four at a time; otherwise one recent window, searched | speech preparation of a thread, a thread summary's parts, a message by id (the page's and the `read_message` tool's), the check of a message before an upstream read mark, only where native |
 | `channel_heads` | each channel's newest message id and instant, its latest activity, and where the provider can vouch for it, an instant since which nothing changed | one one-message `fetch_recent` per channel | the live poller, only where native; a voice catch-up or warm-up, only where native and vouching for edits and deletes; the probe and diagnostics check it |
 | `fetch_recent_many` | each channel's newest messages, optionally only those since an instant | one `fetch_recent_dated` per channel, four at a time | a voice catch-up or warm-up, only where native |
@@ -2341,7 +2341,10 @@ not asked for a range read again for ten minutes.
   still leaves no message to resume after (no `next`, the third read empty too, or a newest message
   whose instant cannot be read) is the read `/page` makes without `range_reads`, answered exactly
   as that read always answered it. So a range read never ends a walk on a step the bridge did not
-  say ends it; that read, as before, ends it on an empty page of `/messages?after=`.
+  say ends it; that read, as before, ends it on an empty page of `/messages?after=`. A step
+  resumed from a `next_since` that names a message asks from that message's instant, for one more
+  than it would otherwise, and leaves out that message and any before it in the same millisecond,
+  so a bridge may end a step anywhere, between two messages of one millisecond included.
 * `as_of` (optional): as on a timeline read, the instant up to which the bridge knows its answer is
   complete when it could not bring its copy up to date. Absent means now. vibe-talk never answers
   from such a window: `/page` and `/count` then make the read they made without `range_reads`, so
@@ -3243,6 +3246,16 @@ now — so a caller asked about "the last day" need not learn the time first; it
 `since=`. A page tops out at
 99 rather than 100 on purpose: the server fetches one more than it returns and drops it, which is
 the only way to answer "is there more?" exactly instead of guessing from a full window.
+
+**Hand `next_since` back unchanged.** It is usually not a bare instant but the instant of the
+step's newest message, `~`, and that message's id (`2026-08-17T20:53:20.002Z~1539014289010982913`),
+and `since=` takes it as it is: the next step reads from that millisecond and leaves out every
+message up to that one. Two messages can be created in the same millisecond and a step can end
+between them, cut there by the page size or by a provider answering fewer than it was asked for;
+resuming at the next millisecond, as `/page` did before, lost the second for good. Only where a
+provider's own range read answered the step and the message it over-fetched is newer than the
+step's newest is `next_since` the bare instant of the millisecond after. A `since=` naming a
+message created in any other millisecond is `invalid_range`.
 
 Ranges work because a Discord snowflake carries its own creation time in its top 42 bits, so an
 instant converts straight into a cursor. A numeric offset would have to be synthesised and would

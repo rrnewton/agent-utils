@@ -1159,7 +1159,8 @@ pub struct PageRequest<'a> {
     pub limit: Option<u16>,
     /// Step back from this message id, exclusive. Hand back [`Page::next_before`].
     pub before: Option<&'a str>,
-    /// Start of a time span, inclusive, as an ISO-8601 instant.
+    /// Start of a time span, inclusive, as an ISO-8601 instant, or a [`Page::next_since`] handed
+    /// back unchanged.
     pub since: Option<&'a str>,
     /// End of a time span, EXCLUSIVE, as an ISO-8601 instant. Requires `since`.
     pub until: Option<&'a str>,
@@ -1226,8 +1227,75 @@ pub struct Page {
     pub has_more: bool,
     /// The `before` cursor for the next step back. Set only when [`Page::has_more`].
     pub next_before: Option<MessageId>,
-    /// The `since` instant for the next step of a range walk. Set only when [`Page::has_more`].
+    /// Where the next step of a range walk starts, handed back as `since`. Set only when
+    /// [`Page::has_more`].
+    ///
+    /// The instant of this page's newest message, [`RESUME_SEPARATOR`], and that message's id
+    /// (`2026-08-17T20:53:20.002Z~1539014289010982913`): the next step reads from that
+    /// millisecond and leaves out every message up to that one. Not the millisecond after it:
+    /// two messages can be created in the same millisecond, a step can end between them (cut
+    /// there by the page size, or by a provider answering fewer than it was asked for), and
+    /// resuming at the next millisecond would lose the second for good. Nor that millisecond
+    /// alone, which would hand back again what this page returned. The read `/page` always made
+    /// resumes exactly after that message, so its over-fetch is spent on none it returned.
+    ///
+    /// Only where a provider's own range read answered the step, and the message it over-fetched
+    /// and dropped is newer than the page's newest, is it the plain instant of the millisecond
+    /// after: the page then holds every message of its last millisecond, and such a read takes
+    /// the window by creation time. Fix round 1 of remote-ops-audit W10-W14 `#287 bulk-reads`.
     pub next_since: Option<String>,
+}
+
+/// What separates the instant from the message id in a [`Page::next_since`].
+pub const RESUME_SEPARATOR: char = '~';
+
+/// Where a step of a walk through a span starts: `since`, and, for a step that resumes a walk,
+/// the last message the step before it returned.
+#[derive(Clone, Copy, Debug)]
+struct SpanStart {
+    /// The first instant read, Unix milliseconds.
+    ms: i64,
+    /// The numeric id of the last message already returned; only messages after it are new.
+    after: Option<u64>,
+}
+
+/// Parse a caller's `since`: an instant, or a [`Page::next_since`] that names a message too.
+///
+/// A message is accepted only in the millisecond its own id says it was created in, as this
+/// server hands it back: anything else is a resume point no step could have given.
+fn span_start(value: Option<&str>) -> Result<Option<SpanStart>, OpError> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let (at, after) = match raw.split_once(RESUME_SEPARATOR) {
+        None => (raw, None),
+        Some((at, id)) => (at, Some(MessageId(id.trim().to_owned()))),
+    };
+    let ms = crate::clock::instant_ms(at).ok_or(OpError::InvalidRange)?;
+    let after = match after {
+        None => None,
+        Some(id) if id.created_at_ms() == Some(ms) => id.numeric(),
+        Some(_) => return Err(OpError::InvalidRange),
+    };
+    Ok(Some(SpanStart { ms, after }))
+}
+
+/// [`Page::next_since`] after `last`, the newest message a step through a span returned.
+///
+/// `beyond` is the instant of the message a provider's own range read brought past the page and
+/// was dropped, `None` for none or for a step the read `/page` always made answered. A message
+/// whose id is not a snowflake cannot be resumed after, and is resumed past at the next
+/// millisecond, as every walk was before.
+fn resume_point(last: &Message, beyond: Option<i64>) -> Option<String> {
+    let ms = message_ms(last)?;
+    if beyond.is_some_and(|beyond| beyond > ms) || last.id.numeric().is_none() {
+        return Some(crate::clock::iso_from_ms(ms + 1));
+    }
+    Some(format!(
+        "{}{RESUME_SEPARATOR}{}",
+        crate::clock::iso_from_ms(ms),
+        last.id
+    ))
 }
 
 impl Page {
@@ -1281,16 +1349,20 @@ pub async fn page(
     let channel = allowed(state, channel_id).await?;
     let before = cursor(request.before)?;
     let until = instant(request.until)?;
-    let since = match request.hours {
-        None => instant(request.since)?,
+    let start = match request.hours {
+        None => span_start(request.since)?,
         // A blank `since` is absent, as everywhere else here: a model that sends `"since": ""`
         // beside `hours` asked for one window, not two.
         Some(_) if !blank(request.since) || until.is_some() || before.is_some() => {
             return Err(OpError::HoursWithSpan);
         }
         // From then to now is exactly a `since` walk with no end, so it is one.
-        Some(hours) => Some(hours_before(hours, now_ms())?),
+        Some(hours) => Some(SpanStart {
+            ms: hours_before(hours, now_ms())?,
+            after: None,
+        }),
     };
+    let since = start.map(|start| start.ms);
     if (since.is_some() || until.is_some()) && before.is_some() {
         return Err(OpError::InvalidRange);
     }
@@ -1316,8 +1388,8 @@ pub async fn page(
 
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
-    let (mut messages, forward, unproven) = match since {
-        Some(from) => {
+    let (mut messages, forward, unproven, beyond) = match start {
+        Some(SpanStart { ms: from, after }) => {
             // One step of a range read, oldest first: remote-ops-audit W10 `#287 bulk-reads`. A
             // provider that reads by time itself reads the span and nothing after it. One that
             // does not answers with the read this route always made (`chat::emulated_range`):
@@ -1326,6 +1398,7 @@ pub async fn page(
             // exactly on the boundary — the edge the issue asks be tested.
             let mut native =
                 state.chat.read_caps(&channel.id).range == crate::chat::Support::Native;
+            let asked_native = native;
             let range = crate::chat::TimeRange {
                 since_ms: from,
                 until_ms: until,
@@ -1334,41 +1407,70 @@ pub async fn page(
             // cursor is only millisecond-accurate: the extra millisecond it lets through at the
             // bottom is trimmed here, and a message exactly at `until` is deterministically OUT.
             // The range read has trimmed already; this holds every provider to the same edges.
+            // A step that resumes after a message (`Page::next_since`) reads that message's
+            // millisecond again, and leaves out what the step before returned: every id up to
+            // that one, ids ordering as their messages were created. Fix round 1 of
+            // remote-ops-audit W10-W14 `#287 bulk-reads`.
             let in_span = |m: &Message| {
                 message_ms(m).is_none_or(|ms| ms >= from && until.is_none_or(|to| ms < to))
+                    && after.is_none_or(|after| m.id.numeric().is_none_or(|id| id > after))
             };
-            let mut cursor: Option<String> = None;
-            let mut steps = 0;
-            let mut read = loop {
-                let mut step = state
-                    .chat
-                    .fetch_range(
-                        &channel.id,
-                        &crate::chat::ReadScope::Main,
-                        range,
-                        crate::chat::RangeOrder::OldestFirst,
-                        probe,
-                        cursor.as_deref(),
-                    )
-                    .await?;
-                steps += 1;
-                if step.emulated {
-                    // The read this route always made, answered as it always was, even where the
-                    // provider said it reads by time and then could not just now. Fix round 1 of
-                    // remote-ops-audit W10 `#287 bulk-reads`.
-                    native = false;
-                }
-                step.messages.retain(in_span);
-                // A provider's own step may come back empty and still not be the end: a bridge
-                // "may answer fewer, as long as next and exhausted say so", and Slack's narrowing
-                // can prove a long stretch empty without reaching a message past it. Such a step
-                // is followed on the provider's own cursor, within `MAX_SPAN_STEPS`. Fix round 2
-                // of remote-ops-audit W10 `#287 bulk-reads`.
-                let nothing_yet =
-                    native && step.as_of.is_none() && !step.exhausted && step.messages.is_empty();
-                match step.next.clone() {
-                    Some(next) if nothing_yet && steps < MAX_SPAN_STEPS => cursor = Some(next),
-                    _ => break step,
+            // Where the read this route always made starts: after the message the step before
+            // returned last, so its over-fetch counts only messages this step has not returned.
+            let resume = after.map(|after| after.to_string());
+            let mut read = if let (false, Some(resume)) = (native, &resume) {
+                crate::chat::emulated_range(
+                    state.chat.as_ref(),
+                    &channel.id,
+                    &crate::chat::ReadScope::Main,
+                    range,
+                    crate::chat::RangeOrder::OldestFirst,
+                    probe,
+                    Some(resume),
+                )
+                .await?
+            } else {
+                // A provider's own read has no cursor at a message: it reads from `since`, and
+                // the message the step before ended on comes back first. One more is asked for
+                // it, so the over-fetch still answers "is there more" for this step.
+                let ask = if after.is_some() { probe + 1 } else { probe };
+                let mut cursor: Option<String> = None;
+                let mut steps = 0;
+                loop {
+                    let mut step = state
+                        .chat
+                        .fetch_range(
+                            &channel.id,
+                            &crate::chat::ReadScope::Main,
+                            range,
+                            crate::chat::RangeOrder::OldestFirst,
+                            ask,
+                            cursor.as_deref(),
+                        )
+                        .await?;
+                    steps += 1;
+                    if step.emulated {
+                        // The read this route always made, answered as it always was, even where
+                        // the provider said it reads by time and then could not just now. Fix
+                        // round 1 of remote-ops-audit W10 `#287 bulk-reads`.
+                        native = false;
+                    }
+                    step.messages.retain(in_span);
+                    // A provider's own step may come back empty and still not be the end: a
+                    // bridge "may answer fewer, as long as next and exhausted say so", and
+                    // Slack's narrowing can prove a long stretch empty without reaching a message
+                    // past it. Such a step is followed on the provider's own cursor, within
+                    // `MAX_SPAN_STEPS`. Fix round 2 of remote-ops-audit W10 `#287 bulk-reads`.
+                    let nothing_yet = native
+                        && step.as_of.is_none()
+                        && !step.exhausted
+                        && step.messages.is_empty();
+                    match step.next.clone() {
+                        Some(next) if nothing_yet && steps < MAX_SPAN_STEPS => {
+                            cursor = Some(next);
+                        }
+                        _ => break step,
+                    }
                 }
             };
             // A native step that is not exhausted and still gives this route no message to resume
@@ -1380,7 +1482,11 @@ pub async fn page(
                 && !read.exhausted
                 && read.messages.len() <= usize::from(limit)
                 && read.messages.last().and_then(message_ms).is_none();
-            if native && (read.as_of.is_some() || stranded) {
+            // A step the provider fell back to the read this route always made for read from the
+            // window's edge, where a step resuming after a message must not: its over-fetch was
+            // spent on messages already returned. Fix round 1 of remote-ops-audit W10-W14.
+            let from_the_edge = asked_native && read.emulated && resume.is_some();
+            if (native && (read.as_of.is_some() || stranded)) || from_the_edge {
                 // An answer from a copy the provider could not bring up to date never stands in
                 // for the read this route always made: that one is made instead, at the cost of
                 // the wasted request. remote-ops-audit section 4.3 `#287 bulk-reads`.
@@ -1391,7 +1497,7 @@ pub async fn page(
                     range,
                     crate::chat::RangeOrder::OldestFirst,
                     probe,
-                    None,
+                    resume.as_deref(),
                 )
                 .await?;
                 native = false;
@@ -1403,14 +1509,21 @@ pub async fn page(
             let unproven = native && !read.exhausted;
             let mut fetched = read.messages;
             fetched.retain(in_span);
-            (fetched, true, unproven)
+            // A provider's own read takes the window by creation time, oldest first: when the
+            // message it brought past the page is newer than the page's newest, the page holds
+            // every message of that millisecond, and the next step can start after it.
+            let beyond = fetched
+                .get(usize::from(limit))
+                .filter(|_| native)
+                .and_then(message_ms);
+            (fetched, true, unproven, beyond)
         }
         None => {
             let fetched = state
                 .chat
                 .fetch_page(&channel.id, probe, before.as_ref(), None)
                 .await?;
-            (fetched, false, false)
+            (fetched, false, false, None)
         }
     };
 
@@ -1440,13 +1553,12 @@ pub async fn page(
     let (next_before, next_since) = if !has_more {
         (None, None)
     } else if forward {
-        // Resume one millisecond after the newest message returned, so the next step covers the
-        // rest of the span without repeating this one's last message.
-        let next = messages
-            .last()
-            .and_then(message_ms)
-            .map(|ms| crate::clock::iso_from_ms(ms + 1));
-        (None, next)
+        // Resume after the newest message returned, so the next step covers the rest of the span
+        // without repeating this one's last message, or losing one created in its millisecond.
+        (
+            None,
+            messages.last().and_then(|last| resume_point(last, beyond)),
+        )
     } else {
         (messages.first().map(|m| m.id.clone()), None)
     };
@@ -3706,7 +3818,7 @@ mod tests {
     #[tokio::test]
     async fn a_page_refuses_arguments_it_cannot_honour_instead_of_picking_one() {
         let (state, _fake) = testing::state();
-        let cases: [(PageRequest<'_>, &str); 4] = [
+        let cases: [(PageRequest<'_>, &str); 6] = [
             (
                 PageRequest {
                     before: Some("not-a-snowflake"),
@@ -3717,6 +3829,22 @@ mod tests {
             (
                 PageRequest {
                     since: Some("yesterday afternoon"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            // A resume point no step could have handed back: a message created in another
+            // millisecond, or no message at all.
+            (
+                PageRequest {
+                    since: Some("2026-08-19T00:00:00Z~1000000000000000001"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            (
+                PageRequest {
+                    since: Some("2026-08-19T00:00:00Z~not-a-snowflake"),
                     ..PageRequest::default()
                 },
                 "invalid_range",

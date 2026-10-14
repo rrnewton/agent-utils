@@ -1198,7 +1198,8 @@ pub trait ChatClient: Send + Sync {
 /// edge with the message the last step reached. The page is then trimmed to the window by each
 /// message's creation instant ([`Message::created_ms`]); one whose instant cannot be read is
 /// kept, as `/page` has always kept it. Exactly the read and the trim `/page?since=` made before
-/// this method existed, so a provider without a range read of its own answers it as before.
+/// this method existed, so a provider without a range read of its own answers it as before, but
+/// for one case that read answered short: see `edge_page`.
 ///
 /// `next` is the id of the last message the page reached, unless the page already reached past
 /// the window's far end. Never `exhausted`: a page that came back short, or one that reached past
@@ -1226,12 +1227,14 @@ pub async fn emulated_range<C: ChatClient + ?Sized>(
     }
     let cursor = cursor.map(|raw| MessageId(raw.to_owned()));
     let raw = match order {
-        RangeOrder::OldestFirst => {
-            let after = cursor.unwrap_or_else(|| MessageId::at_time_ms(range.since_ms - 1));
-            client
-                .fetch_page(channel, limit, None, Some(&after))
-                .await?
-        }
+        RangeOrder::OldestFirst => match cursor {
+            Some(after) => {
+                client
+                    .fetch_page(channel, limit, None, Some(&after))
+                    .await?
+            }
+            None => edge_page(client, channel, range, limit).await?,
+        },
         RangeOrder::NewestFirst => {
             let before = cursor.or_else(|| range.until_ms.map(MessageId::at_time_ms));
             client
@@ -1266,6 +1269,54 @@ pub async fn emulated_range<C: ChatClient + ?Sized>(
         as_of: None,
         emulated: true,
     })
+}
+
+/// Most pages [`edge_page`] reads.
+const EDGE_READS: usize = 4;
+
+/// The page [`emulated_range`] reads oldest first from the start of `range`: `limit` messages
+/// `after` the id of the millisecond before `since`, oldest first.
+///
+/// That edge lets the millisecond before the window through as well: every message created in it
+/// but one whose id has no worker or sequence bits, which a real snowflake almost never lacks.
+/// They are trimmed away afterwards, and a page they filled part of then holds fewer than `limit`
+/// messages of the window even where the window has that many, which `/page`, counting it to
+/// answer "is there more", took for the end of the walk. So when the page came back full, some of
+/// it was from before the window and none of it past its end, as many more are read after its
+/// last message, until a read brings none from before the window or comes back short, within
+/// [`EDGE_READS`] pages. Any other page is the one read `/page?since=` always made. Fix round 1 of
+/// remote-ops-audit W10-W14 `#287 bulk-reads`.
+async fn edge_page<C: ChatClient + ?Sized>(
+    client: &C,
+    channel: &ChannelId,
+    range: TimeRange,
+    limit: u16,
+) -> Result<Vec<Message>, ChatError> {
+    let before_window = |page: &[Message]| {
+        page.iter()
+            .filter(|m| m.created_ms().is_some_and(|ms| ms < range.since_ms))
+            .count()
+    };
+    let past_window = |m: &Message| {
+        m.created_ms()
+            .is_some_and(|ms| range.until_ms.is_some_and(|until| ms >= until))
+    };
+    let edge = MessageId::at_time_ms(range.since_ms - 1);
+    let mut raw = client.fetch_page(channel, limit, None, Some(&edge)).await?;
+    let (mut asked, mut got, mut spent) = (usize::from(limit), raw.len(), before_window(&raw));
+    for _ in 1..EDGE_READS {
+        if spent == 0 || got < asked || raw.iter().any(past_window) {
+            break;
+        }
+        let Some(last) = raw.last().map(|m| m.id.clone()) else {
+            break;
+        };
+        let ask = u16::try_from(spent).unwrap_or(limit);
+        let more = client.fetch_page(channel, ask, None, Some(&last)).await?;
+        (asked, got, spent) = (usize::from(ask), more.len(), before_window(&more));
+        raw.extend(more);
+    }
+    Ok(raw)
 }
 
 /// [`ChatClient::fetch_messages`]'s default: a lookup by id made of the reads that answered one
