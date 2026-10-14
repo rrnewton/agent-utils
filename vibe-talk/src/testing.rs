@@ -442,6 +442,8 @@ pub struct CountedCall {
     pub view: Option<crate::threads::TimelineView>,
     /// The thread, for a call scoped to one.
     pub thread: Option<String>,
+    /// Why it was made: the [`crate::read_reason::ReadReason`] around the call when it was made.
+    pub reason: crate::read_reason::ReadReason,
 }
 
 /// A failure [`CountingChat`] answers in place of the provider, once.
@@ -453,7 +455,7 @@ struct ScriptedFailure {
 
 /// A chat provider that COUNTS every upstream call made through it: the common fixture of the
 /// remote-ops audit (2026-10-13, section 5), so a test can assert how many calls one user-visible
-/// action costs, per method, channel and timeline view.
+/// action costs, per method, channel, timeline view and read reason.
 ///
 /// Wraps any [`crate::chat::ChatClient`] and forwards every method to it, the capability flags
 /// included, so the wrapped provider behaves exactly as it would unwrapped. Each async method (the
@@ -571,6 +573,7 @@ fn call_in(method: &'static str, channel: &crate::model::ChannelId) -> CountedCa
         channel: Some(channel.clone()),
         view: None,
         thread: None,
+        reason: crate::read_reason::ReadReason::current(),
     }
 }
 
@@ -581,6 +584,7 @@ fn call_without_channel(method: &'static str) -> CountedCall {
         channel: None,
         view: None,
         thread: None,
+        reason: crate::read_reason::ReadReason::current(),
     }
 }
 

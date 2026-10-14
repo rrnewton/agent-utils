@@ -1,4 +1,4 @@
-//! remote-ops-audit W5 (naming-budget): how often naming a thread reads the chat provider.
+//! remote-ops-audit W5 (`#286 naming-budget`): how often naming a thread reads the chat provider.
 //!
 //! A thread is named only from a read of it made at its turn. These tests are about WHEN and HOW
 //! OFTEN those reads happen: at most one per channel per thirty seconds by default, a thread with
@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use tower::ServiceExt as _;
 use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity, RateLimitExhausted};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
+use vibe_talk::read_reason::ReadReason;
 use vibe_talk::state::AppState;
 use vibe_talk::summarize::fake::FakeSummarizer;
 use vibe_talk::summarize::threads::{
@@ -588,6 +589,42 @@ async fn twenty_threads_falling_due_over_a_minute_cost_at_most_two_thread_reads(
         h.counting.count("fetch_timeline"),
         20 + 2,
         "twenty list reads by the page, two thread reads for names, and nothing else"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_read_for_its_name_counts_as_naming_whichever_request_queued_it() {
+    // `#285 quick-wins-safe` counts every read under why it was made. The read at a thread's turn
+    // is the server's own: it counts as naming even when the page's poll queued the thread, a turn
+    // later, in the channel's worker, and the poll's own list read counts as the poll.
+    let h = harness();
+    h.upstream.add(WRITE_CHANNEL, 2);
+    let (status, body) = h
+        .send(
+            "GET",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?view=threads&reason=poll"),
+            WRITE_TOKEN,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    h.at(3 * DEFAULT_NAMING_INTERVAL_SECONDS).await;
+    let calls = h.counting.calls();
+    let reasons = |view: TimelineView| -> Vec<ReadReason> {
+        calls
+            .iter()
+            .filter(|call| call.method == "fetch_timeline" && call.view == Some(view))
+            .map(|call| call.reason)
+            .collect()
+    };
+    assert_eq!(
+        reasons(TimelineView::Thread),
+        [ReadReason::Naming; 2],
+        "{calls:?}"
+    );
+    assert_eq!(
+        reasons(TimelineView::Threads),
+        [ReadReason::Poll],
+        "{calls:?}"
     );
 }
 
