@@ -118,6 +118,24 @@ exact slug above — prose that merely mentions the reason is not a recorded
 reason, because nothing can read it. Keep at most one exceptional PR open, and
 land or close it before opening another.
 
+### No branch backlog on GitHub
+
+`main` should be the only live branch on GitHub. Push a branch there only while
+you need it (an exceptional PR, or handing work to another machine), and when
+its work has landed or been abandoned, **move it under `archived/`** instead of
+leaving it at the top level:
+
+```bash
+git push --atomic origin --force-with-lease=refs/heads/NAME:SHA \
+  SHA:refs/heads/archived/NAME :refs/heads/NAME
+```
+
+Unlanded work that is still wanted gets an issue naming the archived branch, so
+moving the branch loses nothing. Preservation snapshots belong outside
+`refs/heads/` entirely (wrkslots writes them under `refs/rescue/`). The
+2026-10-14 cleanup is recorded in
+`ai_docs/transient/2026-10-14-branch-triage/REPORT.md`.
+
 ## Repository Boundary
 
 Everything above describes **this repository** and nothing else.
