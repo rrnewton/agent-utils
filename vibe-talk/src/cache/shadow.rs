@@ -17,10 +17,10 @@
 //!
 //! | Consumer | Would serve when |
 //! |---|---|
-//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, every row served at or above the head's settled top (which no claim holds) was listed by the latest read of the scope's newest end, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), nothing served is in doubt (see below), and the barrier passed |
+//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, every row served at or above the head's settled top (which no claim holds) was listed by the latest read of the scope's newest end, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
 //! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since this process opened the file (a deletion made before then, while the server was down, reached nothing); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
 //! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
-//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head is as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
+//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
 //! | `timeline_fallback` | coverage holds `limit` rows down from the head, with every row above the settled top listed by the latest read of the newest end as for `messages`, nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
 //!
 //! # What a miss says
@@ -41,8 +41,8 @@
 //!   the unsettled band (or above the head) that the latest read of the scope's newest end did not
 //!   list, or not the message;
 //! - `incomplete`: covered, but by reads that may have left a message out (Slack's);
-//! - `stale_head`: what the cache holds was confirmed too long ago: the head, or the coverage of a
-//!   message's home scope on a bridge;
+//! - `stale_head`: what the cache holds was confirmed too long ago: the head, the claims under a
+//!   window or a count, or the coverage of a message's home scope on a bridge;
 //! - `barrier`: what was queued before the ask was not applied within [`BARRIER`].
 //!
 //! And one that is no verdict of a rule: `late`, an evaluation that found what a read begun after
@@ -519,13 +519,30 @@ fn head_trusted(view: &View, dropped: Option<i64>) -> bool {
     }
 }
 
-fn fresh(head: &Head, facts: &Facts) -> bool {
-    let within = if facts.live_fed {
+/// How long what a read saw stands without being read again: the recent windows' own reuse
+/// periods, the longer when a live producer feeds the channel.
+fn reuse_ms(facts: &Facts) -> i64 {
+    if facts.live_fed {
         FRESH_LIVE_FED_MS
     } else {
         FRESH_UNFED_MS
-    };
-    facts.asked_ms.saturating_sub(head.head_listed_ms) <= within
+    }
+}
+
+/// Whether the head was listed within the reuse period: no creation is missing from its top.
+fn fresh(head: &Head, facts: &Facts) -> bool {
+    facts.asked_ms.saturating_sub(head.head_listed_ms) <= reuse_ms(facts)
+}
+
+/// Whether the claims a window or a count rests on still stand: their edits and deletions were
+/// reflected as of `full_ms` (the weakest of them), and that was within the reuse period, or the
+/// live feed has carried every edit and deletion since. A fresh head says only that the newest end
+/// was read; the rows below it rest on claims that may be hours old, and on a feed that carries
+/// no edits or deletions (or none to a channel nothing feeds), what changed since never arrived.
+fn current(full_ms: Option<i64>, facts: &Facts) -> bool {
+    full_ms.is_some_and(|full_ms| {
+        facts.asked_ms.saturating_sub(full_ms) <= reuse_ms(facts) || fed_since(full_ms, facts)
+    })
 }
 
 /// Whether the live feed has carried every edit and deletion since local time `at_ms`: the
@@ -554,9 +571,11 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
         0
     };
     let top = head.settled_top();
-    if bottom < top && coverage::covers(&view.coverage, bottom, top).is_none() {
-        return Err(Miss::Gap);
-    }
+    let cover = if bottom < top {
+        Some(coverage::covers(&view.coverage, bottom, top).ok_or(Miss::Gap)?)
+    } else {
+        None
+    };
     // No claim holds a row at or above the settled top: only the latest read of the scope's newest
     // end does, which moved the time of every row there it listed up to its own start. A row there
     // with an older time is one it did not list: deleted since an earlier read saw it (even one
@@ -568,7 +587,10 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     {
         return Err(Miss::Gap);
     }
-    if needs_fresh && !fresh(&head, facts) {
+    // Fresh, the window as a whole: its head, and the claims under it.
+    if needs_fresh
+        && (!fresh(&head, facts) || cover.is_some_and(|cover| !current(cover.full_ms, facts)))
+    {
         return Err(Miss::StaleHead);
     }
     Ok(Decision::Serve)
@@ -639,7 +661,7 @@ fn page(
     Ok(Decision::Serve)
 }
 
-/// A count from `since`: complete coverage up to the unsettled band, under a fresh head.
+/// A count from `since`: complete coverage up to the unsettled band, current, under a fresh head.
 fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     let dropped = dropped(view, facts);
     if !head_trusted(view, dropped) || !view.rows.iter().all(|row| trusted(row, dropped)) {
@@ -650,7 +672,7 @@ fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     if !cover.complete {
         return Err(Miss::Incomplete);
     }
-    if !fresh(&head, facts) {
+    if !fresh(&head, facts) || !current(cover.full_ms, facts) {
         return Err(Miss::StaleHead);
     }
     Ok(Decision::Serve)
@@ -1185,6 +1207,80 @@ mod tests {
             ..facts(LISTED + FRESH_LIVE_FED_MS + 1)
         };
         assert_eq!(decide(&window(5), &view, &fed), stale);
+    }
+
+    /// A short read of the newest end makes the head fresh; the rows below its band rest on claims,
+    /// whose edits and deletions are reflected only as of their own reads. A window or a count
+    /// that reaches a claim older than the reuse period is stale, unless a live feed that carries
+    /// edits and deletions has run since that claim was read.
+    #[test]
+    fn a_window_or_a_count_resting_on_a_claim_older_than_the_reuse_period_is_stale() {
+        let claimed_at = |full_ms: i64| {
+            let mut view = listed(12, true);
+            view.coverage[0].listed_ms = full_ms;
+            view.coverage[0].full_ms = Some(full_ms);
+            view
+        };
+        let at = facts(LISTED + 1_000);
+        let stale = Decision::Miss(Miss::StaleHead);
+        let count = Ask::Count {
+            since_ms: Some(T),
+            cap: 100,
+        };
+        let hour_old = claimed_at(LISTED - HOUR);
+        assert_eq!(decide(&window(5), &newest(&hour_old, 5), &at), stale);
+        assert_eq!(decide(&count, &hour_old, &at), stale);
+        // A window inside the band rests on no claim: the head's read listed it.
+        assert_eq!(
+            decide(&window(2), &newest(&hour_old, 2), &at),
+            Decision::Serve
+        );
+        // A newest page answered from the cache when upstream fails says how old it is instead.
+        let fallback = Ask::Timeline {
+            view: TimelineView::Main,
+            thread: None,
+            limit: 5,
+        };
+        assert_eq!(
+            decide(&fallback, &newest(&hour_old, 5), &at),
+            Decision::Serve
+        );
+        // Within the reuse period, a claim stands.
+        let just = claimed_at(LISTED + 1_000 - FRESH_UNFED_MS);
+        assert_eq!(decide(&window(5), &newest(&just, 5), &at), Decision::Serve);
+        assert_eq!(decide(&count, &just, &at), Decision::Serve);
+        let past = claimed_at(LISTED + 1_000 - FRESH_UNFED_MS - 1);
+        assert_eq!(decide(&window(5), &newest(&past, 5), &at), stale);
+        // A bridge's live feed has carried every edit and deletion since it began: a claim read
+        // after that stands, however old.
+        let fed = Facts {
+            live_fed: true,
+            fed_since_ms: Some(LISTED - 2 * HOUR),
+            feed: Feed::Deletions,
+            ..at
+        };
+        assert_eq!(
+            decide(&window(5), &newest(&hour_old, 5), &fed),
+            Decision::Serve
+        );
+        assert_eq!(decide(&count, &hour_old, &fed), Decision::Serve);
+        // Not one read before it began, nor on a feed that carries only additions.
+        let restarted = Facts {
+            fed_since_ms: Some(LISTED - HOUR + 1),
+            ..fed
+        };
+        let additions = Facts {
+            feed: Feed::AdditionsOnly,
+            ..fed
+        };
+        for facts in [restarted, additions] {
+            assert_eq!(
+                decide(&window(5), &newest(&hour_old, 5), &facts),
+                stale,
+                "{facts:?}"
+            );
+            assert_eq!(decide(&count, &hour_old, &facts), stale, "{facts:?}");
+        }
     }
 
     #[test]

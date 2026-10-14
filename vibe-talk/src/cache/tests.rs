@@ -2485,6 +2485,55 @@ fn revalidation_keeps_a_claim_read_within_the_week_and_drops_one_that_was_not() 
     );
 }
 
+/// Twenty rows read at once; an hour later (a message edited upstream meanwhile, on a feed that
+/// carries no edits) a read of the newest two. The head is fresh again, but a window of twenty
+/// rests on the claim from an hour before, and is not served as fresh.
+#[test]
+fn a_short_newest_read_never_makes_an_older_claim_fresh() {
+    let fx = Fixture::new("cache-short-fresh");
+    let first = T0 + 20 * STEP + 1_000;
+    fx.clock.set(first);
+    fx.list(
+        (1..=20).map(m).collect(),
+        first,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    let later = first + 3_600_000;
+    fx.clock.set(later);
+    fx.list(
+        vec![m(19), m(20)],
+        later,
+        Some(newest_proof(ListStart::At(T0 + 19 * STEP))),
+    );
+    let decide = |limit: usize| {
+        let ask = shadow::Ask::Window {
+            consumer: shadow::Consumer::Digest,
+            limit,
+        };
+        let query = shadow::query(&ask, observe::Shape::DiscordNative, false).expect("a query");
+        let view = fx
+            .cache
+            .shadow_view(&fx.chan, &query)
+            .served()
+            .expect("served");
+        let facts = shadow::Facts {
+            asked_ms: later + 5_000,
+            live_fed: false,
+            fed_since_ms: None,
+            dropped_ms: None,
+            barrier: true,
+            feed: shadow::Feed::AdditionsOnly,
+        };
+        shadow::decide(&ask, &view, &facts)
+    };
+    assert_eq!(
+        decide(20),
+        shadow::Decision::Miss(shadow::Miss::StaleHead),
+        "twenty rows served as fresh, the oldest last read an hour before"
+    );
+    assert_eq!(decide(2), shadow::Decision::Serve, "the two re-read are");
+}
+
 // ---- the unsettled band ------------------------------------------------------------------------
 
 /// Every read of a scope's newest end that is the latest yet records its time, and vouches for the

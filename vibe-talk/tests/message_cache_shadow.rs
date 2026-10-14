@@ -602,3 +602,60 @@ async fn a_page_is_never_served_from_a_claim_whose_rows_the_week_took() {
     );
     assert_eq!(page.misses.gap, 1, "{page:?}");
 }
+
+/// An hour after the window was read whole, a message in it is edited upstream (Discord's feed
+/// carries no edits), and a write-token read of the newest three makes the head fresh again. A
+/// read-token window of ten still rests on the claim from an hour ago: it is stale, not served
+/// with the old text. The three the short read re-read are fresh.
+#[tokio::test]
+async fn a_short_read_of_the_newest_end_never_makes_an_hour_old_window_fresh() {
+    let d = deployment("cache-shadow-short-edit", &testing::config_toml()).await;
+    d.fill().await;
+    d.clock.advance(HOUR);
+    d.fake.edit(&d.ids[3], "message 3, edited an hour later");
+    d.held_write(3).await;
+    let before = d.messages();
+    d.clock.advance(5 * SECOND);
+    d.read_window(10).await;
+    let counted = d.messages();
+    assert_eq!(
+        (
+            counted.would_serve - before.would_serve,
+            counted.content_differs
+        ),
+        (0, 0),
+        "a window an hour old counted as fresh, and its text differs from upstream: {counted:?}"
+    );
+    assert_eq!(
+        counted.misses.stale_head - before.misses.stale_head,
+        1,
+        "{counted:?}"
+    );
+    d.read_window(3).await;
+    let counted = d.messages();
+    assert_eq!(
+        (counted.would_serve - before.would_serve, counted.agreed),
+        (1, 1),
+        "what the short read re-read is fresh: {counted:?}"
+    );
+}
+
+/// The same with a deletion: a message deleted upstream an hour after the window was read whole
+/// is never counted as one the cache would serve.
+#[tokio::test]
+async fn a_short_read_of_the_newest_end_never_makes_a_deleted_message_servable() {
+    let d = deployment("cache-shadow-short-delete", &testing::config_toml()).await;
+    d.fill().await;
+    d.clock.advance(HOUR);
+    d.fake.delete(&d.ids[4]);
+    d.held_write(3).await;
+    let before = d.messages();
+    d.clock.advance(5 * SECOND);
+    d.read_window(10).await;
+    let counted = d.messages();
+    assert_eq!(
+        (counted.would_serve - before.would_serve, counted.extra_rows),
+        (0, 0),
+        "a message deleted upstream counted as servable: {counted:?}"
+    );
+}
