@@ -387,6 +387,22 @@ def card_point(desk: Desk, list_id: str, card_id: str, part: str) -> tuple[float
     return box["x"] + box["width"] / 2, box["y"] + min(box["height"] / 2, 12)
 
 
+def back_point(desk: Desk) -> tuple[float, float]:
+    """The middle of the X of a thread across the window, once it has come to rest: where a finger presses it.
+
+    `#289 thread-card-header`: a thread opened from its card while the card is on screen has its card at
+    the top move up from there (`data-flying`), the X with it. Measured during that flight, the X is
+    where it was, not where it comes to rest, and a tap there misses it."""
+    desk.wait_for("() => { const card = document.getElementById('thread-card');"
+                  " return !card || !card.hasAttribute('data-flying'); }",
+                  "the card at the top of the thread did not come to rest")
+    desk.settled()
+    box = desk.page.locator("#thread-back").bounding_box()
+    desk.check(box is not None, "the thread has no way back")
+    assert box is not None
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
 def desk_walk(desk: Desk) -> None:
     page = desk.page
     open_two_columns(desk)
@@ -545,10 +561,7 @@ def phone_walk(desk: Desk) -> None:
     desk.check(page.evaluate("() => document.getElementById('thread-select').value") == f"thread:{CANARY}",
                "the replies button entered another thread")
     desk.shot("3-thread")
-    box = page.locator("#thread-back").bounding_box()
-    desk.check(box is not None, "the thread has no way back")
-    assert box is not None
-    page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.touchscreen.tap(*back_point(desk))
     desk.wait_for("() => !document.getElementById('thread-list').hidden", "Back did not come back to the Threads list")
     desk.settled()
     back = state(desk, "thread-list")
@@ -621,10 +634,7 @@ def phone_list_walk(desk: Desk) -> None:
     desk.check(page.evaluate("() => document.getElementById('thread-select').value") == f"thread:{REPLICA}",
                "the replies button opened another thread")
     desk.shot("6-thread-from-list")
-    box = page.locator("#thread-back").bounding_box()
-    desk.check(box is not None, "the thread opened from the thread list has no way back")
-    assert box is not None
-    page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.touchscreen.tap(*back_point(desk))
     desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
                   " && !document.getElementById('side-list').hidden",
                   "Back from the thread did not come back to the thread list")
