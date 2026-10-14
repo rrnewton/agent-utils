@@ -585,21 +585,35 @@ function refusalSentence(error) {
 // from a reader's own Back. Where the entry is gone — never pushed, or the browser holds another — the
 // close stands alone and nothing is gone back through.
 //
-// A RELOAD STARTS AGAIN. An entry from before a reload carries another page load's name, so it is
-// never taken for one of this page's: the page makes the entry it opens on its own base, at depth
-// nought, and pushes again for whatever it reopened (`#189 restore-ui-state`). Chromium's back button
-// skips an entry a page pushed before the reader ever touched it, against pages that trap the button,
-// so an entry wanted that early waits for the reader's first touch (`backDeferred`). The browser keeps
-// the earlier load's entries, and lands on them as on any of the page's (measured in Chromium 149: a
-// popstate, not a load), but the screens they stood for went with that load: a Back at the top onto
-// one closes nothing there, and goes on back through the rest of them, and past that load's own base,
-// in the same press (`leaveEarlierLoad`) — where the Navigation API says the reader went back rather
-// than forward. Without it each costs a press that changes nothing on screen.
+// A RELOAD STANDS ON THE EARLIER LOAD'S ENTRIES. A reload keeps the tab's history, and the browser
+// lands on the earlier load's entries as on any of the page's (measured in Chromium 149: a popstate,
+// not a load). So they are not left under the page as a stale stack. The entry the page opens on says
+// how deep it was, `d`; the `d` entries under it are that load's, one for each thing it had open, and
+// the page takes all of them as its own (`backAdopted`): the one it is on at depth `d`, and each of the
+// others, at the depth it says, when the browser lands on it. Whatever the page reopened as it loaded
+// (`#189 restore-ui-state`, from the channel the device saved) then stands on them, as if it had pushed
+// them: a thread opened from the thread list, reopened, is the two entries it was, and the first Back
+// closes the thread alone, before the reader has touched the page as after. Where less was reopened
+// than there are entries, the page goes back through the rest at once, as for anything closed, down to
+// the earlier load's own base where nothing was. That base is where this load's begins, so there is
+// never an entry left under it to spend a press on: in an installed app, whose window starts its
+// history at `/voice`, the Back after the last thing closes is the system's. The page never asks to go
+// back further than the browser says there are entries of its own under it (`historyIndex`). Where more
+// was reopened than there are entries, the rest are pushed — at the reader's first touch, as Chromium's
+// back button skips an entry a page pushed before it was touched, against pages that trap the button
+// (`backDeferred`). So is what is reopened only once sign-in answers, where the device saved no channel
+// to open on: by then the page, finding nothing open as it loaded, has gone back through the entries. A
+// Back while something waits for its entry closes as many things as entries it goes back through, never
+// all that is over the entry it lands on. An entry the page cannot account for (someone else's, or out
+// of line with the earlier load's) is never taken for a depth: a Back onto it closes one thing, the top
+// one, and a Forward onto it is gone back through.
 //
-// MENUS HAVE A CLOSE WATCHER. Where the browser has `CloseWatcher` (Chrome 120 on), an open ⋯ menu,
-// pace popover or prompts tray has one: the gesture closes the menu without touching the history, and
-// Esc, which the page takes first, never reaches it. Elsewhere each open menu is one more level on top,
-// its entry pushed and gone back through as a screen's is.
+// A MENU IS AN ENTRY TOO. An open ⋯ menu, pace popover or prompts tray is one more level on top, its
+// entry pushed and gone back through as a screen's is. Not a `CloseWatcher`, though Chrome has them: a
+// close watcher hears Esc and the phone's back gesture, but the browser's own Back on a desk, a mouse's
+// back button and Alt+Left are plain traversals that pass it by, and one of those over a menu with no
+// entry would close the thing under the menu and leave the menu open. With an entry, every Back closes
+// the menu first, and a close watcher would have nothing left to do.
 
 /** The key the page's own history entries keep their facts under, in `history.state`. */
 const BACK_STATE_KEY = "vibeTalkBack";
@@ -607,6 +621,8 @@ const BACK_STATE_KEY = "vibeTalkBack";
 const BACK_SESSION = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
 /** How long a going-back the page asked for may take to land before the page stops waiting for it. */
 const BACK_TRAVERSAL_MS = 2000;
+/** The deepest an earlier load's entry is taken to be: more than anything the page opens is ever deep. */
+const BACK_DEPTH_MAX = 16;
 
 /** Whether the page keeps its history in step yet: from the end of the script, once every part is defined. */
 let backStarted = false;
@@ -625,11 +641,10 @@ let backSyncDue = false;
 /** Where the browser was in the tab's history when the page last looked (`historyIndex`), to tell a Back from a Forward. */
 let backIndex = /** @type {number | null} */ (null);
 /**
- * One close watcher per open menu, by its level's name, where the browser has them.
- *
- * @type {Map<string, CloseWatcher>}
+ * How deep the earlier load's entries under this load's reach: one an earlier load made, less deep than
+ * this, is taken for this load's own, at the depth it says. Nought where the page opened on none.
  */
-const menuWatchers = new Map();
+let backAdopted = 0;
 
 /** The window's history, where it can be written; null in a host without one. */
 function backHistory() {
@@ -658,22 +673,26 @@ function earlierLoadEntry(state) {
   return Number.isInteger(facts.depth) && facts.depth >= 0 ? facts : null;
 }
 
-/** Where the browser is in the tab's history, by the Navigation API where it has one; null elsewhere. */
+/**
+ * The facts of an entry the page stands on: one this load made, or one of the earlier load's under it
+ * (`backAdopted`), which the page takes for its own at the depth it says. Null for any other.
+ */
+function standingBackEntry(state) {
+  const live = liveBackEntry(state);
+  if (live) return live;
+  const earlier = earlierLoadEntry(state);
+  return earlier && earlier.depth < backAdopted ? earlier : null;
+}
+
+/**
+ * Where the browser is in the tab's history, by the Navigation API where it has one; null elsewhere.
+ * Counted from the first of the run of this origin's entries the browser is in, so in an installed app,
+ * whose window starts at `/voice`, it is how many entries of the app's own there are under this one.
+ */
 function historyIndex() {
   const navigation = typeof window === "object" && window ? window.navigation : null;
   const entry = navigation ? navigation.currentEntry : null;
   return entry && Number.isInteger(entry.index) && entry.index >= 0 ? entry.index : null;
-}
-
-/**
- * A Back at the top landed on an entry an earlier load of the page made, `facts.depth` deep: go on back
- * through the rest of that load's entries and past its base, which stood for screens that load took
- * with it, so the one press leaves the app as a Back at the top does. Where that base was the tab's
- * first entry there is nowhere further to go, the browser does nothing, and the next Back is the
- * system's, which closes an installed app.
- */
-function leaveEarlierLoad(history, facts) {
-  history.go(-(Math.min(facts.depth, 64) + 1));
 }
 
 /** `backTags` cut or padded to `depth`: what the page knows of the entries up to the one it is on. */
@@ -683,10 +702,12 @@ function fitBackTags(depth) {
   return tags;
 }
 
-/** The browser's close watcher, where it has one. */
-function closeWatcherClass() {
-  const Watcher = typeof window === "object" && window ? window.CloseWatcher : undefined;
-  return typeof Watcher === "function" ? Watcher : null;
+/** Make the entry the browser is on this load's own, at `depth`, standing for `tag` ("top" at depth nought). */
+function ownBackEntry(history, depth, tag) {
+  const named = depth === 0 ? "top" : tag;
+  history.replaceState(backEntry(depth, named), "");
+  backTags = fitBackTags(depth);
+  if (depth > 0) backTags[depth - 1] = named;
 }
 
 /** Whether the page may push an entry now: not before the reader has ever touched it, where the browser says. */
@@ -739,7 +760,8 @@ function closeOpenMenu(name) {
 function backLevels() {
   if (sideActive) return inColumn(columns.main, backLevels);
   const levels = screenLevels(currentScreen);
-  if (!closeWatcherClass()) levels.push(...openMenus());
+  // On top of everything, in every browser: see "A MENU IS AN ENTRY TOO".
+  levels.push(...openMenus());
   return levels;
 }
 
@@ -859,7 +881,6 @@ function scheduleBackSync() {
 function syncBackStack() {
   backSyncDue = false;
   if (!backStarted) return;
-  syncMenuWatchers();
   const history = backHistory();
   if (!history || backTraversal) return;
   const levels = backLevels();
@@ -918,9 +939,13 @@ function backTraversalLost() {
 }
 
 /**
- * The browser went back (or forward) to another entry: close down to its depth, as the Back of each
- * level closed would. The page's own going-back, for levels it had already closed, lands here too,
- * and closes nothing more.
+ * The browser went back (or forward) to another entry: close one thing for each entry it went back
+ * through — down to the entry's depth, where the history is in step — as the Back of each thing closed
+ * would. The page's own going-back, for levels it had already closed, lands here too,
+ * and closes nothing more. An entry of the earlier load's under this one's is taken for this load's,
+ * at its depth (`backAdopted`); one the page cannot account for is never taken for a depth — reached by
+ * a Back it closes the top thing open, one press for one thing, and reached by a Forward it is gone back
+ * through — and either way it is this load's own entry from here on.
  *
  * @param {PopStateEvent} event
  */
@@ -929,62 +954,57 @@ function onBackPop(event) {
   const history = backHistory();
   if (!history) return;
   const state = event ? event.state : null;
-  const entry = liveBackEntry(state);
-  const target = entry ? entry.depth : 0;
   const awaited = backTraversal;
   if (awaited) {
     clearTimeout(awaited.timer);
     backTraversal = null;
   }
   backTraversalStuck = false;
+  const from = backTags.length;
   const index = historyIndex();
-  const wentBack = index !== null && backIndex !== null && index < backIndex;
-  const earlier = earlierLoadEntry(state);
+  const moved = index !== null && backIndex !== null ? index - backIndex : null;
+  backIndex = index;
+  const entry = standingBackEntry(state);
   const wasOpen = backLevels().length;
-  // An entry this page load did not make — one from before a reload — is its base from here on.
-  if (!entry) history.replaceState(backEntry(0, "top"), "");
-  backTags = fitBackTags(target);
-  if (!awaited || target !== awaited.target) closeBackLevelsTo(target);
-  if (earlier && wasOpen === 0 && wentBack) {
-    backIndex = index;
-    leaveEarlierLoad(history, earlier);
-    return;
+  let target;
+  let closeTo;
+  if (entry) {
+    target = entry.depth;
+    // As many things as entries gone back through, from the top: down to the entry's depth where the
+    // history is in step, and no further where something open still waits for its entry (`backDeferred`).
+    closeTo = Math.max(target, wasOpen - Math.max(0, from - target));
+  } else if (awaited) {
+    // The page's own going-back, landed somewhere it cannot read: where it asked to go.
+    target = awaited.target;
+    closeTo = target;
+  } else if (moved !== null && moved > 0) {
+    // A Forward, as the Navigation API says, onto an entry nobody can say the depth of: above where the
+    // page was by as many as it moved, so that nothing closes and the page goes back down to what is open.
+    target = from + moved;
+    closeTo = wasOpen;
+  } else {
+    // A Back onto one: the top thing open closes, and nothing more.
+    target = Math.max(0, wasOpen - 1);
+    closeTo = target;
   }
+  if (!entry || entry.session !== BACK_SESSION) {
+    ownBackEntry(history, target, entry ? String(entry.tag) : "");
+    // Under an entry of the earlier load's, the rest of that load's; under one nobody can account for, nothing.
+    if (entry) backAdopted = target;
+    else if (!awaited && !(moved !== null && moved > 0)) backAdopted = 0;
+  } else {
+    backTags = fitBackTags(target);
+  }
+  if (!awaited || target !== awaited.target) closeBackLevelsTo(closeTo);
   syncBackStack();
 }
 
-/** A close watcher for each open menu, and none for a closed one, where the browser has them. */
-function syncMenuWatchers() {
-  const Watcher = closeWatcherClass();
-  if (!Watcher) return;
-  const open = openMenus();
-  for (const [name, watcher] of [...menuWatchers]) {
-    if (open.includes(name)) continue;
-    menuWatchers.delete(name);
-    watcher.destroy();
-  }
-  for (const name of open) {
-    if (menuWatchers.has(name)) continue;
-    try {
-      const watcher = new Watcher();
-      watcher.onclose = () => {
-        if (menuWatchers.get(name) !== watcher) return;
-        menuWatchers.delete(name);
-        closeOpenMenu(name);
-        scheduleBackSync();
-      };
-      menuWatchers.set(name, watcher);
-    } catch (_error) {
-      // A watcher refused leaves this menu to Escape and a tap outside it, as before.
-    }
-  }
-}
-
 /**
- * Keep the history in step from here on. The entry the page opened on becomes its base, whatever it
- * held before a reload; the browser is told not to move the document on a Back, the lists keeping
- * their own places (`#280 scroll-stability`); and an entry put off until the reader's first touch is
- * pushed then.
+ * Keep the history in step from here on. The page takes the entry it opened on for its own: at the
+ * depth an earlier load gave it, standing on that load's entries under it (`backAdopted`), never more
+ * than the browser says there are entries of the page's own under it; or, holding anything else, as
+ * its base. The browser is told not to move the document on a Back, the lists keeping their own places
+ * (`#280 scroll-stability`); and an entry put off until the reader's first touch is pushed then.
  */
 function startBackStack() {
   backStarted = true;
@@ -995,8 +1015,12 @@ function startBackStack() {
     } catch (_error) {
       // A host whose history will not take it moves nothing on a Back anyway: the page does not scroll.
     }
-    history.replaceState(backEntry(0, "top"), "");
-    backIndex = historyIndex();
+    const earlier = earlierLoadEntry(history.state);
+    const index = historyIndex();
+    const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;
+    ownBackEntry(history, depth, earlier ? String(earlier.tag) : "");
+    backAdopted = depth;
+    backIndex = index;
     window.addEventListener("popstate", onBackPop);
   }
   const touched = () => {
@@ -9295,7 +9319,7 @@ function setPromptsOpen(open) {
   promptsOpen = open === true;
   el("prompts-tray").hidden = !promptsOpen;
   el("prompts-open").setAttribute("aria-expanded", promptsOpen ? "true" : "false");
-  // `#304 back-gesture-in-app`. An open tray has a close watcher, or else an entry.
+  // `#304 back-gesture-in-app`. An open tray is a level, with an entry of its own.
   scheduleBackSync();
 }
 
@@ -25366,7 +25390,7 @@ function discordNode(messages) {
     } else if (openRowMenu && openRowMenu.close === closeMenu) {
       openRowMenu = null;
     }
-    // `#304 back-gesture-in-app`. An open menu has a close watcher, or else an entry.
+    // `#304 back-gesture-in-app`. An open menu is a level, with an entry of its own.
     scheduleBackSync();
   };
   const closeMenu = () => setMenu(false);
@@ -36417,7 +36441,7 @@ el("read-speed").addEventListener("click", () => {
   const open = el("speed-popover").hidden;
   el("speed-popover").hidden = !open;
   el("read-speed").setAttribute("aria-expanded", open ? "true" : "false");
-  // `#304 back-gesture-in-app`. An open popover has a close watcher, or else an entry.
+  // `#304 back-gesture-in-app`. An open popover is a level, with an entry of its own.
   scheduleBackSync();
 });
 

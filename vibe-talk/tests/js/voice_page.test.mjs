@@ -3459,11 +3459,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * and so no entries; a test that wants one calls this from `arrange`, because the page takes charge
    * of its history as it loads.
    *
-   * `entries` is the tab's: first a page elsewhere, what was open before the app, which going back to
-   * is leaving the app (`page.left`); then `below`, the states of entries this app made before a
-   * reload; then the entry the page loads on, holding `state`; then `above`, entries ahead of it that a
-   * Forward reaches. Chromium lands on an earlier load's entries with a popstate, as on any of the page's
-   * (measured on Chromium 149), so these do too. With `navigation`, the window has the Navigation API's
+   * `entries` is the tab's: first, with `leading`, a page elsewhere, what was open before the app, which
+   * going back to is leaving the app (`page.left`); then `below`, the states of entries this app made
+   * before a reload; then the entry the page loads on, holding `state`; then `above`, entries ahead of
+   * it that a Forward reaches. Without `leading` the app's entries are the tab's first, as in an
+   * installed app's own window, which opens at the app: the reader's Back on the first entry is the
+   * system's, which closes the app (`page.left` too), and a traversal the page asks for past either end
+   * goes nowhere, as a browser ignores it, and is recorded in `refused` (so is `go(0)`, a reload).
+   * Chromium lands on an earlier load's entries with a popstate, as on any of the page's (measured on
+   * Chromium 149), so these do too. With `navigation`, the window has the Navigation API's
    * `navigation.currentEntry.index`, counted from the app's first entry, as only same-origin entries
    * are; without it, the API is absent, as in Firefox and Safari. `state`, `pushState` and `replaceState`
    * are synchronous, as a browser's are, and an address handed to either is recorded in `addresses`,
@@ -3474,13 +3478,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * for and landed. States are copied in and out as structured clones are, so the page holds none of
    * the history's own objects.
    */
-  page.enableHistory = ({ state = null, below = [], above = [], navigation = true } = {}) => {
+  page.enableHistory = ({ state = null, below = [], above = [], navigation = true, leading = true } = {}) => {
     const copy = (value) => (value === undefined || value === null ? null : JSON.parse(JSON.stringify(value)));
+    const first = leading ? 1 : 0;
     const history = {
-      entries: [{ app: false, state: null }, ...below.map((held) => ({ app: true, state: copy(held) })),
+      entries: [...(leading ? [{ app: false, state: null }] : []), ...below.map((held) => ({ app: true, state: copy(held) })),
         { app: true, state: copy(state) }, ...above.map((held) => ({ app: true, state: copy(held) }))],
-      index: 1 + below.length,
+      index: first + below.length,
+      first,
       asked: [],
+      refused: [],
       pushes: 0,
       replaces: 0,
       addresses: [],
@@ -3518,7 +3525,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     if (navigation) {
       context.window.navigation = {
         get currentEntry() {
-          return { index: history.index - 1 };
+          return { index: history.index - history.first };
         },
       };
     }
@@ -3528,7 +3535,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     while (history.asked.length > 0) {
       const delta = history.asked.shift();
       const to = history.index + delta;
-      if (delta === 0 || to < 0 || to >= history.entries.length) continue;
+      if (delta === 0 || to < 0 || to >= history.entries.length) {
+        history.refused.push(delta);
+        continue;
+      }
       history.index = to;
       if (!history.entries[to].app) {
         // Another page: the app is gone, and nothing it asked for after this is landed.
@@ -3541,6 +3551,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     }
   };
   page.browserBack = async () => {
+    await page.traverse();
+    if (page.left) return;
+    if (page.history.index === 0) {
+      // The tab's first entry, the app's own in an installed app: the system's Back, which closes it.
+      page.left = true;
+      return;
+    }
     page.history.go(-1);
     await page.traverse();
   };
@@ -3766,6 +3783,12 @@ const TUNING_BANDS = {
     "busy phone's ordinary traversal for one that never came and stops going back, leaving entries the " +
     "gesture then spends presses on; longer keeps every screen opened meanwhile out of the history, so " +
     "its Back leaves the app (#304 back-gesture-in-app)"],
+  BACK_DEPTH_MAX: [6, 64,
+    "the deepest an earlier load's history entry is taken to be after a reload: lower than what the page " +
+    "can have open at once (Help over Settings over a thread over the thread list, a reply, a menu) cuts a " +
+    "real stack short and leaves entries under the page that the gesture spends presses on; much higher " +
+    "lets a damaged entry send the page back past the tab's start where the browser has no Navigation API " +
+    "to say how far it may go (#304 back-gesture-in-app)"],
   UPSTREAM_CLEAR_RECHECK_MS: [2000, 15000,
     "how often, after a Mark read now the server stopped waiting on, Settings asks what it came to: " +
     "sooner asks a server with nothing new to say, later leaves the line saying \"still waiting\" " +
@@ -55431,7 +55454,7 @@ test("`#304 back-gesture-in-app`: NESTED — the thread list, a thread opened fr
   assert.equal(third.left, true, "the third gesture, at the top, did not leave the app");
 
   // NEGATIVE CONTROL: a popstate that closes everything rather than down to its entry's depth skips the list.
-  const greedy = await listThreadWalk(brokenScript("closeBackLevelsTo(target);", "closeBackLevelsTo(0);"));
+  const greedy = await listThreadWalk(brokenScript("closeBackLevelsTo(closeTo);", "closeBackLevelsTo(0);"));
   assert.notEqual(greedy.seen[2].layout, "list", "the control that closes everything still came back to the list");
 });
 
@@ -55503,34 +55526,67 @@ test("`#304 back-gesture-in-app`: the page's own going-back is never taken for t
 /** A tab whose entries an earlier load of the page made, three deep, and the page reloaded on the top one. */
 const EARLIER_LOAD = "an-earlier-load";
 const earlier = (depth, tag) => ({ vibeTalkBack: { session: EARLIER_LOAD, depth, tag } });
-const reloadedTab = (navigation) => ({ state: earlier(2, "thread"), below: [earlier(0, "top"), earlier(1, "list")], navigation });
+const reloadedTab = (navigation, leading = true) =>
+  ({ state: earlier(2, "thread"), below: [earlier(0, "top"), earlier(1, "list")], navigation, leading });
 
-/** The page reloaded on `reloadedTab`, a thread opened and closed by the gesture: where that leaves it. */
-async function reloadedThenThread(navigation, script = SCRIPT) {
-  const page = await backPage({ script, history: reloadedTab(navigation) });
+/**
+ * The page reloaded on `reloadedTab`, reopening nothing of it (this fixture keeps no view to reopen), what
+ * the earlier load's entries are gone back through as landed, then a thread opened and closed by the
+ * gesture: where each step leaves it.
+ */
+async function reloadedThenThread(navigation, { leading = true, script = SCRIPT } = {}) {
+  const page = await backPage({ script, history: reloadedTab(navigation, leading) });
   const loaded = { facts: backFacts(page), session: page.history.state.vibeTalkBack.session,
     asked: [...page.history.asked], picker: page.el("thread-select").value };
+  await page.traverse();
+  const landed = { facts: backFacts(page), session: page.history.state.vibeTalkBack.session, index: page.history.index,
+    picker: page.el("thread-select").value, thread: !page.el("thread-heading").hidden };
   await openFirstThread(page);
-  const opened = backFacts(page);
+  const opened = { facts: backFacts(page), length: page.history.length };
   await page.browserBack();
-  return { page, loaded, opened, closed: page.el("thread-heading").hidden };
+  return { page, loaded, landed, opened, closed: page.el("thread-heading").hidden };
 }
 
-test("`#304 back-gesture-in-app`: A RELOAD on an entry an earlier load made takes nothing from it — the page's base at depth nought, nothing gone back through, nothing opened — and a Back at the top onto the earlier load's entries leaves the app in that one press", async () => {
-  const { page, loaded, opened, closed } = await reloadedThenThread(true);
-  assert.deepStrictEqual(loaded.facts, { depth: 0, tag: "top" }, "the entry the page reloaded on is not its base");
-  assert.notEqual(loaded.session, EARLIER_LOAD, "the page kept the earlier load's name");
-  assert.deepStrictEqual(loaded.asked, [], "the page went back through entries an earlier load made");
-  assert.equal(loaded.picker, "flat", "the page opened something for an earlier load's entry");
-  assert.deepStrictEqual(opened, { depth: 1, tag: "thread" });
-  assert.equal(closed, true);
-  assert.equal(page.left, false);
-  // At the top, a Back onto the earlier load's "list" entry: the screens it stood for are gone, so the
-  // page goes on back through its "top" and past it, out of the app.
-  await page.browserBack();
-  assert.equal(page.left, true, "a Back at the top onto an earlier load's entries did not leave the app");
+test("`#304 back-gesture-in-app`: A RELOAD that reopens nothing goes back through the earlier load's entries at once, to that load's base, which is its own: no stale entry is left under it, with the Navigation API or without, and with the app the tab's first entry the Back at the top is the system's", async () => {
+  for (const [navigation, leading] of [[true, true], [false, true], [true, false], [false, false]]) {
+    const how = `${navigation ? "with" : "without"} the Navigation API, ${leading ? "after a page elsewhere" : "the app first"}`;
+    const { page, loaded, landed, opened, closed } = await reloadedThenThread(navigation, { leading });
+    // The entry reloaded on is this load's own, at the depth the earlier load gave it, and the two under
+    // it stand for nothing now open: gone back through, both, in one going-back.
+    assert.deepStrictEqual(loaded.facts, { depth: 2, tag: "thread" }, `${how}: the entry reloaded on is not this load's at its depth`);
+    assert.notEqual(loaded.session, EARLIER_LOAD, `${how}: the page kept the earlier load's name`);
+    assert.deepStrictEqual(loaded.asked, [-2], `${how}: the page did not go back through the earlier load's two entries at once`);
+    assert.equal(loaded.picker, "flat", `${how}: the page opened something for an earlier load's entry`);
+    assert.deepStrictEqual(landed.facts, { depth: 0, tag: "top" }, `${how}: the earlier load's base is not this load's`);
+    assert.notEqual(landed.session, EARLIER_LOAD, `${how}: the base kept the earlier load's name`);
+    assert.equal(landed.index, page.history.first, `${how}: the going-back did not land on the earlier load's base`);
+    assert.equal(landed.picker, "flat", `${how}: landing on the base changed the view`);
+    assert.equal(landed.thread, false);
+    // A thread from there: one entry over the base, the stale ones ahead cut off.
+    assert.deepStrictEqual(opened.facts, { depth: 1, tag: "thread" });
+    assert.equal(opened.length, page.history.first + 2, `${how}: the earlier load's entries were not cut off by the next one pushed`);
+    assert.equal(closed, true);
+    assert.equal(page.left, false);
+    // At the top, nothing of the app's own is left under the base: one press leaves it.
+    assert.equal(page.history.index, page.history.first, `${how}: there is an entry of the app's under its base`);
+    await page.browserBack();
+    assert.equal(page.left, true, `${how}: the gesture at the top did not leave the app`);
+    assert.deepStrictEqual(page.history.refused, [], `${how}: the page asked to go past the end of the history, or to reload`);
+  }
 
-  // A FORWARD onto an earlier load's entry is not a Back: nothing is gone back through, and nothing opens.
+  // AN ENTRY CLAIMING MORE than the browser has under it: the page goes back no further than the
+  // Navigation API says there are entries of its own, so never past the tab's first.
+  const claiming = (script = SCRIPT) => backPage({ script,
+    history: { state: earlier(5, "thread"), below: [earlier(0, "top"), earlier(1, "list")], leading: false } });
+  const over = await claiming();
+  assert.deepStrictEqual(backFacts(over), { depth: 2, tag: "thread" }, "the page took a depth deeper than the entries under it");
+  await over.traverse();
+  assert.deepStrictEqual(over.history.refused, []);
+  assert.equal(over.history.index, 0);
+  assert.deepStrictEqual(backFacts(over), { depth: 0, tag: "top" });
+
+  // A FORWARD onto an earlier load's entry ahead is not a Back: nothing closes or opens, and the page
+  // goes back through it to its own, so the next Back is not spent on it.
   const forward = async (script = SCRIPT) => {
     const ahead = await backPage({ script, history: { above: [earlier(1, "thread"), earlier(2, "list")] } });
     ahead.history.go(1);
@@ -55539,47 +55595,217 @@ test("`#304 back-gesture-in-app`: A RELOAD on an entry an earlier load made take
   };
   const ahead = await forward();
   assert.equal(ahead.left, false, "a Forward onto an earlier load's entry left the app");
-  assert.deepStrictEqual(ahead.history.asked, []);
   assert.equal(ahead.el("thread-heading").hidden, true);
   assert.equal(ahead.el("thread-select").value, "flat");
+  assert.equal(ahead.history.index, 1, "the page did not go back through the entry a Forward landed on");
   assert.deepStrictEqual(backFacts(ahead), { depth: 0, tag: "top" });
+  await ahead.browserBack();
+  assert.equal(ahead.left, true, "after a Forward onto a stale entry, the gesture at the top did not leave the app");
 
-  // NEGATIVE CONTROLS: a page that never goes on back through an earlier load's entries spends a press
-  // on each; one that cannot tell a Forward from a Back leaves the app on a Forward.
-  const staying = await reloadedThenThread(true, brokenScript("if (earlier && wasOpen === 0 && wentBack) {", "if (false) {"));
-  await staying.page.browserBack();
-  assert.equal(staying.page.left, false, "the control that stays on an earlier load's entries left the app");
-  const blind = await forward(brokenScript("const wentBack = index !== null && backIndex !== null && index < backIndex;",
-    "const wentBack = true;"));
-  assert.equal(blind.left, true, "the control that takes a Forward for a Back did not leave the app");
+  // NEGATIVE CONTROLS. A page that makes the entry it reloaded on its base at depth nought, as this
+  // change first did, leaves the earlier load's entries under it, and the gesture at the top lands on
+  // one; one that never clamps asks to go past the tab's first entry, which the browser ignores; and one
+  // that takes a Forward for a Back makes the stale entry its base, over the base it had.
+  const based = await reloadedThenThread(true, {
+    script: brokenScript("const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
+      "const depth = 0;") });
+  assert.deepStrictEqual(based.loaded.asked, [], "the control that reloads at depth nought went back through entries");
+  await based.page.browserBack();
+  assert.equal(based.page.left, false, "the control's gesture at the top did not land on a stale entry");
+  const unclamped = await claiming(brokenScript("Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX)",
+    "Math.min(earlier.depth, BACK_DEPTH_MAX)"));
+  await unclamped.traverse();
+  assert.deepStrictEqual(unclamped.history.refused, [-5], "the control that never clamps did not ask past the first entry");
+  const blind = await forward(brokenScript("} else if (moved !== null && moved > 0) {", "} else if (false) {"));
+  await blind.browserBack();
+  assert.equal(blind.left, false, "the control that takes a Forward for a Back left the app in one press");
 });
 
-test("`#304 back-gesture-in-app`: without the Navigation API, an earlier load's entries close and open nothing and are one press each, never two, and the page's base is still its own", async () => {
-  const { page, loaded, closed } = await reloadedThenThread(false);
-  assert.deepStrictEqual(loaded.facts, { depth: 0, tag: "top" });
-  assert.deepStrictEqual(loaded.asked, []);
-  assert.equal(closed, true);
-  for (const tag of ["list", "top"]) {
-    const pushes = page.history.pushes;
-    const at = page.history.index;
-    await page.browserBack();
-    assert.equal(at - page.history.index, 1, `the gesture onto the earlier load's "${tag}" entry went back further`);
-    assert.equal(page.left, false, `the earlier load's "${tag}" entry left the app`);
-    assert.equal(page.screen(), "main");
-    assert.equal(page.el("thread-select").value, "flat", `the earlier load's "${tag}" entry changed the view`);
-    assert.equal(page.history.pushes, pushes, `the earlier load's "${tag}" entry pushed one`);
-    assert.deepStrictEqual(page.history.asked, []);
-    assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
-  }
-  await page.browserBack();
-  assert.equal(page.left, true);
+/**
+ * The page reloaded from `first`: its storage, and the tab's history as it left it — the entries under
+ * the one it was on, that one, what was ahead — with a page elsewhere before the app or not, as `first`
+ * had. The reader has not touched the page since, as when a phone reloads an app it put away
+ * (`activation`, Chromium's `navigator.userActivation`, unless the test says otherwise).
+ */
+function reloadedFrom(first, data, { script = SCRIPT, activation = { hasBeenActive: false } } = {}) {
+  const { entries, index, first: start } = first.history;
+  return newPage(first.storage, script, (p) => {
+    p.enableHistory({ state: entries[index].state, below: entries.slice(start, index).map((entry) => entry.state),
+      above: entries.slice(index + 1).map((entry) => entry.state), leading: start === 1 });
+    if (activation) p.setUserActivation(activation);
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.messages = data.messages;
+  });
+}
 
-  // NEGATIVE CONTROL: a page that trusts an entry whatever load made it, landed on the earlier load's
-  // "list" entry, believes it is one deep with nothing open, and goes back through it by itself.
-  const trusting = await reloadedThenThread(false, brokenScript("facts.session !== BACK_SESSION", "false"));
-  const at = trusting.page.history.index;
-  await trusting.page.browserBack();
-  assert.ok(at - trusting.page.history.index > 1, "the control that trusts every entry spent one gesture on one entry");
+/**
+ * A thread opened from the thread list (or, `single`, from the picker), the page reloaded on it, and
+ * the gesture until it leaves: what the reload reopened, and what each gesture came to.
+ */
+async function reloadWalk({ leading = true, single = false, script = SCRIPT, activation } = {}) {
+  const first = await backPage({ history: { leading } });
+  if (single) {
+    await openFirstThread(first);
+  } else {
+    await press(first, first.el("scroll-area"), "3", { ctrlKey: true });
+    await first.settle();
+    await openerOf(first.el("side-cards").children.find((li) => li.hasAttribute("data-card"))).click();
+    await first.settle();
+  }
+  const before = { facts: backFacts(first), length: first.history.length, session: first.history.state.vibeTalkBack.session };
+  await first.setVisibility("hidden");
+  const page = reloadedFrom(first, threadData(), { script, ...(activation === undefined ? {} : { activation }) });
+  await page.settle();
+  await page.settle();
+  const note = () => ({ layout: layoutOf(page), thread: !page.el("thread-heading").hidden, picker: page.el("thread-select").value,
+    facts: page.left ? null : backFacts(page), index: page.history.index, left: page.left });
+  const reopened = { ...note(), session: page.history.state.vibeTalkBack.session, pushes: page.history.pushes,
+    asked: [...page.history.asked], length: page.history.length };
+  const gestures = [];
+  for (let i = 0; i < 5 && !page.left; i += 1) {
+    await page.browserBack();
+    gestures.push(note());
+  }
+  return { page, before, reopened, gestures };
+}
+
+test("`#304 back-gesture-in-app`: A RELOAD in a thread opened from the thread list reopens both on the earlier load's two entries, nothing pushed: the first Back, before any touch, closes the thread alone, the next the list, and the next leaves — and with the app the tab's first entry, it is the system's", async () => {
+  for (const leading of [true, false]) {
+    const how = leading ? "after a page elsewhere" : "the app first";
+    const { page, before, reopened, gestures } = await reloadWalk({ leading });
+    assert.deepStrictEqual(before.facts, { depth: 2, tag: "thread" }, "fixture: the thread opened from the list is not two deep");
+    assert.equal(reopened.thread, true, `${how}: fixture: the reload did not reopen the thread (#189)`);
+    assert.equal(reopened.layout, null);
+    assert.deepStrictEqual(reopened.facts, { depth: 2, tag: "thread" },
+      `${how}: the reopened thread does not stand on the earlier load's entries, two deep`);
+    assert.notEqual(reopened.session, before.session, `${how}: the reloaded page kept the earlier load's name`);
+    assert.equal(reopened.pushes, 0, `${how}: the reload pushed entries where the earlier load's stand`);
+    assert.deepStrictEqual(reopened.asked, [], `${how}: the reload went back through entries it stands on`);
+    assert.equal(reopened.length, before.length, `${how}: the reload changed how many entries the tab has`);
+    const [first, second, third] = gestures;
+    assert.equal(first.left, false, `${how}: the first Back after the reload left the app`);
+    assert.equal(first.thread, false, `${how}: the first Back did not close the reopened thread`);
+    assert.equal(first.layout, "list", `${how}: the first Back after the reload closed more than the thread: ${JSON.stringify(first)}`);
+    assert.deepStrictEqual(first.facts, { depth: 1, tag: "list" });
+    assert.equal(second.left, false);
+    assert.equal(second.layout, null, `${how}: the second Back did not leave the thread list`);
+    assert.equal(second.picker, "flat");
+    assert.deepStrictEqual(second.facts, { depth: 0, tag: "top" });
+    assert.equal(second.index, page.history.first, `${how}: an entry of the app's is left under its base, a press spent on nothing`);
+    assert.equal(third.left, true, `${how}: the third Back did not leave the app`);
+    assert.equal(gestures.length, 3);
+    assert.deepStrictEqual(page.history.refused, []);
+  }
+  // One thread, the app first: one Back closes it, and the next is the system's.
+  const one = await reloadWalk({ leading: false, single: true });
+  assert.deepStrictEqual(one.reopened.facts, { depth: 1, tag: "thread" });
+  assert.equal(one.gestures[0].thread, false, "the Back after a reload in one thread did not close it");
+  assert.equal(one.gestures[0].index, 0, "an entry of the app's is left under its base after a reload in one thread");
+  assert.equal(one.gestures[1].left, true);
+
+  // TWO ENTRIES AT ONCE, from the browser's long-press history list, onto the earlier load's base: both
+  // things close, as that entry is taken for this load's at the depth it says.
+  const jumpedFrom = async (script = SCRIPT) => {
+    const first = await backPage();
+    await press(first, first.el("scroll-area"), "3", { ctrlKey: true });
+    await first.settle();
+    await openerOf(first.el("side-cards").children.find((li) => li.hasAttribute("data-card"))).click();
+    await first.settle();
+    await first.setVisibility("hidden");
+    const page = reloadedFrom(first, threadData(), { script });
+    await page.settle();
+    await page.settle();
+    page.history.go(-2);
+    await page.traverse();
+    return { page, layout: layoutOf(page), thread: !page.el("thread-heading").hidden, picker: page.el("thread-select").value };
+  };
+  const jumped = await jumpedFrom();
+  assert.equal(jumped.thread, false, "a jump of two entries did not close the reopened thread");
+  assert.equal(jumped.layout, null, "a jump of two entries onto the earlier load's base left the thread list open");
+  assert.equal(jumped.picker, "flat");
+  assert.deepStrictEqual(backFacts(jumped.page), { depth: 0, tag: "top" });
+  await jumped.page.browserBack();
+  assert.equal(jumped.page.left, true, "after the jump, the gesture at the top did not leave the app");
+
+  // MORE REOPENED than the earlier load has entries for — that load's own reopen, never touched — the
+  // entry it is short waits for the reader's touch, and a Back before it closes one thing, as many as
+  // entries it went back through, not everything over the entry it lands on.
+  const short = async (script = SCRIPT) => {
+    const first = await backPage();
+    await press(first, first.el("scroll-area"), "3", { ctrlKey: true });
+    await first.settle();
+    await openerOf(first.el("side-cards").children.find((li) => li.hasAttribute("data-card"))).click();
+    await first.settle();
+    await first.setVisibility("hidden");
+    const data = threadData();
+    const page = newPage(first.storage, script, (p) => {
+      p.enableHistory({ state: earlier(1, "thread"), below: [earlier(0, "top")] });
+      p.setUserActivation({ hasBeenActive: false });
+      p.threadingSupported = true;
+      p.threads = data.threads;
+      p.messages = data.messages;
+    });
+    await page.settle();
+    await page.settle();
+    const reopened = { facts: backFacts(page), pushes: page.history.pushes, thread: !page.el("thread-heading").hidden };
+    await page.browserBack();
+    return { reopened, after: { layout: layoutOf(page), thread: !page.el("thread-heading").hidden, left: page.left } };
+  };
+  const shortOne = await short();
+  assert.equal(shortOne.reopened.thread, true, "fixture: the reload did not reopen the thread");
+  assert.deepStrictEqual(shortOne.reopened.facts, { depth: 1, tag: "list" }, "the reopened list does not stand on the earlier load's entry");
+  assert.equal(shortOne.reopened.pushes, 0, "an entry was pushed before the reader touched the page");
+  assert.equal(shortOne.after.left, false);
+  assert.equal(shortOne.after.thread, false, "the Back did not close the thread");
+  assert.equal(shortOne.after.layout, "list", "a Back over an entry still waiting closed more than one thing");
+
+  // AN ENTRY NOBODY CAN ACCOUNT FOR under the page's base — someone else's, holding no state — reached by
+  // a Back while the thread list and a thread from it still wait for their entries: one thing closes.
+  const foreign = async (script = SCRIPT) => {
+    const activation = { hasBeenActive: false };
+    const page = await backPage({ script, history: { below: [null] }, arrange: (p) => p.setUserActivation(activation) });
+    await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+    await page.settle();
+    await openerOf(page.el("side-cards").children.find((li) => li.hasAttribute("data-card"))).click();
+    await page.settle();
+    const waiting = { facts: backFacts(page), thread: !page.el("thread-heading").hidden };
+    await page.browserBack();
+    return { page, waiting, after: { layout: layoutOf(page), thread: !page.el("thread-heading").hidden, left: page.left,
+      facts: page.left ? null : backFacts(page) } };
+  };
+  const someone = await foreign();
+  assert.equal(someone.waiting.thread, true, "fixture: the card did not open its thread");
+  assert.deepStrictEqual(someone.waiting.facts, { depth: 0, tag: "top" }, "fixture: an entry was pushed before a touch");
+  assert.equal(someone.after.left, false);
+  assert.equal(someone.after.thread, false, "a Back onto someone else's entry did not close the thread");
+  assert.equal(someone.after.layout, "list", "a Back onto someone else's entry closed more than the thread");
+  assert.deepStrictEqual(someone.after.facts, { depth: 1, tag: "list" }, "someone else's entry was not made this load's, standing for the list");
+
+  // NEGATIVE CONTROLS. The page as this change first made it — the entry reloaded on its base at depth
+  // nought, and a Back onto an entry it did not make closing everything — closes the thread and the
+  // list in the one press before any touch; with only the base at depth nought, in an installed app the
+  // Backs after the last thing closes are spent on the earlier load's entries.
+  const firstMade = brokenScript("const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;",
+    "const depth = 0;").replace("    target = Math.max(0, wasOpen - 1);\n", "    target = 0;\n");
+  assert.ok(!firstMade.includes("    target = Math.max(0, wasOpen - 1);\n"), "the negative control's second patch found nothing");
+  const greedy = await reloadWalk({ script: firstMade });
+  assert.equal(greedy.gestures[0].thread, false);
+  assert.equal(greedy.gestures[0].layout, null, "the control that closes everything on an earlier load's entry kept the list");
+  assert.equal(greedy.gestures[0].picker, "flat");
+  const stale = await reloadWalk({ leading: false, activation: null, script: brokenScript(
+    "const depth = earlier ? Math.min(earlier.depth, index === null ? BACK_DEPTH_MAX : index, BACK_DEPTH_MAX) : 0;", "const depth = 0;") });
+  assert.equal(stale.gestures[1].layout, null, "fixture: the control's second Back did not close the list");
+  assert.ok(stale.gestures[1].index > 0, "the control that reloads at depth nought left no entry under its base");
+  assert.ok(stale.gestures.length > 3, "the control's presses after the last thing closed were not spent on stale entries");
+  // ...and a page that closes down to the depth of the entry landed on, however many things wait over it,
+  // closes the list with the thread.
+  const deep = await short(brokenScript("closeTo = Math.max(target, wasOpen - Math.max(0, from - target));", "closeTo = target;"));
+  assert.equal(deep.after.layout, null, "the control that closes down to the entry's depth kept the list");
+  const unadopted = await jumpedFrom(brokenScript("return earlier && earlier.depth < backAdopted ? earlier : null;", "return null;"));
+  assert.equal(unadopted.layout, "list", "the control that takes no earlier load's entry for its depth closed both on a jump");
+  const everything = await foreign(brokenScript("    target = Math.max(0, wasOpen - 1);\n", "    target = 0;\n"));
+  assert.equal(everything.after.layout, null, "the control that closes everything on someone else's entry kept the list");
 });
 
 /** The view keys pressed in turn from the list, with how many entries each pushed and what it asked to go back through. */
@@ -55710,46 +55936,216 @@ async function menuPage(closeWatcher, script = SCRIPT) {
   return { page, row };
 }
 
-test("`#304 back-gesture-in-app`: A MENU HAS A CLOSE WATCHER where the browser has them: the gesture closes it and touches no history, and a menu closed another way gives its watcher up", async () => {
-  const { page, row } = await menuPage(true);
-  const pushes = page.history.pushes;
-  assert.equal(rowMoreMenu(row).hidden, false, "fixture: the ⋯ did not open its menu");
-  assert.equal(page.watching().length, 1, "the open menu has no close watcher");
-  assert.equal(await page.gestureBack(), "watcher");
-  assert.equal(rowMoreMenu(row).hidden, true, "the gesture did not close the menu");
-  assert.equal(page.left, false);
-  assert.equal(page.history.pushes, pushes, "the menu pushed an entry beside its close watcher");
-  assert.deepStrictEqual(page.history.asked, []);
-  // Closed by a tap outside it, and by Esc: its watcher is given up, so the next gesture is not spent on it.
-  for (const close of [
-    (p) => p.documentEvent("pointerdown", { target: p.el("scroll-area"), pointerType: "touch" }),
-    (p) => press(p, rowMoreButton(row), "Escape"),
+/**
+ * The ⋯ menu of a row opened over something a Back closes, in a window that has close watchers, then a
+ * plain Back — a desk's toolbar Back, a mouse's back button, Alt+Left, which no close watcher hears —
+ * and another: one column with a thread open, or (`two`) two columns with a thread on the right and the
+ * menu on a row of the left column's. What each step came to, on `script`.
+ */
+async function menuOverLevel(two, script = SCRIPT) {
+  const page = await backPage({ script, closeWatcher: true });
+  const note = () => ({ facts: page.left ? null : backFacts(page), thread: !page.el("thread-heading").hidden,
+    cards: cardsUp(page), side: sideIds(page), left: page.left, watching: page.watching().length });
+  if (two) {
+    await twoColumns(page);
+    await threadBadge(rowWithId(page, "201")).click();
+    await page.settle();
+  } else {
+    await openFirstThread(page);
+  }
+  const under = note();
+  const row = page.el("discord-log").children[0];
+  await rowMoreButton(row).click();
+  await page.settle();
+  const opened = { ...note(), menu: !rowMoreMenu(row).hidden };
+  await page.browserBack();
+  const first = { ...note(), menu: !rowMoreMenu(row).hidden };
+  await page.browserBack();
+  const second = { ...note(), menu: !rowMoreMenu(row).hidden };
+  return { page, row, under, opened, first, second };
+}
+
+test("`#304 back-gesture-in-app`: A MENU IS AN ENTRY even where the browser has close watchers, so a plain Back closes the menu alone — never the thread under it, in one column or on the right of two — and the next Back that thread", async () => {
+  // One column: the ⋯ menu over a thread.
+  const one = await menuOverLevel(false);
+  assert.deepStrictEqual(one.under.facts, { depth: 1, tag: "thread" });
+  assert.equal(one.opened.menu, true, "fixture: the ⋯ did not open its menu");
+  assert.deepStrictEqual(one.opened.facts, { depth: 2, tag: "menu:row" }, "the ⋯ menu over a thread is not an entry over the thread's");
+  assert.equal(one.opened.watching, 0, "the page made a close watcher, which a desk's Back passes by");
+  assert.equal(one.first.menu, false, "a plain Back did not close the ⋯ menu");
+  assert.equal(one.first.thread, true, "a plain Back with the ⋯ menu open closed the thread under it");
+  assert.deepStrictEqual(one.first.facts, { depth: 1, tag: "thread" });
+  assert.equal(one.second.thread, false, "the next Back did not close the thread");
+  assert.equal(one.second.left, false);
+  // The same thread again: no menu is still open on it.
+  await openFirstThread(one.page);
+  assert.ok(one.page.el("discord-log").children.every((li) => !rowMoreMenu(li) || rowMoreMenu(li).hidden),
+    "a menu is still open in the thread opened again");
+  assert.deepStrictEqual(backFacts(one.page), { depth: 1, tag: "thread" });
+
+  // Two columns: the ⋯ menu on a row of the left column's, a thread on the right.
+  const two = await menuOverLevel(true);
+  assert.deepStrictEqual(two.under.facts, { depth: 1, tag: "side" });
+  assert.equal(two.under.cards, false, "fixture: the root's tag did not open its thread on the right");
+  assert.deepStrictEqual(two.opened.facts, { depth: 2, tag: "menu:row" });
+  assert.equal(two.first.menu, false, "a plain Back did not close the ⋯ menu in two columns");
+  assert.equal(two.first.cards, false, "a plain Back with the ⋯ menu open closed the right column's thread");
+  assert.deepStrictEqual(two.first.side, two.under.side, "the right column's thread changed under the menu's Back");
+  assert.deepStrictEqual(two.first.facts, { depth: 1, tag: "side" });
+  assert.equal(two.second.cards, true, "the next Back did not take the right column back to its cards");
+  assert.equal(two.second.left, false);
+
+  // Esc and a tap outside close the menu at once, and go back through its entry.
+  for (const [what, close] of [
+    ["Esc", (p, row) => press(p, rowMoreButton(row), "Escape")],
+    ["a tap outside", (p) => p.documentEvent("pointerdown", { target: p.el("scroll-area"), pointerType: "touch" })],
   ]) {
+    const page = await backPage({ closeWatcher: true });
+    await openFirstThread(page);
+    const row = page.el("discord-log").children[0];
     await rowMoreButton(row).click();
     await page.settle();
-    assert.equal(page.watching().length, 1);
-    await close(page);
+    assert.deepStrictEqual(backFacts(page), { depth: 2, tag: "menu:row" });
+    await close(page, row);
     await page.settle();
-    assert.equal(rowMoreMenu(row).hidden, true);
-    assert.equal(page.watching().length, 0, "a menu closed another way kept its close watcher");
+    assert.equal(rowMoreMenu(row).hidden, true, `${what} did not close the menu`);
+    assert.deepStrictEqual(page.history.asked, [-1], `${what} did not go back through the menu's entry`);
+    await page.traverse();
+    assert.equal(page.el("thread-heading").hidden, false, `${what}: the page's own going-back closed the thread`);
+    assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "thread" });
   }
-  // A menu over a thread: the first gesture closes the menu, the second the thread.
-  await openFirstThread(page);
-  const inThread = page.el("discord-log").children[0];
-  await rowMoreButton(inThread).click();
-  await page.settle();
-  assert.equal(await page.gestureBack(), "watcher");
-  assert.equal(rowMoreMenu(inThread).hidden, true);
-  assert.equal(page.el("thread-heading").hidden, false, "the gesture that closed the menu closed the thread as well");
-  assert.equal(await page.gestureBack(), "history");
-  assert.equal(page.el("thread-heading").hidden, true);
 
-  // NEGATIVE CONTROL: a menu that never tells the page it opened has no watcher and no entry, and the
-  // gesture leaves the app with it open.
-  const silent = await menuPage(true, brokenScript(
-    "    // `#304 back-gesture-in-app`. An open menu has a close watcher, or else an entry.\n    scheduleBackSync();\n", ""));
-  assert.equal(await silent.page.gestureBack(), "history");
-  assert.equal(silent.page.left, true, "the control's menu had a way back after all");
+  // NEGATIVE CONTROL: the page as this change first made it, where a browser with close watchers gives
+  // a menu no entry: a plain Back closes the thread under the menu, and the menu stays open.
+  const unlisted = await menuOverLevel(false, brokenScript("  levels.push(...openMenus());",
+    "  if (typeof window.CloseWatcher !== \"function\") levels.push(...openMenus());"));
+  assert.deepStrictEqual(unlisted.opened.facts, { depth: 1, tag: "thread" }, "the control gave the menu an entry");
+  assert.equal(unlisted.first.thread, false, "the control's Back did not close the thread under the menu");
+  assert.equal(unlisted.first.menu, true, "the control's Back closed the menu");
+});
+
+/**
+ * The reading-pace popover opened by its button, with close watchers or without, on `script`; then the
+ * gesture, then the popover opened and closed by its button, and its going-back landed.
+ */
+async function paceWalk(closeWatcher, script = SCRIPT) {
+  const page = await backPage({ script, closeWatcher });
+  await page.el("read-speed").click();
+  await page.settle();
+  const opened = { open: !page.el("speed-popover").hidden, facts: backFacts(page), watching: page.watching().length };
+  const how = await page.gestureBack();
+  const gesture = { how, open: !page.el("speed-popover").hidden, facts: page.left ? null : backFacts(page),
+    left: page.left, focus: focusName(page) };
+  if (page.left) return { page, opened, gesture };
+  await page.el("read-speed").click();
+  await page.settle();
+  await press(page, page.el("read-speed"), "Escape");
+  await page.settle();
+  const escaped = { open: !page.el("speed-popover").hidden, asked: [...page.history.asked] };
+  await page.traverse();
+  return { page, opened, gesture, escaped };
+}
+
+test("`#304 back-gesture-in-app`: THE READING-PACE POPOVER is an entry, with close watchers or without: the gesture closes it, the focus on its button, and Esc closing it goes back through its entry", async () => {
+  for (const closeWatcher of [false, true]) {
+    const how = closeWatcher ? "with close watchers" : "without close watchers";
+    const { page, opened, gesture, escaped } = await paceWalk(closeWatcher);
+    assert.equal(opened.open, true, `${how}: fixture: the pace button did not open its popover`);
+    assert.deepStrictEqual(opened.facts, { depth: 1, tag: "menu:pace" }, `${how}: the open popover is not an entry`);
+    assert.equal(opened.watching, 0, `${how}: the popover has a close watcher, which a desk's Back passes by`);
+    assert.equal(gesture.how, "history");
+    assert.equal(gesture.left, false, `${how}: the gesture with the popover open left the app`);
+    assert.equal(gesture.open, false, `${how}: the gesture did not close the popover`);
+    assert.equal(gesture.focus, "#read-speed", `${how}: the gesture did not give the focus to the pace button`);
+    assert.deepStrictEqual(gesture.facts, { depth: 0, tag: "top" });
+    assert.equal(escaped.open, false, `${how}: Esc did not close the popover`);
+    assert.deepStrictEqual(escaped.asked, [-1], `${how}: Esc did not go back through the popover's entry`);
+    assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+    await page.browserBack();
+    assert.equal(page.left, true, `${how}: after the popover, the gesture at the top did not leave the app`);
+  }
+  // NEGATIVE CONTROLS: a pace button that never tells the page it opened the popover gives it no entry,
+  // and the gesture leaves the app with it open; a popover put down without telling the page leaves its
+  // entry under the next gesture.
+  for (const closeWatcher of [false, true]) {
+    const silent = await paceWalk(closeWatcher, brokenScript(
+      "  // `#304 back-gesture-in-app`. An open popover is a level, with an entry of its own.\n  scheduleBackSync();\n", ""));
+    assert.equal(silent.gesture.left, true, "the control whose pace button pushes nothing did not leave the app");
+    assert.equal(silent.gesture.open, true);
+  }
+  const quiet = await paceWalk(false, brokenScript('  el("read-speed").setAttribute("aria-expanded", "false");\n  scheduleBackSync();\n',
+    '  el("read-speed").setAttribute("aria-expanded", "false");\n'));
+  assert.deepStrictEqual(quiet.escaped.asked, [], "the control that closes the popover silently went back through its entry");
+});
+
+/** Two columns on a page keeping a history, the first thread on the right, and a reply opened at the right column's foot. */
+async function dockedReplyWalk(script = SCRIPT) {
+  const page = newPage(new Map(), script, (p) => p.enableHistory());
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await twoColumns(page);
+  await page.settle();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const side = { facts: backFacts(page), ids: sideIds(page) };
+  await replyButton(sideRow(page, "202")).click();
+  await page.settle();
+  const docked = { facts: backFacts(page), at: replyBoxAt(page) };
+  await page.el("reply-text").setValue("draft words");
+  await page.browserBack();
+  const gesture = { facts: page.left ? null : backFacts(page), at: replyBoxAt(page), ids: sideIds(page), cards: cardsUp(page),
+    left: page.left, screen: page.screen() };
+  if (page.left || gesture.cards) return { page, side, docked, gesture };
+  await replyButton(sideRow(page, "202")).click();
+  await page.settle();
+  const again = { facts: backFacts(page), at: replyBoxAt(page), text: page.el("reply-text").value };
+  await page.el("reply-cancel").click();
+  await page.settle();
+  const cancelled = { at: replyBoxAt(page), asked: [...page.history.asked] };
+  await page.traverse();
+  const landed = { facts: backFacts(page), ids: sideIds(page), cards: cardsUp(page) };
+  return { page, side, docked, gesture, again, cancelled, landed };
+}
+
+test("`#304 back-gesture-in-app`: A REPLY OPEN AT THE FOOT OF THE RIGHT COLUMN is an entry over its thread's: the gesture puts it down with the draft kept and the thread still on the right, and Cancel goes back through its entry", async () => {
+  const { page, side, docked, gesture, again, cancelled, landed } = await dockedReplyWalk();
+  assert.deepStrictEqual(side.facts, { depth: 1, tag: "side" });
+  assert.deepStrictEqual(side.ids, ["201", "202"], "fixture: the first thread is not on the right");
+  assert.equal(docked.at, "right", "fixture: Reply in the right column did not open its box at that column's foot");
+  assert.deepStrictEqual(docked.facts, { depth: 2, tag: "reply" }, "the reply open in a column is not an entry over its thread's");
+  assert.equal(gesture.left, false, "the gesture with a reply open in a column left the app");
+  assert.notEqual(gesture.at, "right", "the gesture did not put the reply down");
+  assert.equal(gesture.screen, "main");
+  assert.equal(gesture.cards, false, "the gesture that put the reply down closed the right column's thread too");
+  assert.deepStrictEqual(gesture.ids, ["201", "202"]);
+  assert.deepStrictEqual(gesture.facts, { depth: 1, tag: "side" });
+  assert.equal(again.text, "draft words", "the gesture lost the reply's words");
+  assert.deepStrictEqual(again.facts, { depth: 2, tag: "reply" });
+  assert.notEqual(cancelled.at, "right", "Cancel did not put the reply down");
+  assert.deepStrictEqual(cancelled.asked, [-1], "Cancel did not go back through the reply's entry");
+  assert.deepStrictEqual(landed.facts, { depth: 1, tag: "side" });
+  assert.equal(landed.cards, false, "the page's own going-back after Cancel closed the right column's thread");
+  assert.deepStrictEqual(landed.ids, ["201", "202"]);
+  await page.browserBack();
+  assert.equal(cardsUp(page), true, "the gesture after the reply did not take the right column back to its cards");
+  assert.equal(page.left, false);
+
+  // NEGATIVE CONTROLS. A page that takes no reply open in a column for a level closes the thread under
+  // it with the one gesture; one never told a reply opened gives it no entry; one never told it was put
+  // down leaves its entry for the next gesture to spend.
+  const unlevelled = await dockedReplyWalk(brokenScript('  if (replyDocked) levels.push("reply");\n', "\n"));
+  assert.deepStrictEqual(unlevelled.docked.facts, { depth: 1, tag: "side" }, "the control with no reply level pushed an entry for it");
+  assert.equal(unlevelled.gesture.cards, true, "the control with no reply level kept the right column's thread on the gesture");
+  const untold = await dockedReplyWalk(brokenScript(
+    "  // `#304 back-gesture-in-app`. A reply open in a column is a level, as the reply screen is.\n  scheduleBackSync();\n", ""));
+  assert.deepStrictEqual(untold.docked.facts, { depth: 1, tag: "side" }, "the control never told a reply opened pushed an entry for it");
+  const undocked = await dockedReplyWalk(brokenScript("  placeToolsOverReply();\n  scheduleBackSync();\n}", "  placeToolsOverReply();\n}"));
+  assert.deepStrictEqual(undocked.cancelled.asked, [], "the control never told the reply was put down went back through its entry");
 });
 
 test("`#304 back-gesture-in-app`: without close watchers a menu is an entry: the gesture closes it, and a tap outside goes back through it", async () => {

@@ -481,21 +481,27 @@ steps:
   # a thread opened from its root is one history entry at the same address, and the browser's Back -- what the
   # phone's gesture sends -- closes it in the same document with All back at the reader's place; the thread
   # list and a thread opened from it are two entries, history.back() comes back to the list and the browser's
-  # Back to All; the ⋯ menu is no entry (close watchers); the on-screen Back goes back through the thread's
-  # entry, so at the top the browser's Back leaves the app; and a page reloaded in a thread makes its entry its
-  # base and pushes the reopened thread's at the first touch. Against the page before it, the first Back in a
-  # thread leaves the app. Measured on 2026-10-14: about 4s wall.
+  # Back to All; the ⋯ menu over a thread is an entry, which the browser's Back closes alone; the on-screen Back
+  # goes back through the thread's entry, so at the top the browser's Back leaves the app. A page reloaded in a
+  # thread opened from the list stands on the earlier load's two entries: before any touch the first Back
+  # closes the thread alone, the next the list, the next leaves. With the app as the tab's first entry, as in
+  # an installed app's window, the same reload leaves no entry under the app's base, and a reload on Settings,
+  # which nothing reopens, goes back through its entry at once. At a 1440x900 desk in two columns, the browser's
+  # Back with a ⋯ menu open closes the menu and keeps the thread on the right. Against the page before it, the
+  # first Back in a thread leaves the app; against the page before its first review, the menu's Back closes the
+  # thread under it, the first Back after the reload closes the list with the thread, and the installed app
+  # keeps the earlier load's entries under its base. Measured on 2026-10-14: about 7s wall.
   - group: check
     job: back-gesture-browser
-    desc: the browser's Back closes a thread, the thread list and a thread opened from it in the same document, keeping the reader's place, and leaves the app only from the top, in current Chromium at a 412x915 Android phone in standalone mode
+    desc: the browser's Back closes a thread, the thread list, a thread opened from it and a menu over either in the same document, one per press, keeping the reader's place, stands on the earlier load's entries after a reload, and leaves the app only from the top, in current Chromium at a 412x915 Android phone in standalone mode and a 1440x900 desk
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/back_gesture_browser.py
     jobs_flag: ""
-    timeout: 90
-    cpu_timeout: 45
+    timeout: 120
+    cpu_timeout: 60
     hint:
       resources: {browser: 1}
-      est_duration_s: 5
+      est_duration_s: 8
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

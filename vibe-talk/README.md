@@ -83,7 +83,8 @@ focus and your place in the list coming back as they do there:
 * the thread list, back to the view it was chosen from — a thread, if it was chosen over one;
 * the reply screen, or a reply open at the foot of a column, its words kept as a draft;
 * Settings, and Help, back to Settings or to wherever **?** was pressed;
-* a message's **⋯** menu, the reading-pace popover and the prompts tray.
+* a message's **⋯** menu, the reading-pace popover and the prompts tray, before whatever is under
+  them — a thread under a menu stays open until the next press.
 
 With nothing open the gesture leaves the app, as it always did. Main, All and two columns are views,
 not screens, so choosing among them (the picker, Ctrl+1, Ctrl+2, Ctrl+4) adds nothing to go back
@@ -92,14 +93,23 @@ a highlighted card and the agent's proposal to post are not screens either, and 
 answers a proposal. The page keeps one browser history entry for each thing open, all at the page's
 own address — the URL never changes, so a reload, and `/` beside `/voice`, are as before. The
 on-screen ways out still close at once, and then go back through their entry with `history.back()`,
-so the next gesture never lands on a stale one. Where the browser has close watchers (Chrome 120 and
-later), an open menu has one instead of an entry. A reload starts afresh: entries made before it
-carry another page load's name and are never taken for this one's; whatever the page reopened (see
-[Reopening where you left off](#reopening-where-you-left-off)) gets its entry at your first touch,
-because Chromium's back button skips an entry a page pushed before it was touched; and a Back at the
-top onto the earlier load's entries goes on back past them in the same press, where the browser has
-the Navigation API to say it was a Back. Elsewhere each of those costs one press that changes nothing.
-`make -C vibe-talk back-gesture-browser` walks this in a real Chromium at an Android phone's size.
+so the next gesture never lands on a stale one. A menu has an entry too, in every browser, rather
+than a close watcher: Chrome's close watchers hear Esc and the phone's gesture, but not the
+browser's Back on a desk, a mouse's back button or Alt+Left.
+
+A reload keeps the tab's history, and the page stands on the entries the earlier load left rather
+than leaving them under it. What it reopens as it loads, from the channel this device saved (see
+[Reopening where you left off](#reopening-where-you-left-off)), takes them over: reloaded in a thread
+opened from the thread list, the first Back closes the thread and the next the list, whether or not
+you have touched the page yet. Where it reopens less than there were entries — Settings, say, is
+not reopened — it goes back through the rest at once. So no stale entry is ever left under the page:
+in the installed app, whose history starts at the app, the Back after the last thing closes is the
+system's, as it should be, and no press is spent on an entry left from before the reload. Anything
+with no entry to stand on — more than there were entries, or what is reopened only once sign-in
+answers, where the device had saved no channel — gets its entry at your first touch, because
+Chromium's back button skips an entry a page pushed before it was touched.
+`make -C vibe-talk back-gesture-browser` walks this in a real Chromium at an Android phone's size,
+with the app as the tab's first entry, and at a desk in two columns.
 
 **Reply answers a message where it is.** Replying to a thread message posts in that thread, from
 any view, including **All**. Replying to a main-channel message posts in the main channel as a reply
