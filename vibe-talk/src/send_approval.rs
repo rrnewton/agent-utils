@@ -245,6 +245,11 @@ pub async fn voice_post(
                         None,
                         None,
                     );
+                    // `#292 reply-marks-read`. Sent, so what it answers is read, as the Reply
+                    // button's send marks it. Not on a partial post or a failure, below.
+                    if let Some(target) = reply_to {
+                        crate::reply_read::after_voice_send(state, &channel, target).await;
+                    }
                     Ok(VoicePost::Sent {
                         channel,
                         serial,

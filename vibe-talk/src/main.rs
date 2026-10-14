@@ -727,6 +727,7 @@ async fn main() -> anyhow::Result<()> {
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
+        reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),
