@@ -3683,7 +3683,10 @@ would have gone. The last two minutes before a view's newest message are the exc
 provider may list a message there late: a listing proves nothing about them, so a message missing
 from one there, or brought back by an earlier read landing late, is kept until a later listing
 settles that stretch. It is never counted as one the cache would serve unless the latest read of
-the view's newest end listed it. An edit replaces the text, unless what the cache holds was seen later. A message
+the view's newest end listed it, and those two minutes count only as far down as that read
+listed: a message seen since by anything else (a push, a post, a read by id) says it exists, not
+that nothing beside it is missing, and one written above the newest message that read listed (a
+post of the server's own, say) is never counted at all. An edit replaces the text, unless what the cache holds was seen later. A message
 the live poller publishes counts as seen when the poller's read began, not when it published it.
 In both cases a summary of the old text is deleted from the store once the change is written.
 Turning the cache off never deletes a summary. A message the server does not re-check is deleted

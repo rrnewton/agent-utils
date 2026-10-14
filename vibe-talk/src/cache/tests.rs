@@ -328,18 +328,89 @@ fn a_file_of_schema_one_takes_the_record_of_what_was_left_out_and_keeps_its_rows
     }
     let cache = fixtures::open(&dir, &clock, Limits::default());
     assert_eq!(cache.counts().served().expect("counts").channels, 1, "kept");
-    let (dropped, checked): (Option<i64>, Option<i64>) = cache
+    let (dropped, checked, checked_from): (Option<i64>, Option<i64>, Option<i64>) = cache
         .read(None, |c| {
             c.query_row(
-                "SELECT c.dropped_ms, h.checked_ms FROM channel c
+                "SELECT c.dropped_ms, h.checked_ms, h.checked_from_ms FROM channel c
                  JOIN scope_head h ON h.chan = c.chan",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
         })
         .served()
         .expect("served");
-    assert_eq!((dropped, checked), (None, None));
+    assert_eq!((dropped, checked, checked_from), (None, None, None));
+}
+
+/// A head written before cache schema 3 does not say where the read that set it began listing, and
+/// a membership does not say which read vouched for it: the band of such a head is vouched for by
+/// nothing until the next read of the newest end, which records both.
+#[test]
+fn a_head_of_schema_two_vouches_for_no_band_until_the_next_read_of_the_newest_end() {
+    let fx = Fixture::new("cache-migrate-v3");
+    let proof = Some(newest_proof(ListStart::At(T0 + STEP)));
+    let first = T0 + 6 * STEP + 1_000;
+    fx.clock.set(first);
+    fx.list((1..=6).map(m).collect(), first, proof);
+    let path = fx.path();
+    let Fixture {
+        cache, clock, dir, ..
+    } = fx;
+    drop(cache);
+    {
+        // What a file of schema 2 held: no reach, no vouch.
+        let c = rusqlite::Connection::open(&path).expect("open");
+        c.execute_batch(
+            "UPDATE scope_head SET checked_from_ms = NULL;
+             UPDATE message_scope SET vouched_ms = NULL;",
+        )
+        .expect("as schema 2 left them");
+    }
+    let fx = Fixture {
+        cache: fixtures::open(&dir, &clock, Limits::default()),
+        chan: ChanKey::new("p", "C1"),
+        clock,
+        dir,
+    };
+    fx.cache
+        .retain_only(RouteSnapshot::new([fx.chan.clone()], ["p".to_owned()]));
+    fx.settle();
+    let window = shadow::Ask::Window {
+        consumer: shadow::Consumer::Messages,
+        limit: 1,
+    };
+    let decide = |asked_ms: i64| {
+        let query = shadow::query(&window, observe::Shape::DiscordNative, false).expect("query");
+        let view = fx
+            .cache
+            .shadow_view(&fx.chan, &query)
+            .served()
+            .expect("served");
+        let facts = shadow::Facts {
+            asked_ms,
+            live_fed: false,
+            fed_since_ms: None,
+            dropped_ms: None,
+            barrier: true,
+            feed: shadow::Feed::AdditionsOnly,
+        };
+        (shadow::decide(&window, &view, &facts), view)
+    };
+    let (decision, view) = decide(first + 1_000);
+    assert_eq!(
+        (view.head_checked_from_ms, view.rows[0].vouched_ms),
+        (None, None)
+    );
+    assert_eq!(decision, shadow::Decision::Miss(shadow::Miss::Gap));
+    let second = first + 5_000;
+    fx.clock.set(second);
+    fx.list((1..=6).map(m).collect(), second, proof);
+    let (decision, view) = decide(second + 1_000);
+    assert_eq!(
+        (view.head_checked_from_ms, view.rows[0].vouched_ms),
+        (Some(T0 + STEP), Some(second))
+    );
+    assert_eq!(decision, shadow::Decision::Serve);
 }
 
 // ---- the full-text index and privacy -----------------------------------------------------------
@@ -2717,10 +2788,11 @@ fn a_short_newest_read_never_makes_an_older_claim_fresh() {
 
 // ---- the unsettled band ------------------------------------------------------------------------
 
-/// Every read of a scope's newest end that is the latest yet records its time, and vouches for the
-/// rows of the band it listed by moving their times up to its own. A row of the band it did not
-/// list keeps its older time; a read that began earlier and lands late moves neither the head nor
-/// that time, whatever newer row it carries.
+/// Every read of a scope's newest end that is the latest yet records its time and where its listing
+/// began, and vouches for the rows of the band it listed: their memberships of the scope record its
+/// start, and their times move up to it. A row of the band it did not list keeps its older vouch
+/// and time; a read that began earlier and lands late moves neither the head nor either, and
+/// vouches for nothing, whatever newer row it carries.
 #[test]
 fn only_the_latest_read_of_the_newest_end_vouches_for_the_band() {
     let fx = Fixture::new("cache-band-vouch");
@@ -2781,6 +2853,18 @@ fn only_the_latest_read_of_the_newest_end_vouches_for_the_band() {
         .served()
         .expect("served");
     assert_eq!(view.head_checked_ms, Some(second));
+    assert_eq!(view.head_checked_from_ms, Some(T0 + STEP));
+    let vouched = |id: &str| {
+        view.rows
+            .iter()
+            .find(|row| row.message.id.as_str() == id)
+            .expect("read")
+            .vouched_ms
+    };
+    assert_eq!(
+        (vouched("b1"), vouched("m6"), vouched("m7")),
+        (Some(first), Some(second), None)
+    );
     let facts = shadow::Facts {
         asked_ms: second + 1_000,
         live_fed: false,

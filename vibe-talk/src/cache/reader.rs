@@ -145,6 +145,15 @@ fn cached(channel_id: &str, row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedM
         created_ms: row.get(7)?,
         observed_ms: row.get(8)?,
         content_partial: row.get(9)?,
+        vouched_ms: None,
+    })
+}
+
+/// A row read through one scope: [`MESSAGE_COLUMNS`], then that membership's `vouched_ms`.
+fn scoped(channel_id: &str, row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedMessage> {
+    Ok(CachedMessage {
+        vouched_ms: row.get(10)?,
+        ..cached(channel_id, row)?
     })
 }
 
@@ -158,14 +167,15 @@ pub(crate) fn newest(
         return Ok(Vec::new());
     };
     let mut statement = connection.prepare(&format!(
-        "SELECT {MESSAGE_COLUMNS} FROM message_scope s JOIN message m ON m.row_id = s.row_id
+        "SELECT {MESSAGE_COLUMNS}, s.vouched_ms
+         FROM message_scope s JOIN message m ON m.row_id = s.row_id
          WHERE s.chan = ?1 AND s.scope_key = ?2
          ORDER BY s.created_ms DESC, m.numeric_id DESC, m.message_id DESC LIMIT ?3"
     ))?;
     let mut rows = statement
         .query_map(
             params![id, scope_key, i64::try_from(limit).unwrap_or(i64::MAX)],
-            |row| cached(&chan.channel_id, row),
+            |row| scoped(&chan.channel_id, row),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.reverse();
@@ -182,7 +192,8 @@ fn span(
     limit: usize,
 ) -> rusqlite::Result<Vec<CachedMessage>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {MESSAGE_COLUMNS} FROM message_scope s JOIN message m ON m.row_id = s.row_id
+        "SELECT {MESSAGE_COLUMNS}, s.vouched_ms
+         FROM message_scope s JOIN message m ON m.row_id = s.row_id
          WHERE s.chan = ?1 AND s.scope_key = ?2 AND s.created_ms >= ?3 AND s.created_ms < ?4
          ORDER BY s.created_ms, m.numeric_id, m.message_id LIMIT ?5"
     ))?;
@@ -195,7 +206,7 @@ fn span(
                 until_ms,
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
-            |row| cached(&chan.channel_id, row),
+            |row| scoped(&chan.channel_id, row),
         )?
         .collect();
     rows
@@ -217,8 +228,9 @@ pub(crate) fn shadow_view(
             let key = scope.key();
             let head = head_by_id(&snapshot, chan_id, &key)?;
             View {
-                head: head.map(|(head, _)| head),
-                head_checked_ms: head.map(|(_, checked)| checked),
+                head: head.map(|record| record.head),
+                head_checked_ms: head.map(|record| record.checked_ms),
+                head_checked_from_ms: head.and_then(|record| record.checked_from_ms),
                 coverage: coverage_by_id(&snapshot, chan_id, &key)?,
                 rows: newest(&snapshot, chan, &key, *limit)?,
                 home: None,
@@ -234,8 +246,9 @@ pub(crate) fn shadow_view(
             let key = scope.key();
             let head = head_by_id(&snapshot, chan_id, &key)?;
             View {
-                head: head.map(|(head, _)| head),
-                head_checked_ms: head.map(|(_, checked)| checked),
+                head: head.map(|record| record.head),
+                head_checked_ms: head.map(|record| record.checked_ms),
+                head_checked_from_ms: head.and_then(|record| record.checked_from_ms),
                 coverage: coverage_by_id(&snapshot, chan_id, &key)?,
                 rows: span(
                     &snapshot,
@@ -355,31 +368,44 @@ pub(crate) fn head(
     let Some(id) = chan_id(connection, chan)? else {
         return Ok(None);
     };
-    Ok(head_by_id(connection, id, scope_key)?.map(|(head, _)| head))
+    Ok(head_by_id(connection, id, scope_key)?.map(|record| record.head))
 }
 
-/// A scope's head, and when the latest read of its newest end the file records began: the
-/// head's own listing time where no later one was written.
+/// A scope's head, with what the file records of the latest read of its newest end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadRecord {
+    /// The head.
+    pub(crate) head: Head,
+    /// When that read began, local time: the head's own listing time where no later one was
+    /// written.
+    pub(crate) checked_ms: i64,
+    /// Where that read's listing began, provider time: it listed every message it saw from there
+    /// up. `None` where the file does not say (a head written before cache schema 3).
+    pub(crate) checked_from_ms: Option<i64>,
+}
+
+/// A scope's head, and what the file records of the latest read of its newest end.
 pub(crate) fn head_by_id(
     connection: &Connection,
     chan_id: i64,
     scope_key: &str,
-) -> rusqlite::Result<Option<(Head, i64)>> {
+) -> rusqlite::Result<Option<HeadRecord>> {
     connection
         .query_row(
             "SELECT head_ms, unsettled_from_ms, head_listed_ms,
-                    COALESCE(checked_ms, head_listed_ms)
+                    COALESCE(checked_ms, head_listed_ms), checked_from_ms
              FROM scope_head WHERE chan = ?1 AND scope_key = ?2",
             params![chan_id, scope_key],
             |row| {
-                Ok((
-                    Head {
+                Ok(HeadRecord {
+                    head: Head {
                         head_ms: row.get(0)?,
                         unsettled_from_ms: row.get(1)?,
                         head_listed_ms: row.get(2)?,
                     },
-                    row.get(3)?,
-                ))
+                    checked_ms: row.get(3)?,
+                    checked_from_ms: row.get(4)?,
+                })
             },
         )
         .optional()

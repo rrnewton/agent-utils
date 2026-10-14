@@ -126,6 +126,10 @@ pub struct CachedMessage {
     pub observed_ms: i64,
     /// Whether the content came from a push that may carry only a snippet.
     pub content_partial: bool,
+    /// For a row read through one scope: when the latest read of that scope's newest end to list
+    /// it while it lay at or above the head's settled top began, local time. `None` when no such
+    /// read listed it, and for a row read by id.
+    pub vouched_ms: Option<i64>,
 }
 
 /// The JSON `extra` column: what a message carries beyond the indexed columns.

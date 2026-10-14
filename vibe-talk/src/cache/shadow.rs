@@ -17,11 +17,11 @@
 //!
 //! | Consumer | Would serve when |
 //! |---|---|
-//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, every row served at or above the head's settled top (which no claim holds) was listed by the latest read of the scope's newest end, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
+//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
 //! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since this process opened the file (a deletion made before then, while the server was down, reached nothing); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
-//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), every row read at or above the head's settled top was listed by the latest read of the scope's newest end as for `messages`, no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
-//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), every row counted at or above the settled top was listed by the latest read of the newest end as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
-//! | `timeline_fallback` | coverage holds `limit` rows down from the head, with every row at or above the settled top listed by the latest read of the newest end as for `messages`, nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
+//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), the band is vouched for as for `messages`, no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
+//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the band is vouched for as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
+//! | `timeline_fallback` | coverage holds `limit` rows down from the head, the band is vouched for as for `messages` (so a row pushed or posted above the head is never served), nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
 //!
 //! # What a miss says
 //!
@@ -37,9 +37,9 @@
 //!   seen by a read that began after the latest drop, or the answer needs the scope's head and no
 //!   read of that scope's newest end began after it. A read lifts the doubt about exactly what it
 //!   saw: a thread's listing says nothing of Main, nor a two-row page of the rows below it;
-//! - `gap`: the cache does not hold what would be served: no head, a hole in the coverage, a row in
-//!   the unsettled band (or above the head) that the latest read of the scope's newest end did not
-//!   list, or not the message;
+//! - `gap`: the cache does not hold what would be served: no head, a hole in the coverage, a stretch
+//!   of the unsettled band below where the latest read of the scope's newest end began listing, a
+//!   row in the band that read did not list, a row above the head, or not the message;
 //! - `incomplete`: covered, but by reads that may have left a message out (Slack's);
 //! - `stale_head`: what the cache holds was confirmed too long ago: the head, the claims under a
 //!   window or a count, or the coverage of a message's home scope on a bridge;
@@ -344,6 +344,9 @@ pub struct View {
     /// When the latest read of that scope's newest end the file records began: the head's own
     /// listing time, or later.
     pub head_checked_ms: Option<i64>,
+    /// Where that read's listing began, provider time: it listed every message it saw from there
+    /// up. `None` when the file does not say, and then it vouches for no stretch of the band.
+    pub head_checked_from_ms: Option<i64>,
     /// The coverage of the scope read, or of the message's home scope.
     pub coverage: Vec<Interval>,
     /// The messages read, oldest first.
@@ -555,22 +558,47 @@ fn fed_since(at_ms: i64, facts: &Facts) -> bool {
         && facts.fed_since_ms.is_some_and(|since| at_ms >= since)
 }
 
-/// Whether every row of `rows` at or above the head's settled top is vouched for: the one rule
-/// each consumer that may hand back such rows applies, a newest window or page, a page and a count
-/// alike. No claim holds a row there, in the unsettled band or above the head: only the latest read
-/// of the scope's newest end does, which moved the time of every row there it listed up to its own
-/// start. A row there with an older time is one it did not list: deleted since an earlier read saw
-/// it (even one that landed after it), or pushed before the provider listed it. Below the settled
-/// top a claim holds every row, and with no head there is no band: such rows rest on the coverage,
-/// which each rule checks for itself.
-fn band_vouched<'a>(view: &View, rows: impl IntoIterator<Item = &'a CachedMessage>) -> bool {
+/// Whether what a consumer hands back at or above the head's settled top is vouched for: the one
+/// rule each consumer that may hand back such rows applies, a newest window or page, a page and a
+/// count alike. `(from, to)` is the stretch it hands back, provider time, from `from` up to `to`
+/// (exclusive), or to the newest end when `to` is `None`; `rows` are the rows it read there.
+///
+/// No claim holds the unsettled band, nor anything above the head: only the latest read of the
+/// scope's newest end does, and only for what it listed. So the part of the stretch inside the band
+/// must lie wholly in what that read listed, from where its listing began up: below that, a message
+/// it never saw may be missing however many rows above it are vouched for. Every row there must be
+/// one that read listed, its membership's `vouched_ms` that read's start: a row it did not list was
+/// deleted since an earlier read saw it (even one that landed after it), or was pushed, posted or
+/// read by id before the provider listed it, and a sighting of any of those kinds says the row
+/// exists, never that nothing beside it is missing. And no row may lie above the head: whatever was
+/// written there since that read (a post of this server's own, an hour on) stands beside messages
+/// nothing has read. Below the settled top a claim holds every row, and with no head there is no
+/// band: such rows rest on the coverage, which each rule checks for itself.
+fn band_vouched<'a>(
+    view: &View,
+    (from, to): (i64, Option<i64>),
+    rows: impl IntoIterator<Item = &'a CachedMessage>,
+) -> bool {
     let Some(head) = view.head else {
         return true;
     };
     let top = head.settled_top();
     let checked = view.head_checked_ms.unwrap_or(head.head_listed_ms);
-    rows.into_iter()
-        .all(|row| row.created_ms < top || row.observed_ms >= checked)
+    // The lowest instant of the stretch the band holds, when the stretch reaches the band at all.
+    let lower = from.max(top);
+    let in_band = lower <= head.head_ms && to.is_none_or(|to| lower < to);
+    if in_band
+        && view
+            .head_checked_from_ms
+            .is_none_or(|listed_from| listed_from > lower)
+    {
+        return false;
+    }
+    rows.into_iter().all(|row| {
+        row.created_ms < top
+            || (row.created_ms <= head.head_ms
+                && row.vouched_ms.is_some_and(|vouched| vouched >= checked))
+    })
 }
 
 /// A newest window, or a newest page: coverage contiguous from the head down to `limit` rows.
@@ -594,7 +622,7 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     } else {
         None
     };
-    if !band_vouched(view, window) {
+    if !band_vouched(view, (bottom, None), window) {
         return Err(Miss::Gap);
     }
     // Fresh, the window as a whole: its head, and the claims under it.
@@ -664,7 +692,7 @@ fn page(
         view.head.ok_or(Miss::Gap)?.head_ms.saturating_add(1)
     };
     let cover = coverage::covers(&view.coverage, since, end).ok_or(Miss::Gap)?;
-    if !band_vouched(view, &view.rows) {
+    if !band_vouched(view, (since, Some(end)), &view.rows) {
         return Err(Miss::Gap);
     }
     if !cover.complete {
@@ -685,7 +713,7 @@ fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     }
     let head = view.head.ok_or(Miss::Gap)?;
     let cover = coverage::covers(&view.coverage, since, head.settled_top()).ok_or(Miss::Gap)?;
-    if !band_vouched(view, &view.rows) {
+    if !band_vouched(view, (since, None), &view.rows) {
         return Err(Miss::Gap);
     }
     if !cover.complete {
@@ -1060,6 +1088,7 @@ mod tests {
             created_ms: T + n * MINUTE,
             observed_ms: LISTED,
             content_partial: false,
+            vouched_ms: Some(LISTED),
         }
     }
 
@@ -1088,11 +1117,13 @@ mod tests {
         }
     }
 
-    /// What a proven newest read of rows `0..n` leaves in the cache, `complete` or not.
+    /// What a proven newest read of rows `0..n`, listing from an hour before the first, leaves in
+    /// the cache, `complete` or not.
     fn listed(n: i64, complete: bool) -> View {
         let head = head(n);
         View {
             head: Some(head),
+            head_checked_from_ms: Some(T - HOUR),
             coverage: vec![interval(T - HOUR, head.unsettled_from_ms, complete)],
             rows: rows(0..n),
             ..View::default()
@@ -1151,31 +1182,42 @@ mod tests {
         );
     }
 
-    /// A later read of the newest end listed every row of the band but m10: m10 was deleted since
-    /// the head's read saw it, or a read that saw it landed late, or it was pushed and not listed
-    /// yet. Nothing vouches for it, and no window holding it is served; nor one holding a row
-    /// pushed above the head before that read began.
-    #[test]
-    fn a_band_row_the_latest_read_of_the_newest_end_did_not_list_is_never_served() {
-        let fallback = |limit: usize| Ask::Timeline {
+    /// What the latest read of the newest end leaves, `later`: it began listing at `listed_from`,
+    /// and listed every row of the band but `missing`.
+    fn relisted(view: &View, later: i64, listed_from: i64, missing: &str) -> View {
+        let mut view = view.clone();
+        view.head_checked_ms = Some(later);
+        view.head_checked_from_ms = Some(listed_from);
+        let top = view.head.expect("a head").settled_top();
+        for row in &mut view.rows {
+            if row.created_ms >= top
+                && row.created_ms >= listed_from
+                && row.message.id.as_str() != missing
+            {
+                row.observed_ms = later;
+                row.vouched_ms = Some(later);
+            }
+        }
+        view
+    }
+
+    fn fallback(limit: usize) -> Ask {
+        Ask::Timeline {
             view: TimelineView::Main,
             thread: None,
             limit,
-        };
+        }
+    }
+
+    /// A later read of the newest end listed every row of the band but m10: m10 was deleted since
+    /// the head's read saw it, or a read that saw it landed late, or it was pushed and not listed
+    /// yet. Nothing vouches for it, and no window holding it is served; nor one holding a row
+    /// pushed above the head, whenever it was seen.
+    #[test]
+    fn a_band_row_the_latest_read_of_the_newest_end_did_not_list_is_never_served() {
         let later = LISTED + MINUTE;
-        let relisted = |view: &View, missing: &str| {
-            let mut view = view.clone();
-            view.head_checked_ms = Some(later);
-            let top = view.head.expect("a head").settled_top();
-            for row in &mut view.rows {
-                if row.created_ms >= top && row.message.id.as_str() != missing {
-                    row.observed_ms = later;
-                }
-            }
-            view
-        };
         let at = facts(later + 1_000);
-        let view = relisted(&newest(&listed(12, false), 5), "m10");
+        let view = relisted(&newest(&listed(12, false), 5), later, T - HOUR, "m10");
         assert_eq!(
             decide(&fallback(5), &view, &at),
             Decision::Miss(Miss::Gap),
@@ -1187,13 +1229,14 @@ mod tests {
             Decision::Serve
         );
         // Below the band, claims hold the rows, whenever they were seen.
-        let all = relisted(&newest(&listed(12, false), 5), "");
+        let all = relisted(&newest(&listed(12, false), 5), later, T - HOUR, "");
         assert_eq!(decide(&fallback(5), &all, &at), Decision::Serve);
-        // A row pushed above the head: seen before the latest read began and not listed by it, it
-        // is not vouched for; seen after, it is.
+        // A row pushed above the head is held by nothing that says what else was written beside
+        // it: not vouched for, seen before the latest read began or after it.
         let mut pushed = all.clone();
         let mut above = row(12);
         above.observed_ms = later - 1;
+        above.vouched_ms = None;
         pushed.rows.push(above.clone());
         pushed.rows.remove(0);
         assert_eq!(
@@ -1201,7 +1244,81 @@ mod tests {
             Decision::Miss(Miss::Gap)
         );
         pushed.rows.last_mut().expect("a row").observed_ms = later + 1;
-        assert_eq!(decide(&fallback(5), &pushed, &at), Decision::Serve);
+        assert_eq!(
+            decide(&fallback(5), &pushed, &at),
+            Decision::Miss(Miss::Gap)
+        );
+        // Nor an hour on, as a newest page answered from the cache would be.
+        assert_eq!(
+            decide(&fallback(5), &pushed, &facts(later + HOUR)),
+            Decision::Miss(Miss::Gap)
+        );
+    }
+
+    /// A row of the band seen after the latest read of the newest end began, by anything but that
+    /// read (a read of it by id, a short page, a post), says that it exists, and nothing of what
+    /// lies beside it: a message that read never listed may be missing below it. And a stretch of
+    /// the band below where that read began listing is vouched for by nothing, however many rows
+    /// above it are.
+    #[test]
+    fn a_band_row_seen_since_the_latest_read_but_not_listed_by_it_never_closes_a_gap() {
+        let later = LISTED + 5_000;
+        let at = facts(later + 1_000);
+        // The band is the head's last two minutes: m8 lies below it, m9, m10 and m11 in it.
+        let view = newest(&listed(12, false), 4);
+        let top = view.head.expect("a head").settled_top();
+        assert!(row(8).created_ms < top && row(9).created_ms >= top);
+        // The latest read listed only m11, from m11 up; m10 was read alone afterwards.
+        let mut short = relisted(&view, later, row(11).created_ms, "");
+        let m10 = short
+            .rows
+            .iter_mut()
+            .find(|row| row.message.id.as_str() == "m10")
+            .expect("m10");
+        m10.observed_ms = later + 500;
+        assert_eq!(m10.vouched_ms, Some(LISTED), "only an older read listed it");
+        for ask in [window(2), fallback(2)] {
+            assert_eq!(
+                decide(&ask, &newest(&short, 2), &at),
+                Decision::Miss(Miss::Gap),
+                "{ask:?}: m10 was not listed by the latest read"
+            );
+        }
+        // Were every row vouched for by it after all, the stretch of the band below m11 is still
+        // not one that read listed: a message written between m8 and m11 may be missing, whether
+        // the window's oldest row lies in the band or below it.
+        for row in &mut short.rows {
+            row.vouched_ms = Some(later);
+        }
+        for (ask, limit) in [
+            (window(3), 3),
+            (fallback(3), 3),
+            (window(4), 4),
+            (fallback(4), 4),
+        ] {
+            assert_eq!(
+                decide(&ask, &newest(&short, limit), &at),
+                Decision::Miss(Miss::Gap),
+                "{ask:?}: the band below where the latest read began listing"
+            );
+        }
+        // A window inside what it listed is served.
+        assert_eq!(decide(&window(1), &newest(&short, 1), &at), Decision::Serve);
+        // A head whose read's start is not recorded (written before cache schema 3) vouches for no
+        // stretch of the band at all.
+        let unrecorded = View {
+            head_checked_from_ms: None,
+            ..short.clone()
+        };
+        assert_eq!(
+            decide(&window(1), &newest(&unrecorded, 1), &at),
+            Decision::Miss(Miss::Gap)
+        );
+        // Listed from below the band, the whole window is served.
+        let whole = relisted(&view, later, T - HOUR, "");
+        for ask in [window(4), fallback(4)] {
+            assert_eq!(decide(&ask, &whole, &at), Decision::Serve, "{ask:?}");
+        }
     }
 
     /// The band rule is one rule: a count and a page hand back the rows of the band, and the rows
@@ -1220,30 +1337,29 @@ mod tests {
         // Twelve rows; the latest read of the newest end, five seconds on, listed all but m10.
         let mut view = listed(12, true);
         view.coverage[0].full_ms = Some(later);
-        view.head_checked_ms = Some(later);
-        let top = view.head.expect("a head").settled_top();
-        for row in &mut view.rows {
-            if row.created_ms >= top && row.message.id.as_str() != "m10" {
-                row.observed_ms = later;
-            }
-        }
+        let view = relisted(&view, later, T - HOUR, "m10");
         assert_eq!(decide(&count, &view, &at), Decision::Miss(Miss::Gap));
-        let mut listed_all = view.clone();
-        for row in &mut listed_all.rows {
-            if row.created_ms >= top {
-                row.observed_ms = later;
-            }
-        }
+        let listed_all = relisted(&view, later, T - HOUR, "");
         assert_eq!(decide(&count, &listed_all, &at), Decision::Serve);
-        // A row pushed above the head before that read began, and not listed by it.
+        // A row pushed above the head, before that read began or after: never counted.
         let mut pushed = listed_all.clone();
         pushed.rows.push(CachedMessage {
             observed_ms: later - 1,
+            vouched_ms: None,
             ..row(12)
         });
         assert_eq!(decide(&count, &pushed, &at), Decision::Miss(Miss::Gap));
         pushed.rows.last_mut().expect("a row").observed_ms = later;
-        assert_eq!(decide(&count, &pushed, &at), Decision::Serve);
+        assert_eq!(decide(&count, &pushed, &at), Decision::Miss(Miss::Gap));
+        // Nor one that read listed from above where the band begins, every row of it vouched for.
+        let mut short = relisted(&listed_all, later + 1, T + 11 * MINUTE, "");
+        for row in &mut short.rows {
+            row.vouched_ms = Some(later + 1);
+        }
+        assert_eq!(
+            decide(&count, &short, &facts(later + 1_001)),
+            Decision::Miss(Miss::Gap)
+        );
 
         // The band settled by time: the settled top is just past the head, and the coverage
         // reaches it. A read that began before the latest one lands late, with a message deleted
@@ -1256,6 +1372,7 @@ mod tests {
                 head_listed_ms: later,
             }),
             head_checked_ms: Some(later),
+            head_checked_from_ms: Some(T - HOUR),
             coverage: vec![Interval {
                 full_ms: Some(later),
                 listed_ms: later,
@@ -1273,6 +1390,7 @@ mod tests {
         let mut resurrected = settled.clone();
         resurrected.rows.push(CachedMessage {
             observed_ms: later - 30_000,
+            vouched_ms: None,
             ..row(12)
         });
         assert_eq!(decide(&open, &resurrected, &at), Decision::Miss(Miss::Gap));
@@ -1454,11 +1572,14 @@ mod tests {
         // head, and for nothing below them.
         let seen = |mut view: View, newest: usize| {
             let from = view.rows.len().saturating_sub(newest);
+            let listed_from = view.rows[from].created_ms;
             for row in &mut view.rows[from..] {
                 row.observed_ms = LISTED + 20;
+                row.vouched_ms = Some(LISTED + 20);
             }
             View {
                 head_checked_ms: Some(LISTED + 20),
+                head_checked_from_ms: Some(listed_from),
                 ..view
             }
         };

@@ -59,6 +59,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension as _, Statement}
 use super::checkpoint::Checkpointer;
 use super::coverage::{self, Head, Interval, Params};
 use super::merge::{self, Arrival, Held, Offered, Verdict};
+use super::reader::HeadRecord;
 use super::rows::{self, Extra};
 use super::schema::sqlite_code;
 use super::structure;
@@ -239,6 +240,7 @@ struct Hot<'c> {
     row_update: Statement<'c>,
     row_update_search: Statement<'c>,
     row_vouch: Statement<'c>,
+    scope_vouch: Statement<'c>,
     row_delete: Statement<'c>,
     scope_insert: Statement<'c>,
     tomb_select: Statement<'c>,
@@ -285,6 +287,12 @@ impl<'c> Hot<'c> {
             row_vouch: conn.prepare(
                 "UPDATE message SET observed_ms = ?3
                  WHERE chan = ?1 AND message_id = ?2 AND observed_ms < ?3",
+            )?,
+            scope_vouch: conn.prepare(
+                "UPDATE message_scope SET vouched_ms = ?4
+                 WHERE chan = ?1 AND scope_key = ?2
+                   AND row_id = (SELECT row_id FROM message WHERE chan = ?1 AND message_id = ?3)
+                   AND (vouched_ms IS NULL OR vouched_ms < ?4)",
             )?,
             row_delete: conn.prepare("DELETE FROM message WHERE row_id = ?1")?,
             scope_insert: conn.prepare(
@@ -1335,33 +1343,37 @@ impl Writer<'_> {
         // file records. One that began earlier and lands late knows nothing that read did not:
         // what a provider lists only ever grows, so a row it saw above that read's head has been
         // deleted since, and what that read settled may not have been visible to it yet.
-        let latest = stored.is_none_or(|(_, checked)| listing.observed_ms >= checked);
+        let latest = stored.is_none_or(|stored| listing.observed_ms >= stored.checked_ms);
+        let from = match proof.from {
+            ListStart::ScopeStart => 0,
+            ListStart::At(ms) => ms,
+        };
         let head = match proof.until {
             ListEnd::Newest => {
-                let old = stored.map(|(head, _)| head);
+                let old = stored.map(|stored| stored.head);
                 let head = match old {
                     Some(old) if !latest => old,
                     _ => coverage::advance_head(old, newest, listing.observed_ms),
                 };
                 if latest {
-                    // The time of every latest read of the newest end is written, whether or not
-                    // the head moved: the rows of the unsettled band are vouched for by that read
-                    // alone ([`Writer::vouch_for_band`]), and a read that began after a drop would
-                    // have listed a creation the drop left out, so the head is trusted again.
-                    if Some(head) != old
-                        || stored.map(|(_, checked)| checked) != Some(listing.observed_ms)
-                    {
-                        self.store_head(chan_id, &scope_key, &head, listing.observed_ms)?;
+                    // Every latest read of the newest end is written, whether or not the head
+                    // moved: its time and where its listing began, because the rows of the
+                    // unsettled band are vouched for by that read alone
+                    // ([`Writer::vouch_for_band`]), and a read that began after a drop would have
+                    // listed a creation the drop left out, so the head is trusted again.
+                    let record = HeadRecord {
+                        head,
+                        checked_ms: listing.observed_ms,
+                        checked_from_ms: Some(from),
+                    };
+                    if stored != Some(record) {
+                        self.store_head(chan_id, &scope_key, &record)?;
                     }
                     self.vouch_for_band(chan_id, &head, listing)?;
                 }
                 Some(head)
             }
-            ListEnd::Before(_) => stored.map(|(head, _)| head),
-        };
-        let from = match proof.from {
-            ListStart::ScopeStart => 0,
-            ListStart::At(ms) => ms,
+            ListEnd::Before(_) => stored.map(|stored| stored.head),
         };
         let until = match proof.until {
             ListEnd::Newest => head
@@ -1408,11 +1420,14 @@ impl Writer<'_> {
 
     /// A read of a scope's newest end, the latest yet, vouches for the rows at or above the head's
     /// settled top that it listed: no claim holds them, only the read that listed them. Each such
-    /// row's time moves up to the read's start. A row there that it did not list keeps an older
-    /// time, and is not vouched for ([`super::shadow`]): it was deleted since an earlier read saw
-    /// it, or it was pushed before the provider listed it. Its absence is not taken as a deletion
-    /// while the band is open (a pushed copy may simply not be listed yet); the listing that
-    /// settles the band does that. A handful of rows at most: the band is two minutes wide.
+    /// row's membership of the scope records the read's start as its `vouched_ms`, and the row's
+    /// time moves up to it. A row there that it did not list keeps an older vouch, and is not
+    /// vouched for ([`super::shadow`]), whatever saw it since: it was deleted since an earlier read
+    /// saw it, or it was pushed, posted or read by id before the provider listed it, and a sighting
+    /// says only that the row exists, never that nothing beside it is missing. Its absence is not
+    /// taken as a deletion while the band is open (a pushed copy may simply not be listed yet); the
+    /// listing that settles the band does that. A handful of rows at most: the band is two minutes
+    /// wide.
     fn vouch_for_band(
         &mut self,
         chan_id: i64,
@@ -1420,11 +1435,17 @@ impl Writer<'_> {
         listing: &Listing,
     ) -> rusqlite::Result<()> {
         let top = head.settled_top();
+        let scope_key = listing.scope.key();
         for row in &listing.rows {
             if rows::created_ms(&row.message).is_some_and(|created| created >= top) {
-                self.hot.row_vouch.execute(params![
+                let id = row.message.id.as_str();
+                self.hot
+                    .row_vouch
+                    .execute(params![chan_id, id, listing.observed_ms])?;
+                self.hot.scope_vouch.execute(params![
                     chan_id,
-                    row.message.id.as_str(),
+                    scope_key,
+                    id,
                     listing.observed_ms
                 ])?;
             }
@@ -1904,8 +1925,8 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// A scope's head, and when the latest read of its newest end the file records began.
-    fn load_head(&self, chan_id: i64, scope_key: &str) -> rusqlite::Result<Option<(Head, i64)>> {
+    /// A scope's head, and what the file records of the latest read of its newest end.
+    fn load_head(&self, chan_id: i64, scope_key: &str) -> rusqlite::Result<Option<HeadRecord>> {
         super::reader::head_by_id(self.conn, chan_id, scope_key)
     }
 
@@ -1913,24 +1934,25 @@ impl Writer<'_> {
         &self,
         chan_id: i64,
         scope_key: &str,
-        head: &Head,
-        checked_ms: i64,
+        record: &HeadRecord,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO scope_head (chan, scope_key, head_ms, unsettled_from_ms, head_listed_ms,
-                    checked_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    checked_ms, checked_from_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (chan, scope_key) DO UPDATE SET head_ms = excluded.head_ms,
                 unsettled_from_ms = excluded.unsettled_from_ms,
                 head_listed_ms = excluded.head_listed_ms,
-                checked_ms = excluded.checked_ms",
+                checked_ms = excluded.checked_ms,
+                checked_from_ms = excluded.checked_from_ms",
             params![
                 chan_id,
                 scope_key,
-                head.head_ms,
-                head.unsettled_from_ms,
-                head.head_listed_ms,
-                checked_ms
+                record.head.head_ms,
+                record.head.unsettled_from_ms,
+                record.head.head_listed_ms,
+                record.checked_ms,
+                record.checked_from_ms
             ],
         )?;
         Ok(())

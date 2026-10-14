@@ -513,3 +513,312 @@ fn a_pushed_deletion_whose_write_failed_is_never_vouched_for_even_after_a_restar
         "after a restart the deleted message is vouched for"
     );
 }
+
+// ---- what a sighting does not prove --------------------------------------------------------------
+
+fn main_page(limit: usize) -> shadow::Ask {
+    shadow::Ask::Timeline {
+        view: crate::threads::TimelineView::Main,
+        thread: None,
+        limit,
+    }
+}
+
+fn root(id: &str, text: &str, created_ms: i64) -> Message {
+    let mut root = message(id, "ada", text, created_ms);
+    root.thread = Some(crate::threads::MessageThread {
+        id: id.to_owned(),
+        root_message_id: Some(MessageId(id.to_owned())),
+        is_root: true,
+        reply_count: Some(1),
+        reply_count_exact: true,
+    });
+    root
+}
+
+/// Slack. m1..m6 are listed; ten minutes on u, w and x are written; five minutes after that a read
+/// of the newest end lists only its newest two, w and x. Then v, a root written before u, is read
+/// by id (as a thread's root is). v exists, but nothing says u does not: upstream's newest three are
+/// u, w and x, and u was written six minutes before that read began, so late visibility does not
+/// explain its absence. Neither a window nor, an hour on, a newest page is served.
+#[test]
+fn a_band_row_read_by_id_after_a_short_read_of_the_newest_end_never_hides_the_message_beside_it() {
+    let fx = Fixture::new("shadow-band-by-id");
+    let m6 = T0 + 6 * STEP;
+    let first = m6 + 1_000;
+    fx.clock.set(first);
+    fx.list(
+        (1..=6).map(m).collect(),
+        first,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    let x_ms = m6 + 10 * 60_000;
+    let v = root("v", "a root with replies", x_ms - 100_000);
+    let w = message("w", "ada", "w", x_ms - 20_000);
+    let x = message("x", "ada", "x", x_ms);
+    // u, at x - 60 s, is never held.
+    let second = x_ms + 5 * 60_000;
+    fx.clock.set(second);
+    fx.list(
+        vec![w, x],
+        second,
+        Some(newest_proof(ListStart::At(x_ms - 20_000))),
+    );
+    let third = second + 2_000;
+    fx.clock.set(third);
+    for observation in observe::single(observe::Shape::Slack, &v, "v", third) {
+        fx.offer(&fx.chan, observation);
+    }
+    let digest = shadow::Ask::Window {
+        consumer: shadow::Consumer::Digest,
+        limit: 3,
+    };
+    for (ask, asked_ms) in [(digest, third + 1_000), (main_page(3), third + HOUR)] {
+        let (decision, view) = decide_on(
+            &fx.cache,
+            &fx.chan,
+            &ask,
+            observe::Shape::Slack,
+            false,
+            facts(asked_ms, false, None, shadow::Feed::AdditionsOnly),
+        );
+        assert_eq!(row_ids(&view), ["v", "w", "x"], "{ask:?}");
+        assert_eq!(
+            decision,
+            shadow::Decision::Miss(shadow::Miss::Gap),
+            "{ask:?} served without u"
+        );
+    }
+}
+
+/// Discord. The same with rows only, a short page's worth, read after a read of the newest end
+/// that listed two rows: what that read did not list is vouched for by nothing.
+#[test]
+fn a_band_row_a_read_of_rows_saw_after_the_latest_listing_never_closes_a_gap() {
+    let fx = Fixture::new("shadow-band-rows");
+    let m6 = T0 + 6 * STEP;
+    let first = m6 + 1_000;
+    fx.clock.set(first);
+    fx.list(
+        (1..=6).map(m).collect(),
+        first,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    let v = message("v", "ada", "v", m6 + 20_000);
+    // u, at m6 + 40 s, is never held.
+    let w = message("w", "ada", "w", m6 + 60_000);
+    let x = message("x", "ada", "x", m6 + 80_000);
+    let second = m6 + 90_000;
+    fx.clock.set(second);
+    fx.list(
+        vec![w, x],
+        second,
+        Some(newest_proof(ListStart::At(m6 + 60_000))),
+    );
+    let third = second + 2_000;
+    fx.clock.set(third);
+    fx.offer(
+        &fx.chan,
+        Observation::Rows {
+            rows: vec![Incoming::new(v, Scope::Main)],
+            scope: Some(Scope::Main),
+            observed_ms: third,
+        },
+    );
+    let window = shadow::Ask::Window {
+        consumer: shadow::Consumer::Messages,
+        limit: 3,
+    };
+    for (ask, asked_ms) in [(window, third + 1_000), (main_page(3), third + HOUR)] {
+        let (decision, view) = decide(
+            &fx,
+            &ask,
+            facts(asked_ms, false, None, shadow::Feed::AdditionsOnly),
+        );
+        assert_eq!(row_ids(&view), ["v", "w", "x"], "{ask:?}");
+        assert_eq!(
+            decision,
+            shadow::Decision::Miss(shadow::Miss::Gap),
+            "{ask:?} served without u"
+        );
+    }
+}
+
+/// A message deleted moments after it was posted lies in the band, where its absence from the
+/// latest read of the newest end proves nothing, so the file still holds it. A push of it that
+/// lands after that read (an event retried, a poller's publish of what it read before) says only
+/// that it existed once: it never vouches for the row, in a window or a count.
+#[test]
+fn a_late_push_of_a_band_row_the_latest_read_did_not_list_never_vouches_for_it() {
+    let fx = Fixture::new("shadow-band-late-push");
+    let gone = message("bx", "ada", "posted and deleted", T0 + 6 * STEP - 30_000);
+    let first = T0 + 6 * STEP + 1_000;
+    fx.clock.set(first);
+    let mut with: Vec<Message> = (1..=6).map(m).collect();
+    with.push(gone.clone());
+    fx.list(with, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    let second = first + 5_000;
+    fx.clock.set(second);
+    fx.list(
+        (1..=6).map(m).collect(),
+        second,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    let third = second + 2_000;
+    fx.clock.set(third);
+    fx.offer(
+        &fx.chan,
+        Observation::Push {
+            push: Push::Upsert {
+                message: Box::new(Incoming::new(gone, Scope::Main)),
+                update: false,
+                partial: false,
+            },
+            observed_ms: third,
+        },
+    );
+    let at = facts(third + 1_000, false, None, shadow::Feed::AdditionsOnly);
+    let window = shadow::Ask::Window {
+        consumer: shadow::Consumer::Messages,
+        limit: 3,
+    };
+    for ask in [window, count_from_first()] {
+        let (decision, view) = decide(&fx, &ask, at);
+        assert!(row_ids(&view).contains(&"bx".to_owned()), "{ask:?}");
+        assert_eq!(
+            decision,
+            shadow::Decision::Miss(shadow::Miss::Gap),
+            "{ask:?} holds bx, deleted before the latest read: {:?}",
+            row_ids(&view)
+        );
+    }
+}
+
+/// This server's own post, an hour after the latest read of the newest end, with messages written
+/// in between that no read listed: a newest page answered from the cache would hold a gap of an
+/// hour beneath the post, so none is.
+#[test]
+fn an_own_post_above_a_stale_head_never_makes_a_newest_page_with_a_gap() {
+    let fx = Fixture::new("shadow-own-post");
+    let m6 = T0 + 6 * STEP;
+    let first = m6 + 1_000;
+    fx.clock.set(first);
+    fx.list(
+        (1..=6).map(m).collect(),
+        first,
+        Some(newest_proof(ListStart::At(T0 + STEP))),
+    );
+    let posted_at = first + HOUR;
+    fx.clock.set(posted_at);
+    let own = message("own", "me", "our reply", m6 + HOUR);
+    for observation in observe::posted(observe::Shape::DiscordNative, &own, None, posted_at) {
+        fx.offer(&fx.chan, observation);
+    }
+    let (decision, view) = decide(
+        &fx,
+        &main_page(3),
+        facts(posted_at + 5_000, false, None, shadow::Feed::AdditionsOnly),
+    );
+    assert_eq!(row_ids(&view), ["m5", "m6", "own"]);
+    assert_eq!(decision, shadow::Decision::Miss(shadow::Miss::Gap));
+}
+
+/// A Slack Main listing carrying r1, a reply also sent to the channel (its home is its thread).
+fn main_with_broadcast(fx: &Fixture, broadcast_ms: i64, observed_ms: i64) {
+    let mut rows = vec![Incoming::new(root("m1", "body 1", T0 + STEP), Scope::Main)];
+    rows.extend((2..=6).map(|n| Incoming::new(m(n), Scope::Main)));
+    rows.push(Incoming::new(
+        reply("r1", "m1", "also in the channel", broadcast_ms),
+        Scope::Thread("m1".to_owned()),
+    ));
+    fx.offer(
+        &fx.chan,
+        Observation::Listing(Listing {
+            scope: Scope::Main,
+            rows,
+            observed_ms,
+            proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+        }),
+    );
+}
+
+/// Slack. An earlier read of Main listed r1, a reply also sent to the channel, in Main's band; the
+/// latest read of Main's newest end did not. A read of r1's thread since lists it: that read
+/// vouches for r1 in its thread, never in Main, so a window of Main holding r1 is not served.
+#[test]
+fn a_read_of_one_scope_never_vouches_for_a_row_in_anothers_band() {
+    let fx = Fixture::new("shadow-band-other-scope");
+    let first = T0 + 6 * STEP + 1_000;
+    fx.clock.set(first);
+    let broadcast_ms = T0 + 6 * STEP - 30_000;
+    main_with_broadcast(&fx, broadcast_ms, first);
+    let second = first + 5_000;
+    fx.clock.set(second);
+    let mut main = vec![Incoming::new(root("m1", "body 1", T0 + STEP), Scope::Main)];
+    main.extend((2..=6).map(|n| Incoming::new(m(n), Scope::Main)));
+    fx.offer(
+        &fx.chan,
+        Observation::Listing(Listing {
+            scope: Scope::Main,
+            rows: main,
+            observed_ms: second,
+            proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+        }),
+    );
+    let third = second + 2_000;
+    fx.clock.set(third);
+    let thread = Scope::Thread("m1".to_owned());
+    fx.offer(
+        &fx.chan,
+        Observation::Listing(Listing {
+            scope: thread.clone(),
+            rows: vec![
+                Incoming::new(root("m1", "body 1", T0 + STEP), Scope::Main),
+                Incoming::new(
+                    reply("r1", "m1", "also in the channel", broadcast_ms),
+                    thread.clone(),
+                ),
+            ],
+            observed_ms: third,
+            proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+        }),
+    );
+    let window = shadow::Ask::Window {
+        consumer: shadow::Consumer::Messages,
+        limit: 3,
+    };
+    let (decision, view) = decide_on(
+        &fx.cache,
+        &fx.chan,
+        &window,
+        observe::Shape::Slack,
+        false,
+        facts(third + 1_000, false, None, shadow::Feed::AdditionsOnly),
+    );
+    assert_eq!(row_ids(&view), ["m5", "r1", "m6"]);
+    assert_eq!(
+        decision,
+        shadow::Decision::Miss(shadow::Miss::Gap),
+        "r1 vouched for in Main by a read of its thread"
+    );
+    // The same read of the thread does vouch for it there.
+    let page = shadow::Ask::Timeline {
+        view: crate::threads::TimelineView::Thread,
+        thread: Some("m1".to_owned()),
+        limit: 2,
+    };
+    let (decision, view) = decide_on(
+        &fx.cache,
+        &fx.chan,
+        &page,
+        observe::Shape::Slack,
+        false,
+        facts(third + 1_000, false, None, shadow::Feed::AdditionsOnly),
+    );
+    assert_eq!(row_ids(&view), ["m1", "r1"]);
+    assert_eq!(
+        decision,
+        shadow::Decision::Serve,
+        "the thread's own read vouches for its band"
+    );
+}

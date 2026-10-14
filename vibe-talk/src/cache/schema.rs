@@ -178,8 +178,29 @@ ALTER TABLE channel ADD COLUMN dropped_ms INTEGER;
 ALTER TABLE scope_head ADD COLUMN checked_ms INTEGER;
 ";
 
+/// Cache schema 3: what the latest read of a scope's newest end listed, which is all that holds the
+/// rows of its unsettled band.
+///
+/// - `scope_head.checked_from_ms`: where that read's listing began (its proof's start, provider
+///   time): it listed every message it saw from there up. `NULL` (a head written before this step)
+///   reaches nothing, so no row of the band is vouched for until the next such read.
+/// - `message_scope.vouched_ms`: when the latest read of the scope's newest end to list the row
+///   while it lay at or above the head's settled top began. A row of the band is vouched for only
+///   when this is that scope's `checked_ms`: a sighting of any other kind (a push, a post, a read
+///   by id, another scope's listing) says the row exists, never that nothing beside it is missing.
+///
+/// Its compat is 3: code of schema 2 would vouch for a band row seen by anything after that read.
+const V3: &str = "
+ALTER TABLE scope_head ADD COLUMN checked_from_ms INTEGER;
+ALTER TABLE message_scope ADD COLUMN vouched_ms INTEGER;
+";
+
 /// Every step this code knows, in order. Step `n` (from 1) brings a file to `user_version = n`.
-pub const STEPS: &[Step] = &[Step { sql: V1, compat: 1 }, Step { sql: V2, compat: 2 }];
+pub const STEPS: &[Step] = &[
+    Step { sql: V1, compat: 1 },
+    Step { sql: V2, compat: 2 },
+    Step { sql: V3, compat: 3 },
+];
 
 /// Why a file cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
