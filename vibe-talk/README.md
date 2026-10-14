@@ -39,7 +39,10 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
 
 * **Main** shows channel messages, with a reply-count button below each thread root.
 * **All** interleaves channel and thread messages chronologically. Colored **Thread** badges
-  distinguish conversations; tapping a badge opens that thread.
+  distinguish conversations; tapping a badge opens that thread. Every message of an answered thread
+  also has a strip in the thread's colour down its left edge: a click on it (or `t` on the selected
+  message) selects that thread without leaving All, dimming every other message; the same strip,
+  `t` again or Esc lets go.
 * **Thread list** is a card per thread — its name and summary, or its first message, and its reply
   counts — ordered by most recent activity at the bottom, across the window. Opening the list starts
   at that end; **Older threads…** above the oldest card reads further back. Esc goes back to the view
@@ -6477,6 +6480,16 @@ its state is swapped in around that work (`COLUMN_IDS`, `COLUMN_STATE` and `inCo
 pixels drawn, at 1280x800 and on a 412x915 phone, and `tests/thread_card_header_browser.py` the card at
 the top of a thread, its move up frame by frame, its line and its glide, at 1280x800 in both schemes and
 with reduced motion, and across the window from the thread list at 1280x800 and on a 412x915 phone.
+
+In All, every row of a thread somebody has answered carries a `.thread-strip` button on its left edge
+(`#299 all-thread-strip`): a bar in the thread's colour, five pixels wide (six under a finger) in a hit
+area of 16 (22), over a lane every row of All keeps so that a strip arriving with a first reply moves
+no words. Rows with a strip recede in their box, as replies do, so a read row's strip keeps its colour.
+A click on a strip, or `t`, selects the thread for that channel for the session (`allThreadFocus`),
+kept apart from the thread list's highlighted card: the list gets `data-focus-thread` and the thread's
+rows `data-thread-in`, and the stylesheet dims and drains every other row; nothing scrolls, is read or
+is drawn again. Esc, the same strip or `t` lets go. `tests/all_thread_strip_browser.py` measures and
+colours it in Chromium at 1280x800 and on a 412x915 phone, in both schemes.
 
 **The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
 Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and
