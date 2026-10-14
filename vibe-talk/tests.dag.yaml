@@ -505,6 +505,31 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#299 all-thread-strip` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, in the
+  # dark scheme and the light, in All: a strip on every row of an answered thread and on no other row (not
+  # a message in no thread, not a root nobody has answered), its bar at least 5px (6px) and four times the
+  # row's border, its hit box 16px (22px) wide and the row's full height, in its Thread(N)'s colour by
+  # computed colour and by pixels, a read reply's too; every row's words at one inset, strip or none; a
+  # resting mouse widening it, the keys ringing it; a click on a strip: no scroll, no row moved by a pixel,
+  # still All, the rest at 0.3 and drained with grey strips by pixels, the thread's own at full strength; a
+  # live reply of the thread arriving in it and a live message of no thread dimmed; a second click, Esc,
+  # another strip and t; Thread(N) and Back keeping the selection; a live first reply giving its root a
+  # strip with its words unmoved; on the phone a tap selecting and a finger drawn sideways from a strip
+  # archiving nothing. Measured on 2026-10-14: about 20s wall.
+  - group: check
+    job: all-thread-strip-browser
+    desc: a thread's colour strip on every row of All that is in an answered thread, thicker than a border and a hit area wide, and a click or tap on it selecting the thread in All with the rest dimmed and nothing moving, in current Chromium at 1280x800 and 412x915 in both schemes
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/all_thread_strip_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
   # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
   # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message

@@ -8017,7 +8017,8 @@ function closeDetailsOn(target) {
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
  * holds (`isBarPicker`); then the card at the top of a thread, opened over its list, closes, while it
  * is on screen (`#298 thread-card-header`); then a highlighted thread card on screen is put out (`#277
- * thread-card-focus`); then Back: out of Settings, Help or Reply, out of the thread list to what it
+ * thread-card-focus`); then a thread selected in All by its strip is let go (`#299 all-thread-strip`);
+ * then Back: out of Settings, Help or Reply, out of the thread list to what it
  * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
  * Returns whether it did anything. With none of those it does nothing:
  * in particular it marks nothing read, which is the proposal's answer to the clients whose Escape does.
@@ -8055,6 +8056,8 @@ function onEscape(event, target) {
   // next Esc goes back out of the thread. Only a card on screen: one out of sight is nobody's Esc.
   if (collapseThreadCard(expandedThreadCardOnScreen())) return true;
   if (putOutLitCard()) return true;
+  // `#299 all-thread-strip`. A thread selected in All by its strip is let go before All is left.
+  if (clearAllThreadFocus()) return true;
   return goBack();
 }
 
@@ -8157,7 +8160,7 @@ const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
     does: "Back: closes a menu, the search, a sheet or a thread's card opened at the top of the thread, takes " +
-      "the highlight off a thread card, leaves Settings, " +
+      "the highlight off a thread card, lets go of a thread selected in All, leaves Settings, " +
       "Help, Reply or a thread — one opened from the thread list goes back to it — and leaves the thread list for " +
       "the view it was chosen from. In a message box with text in it, leaves the box first and keeps the draft; " +
       "on the channel or view picker, back to the messages",
@@ -8353,6 +8356,14 @@ const KEYMAP = [
     group: KEYS_MESSAGE, chords: [{ key: "i" }],
     does: "Who wrote it, when, and its id",
     run: (event, target) => detailsFromKeyboard(target),
+  },
+  // `#299 all-thread-strip`. Its strip, pressed.
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "t" }],
+    does: "In All, select its thread, as a click on the colour strip at its left edge does: the messages not in " +
+      "it dim, and All stays All. Again, or Esc, lets go",
+    rowControls: ["thread-strip"],
+    run: (event, target) => threadStripFromKeyboard(target),
   },
   {
     // `#296 copy-highlighted-message`. y was free: no binding had it, and as a bare letter it never
@@ -15515,6 +15526,10 @@ function renderChannelNavigation() {
 
 /** Which of the column's lists is up, and where its box posts. */
 function renderColumnLists() {
+  markListView();
+  // `#299 all-thread-strip`. A view put back from rows this page held is drawn with no pass over them:
+  // All comes back to the thread selected in it, and any other view to none.
+  paintAllThreadFocus();
   // `#206 pin-message`. The Pinned filter's list stands in for whichever of these is up.
   el("thread-list").hidden = channelView !== "threads" || pinnedOnly;
   el("discord-log").hidden = channelView === "threads" || pinnedOnly;
@@ -17215,7 +17230,7 @@ function readFilterKeeps() {
  * Called by every pass over the rows, which follows every redraw, so the counts follow arrivals, reads
  * and Done wherever they happen. Written only when they change: this runs with every pass.
  */
-function drawThreadChips(row, tally, inMain) {
+function drawThreadChips(row, tally, inMain, inAll = false) {
   const message = rowMessages(row)[0];
   if (!message) return;
   const own = threadOf(message);
@@ -17235,6 +17250,11 @@ function drawThreadChips(row, tally, inMain) {
       if (gather.textContent !== words) gather.textContent = words;
     }
   }
+  // `#299 all-thread-strip`. In All, the strip in its thread's colour, by the rule the tag just drew:
+  // a thread somebody has answered, whose tag is its coloured Thread(N). Nobody's thread, no strip.
+  const striped = inAll && own !== null && badge !== null && !badge.hidden &&
+    badge.getAttribute("data-thread-state") === "open";
+  paintThreadStrip(row, striped ? own : null);
   // The thread the root heads by the store's record of it (`rootReplyState`), as the read filters
   // decide by — not only by the row's own copy, which may have none: a message drawn before its first
   // reply, whose thread a summary from the Threads list knows of. Hide read keeps that root, and it
@@ -17272,6 +17292,198 @@ function drawThreadChips(row, tally, inMain) {
     chip.setAttribute("aria-label", `Open this thread at its first unread reply, ${label}`);
   }
   if (chip.hidden) chip.hidden = false;
+}
+
+// --- a thread's strip in All, and selecting a thread there ------------------------------------------
+//
+// `#299 all-thread-strip`. The owner, 2026-10-14: "In the interleaved All view I would like a little
+// color strip along the left edge of the rectangular messages that are messages in threads. Not the
+// curved style of the thread cards, just the normal message view but with a color accent on the left.
+// Somewhat thicker than the normal border so it is clickable. But when this border is clicked instead
+// of drilling INTO the thread (like clicking the existing "(Thread(N))" button) I want it to just
+// SELECT that thread, dimming all messages that are not part of the thread but keeping us in the
+// global view."
+//
+//   * WHICH ROWS. Every row of All whose message is in a thread somebody has answered — its root, its
+//     replies, the replies gathered under the root — by the rule its tag is coloured by (the "open"
+//     state of `paintThreadBadge`): a thread nobody has answered spends no colour (`#252
+//     thread-button-state`), and on a provider that names a thread for every message that would be a
+//     strip on every row. Main, a thread, the Pinned filter and the right column have none. Every row
+//     of All keeps the strip's lane (web/voice.css), so a strip that comes with a first reply moves
+//     nothing.
+//   * WHAT IT IS. A button on the row's left edge (`.thread-strip`): a bar in its thread's colour,
+//     thicker than a border, inside a hit area wider still and the row's full height. Its name is
+//     "Select this thread", and it is pressed while its thread is the one selected.
+//   * WHAT IT DOES. It selects its thread IN ALL, which stays All: the rows not in the thread dim and
+//     lose their colour, their strips go grey, and the thread's own rows are drawn at full strength —
+//     the read ones still drained, so what is read still shows. Only attributes are written: nothing
+//     scrolls, nothing is read from the server or marked, and no row is drawn again. A second press,
+//     Esc or t lets go; another thread's strip, or t on another thread's message, moves it.
+//   * PER CHANNEL, FOR THE SESSION, AND ALL'S OWN: kept apart from the thread list's highlighted card
+//     (`#279 thread-card-focus`). Shared, a card highlighted for a thread with no message in All would
+//     leave all of All dimmed with nothing at full strength. Opening the thread by its Thread(N) and
+//     coming back finds it still selected; so do the read mode, the search, Hide read and older pages.
+//   * A READ ROW KEEPS ITS STRIP'S COLOUR. A row with a strip recedes in its box (`#204 reply-arrow`'s
+//     veil and per-child filter), the strip exempt, as a reply's arrow is: else every read message's
+//     strip would be grey before anything was selected, and the selection would not stand out.
+
+/**
+ * By channel, the thread selected in All by its strip (`#299 all-thread-strip`), for this session.
+ *
+ * @type {Map<string, string>}
+ */
+const allThreadFocus = new Map();
+
+/** The thread selected in All on the channel on screen, or null. */
+function allThreadSelected() {
+  return allThreadFocus.get(String(el("discord-channel").value)) || null;
+}
+
+/** Whether the rows being drawn are All's, which only the left column shows: the only rows with strips. */
+function drawingAll() {
+  return !sideActive && channelView === "flat";
+}
+
+/**
+ * Say on the column's list which view its rows are (`data-view`), for web/voice.css to keep the lane
+ * of All's strips on every row of All, a strip or none. Written only when it changes.
+ */
+function markListView() {
+  const list = el("discord-log");
+  if (list.getAttribute("data-view") !== channelView) list.setAttribute("data-view", channelView);
+}
+
+/**
+ * Give `row` its strip in thread `id`'s colour or, with `id` null, take it away: hidden, so a row that
+ * has one again later makes no second button. Written only where it changes, as every pass over the
+ * rows asks. Whether it is pressed is the selection's (`paintAllThreadFocus`).
+ *
+ * @param {HTMLElement} row
+ * @param {string | null} id
+ */
+function paintThreadStrip(row, id) {
+  const held = /** @type {any} */ (row).threadStrip || null;
+  if (id === null) {
+    if (held && !held.hidden) held.hidden = true;
+    if (row.hasAttribute("data-thread-strip")) row.removeAttribute("data-thread-strip");
+    return;
+  }
+  const strip = held || threadStrip(row);
+  const hue = String(threadHue(id));
+  if (strip.style.getPropertyValue("--thread-hue") !== hue) strip.style.setProperty("--thread-hue", hue);
+  if (strip.hidden) strip.hidden = false;
+  if (!row.hasAttribute("data-thread-strip")) row.setAttribute("data-thread-strip", "");
+}
+
+/**
+ * Make `row`'s strip: its first part, after a reply's arrow where it has one, so a screen reader meets
+ * the way to what the row answers first. Put in with `insertBefore`, which moves nothing else in the
+ * row: a strip that comes with a first reply never takes the focus off a button of the row.
+ *
+ * @param {HTMLElement} row
+ */
+function threadStrip(row) {
+  const strip = document.createElement("button");
+  strip.className = "thread-strip";
+  strip.setAttribute("type", "button");
+  strip.setAttribute("aria-label", "Select this thread");
+  strip.setAttribute("aria-pressed", "false");
+  strip.setAttribute("title", "Select this thread: the messages not in it dim. Again, or Esc, lets go");
+  sayRowShortcut(strip, "thread-strip");
+  // Its thread is read when it is pressed, as the tag's is.
+  strip.addEventListener("click", inThisColumn(() => {
+    const id = threadOf(rowMessages(row)[0]);
+    if (id) toggleAllThreadFocus(id);
+  }));
+  const first = /** @type {HTMLElement | null} */ (row.firstChild);
+  const arrow = first && String(first.className || "").split(/\s+/).includes("reply-jump") ? first : null;
+  row.insertBefore(strip, arrow ? arrow.nextSibling : first);
+  /** @type {any} */ (row).threadStrip = strip;
+  return strip;
+}
+
+/**
+ * Draw the thread selected in All on its rows: `data-focus-thread` on the list, `data-thread-in` on
+ * every row with a message in it, and its strips pressed. Only attributes, and only where they change.
+ * Run at the end of every pass over the rows, and by a press. A thread the store no longer holds a
+ * message of is let go, so All is never all dimmed with nothing at full strength.
+ */
+function paintAllThreadFocus() {
+  if (sideActive) return;
+  const list = el("discord-log");
+  const channel = String(el("discord-channel").value);
+  let id = channelView === "flat" ? allThreadSelected() : null;
+  if (id !== null && channelCanon.channel === channel && !channelCanon.messages.some((message) => threadOf(message) === id)) {
+    allThreadFocus.delete(channel);
+    id = null;
+  }
+  if (id === null) {
+    if (list.hasAttribute("data-focus-thread")) list.removeAttribute("data-focus-thread");
+  } else if (list.getAttribute("data-focus-thread") !== id) {
+    list.setAttribute("data-focus-thread", id);
+  }
+  for (const row of /** @type {HTMLElement[]} */ ([...list.children])) {
+    const held = rowMessages(row);
+    const within = id !== null && held.some((message) => threadOf(message) === id);
+    if (row.hasAttribute("data-thread-in") !== within) {
+      if (within) row.setAttribute("data-thread-in", "");
+      else row.removeAttribute("data-thread-in");
+    }
+    const strip = /** @type {any} */ (row).threadStrip;
+    if (!strip) continue;
+    const pressed = id !== null && held.length > 0 && threadOf(held[0]) === id ? "true" : "false";
+    if (strip.getAttribute("aria-pressed") !== pressed) strip.setAttribute("aria-pressed", pressed);
+  }
+}
+
+/**
+ * A strip pressed, or t: thread `id` selected in All, or let go when it was the one selected. Says
+ * what it did, and how many of the messages here are the thread's.
+ *
+ * @param {string} id
+ */
+function toggleAllThreadFocus(id) {
+  const channel = String(el("discord-channel").value);
+  const letting = allThreadFocus.get(channel) === id;
+  if (letting) allThreadFocus.delete(channel);
+  else allThreadFocus.set(channel, id);
+  paintAllThreadFocus();
+  if (letting) {
+    setStatus("Thread selection cleared.");
+    return;
+  }
+  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]);
+  const here = rows.flatMap(idsOf).length;
+  const mine = rows.filter((row) => row.hasAttribute("data-thread-in")).flatMap(idsOf).length;
+  setStatus(`Thread selected: ${threadName(knownThreadChoice(id, null))} — ${mine} of ${here} messages here. Esc clears it.`);
+}
+
+/**
+ * Esc: the thread selected in All let go, while All is what is on screen. Whether there was one, for
+ * Esc to stop there; the next Esc does what it does in All.
+ */
+function clearAllThreadFocus() {
+  return inColumn(columns.main, () => {
+    if (!channelOnScreen() || threadListShown || pinnedOnly || channelView !== "flat") return false;
+    const channel = String(el("discord-channel").value);
+    if (!allThreadFocus.has(channel)) return false;
+    allThreadFocus.delete(channel);
+    paintAllThreadFocus();
+    setStatus("Thread selection cleared.");
+    return true;
+  });
+}
+
+/**
+ * t: the selected message's strip pressed — its thread selected in All, or let go. Nothing on a message
+ * with no strip (no thread, nobody's thread yet, or not in All), so the key is left to the browser.
+ */
+function threadStripFromKeyboard(target) {
+  const { row, took } = rowForAct(target);
+  const strip = row ? /** @type {any} */ (row).threadStrip : null;
+  if (!strip || strip.hidden) return took;
+  strip.click();
+  return true;
 }
 
 /**
@@ -20607,9 +20819,12 @@ function renderChannelRows() {
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
   const tally = replyTally();
   const mainList = new Set(rows);
+  // `#299 all-thread-strip`. All's rows are drawn in the left column only, never on the right.
+  const inAll = drawingAll();
+  markListView();
   for (const row of [...rows, ...el("pinned-log").children]) {
     const id = row.getAttribute("data-id") || "";
-    drawThreadChips(row, tally, channelView === "main" && mainList.has(row));
+    drawThreadChips(row, tally, channelView === "main" && mainList.has(row), inAll && mainList.has(row));
     // Every message the row stands for. One of them on an ordinary row; see the combining note.
     const ids = idsOf(row);
     // DIMS, never hides. See the note at the head of this section: this is derived from what
@@ -20750,6 +20965,9 @@ function renderChannelRows() {
   // and so does the card at the top of a thread across the window.
   paintSideThreadCard(tally);
   if (!sideActive && channelView === "thread") paintThreadCard(leftEl("thread-card"), openThreadChoice(), tally);
+  // `#299 all-thread-strip`. The thread selected in All, on the rows as they now stand: a live reply of
+  // it arrives at full strength, any other message dimmed.
+  paintAllThreadFocus();
 }
 
 /**
@@ -24301,6 +24519,11 @@ function swipeable(li, messages) {
     }
     // `#228 reply-visible`. Nor on the circle at the row's corner, the way down to a reply.
     if (li.replyMarker && nodeWithin(li.replyMarker, event.target)) {
+      return;
+    }
+    // `#299 all-thread-strip`. Nor on the strip at its left edge, which selects its thread: a finger
+    // resting there, or sliding off it, neither archives the message nor opens its details.
+    if (li.threadStrip && nodeWithin(li.threadStrip, event.target)) {
       return;
     }
     active = true;
