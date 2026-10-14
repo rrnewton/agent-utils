@@ -47,6 +47,8 @@ class FakeAgent:
         self.pastes: list[str] = []
         self.keys: list[str] = []
         self.drop_keys = 0
+        # Every submission key (Enter or Tab) is dropped; editing keys still work.
+        self.drop_submit_keys = False
         self.paste_visible_after_reads = 0
         self.redraw_lag_reads = 0
         self.stale_screen: str | None = None
@@ -86,6 +88,26 @@ class FakeAgent:
         self.keys.append(keys)
         if self.drop_keys > 0:
             self.drop_keys -= 1
+            return
+        if self.drop_submit_keys and keys in ("Enter", "Tab"):
+            return
+        # Editing keys with the cursor at the end: ctrl+e moves nothing, ctrl+u deletes the
+        # last row (a paste placeholder goes whole), backspace deletes one character.
+        if keys == "ctrl+e":
+            return
+        if keys in ("ctrl+u", "backspace") and self._placeholder is not None:
+            self.composer, self._placeholder = "", None
+            return
+        if keys == "ctrl+u":
+            # On an empty last row only Codex removes the line break before it.
+            start = self.composer.rfind("\n") + 1
+            if start < len(self.composer):
+                self.composer = self.composer[:start]
+            elif self.harness == "codex":
+                self.composer = self.composer[:max(start - 1, 0)]
+            return
+        if keys == "backspace":
+            self.composer = self.composer[:-1]
             return
         before = self._render()
         text = self.composer
@@ -867,10 +889,13 @@ class ProcessBackedClient(HerdrClient):
         self.process = FakeHerdrProcess(agent)
         super().__init__(herdr_bin="fixture-herdr", run=self.process)
         self.agent = agent
+        #: The status Herdr reports; None follows the agent (working while busy).
+        self.status: str | None = "idle"
 
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
+        status = self.status if self.status is not None else ("working" if self.agent.busy else "idle")
         return AgentPaneInfo(pane_id, "w1", "/work/project", self.agent.harness,
-                             "idle", None, None)
+                             status, None, None)
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
@@ -935,3 +960,70 @@ def test_slash_commands_keep_the_native_prompt_path() -> None:
     client = ProcessBackedClient(agent)
     assert client.prompt_agent("w1:p1", "/goal ship it") is None
     assert client.process.calls[0][:2] == ("agent", "prompt")
+
+
+def test_a_working_claude_is_typed_into_only_with_deliver_while_working(tmp_path: Path) -> None:
+    agent = FakeAgent("claude", busy=True)
+    client = ProcessBackedClient(agent)
+    client.status = "working"
+    root = tmp_path / "queue"
+    enqueue(str(root), "queue behind the turn", message_id="m1")
+    waited = drain(client, Target(pane_id="w1:p1"), str(root), ready_timeout=0, working_timeout=1.0)
+    assert waited.pending == ("m1",) and "did not become idle/done" in (waited.blocked or "")
+    assert agent.pastes == []
+    result = drain(client, Target(pane_id="w1:p1"), str(root), ready_timeout=0, working_timeout=1.0,
+                   deliver_while_working=True)
+    assert result.delivered == ("m1",), result
+    assert agent.queued == ["queue behind the turn"] and agent.composer == ""
+
+
+def test_a_working_claude_that_never_queues_the_prompt_gets_it_taken_back_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agentctl.submission as submission
+
+    monkeypatch.setattr(submission, "SUBMIT_TIMEOUT_SECONDS", 0.3)
+    agent = FakeAgent("claude", busy=True)
+    agent.drop_submit_keys = True
+    client = ProcessBackedClient(agent)
+    client.status = "working"
+    root = tmp_path / "queue"
+    enqueue(str(root), "never queued", message_id="m1")
+    result = drain(client, Target(pane_id="w1:p1"), str(root), ready_timeout=0, working_timeout=1.0,
+                   deliver_while_working=True)
+    assert result.pending == ("m1",) and result.quarantined == (), result
+    assert "taken back out of the composer" in (result.blocked or "")
+    assert agent.composer == "" and agent.queued == [] and "ctrl+u" in agent.keys
+    document = json.loads((root / "inbox" / "m1.json").read_text())
+    assert "possibly_submitted" not in document
+
+
+def test_a_slash_command_still_waits_for_an_idle_claude(tmp_path: Path) -> None:
+    agent = FakeAgent("claude", busy=True)
+    client = ProcessBackedClient(agent)
+    client.status = "working"
+    root = tmp_path / "queue"
+    enqueue(str(root), "/goal finish", message_id="m1")
+    result = drain(client, Target(pane_id="w1:p1"), str(root), ready_timeout=0, working_timeout=1.0,
+                   deliver_while_working=True)
+    assert result.pending == ("m1",) and agent.pastes == []
+
+
+def test_clear_composer_empties_a_multi_row_draft_without_submitting() -> None:
+    from agentctl.submission import clear_composer
+
+    clock = Clock()
+    agent = FakeAgent("claude")
+    agent.composer = "first row\nsecond row"
+    keys = clear_composer(agent, "w1:p1", "claude", sleep=clock.sleep)
+    assert agent.composer == "" and keys == len(agent.keys)
+    assert set(agent.keys) <= {"ctrl+e", "ctrl+u", "backspace"}
+    assert clear_composer(agent, "w1:p1", "claude", sleep=clock.sleep) == 0
+
+
+def test_the_cli_passes_deliver_while_working_only_when_asked() -> None:
+    from agentctl import cli
+
+    parsed = cli.parser().parse_args(["send", "worker", "--deliver-while-working", "steer"])
+    assert parsed.deliver_while_working is True
+    assert cli.parser().parse_args(["send", "worker", "steer"]).deliver_while_working is False

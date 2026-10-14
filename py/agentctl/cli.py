@@ -55,7 +55,10 @@ def _delivery(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-attempts", type=_bounded_uint, default=3, metavar="COUNT",
         help="interactive only: delivery attempt limit; uncertain input is never replayed automatically (default: 3)")
     parser.add_argument("--deliver-while-working", action="store_true",
-        help="type into a working Claude Code pane and let it queue the prompt (Rust edition only; this edition refuses)")
+        help="interactive only: also type into a Claude Code pane that is working, native or behind a root slot "
+             "relay, and let Claude Code queue the prompt behind its turn (default: off, which waits for idle or "
+             "done). The composer must be empty first and the submission verified; a prompt Claude Code never "
+             "accepts is taken back out and stays pending. Slash commands and other harnesses still wait")
 
 
 def _environment_entry(value: str) -> str:
@@ -378,13 +381,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         sessions = Sessions(HerdrClient(herdr_bin=args.herdr_bin), args.registry)
         options: dict[str, object] = {key: getattr(args, key) for key in
             ("ready_timeout", "working_timeout", "max_attempts") if hasattr(args, key)}
+        if getattr(args, "deliver_while_working", False):
+            # Only when asked: a headless worker's request schema has no such option.
+            options["deliver_while_working"] = True
         result: object
         name = getattr(args, "name", "")
-        if getattr(args, "deliver_while_working", False):
-            raise ValueError(
-                "--deliver-while-working is implemented only by the Rust edition of agentctl; run it with the "
-                "Rust agentctl (for example DAGRUN_ENGINE=rust)"
-            )
         if args.command == "attach-self":
             raise ValueError(
                 "attach-self presents an agentcloud session, which only the Rust edition of "
@@ -442,7 +443,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts,
                 slot=args.slot, slot_isolation=args.slot_isolation,
-                slot_project=args.slot_project, profile=args.profile)
+                slot_project=args.slot_project, profile=args.profile,
+                deliver_while_working=args.deliver_while_working)
         elif args.command == "adopt":
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,

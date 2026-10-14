@@ -17,7 +17,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -31,7 +31,7 @@ from agentctl.errors import (
     ProbableMisroute,
 )
 from agentctl.prompt_time import retime as _retime_prompt
-from agentctl.submission import PromptNotStaged, SubmissionReceipt
+from agentctl.submission import PromptNotStaged, SubmissionReceipt, withdrawing_unaccepted
 
 __all__ = [
     "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send", "status", "read",
@@ -1833,6 +1833,7 @@ def _wait_ready(
     monotonic: Callable[[], float],
     locked_pane_id: str,
     initial_info: AgentPaneInfo | None = None,
+    accept_working: bool = False,
 ) -> AgentPaneInfo:
     deadline = monotonic() + timeout
     while True:
@@ -1843,6 +1844,10 @@ def _wait_ready(
                 f"target moved from locked pane {locked_pane_id!r} to {info.pane_id!r}"
             )
         if info.status in ("idle", "done"):
+            return info
+        # Claude Code queues a prompt submitted while it works and shows that it did; the
+        # verified submission checks the composer is empty first and proves the prompt left it.
+        if accept_working and info.status == "working" and info.agent == "claude":
             return info
         codex_ready = getattr(client, "codex_idle_ready", None)
         if (info.agent == "codex" and info.status == "unknown"
@@ -1912,21 +1917,28 @@ def drain(
     monotonic: Callable[[], float] = time.monotonic,
     atomic_policy: AtomicWritePolicy | None = None,
     allow_legacy_workspace_binding: bool = False,
+    deliver_while_working: bool = False,
 ) -> QueueResult:
-    """Drain a queue, optionally sharing a bounded atomic staging domain."""
+    """Drain a queue, optionally sharing a bounded atomic staging domain.
+
+    With ``deliver_while_working``, a Claude Code pane that is working is also typed into and
+    Claude Code queues the prompt; one it never accepts is taken back out and stays pending.
+    Slash commands and other harnesses still wait for idle or done.
+    """
     with atomic_write_policy(atomic_policy):
         return _drain(client, target, root, ready_timeout=ready_timeout,
                       working_timeout=working_timeout, max_attempts=max_attempts,
                       max_artifact_bytes=max_artifact_bytes, sleep=sleep,
                       monotonic=monotonic,
-                      allow_legacy_workspace_binding=allow_legacy_workspace_binding)
+                      allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+                      deliver_while_working=deliver_while_working)
 
 
 def _drain(
     client: HerdrClient, target: Target, root: str, *, ready_timeout: float,
     working_timeout: float, max_attempts: int, max_artifact_bytes: int | None,
     sleep: Callable[[float], None], monotonic: Callable[[], float],
-    allow_legacy_workspace_binding: bool,
+    allow_legacy_workspace_binding: bool, deliver_while_working: bool = False,
 ) -> QueueResult:
     """Serialize and drain a FIFO; poison prompts are retained in ``failed``.
 
@@ -2004,6 +2016,9 @@ def _drain(
                         target_lock, locked_pane_id, initial_info = _lock_resolved_target(
                             client, target
                         )
+                    # A slash command opens a harness menu, so it never goes to a working pane.
+                    accept_working = (deliver_while_working
+                                      and not str(document.get("text", "")).lstrip().startswith("/"))
                     info = _wait_ready(
                         client,
                         target,
@@ -2012,6 +2027,7 @@ def _drain(
                         monotonic=monotonic,
                         locked_pane_id=locked_pane_id,
                         initial_info=initial_info,
+                        accept_working=accept_working,
                     )
                     initial_info = None
                 except (AgentDeliveryError, HerdrUnavailable) as exc:
@@ -2044,9 +2060,14 @@ def _drain(
                 retained_path = inflight_path
                 try:
                     try:
-                        _deliver_one(
-                            client, info, _typed_text(document), working_timeout=working_timeout,
-                        )
+                        # Typing into a working pane relies on the agent to queue the prompt; one
+                        # it never accepts is taken back out of the composer so it stays pending.
+                        with (withdrawing_unaccepted() if accept_working and info.status == "working"
+                              else nullcontext()):
+                            _deliver_one(
+                                client, info, _typed_text(document),
+                                working_timeout=working_timeout,
+                            )
                     except _NotStaged as exc:
                         # Nothing reached the composer: undo the at-most-once barrier so the
                         # prompt stays pending. A crash before the rename still quarantines it.

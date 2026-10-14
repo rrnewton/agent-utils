@@ -60,7 +60,7 @@ from agentctl.profiles import (
     wrkslots_for_registry,
 )
 from agentctl.submission import (
-    PromptNotStaged, SubmissionReceipt, _compact, submit_verified,
+    PromptNotStaged, SubmissionReceipt, _compact, submit_verified, withdraw_requested,
 )
 
 _T = TypeVar("_T")
@@ -1745,7 +1745,12 @@ class _WorkspaceClient:
                 raise HerdrUnavailable(
                     "slash commands cannot be delivered to a harness behind a root slot relay"
                 )
-            if self.pane_info(pane_id).status != "idle":
+            status = self.pane_info(pane_id).status
+            # A drain types into a working pane only when the caller allowed it, and then asks
+            # the submission to withdraw a prompt Claude Code never queues.
+            queue_behind_turn = (status == "working" and self.record.harness == "claude"
+                                 and withdraw_requested())
+            if status != "idle" and not queue_behind_turn:
                 raise HerdrUnavailable(f"relayed {self.record.harness} in pane {pane_id} is not idle")
             relay = self._guarded()
             return self._deliver_checked(
@@ -2828,6 +2833,7 @@ class ManagedAgents:
         slot: str | None = None, slot_isolation: str | None = None,
         slot_project: str | None = None,
         profile: str | None = None,
+        deliver_while_working: bool = False,
     ) -> dict[str, object]:
         """Create one new tab and start its interactive harness without stealing focus.
 
@@ -2987,7 +2993,7 @@ class ManagedAgents:
                 ))
                 agent.send(client, self._target(record), self._queue(name), brief,
                            ready_timeout=ready_timeout, working_timeout=working_timeout,
-                           max_attempts=max_attempts,
+                           max_attempts=max_attempts, deliver_while_working=deliver_while_working,
                            allow_legacy_workspace_binding=True)
             # Keep the generation lock until its initial instruction and result
             # are captured; a replacement must never receive this launch's brief.

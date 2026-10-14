@@ -325,7 +325,7 @@ def test_rust_only_restore_commands_are_refused_by_this_edition(
 
 
 def relay_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str = "codex",
 ) -> tuple[Sessions, FakeManagedClient, CustomProcessIdentity]:
     """A Codex harness started behind a root slot relay, its process pinned at launch."""
     from .test_agentctl_sessions import _fake_wrkslots, setup as sessions_setup
@@ -347,12 +347,12 @@ def relay_worker(
     monkeypatch.setattr(fake, "start_relay_agent", start_relay, raising=False)
     monkeypatch.setattr(fake, "_harness_executable", lambda kind: f"/opt/bin/{kind}", raising=False)
     monkeypatch.setattr(fake, "verify_relay_harness", lambda pane, expected: None, raising=False)
-    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("codex", "idle"), raising=False)
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: (harness, "idle"), raising=False)
     monkeypatch.setattr(fake, "report_pane_agent", report, raising=False)
     monkeypatch.setattr(fake, "process_liveness",
                         lambda expected: "alive" if expected == identity else "unknown", raising=False)
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, "root")))
-    sessions.start_session("worker", cwd=str(tmp_path), harness="codex", slot="s1")
+    sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s1")
     return sessions, fake, identity
 
 
@@ -401,10 +401,27 @@ def test_promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_run
     assert sessions.get("worker").lifecycle == "launch_failed"
 
 
-def test_deliver_while_working_is_refused_by_this_edition(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+
+def test_deliver_while_working_reaches_a_working_claude_behind_a_root_slot_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from agentctl import cli
-    assert cli.main(["--registry", str(tmp_path / "registry"), "send", "worker", "--deliver-while-working",
-                     "steer"]) == 2
-    assert "--deliver-while-working is implemented only by the Rust edition" in capsys.readouterr().err
+    import agentctl.subagents as subagents_module
+    from agentctl.submission import SubmissionReceipt, withdraw_requested
+
+    sessions, fake, _identity = relay_worker(tmp_path, monkeypatch, harness="claude")
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("claude", "working"), raising=False)
+    typed: list[tuple[str, bool]] = []
+
+    def submit(terminal: object, pane_id: str, harness: str, text: str) -> SubmissionReceipt:
+        typed.append((text, withdraw_requested()))
+        fake.transcripts.setdefault(pane_id, []).append(text)
+        return SubmissionReceipt("Enter", 1, 0.1, "agent queue marker is visible")
+
+    monkeypatch.setattr(subagents_module, "submit_verified", submit)
+    monkeypatch.setattr(fake, "relay_process", lambda pane: _identity, raising=False)
+    with pytest.raises(AgentDeliveryError):
+        sessions.send("worker", "steer the busy lane", ready_timeout=0)
+    assert typed == []
+    result = sessions.drain("worker", ready_timeout=0, deliver_while_working=True)
+    assert len(result.delivered) == 1, result
+    assert typed == [("steer the busy lane", True)]

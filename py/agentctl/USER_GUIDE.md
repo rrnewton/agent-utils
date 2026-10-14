@@ -743,8 +743,8 @@ agentctl send reviewer --file /tmp/follow-up.txt --ready-timeout 0
 agentctl drain reviewer --ready-timeout 0
 ```
 
-To steer a Claude Code agent that is busy, `--deliver-while-working` (Rust
-edition; this edition refuses it) on `send`, `drain`, `start` and `goal` also
+To steer a Claude Code agent that is busy, `--deliver-while-working` on `send`,
+`drain`, `start` and `goal` also
 types into a pane that is working, native or behind a root slot relay, and lets
 Claude Code queue the prompt behind its current turn. The composer must be empty
 first and the submission is verified; a prompt Claude Code never accepts is

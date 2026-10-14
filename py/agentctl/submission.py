@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -108,6 +110,32 @@ _CODEX_QUEUED_ROWS = (
     "queued follow-up inputs", "messages to be submitted after next tool call",
     "messages to be submitted at end of turn",
 )
+
+
+#: Set while a queue drain types into a pane that is working: a prompt the agent then never
+#: accepts is taken back out of the composer and reported as not typed, so it stays pending.
+_WITHDRAW_UNACCEPTED: ContextVar[bool] = ContextVar("agentctl_withdraw_unaccepted", default=False)
+#: Keys that move to the end of the composer's current row and delete back to its start.
+CLEAR_ROW_KEYS = ("ctrl+e", "ctrl+u")
+#: Sent when a pair of :data:`CLEAR_ROW_KEYS` changed nothing, as on an empty row.
+CLEAR_CHARACTER_KEY = "backspace"
+#: Most pairs of :data:`CLEAR_ROW_KEYS` one :func:`clear_composer` sends.
+MAX_CLEAR_ROUNDS = 64
+
+
+@contextmanager
+def withdrawing_unaccepted() -> Iterator[None]:
+    """Within this block, :func:`submit_verified` takes back a prompt the agent never accepts."""
+    token = _WITHDRAW_UNACCEPTED.set(True)
+    try:
+        yield
+    finally:
+        _WITHDRAW_UNACCEPTED.reset(token)
+
+
+def withdraw_requested() -> bool:
+    """Whether the current delivery types into a working pane (see :func:`withdrawing_unaccepted`)."""
+    return _WITHDRAW_UNACCEPTED.get()
 
 
 class PromptNotStaged(HerdrUnavailable):
@@ -376,6 +404,22 @@ def _corroborated(before: ComposerView, after: ComposerView, text: str) -> str |
     return None
 
 
+def _printed(before: ComposerView, after: ComposerView, text: str) -> str | None:
+    """Evidence that the prompt itself reached the agent, unlike an active turn the pane
+    already showed before typing; used when a prompt is taken back out of a working pane."""
+    if _transcript_count(after, text) > _transcript_count(before, text):
+        return "prompt text appeared above the composer"
+    if (len(_PASTE_PLACEHOLDER.findall(after.transcript))
+            > len(_PASTE_PLACEHOLDER.findall(before.transcript))):
+        return "pasted prompt appeared above the composer"
+    previous = f"{before.transcript}\n{before.footer}"
+    current = f"{after.transcript}\n{after.footer}"
+    for marker in _QUEUE_MARKERS:
+        if marker in current and marker not in previous:
+            return f"agent queue marker appeared ({marker!r})"
+    return None
+
+
 def _submit_key(harness: str, view: ComposerView) -> str:
     # A busy Codex steers the active turn on Enter and queues on Tab. It shows
     # the Tab hint only while it is busy and holds staged text.
@@ -470,6 +514,10 @@ def submit_verified(
         view = composer_view(harness, terminal.read_screen(pane_id))
         if view is not None and _staged(view, text, placeholders_before):
             left_composer = False
+            if now >= submit_deadline and _WITHDRAW_UNACCEPTED.get():
+                _withdraw_unaccepted(
+                    terminal, pane_id, harness, text, before, presses, key, now - started, sleep,
+                )
             if now >= submit_deadline:
                 raise PromptStagedNotSubmitted(
                     f"pane {pane_id}: prompt is still staged in the {harness} composer after "
@@ -497,3 +545,99 @@ def submit_verified(
                 f"pane {pane_id}: prompt {state} after {presses} {key} key press(es); "
                 "outcome is unknown"
             )
+
+
+def composer_is_empty(view: ComposerView) -> bool:
+    """No solid text and no paste placeholder: faint hints and the cursor cell do not count."""
+    return not view.composer_solid.strip() and not _PASTE_PLACEHOLDER.findall(view.composer)
+
+
+def _composer_content(view: ComposerView) -> str:
+    return "\n".join(line.rstrip() for line in view.composer.splitlines())
+
+
+def clear_composer(
+    terminal: PromptTerminal, pane_id: str, harness: str,
+    *, sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Delete everything in the composer without submitting it, and prove it empty.
+
+    Sends the :data:`CLEAR_ROW_KEYS` pair and rereads the screen while text remains and the
+    last pair changed it, at most :data:`MAX_CLEAR_ROUNDS` times; a pair that changed nothing
+    is followed by one :data:`CLEAR_CHARACTER_KEY`, and if that changes nothing either the
+    clear fails. No key that submits, interrupts or opens a menu is sent. Returns the number
+    of keys sent; raises :class:`HerdrUnavailable` saying what was left.
+    """
+    def read() -> ComposerView:
+        view = composer_view(harness, terminal.read_screen(pane_id))
+        if view is None:
+            raise HerdrUnavailable(f"pane {pane_id} no longer shows a recognisable {harness} composer")
+        return view
+
+    view = read()
+    keys = 0
+    for _round in range(MAX_CLEAR_ROUNDS):
+        if composer_is_empty(view):
+            return keys
+        before = _composer_content(view)
+        for key in CLEAR_ROW_KEYS:
+            terminal.send_keys(pane_id, key)
+            keys += 1
+        sleep(POLL_SECONDS)
+        view = read()
+        if composer_is_empty(view):
+            return keys
+        if _composer_content(view) == before:
+            terminal.send_keys(pane_id, CLEAR_CHARACTER_KEY)
+            keys += 1
+            sleep(POLL_SECONDS)
+            view = read()
+            if not composer_is_empty(view) and _composer_content(view) == before:
+                raise HerdrUnavailable(
+                    f"pane {pane_id}: the {harness} composer did not change after {keys} "
+                    "clearing key(s); it still holds text"
+                )
+    if composer_is_empty(view):
+        return keys
+    raise HerdrUnavailable(
+        f"pane {pane_id}: the {harness} composer still holds text after {keys} clearing key(s)"
+    )
+
+
+def _withdraw_unaccepted(
+    terminal: PromptTerminal, pane_id: str, harness: str, text: str, before: ComposerView,
+    presses: int, key: str, elapsed: float, sleep: Callable[[float], None],
+) -> None:
+    """Take a prompt the agent never accepted back out; always raises.
+
+    :class:`PromptNotStaged` when the composer is proved empty and the screen shows nothing
+    the prompt left behind, so the prompt stays pending; otherwise an error the caller treats
+    as possibly submitted, as it treats a prompt left staged.
+    """
+    def left(detail: str) -> HerdrUnavailable:
+        return HerdrUnavailable(
+            f"pane {pane_id}: prompt is still staged in the {harness} composer after {presses} "
+            f"{key} key press(es) over {elapsed:.1f}s; taking it back out failed, so it is left "
+            f"there and treated as possibly submitted: {detail}"
+        )
+
+    try:
+        clear_composer(terminal, pane_id, harness, sleep=sleep)
+        view = composer_view(harness, terminal.read_screen(pane_id))
+    except HerdrUnavailable as exc:
+        raise left(str(exc)) from exc
+    if view is None:
+        raise left(f"pane {pane_id} no longer shows a recognisable {harness} composer")
+    if not composer_is_empty(view):
+        raise left("the composer is not empty after the clear")
+    evidence = _printed(before, view, text)
+    if evidence is not None:
+        raise HerdrUnavailable(
+            f"pane {pane_id}: the prompt may have been accepted while it was taken back out of "
+            f"the {harness} composer ({evidence}); outcome is unknown"
+        )
+    raise PromptNotStaged(
+        f"pane {pane_id}: the {harness} agent did not accept the prompt after {presses} {key} "
+        f"key press(es) over {elapsed:.1f}s; it was taken back out of the composer, which is "
+        "empty again, so nothing was submitted"
+    )

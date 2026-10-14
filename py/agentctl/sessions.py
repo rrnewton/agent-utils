@@ -89,7 +89,8 @@ class Sessions(ManagedAgents):
                       max_attempts: int = 3, slot: str | None = None,
                       slot_isolation: str | None = None,
                       slot_project: str | None = None,
-                      profile: str | None = None) -> dict[str, object]:
+                      profile: str | None = None,
+                      deliver_while_working: bool = False) -> dict[str, object]:
         """Create a native interactive terminal or a persistent headless runner."""
         _name(name)
         if profile is not None and re.fullmatch(r"[a-z][a-z0-9-]{0,31}", profile) is None:
@@ -105,8 +106,10 @@ class Sessions(ManagedAgents):
                 ready_timeout=ready_timeout, working_timeout=working_timeout,
                 max_attempts=max_attempts, slot=slot, slot_isolation=slot_isolation,
                 slot_project=slot_project,
-                profile=profile,
+                profile=profile, deliver_while_working=deliver_while_working,
             )
+        if deliver_while_working:
+            raise AgentDeliveryError("--deliver-while-working applies to interactive sessions only")
         if slot is not None:
             raise AgentDeliveryError("--slot is supported for interactive Herdr sessions only")
         if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy", "muse"):
