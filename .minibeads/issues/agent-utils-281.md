@@ -1,12 +1,13 @@
 ---
 title: 'view-keys: Cmd-1..Cmd-4 choose Main, All, Thread list and Two columns from anywhere'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-13T21:18:55.872525957+00:00
-updated_at: 2026-10-13T21:18:55.872525957+00:00
+updated_at: 2026-10-14T02:42:17.692232629+00:00
+closed_at: 2026-10-14T02:42:17.692232499+00:00
 ---
 
 # Description
