@@ -481,6 +481,10 @@ pub struct ReadCaps {
     /// `heads` is native). False for Discord, whose head moves only when a message is added.
     /// remote-ops-audit W12.
     pub heads_cover_edits: bool,
+    /// [`ChatClient::fetch_recent_many`]: the newest messages of several channels in fewer
+    /// upstream calls than a read of each. A caller that would gather reads into one only to save
+    /// calls (a catch-up, a warm-up) gathers them only when this is native. remote-ops-audit W13.
+    pub many_channels: Support,
     /// The most rows one upstream call returns, for a caller counting a budget in calls: Discord's
     /// 100 unless the provider says otherwise.
     pub page_rows: u16,
@@ -493,6 +497,7 @@ impl Default for ReadCaps {
             by_ids: Support::Emulated,
             heads: Support::Emulated,
             heads_cover_edits: false,
+            many_channels: Support::Emulated,
             page_rows: crate::discord::http::DISCORD_MAX_LIMIT,
         }
     }
@@ -565,12 +570,46 @@ impl ChannelHead {
     }
 }
 
+/// One answer per channel of a call about several channels, in the order asked: each channel
+/// with what was read of it, or why it could not be.
+pub type ChannelAnswers<T> = Vec<(ChannelId, Result<T, ChatError>)>;
+
 /// One answer per channel of a [`ChatClient::channel_heads`] call, in the order asked.
-pub type HeadAnswers = Vec<(ChannelId, Result<ChannelHead, ChatError>)>;
+pub type HeadAnswers = ChannelAnswers<ChannelHead>;
 
 /// How many [`ChatClient::fetch_recent`] reads [`emulated_heads`] keeps in flight: the bounded
 /// fan-out every bulk default keeps, per provider.
 pub const HEADS_IN_FLIGHT: usize = 4;
+
+/// What one channel's part of a [`ChatClient::fetch_recent_many`] asks for. remote-ops-audit W13
+/// `#287 bulk-reads`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecentAsk {
+    /// At most this many of the channel's most recent messages, as
+    /// [`ChatClient::fetch_recent_dated`] takes them.
+    pub limit: u16,
+    /// Only those created at or after this instant, in Unix milliseconds; `None` for no bound. A
+    /// message whose instant cannot be read is kept, as every time-bounded read here keeps it.
+    pub since_ms: Option<i64>,
+}
+
+impl RecentAsk {
+    /// The newest `limit` messages, however old.
+    #[must_use]
+    pub const fn newest(limit: u16) -> Self {
+        Self {
+            limit,
+            since_ms: None,
+        }
+    }
+}
+
+/// One answer per ask of a [`ChatClient::fetch_recent_many`] call, in the order asked.
+pub type RecentAnswers = ChannelAnswers<RecentRead>;
+
+/// How many [`ChatClient::fetch_recent_dated`] reads [`emulated_recent_many`] keeps in flight: the
+/// bounded fan-out every bulk default keeps, per provider. remote-ops-audit W13 `#287 bulk-reads`.
+pub const RECENT_IN_FLIGHT: usize = 4;
 
 /// Read and post access to configured chat channels.
 #[async_trait]
@@ -898,6 +937,26 @@ pub trait ChatClient: Send + Sync {
         emulated_heads(self, channels).await
     }
 
+    /// The most recent messages of each channel `asks` names: one answer per ask, in the order
+    /// asked, a repeated ask answered each time. remote-ops-audit W13 `#287 bulk-reads`.
+    ///
+    /// Each answer is what [`ChatClient::fetch_recent_dated`] of the ask's `limit` would answer for
+    /// that channel, less every message created before the ask's `since_ms` ([`since_trimmed`]).
+    /// A native read ([`ReadCaps::many_channels`]) costs fewer upstream calls than a read of each
+    /// channel (a bridge's is one request for all of them), so a caller may gather its reads into
+    /// one for it. An emulated one costs exactly the reads it is made of, so a caller that would
+    /// gather reads only to save calls does not.
+    ///
+    /// The default is [`emulated_recent_many`]: one [`ChatClient::fetch_recent_dated`] per ask,
+    /// [`RECENT_IN_FLIGHT`] at a time. The router asks each provider once, for its own channels
+    /// only.
+    ///
+    /// A channel that cannot be answered is an `Err` in its own place, never a failure of the
+    /// whole call.
+    async fn fetch_recent_many(&self, asks: &[(ChannelId, RecentAsk)]) -> RecentAnswers {
+        emulated_recent_many(self, asks).await
+    }
+
     /// Post `content` to `channel`, optionally as a reply to an existing message.
     ///
     /// # Errors
@@ -1216,7 +1275,96 @@ pub fn heads_in_order(
     channels: &[ChannelId],
     parts: Vec<(Vec<usize>, HeadAnswers)>,
 ) -> HeadAnswers {
-    let mut answers: Vec<Option<Result<ChannelHead, ChatError>>> = vec![None; channels.len()];
+    answers_in_order(channels, parts, "a head read", "head")
+}
+
+/// [`ChatClient::fetch_recent_many`]'s default: a read of several channels made of the read of
+/// each. remote-ops-audit W13 `#287 bulk-reads`.
+///
+/// One [`ChatClient::fetch_recent_dated`] of the ask's `limit` per ask, [`RECENT_IN_FLIGHT`] at a
+/// time, in the order asked; each read's failure is that channel's answer, and each answer is
+/// [`since_trimmed`] to its ask. Exactly the reads a caller reading the channels one by one would
+/// make, so a provider without a read of several channels of its own is asked nothing new. Nothing
+/// is read for an empty list.
+pub async fn emulated_recent_many<C: ChatClient + ?Sized>(
+    client: &C,
+    asks: &[(ChannelId, RecentAsk)],
+) -> RecentAnswers {
+    use futures_util::StreamExt as _;
+
+    // Made before they are streamed, as in `emulated_messages`.
+    let reads: Vec<_> = asks
+        .iter()
+        .map(|(channel, ask)| client.fetch_recent_dated(channel, ask.limit))
+        .collect();
+    let answers: Vec<_> = futures_util::stream::iter(reads)
+        .buffered(RECENT_IN_FLIGHT)
+        .collect()
+        .await;
+    asks.iter()
+        .zip(answers)
+        .map(|((channel, ask), read)| {
+            (
+                channel.clone(),
+                read.map(|read| since_trimmed(read, ask.since_ms)),
+            )
+        })
+        .collect()
+}
+
+/// `read` without the messages created before `since_ms`, when it is given. remote-ops-audit W13
+/// `#287 bulk-reads`.
+///
+/// A message whose creation instant cannot be read ([`Message::created_ms`]) is kept, as every
+/// time-bounded read here keeps it. A read that lost a message to the trim no longer reaches back
+/// to the channel's first message, so it is not `exhausted` whatever the provider said; `as_of` is
+/// kept as it was.
+#[must_use]
+pub fn since_trimmed(read: RecentRead, since_ms: Option<i64>) -> RecentRead {
+    let Some(since_ms) = since_ms else {
+        return read;
+    };
+    let before = read.messages.len();
+    let messages: Vec<Message> = read
+        .messages
+        .into_iter()
+        .filter(|m| m.created_ms().is_none_or(|ms| ms >= since_ms))
+        .collect();
+    let trimmed = messages.len() < before;
+    RecentRead {
+        messages,
+        as_of: read.as_of,
+        exhausted: read.exhausted && !trimmed,
+    }
+}
+
+/// Put recent reads given for parts of a list of asks back in the list's order, as
+/// [`heads_in_order`] does heads: `channels` are the asks' channels, in order. remote-ops-audit
+/// W13 `#287 bulk-reads`.
+#[must_use]
+pub fn recent_in_order(
+    channels: &[ChannelId],
+    parts: Vec<(Vec<usize>, RecentAnswers)>,
+) -> RecentAnswers {
+    answers_in_order(channels, parts, "a recent read", "recent read")
+}
+
+/// Put per-channel answers given for parts of a list of channels back in the list's order: each
+/// part is the positions its channels held in `channels` and what was answered for them, in that
+/// order. `read` names the read in an error ("a head read"), `answer` what one answer is ("head").
+///
+/// A position no part answered, or answered for a different channel, is a [`ChatError::Shape`] in
+/// its own place: a provider that skips or reorders channels must not have one channel's answer
+/// taken for another's.
+fn answers_in_order<T>(
+    channels: &[ChannelId],
+    parts: Vec<(Vec<usize>, ChannelAnswers<T>)>,
+    read: &str,
+    answer: &str,
+) -> ChannelAnswers<T> {
+    let mut answers: Vec<Option<Result<T, ChatError>>> = std::iter::repeat_with(|| None)
+        .take(channels.len())
+        .collect();
     for (positions, answered) in parts {
         let mut answered = answered.into_iter();
         for at in positions {
@@ -1224,25 +1372,24 @@ pub fn heads_in_order(
                 continue;
             };
             *slot = Some(match answered.next() {
-                Some((channel, head)) if channel == channels[at] => head,
-                Some(_) => Err(ChatError::Shape(
-                    "a head read answered for a different channel than the one in its place"
-                        .to_owned(),
-                )),
-                None => Err(ChatError::Shape(
-                    "a head read answered for fewer channels than it was asked about".to_owned(),
-                )),
+                Some((channel, value)) if channel == channels[at] => value,
+                Some(_) => Err(ChatError::Shape(format!(
+                    "{read} answered for a different channel than the one in its place"
+                ))),
+                None => Err(ChatError::Shape(format!(
+                    "{read} answered for fewer channels than it was asked about"
+                ))),
             });
         }
     }
     channels
         .iter()
         .cloned()
-        .zip(answers.into_iter().map(|answer| {
-            answer.unwrap_or_else(|| {
-                Err(ChatError::Shape(
-                    "no head was asked for in this channel's place".to_owned(),
-                ))
+        .zip(answers.into_iter().map(|value| {
+            value.unwrap_or_else(|| {
+                Err(ChatError::Shape(format!(
+                    "no {answer} was asked for in this channel's place"
+                )))
             })
         }))
         .collect()
@@ -1433,6 +1580,294 @@ mod heads_tests {
             FakeDiscord::new()
                 .read_caps(&ChannelId("42".to_owned()))
                 .heads,
+            Support::Emulated
+        );
+    }
+}
+
+#[cfg(test)]
+mod recent_many_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::discord::fake::FakeDiscord;
+
+    const BASE_MS: i64 = 1_787_000_000_000;
+
+    /// A provider that writes only what the trait requires, counts its page reads and the most in
+    /// flight at once, and logs each one.
+    struct Plain {
+        inner: FakeDiscord,
+        in_flight: AtomicUsize,
+        most_in_flight: AtomicUsize,
+        reads: Mutex<Vec<(String, u16)>>,
+    }
+
+    impl Plain {
+        fn new() -> Self {
+            Self {
+                inner: FakeDiscord::new(),
+                in_flight: AtomicUsize::new(0),
+                most_in_flight: AtomicUsize::new(0),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatClient for Plain {
+        async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+            self.inner.identity().await
+        }
+
+        async fn fetch_page(
+            &self,
+            channel: &ChannelId,
+            limit: u16,
+            before: Option<&MessageId>,
+            after: Option<&MessageId>,
+        ) -> Result<Vec<Message>, ChatError> {
+            self.reads
+                .lock()
+                .expect("log")
+                .push((channel.0.clone(), limit));
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.inner.fetch_page(channel, limit, before, after).await
+        }
+
+        async fn post_message(
+            &self,
+            channel: &ChannelId,
+            content: &str,
+            reply_to: Option<&MessageId>,
+        ) -> Result<Message, ChatError> {
+            self.inner.post_message(channel, content, reply_to).await
+        }
+    }
+
+    fn bodies(read: &RecentRead) -> Vec<&str> {
+        read.messages.iter().map(|m| m.content.as_str()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_reads_each_channel_four_at_a_time_in_order() {
+        let provider = Plain::new();
+        let mut asks = Vec::new();
+        for n in 0..6_i64 {
+            let channel = ChannelId(format!("{}", 100 + n));
+            for m in 0..3 {
+                provider.inner.seed_at(
+                    &channel,
+                    "ada",
+                    &format!("{n}.{m}"),
+                    BASE_MS + n * 10_000 + m * 1_000,
+                );
+            }
+            asks.push((channel, RecentAsk::newest(2)));
+        }
+        let unknown = ChannelId("404".to_owned());
+        asks.insert(2, (unknown, RecentAsk::newest(2)));
+        asks.push((asks[0].0.clone(), RecentAsk::newest(3)));
+
+        let answers = provider.fetch_recent_many(&asks).await;
+
+        assert_eq!(
+            answers.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+            asks.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+            "one answer per ask, in the order asked, a repeat answered again"
+        );
+        let reads = provider.reads.lock().expect("log").clone();
+        assert_eq!(
+            reads,
+            asks.iter()
+                .map(|(c, ask)| (c.0.clone(), ask.limit))
+                .collect::<Vec<_>>(),
+            "one read of each ask's size per ask, in order"
+        );
+        assert_eq!(
+            provider.most_in_flight.load(Ordering::SeqCst),
+            RECENT_IN_FLIGHT
+        );
+        assert!(
+            answers[2].1.is_err(),
+            "the unknown channel fails in its own place"
+        );
+        let read = |at: usize| answers[at].1.as_ref().expect("read");
+        assert_eq!(bodies(read(0)), ["0.1", "0.2"]);
+        assert_eq!(bodies(read(3)), ["2.1", "2.2"]);
+        assert_eq!(
+            bodies(read(7)),
+            ["0.0", "0.1", "0.2"],
+            "the repeat's own size"
+        );
+        for at in [0, 1, 3, 4, 5, 6, 7] {
+            assert_eq!(read(at).as_of, None);
+            assert!(!read(at).exhausted, "a default read proves nothing");
+        }
+
+        provider.reads.lock().expect("log").clear();
+        assert!(provider.fetch_recent_many(&[]).await.is_empty());
+        assert!(
+            provider.reads.lock().expect("log").is_empty(),
+            "nothing asked"
+        );
+    }
+
+    /// A provider that answers every recent read with the three messages it holds, from a copy it
+    /// says is complete up to a fixed instant and reaches back to the channel's first message.
+    struct Whole(FakeDiscord);
+
+    #[async_trait]
+    impl ChatClient for Whole {
+        async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+            self.0.identity().await
+        }
+
+        async fn fetch_page(
+            &self,
+            channel: &ChannelId,
+            limit: u16,
+            before: Option<&MessageId>,
+            after: Option<&MessageId>,
+        ) -> Result<Vec<Message>, ChatError> {
+            self.0.fetch_page(channel, limit, before, after).await
+        }
+
+        async fn fetch_recent_dated(
+            &self,
+            channel: &ChannelId,
+            limit: u16,
+        ) -> Result<RecentRead, ChatError> {
+            Ok(RecentRead {
+                messages: self.0.fetch_recent(channel, limit).await?,
+                as_of: Some("2026-10-13T12:00:00Z".to_owned()),
+                exhausted: true,
+            })
+        }
+
+        async fn post_message(
+            &self,
+            channel: &ChannelId,
+            content: &str,
+            reply_to: Option<&MessageId>,
+        ) -> Result<Message, ChatError> {
+            self.0.post_message(channel, content, reply_to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_trims_each_answer_to_its_since_and_never_claims_a_trimmed_read_whole() {
+        let provider = Whole(FakeDiscord::new());
+        let channel = ChannelId("42".to_owned());
+        for m in 0..3 {
+            provider
+                .0
+                .seed_at(&channel, "ada", &format!("m{m}"), BASE_MS + m * 1_000);
+        }
+        let answers = provider
+            .fetch_recent_many(&[
+                (channel.clone(), RecentAsk::newest(10)),
+                (
+                    channel.clone(),
+                    RecentAsk {
+                        limit: 10,
+                        since_ms: Some(BASE_MS + 1_000),
+                    },
+                ),
+                (
+                    channel.clone(),
+                    RecentAsk {
+                        limit: 10,
+                        since_ms: Some(BASE_MS),
+                    },
+                ),
+            ])
+            .await;
+        let read = |at: usize| answers[at].1.as_ref().expect("read");
+        assert_eq!(bodies(read(0)), ["m0", "m1", "m2"]);
+        assert!(read(0).exhausted, "untrimmed, the provider's word stands");
+        assert_eq!(bodies(read(1)), ["m1", "m2"], "the since is inclusive");
+        assert!(
+            !read(1).exhausted,
+            "a trimmed read is not the whole channel"
+        );
+        assert_eq!(bodies(read(2)), ["m0", "m1", "m2"]);
+        assert!(read(2).exhausted, "nothing was trimmed");
+        for at in 0..3 {
+            assert_eq!(read(at).as_of.as_deref(), Some("2026-10-13T12:00:00Z"));
+        }
+    }
+
+    #[test]
+    fn a_message_whose_instant_cannot_be_read_survives_the_trim() {
+        let fake = FakeDiscord::new();
+        let channel = ChannelId("42".to_owned());
+        let mut timeless = fake
+            .message(&fake.seed_at(&channel, "ada", "new", BASE_MS + 5_000))
+            .expect("seeded");
+        timeless.id = MessageId("not-a-snowflake".to_owned());
+        timeless.timestamp = String::new();
+        let old = fake
+            .message(&fake.seed_at(&channel, "ada", "older", BASE_MS - 5_000))
+            .expect("seeded");
+        let read = since_trimmed(
+            RecentRead {
+                messages: vec![old, timeless],
+                as_of: None,
+                exhausted: true,
+            },
+            Some(BASE_MS),
+        );
+        assert_eq!(bodies(&read), ["new"]);
+        assert!(!read.exhausted);
+        let untouched = RecentRead {
+            messages: read.messages.clone(),
+            as_of: None,
+            exhausted: true,
+        };
+        assert_eq!(since_trimmed(untouched.clone(), None), untouched);
+    }
+
+    #[test]
+    fn recent_reads_go_back_in_the_order_asked_and_a_skipped_or_reordered_one_is_an_error() {
+        let ids: Vec<ChannelId> = ["a", "b", "c"]
+            .iter()
+            .map(|id| ChannelId((*id).to_owned()))
+            .collect();
+        let answers = recent_in_order(
+            &ids,
+            vec![
+                (vec![2], vec![(ids[2].clone(), Ok(RecentRead::default()))]),
+                (vec![0], vec![(ids[1].clone(), Ok(RecentRead::default()))]),
+            ],
+        );
+        assert!(
+            matches!(&answers[0].1, Err(ChatError::Shape(detail)) if detail.contains("recent read")),
+            "another channel's read: {:?}",
+            answers[0].1
+        );
+        assert!(
+            matches!(&answers[1].1, Err(ChatError::Shape(detail)) if detail.contains("recent read")),
+            "never asked"
+        );
+        assert_eq!(answers[2].1.as_ref().ok(), Some(&RecentRead::default()));
+        assert_eq!(
+            answers.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn a_provider_that_says_nothing_reads_several_channels_as_it_always_read_them() {
+        assert_eq!(ReadCaps::default().many_channels, Support::Emulated);
+        assert_eq!(
+            FakeDiscord::new()
+                .read_caps(&ChannelId("42".to_owned()))
+                .many_channels,
             Support::Emulated
         );
     }

@@ -23,8 +23,8 @@ use slack_fake::{profiled, ts, Fake, FakeState, METHODS, TOKEN};
 use tower::ServiceExt as _;
 use vibe_talk::chat::{
     ChannelHead, ChatClient, ChatError, ChatIdentity, HeadAnswers, Lookup, PostLimit, RangeOrder,
-    RangeRead, ReadCaps, ReadScope, RecentRead, RegisteredChannel, SourceClaim, Support, TimeRange,
-    UpstreamClearOutcome,
+    RangeRead, ReadCaps, ReadScope, RecentAnswers, RecentAsk, RecentRead, RegisteredChannel,
+    SourceClaim, Support, TimeRange, UpstreamClearOutcome,
 };
 use vibe_talk::directory::{DirectoryPage, DirectoryRequest};
 use vibe_talk::discord::fake::FakeDiscord;
@@ -435,6 +435,7 @@ impl ChatClient for Recorder {
             by_ids: Support::Native,
             heads: Support::Native,
             heads_cover_edits: true,
+            many_channels: Support::Native,
             page_rows: 7,
         }
     }
@@ -485,6 +486,21 @@ impl ChatClient for Recorder {
                         newest_id: Some(self.message.id.clone()),
                         unchanged_since_ms: Some(7),
                         ..ChannelHead::default()
+                    }),
+                )
+            })
+            .collect()
+    }
+    async fn fetch_recent_many(&self, asks: &[(ChannelId, RecentAsk)]) -> RecentAnswers {
+        self.note("fetch_recent_many");
+        asks.iter()
+            .map(|(channel, _)| {
+                (
+                    channel.clone(),
+                    Ok(RecentRead {
+                        messages: vec![self.message.clone()],
+                        as_of: Some("2026-10-12T10:00:00Z".to_owned()),
+                        exhausted: false,
                     }),
                 )
             })
@@ -719,6 +735,24 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         calls.drain(..2);
     }
     ran("channel_heads");
+    let recent = client
+        .fetch_recent_many(&[
+            (channel.clone(), RecentAsk::newest(5)),
+            (ChannelId("C9".to_owned()), RecentAsk::newest(5)),
+        ])
+        .await;
+    assert_eq!(recent.len(), 2);
+    assert!(recent
+        .iter()
+        .all(|(_, read)| read.as_ref().expect("a read").as_of.as_deref()
+            == Some("2026-10-12T10:00:00Z")));
+    // The profiler asks, channel by channel, whether the provider reads them together itself.
+    {
+        let mut calls = recorder.calls.lock().expect("calls");
+        assert_eq!(calls[..2], ["read_caps", "read_caps"], "{calls:?}");
+        calls.drain(..2);
+    }
+    ran("fetch_recent_many");
     client
         .post_message(&channel, "hi", None)
         .await
@@ -797,11 +831,16 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     );
     assert_eq!(rows("fetch_range"), Some(1));
     assert_eq!(rows("fetch_messages"), Some(1), "a found message is a row");
-    // Nine reads each return the one message (a lookup's absent id is no message); posts return
-    // ours and are not counted.
+    assert_eq!(
+        rows("fetch_recent_many"),
+        Some(2),
+        "one message from each of two channels"
+    );
+    // Nine reads each return the one message (a lookup's absent id is no message), and the read
+    // of two channels returns it twice; posts return ours and are not counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 9, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 9 * bytes);
+    assert_eq!(rec.content_bytes.messages, 11, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 11 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),
@@ -1231,4 +1270,47 @@ async fn an_emulated_head_read_is_timed_and_counted_as_the_reads_it_is_made_of()
     counting.channel_heads(&channels).await;
     assert_eq!(counting.count("fetch_recent"), 2);
     assert_eq!(counting.count("channel_heads"), 0);
+}
+
+/// remote-ops-audit W13 `#287 bulk-reads`: a provider that does not read several channels together
+/// itself is asked the recent reads the default is made of, and each is timed and counted as
+/// itself; nothing is ever timed as `fetch_recent_many` for it.
+#[tokio::test]
+async fn an_emulated_read_of_several_channels_is_timed_and_counted_as_the_reads_it_is_made_of() {
+    let fake = Arc::new(FakeDiscord::new());
+    let channels = [ChannelId("C1".to_owned()), ChannelId("C2".to_owned())];
+    let newest = fake.seed(&channels[0], "ada", "words of some length");
+    fake.register_channel(&channels[1]);
+    let asks: Vec<(ChannelId, RecentAsk)> = channels
+        .iter()
+        .map(|channel| (channel.clone(), RecentAsk::newest(5)))
+        .collect();
+    let profile = UpstreamProfile::new();
+    let profiled = ProfiledClient::new(
+        Arc::clone(&fake) as Arc<dyn ChatClient>,
+        profile.provider("fake", "Fake"),
+    );
+    let answers = profiled.fetch_recent_many(&asks).await;
+    let read = |at: usize| answers[at].1.as_ref().expect("a read");
+    assert_eq!(
+        read(0)
+            .messages
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>(),
+        [newest]
+    );
+    assert!(read(1).messages.is_empty());
+    let report = profile.report();
+    let names: Vec<(&str, u64)> = report.providers[0]
+        .operations
+        .iter()
+        .map(|row| (row.name, row.count))
+        .collect();
+    assert_eq!(names, [("fetch_recent_dated", 2)], "{names:?}");
+
+    let counting = vibe_talk::testing::CountingChat::new(Arc::clone(&fake) as Arc<dyn ChatClient>);
+    counting.fetch_recent_many(&asks).await;
+    assert_eq!(counting.count("fetch_recent_dated"), 2);
+    assert_eq!(counting.count("fetch_recent_many"), 0);
 }

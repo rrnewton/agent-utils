@@ -22,11 +22,14 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
-use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
+use vibe_talk::chat::{
+    ChatClient, ChatError, ChatIdentity, ReadCaps, RecentAnswers, RecentAsk, RecentRead, Support,
+};
 use vibe_talk::discord::fake::FakeDiscord;
-use vibe_talk::model::{ChannelId, Message, MessageId};
+use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId};
+use vibe_talk::providers::{ChatRouter, ProviderEntry};
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
+use vibe_talk::testing::{CountingChat, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL};
 
 /// The three channels past the two the test configuration has, so a catch-up reads five.
 const EXTRA: [&str; 3] = ["3333333333", "4444444444", "5555555555"];
@@ -466,4 +469,197 @@ async fn a_provider_without_a_read_of_several_channels_gets_todays_answers_at_to
         "one page read, then the other four: {page_then:?}"
     );
     assert!(page_then[0].contains(WRITE_CHANNEL));
+}
+
+/// A provider that reads several channels together itself (or says it does not, with
+/// `native: false`), answering each ask from its fake's newest messages and logging the channels
+/// of each call. What it reads to answer is not an upstream call of its own: a [`CountingChat`]
+/// around it counts what the server asks.
+struct Gathered {
+    inner: Arc<FakeDiscord>,
+    native: bool,
+    /// What every answer says about its currency; see [`RecentRead::as_of`].
+    as_of: Mutex<Option<String>>,
+    /// Channels the provider leaves out of its answers.
+    leaves_out: Mutex<HashSet<String>>,
+    asked: Mutex<Vec<Vec<String>>>,
+}
+
+impl Gathered {
+    fn new(inner: Arc<FakeDiscord>, native: bool) -> Self {
+        Self {
+            inner,
+            native,
+            as_of: Mutex::new(None),
+            leaves_out: Mutex::new(HashSet::new()),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<Vec<String>> {
+        self.asked.lock().expect("log").clone()
+    }
+}
+
+#[async_trait]
+impl ChatClient for Gathered {
+    fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {
+        ReadCaps {
+            many_channels: if self.native {
+                Support::Native
+            } else {
+                Support::Emulated
+            },
+            ..ReadCaps::default()
+        }
+    }
+
+    async fn fetch_recent_many(&self, asks: &[(ChannelId, RecentAsk)]) -> RecentAnswers {
+        self.asked
+            .lock()
+            .expect("log")
+            .push(asks.iter().map(|(c, _)| c.0.clone()).collect());
+        let as_of = self.as_of.lock().expect("setting").clone();
+        let leaves_out = self.leaves_out.lock().expect("setting").clone();
+        let mut answers = Vec::new();
+        for (channel, ask) in asks {
+            let read = if leaves_out.contains(channel.as_str()) {
+                Err(ChatError::Refused("left out".to_owned()))
+            } else {
+                self.inner
+                    .fetch_recent(channel, ask.limit)
+                    .await
+                    .map(|messages| RecentRead {
+                        messages,
+                        as_of: as_of.clone(),
+                        exhausted: false,
+                    })
+            };
+            answers.push((channel.clone(), read));
+        }
+        answers
+    }
+
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn post_message(
+        &self,
+        _channel: &ChannelId,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused("this test posts nothing".to_owned()))
+    }
+}
+
+fn routed(id: &str, provider: &str) -> ChannelInfo {
+    ChannelInfo {
+        id: channel(id),
+        label: id.to_owned(),
+        writable: false,
+        alias: None,
+        added: false,
+        provider: Some(provider.to_owned()),
+    }
+}
+
+/// remote-ops-audit W13, the router's proof: five channels on a provider that reads several
+/// together and one on a provider that does not are one call to the first, for all five of its
+/// channels, and the one read the second's default is made of; every answer comes back in the
+/// order asked, and a channel no provider holds is refused in its own place and asked of nobody.
+#[tokio::test]
+async fn the_router_asks_each_provider_once_for_its_own_channels() {
+    let fake_a = Arc::new(FakeDiscord::new());
+    let fake_b = Arc::new(FakeDiscord::new());
+    let a_ids = ["A1", "A2", "A3", "A4", "A5"];
+    for id in a_ids {
+        fake_a.seed(&channel(id), "ada", &format!("said in {id}"));
+    }
+    fake_b.seed(&channel("B1"), "ada", "said in B1");
+    let gathered_a = Arc::new(Gathered::new(fake_a, true));
+    let gathered_b = Arc::new(Gathered::new(fake_b, false));
+    let counting_a = Arc::new(CountingChat::new(
+        Arc::clone(&gathered_a) as Arc<dyn ChatClient>
+    ));
+    let counting_b = Arc::new(CountingChat::new(
+        Arc::clone(&gathered_b) as Arc<dyn ChatClient>
+    ));
+    let entry = |key: &str, client: Arc<CountingChat>| ProviderEntry {
+        key: key.to_owned(),
+        namespace: key.to_owned(),
+        client,
+        live_poll_seconds: 0,
+    };
+    let router = ChatRouter::new(
+        vec![
+            entry("a", Arc::clone(&counting_a)),
+            entry("b", Arc::clone(&counting_b)),
+        ],
+        None,
+    );
+    let mut routes: Vec<ChannelInfo> = a_ids.iter().map(|id| routed(id, "a")).collect();
+    routes.push(routed("B1", "b"));
+    router.replace_routes(&routes);
+
+    let asked: Vec<ChannelId> = ["A1", "A2", "B1", "A3", "NOWHERE", "A4", "A5"]
+        .iter()
+        .map(|id| channel(id))
+        .collect();
+    let asks: Vec<(ChannelId, RecentAsk)> = asked
+        .iter()
+        .map(|channel| (channel.clone(), RecentAsk::newest(20)))
+        .collect();
+    let answers = router.fetch_recent_many(&asks).await;
+
+    assert_eq!(counting_a.count("fetch_recent_many"), 1);
+    assert_eq!(
+        counting_a.calls().len(),
+        1,
+        "one call for all five, and no read of any one channel"
+    );
+    assert_eq!(gathered_a.asked(), [a_ids.to_vec()]);
+    assert_eq!(counting_b.count("fetch_recent_many"), 0);
+    assert_eq!(
+        counting_b.count("fetch_recent_dated"),
+        1,
+        "the emulated provider is read as it always was"
+    );
+    assert!(
+        gathered_b.asked().is_empty(),
+        "an emulated provider's own read of several channels is never asked"
+    );
+    assert_eq!(
+        answers.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+        asked
+    );
+    for (at, (id, (_, answer))) in asked.iter().zip(&answers).enumerate() {
+        if id.as_str() == "NOWHERE" {
+            assert!(
+                matches!(answer, Err(ChatError::Refused(_))),
+                "{at}: {answer:?}"
+            );
+            continue;
+        }
+        let read = answer.as_ref().expect("a read");
+        assert_eq!(
+            read.messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            [format!("said in {id}")],
+            "{at}: each channel's own messages, in its own place"
+        );
+    }
 }

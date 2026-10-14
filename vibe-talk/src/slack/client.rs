@@ -921,12 +921,18 @@ impl ChatClient for HttpSlackClient {
     /// Heads stay emulated (remote-ops-audit W12): no Slack call answers the newest message of
     /// several conversations, so a head here is a one-message history read per channel, and the
     /// callers that would use heads only as a cheap gate do not ask.
+    ///
+    /// Reads of several channels stay emulated too (remote-ops-audit W13): no Slack call reads the
+    /// newest messages of several conversations at once, so a read of several is the trait's
+    /// default, one history read per channel, and a catch-up reads Slack channels one by one as
+    /// before.
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
         crate::chat::ReadCaps {
             range: crate::chat::Support::Native,
             by_ids: crate::chat::Support::Native,
             heads: crate::chat::Support::Emulated,
             heads_cover_edits: false,
+            many_channels: crate::chat::Support::Emulated,
             page_rows: super::range::PAGE_ROWS,
         }
     }

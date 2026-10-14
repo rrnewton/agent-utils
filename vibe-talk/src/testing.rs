@@ -882,6 +882,47 @@ impl crate::chat::ChatClient for CountingChat {
         )
     }
 
+    /// Counted as what it costs upstream, as `ProfiledClient` times it: the channels the provider
+    /// reads together itself are one `fetch_recent_many` (naming no single channel); for the rest
+    /// the trait's default runs here, so each `fetch_recent_dated` it is made of is counted as
+    /// itself. A scripted failure of `fetch_recent_many` is every native ask's answer.
+    /// remote-ops-audit W13 `#287 bulk-reads`.
+    async fn fetch_recent_many(
+        &self,
+        asks: &[(crate::model::ChannelId, crate::chat::RecentAsk)],
+    ) -> crate::chat::RecentAnswers {
+        let (native, emulated): (Vec<usize>, Vec<usize>) = (0..asks.len()).partition(|at| {
+            self.inner.read_caps(&asks[*at].0).many_channels == crate::chat::Support::Native
+        });
+        let pick = |positions: &[usize]| -> Vec<(crate::model::ChannelId, crate::chat::RecentAsk)> {
+            positions.iter().map(|at| asks[*at].clone()).collect()
+        };
+        let (native_asks, emulated_asks) = (pick(&native), pick(&emulated));
+        let native_answers = if native_asks.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .counted(call_without_channel("fetch_recent_many"), async {
+                    Ok(self.inner.fetch_recent_many(&native_asks).await)
+                })
+                .await
+            {
+                Ok(answers) => answers,
+                Err(error) => native_asks
+                    .iter()
+                    .map(|(channel, _)| (channel.clone(), Err(error.clone())))
+                    .collect(),
+            }
+        };
+        let emulated_answers = crate::chat::emulated_recent_many(self, &emulated_asks).await;
+        let channels: Vec<crate::model::ChannelId> =
+            asks.iter().map(|(channel, _)| channel.clone()).collect();
+        crate::chat::recent_in_order(
+            &channels,
+            vec![(native, native_answers), (emulated, emulated_answers)],
+        )
+    }
+
     async fn post_message(
         &self,
         channel: &crate::model::ChannelId,

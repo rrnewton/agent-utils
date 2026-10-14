@@ -1028,6 +1028,34 @@ impl ProfiledClient {
         answers
     }
 
+    /// One native read of several channels, timed as `fetch_recent_many`: its rows are the
+    /// messages of every channel answered, its content theirs, and it failed when no channel was
+    /// answered. Nothing is asked, or timed, for no asks. remote-ops-audit W13 `#287 bulk-reads`.
+    async fn timed_recent_many(
+        &self,
+        asks: &[(ChannelId, crate::chat::RecentAsk)],
+    ) -> crate::chat::RecentAnswers {
+        if asks.is_empty() {
+            return Vec::new();
+        }
+        let timer = self.profile.start(Series::Operation, "fetch_recent_many");
+        let answers = self.inner.fetch_recent_many(asks).await;
+        let reads: Vec<&RecentRead> = answers
+            .iter()
+            .filter_map(|(_, read)| read.as_ref().ok())
+            .collect();
+        match answers.iter().find_map(|(_, read)| read.as_ref().err()) {
+            Some(error) if reads.is_empty() => timer.finish(Outcome::of(error), 0),
+            _ => {
+                let rows = reads.iter().map(|read| read.messages.len()).sum();
+                timer.finish(Outcome::Ok, rows)
+            }
+        };
+        self.profile
+            .record_content(reads.iter().flat_map(|read| read.messages.iter()));
+        answers
+    }
+
     async fn timed<T, F>(
         &self,
         operation: &'static str,
@@ -1321,6 +1349,32 @@ impl ChatClient for ProfiledClient {
         );
         crate::chat::heads_in_order(
             channels,
+            vec![(native, native_answers), (emulated, emulated_answers)],
+        )
+    }
+
+    async fn fetch_recent_many(
+        &self,
+        asks: &[(ChannelId, crate::chat::RecentAsk)],
+    ) -> crate::chat::RecentAnswers {
+        // Timed under what it costs upstream, as a head read is. The channels the provider reads
+        // together itself are one `fetch_recent_many`; for the rest the trait's default runs HERE,
+        // so each `fetch_recent_dated` it is made of is timed as itself, as it was before this
+        // method existed. remote-ops-audit W13 `#287 bulk-reads`.
+        let (native, emulated): (Vec<usize>, Vec<usize>) = (0..asks.len()).partition(|at| {
+            self.inner.read_caps(&asks[*at].0).many_channels == crate::chat::Support::Native
+        });
+        let pick = |positions: &[usize]| -> Vec<(ChannelId, crate::chat::RecentAsk)> {
+            positions.iter().map(|at| asks[*at].clone()).collect()
+        };
+        let (native_asks, emulated_asks) = (pick(&native), pick(&emulated));
+        let (native_answers, emulated_answers) = tokio::join!(
+            self.timed_recent_many(&native_asks),
+            crate::chat::emulated_recent_many(self, &emulated_asks)
+        );
+        let channels: Vec<ChannelId> = asks.iter().map(|(channel, _)| channel.clone()).collect();
+        crate::chat::recent_in_order(
+            &channels,
             vec![(native, native_answers), (emulated, emulated_answers)],
         )
     }

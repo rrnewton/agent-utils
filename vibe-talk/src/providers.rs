@@ -284,6 +284,21 @@ impl ChatRouter {
         self.routes.read().ok()?.get(channel).copied()
     }
 
+    /// The positions in `channels` of each provider's channels, by provider, in order, and the
+    /// positions of the channels no provider holds. For a call about several channels, which asks
+    /// each provider once for its own. remote-ops-audit W12 and W13 `#287 bulk-reads`.
+    fn by_provider(&self, channels: &[ChannelId]) -> (BTreeMap<usize, Vec<usize>>, Vec<usize>) {
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut unrouted = Vec::new();
+        for (at, channel) in channels.iter().enumerate() {
+            match self.index_for(channel) {
+                Some(index) => groups.entry(index).or_default().push(at),
+                None => unrouted.push(at),
+            }
+        }
+        (groups, unrouted)
+    }
+
     fn route(&self, channel: &ChannelId) -> Result<&ProviderEntry, ChatError> {
         self.index_for(channel)
             .map(|index| &self.entries[index])
@@ -419,6 +434,28 @@ fn decode_cursor(cursor: &str) -> Option<(usize, Option<String>)> {
     let (index, inner) = rest.split_once('.')?;
     let index = index.parse().ok()?;
     Some((index, (!inner.is_empty()).then(|| inner.to_owned())))
+}
+
+/// The answers of the channels at `positions` of `channels`, which no provider holds: each refused
+/// in its own place, as a read of one of them always was. For [`ChatRouter::by_provider`]'s
+/// callers.
+fn unrouted_part<T>(
+    channels: &[ChannelId],
+    positions: Vec<usize>,
+) -> (Vec<usize>, crate::chat::ChannelAnswers<T>) {
+    let answers = positions
+        .iter()
+        .map(|at| {
+            let channel = &channels[*at];
+            (
+                channel.clone(),
+                Err(ChatError::Refused(format!(
+                    "channel {channel} is not assigned to any configured chat provider"
+                ))),
+            )
+        })
+        .collect();
+    (positions, answers)
 }
 
 #[async_trait]
@@ -587,30 +624,37 @@ impl ChatClient for ChatRouter {
     /// read once whatever else is asked beside them. A channel no provider holds is refused in its
     /// own place and asked of nobody.
     async fn channel_heads(&self, channels: &[ChannelId]) -> crate::chat::HeadAnswers {
-        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        let mut unrouted = (Vec::new(), Vec::new());
-        for (at, channel) in channels.iter().enumerate() {
-            match self.index_for(channel) {
-                Some(index) => groups.entry(index).or_default().push(at),
-                None => {
-                    unrouted.0.push(at);
-                    unrouted.1.push((
-                        channel.clone(),
-                        Err(ChatError::Refused(format!(
-                            "channel {channel} is not assigned to any configured chat provider"
-                        ))),
-                    ));
-                }
-            }
-        }
+        let (groups, unrouted) = self.by_provider(channels);
         let asks = groups.into_iter().map(|(index, positions)| async move {
             let subset: Vec<ChannelId> = positions.iter().map(|at| channels[*at].clone()).collect();
             let answered = self.entries[index].client.channel_heads(&subset).await;
             (positions, answered)
         });
         let mut parts = futures_util::future::join_all(asks).await;
-        parts.push(unrouted);
+        parts.push(unrouted_part(channels, unrouted));
         crate::chat::heads_in_order(channels, parts)
+    }
+
+    /// Each provider is asked once, for its own channels, and every provider at once; the answers
+    /// go back in the order asked. remote-ops-audit W13 `#287 bulk-reads`. So five bridge channels
+    /// and a Slack channel are two calls: one to the bridge, which may answer all five in one
+    /// request, and one to Slack, whose default reads its channel as before. A channel no provider
+    /// holds is refused in its own place and asked of nobody.
+    async fn fetch_recent_many(
+        &self,
+        asks: &[(ChannelId, crate::chat::RecentAsk)],
+    ) -> crate::chat::RecentAnswers {
+        let channels: Vec<ChannelId> = asks.iter().map(|(channel, _)| channel.clone()).collect();
+        let (groups, unrouted) = self.by_provider(&channels);
+        let reads = groups.into_iter().map(|(index, positions)| async move {
+            let subset: Vec<(ChannelId, crate::chat::RecentAsk)> =
+                positions.iter().map(|at| asks[*at].clone()).collect();
+            let answered = self.entries[index].client.fetch_recent_many(&subset).await;
+            (positions, answered)
+        });
+        let mut parts = futures_util::future::join_all(reads).await;
+        parts.push(unrouted_part(&channels, unrouted));
+        crate::chat::recent_in_order(&channels, parts)
     }
 
     fn supports_channel_registration(&self) -> bool {
