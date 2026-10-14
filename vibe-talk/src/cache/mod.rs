@@ -1,10 +1,27 @@
 //! The message cache: a disposable on-disk copy of channel messages. `#208 persistent-cache`.
 //!
-//! **Filled, not served yet.** The read sites offer what write-scope and server-owned reads see to
-//! the server's [`Sink`] (milestone `cache-fill`, under way). A server opens a cache behind it
-//! only when its configuration's `[message_cache]` table says `enabled = true` and the owner has
-//! not turned it off ([`lifecycle`]); nothing reads one back yet, so what a caller is answered is
-//! exactly what it was before the cache existed. Later milestones serve from it.
+//! **Filled, not served yet** (milestone `cache-fill`). A server opens a cache only when its
+//! configuration's `[message_cache]` table says `enabled = true` and the owner has not turned it
+//! off ([`lifecycle`]). The cache then sits behind the server's one [`Sink`], which fills it from:
+//!
+//! - what write-scope and server-owned reads see. The read sites offer it under a [`FillGrant`],
+//!   which a read-scope caller never has ([`grant`]), and each read claims only what it proves
+//!   ([`observe`]);
+//! - every change the live feed publishes, and every message the server posts.
+//!
+//! The sink fills a channel only while it is on the server's list, and sweeps away every channel
+//! that is not. It fills a provider only once that provider's own client has said which account it
+//! is, and the file agrees. When a provider refuses to let the server read a channel, a thread or
+//! anything at all, the sink stops trusting what it holds of it at once, and erases that once the
+//! refusal is confirmed ([`access`]). The store's summaries follow what the cache learns
+//! ([`orphans`]). The owner's switch, the purge and every erase of the whole file are in
+//! [`lifecycle`] and [`marker`].
+//!
+//! Nothing reads the cache back to answer anyone: what a caller is answered is exactly what it was
+//! before the cache existed. Instead, each read a later milestone will answer from the cache is
+//! shadowed ([`shadow`]). What the cache would have served is counted in memory, beside the
+//! upstream answer, and reported in diagnostics. For operators, see the README's section "The
+//! message cache".
 //!
 //! # A separate file, never tables in the store
 //!
