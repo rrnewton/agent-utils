@@ -45181,7 +45181,9 @@ def _absent_batch_refused_after_its_archives(
     allow_test_host_for_absent_validate_recovery(project, monkeypatch)
     real_safe = wrkslots._assert_absent_validate_rows_safe
 
-    def refuse_once_archived(config_arg, rows):
+    def refuse_once_archived(
+        config_arg: wrkslots.Config, rows: Sequence[wrkslots.ActiveRecord]
+    ) -> None:
         archived = {
             entry.get("slot") for entry in wrkslots._load_archive(config_arg).records
         }
@@ -45248,7 +45250,7 @@ def test_create_and_classification_proceed_beside_an_interrupted_absent_validate
 
     # The replay still finishes the batch exactly, around the new slot.
     assert run_absent_validate_recovery(project, input_path, apply=True) == 0
-    assert [row["slot"] for row in active_slots(project)] == ["fresh-c"]
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == ["fresh-c"]
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
@@ -45298,12 +45300,14 @@ def test_a_batch_named_row_whose_archive_is_not_the_batch_recovery_still_refuses
     )
     real_archives = wrkslots._load_all_archives
 
-    def archived_by_another_path(*args, **kwargs):
+    def archived_by_another_path(
+        config: wrkslots.Config, *, require_repository: bool = True
+    ) -> list[wrkslots.ArchiveState]:
         # The rows stay archived, but no longer as this batch's typed recovery,
         # as when a different removal path archived them.
         return [
             dataclasses.replace(archive, absent_validate_recoveries=frozenset())
-            for archive in real_archives(*args, **kwargs)
+            for archive in real_archives(config, require_repository=require_repository)
         ]
 
     monkeypatch.setattr(wrkslots, "_load_all_archives", archived_by_another_path)
@@ -45321,7 +45325,9 @@ def test_a_batch_named_row_changed_since_the_batch_still_refuses(
     )
     real_active = wrkslots._load_all_active
 
-    def row_changed(*args, **kwargs):
+    def row_changed(
+        config: wrkslots.Config, *, require_repository: bool = True
+    ) -> list[wrkslots.ActiveState]:
         return [
             dataclasses.replace(
                 state,
@@ -45332,7 +45338,7 @@ def test_a_batch_named_row_changed_since_the_batch_still_refuses(
                     for record in state.slots
                 ),
             )
-            for state in real_active(*args, **kwargs)
+            for state in real_active(config, require_repository=require_repository)
         ]
 
     monkeypatch.setattr(wrkslots, "_load_all_active", row_changed)

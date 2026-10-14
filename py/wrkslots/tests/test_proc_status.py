@@ -13,7 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Literal, TextIO
+from typing import Literal, TextIO, TypedDict
 
 import pytest
 
@@ -1238,7 +1238,8 @@ def exiting_init_proc(
     return pid_dir
 
 
-def test_an_exiting_namespace_init_holds_no_checkout(tmp_path: Path, capsys) -> None:
+def test_an_exiting_namespace_init_holds_no_checkout(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # 2026-10-13: every `wrkslots remove <validate-fresh-...> --validate-complete`
     # refused "mount namespace is indeterminate for live PID 2991802", a
     # namespace init stuck in zap_pid_ns_processes, and 49 GB of finished
@@ -1253,6 +1254,16 @@ def test_an_exiting_namespace_init_holds_no_checkout(tmp_path: Path, capsys) -> 
     assert "PID 2991802 (pidns_recheck) is a PID-namespace init being torn down" in err
 
 
+class _NearMiss(TypedDict, total=False):
+    """One way to differ from an exiting namespace init; keyword arguments of exiting_init_proc."""
+
+    wchan: str
+    nspid: str
+    cwd: str
+    root: str
+    threads: int
+
+
 @pytest.mark.parametrize("near_miss", [
     {"wchan": "do_wait"},                   # same name, not tearing down: still refused
     {"nspid": "2991802\t7"},               # not the init of its namespace
@@ -1263,7 +1274,7 @@ def test_an_exiting_namespace_init_holds_no_checkout(tmp_path: Path, capsys) -> 
 ], ids=["other-wait-channel", "not-a-namespace-init", "init-only-at-an-outer-level",
         "cwd-still-held", "root-still-held", "two-threads"])
 def test_a_near_miss_of_an_exiting_namespace_init_is_still_refused(
-        tmp_path: Path, near_miss: dict[str, str]) -> None:
+        tmp_path: Path, near_miss: _NearMiss) -> None:
     proc_root = tmp_path / "proc"
     exiting_init_proc(proc_root, **near_miss)
     with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991802"):
@@ -1282,10 +1293,11 @@ def test_a_link_that_is_unreadable_rather_than_released_is_still_refused(
     pid_dir = exiting_init_proc(proc_root)
     real_readlink = os.readlink
 
-    def readlink(path, *args, **kwargs):
+    def readlink(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> str:
         if Path(path) == pid_dir / "cwd":
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
-        return real_readlink(path, *args, **kwargs)
+        return real_readlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(cli.os, "readlink", readlink)
+    # cli reads links through the os module, so patching os.readlink reaches it.
+    monkeypatch.setattr(os, "readlink", readlink)
     assert not cli._process_is_exiting_namespace_init(pid_dir)
