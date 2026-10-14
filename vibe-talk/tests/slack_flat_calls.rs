@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use slack_fake::{profiled, thread, ts, Fake, FakeState};
-use vibe_talk::chat::ChatClient;
+use vibe_talk::chat::{ChatClient, ThreadAsk};
 use vibe_talk::model::{ChannelId, Message};
 use vibe_talk::slack::{ts_from_message_id, HttpSlackClient};
 use vibe_talk::threads::{TimelineRequest, TimelineView};
@@ -597,6 +597,68 @@ async fn a_thread_view_that_shows_an_edit_brings_it_into_flat() {
     let (shown, thread_calls) = open_thread(&fake, &client, &back, 10).await;
     assert_eq!(thread_calls, 1 + 2);
     assert!(!shown.iter().any(|text| text == "edited far back"));
+    assert!(flat(&fake, &client).await.replies.is_empty());
+}
+
+/// Read `root`'s thread's newest fifty messages through a read of several threads, as a caller of
+/// `fetch_threads` would. Returns the texts it shows and the `conversations.replies` calls it made.
+async fn read_newest(fake: &Fake, client: &HttpSlackClient, root: &str) -> (Vec<String>, usize) {
+    let before = fake.requests("conversations.replies").len();
+    let answers = client
+        .fetch_threads(&channel(), &[ThreadAsk::newest(root, 50)])
+        .await;
+    let texts = answers[0]
+        .1
+        .as_ref()
+        .expect("the thread's newest page")
+        .messages
+        .iter()
+        .map(|message| message.content.clone())
+        .collect();
+    (texts, fake.requests("conversations.replies").len() - before)
+}
+
+/// `#287 bulk-reads`: a read of several threads reads a thread's newest page itself, as the thread
+/// view does, so it settles what Flat holds exactly as the thread view's read does: once it has
+/// shown an edit, the next Flat read reads that thread in full and shows it too; one that shows
+/// what Flat holds changes nothing.
+#[tokio::test]
+async fn a_read_of_several_threads_that_shows_an_edit_brings_it_into_flat() {
+    let (state, roots) = ten_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    assert_eq!(flat(&fake, &client).await.calls(), 23);
+    let (opened, index) = roots[0].clone();
+    let (_, calls) = read_newest(&fake, &client, &opened).await;
+    assert_eq!(calls, 2, "one window of two pages, no root read");
+    let same = flat(&fake, &client).await;
+    assert!(same.replies.is_empty(), "{:?}", same.threads());
+
+    let target = reply_ts(index, REPLIES - 2);
+    fake.with(|state| {
+        let reply = state
+            .replies
+            .get_mut(&(CH.to_owned(), opened.clone()))
+            .expect("thread")
+            .iter_mut()
+            .find(|reply| reply["ts"] == json!(target))
+            .expect("reply");
+        reply["text"] = json!("edited after the read");
+        reply["edited"] = json!({"user": "UREPLIER1", "ts": ts(9800, 0)});
+    });
+    let held = flat(&fake, &client).await;
+    assert!(held.replies.is_empty(), "the root did not move");
+    assert!(!held.shows("edited after the read"));
+
+    let (shown, _) = read_newest(&fake, &client, &opened).await;
+    assert!(shown.iter().any(|text| text == "edited after the read"));
+    let next = flat(&fake, &client).await;
+    assert_eq!(
+        next.threads(),
+        [opened.clone(), opened.clone()],
+        "that thread, read in full"
+    );
+    assert!(next.shows("edited after the read"));
     assert!(flat(&fake, &client).await.replies.is_empty());
 }
 

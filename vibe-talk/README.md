@@ -2651,11 +2651,14 @@ instead of two; a longer thread is read by the thread view, as before); and afte
 roots come from one `conversations.history` page shared by every thread asked about (never more
 pages than reading each root would cost), a thread whose root's `latest_reply` is not after the
 instant costs no read of its replies, and one that moved costs one `conversations.replies` read
-with `oldest` at the instant. A channel narrowed to one Slack thread is read by the default. Every
-other provider answers with the trait's default, one thread view read per thread, at most two in flight,
-which costs exactly what reading each thread did, and says so (`ReadCaps::many_threads` is
-emulated). A caller that would gather its thread reads into one only to save calls gathers them
-only for a provider that reads them natively.
+with `oldest` at the instant. Slack reads a root there by the very rule its flat view uses to
+reread only the threads that moved, so a root with replies and no `latest_reply` is read; and a
+newest page settles what the flat view holds for that thread as the thread view's read does, so an
+edited reply it shows reaches the flat view's next read. A channel narrowed to one Slack thread is
+read by the default. Every other provider answers with the trait's default, one thread view read
+per thread, at most two in flight, which costs exactly what reading each thread did, and says so
+(`ReadCaps::many_threads` is emulated). A caller that would gather its thread reads into one only
+to save calls gathers them only for a provider that reads them natively.
 
 ### A bridge's reads of several threads
 

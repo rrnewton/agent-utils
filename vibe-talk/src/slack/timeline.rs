@@ -312,6 +312,24 @@ impl FlatMemory {
     }
 }
 
+/// Whether thread root `root` says a reply was posted after the instant `after` (microseconds):
+/// `Some(true)` or `Some(false)` when it can say, `None` when it cannot, because it counts replies
+/// but names no `latest_reply`. A root with no replies says none was.
+///
+/// The one rule by which a Slack read leaves a thread's replies unread on the word of its root:
+/// Flat's skip-list, against the newest reply it holds for the thread (`#282 slack-flat-skip`,
+/// `HttpSlackClient::flat_replies`), and a read of several threads after an instant (`#287
+/// bulk-reads`, `super::threads`). Each reads a thread whose root cannot say. Slack moves
+/// `latest_reply` only when a reply is added, so a root that says none was added vouches for
+/// additions only: an edit or a deletion is left to what each read does about those.
+pub(super) fn root_says_replies_after(root: &Raw, after: i64) -> Option<bool> {
+    match root.latest_reply_micros() {
+        Some(latest) => Some(latest > after),
+        None if root.reply_count() == 0 => Some(false),
+        None => None,
+    }
+}
+
 /// Whether two gap-free stretches of one thread's replies, root excluded, oldest first, say the
 /// same wherever they overlap, message by message as Slack sent them. Two that do not overlap
 /// agree: neither says anything about the other's replies.
@@ -746,7 +764,8 @@ impl HttpSlackClient {
     /// The Flat read has just fetched `root` from history, and a root reports its `reply_count`
     /// and `latest_reply`. So a thread whose root says what it said when its replies were last
     /// read has nothing new: the replies held are reused, at no call. A thread whose root names a
-    /// newer latest reply and a higher count is read forward from the newest reply held
+    /// newer latest reply ([`root_says_replies_after`], the rule a read of several threads after an
+    /// instant reads a root by too) and a higher count is read forward from the newest reply held
     /// (`conversations.replies oldest=`), one call for up to a page of new replies, and kept only
     /// when exactly as many messages came back as the count grew by, every one of them a real
     /// reply, the last at the latest the root names. Every message newer than the newest held is
@@ -787,7 +806,10 @@ impl HttpSlackClient {
             }
             let grew = usize::try_from(count.saturating_sub(held.reply_count))
                 .ok()
-                .filter(|grew| (1..=FLAT_MAX_REPLIES).contains(grew) && latest > held.latest_reply);
+                .filter(|grew| {
+                    (1..=FLAT_MAX_REPLIES).contains(grew)
+                        && root_says_replies_after(root, held.latest_reply) == Some(true)
+                });
             if let Some(grew) = grew {
                 let fresh = self
                     .replies_all_after(conversation, &root.ts, held.latest_reply, grew)
@@ -857,7 +879,7 @@ impl HttpSlackClient {
     /// thread already under way, which may have read it before an edit this read shows, holds
     /// nothing (`settle_flat`). Nothing else could tell: such a Flat read may have nothing held to
     /// compare with yet, or be about to put back the very replies this drops.
-    fn check_flat_against_thread(&self, conversation: &str, thread: &str, raws: &[Raw]) {
+    pub(super) fn check_flat_against_thread(&self, conversation: &str, thread: &str, raws: &[Raw]) {
         let key = (conversation.to_owned(), thread.to_owned());
         let mut memory = self
             .flat_memory
@@ -1438,4 +1460,41 @@ fn encode_directory(cursor: &DirectoryCursor) -> Result<String, ChatError> {
     serde_json::to_vec(cursor)
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
         .map_err(|_| shape("could not encode the channel-directory continuation"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{root_says_replies_after, Raw};
+
+    fn root(fields: serde_json::Value) -> Raw {
+        let mut value = json!({"type": "message", "ts": "1700000000.000100", "text": "root"});
+        for (key, field) in fields.as_object().expect("fields") {
+            value[key] = field.clone();
+        }
+        Raw::parse(value).expect("a root")
+    }
+
+    /// The one rule both Slack skip-lists read a root by (`#282 slack-flat-skip`, `#287
+    /// bulk-reads`): a root that names its latest reply says whether one came after an instant; one
+    /// with no replies says none did; one that counts replies but names no latest says nothing.
+    #[test]
+    fn a_root_says_whether_a_reply_came_after_an_instant_only_when_it_names_its_latest() {
+        let named = root(json!({"reply_count": 2, "latest_reply": "1700000060.000000"}));
+        assert_eq!(
+            root_says_replies_after(&named, 1_700_000_059_999_999),
+            Some(true)
+        );
+        assert_eq!(
+            root_says_replies_after(&named, 1_700_000_060_000_000),
+            Some(false)
+        );
+        let empty = root(json!({}));
+        assert_eq!(root_says_replies_after(&empty, 0), Some(false));
+        let unnamed = root(json!({"reply_count": 3}));
+        assert_eq!(root_says_replies_after(&unnamed, i64::MAX), None);
+        let blank = root(json!({"reply_count": 3, "latest_reply": ""}));
+        assert_eq!(root_says_replies_after(&blank, i64::MAX), None);
+    }
 }

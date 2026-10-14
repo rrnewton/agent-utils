@@ -617,9 +617,12 @@ impl Raw {
 
     /// The latest reply's instant, for a root; the message's own otherwise.
     pub fn activity_micros(&self) -> i64 {
-        self.str_field("latest_reply")
-            .and_then(ids::ts_micros)
-            .unwrap_or(self.micros)
+        self.latest_reply_micros().unwrap_or(self.micros)
+    }
+
+    /// The instant of the latest reply this root names, when it names one (`latest_reply`).
+    pub fn latest_reply_micros(&self) -> Option<i64> {
+        self.str_field("latest_reply").and_then(ids::ts_micros)
     }
 
     fn author_id(&self) -> Option<&str> {

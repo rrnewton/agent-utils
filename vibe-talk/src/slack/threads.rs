@@ -6,13 +6,16 @@
 //!
 //! * **A thread's newest page** is one `conversations.replies` window read, whose first message is
 //!   the root, where the thread view reads the root first and then the window: one call a thread
-//!   of up to a page, instead of two. The answer is the thread view's own, cursors included. A
-//!   thread too long for the window, or one a walk already proved a stretch of empty, is read by
-//!   the thread view itself, as before.
-//! * **What is newer than an instant** is a skip-list. A root says when its latest reply was
+//!   of up to a page, instead of two. The answer is the thread view's own, cursors included, and
+//!   it settles what Flat holds for the thread exactly as the thread view's read does
+//!   (`#282 slack-flat-skip`): an edit it shows reaches Flat's next read. A thread too long for the
+//!   window, or one a walk already proved a stretch of empty, is read by the thread view itself,
+//!   as before.
+//! * **What is newer than an instant** is a skip-list, by the rule Flat's skip-list reads a root by
+//!   ([`super::timeline::root_says_replies_after`]). A root says when its latest reply was
 //!   posted, so a thread whose root says nothing newer was added costs no read of its replies,
-//!   and one whose root moved costs one `conversations.replies` read with `oldest` at the
-//!   instant. The roots come from one `conversations.history` page shared by every such ask
+//!   and one whose root moved, or cannot say, costs one `conversations.replies` read with `oldest`
+//!   at the instant. The roots come from one `conversations.history` page shared by every such ask
 //!   (newest first, from the oldest root asked about), read at most a page fewer times than there
 //!   are threads; a root it did not reach is read on its own, as the thread view reads it. Slack
 //!   moves `latest_reply` only when a reply is added, so such an answer is additions only, and
@@ -29,7 +32,7 @@ use super::history::{
     advance, far_future_micros, nearest, Feed, Toward, MAX_WINDOW_PAGES, SCAN_PAGE_LIMIT,
 };
 use super::ids;
-use super::timeline::{thread_ts, MAX_TIMELINE_LIMIT, TIMELINE_TIMEOUT};
+use super::timeline::{root_says_replies_after, thread_ts, MAX_TIMELINE_LIMIT, TIMELINE_TIMEOUT};
 use crate::chat::{ChatError, ThreadAnswers, ThreadAsk};
 use crate::model::ChannelId;
 use crate::threads::{TimelineDelta, TimelinePage};
@@ -191,6 +194,10 @@ impl HttpSlackClient {
         if has_more {
             raws.drain(..raws.len() - limit);
         }
+        // What the thread view's read does with the same messages (`#282 slack-flat-skip`): Flat
+        // drops what it holds for the thread where this read shows otherwise, and a Flat read of it
+        // already under way holds nothing it read.
+        self.check_flat_against_thread(conversation, thread, &raws);
         let next_before = if has_more {
             Some(self.cursor(channel, &request, raws[0].ts.clone())?)
         } else {
@@ -236,15 +243,7 @@ impl HttpSlackClient {
         // The last microsecond of the instant's millisecond: everything after it is newer.
         let after = newer_than_ms.saturating_mul(1_000).saturating_add(999);
         // A root with replies but no `latest_reply` says nothing about them, so it is read.
-        let moved = match root
-            .value
-            .get("latest_reply")
-            .and_then(serde_json::Value::as_str)
-            .and_then(ids::ts_micros)
-        {
-            Some(latest) => latest > after,
-            None => root.reply_count() > 0,
-        };
+        let moved = root_says_replies_after(&root, after).unwrap_or(true);
         let mut raws = if moved {
             self.replies_oldest_after(conversation, thread, Some(after), limit + 1)
                 .await?
