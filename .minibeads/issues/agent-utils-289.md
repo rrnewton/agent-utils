@@ -1,12 +1,13 @@
 ---
 title: 'census-zombie-leader-threads: treat a zombie thread-group leader with live threads as alive in the slot-use census'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-10-14T14:48:59.062857319+00:00
-updated_at: 2026-10-14T14:48:59.062857319+00:00
+updated_at: 2026-10-14T18:09:30.707990307+00:00
+closed_at: 2026-10-14T18:09:30.707990157+00:00
 ---
 
 # Description

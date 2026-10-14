@@ -488,8 +488,10 @@ half a second; each keeps the run `alive`. A step back does not show if it is un
 within half a second, before a realtime read sees it. After the last read of the handles before the
 process tables, and just before those tables, the process generation that each handle records is
 read from its own entry under `/proc`. The process tables list thread groups and skip terminal
-ones, so they show neither a recorded thread ID nor a thread group leader that has exited while
-another thread of its group runs; that entry shows both. A recorded generation that runs then is
+ones. In place of a thread group leader that has exited while other threads of its group run, they
+list those threads under their own IDs, but they never show the exited leader's own generation, and
+never a thread of a leader that still runs, so a handle recording either is found only through its
+own entry, which shows both. A recorded generation that runs then is
 `alive` even when it exits before the end, since it may queue its unit after the second
 enumeration; one that does not run then cannot act later. Last, the current members of every
 control group named after a handle's unit,
@@ -817,7 +819,11 @@ decide, `lsof +D` decides exactly as in `remove --no-lock-budget`. The scan cann
   the caller may not inspect.
 
 Processes that have exited, and processes the caller may not inspect, are skipped, as `lsof` run by
-the same user skips them. As with `remove`, descriptors of other users' processes are visible to
+the same user skips them. Both `/proc` scans, like the check `remove` makes after `lsof`, also visit
+the running threads of a process whose main thread has exited: `/proc` does not list those threads,
+`lsof +D` cannot see them, and the process's own entries show nothing, although the threads still
+hold its working directory, descriptors, and mappings. A slot such a thread holds is refused, naming
+the thread and its process. As with `remove`, descriptors of other users' processes are visible to
 neither check without privilege, and every process's mount table is read. The JSON report counts the
 scans after the fence in `fenced_process_scans`, their total time in `fenced_process_scan_seconds`,
 and the checks that `lsof` decided in `fenced_lsof_fallbacks`, with each reason in
