@@ -8554,8 +8554,8 @@ async function apiDecoded(type, path, options) {
  * `#195 send-resilience`. The server bounds its own read of a slow chat service, but at a figure
  * set for the service — fifty seconds, in the incident this was written for — not for a reader
  * looking at the screen. Giving up here does not cancel the server's read; it only stops this page
- * waiting on it. The read of a view is not sent again until the server's own bound has passed, or a
- * live event says the service is answering (`readHeld`, `remote-ops-audit` W7).
+ * waiting on it. The poll does not read that view again until the read answers, the server's own
+ * bound has passed, or a live event says the service is answering (`readHeld`, `remote-ops-audit` W7).
  *
  * `abandoned`, when given, is handed the request still on the wire when the wait is given up, and
  * the request is then not aborted: its answer, if it comes, is the caller's to use or drop
@@ -17635,8 +17635,8 @@ function landedAnswer(pages) {
 }
 
 async function loadTimeline(options) {
-  // `remote-ops-audit` W7. Nothing the reader did not ask for while a read of this view the page gave
-  // up on may still be running at the server: the poll past the server's bound, or a live event, reads it.
+  // `remote-ops-audit` W7. No poll while a read of this view the page gave up on may still be running at
+  // the server. Every other read goes.
   if (readHeld(readHoldKey(), options)) return;
   const generation = ++discordLoadGeneration;
   // `#229 desktop-two-column`. The column this read is for: its work after every wait is done there.
@@ -17723,7 +17723,7 @@ async function loadTimeline(options) {
         steps.pause();
         // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
         const abandoned = { key: holdKey, context, channel, view, thread, canon, column: steps.column, sent,
-          sentAt: Date.now(), live: liveEventsSeen.get(channel) || 0, number: 0 };
+          sentAt: Date.now(), live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0 };
         const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
           (answer) => abandonRead(answer, abandoned, (late) => landAbandonedTimelineRead(late, abandoned)));
         abandoned.number = timelineAnswersAsked;
@@ -25930,7 +25930,7 @@ function channelReadPosition(area) {
 }
 
 /**
- * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string, asked?: boolean}} [options]
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  *   `keepPosition` marks a RE-read of a channel already on screen — the background poll, or the
  *   Refresh button. It must not drag the reader to the bottom while they are reading older
  *   messages; it follows the newest line only if that is where they already were. The FIRST load
@@ -25942,8 +25942,6 @@ function channelReadPosition(area) {
  *   are a read behind rows a view switch has already drawn (`readBehindSwitch`, `#220
  *   view-switch-instant`): it shows no loading line over them, and what it adds is not counted as
  *   arrived. `readAs` is only the word the read sends the server (`readReasonOf`), and decides nothing.
- *   `asked` is a read the reader asked for by coming back to the channel view, which a view's hold on
- *   reading again (`readHeld`, `remote-ops-audit` W7) never puts off.
  */
 async function loadDiscord(options) {
   screenBelongsToToken();
@@ -25984,7 +25982,8 @@ async function loadDiscord(options) {
     const sent = readStateEpoch;
     // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
     const abandoned = { key: holdKey, channel: String(channel), sentAt: Date.now(),
-      live: liveEventsSeen.get(String(channel)) || 0, canon: null, generation };
+      live: liveEventsSeen.get(String(channel)) || 0, news: liveNewsSeen.get(String(channel)) || 0, canon: null,
+      generation };
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }),
       (answer) => abandonRead(answer, abandoned, (late) => {
         if (late && typeof late === "object") readSentEpochs.set(late, sent);
@@ -31340,17 +31339,14 @@ function resetSideColumn(reopen = false) {
  * read behind it, and that read ran before the poll got here. Reading it again brought nothing the
  * first had not, a second request for the same rows. See `answeredSince` for which reads count.
  *
- * `asked`: a read the reader asked for by coming back to the channel view (see `loadDiscord`).
- *
  * @param {string} reason
  * @param {number | null} [since]
- * @param {boolean} [asked]
  */
-async function readSideColumn(reason, since = null, asked = false) {
+async function readSideColumn(reason, since = null) {
   if (!sideColumnUp()) return;
   if (columns.side.mode === "thread") {
     await inColumn(columns.side, () => (since !== null && answeredSince(since, reason)
-      ? undefined : loadDiscord({ keepPosition: true, reason, readAs: "side", ...(asked ? { asked } : {}) })));
+      ? undefined : loadDiscord({ keepPosition: true, reason, readAs: "side" })));
   } else {
     await refreshThreadDirectory();
   }
@@ -31962,23 +31958,30 @@ const CHANNEL_READ_TIMEOUT_MS = 20000;
 //
 // Giving up on a read at `CHANNEL_READ_TIMEOUT_MS` stops the page waiting, not the server: its own read
 // of the chat service runs on to `SERVER_READ_BOUND_MS`, and behind a bridge that read is a scan of the
-// whole space. The page used to ask again at once — the read queued behind the one given up on, the
-// page shown again, the poll come round — each one a second scan beside the first.
+// whole space. The page used to poll again regardless, a second scan beside the first.
 //
-// So once a read of a view is given up on, nothing the reader did not ask for reads that view again
-// until the server's bound has passed since the read was sent, or a live event for its channel says
-// the service is answering. A pull to refresh, entering a channel or a view, and a re-read after a
-// change (`mutation`) read at once, as ever. The read given up on is not aborted either: if its answer
-// lands, it is used, unless something newer has replaced it meanwhile (`abandonedReadStands`).
+// So once a read of a view is given up on, the POLL does not read that view again while the read given
+// up on may still be running at the server: until it answers or fails, or the server's bound has passed
+// since it was sent, or a live event for its channel says the service is answering. A live event that
+// arrived while the page still waited means no hold at all. Nothing else is put off: a pull to refresh,
+// entering a channel or a view, coming back to the page, a re-read after a change, and every read that
+// fills a gap the stream reports (a reset, an edit or removal out of its replay tail) read at once, as
+// before. Each of those may bring what no answer begun before it can, and the poll is the one read that
+// only asks again. The read given up on is not aborted either: if its answer lands, it is used, unless
+// something newer has replaced it meanwhile (`abandonedReadStands`).
 
 /**
- * The server's own bound on a read of a slow chat service, from when the read was sent: how long a
- * view whose read the page gave up on is not asked again unasked.
+ * The server's own bound on a read of a slow chat service, from when the read was sent: the longest a
+ * view whose read the page gave up on goes unpolled.
  */
 const SERVER_READ_BOUND_MS = 50000;
 
-/** The reasons a view's hold puts off: none of them the reader's own act. */
-const HELD_REASONS = ["poll", "live", "visible", "replay", "reset"];
+/**
+ * The reasons a view's hold puts off: only the poll. Coming back to the page, a stream reset and the
+ * replay tail's edits each stand for something the read given up on may not carry, and a live message
+ * ends the hold before its own read is asked for (`noteLiveEvent`).
+ */
+const HELD_REASONS = ["poll"];
 
 /**
  * By view (`readHoldKey`), until when a read of it the page gave up on may still be running at the
@@ -31996,25 +31999,41 @@ const readHolds = new Map();
  */
 const liveEventsSeen = new Map();
 
+/**
+ * How many of those were news, not the stream's replay tail: one that arrived after a read was sent
+ * says the service is answering for the channel, and no hold is set when that read is given up on.
+ *
+ * @type {Map<string, number>}
+ */
+const liveNewsSeen = new Map();
+
 /** The view a read of the column being worked on is for: its context, and the to-do list apart. */
 function readHoldKey() {
   return !threadingSupported && todoMode ? `${channelContextKey()} todo` : channelContextKey();
 }
 
-/** A read of the view `key` names, in `channel`, sent at `sentAt`, was given up on: hold the view to the server's bound. */
+/**
+ * A read of the view `key` names, in `channel`, sent at `sentAt`, was given up on: hold the view to the
+ * server's bound. The hold set, for the read to take away when it answers (`abandonRead`).
+ *
+ * @param {string} key
+ * @param {string} channel
+ * @param {number} sentAt
+ */
 function holdView(key, channel, sentAt) {
-  readHolds.set(key, { channel, until: sentAt + SERVER_READ_BOUND_MS });
+  const hold = { channel, until: sentAt + SERVER_READ_BOUND_MS };
+  readHolds.set(key, hold);
+  return hold;
 }
 
 /**
  * Whether a read of the view `key` names, with `options`, must not be sent now: a read of it given up
  * on may still be running at the server, and no live event has said since that the service is
- * answering. Never one the reader asked for (`asked`: coming back to the channel view), nor one whose
- * reason is not in `HELD_REASONS`; a queued read standing for several triggers is held only if every
- * one of them is.
+ * answering. Only a read whose every reason is in `HELD_REASONS`, so a queued read that also stands
+ * for any other trigger goes.
  *
  * @param {string} key
- * @param {{asked?: boolean, reason?: string | (string | undefined)[]} | undefined} options
+ * @param {{reason?: string | (string | undefined)[]} | undefined} options
  */
 function readHeld(key, options) {
   const hold = readHolds.get(key);
@@ -32023,7 +32042,6 @@ function readHeld(key, options) {
     readHolds.delete(key);
     return false;
   }
-  if (options && options.asked) return false;
   const reason = options && options.reason;
   const reasons = Array.isArray(reason) ? reason : [reason];
   return reasons.every((one) => typeof one === "string" && HELD_REASONS.includes(one));
@@ -32042,6 +32060,7 @@ function noteLiveEvent(channel, fromTail) {
   const id = String(channel);
   liveEventsSeen.set(id, (liveEventsSeen.get(id) || 0) + 1);
   if (fromTail) return;
+  liveNewsSeen.set(id, (liveNewsSeen.get(id) || 0) + 1);
   for (const [key, hold] of [...readHolds]) {
     if (hold.channel === id) readHolds.delete(key);
   }
@@ -32053,6 +32072,7 @@ function noteLiveEvent(channel, fromTail) {
  * @property {string} channel
  * @property {number} sentAt when it was sent, by the clock
  * @property {number} live `liveEventsSeen` for its channel when it was sent
+ * @property {number} news `liveNewsSeen` for its channel when it was sent
  * @property {any} canon the store it was read for
  */
 
@@ -32061,16 +32081,25 @@ function noteLiveEvent(channel, fromTail) {
  * the answer if it lands and nothing newer has replaced it (`abandonedReadStands`), through `land`. A
  * failure later is nobody's to report: the wait for it was over, and was reported then.
  *
+ * No hold when a live event that is news arrived for the channel after the read was sent: the service
+ * is answering, and a read that event queued behind this one must go. And the hold goes when the
+ * answer settles, landed or failed, used or not: the server is reading nothing for it then.
+ *
  * @template T
  * @param {Promise<T>} answer
  * @param {AbandonedRead} read
  * @param {(payload: T) => void} land
  */
 function abandonRead(answer, read, land) {
-  holdView(read.key, read.channel, read.sentAt);
+  const answering = (liveNewsSeen.get(read.channel) || 0) !== read.news;
+  const hold = answering ? null : holdView(read.key, read.channel, read.sentAt);
+  const release = () => {
+    if (hold && readHolds.get(read.key) === hold) readHolds.delete(read.key);
+  };
   answer.then((payload) => {
+    release();
     if (abandonedReadStands(read)) land(payload);
-  }, () => {});
+  }, release);
 }
 
 /**
@@ -32175,7 +32204,7 @@ const replaysAwaitingRead = new Map();
  * drew stays one without the loading line over them when a poll queues behind it (`#220
  * view-switch-instant`; a list with nothing in it shows the line whatever was asked).
  *
- * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string, asked?: boolean}} [options]
+ * @param {{keepPosition?: boolean, quiet?: boolean, ownAct?: boolean, reason?: string | (string | undefined)[], readAs?: string}} [options]
  */
 function queueDiscordLoad(options) {
   const queued = discordQueuedLoads.get(activeColumn);
@@ -32187,10 +32216,8 @@ function queueDiscordLoad(options) {
   const reasons = (opts) => (opts && Array.isArray(opts.reason) ? opts.reason : [opts ? opts.reason : undefined]);
   const all = [...new Set([...reasons(queued.options), ...reasons(options)])];
   const quiet = Boolean(queued.options && queued.options.quiet) || Boolean(options && options.quiet);
-  // `remote-ops-audit` W7. So is `asked`: a read the reader asked for stays one.
-  const asked = Boolean(queued.options && queued.options.asked) || Boolean(options && options.asked);
-  discordQueuedLoads.set(activeColumn, { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all,
-    ...(quiet ? { quiet } : {}), ...(asked ? { asked } : {}) } });
+  discordQueuedLoads.set(activeColumn,
+    { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all, ...(quiet ? { quiet } : {}) } });
 }
 
 /**
@@ -32206,6 +32233,10 @@ async function finishDiscordLoad(column = activeColumn) {
     const queued = discordQueuedLoads.get(next);
     discordQueuedLoads.delete(next);
     await inColumn(next, () => loadDiscord(queued.options));
+    // The read handed on may not have gone at all: a poll put off while the server still reads one
+    // given up on (`readHeld`, `remote-ops-audit` W7). Then no read is out, and its column's loading
+    // line, which nothing else would take down, goes here.
+    if (!discordFetchInFlight) inColumn(next, () => renderChannelLoading(false));
     return;
   }
   inColumn(column, () => renderChannelLoading(false));
@@ -35481,11 +35512,9 @@ function readEnteredChannel(keepPosition) {
     try {
       // A return finds the channel's store as it was left, so it asks only for what changed.
       const since = timelineReadsStarted;
-      // `asked`: entering the view is the reader's own act, which a hold on reading again never puts off
-      // (`remote-ops-audit` W7).
-      await loadDiscord(keepPosition ? { keepPosition: true, reason: "visible", asked: true } : { reason: "enter", asked: true });
+      await loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
       // ...and the right column's thread, or its list of threads. `#229 desktop-two-column`.
-      await readSideColumn(keepPosition ? "visible" : "enter", since, true);
+      await readSideColumn(keepPosition ? "visible" : "enter", since);
     } finally {
       // Armed after a failure too: offline is exactly when the reader needs the page to try again.
       if (currentView === "discord") {

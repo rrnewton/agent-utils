@@ -3704,10 +3704,10 @@ const TUNING_BANDS = {
     "delta pages one refresh follows before it reads the newest page instead: one turns every burst " +
     "into a full read; past ten a refresh far behind spends longer catching up than a full read takes"],
   SERVER_READ_BOUND_MS: [30000, 120000,
-    "how long a view whose read the page gave up on is not read again unasked (remote-ops-audit W7): " +
-    "the server's own fifty-second bound. Under thirty, a second scan of the space behind a bridge " +
-    "starts while the first still runs; past two minutes a view stays stale long after the server " +
-    "stopped reading it"],
+    "the longest a view whose read the page gave up on goes unpolled (remote-ops-audit W7), when that " +
+    "read never answers: the server's own fifty-second bound. Under thirty, a second scan of the space " +
+    "behind a bridge starts while the first still runs; past two minutes a view stays stale long after " +
+    "the server stopped reading it"],
   VISIBLE_REFRESH_MS: [5000, 60000,
     "how long the page is hidden before coming back refreshes it: under five seconds a glance at " +
     "another app costs a read; past a minute the reader comes back to rows the held poll left stale"],
@@ -52915,11 +52915,11 @@ test("`remote-ops-audit`: a channel without threads says why it reads its page a
   assertEveryReadSaysWhy(page);
 });
 
-// --- remote-ops-audit W7: no read sent again while the server still reads one given up on ---------
+// --- remote-ops-audit W7: no poll sent again while the server still reads one given up on ---------
 //
 // The page gives up on a read at CHANNEL_READ_TIMEOUT_MS; the server's own read runs on to its
-// fifty-second bound, and behind a bridge it is a scan of the whole space. The page used to ask again
-// at once. These tests stand a server in front of it that answers in a minute.
+// fifty-second bound, and behind a bridge it is a scan of the whole space. The page used to poll again
+// regardless. These tests stand a server in front of it that answers in a minute.
 
 /**
  * Derived, or the server's fifty seconds on a page that has no such rule, so that each test below
@@ -52939,14 +52939,17 @@ function answerInAMinute(server) {
       const asked = await server.answer(path);
       const frozen = await asked.text();
       return new Promise((resolve) => {
-        waiting.push(() => resolve({ ok: asked.ok, status: asked.status, text: async () => frozen }));
+        waiting.push((failWith) => resolve(failWith
+          ? json(failWith, { error: "upstream_timeout", detail: "the chat service did not answer in time" })
+          : { ok: asked.ok, status: asked.status, text: async () => frozen }));
       });
     },
   };
   return {
-    release: () => {
+    /** Hand the held answers over; with `failWith`, as that refusal instead, as a server's bound ends a read. */
+    release: (failWith = null) => {
       server.hold = null;
-      for (const answer of waiting.splice(0)) answer();
+      for (const answer of waiting.splice(0)) answer(failWith);
     },
   };
 }
@@ -52969,15 +52972,10 @@ test("`remote-ops-audit` W7: with a server that answers in a minute, the polls s
   await pollAndGiveUp(page);
   assert.equal(page.timelineCalls.length - calls, 1, "the poll did not read");
   assert.ok(!shownIds(page).includes("450"), "fixture: the read was answered before it was given up on");
-  // Everything that would ask again unasked inside the server's bound: the poll come round, twice, and
-  // the page shown again after more than fifteen seconds away.
+  // The one thing put off inside the server's bound: the poll come round, here twice. (Coming back
+  // to the page, a stream reset and the replay tail's edits are not: see the tests below.)
   page.setClock(sent + 30000);
   await pollOnce(page);
-  await page.setVisibility("hidden");
-  page.setClock(sent + 30000 + VISIBLE_REFRESH_MS + 1000);
-  await page.setVisibility("visible");
-  await page.settle();
-  await page.settle();
   page.setClock(sent + SERVER_READ_BOUND_MS - 1);
   await pollOnce(page);
   assert.equal(page.timelineCalls.length - calls, 1,
@@ -53145,4 +53143,191 @@ test("`remote-ops-audit` W7: the late answer of a read given up on is not drawn 
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["1948", "1949"], "the late answer took away a live message newer than it");
+});
+
+// Review round 1. Only the poll is put off: every read that fills a gap the stream reported, or that
+// coming back to the page makes, goes at once, as it did before W7; a live message that arrives while
+// the page still waits ends the wait before it can begin; and the wait ends when the read given up on
+// answers, however it answers, because the server is then reading nothing.
+
+test("`remote-ops-audit` W7: a stream reset inside the wait re-reads the channel at once, and the late answer does not take back what it brought", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  const minute = answerInAMinute(server);
+  await pollAndGiveUp(page);
+  // The service is answering again, and something changed upstream that the stream then lost.
+  server.hold = null;
+  server.edit("200", { content: "edited inside the gap" });
+  server.post(message({ id: "470", content: "posted inside the gap" }));
+  page.setClock(sent + 30000);
+  await deliver(page, page.stream(), "event: reset\ndata: {}\n\n");
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 2,
+    `a stream reset inside the wait did not re-read the channel: ${page.timelineCalls.slice(calls)}`);
+  assert.ok(rowShowing(page, "edited inside the gap"), "the edit the stream lost was not drawn");
+  assert.ok(shownIds(page).includes("470"), "the message the stream lost was not drawn");
+  // The read given up on answers now, with the channel from before the gap.
+  page.setClock(sent + 40000);
+  minute.release();
+  await page.settle();
+  await page.settle();
+  assert.ok(rowShowing(page, "edited inside the gap"), "the late answer, read before the gap, took back the edit");
+  assert.ok(shownIds(page).includes("470"), "the late answer, read before the gap, took back the message");
+});
+
+test("`remote-ops-audit` W7: an edit out of the replay tail inside the wait is read at once", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  answerInAMinute(server);
+  await pollAndGiveUp(page);
+  server.hold = null;
+  // The stream drops, the message is edited, and the stream comes back with the edit in its tail.
+  page.stream().drop();
+  await page.settle();
+  server.edit("200", { content: "edited while the stream was away" });
+  page.setClock(sent + 25000);
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  const edited = page.messages.find((m) => String(m.id) === "200");
+  await deliver(page, page.stream(), sseUpdate("u77", edited, { replayed: true, from_tail: true }));
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 2,
+    `an edit out of the replay tail inside the wait was not read: ${page.timelineCalls.slice(calls)}`);
+  assert.ok(rowShowing(page, "edited while the stream was away"), "the edit out of the replay tail was not drawn");
+});
+
+test("`remote-ops-audit` W7: on a channel without threads a stream reset inside the wait re-reads the page at once", async () => {
+  const page = newPage();
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1950", content: "already on screen" })]);
+  const healthy = page.channelPage;
+  const reads = page.pageReads;
+  const sent = page.clock();
+  /** @type {Array<() => void>} */
+  const waiting = [];
+  // The channel as it stood when the read was asked, handed over a minute later.
+  page.channelPage = (path, options) => {
+    const asked = healthy(path, options);
+    return new Promise((resolve) => waiting.push(() => resolve(asked)));
+  };
+  await reReadChannel(page);
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+  assert.equal(page.expireTimers(CHANNEL_READ_TIMEOUT_MS), 1, "nothing bounded the read");
+  await page.settle();
+  page.channelPage = healthy;
+  page.messages.push(message({ id: "1951", content: "lost in the gap" }));
+  page.setClock(sent + 30000);
+  await deliver(page, page.stream(), "event: reset\ndata: {}\n\n");
+  await page.settle();
+  await page.settle();
+  assert.equal(page.pageReads, reads + 2, "a stream reset inside the wait did not re-read the page");
+  assert.deepStrictEqual(shownIds(page), ["1950", "1951"], "the message the stream lost was not drawn");
+  page.setClock(sent + 40000);
+  for (const answer of waiting.splice(0)) answer();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["1950", "1951"], "the late answer, read before the gap, took back the message");
+});
+
+test("`remote-ops-audit` W7: coming back to a hidden page inside the wait reads at once", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  answerInAMinute(server);
+  await pollAndGiveUp(page);
+  server.hold = null;
+  server.edit("200", { content: "edited while hidden" });
+  await page.setVisibility("hidden");
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS + VISIBLE_REFRESH_MS + 1000);
+  await page.setVisibility("visible");
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 2,
+    `coming back to the page inside the wait did not read: ${page.timelineCalls.slice(calls)}`);
+  assert.ok(rowShowing(page, "edited while hidden"), "the edit made while the page was hidden was not drawn");
+});
+
+test("`remote-ops-audit` W7: a poll queued behind a read given up on, and then put off, leaves no loading line up", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  answerInAMinute(server);
+  // The reader pulls to refresh, and the poll comes round while that read is out: it queues behind it.
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX, { lift: false });
+  // Not awaited: the pull's read is out until the server answers, a minute from now.
+  void page.el("scroll-area").dispatch("touchend");
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 1, "fixture: the pull did not read");
+  await pollOnce(page);
+  assert.equal(page.timelineCalls.length - calls, 1, "fixture: the poll did not queue behind the pull's read");
+  assert.equal(page.el("channel-loading").hidden, false, "fixture: no loading line while the pull's read was out");
+  // Given up on at twenty seconds: the queued poll is put off, so no read is out.
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+  assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the read");
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 1, "fixture: the queued poll was not put off");
+  page.setClock(sent + 25000);
+  page.expireTimers(LOADING_LINE_DELAY_MS);
+  await page.settle();
+  const line = page.el("channel-loading");
+  assert.equal(line.hidden, true, `the loading line stayed up with no read out: "${line.textContent}"`);
+  assert.doesNotMatch(freshness(page).textContent, /refreshing/, `pill: "${freshness(page).textContent}"`);
+});
+
+test("`remote-ops-audit` W7: a live message that arrives while the page still waits ends the wait before it begins", async () => {
+  const { page, server } = await forwardPage();
+  const sent = page.clock();
+  const calls = page.timelineCalls.length;
+  answerInAMinute(server);
+  await pollOnce(page);
+  page.setClock(sent + 5000);
+  const arriving = server.post(message({ id: "440", content: "live during the wait" }));
+  await deliver(page, page.stream(), sseMessage(arriving));
+  await page.settle();
+  server.hold = null;
+  page.setClock(sent + CHANNEL_READ_TIMEOUT_MS);
+  assert.ok(page.expireTimers(CHANNEL_READ_TIMEOUT_MS) >= 1, "nothing bounded the read");
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length - calls, 2,
+    `the read the live message queued was dropped when the wait was given up on: ${page.timelineCalls.slice(calls)}`);
+  assert.equal(page.el("channel-loading").hidden, true, "the loading line stayed up");
+  // The service answered for the channel after the read was sent: the view is not held, and the poll
+  // come round inside the server's bound reads.
+  page.setClock(sent + 30000);
+  await pollOnce(page);
+  assert.equal(page.timelineCalls.length - calls, 3,
+    `the view was held after a live message said the service was answering: ${page.timelineCalls.slice(calls)}`);
+});
+
+test("`remote-ops-audit` W7: once the read given up on has answered, or failed, the wait is over and the poll reads", async () => {
+  for (const failWith of [null, 504]) {
+    const { page, server } = await forwardPage();
+    const sent = page.clock();
+    const calls = page.timelineCalls.length;
+    server.post(message({ id: "450", content: "posted before the poll" }));
+    const minute = answerInAMinute(server);
+    await pollAndGiveUp(page);
+    // The server answers at twenty-five seconds: it is reading nothing now.
+    page.setClock(sent + 25000);
+    minute.release(failWith);
+    await page.settle();
+    await page.settle();
+    if (!failWith) assert.ok(shownIds(page).includes("450"), "fixture: the late answer was not drawn");
+    server.post(message({ id: "451", content: "posted after the late answer" }));
+    page.setClock(sent + 30000);
+    await pollOnce(page);
+    assert.equal(page.timelineCalls.length - calls, 2,
+      `the poll was put off after the read given up on had ${failWith ? "failed" : "answered"}: ${page.timelineCalls.slice(calls)}`);
+    assert.ok(shownIds(page).includes("451"), `the poll after the read given up on ${failWith ? "failed" : "answered"} was not drawn`);
+  }
 });
