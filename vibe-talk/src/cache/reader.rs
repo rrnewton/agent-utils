@@ -81,13 +81,49 @@ impl Readers {
 
 /// The interned id of a channel, if it has one.
 fn chan_id(connection: &Connection, chan: &ChanKey) -> rusqlite::Result<Option<i64>> {
+    Ok(chan_row(connection, chan)?.map(|(id, _)| id))
+}
+
+/// The interned id of a channel, and the latest drop of an offer for it the file records.
+fn chan_row(
+    connection: &Connection,
+    chan: &ChanKey,
+) -> rusqlite::Result<Option<(i64, Option<i64>)>> {
     connection
         .query_row(
-            "SELECT chan FROM channel WHERE provider_key = ?1 AND channel_id = ?2",
+            "SELECT chan, dropped_ms FROM channel WHERE provider_key = ?1 AND channel_id = ?2",
             params![chan.provider_key, chan.channel_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
+}
+
+/// Whether anything held of `chan` is in doubt after the latest drop of an offer for it, the
+/// file's or `memory`'s: a row observed no later, or a head whose scope's newest end was last read
+/// no later. Nothing held is nothing in doubt.
+pub(crate) fn in_doubt(
+    connection: &Connection,
+    chan: &ChanKey,
+    memory: Option<i64>,
+) -> rusqlite::Result<bool> {
+    let snapshot = connection.unchecked_transaction()?;
+    let Some((chan_id, file)) = chan_row(&snapshot, chan)? else {
+        return Ok(false);
+    };
+    let dropped = match (file, memory) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return Ok(false),
+    };
+    let doubt = snapshot.query_row(
+        "SELECT EXISTS (SELECT 1 FROM message WHERE chan = ?1 AND observed_ms <= ?2)
+             OR EXISTS (SELECT 1 FROM scope_head
+                        WHERE chan = ?1 AND COALESCE(checked_ms, head_listed_ms) <= ?2)",
+        params![chan_id, dropped],
+        |row| row.get(0),
+    )?;
+    snapshot.finish()?;
+    Ok(doubt)
 }
 
 const MESSAGE_COLUMNS: &str = "m.message_id, m.author_id, m.author, m.author_is_bot, m.reply_to,
@@ -173,17 +209,20 @@ pub(crate) fn shadow_view(
     query: &Query,
 ) -> rusqlite::Result<View> {
     let snapshot = connection.unchecked_transaction()?;
-    let Some(chan_id) = chan_id(&snapshot, chan)? else {
+    let Some((chan_id, dropped_ms)) = chan_row(&snapshot, chan)? else {
         return Ok(View::default());
     };
     let view = match query {
         Query::Newest { scope, limit } => {
             let key = scope.key();
+            let head = head_by_id(&snapshot, chan_id, &key)?;
             View {
-                head: head(&snapshot, chan, &key)?,
+                head: head.map(|(head, _)| head),
+                head_checked_ms: head.map(|(_, checked)| checked),
                 coverage: coverage_by_id(&snapshot, chan_id, &key)?,
                 rows: newest(&snapshot, chan, &key, *limit)?,
                 home: None,
+                dropped_ms,
             }
         }
         Query::Span {
@@ -193,8 +232,10 @@ pub(crate) fn shadow_view(
             limit,
         } => {
             let key = scope.key();
+            let head = head_by_id(&snapshot, chan_id, &key)?;
             View {
-                head: head(&snapshot, chan, &key)?,
+                head: head.map(|(head, _)| head),
+                head_checked_ms: head.map(|(_, checked)| checked),
                 coverage: coverage_by_id(&snapshot, chan_id, &key)?,
                 rows: span(
                     &snapshot,
@@ -205,16 +246,21 @@ pub(crate) fn shadow_view(
                     *limit,
                 )?,
                 home: None,
+                dropped_ms,
             }
         }
         Query::Message { id } => match message_and_home(&snapshot, chan, id)? {
             Some((row, home)) => View {
-                head: None,
                 coverage: coverage_by_id(&snapshot, chan_id, &home)?,
                 rows: vec![row],
                 home: Scope::parse(&home),
+                dropped_ms,
+                ..View::default()
             },
-            None => View::default(),
+            None => View {
+                dropped_ms,
+                ..View::default()
+            },
         },
     };
     snapshot.finish()?;
@@ -309,17 +355,31 @@ pub(crate) fn head(
     let Some(id) = chan_id(connection, chan)? else {
         return Ok(None);
     };
+    Ok(head_by_id(connection, id, scope_key)?.map(|(head, _)| head))
+}
+
+/// A scope's head, and when the latest read of its newest end the file records began: the
+/// head's own listing time where no later one was written.
+pub(crate) fn head_by_id(
+    connection: &Connection,
+    chan_id: i64,
+    scope_key: &str,
+) -> rusqlite::Result<Option<(Head, i64)>> {
     connection
         .query_row(
-            "SELECT head_ms, unsettled_from_ms, head_listed_ms FROM scope_head
-             WHERE chan = ?1 AND scope_key = ?2",
-            params![id, scope_key],
+            "SELECT head_ms, unsettled_from_ms, head_listed_ms,
+                    COALESCE(checked_ms, head_listed_ms)
+             FROM scope_head WHERE chan = ?1 AND scope_key = ?2",
+            params![chan_id, scope_key],
             |row| {
-                Ok(Head {
-                    head_ms: row.get(0)?,
-                    unsettled_from_ms: row.get(1)?,
-                    head_listed_ms: row.get(2)?,
-                })
+                Ok((
+                    Head {
+                        head_ms: row.get(0)?,
+                        unsettled_from_ms: row.get(1)?,
+                        head_listed_ms: row.get(2)?,
+                    },
+                    row.get(3)?,
+                ))
             },
         )
         .optional()

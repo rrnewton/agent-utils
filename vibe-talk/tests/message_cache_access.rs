@@ -1375,3 +1375,197 @@ async fn a_deletion_reaches_the_file_while_the_provider_is_suspended() {
     assert_eq!(text_of(&cache, &ids[2]).as_deref(), Some("edited upstream"));
     assert_eq!(held(&cache, &first_chan()), 8);
 }
+
+// ---- a left-out change is remembered per message, and across a restart -------------------------
+
+/// What the shadow has counted for `message_by_id` once a write-token read of `message` by id has
+/// answered `expected` upstream.
+async fn by_id(
+    state: &AppState,
+    message: &MessageId,
+    expected: StatusCode,
+) -> vibe_talk::cache::shadow::ConsumerCounts {
+    let (status, _) = call(
+        state,
+        "GET",
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            message.as_str()
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, expected);
+    assert!(state.message_cache.shadow_settled(WAIT).await);
+    shadowed(state, "message_by_id")
+}
+
+/// The next start of a filled cache, its provider slow to say which account it is. The message is
+/// deleted upstream meanwhile, and the write-scope read that would have shown it gone is left out.
+/// Once the account answers, a two-row newest page re-reads only the newest messages: the deleted
+/// message, still in the file, must not be one the cache would serve.
+#[tokio::test]
+async fn a_deletion_left_out_while_the_account_was_unchecked_is_never_vouched_for_by_a_short_page()
+{
+    let dir = TempDir::new("cache-access-missed-deletion");
+    let clock = ManualClock::at(T0 + HOUR);
+    filled(&dir, &clock).await.close();
+    let ids = seeded(READ_CHANNEL);
+    let d = upstream(10, "UA1", "UB1");
+    d.first.hold_identity();
+    let state = testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
+    let d = Deployment { state, ..d };
+    let cache = d.cache();
+
+    clock.advance(MINUTE);
+    d.fake.delete(&ids[3]);
+    assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+    assert!(suspect(&cache), "the read was left out");
+    d.first.release_identity();
+    assert!(d.state.message_cache.identities_verified(WAIT).await);
+
+    clock.advance(MINUTE);
+    let (status, _) = call(
+        &d.state,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=2"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        text_of(&cache, &ids[3]).is_some(),
+        "the short page did not reach it"
+    );
+    assert!(
+        suspect(&cache),
+        "nothing re-read the deleted message's stretch"
+    );
+    let counted = by_id(&d.state, &ids[3], StatusCode::NOT_FOUND).await;
+    assert_eq!(
+        (
+            counted.would_serve,
+            counted.extra_rows,
+            counted.misses.suspect
+        ),
+        (0, 0, 1),
+        "the shadow would serve a deleted message: {counted:?}"
+    );
+
+    // A read of the whole of Main that began after it was left out takes the deletion in.
+    clock.advance(MINUTE);
+    assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+    assert!(text_of(&cache, &ids[3]).is_none());
+    assert!(!suspect(&cache));
+}
+
+/// A left-out edit of a Main message leaves the channel in doubt; a read of one of its threads,
+/// which never carries that message, must not lift the doubt about it.
+#[tokio::test]
+async fn a_threads_listing_never_vouches_for_a_main_message_whose_edit_was_left_out() {
+    let dir = TempDir::new("cache-access-thread-clears");
+    let clock = ManualClock::at(T0 + HOUR);
+    let ids = seeded(READ_CHANNEL);
+    let root = ids[5].clone();
+    let thread = format!(
+        "/api/v1/channels/{READ_CHANNEL}/timeline?view=thread&thread_id={}",
+        root.as_str()
+    );
+    let threaded = || {
+        let d = upstream(10, "UA1", "UB1");
+        for n in [7, 9] {
+            d.fake.set_reply_to(&ids[n], &root);
+        }
+        d
+    };
+    {
+        let d = threaded();
+        let state = testing::with_message_cache(d.state.clone(), dir.path(), clock.clone()).await;
+        let d = Deployment { state, ..d };
+        assert_eq!(
+            call(&d.state, "GET", &thread, WRITE_TOKEN).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+        d.close();
+    }
+    let d = threaded();
+    d.first.hold_identity();
+    let state = testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
+    let d = Deployment { state, ..d };
+    let cache = d.cache();
+    clock.advance(MINUTE);
+    d.fake.edit(&ids[2], "edited upstream");
+    push(&d, "left-out", LiveKind::Update, &ids[2], None);
+    assert!(suspect(&cache), "the edit was left out");
+    d.first.release_identity();
+    assert!(d.state.message_cache.identities_verified(WAIT).await);
+
+    // A write-scope read of the thread, begun after the edit was left out, lands.
+    clock.advance(MINUTE);
+    assert_eq!(
+        call(&d.state, "GET", &thread, WRITE_TOKEN).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(text_of(&cache, &ids[2]).as_deref(), Some("a message"));
+    assert!(
+        suspect(&cache),
+        "a thread's listing lifted the doubt about a Main message"
+    );
+    let counted = by_id(&d.state, &ids[2], StatusCode::OK).await;
+    assert_eq!(
+        (
+            counted.would_serve,
+            counted.content_differs,
+            counted.misses.suspect
+        ),
+        (0, 0, 1),
+        "{counted:?}"
+    );
+}
+
+/// What a left-out edit leaves in doubt is written to the file: a restart, whose provider answers
+/// at once, must still not vouch for the message whose edit the file lacks.
+#[tokio::test]
+async fn a_left_out_edit_is_still_distrusted_after_a_restart() {
+    let dir = TempDir::new("cache-access-restart-forgets");
+    let clock = ManualClock::at(T0 + HOUR);
+    filled(&dir, &clock).await.close();
+    let ids = seeded(READ_CHANNEL);
+    {
+        let d = upstream(10, "UA1", "UB1");
+        d.first.hold_identity();
+        let state =
+            testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
+        let d = Deployment { state, ..d };
+        let cache = d.cache();
+        clock.advance(MINUTE);
+        d.fake.edit(&ids[2], "edited upstream");
+        push(&d, "left-out", LiveKind::Update, &ids[2], None);
+        assert!(suspect(&cache), "the edit was left out");
+        drop(cache);
+        d.first.release_identity();
+        assert!(d.state.message_cache.identities_verified(WAIT).await);
+        d.close();
+    }
+
+    // The next start: the account answers at once, and nothing has read the channel since.
+    let d = upstream(10, "UA1", "UB1");
+    d.fake.edit(&ids[2], "edited upstream");
+    let state = testing::with_message_cache(d.state.clone(), dir.path(), clock.clone()).await;
+    let d = Deployment { state, ..d };
+    let cache = d.cache();
+    assert_eq!(text_of(&cache, &ids[2]).as_deref(), Some("a message"));
+    assert!(suspect(&cache), "the restart forgot what was left out");
+    clock.advance(MINUTE);
+    let counted = by_id(&d.state, &ids[2], StatusCode::OK).await;
+    assert_eq!(
+        (
+            counted.would_serve,
+            counted.content_differs,
+            counted.misses.suspect
+        ),
+        (0, 0, 1),
+        "{counted:?}"
+    );
+}

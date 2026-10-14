@@ -230,6 +230,7 @@ pub(crate) fn run(
 struct Hot<'c> {
     chan_select: Statement<'c>,
     chan_insert: Statement<'c>,
+    chan_dropped: Statement<'c>,
     row_select: Statement<'c>,
     row_insert: Statement<'c>,
     row_update: Statement<'c>,
@@ -251,9 +252,10 @@ impl<'c> Hot<'c> {
             chan_select: conn
                 .prepare("SELECT chan FROM channel WHERE provider_key = ?1 AND channel_id = ?2")?,
             chan_insert: conn.prepare(
-                "INSERT INTO channel (provider_key, channel_id) VALUES (?1, ?2)
+                "INSERT INTO channel (provider_key, channel_id, dropped_ms) VALUES (?1, ?2, ?3)
                  ON CONFLICT (provider_key, channel_id) DO NOTHING",
             )?,
+            chan_dropped: conn.prepare("SELECT dropped_ms FROM channel WHERE chan = ?1")?,
             row_select: conn.prepare(
                 "SELECT row_id, numeric_id, created_ms, edited_ms, observed_ms, home_scope,
                         thread_id, is_root, reply_to, author_id, author, author_is_bot, content,
@@ -901,6 +903,10 @@ impl Writer<'_> {
                 });
                 self.report("account", result);
             }
+            Op::Dropped { chan } => {
+                let result = self.transaction(|w| w.record_drop(&chan));
+                self.report("drop record", result);
+            }
             Op::Maintain { kind } => self.maintain(kind),
             #[cfg(test)]
             Op::Probe { reply } => {
@@ -1019,15 +1025,57 @@ impl Writer<'_> {
             .optional()
     }
 
+    /// The channel's interned id, making one if the file holds nothing of it yet. A new one takes
+    /// the latest drop of the channel in this process: rows from reads that began before it may
+    /// still land.
     fn intern(&mut self, chan: &ChanKey) -> rusqlite::Result<i64> {
         if let Some(id) = self.find_chan(chan)? {
             return Ok(id);
         }
+        let dropped = self.dropped_in_memory(chan);
         self.hot
             .chan_insert
-            .execute(params![chan.provider_key, chan.channel_id])?;
+            .execute(params![chan.provider_key, chan.channel_id, dropped])?;
         self.find_chan(chan)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    fn dropped_in_memory(&self, chan: &ChanKey) -> Option<i64> {
+        lock(&self.shared.drops)
+            .get(chan)
+            .map(|record| record.at_ms)
+    }
+
+    /// The latest drop of an offer for the channel, by the file (an earlier process's, too) or by
+    /// memory (one whose [`Op::Dropped`] is not applied yet).
+    fn dropped(&mut self, chan: &ChanKey, chan_id: i64) -> rusqlite::Result<Option<i64>> {
+        let file: Option<i64> = self
+            .hot
+            .chan_dropped
+            .query_row([chan_id], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(later(file, self.dropped_in_memory(chan)))
+    }
+
+    /// [`Op::Dropped`]: write the channel's latest drop into its row, if the file holds one. The
+    /// op is marked applied before the time is read, so a drop after this point queues another.
+    fn record_drop(&mut self, chan: &ChanKey) -> rusqlite::Result<()> {
+        let at_ms = {
+            let mut drops = lock(&self.shared.drops);
+            let Some(record) = drops.get_mut(chan) else {
+                return Ok(());
+            };
+            record.queued = false;
+            record.at_ms
+        };
+        if let Some(chan_id) = self.find_chan(chan)? {
+            self.conn.execute(
+                "UPDATE channel SET dropped_ms = MAX(COALESCE(dropped_ms, ?2), ?2) WHERE chan = ?1",
+                params![chan_id, at_ms],
+            )?;
+        }
+        Ok(())
     }
 
     // ---- observations ---------------------------------------------------------------------
@@ -1093,8 +1141,9 @@ impl Writer<'_> {
     fn observe(&mut self, chan: &ChanKey, observation: &Observation) -> rusqlite::Result<()> {
         let chan_id = self.intern(chan)?;
         let cutoff = self.shared.limits.cutoff_ms(&chan.channel_id, self.now());
+        let dropped = self.dropped(chan, chan_id)?;
         match observation {
-            Observation::Listing(listing) => self.listing(chan, chan_id, cutoff, listing),
+            Observation::Listing(listing) => self.listing(chan, chan_id, cutoff, dropped, listing),
             Observation::Rows {
                 rows,
                 scope,
@@ -1105,6 +1154,7 @@ impl Writer<'_> {
                         chan,
                         chan_id,
                         cutoff,
+                        dropped,
                         row,
                         *observed_ms,
                         Arrival::Rows,
@@ -1135,6 +1185,7 @@ impl Writer<'_> {
                         chan,
                         chan_id,
                         cutoff,
+                        dropped,
                         message,
                         *observed_ms,
                         arrival,
@@ -1163,6 +1214,7 @@ impl Writer<'_> {
         chan: &ChanKey,
         chan_id: i64,
         cutoff: i64,
+        dropped: Option<i64>,
         listing: &Listing,
     ) -> rusqlite::Result<()> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(listing.rows.len());
@@ -1177,6 +1229,7 @@ impl Writer<'_> {
                 chan,
                 chan_id,
                 cutoff,
+                dropped,
                 row,
                 listing.observed_ms,
                 Arrival::Listing,
@@ -1193,14 +1246,24 @@ impl Writer<'_> {
         let stored = self.load_head(chan_id, &scope_key)?;
         let head = match proof.until {
             ListEnd::Newest => {
-                let head = coverage::advance_head(stored, newest, listing.observed_ms);
-                if Some(head) != stored {
-                    self.store_head(chan_id, &scope_key, &head)?;
+                let old = stored.map(|(head, _)| head);
+                let head = coverage::advance_head(old, newest, listing.observed_ms);
+                let checked = stored.map_or(listing.observed_ms, |(_, checked)| {
+                    checked.max(listing.observed_ms)
+                });
+                // A read of this scope's newest end that began after the latest drop would have
+                // listed a creation the drop left out: the head is trusted again, and the file
+                // says so though the head did not move. Otherwise the time is written only with a
+                // head that moved, so that reading an unchanged scope again writes nothing.
+                let rechecked = stored.is_some_and(|(_, checked)| {
+                    dropped.is_some_and(|d| checked <= d && d < listing.observed_ms)
+                });
+                if Some(head) != old || rechecked {
+                    self.store_head(chan_id, &scope_key, &head, checked)?;
                 }
-                self.clear_suspect(chan, listing.observed_ms);
                 Some(head)
             }
-            ListEnd::Before(_) => stored,
+            ListEnd::Before(_) => stored.map(|(head, _)| head),
         };
         let from = match proof.from {
             ListStart::ScopeStart => 0,
@@ -1247,19 +1310,6 @@ impl Writer<'_> {
             }
         }
         Ok(())
-    }
-
-    /// A read of the newest end that STARTED after the drop that made the channel suspect has
-    /// landed: its head is trusted again. One that started earlier proves nothing about the
-    /// dropped offer.
-    fn clear_suspect(&self, chan: &ChanKey, observed_ms: i64) {
-        let mut suspects = lock(&self.shared.suspects);
-        if suspects
-            .get(chan)
-            .is_some_and(|&dropped_at| observed_ms > dropped_at)
-        {
-            suspects.remove(chan);
-        }
     }
 
     /// Rule 4: rows of this scope in `[from, to)` that the listing did not carry.
@@ -1405,6 +1455,7 @@ impl Writer<'_> {
         chan: &ChanKey,
         chan_id: i64,
         cutoff: i64,
+        dropped: Option<i64>,
         incoming: &Incoming,
         observed_ms: i64,
         arrival: Arrival,
@@ -1500,7 +1551,7 @@ impl Writer<'_> {
                     incoming,
                     &hash,
                     offered_thread,
-                    observed_ms,
+                    (observed_ms, dropped),
                     arrival,
                     offered_partial,
                 )?;
@@ -1521,6 +1572,8 @@ impl Writer<'_> {
         self.thread_from_row(chan_id, incoming, created, observed_ms)
     }
 
+    /// Rules 2 and 5 for a message the file holds, and what a read after a drop vouches for. The
+    /// pair is when the incoming copy was seen, and when an offer for the channel was last dropped.
     #[allow(clippy::too_many_arguments)]
     fn update(
         &mut self,
@@ -1529,7 +1582,7 @@ impl Writer<'_> {
         incoming: &Incoming,
         hash: &str,
         offered_thread: Option<String>,
-        observed_ms: i64,
+        (observed_ms, dropped): (i64, Option<i64>),
         arrival: Arrival,
         offered_partial: bool,
     ) -> rusqlite::Result<()> {
@@ -1571,6 +1624,16 @@ impl Writer<'_> {
                 next.observed_ms = observed_ms;
                 next.edited_ms = later(held.edited_ms, incoming.edited_ms);
             }
+        }
+        // A read that began after the channel's latest drop, and found the text the file holds,
+        // vouches for the row again: whatever the dropped offer said of it (an edit, a deletion)
+        // came before this read. Only then does a read of unchanged text move the time, so that
+        // listing an unchanged row again still writes nothing.
+        if !arrival.is_push()
+            && hash == held.content_hash
+            && dropped.is_some_and(|d| held.observed_ms <= d && d < observed_ms)
+        {
+            next.observed_ms = next.observed_ms.max(observed_ms);
         }
         // The rest of the message follows the newer observation; an older one changes nothing
         // but what only ever accumulates.
@@ -1721,36 +1784,33 @@ impl Writer<'_> {
         Ok(())
     }
 
-    fn load_head(&self, chan_id: i64, scope_key: &str) -> rusqlite::Result<Option<Head>> {
-        self.conn
-            .query_row(
-                "SELECT head_ms, unsettled_from_ms, head_listed_ms FROM scope_head
-                 WHERE chan = ?1 AND scope_key = ?2",
-                params![chan_id, scope_key],
-                |row| {
-                    Ok(Head {
-                        head_ms: row.get(0)?,
-                        unsettled_from_ms: row.get(1)?,
-                        head_listed_ms: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
+    /// A scope's head, and when the latest read of its newest end the file records began.
+    fn load_head(&self, chan_id: i64, scope_key: &str) -> rusqlite::Result<Option<(Head, i64)>> {
+        super::reader::head_by_id(self.conn, chan_id, scope_key)
     }
 
-    fn store_head(&self, chan_id: i64, scope_key: &str, head: &Head) -> rusqlite::Result<()> {
+    fn store_head(
+        &self,
+        chan_id: i64,
+        scope_key: &str,
+        head: &Head,
+        checked_ms: i64,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO scope_head (chan, scope_key, head_ms, unsettled_from_ms, head_listed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO scope_head (chan, scope_key, head_ms, unsettled_from_ms, head_listed_ms,
+                    checked_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (chan, scope_key) DO UPDATE SET head_ms = excluded.head_ms,
                 unsettled_from_ms = excluded.unsettled_from_ms,
-                head_listed_ms = excluded.head_listed_ms",
+                head_listed_ms = excluded.head_listed_ms,
+                checked_ms = excluded.checked_ms",
             params![
                 chan_id,
                 scope_key,
                 head.head_ms,
                 head.unsettled_from_ms,
-                head.head_listed_ms
+                head.head_listed_ms,
+                checked_ms
             ],
         )?;
         Ok(())

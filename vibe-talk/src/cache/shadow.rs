@@ -17,11 +17,11 @@
 //!
 //! | Consumer | Would serve when |
 //! |---|---|
-//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), the channel is not suspect, and the barrier passed |
-//! | `message_by_id`, `summary` | the message is held, the channel is not suspect (an offer dropped for it may have been this message's edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`] or the channel is live-fed; on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
-//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), and the barrier passed; an open-ended page needs a fresh head as well |
-//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head is as fresh as for `messages`, and the barrier passed |
-//! | `timeline_fallback` | coverage holds `limit` rows down from the head, the channel is not suspect, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
+//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), nothing served is in doubt (see below), and the barrier passed |
+//! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`] or the channel is live-fed; on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
+//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
+//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head is as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
+//! | `timeline_fallback` | coverage holds `limit` rows down from the head, nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
 //!
 //! # What a miss says
 //!
@@ -31,8 +31,12 @@
 //! - `blocked`: the cache would not read the channel or the scope at all: it is not on the route
 //!   snapshot, an erase of it is waiting, access to it is in doubt, its provider is suspended, or
 //!   the read failed;
-//! - `suspect`: an offer for the channel was dropped (the queue was full, or its provider's account
-//!   was not checked against the file), and no read of its newest end that began since has landed;
+//! - `suspect`: something the answer rests on is in doubt. An offer for the channel was dropped
+//!   (the queue was full, or its provider's account was not checked against the file), in this
+//!   process or, as the file records, an earlier one; and a row the answer would hold has not been
+//!   seen by a read that began after the latest drop, or the answer needs the scope's head and no
+//!   read of that scope's newest end began after it. A read lifts the doubt about exactly what it
+//!   saw: a thread's listing says nothing of Main, nor a two-row page of the rows below it;
 //! - `gap`: the cache does not hold what would be served: no head, a hole in the coverage, or not
 //!   the message;
 //! - `incomplete`: covered, but by reads that may have left a message out (Slack's);
@@ -336,12 +340,17 @@ fn timeline_scope(shape: Shape, view: TimelineView, thread: Option<&str>) -> Opt
 pub struct View {
     /// The scope's head, when the query read one and a read of the newest end has landed.
     pub head: Option<Head>,
+    /// When the latest read of that scope's newest end the file records began: the head's own
+    /// listing time, or later.
+    pub head_checked_ms: Option<i64>,
     /// The coverage of the scope read, or of the message's home scope.
     pub coverage: Vec<Interval>,
     /// The messages read, oldest first.
     pub rows: Vec<CachedMessage>,
     /// The message's home scope, for a query of one message the cache holds.
     pub home: Option<Scope>,
+    /// The latest local time an offer for the channel was dropped, as the file records it.
+    pub dropped_ms: Option<i64>,
 }
 
 /// Whether a provider's live feed carries deletions, so a message it has not reported deleted
@@ -373,8 +382,9 @@ pub struct Facts {
     pub asked_ms: i64,
     /// Whether a live producer feeds the channel: its provider is polled, or adapters push.
     pub live_fed: bool,
-    /// Whether the channel was suspect.
-    pub suspect: bool,
+    /// The latest local time an offer for the channel was dropped in this process, if one was.
+    /// The rule takes the later of this and the file's [`View::dropped_ms`].
+    pub dropped_ms: Option<i64>,
     /// Whether what was queued before the ask was applied within [`BARRIER`].
     pub barrier: bool,
     /// What the provider's feed carries.
@@ -448,6 +458,9 @@ pub fn late(view: &View, asked_ms: i64) -> bool {
     view.head
         .is_some_and(|head| head.head_listed_ms >= asked_ms)
         || view
+            .head_checked_ms
+            .is_some_and(|checked| checked >= asked_ms)
+        || view
             .coverage
             .iter()
             .any(|interval| interval.listed_ms >= asked_ms)
@@ -481,6 +494,32 @@ fn settled_top(head: &Head) -> i64 {
     head.unsettled_from_ms.min(head.head_ms.saturating_add(1))
 }
 
+/// The latest drop of an offer for the channel: by this process's memory, or by the file.
+fn dropped(view: &View, facts: &Facts) -> Option<i64> {
+    match (view.dropped_ms, facts.dropped_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// Whether a row is vouched for after the latest drop: seen by a read that began after it. Anything
+/// older may be the row whose edit or deletion was the offer dropped.
+fn trusted(row: &CachedMessage, dropped: Option<i64>) -> bool {
+    dropped.is_none_or(|dropped| row.observed_ms > dropped)
+}
+
+/// Whether the scope's head is trusted after the latest drop: a read of the scope's newest end
+/// began after it, and would have listed a creation the drop left out. No head is not a doubt.
+fn head_trusted(view: &View, dropped: Option<i64>) -> bool {
+    match (view.head, dropped) {
+        (Some(head), Some(dropped)) => {
+            view.head_checked_ms.unwrap_or(head.head_listed_ms) > dropped
+        }
+        _ => true,
+    }
+}
+
 fn fresh(head: &Head, facts: &Facts) -> bool {
     let within = if facts.live_fed {
         FRESH_LIVE_FED_MS
@@ -492,7 +531,9 @@ fn fresh(head: &Head, facts: &Facts) -> bool {
 
 /// A newest window, or a newest page: coverage contiguous from the head down to `limit` rows.
 fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result<Decision, Miss> {
-    if facts.suspect {
+    let dropped = dropped(view, facts);
+    let window = &view.rows[view.rows.len().saturating_sub(limit.max(1))..];
+    if !head_trusted(view, dropped) || !window.iter().all(|row| trusted(row, dropped)) {
         return Err(Miss::Suspect);
     }
     let head = view.head.ok_or(Miss::Gap)?;
@@ -514,14 +555,14 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     Ok(Decision::Serve)
 }
 
-/// One message: held, its channel not suspect, and its home scope revalidated recently enough for
-/// its provider's feed. A live feed that carries deletions vouches for a message only while
-/// nothing it offered was dropped.
+/// One message: held, seen since the channel's latest drop, and its home scope revalidated recently
+/// enough for its provider's feed. A live feed that carries deletions vouches for a message only
+/// when nothing it offered since the message was seen was dropped.
 fn message(view: &View, facts: &Facts) -> Result<Decision, Miss> {
-    if facts.suspect {
+    let row = view.rows.first().ok_or(Miss::Gap)?;
+    if !trusted(row, dropped(view, facts)) {
         return Err(Miss::Suspect);
     }
-    let row = view.rows.first().ok_or(Miss::Gap)?;
     let revalidated = view
         .coverage
         .iter()
@@ -551,7 +592,9 @@ fn page(
     // A page that is not full runs to `until`, or, with none, to the newest end: that needs the
     // head, and the head trusted and fresh.
     let open = !full && until.is_none();
-    if open && facts.suspect {
+    let dropped = dropped(view, facts);
+    if (open && !head_trusted(view, dropped)) || !view.rows.iter().all(|row| trusted(row, dropped))
+    {
         return Err(Miss::Suspect);
     }
     let end = if full {
@@ -573,7 +616,8 @@ fn page(
 
 /// A count from `since`: complete coverage up to the unsettled band, under a fresh head.
 fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
-    if facts.suspect {
+    let dropped = dropped(view, facts);
+    if !head_trusted(view, dropped) || !view.rows.iter().all(|row| trusted(row, dropped)) {
         return Err(Miss::Suspect);
     }
     let head = view.head.ok_or(Miss::Gap)?;
@@ -985,7 +1029,7 @@ mod tests {
             head: Some(head),
             coverage: vec![interval(T - HOUR, head.unsettled_from_ms, complete)],
             rows: rows(0..n),
-            home: None,
+            ..View::default()
         }
     }
 
@@ -993,7 +1037,7 @@ mod tests {
         Facts {
             asked_ms,
             live_fed: false,
-            suspect: false,
+            dropped_ms: None,
             barrier: true,
             feed: Feed::AdditionsOnly,
         }
@@ -1078,7 +1122,7 @@ mod tests {
         assert_eq!(decide(&window(3), &newest(&holed, 3), &at), Decision::Serve);
         let view = newest(&listed(12, false), 5);
         let suspect = Facts {
-            suspect: true,
+            dropped_ms: Some(LISTED),
             ..at
         };
         assert_eq!(
@@ -1110,6 +1154,85 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_leaves_in_doubt_only_the_rows_and_heads_no_read_has_seen_since() {
+        let at = facts(LISTED + 1_000);
+        let view = newest(&listed(12, true), 5);
+        let after = |dropped_ms: i64| Facts {
+            dropped_ms: Some(dropped_ms),
+            ..at
+        };
+        let suspect = Decision::Miss(Miss::Suspect);
+        // A drop before everything was seen leaves nothing in doubt; one after, everything.
+        assert_eq!(
+            decide(&window(5), &view, &after(LISTED - 1)),
+            Decision::Serve
+        );
+        assert_eq!(decide(&window(5), &view, &after(LISTED)), suspect);
+        // The file's record of an earlier process's drop counts as this process's own does.
+        let recorded = View {
+            dropped_ms: Some(LISTED),
+            ..view.clone()
+        };
+        assert_eq!(decide(&window(5), &recorded, &at), suspect);
+        // A read of the newest two rows, begun after the drop, vouches for those two and for the
+        // head, and for nothing below them.
+        let seen = |mut view: View, newest: usize| {
+            let from = view.rows.len().saturating_sub(newest);
+            for row in &mut view.rows[from..] {
+                row.observed_ms = LISTED + 20;
+            }
+            View {
+                head_checked_ms: Some(LISTED + 20),
+                ..view
+            }
+        };
+        let two = seen(recorded.clone(), 2);
+        assert_eq!(decide(&window(2), &newest(&two, 2), &at), Decision::Serve);
+        assert_eq!(decide(&window(5), &two, &at), suspect);
+        // Every row seen again, but the head not: a creation the drop left out may be missing.
+        let rows_only = View {
+            head_checked_ms: Some(LISTED),
+            ..seen(recorded.clone(), 5)
+        };
+        assert_eq!(decide(&window(5), &rows_only, &at), suspect);
+        assert_eq!(
+            decide(&window(5), &seen(recorded.clone(), 5), &at),
+            Decision::Serve
+        );
+        // One message is judged by itself: m7, below the band, seen again or not.
+        let ask = Ask::Message {
+            consumer: Consumer::MessageById,
+            id: MessageId("m7".to_owned()),
+        };
+        let message = |view: &View| View {
+            rows: view.rows.first().cloned().into_iter().collect(),
+            head: None,
+            head_checked_ms: None,
+            ..view.clone()
+        };
+        let all = seen(recorded.clone(), 5);
+        assert_eq!(decide(&ask, &message(&all), &at), Decision::Serve);
+        assert_eq!(decide(&ask, &message(&two), &at), suspect);
+        // A page or a count holding a row in doubt would serve it too.
+        let page = Ask::Page {
+            since_ms: T,
+            until_ms: Some(T + 5 * MINUTE),
+            limit: 20,
+        };
+        let span = View {
+            rows: rows(0..5),
+            ..listed(12, true)
+        };
+        assert_eq!(decide(&page, &span, &at), Decision::Serve);
+        assert_eq!(decide(&page, &span, &after(LISTED)), suspect);
+        let count = Ask::Count {
+            since_ms: Some(T),
+            cap: 100,
+        };
+        assert_eq!(decide(&count, &listed(12, true), &after(LISTED)), suspect);
+    }
+
+    #[test]
     fn a_message_by_id_follows_its_providers_feed() {
         let held = |full_ms: i64| View {
             head: None,
@@ -1119,6 +1242,7 @@ mod tests {
             }],
             rows: vec![row(3)],
             home: Some(Scope::Main),
+            ..View::default()
         };
         let ask = Ask::Message {
             consumer: Consumer::MessageById,
@@ -1174,7 +1298,7 @@ mod tests {
         // edit, so neither a feed that carries deletions nor a recent check vouches for it.
         for trusting in [fed, bridge, slack] {
             let suspect = Facts {
-                suspect: true,
+                dropped_ms: Some(LISTED),
                 ..trusting
             };
             assert_eq!(

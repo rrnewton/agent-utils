@@ -262,11 +262,12 @@ fn a_newer_additive_schema_is_used_and_an_incompatible_one_is_rebuilt() {
         )
         .expect("compat");
     };
-    poke(2, "1");
+    let known = i64::try_from(schema::STEPS.len()).expect("a few steps");
+    poke(known + 1, &known.to_string());
     let cache = fixtures::open(&dir, &clock, Limits::default());
     assert_eq!(cache.counts().served().expect("counts").messages, 1, "kept");
     drop(cache);
-    poke(2, "2");
+    poke(known + 1, &(known + 1).to_string());
     let cache = fixtures::open(&dir, &clock, Limits::default());
     assert_eq!(
         cache.counts().served().expect("counts").messages,
@@ -282,25 +283,63 @@ fn migrations_are_additive_and_keep_what_the_file_holds() {
     let path = fx.path();
     drop(fx.cache);
     let connection = rusqlite::Connection::open(&path).expect("open");
-    let ladder = [
-        schema::STEPS[0],
-        schema::Step {
-            sql: "ALTER TABLE message ADD COLUMN later_column INTEGER;
-                  CREATE INDEX message_by_later ON message (later_column);",
-            compat: 1,
-        },
-    ];
+    let mut ladder = schema::STEPS.to_vec();
+    ladder.push(schema::Step {
+        sql: "ALTER TABLE message ADD COLUMN later_column INTEGER;
+              CREATE INDEX message_by_later ON message (later_column);",
+        compat: 1,
+    });
     schema::migrate(&connection, &ladder).expect("additive step");
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("version");
-    assert_eq!(version, 2);
+    assert_eq!(version, i64::try_from(ladder.len()).expect("a few steps"));
     let rows: i64 = connection
-        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM message WHERE later_column IS NULL",
+            [],
+            |r| r.get(0),
+        )
         .expect("count");
     assert_eq!(rows, 2);
     // Applying the ladder again does nothing.
     schema::migrate(&connection, &ladder).expect("idempotent");
+}
+
+#[test]
+fn a_file_of_schema_one_takes_the_record_of_what_was_left_out_and_keeps_its_rows() {
+    let dir = crate::testing::TempDir::new("cache-migrate-v2");
+    let clock = Arc::new(ManualClock(AtomicI64::new(T0)));
+    let cache_dir = dir.path().join("cache");
+    file::ensure_private_dir(&cache_dir).expect("dir");
+    let path = cache_dir.join("c.sqlite3");
+    file::create_if_absent(&path).expect("create");
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        schema::prepare_writer(&connection, schema::Header::Empty, &schema::STEPS[..1])
+            .expect("schema 1");
+        connection
+            .execute_batch(
+                "INSERT INTO channel (chan, provider_key, channel_id) VALUES (1, 'p', 'C1');
+                 INSERT INTO scope_head (chan, scope_key, head_ms, unsettled_from_ms,
+                        head_listed_ms) VALUES (1, 'main', 5, 6, 7);",
+            )
+            .expect("rows");
+    }
+    let cache = fixtures::open(&dir, &clock, Limits::default());
+    assert_eq!(cache.counts().served().expect("counts").channels, 1, "kept");
+    let (dropped, checked): (Option<i64>, Option<i64>) = cache
+        .read(None, |c| {
+            c.query_row(
+                "SELECT c.dropped_ms, h.checked_ms FROM channel c
+                 JOIN scope_head h ON h.chan = c.chan",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .served()
+        .expect("served");
+    assert_eq!((dropped, checked), (None, None));
 }
 
 // ---- the full-text index and privacy -----------------------------------------------------------
@@ -1450,6 +1489,7 @@ fn a_bounded_flat_page_never_deletes_a_reply_or_stamps_a_thread() {
 #[test]
 fn an_offer_too_big_for_the_queue_is_dropped_and_marks_the_channel_suspect() {
     let fx = Fixture::new("cache-drop");
+    fx.list(vec![m(1)], T0 - 20, Some(newest_proof(ListStart::At(T0))));
     let huge = Message {
         content: "x".repeat(QUEUE_BYTES),
         ..m(1)
@@ -1466,9 +1506,10 @@ fn an_offer_too_big_for_the_queue_is_dropped_and_marks_the_channel_suspect() {
         }),
     );
     assert_eq!(offered, Offered::Dropped);
-    assert!(fx.cache.is_suspect(&fx.chan));
+    assert_eq!(fx.cache.last_drop_ms(&fx.chan), Some(T0));
+    assert!(fx.cache.is_suspect(&fx.chan), "m1 was seen before the drop");
     assert_eq!(fx.cache.stats().ops_dropped, 1);
-    // A read of the newest end that started after the drop makes the head trusted again.
+    // A read of the newest end that started after the drop sees m1 and the head again.
     fx.list(vec![m(1)], T0 + 20, Some(newest_proof(ListStart::At(T0))));
     assert!(!fx.cache.is_suspect(&fx.chan));
 }

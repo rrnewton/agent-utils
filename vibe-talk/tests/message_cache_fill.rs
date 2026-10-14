@@ -1100,7 +1100,19 @@ async fn an_unarmed_cache_is_filled_by_nothing() {
         get(&state, &uri).await;
     }
     assert!(cache.quiesce_blocking(WAIT));
-    assert_eq!(cache.applied_seq(), 0, "nothing reached the writer");
+    // Each read was left out, and only that it was reached the writer: a time, for a channel the
+    // file holds nothing of, so nothing at all was written.
+    assert!(
+        cache.last_drop_ms(&read_chan()).is_some(),
+        "the reads were left out"
+    );
+    let counts = cache.counts().served().expect("counts");
+    assert_eq!(
+        (counts.messages, counts.channels, counts.intervals),
+        (0, 0, 0),
+        "nothing was written"
+    );
+    assert_eq!(cache.stats().rows_written, 0);
     assert_eq!(held(&cache), 0);
 }
 
@@ -2247,4 +2259,153 @@ async fn a_pollers_publish_never_inserts_a_message_a_later_listing_proved_gone()
         (0, 0),
         "{counted:?}"
     );
+}
+
+// ---- a change left out while the account is checked again ---------------------------------------
+
+/// A bridge whose identity answer the test can hold, to stand for a provider slow to say which
+/// account it is.
+struct SlowIdentity {
+    inner: Arc<TimelineChat>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+#[async_trait::async_trait]
+impl vibe_talk::chat::ChatClient for SlowIdentity {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    async fn identity(&self) -> Result<vibe_talk::chat::ChatIdentity, vibe_talk::chat::ChatError> {
+        let mut open = self.open.subscribe();
+        let _ = open.wait_for(|open| *open).await;
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, vibe_talk::chat::ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, vibe_talk::chat::ChatError> {
+        self.inner.fetch_recent(channel, limit).await
+    }
+
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<vibe_talk::chat::RecentRead, vibe_talk::chat::ChatError> {
+        self.inner.fetch_recent_dated(channel, limit).await
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &vibe_talk::threads::TimelineRequest,
+    ) -> Result<vibe_talk::threads::TimelinePage, vibe_talk::chat::ChatError> {
+        self.inner.fetch_timeline(channel, request).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, vibe_talk::chat::ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
+/// A live-fed bridge: the account is checked again and its answer is slow, so an adapter's edit of
+/// an older message is left out. Once the account answers, the page's first look, a two-row Flat
+/// page, re-reads only the newest messages: the cache must still not vouch for the older one, whose
+/// text in the file is the text from before the edit.
+#[tokio::test]
+async fn a_short_flat_page_never_vouches_for_an_older_message_whose_pushed_edit_was_left_out() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let Upstream {
+        mut state,
+        fake,
+        ids,
+        ..
+    } = upstream(true, 8);
+    let slow = Arc::new(SlowIdentity {
+        inner: Arc::new(TimelineChat::new(fake.clone())),
+        open: tokio::sync::watch::Sender::new(true),
+    });
+    state.replace_chat(slow.clone());
+    let dir = TempDir::new("cache-left-out-edit");
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    get(&state, &flat_page()).await;
+    assert_eq!(held(&cache), 8);
+
+    slow.open.send_replace(false);
+    state.message_cache.reverify();
+    clock.advance(MINUTE);
+    let edit = said(&fake, &ids[1], "message 1, edited upstream");
+    fake.edit(&ids[1], "message 1, edited upstream");
+    assert_eq!(
+        ingest(&state, pushed("left-out", "update", &edit)).await,
+        StatusCode::ACCEPTED
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+    assert!(cache.is_suspect(&read_chan()), "the edit was left out");
+    slow.open.send_replace(true);
+    assert!(state.message_cache.identities_verified(WAIT).await);
+
+    clock.advance(MINUTE);
+    get(
+        &state,
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=flat&limit=2"),
+    )
+    .await;
+    assert_eq!(
+        cached(&cache, &read_chan(), &ids[1]).message.content,
+        "message 1",
+        "the short page did not reach it"
+    );
+    assert!(
+        cache.is_suspect(&read_chan()),
+        "nothing re-read the older message"
+    );
+    let (status, _) = call(
+        &state,
+        "GET",
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            ids[1].as_str()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.misses.suspect),
+        (0, 1),
+        "{counted:?}"
+    );
+
+    // A read of the whole channel that began after the edit was left out takes it in.
+    clock.advance(MINUTE);
+    get(&state, &flat_page()).await;
+    assert_eq!(
+        cached(&cache, &read_chan(), &ids[1]).message.content,
+        "message 1, edited upstream"
+    );
+    assert!(!cache.is_suspect(&read_chan()));
 }

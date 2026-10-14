@@ -38,7 +38,9 @@
 //!   takes the sequencer, numbers the offer and queues it while holding it, so queue order is
 //!   sequence order and the applied sequence is always contiguous.
 //! - The queue is bounded by BYTES (32 MB), not by count. An offer that does not fit is dropped,
-//!   counted, and marks its channel suspect; no producer ever waits on the cache.
+//!   counted, and marks its channel suspect ([`MessageCache::mark_suspect`]); no producer ever
+//!   waits on the cache. What a drop leaves in doubt is kept in the file, per channel, and lifted
+//!   row by row and head by head as reads that began after it see them again.
 //! - The writer commits after about 25 ms of work, or at once when a reader raises the flush flag.
 //!   A read that must be current notes the sequence, raises the flag and waits (the barrier).
 //! - Readers use two read-only connections. Each re-checks the file generation and the channel's
@@ -1009,8 +1011,11 @@ pub(crate) struct Shared {
     pub(crate) seq: Sequencer,
     pub(crate) budget: ByteBudget,
     pub(crate) routes: RwLock<Option<Arc<RouteSnapshot>>>,
-    /// Channels whose head is not trusted, since the local time an offer for them was dropped.
-    pub(crate) suspects: Mutex<HashMap<ChanKey, i64>>,
+    /// The latest local time an offer for each channel was dropped in this process, and whether a
+    /// [`Op::Dropped`] that will write it to the file is queued. Never cleared by a read: what a
+    /// drop leaves in doubt is lifted row by row and head by head, as reads that began after it
+    /// land ([`MessageCache::is_suspect`]).
+    pub(crate) drops: Mutex<HashMap<ChanKey, DropRecord>>,
     pub(crate) stats: Stats,
     pub(crate) limits: Limits,
     pub(crate) search_text: Arc<dyn SearchTextSource>,
@@ -1040,6 +1045,16 @@ pub(crate) struct Shared {
     /// A test's hook into [`MessageCache::read`], run at each [`ReadPoint`].
     #[cfg(test)]
     pub(crate) read_hook: Mutex<Option<ReadHook>>,
+}
+
+/// When an offer for one channel was last dropped, in this process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DropRecord {
+    /// Local time, by the cache's clock.
+    pub(crate) at_ms: i64,
+    /// An [`Op::Dropped`] for the channel is queued and not yet applied: the writer reads `at_ms`
+    /// when it applies it, so a later drop needs no op of its own.
+    pub(crate) queued: bool,
 }
 
 /// Channels, scopes and providers whose rows are kept but not served: access to them is in
@@ -1123,6 +1138,11 @@ pub(crate) enum Op {
         provider_key: String,
         account_id: String,
         workspace_id: Option<String>,
+    },
+    /// Write the channel's latest drop ([`Shared::drops`]) into the file, where it holds a row.
+    /// Times only: nothing an account could have read.
+    Dropped {
+        chan: ChanKey,
     },
     Maintain {
         kind: Maintenance,
@@ -1275,7 +1295,7 @@ impl MessageCache {
             seq: Sequencer::default(),
             budget: ByteBudget::default(),
             routes: RwLock::new(None),
-            suspects: Mutex::new(HashMap::new()),
+            drops: Mutex::new(HashMap::new()),
             stats: Stats::default(),
             limits: options.limits,
             search_text: options.search_text,
@@ -1408,32 +1428,39 @@ impl MessageCache {
     /// Offer an observation. Never waits: a full queue drops it and marks the channel suspect.
     pub fn offer(&self, chan: ChanKey, stamp: Stamp, observation: Observation) -> Offered {
         let bytes = observation.estimated_bytes();
-        let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let Some(inner) = guard.as_ref() else {
-            return Offered::Off;
+        // The open file is let go of before a drop is recorded: recording one queues an op, and
+        // takes the file again.
+        let queued = {
+            let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+            let Some(inner) = guard.as_ref() else {
+                return Offered::Off;
+            };
+            let mut enqueued = lock(&self.shared.seq.enqueued);
+            if self.shared.budget.try_take(bytes) {
+                let seq = *enqueued + 1;
+                let envelope = Envelope {
+                    seq,
+                    bytes,
+                    op: Op::Observe {
+                        chan: chan.clone(),
+                        stamp,
+                        observation: Box::new(observation),
+                    },
+                };
+                if inner.send(envelope) {
+                    *enqueued = seq;
+                    Some(seq)
+                } else {
+                    self.shared.budget.release(bytes);
+                    None
+                }
+            } else {
+                None
+            }
         };
-        let mut enqueued = lock(&self.shared.seq.enqueued);
-        if !self.shared.budget.try_take(bytes) {
-            drop(enqueued);
-            self.dropped(&chan, bytes);
-            return Offered::Dropped;
-        }
-        let seq = *enqueued + 1;
-        let envelope = Envelope {
-            seq,
-            bytes,
-            op: Op::Observe {
-                chan: chan.clone(),
-                stamp,
-                observation: Box::new(observation),
-            },
-        };
-        if inner.send(envelope) {
-            *enqueued = seq;
+        if let Some(seq) = queued {
             Offered::Queued(seq)
         } else {
-            drop(enqueued);
-            self.shared.budget.release(bytes);
             self.dropped(&chan, bytes);
             Offered::Dropped
         }
@@ -1448,10 +1475,36 @@ impl MessageCache {
         self.mark_suspect(chan);
     }
 
-    /// Something seen of `chan` was not offered: its head is not trusted until a read of its
-    /// newest end that starts after now has landed. In memory only, as every suspicion is.
+    /// Something seen of `chan` was not offered, now: it may have been an edit, a deletion or a
+    /// creation the file lacks. From now on, until a read that began after now has seen it again,
+    /// no row of the channel observed no later is vouched for, and no head of its scopes listed no
+    /// later is trusted ([`MessageCache::is_suspect`]).
+    ///
+    /// Recorded in memory at once, and in the file through the writer ([`Op::Dropped`], a control
+    /// operation, so a full queue never drops it), so that the next start remembers it too. One
+    /// such operation per channel is queued at a time; it writes the latest drop when it is
+    /// applied. A channel the file holds nothing of yet takes the time when its first row is
+    /// written.
     pub fn mark_suspect(&self, chan: &ChanKey) {
-        lock(&self.shared.suspects).insert(chan.clone(), self.shared.clock.now_ms());
+        let now = self.shared.clock.now_ms();
+        let mut drops = lock(&self.shared.drops);
+        let record = drops.entry(chan.clone()).or_insert(DropRecord {
+            at_ms: now,
+            queued: false,
+        });
+        record.at_ms = record.at_ms.max(now);
+        if !record.queued {
+            record.queued = self.control(Op::Dropped { chan: chan.clone() }).is_some();
+        }
+    }
+
+    /// The latest local time an offer for `chan` was dropped in this process, if one was. The file
+    /// may record a later one from an earlier process; [`MessageCache::is_suspect`] reads both.
+    #[must_use]
+    pub fn last_drop_ms(&self, chan: &ChanKey) -> Option<i64> {
+        lock(&self.shared.drops)
+            .get(chan)
+            .map(|record| record.at_ms)
     }
 
     /// Queue a control operation: exempt from the byte budget, because an erase must never be
@@ -1772,11 +1825,23 @@ impl MessageCache {
         receiver
     }
 
-    /// Whether a channel's head is untrusted because an offer for it was dropped and no read of
-    /// its newest end that started afterwards has landed.
+    /// Whether something the cache holds of `chan` is in doubt because an offer for it was dropped
+    /// ([`MessageCache::mark_suspect`]), in this process or, as the file records, an earlier one: a
+    /// row no read that began after the latest drop has seen since, or a scope's head no read of
+    /// that scope's newest end that began after it has listed since. A read of one scope, or of
+    /// its newest few rows, lifts the doubt about exactly what it saw, and nothing else.
+    ///
+    /// Reads the file, so it blocks as every read does; nothing on a request's path calls it (the
+    /// shadow decides on what it reads itself). When the file cannot be read, any drop counts.
     #[must_use]
     pub fn is_suspect(&self, chan: &ChanKey) -> bool {
-        lock(&self.shared.suspects).contains_key(chan)
+        let memory = self.last_drop_ms(chan);
+        match self.read(Some(chan), |connection| {
+            reader::in_doubt(connection, chan, memory)
+        }) {
+            Read::Served(doubt) => doubt,
+            Read::Off | Read::Moved | Read::Blocked | Read::Failed(_) => memory.is_some(),
+        }
     }
 
     /// Whether every row's `search_text` was built by the current rendering rules. A search
@@ -1843,6 +1908,12 @@ impl MessageCache {
         self.shared.seq.catch_up();
         self.shared.seq.set_busy(false);
         self.shared.budget.used.store(0, Ordering::SeqCst);
+        // What the old writer had queued is gone, its drop records with it. The times stay in
+        // memory, where they still judge what this process reads back, and a channel's first row
+        // in the fresh file takes its time with it.
+        for record in lock(&self.shared.drops).values_mut() {
+            record.queued = false;
+        }
         let bytes = file::unlink_family(&self.path);
         // Nothing in the old file can be served any more, and a fresh one holds nothing: what
         // was waiting to be erased, or could not be, is moot.

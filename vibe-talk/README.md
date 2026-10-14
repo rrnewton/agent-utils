@@ -3493,7 +3493,9 @@ existed.
   * a full-text index of their text;
   * the stretches of each channel's history known to be complete ("coverage");
   * a tombstone for each message deleted upstream, holding only ids and times and kept seven
-    days, so that a read which began before the deletion cannot bring the message back.
+    days, so that a read which began before the deletion cannot bring the message back;
+  * per channel, when a change for it was last left out, so that a restart does not trust what it
+    left in doubt (see "Deletions and edits").
 
   No summary is ever in it: summaries stay in the store.
 * **Where.** `[message_cache] path`, which must be absolute and must not be the store's own file.
@@ -3678,9 +3680,12 @@ within seven days anyway.
 A deletion is applied whatever is known of the provider's account: while it is being checked,
 while its credential is refused, and before the startup sweep. It writes nothing an account could
 have read, and an account found later to differ erases the provider anyway. Anything else seen in
-that time, an edit included, is left out, and the channel is marked suspect. Nothing is then
-trusted about its newest messages, or about any one of its messages, until a read that began
-afterwards has landed.
+that time, an edit included, is left out, and the channel is marked suspect. That is written to the
+file, a time and nothing more, so the next start remembers it. From then on, no message of the
+channel seen before is trusted until a read that began afterwards has seen it again, and no view's
+newest messages until a read of that view's newest end that began afterwards has landed. A read
+lifts the doubt about what it saw and nothing else: a thread's page says nothing about the
+channel's other messages, and a page of the newest two says nothing about the messages below them.
 
 ### Whose reads fill it
 
@@ -3806,8 +3811,8 @@ path:
 What the fields mean:
 
 * **Drops.** `ops_dropped` and `bytes_dropped` count offers the writer's 32 MB queue had no room
-  for. Each drop also stops the cache treating the newest end of that channel as current, until a
-  later read of it lands.
+  for. Each drop also leaves that channel in doubt, as a change left out does (see "Deletions and
+  edits"), until later reads have seen again what it holds.
 * **Stale and unrouted.** `ops_stale` counts what reads offered after an erase had overtaken
   them. `ops_unrouted` counts offers for a channel that is not on the list.
 * **Batches.** `batch_us` gives how long the writer's batches take.

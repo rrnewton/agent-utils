@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use super::fixtures::{self, message, newest_proof, Fixture, T0};
-use super::tests::{m, mid};
+use super::tests::{held, m, mid};
 use super::*;
 use crate::model::Message;
 
@@ -267,11 +267,26 @@ fn the_writer_gives_back_queue_bytes_so_offers_past_the_budget_still_land() {
     assert_eq!(fx.cache.counts().served().expect("counts").messages, 20);
 }
 
-/// After a dropped offer, only a read of the newest end that STARTED after the drop makes the
-/// channel's head trusted again.
+/// After a dropped offer, a row is vouched for again only once a read that STARTED after the drop
+/// has seen it, and a scope's head only once a read of that scope's newest end that started after
+/// it has landed. Whatever else lands lifts nothing.
 #[test]
-fn only_a_read_of_the_newest_end_started_after_the_drop_clears_a_suspect_channel() {
+fn after_a_drop_only_reads_begun_later_vouch_again_for_a_row_or_a_scopes_head() {
     let fx = Fixture::new("cache-race-suspect");
+    let thread = Scope::Thread("m1".to_owned());
+    fx.list(vec![m(1)], T0 + 100, Some(newest_proof(ListStart::At(T0))));
+    fx.list_scope(
+        thread.clone(),
+        vec![super::fixtures::reply(
+            "r1",
+            "m1",
+            "a reply",
+            T0 + 2 * STEP_MS,
+        )],
+        T0 + 100,
+        Some(newest_proof(ListStart::At(T0))),
+    );
+    assert!(!fx.cache.is_suspect(&fx.chan), "nothing dropped yet");
     fx.clock.set(T0 + 1_000);
     let huge = Message {
         content: "x".repeat(QUEUE_BYTES),
@@ -288,11 +303,14 @@ fn only_a_read_of_the_newest_end_started_after_the_drop_clears_a_suspect_channel
         },
     );
     assert_eq!(offered, Offered::Dropped);
+    assert_eq!(fx.cache.last_drop_ms(&fx.chan), Some(T0 + 1_000));
     assert!(fx.cache.is_suspect(&fx.chan));
     fx.list(vec![m(1)], T0 + 500, Some(newest_proof(ListStart::At(T0))));
     assert!(fx.cache.is_suspect(&fx.chan), "it started before the drop");
+    // Rows alone vouch for m1, but not for any head.
     fx.list(vec![m(1)], T0 + 2_000, None);
-    assert!(fx.cache.is_suspect(&fx.chan), "no proof of the newest end");
+    assert_eq!(held(&fx, "m1").expect("held").observed_ms, T0 + 2_000);
+    assert!(fx.cache.is_suspect(&fx.chan), "no read of the newest end");
     fx.list(
         vec![m(1)],
         T0 + 2_000,
@@ -308,12 +326,41 @@ fn only_a_read_of_the_newest_end_started_after_the_drop_clears_a_suspect_channel
         fx.cache.is_suspect(&fx.chan),
         "not a read of the newest end"
     );
+    // Main's newest end, read since: main is trusted, the thread is not.
     fx.list(
         vec![m(1)],
         T0 + 2_000,
         Some(newest_proof(ListStart::At(T0))),
     );
+    assert!(
+        fx.cache.is_suspect(&fx.chan),
+        "the thread's head and its reply were not read again"
+    );
+    fx.list_scope(
+        thread,
+        vec![super::fixtures::reply(
+            "r1",
+            "m1",
+            "a reply",
+            T0 + 2 * STEP_MS,
+        )],
+        T0 + 2_000,
+        Some(newest_proof(ListStart::At(T0))),
+    );
     assert!(!fx.cache.is_suspect(&fx.chan));
+    // What the drop left in doubt is in the file, for the next start.
+    let recorded: Option<i64> = fx
+        .cache
+        .read(None, |c| {
+            c.query_row(
+                "SELECT dropped_ms FROM channel WHERE channel_id = 'C1'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .served()
+        .expect("served");
+    assert_eq!(recorded, Some(T0 + 1_000));
 }
 
 const STEP_MS: i64 = super::tests::STEP;

@@ -162,8 +162,24 @@ CREATE TRIGGER message_fts_au AFTER UPDATE OF search_text ON message BEGIN
 END;
 ";
 
+/// Cache schema 2: what an offer left out leaves in doubt, kept in the file so that a restart
+/// does not forget it.
+///
+/// - `channel.dropped_ms`: the latest local time an offer for the channel was dropped (the queue
+///   was full, or its provider's account was not checked against the file). A row observed no
+///   later is not vouched for until a read that began after it has seen the row again.
+/// - `scope_head.checked_ms`: when the latest read of the scope's newest end that the file
+///   records began. A head checked no later than the channel's `dropped_ms` is not trusted: the
+///   dropped offer may have been a creation. `NULL` reads as `head_listed_ms`.
+///
+/// Its compat is 2: code of schema 1 would ignore both, and vouch for what was left out.
+const V2: &str = "
+ALTER TABLE channel ADD COLUMN dropped_ms INTEGER;
+ALTER TABLE scope_head ADD COLUMN checked_ms INTEGER;
+";
+
 /// Every step this code knows, in order. Step `n` (from 1) brings a file to `user_version = n`.
-pub const STEPS: &[Step] = &[Step { sql: V1, compat: 1 }];
+pub const STEPS: &[Step] = &[Step { sql: V1, compat: 1 }, Step { sql: V2, compat: 2 }];
 
 /// Why a file cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,7 +508,9 @@ mod tests {
     #[test]
     fn every_table_is_strict() {
         let connection = Connection::open_in_memory().expect("memory");
-        connection.execute_batch(V1).expect("schema");
+        for step in STEPS {
+            connection.execute_batch(step.sql).expect("schema");
+        }
         let mut statement = connection
             .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'message_fts%'")
             .expect("list");

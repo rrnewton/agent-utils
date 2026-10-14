@@ -60,8 +60,10 @@
 //! whatever is known of the account (unchecked, suspended, or the sink not armed), and a mismatch
 //! found later erases the provider anyway. Leaving it out would leave the deleted message in the
 //! file, to be served once the account is checked. Everything else such a fill would have offered
-//! is dropped, and the channel is marked suspect: its head is not trusted until a read that began
-//! afterwards has landed, since what was dropped may have been an edit.
+//! is dropped, and the channel is marked suspect ([`MessageCache::mark_suspect`]), in memory and in
+//! the file: what was dropped may have been an edit, a deletion or a creation, so no row of the
+//! channel seen before is vouched for until a read that began afterwards has seen it again, and no
+//! scope's head until a read of that scope's newest end that began afterwards has landed.
 //!
 //! It is asked whenever a cache is put behind an armed sink, when the sink is armed with one
 //! behind it, when the providers change, and after any erase of the whole file: a fill checks the
@@ -528,7 +530,8 @@ struct ShadowTask {
 struct Evaluated {
     read: Read<View>,
     barrier: bool,
-    suspect: bool,
+    /// The latest drop of an offer for the channel in this process, when it read.
+    dropped_ms: Option<i64>,
     /// The highest sequence number applied once it had read.
     applied_after: u64,
 }
@@ -539,7 +542,7 @@ impl Evaluated {
         Self {
             read: Read::Off,
             barrier: false,
-            suspect: false,
+            dropped_ms: None,
             applied_after: 0,
         }
     }
@@ -593,7 +596,7 @@ impl ShadowTask {
         if let Ok(Evaluated {
             read,
             barrier,
-            suspect,
+            dropped_ms,
             applied_after,
         }) = evaluated.await
         {
@@ -609,7 +612,7 @@ impl ShadowTask {
                         let facts = shadow::Facts {
                             asked_ms,
                             live_fed,
-                            suspect,
+                            dropped_ms,
                             barrier,
                             feed,
                         };
@@ -968,12 +971,12 @@ impl Sink {
         let evaluated = runtime.spawn_blocking(move || {
             let barrier = barrier(&reads, target, shadow::BARRIER);
             let evaluated = reads.upgrade().map_or_else(Evaluated::off, |cache| {
-                let suspect = cache.is_suspect(&chan);
+                let dropped_ms = cache.last_drop_ms(&chan);
                 let read = cache.shadow_view(&chan, &query);
                 Evaluated {
                     read,
                     barrier,
-                    suspect,
+                    dropped_ms,
                     applied_after: cache.applied_seq(),
                 }
             });
@@ -1795,7 +1798,7 @@ mod tests {
         let resume = cache.pause_writer();
         let body = "x".repeat(3 * 1024 * 1024);
         let mut published = 0;
-        while !cache.is_suspect(&chan) {
+        while cache.last_drop_ms(&chan).is_none() {
             assert!(published < 40, "the hub never offered the cache anything");
             let started = std::time::Instant::now();
             state
