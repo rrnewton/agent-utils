@@ -11,8 +11,9 @@
 //! 3. A targeted reply — one sent with `reply_to`, which the Reply and Quote reply buttons set —
 //!    marks the message it answers read, on the main channel or inside a thread.
 //! 4. Marking read is what the page's own read action does: Done, held on this server, and the
-//!    provider's read marker moved through the message where the provider lets this server move it
-//!    and the move is forward. Never backward.
+//!    provider's read marker moved through the message where the provider lets this server move it,
+//!    the marker covers no more than the channel, and the move is forward. Never backward, and never
+//!    the rest of a space the channel is one thread of.
 //! 5. A voice agent's send follows the button it stands for. `post_reply` with `reply_to` is a
 //!    targeted reply; it has no thread argument, so it never stands for the thread's composer. It
 //!    marks only once the post is confirmed.
@@ -39,12 +40,32 @@
 //!
 //! The floor lives in memory. After a restart the first reply-mark of a channel asks the provider,
 //! whose own check keeps it forward. A mark that fails moves no floor, so the next reply asks again.
+//!
+//! # Never wider than the channel
+//!
+//! The marker a reply's mark moves is the one **Mark read in** moves, and that covers the whole space.
+//! When the owner presses that item it says so and the choice is his. A reply's mark is made with
+//! nobody pressing anything — for a voice agent's reply, with nobody watching — so it is made only
+//! where the marker covers no more than vibe-talk holds of the channel, the line the automatic clear
+//! of `#232 upstream-mark-read` draws too (its bridge refuses such a channel with `thread_channel`).
+//! On a registration narrowed to one thread of a larger space, marking a reply's message would mark
+//! every earlier message of the whole space read in the provider's own app, messages vibe-talk never
+//! received, and nothing here could move the marker back.
+//!
+//! So before the first reply-mark of a channel the provider is asked what its marker covers there
+//! ([`crate::chat::ChatClient::upstream_read_scope`]): a bridge answers from its own timeline, which
+//! names the one conversation a narrowed registration is scoped to. Only
+//! [`UpstreamReadScope::Channel`] is marked. A narrowed channel ([`UpstreamMark::ThreadChannel`]) and
+//! one whose provider cannot say ([`UpstreamMark::ScopeUnknown`]) ask the marker nothing; the Done
+//! stands. The answer is kept beside the channel's floor, in memory, and so is a `thread_channel`
+//! refusal from the provider's own mark, whoever asked it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, PoisonError};
 
-use crate::chat::ChatError;
+use crate::chat::{ChatError, UpstreamReadScope};
 use crate::model::{ChannelId, ChannelInfo, MessageId};
+use crate::read_reason::ReadReason;
 use crate::state::AppState;
 use crate::store::StoreError;
 
@@ -63,6 +84,12 @@ pub enum UpstreamMark {
     Behind,
     /// The channel's provider does not let this server move its marker.
     Unsupported,
+    /// The channel is one thread of a larger space, whose marker would also clear messages this
+    /// server never received; nothing was asked.
+    ThreadChannel,
+    /// The channel's provider cannot say whether its marker covers more than the channel; nothing
+    /// was asked.
+    ScopeUnknown,
 }
 
 /// Every channel's floor, each behind a lock of its own, so a slow provider in one channel holds up
@@ -72,11 +99,14 @@ pub struct ReplyReads {
     floors: std::sync::Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<Floor>>>>,
 }
 
-/// One channel's floor: the newest message marked through, and the unorderable ids marked.
+/// One channel's floor: the newest message marked through, the unorderable ids marked, and what
+/// the provider's marker covers there, once the provider has said
+/// ([`UpstreamReadScope::Channel`] or [`UpstreamReadScope::Wider`]; an unknown answer is asked again).
 #[derive(Debug, Default)]
 struct Floor {
     through: Option<(u64, MessageId)>,
     unordered: VecDeque<MessageId>,
+    scope: Option<UpstreamReadScope>,
 }
 
 impl Floor {
@@ -146,6 +176,23 @@ impl ReplyReads {
     pub async fn note_marked(&self, channel: &ChannelId, message: &MessageId) {
         self.floor(channel).lock().await.raise(message);
     }
+
+    /// Note why the provider refused a mark in `channel`, whoever asked it: a `thread_channel`
+    /// refusal says the marker covers more than the channel, so no reply asks it again.
+    pub async fn note_refused(&self, channel: &ChannelId, error: &ChatError) {
+        if is_thread_channel(error) {
+            self.floor(channel).lock().await.scope = Some(UpstreamReadScope::Wider);
+        }
+    }
+}
+
+/// Whether `error` is the provider refusing a channel whose marker covers more than it: the bridge
+/// contract's `409` with `"code":"thread_channel"`.
+fn is_thread_channel(error: &ChatError) -> bool {
+    matches!(
+        error.cause(),
+        ChatError::Status { status: 409, body } if body.contains("thread_channel")
+    )
 }
 
 /// Whether `channel`'s own provider lets this server move its read marker.
@@ -158,14 +205,16 @@ pub fn supported(state: &AppState, channel: &ChannelId) -> bool {
 }
 
 /// Move the provider's read marker for `channel` through `message`, because a reply answered it —
-/// unless this server has marked that message, or a later one, already. See the module note.
+/// unless this server has marked that message, or a later one, already, or the marker covers more
+/// than the channel, or the provider cannot say whether it does. See the module note.
 ///
 /// One at a time per channel: the channel's floor is read and raised around the provider's answer,
-/// so two replies to the same message landing together ask once.
+/// so two replies to the same message landing together ask once, and the marker's scope is asked
+/// once.
 ///
 /// # Errors
 ///
-/// The provider's own failure, which raises no floor.
+/// The provider's own failure, to say what its marker covers or to move it, which raises no floor.
 pub async fn mark_upstream(
     state: &AppState,
     channel: &ChannelId,
@@ -179,9 +228,35 @@ pub async fn mark_upstream(
     if let Some(covered) = floor.covers(message) {
         return Ok(covered);
     }
-    state.chat.mark_read_upstream(channel, message).await?;
-    floor.raise(message);
-    Ok(UpstreamMark::Marked)
+    let scope = match floor.scope {
+        Some(known) => known,
+        None => {
+            let told = ReadReason::ReplyMark
+                .scope(state.chat.upstream_read_scope(channel))
+                .await?;
+            if told != UpstreamReadScope::Unknown {
+                floor.scope = Some(told);
+            }
+            told
+        }
+    };
+    match scope {
+        UpstreamReadScope::Channel => {}
+        UpstreamReadScope::Wider => return Ok(UpstreamMark::ThreadChannel),
+        UpstreamReadScope::Unknown => return Ok(UpstreamMark::ScopeUnknown),
+    }
+    match state.chat.mark_read_upstream(channel, message).await {
+        Ok(()) => {
+            floor.raise(message);
+            Ok(UpstreamMark::Marked)
+        }
+        // The provider knows better than its earlier word: kept, and nothing is asked again.
+        Err(error) if is_thread_channel(&error) => {
+            floor.scope = Some(UpstreamReadScope::Wider);
+            Ok(UpstreamMark::ThreadChannel)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// What a voice agent's confirmed reply marked.
@@ -200,7 +275,9 @@ pub struct VoiceMark {
 ///
 /// Done is written here, before the tool's answer, because it is one write to the store. The
 /// provider's half is a request to the chat service, sometimes a slow one, so it runs on its own and
-/// the answer does not wait for it; its failure is logged.
+/// the answer does not wait for it; its failure is logged. It is [`mark_upstream`], so a channel
+/// whose marker covers more than the channel, or whose provider cannot say, is not marked there:
+/// with "Ask me before the voice agent sends" off nobody is watching to object.
 pub async fn after_voice_send(
     state: &AppState,
     channel: &ChannelInfo,

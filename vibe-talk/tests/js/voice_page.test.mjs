@@ -48432,9 +48432,74 @@ test("`#292 reply-marks-read`: a Reply's mark at the provider follows its Done, 
   assert.deepStrictEqual(plain.dismissCalls, [{ messages: [target] }]);
   assert.deepStrictEqual(plain.upstreamReadCalls, [], "a provider with no marker was asked to move it");
   // THE CONTROL: the provider's word is what keeps the page from asking.
-  const control = await run(false, brokenScript("  if (!channelMarksUpstream(entry.channel)) return;\n", ""));
+  const control = await run(false, brokenScript("!channelMarksUpstream(entry.channel) || ", ""));
   await replyAndSend(control, target, "on it");
   assert.equal(control.upstreamReadCalls.length, 1, "with the check taken out nothing was asked, so this test cannot see it");
+});
+
+test("`#292 reply-marks-read`: a Reply in a channel that is one thread of a larger space is Done, and the service's marker, which covers the whole space, is not asked", async () => {
+  // The finding: every reply moved the provider's marker for the whole space, so on a registration
+  // narrowed to one thread each Reply marked every earlier message of the space read in the service's
+  // own app, messages vibe-talk never received. The timeline names such a channel's conversation as
+  // its `thread` (`#44 thread-scope-main-view`), and the page holds it as `channelCanon.scope`.
+  const run = async (script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = true;
+    const data = scopedData();
+    serveScoped(page, data.summary);
+    await signIn(page);
+    await showDiscord(page, data.messages.slice(0, 3));
+    return page;
+  };
+  const page = await run();
+  await replyAndSend(page, "302", "answering in the conversation");
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, "302", "the premise is a reply sent");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["302"] }], "the reply's Done did not stand");
+  assert.deepStrictEqual(page.upstreamReadCalls, [],
+    "a reply in one thread of a larger space asked to move the whole space's read marker");
+  assert.doesNotMatch(page.el("status").textContent, /Marked read here and in/,
+    "the status line says the chat service was marked");
+  assert.equal(rowOf(page, "302").getAttribute("data-archived"), "true", "the answered row is not drawn read");
+
+  // THE CONTROL: without the page's own check it asks, and only the server would stand in the way.
+  const control = await run(brokenScript(" || channelIsOneThread(entry.channel)", ""));
+  await replyAndSend(control, "302", "answering in the conversation");
+  assert.deepStrictEqual(control.upstreamReadCalls, [{ message_id: "302", after_reply: true }],
+    "with the check taken out nothing was asked, so this test cannot see it");
+});
+
+test("`#292 reply-marks-read`: a reply's mark the server did not ask of the service is said as not marked there, with the reason", async () => {
+  const target = "1000000000000000003";
+  const run = async (script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = true;
+    await signIn(page);
+    await showDiscord(page, conversation());
+    return page;
+  };
+  const notAsked = (outcome) => (body) => json(200, { channel: CHANNEL, through: body.message_id, outcome,
+    upstream_read_notice: "The source chat provider was not asked to move its read cursor." });
+  const page = await run();
+  page.upstreamReadResponse = notAsked("thread_channel");
+  await replyAndSend(page, target, "on it");
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: target, after_reply: true }], "the premise is the server asked");
+  assert.match(page.el("status").textContent,
+    /^Marked read here, not in Discord: this channel is one thread of a larger space there, and its read marker covers the whole space\./,
+    "a mark the server did not ask of the service was said as made");
+  assert.equal(page.el("error").hidden, true, `a mark not asked put up the error banner: ${page.el("error").textContent}`);
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "true", "the Done did not stand");
+
+  page.upstreamReadResponse = notAsked("scope_unknown");
+  await replyAndSend(page, "1000000000000000001", "and this");
+  assert.match(page.el("status").textContent,
+    /^Marked read here, not in Discord: it cannot say whether its read marker covers more than this channel\./);
+
+  // THE CONTROL: without the outcome read, the status line claims the service was marked.
+  const control = await run(brokenScript("    said = replyMarkNotAsked(answer && answer.outcome, service) || said;\n", ""));
+  control.upstreamReadResponse = notAsked("thread_channel");
+  await replyAndSend(control, target, "on it");
+  assert.match(control.el("status").textContent, /^Marked read here and in Discord\./,
+    "with the outcome ignored the status line still said why, so this test cannot see it");
 });
 
 test("`#292 reply-marks-read`: Quote reply, and Reply docked in either column, mark what they answer as Reply does", async () => {

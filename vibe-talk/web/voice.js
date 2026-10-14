@@ -29480,7 +29480,9 @@ function unseenColumnReply() {
 //     is confirmed (`markSentRead`): Done, as above; and, where the channel's provider lets the server
 //     move its own read marker (the "⋯" menu's "In <service> only"), that marker moved through the
 //     message, asked `after_reply` so the server never moves it back behind a message already marked
-//     and never asks twice for one (src/reply_read.rs).
+//     and never asks twice for one (src/reply_read.rs). Never where that marker covers more than the
+//     channel — one thread of a larger space, or a service that cannot say — since nobody pressed
+//     anything to clear messages this page never received.
 //   * A VOICE AGENT'S REPLY follows the same rule, marked by the server, which posts it: see
 //     src/reply_read.rs. This page shows its Done at its next read of the channel.
 
@@ -29580,10 +29582,48 @@ function rootThisStarts(channel, thread) {
 }
 
 /**
+ * Whether `channel` is, by this page's last read of it, one thread of a larger space: a registration
+ * narrowed to one conversation, which the timeline names as its `thread` (`channelCanon.scope`). Its
+ * service's read marker covers the whole space. `#292 reply-marks-read`.
+ *
+ * @param {string} channel
+ */
+function channelIsOneThread(channel) {
+  return channelCanon.channel === String(channel) && Boolean(channelCanon.scope);
+}
+
+/**
+ * What the status line says when the server asked the chat service nothing for a reply's mark,
+ * by the `outcome` it answered: the service's marker covers more than the channel, or the service
+ * cannot say whether it does. `#292 reply-marks-read`.
+ *
+ * @param {unknown} outcome
+ * @param {string} service
+ * @returns {string | null}
+ */
+function replyMarkNotAsked(outcome, service) {
+  if (outcome === "thread_channel") {
+    return `Marked read here, not in ${service}: this channel is one thread of a larger space there, ` +
+      "and its read marker covers the whole space.";
+  }
+  if (outcome === "scope_unknown") {
+    return `Marked read here, not in ${service}: it cannot say whether its read marker covers more ` +
+      "than this channel.";
+  }
+  return null;
+}
+
+/**
  * Mark read what `entry`, a send just confirmed, marks (`marksRead`): Done, and then, where its
  * channel's provider has one, the provider's own read marker moved through it. The second waits for
  * the first and is not asked when the Done failed, as "Mark read through here" goes. See the section
  * note. `#292 reply-marks-read`.
+ *
+ * Never where that marker is wider than the channel: on a channel that is one thread of a larger
+ * space it would mark every earlier message of the whole space read in the service's own app,
+ * messages this page never received, and nobody pressed anything to ask for that. The page does not
+ * ask for a channel it holds as one thread (`channelIsOneThread`), and the server, which asks the
+ * service what its marker covers, refuses the rest (`replyMarkNotAsked`). The Done stands either way.
  *
  * The provider's half failing is said on the status line, not in the error banner: nobody pressed
  * anything for it, the Done it follows stands, and the chat service refusing it for a while (Google
@@ -29594,13 +29634,15 @@ function rootThisStarts(channel, thread) {
 async function markSentRead(entry) {
   const id = String(entry.marksRead);
   await markAnsweredDone(entry.channel, id);
-  if (!channelMarksUpstream(entry.channel)) return;
+  // The Done's own words already say it was not marked in the chat service.
+  if (!channelMarksUpstream(entry.channel) || channelIsOneThread(entry.channel)) return;
   const service = chatServiceOf(entry.channel);
   let said = `Marked read here and in ${service}.`;
   try {
-    await api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/upstream-read`, {
+    const answer = await api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/upstream-read`, {
       method: "POST", body: { message_id: id, after_reply: true },
     });
+    said = replyMarkNotAsked(answer && answer.outcome, service) || said;
   } catch (error) {
     said = `Marked read here, not in ${service}: ${readableFailure(error, service)}`;
   }

@@ -3113,13 +3113,19 @@ pub struct UpstreamReadResponse {
     /// The contract common to every provider implementation.
     pub upstream_read_notice: &'static str,
     /// For a mark asked `after_reply`, what it came to: `marked`, or `already_marked` and `behind`
-    /// when this server had marked that message, or a later one, already and asked nothing.
+    /// when this server had marked that message, or a later one, already and asked nothing; or
+    /// `thread_channel` and `scope_unknown` when the provider's cursor covers more than this
+    /// channel, or its provider cannot say whether it does, and nothing was asked (`#292
+    /// reply-marks-read`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<crate::reply_read::UpstreamMark>,
 }
 
 /// What a successful source-provider read mark means.
 pub const UPSTREAM_READ_NOTICE: &str = "The source chat provider's read cursor was moved through this message. Read cursors only move forward; thread-level behavior is defined by the provider.";
+
+/// What a reply's mark that was not asked of the provider means. `#292 reply-marks-read`.
+pub const UPSTREAM_READ_NOT_ASKED_NOTICE: &str = "The source chat provider was not asked to move its read cursor: here it covers more than this channel, or the provider cannot say whether it does, and a mark that follows a reply never clears messages vibe-talk never received.";
 
 /// `POST /api/v1/channels/{channel_id}/upstream-read`
 pub async fn mark_read_upstream(
@@ -3148,15 +3154,26 @@ pub async fn mark_read_upstream(
     } else {
         // The owner's own mark always asks: it can name any message, and the provider's check,
         // read fresh, is what keeps it forward. What it moved is noted, so that a reply to it
-        // later, or to anything before it, does not ask again.
-        state.chat.mark_read_upstream(&channel.id, &through).await?;
+        // later, or to anything before it, does not ask again; and a refusal that says the cursor
+        // covers more than the channel is noted, so that no reply asks it.
+        if let Err(error) = state.chat.mark_read_upstream(&channel.id, &through).await {
+            state.reply_reads.note_refused(&channel.id, &error).await;
+            return Err(OpError::Chat(error).into());
+        }
         state.reply_reads.note_marked(&channel.id, &through).await;
         None
+    };
+    let upstream_read_notice = match &outcome {
+        Some(
+            crate::reply_read::UpstreamMark::ThreadChannel
+            | crate::reply_read::UpstreamMark::ScopeUnknown,
+        ) => UPSTREAM_READ_NOT_ASKED_NOTICE,
+        _ => UPSTREAM_READ_NOTICE,
     };
     Ok(no_store(Json(UpstreamReadResponse {
         channel,
         through,
-        upstream_read_notice: UPSTREAM_READ_NOTICE,
+        upstream_read_notice,
         outcome,
     })))
 }
