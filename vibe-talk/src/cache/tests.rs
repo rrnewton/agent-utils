@@ -1516,7 +1516,9 @@ fn an_offer_too_big_for_the_queue_is_dropped_and_marks_the_channel_suspect() {
 
 /// Another connection holds the cache file's write lock until the returned sender is dropped or
 /// sent to, as a full disk, an I/O error or an operator's own session would make every write fail.
-fn hold_write_lock(cache: &MessageCache) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+pub(super) fn hold_write_lock(
+    cache: &MessageCache,
+) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let path = cache.path().to_owned();
     let (locked_tx, locked_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();

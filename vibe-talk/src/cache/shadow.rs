@@ -19,9 +19,9 @@
 //! |---|---|
 //! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, every row served at or above the head's settled top (which no claim holds) was listed by the latest read of the scope's newest end, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
 //! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since this process opened the file (a deletion made before then, while the server was down, reached nothing); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
-//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
-//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
-//! | `timeline_fallback` | coverage holds `limit` rows down from the head, with every row above the settled top listed by the latest read of the newest end as for `messages`, nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
+//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), every row read at or above the head's settled top was listed by the latest read of the scope's newest end as for `messages`, no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
+//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), every row counted at or above the settled top was listed by the latest read of the newest end as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
+//! | `timeline_fallback` | coverage holds `limit` rows down from the head, with every row at or above the settled top listed by the latest read of the newest end as for `messages`, nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
 //!
 //! # What a miss says
 //!
@@ -555,6 +555,24 @@ fn fed_since(at_ms: i64, facts: &Facts) -> bool {
         && facts.fed_since_ms.is_some_and(|since| at_ms >= since)
 }
 
+/// Whether every row of `rows` at or above the head's settled top is vouched for: the one rule
+/// each consumer that may hand back such rows applies, a newest window or page, a page and a count
+/// alike. No claim holds a row there, in the unsettled band or above the head: only the latest read
+/// of the scope's newest end does, which moved the time of every row there it listed up to its own
+/// start. A row there with an older time is one it did not list: deleted since an earlier read saw
+/// it (even one that landed after it), or pushed before the provider listed it. Below the settled
+/// top a claim holds every row, and with no head there is no band: such rows rest on the coverage,
+/// which each rule checks for itself.
+fn band_vouched<'a>(view: &View, rows: impl IntoIterator<Item = &'a CachedMessage>) -> bool {
+    let Some(head) = view.head else {
+        return true;
+    };
+    let top = head.settled_top();
+    let checked = view.head_checked_ms.unwrap_or(head.head_listed_ms);
+    rows.into_iter()
+        .all(|row| row.created_ms < top || row.observed_ms >= checked)
+}
+
 /// A newest window, or a newest page: coverage contiguous from the head down to `limit` rows.
 fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result<Decision, Miss> {
     let dropped = dropped(view, facts);
@@ -576,15 +594,7 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     } else {
         None
     };
-    // No claim holds a row at or above the settled top: only the latest read of the scope's newest
-    // end does, which moved the time of every row there it listed up to its own start. A row there
-    // with an older time is one it did not list: deleted since an earlier read saw it (even one
-    // that landed after it), or pushed before the provider listed it.
-    let checked = view.head_checked_ms.unwrap_or(head.head_listed_ms);
-    if window
-        .iter()
-        .any(|row| row.created_ms >= top && row.observed_ms < checked)
-    {
+    if !band_vouched(view, window) {
         return Err(Miss::Gap);
     }
     // Fresh, the window as a whole: its head, and the claims under it.
@@ -627,7 +637,9 @@ fn message(view: &View, facts: &Facts) -> Result<Decision, Miss> {
     }
 }
 
-/// A page walked forward from `since`: its span inside complete coverage.
+/// A page walked forward from `since`: its span inside complete coverage, and every row it read
+/// above that coverage (an open page reads on past the head) vouched for by the latest read of the
+/// newest end.
 fn page(
     view: &View,
     since: i64,
@@ -652,6 +664,9 @@ fn page(
         view.head.ok_or(Miss::Gap)?.head_ms.saturating_add(1)
     };
     let cover = coverage::covers(&view.coverage, since, end).ok_or(Miss::Gap)?;
+    if !band_vouched(view, &view.rows) {
+        return Err(Miss::Gap);
+    }
     if !cover.complete {
         return Err(Miss::Incomplete);
     }
@@ -661,7 +676,8 @@ fn page(
     Ok(Decision::Serve)
 }
 
-/// A count from `since`: complete coverage up to the unsettled band, current, under a fresh head.
+/// A count from `since`: complete coverage up to the unsettled band, every row counted at or above
+/// it vouched for by the latest read of the newest end, current, under a fresh head.
 fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     let dropped = dropped(view, facts);
     if !head_trusted(view, dropped) || !view.rows.iter().all(|row| trusted(row, dropped)) {
@@ -669,6 +685,9 @@ fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     }
     let head = view.head.ok_or(Miss::Gap)?;
     let cover = coverage::covers(&view.coverage, since, head.settled_top()).ok_or(Miss::Gap)?;
+    if !band_vouched(view, &view.rows) {
+        return Err(Miss::Gap);
+    }
     if !cover.complete {
         return Err(Miss::Incomplete);
     }
@@ -1183,6 +1202,88 @@ mod tests {
         );
         pushed.rows.last_mut().expect("a row").observed_ms = later + 1;
         assert_eq!(decide(&fallback(5), &pushed, &at), Decision::Serve);
+    }
+
+    /// The band rule is one rule: a count and a page hand back the rows of the band, and the rows
+    /// above the head, as a newest window does, and none of them counts or pages a row there the
+    /// latest read of the newest end did not list. A count reads on past the band to the newest
+    /// end; an open page past the head, even once the band has settled and the coverage reaches
+    /// the head itself.
+    #[test]
+    fn a_count_or_a_page_never_hands_back_a_band_row_the_latest_read_did_not_list() {
+        let later = LISTED + 5_000;
+        let at = facts(later + 1_000);
+        let count = Ask::Count {
+            since_ms: Some(T),
+            cap: 100,
+        };
+        // Twelve rows; the latest read of the newest end, five seconds on, listed all but m10.
+        let mut view = listed(12, true);
+        view.coverage[0].full_ms = Some(later);
+        view.head_checked_ms = Some(later);
+        let top = view.head.expect("a head").settled_top();
+        for row in &mut view.rows {
+            if row.created_ms >= top && row.message.id.as_str() != "m10" {
+                row.observed_ms = later;
+            }
+        }
+        assert_eq!(decide(&count, &view, &at), Decision::Miss(Miss::Gap));
+        let mut listed_all = view.clone();
+        for row in &mut listed_all.rows {
+            if row.created_ms >= top {
+                row.observed_ms = later;
+            }
+        }
+        assert_eq!(decide(&count, &listed_all, &at), Decision::Serve);
+        // A row pushed above the head before that read began, and not listed by it.
+        let mut pushed = listed_all.clone();
+        pushed.rows.push(CachedMessage {
+            observed_ms: later - 1,
+            ..row(12)
+        });
+        assert_eq!(decide(&count, &pushed, &at), Decision::Miss(Miss::Gap));
+        pushed.rows.last_mut().expect("a row").observed_ms = later;
+        assert_eq!(decide(&count, &pushed, &at), Decision::Serve);
+
+        // The band settled by time: the settled top is just past the head, and the coverage
+        // reaches it. A read that began before the latest one lands late, with a message deleted
+        // since, above the head: an open page from m8 holds it, and is not served.
+        let head_ms = T + 11 * MINUTE;
+        let settled = View {
+            head: Some(Head {
+                head_ms,
+                unsettled_from_ms: head_ms + 1,
+                head_listed_ms: later,
+            }),
+            head_checked_ms: Some(later),
+            coverage: vec![Interval {
+                full_ms: Some(later),
+                listed_ms: later,
+                ..interval(T - HOUR, head_ms + 1, true)
+            }],
+            rows: rows(8..12),
+            ..View::default()
+        };
+        let open = Ask::Page {
+            since_ms: T + 8 * MINUTE,
+            until_ms: None,
+            limit: 20,
+        };
+        assert_eq!(decide(&open, &settled, &at), Decision::Serve);
+        let mut resurrected = settled.clone();
+        resurrected.rows.push(CachedMessage {
+            observed_ms: later - 30_000,
+            ..row(12)
+        });
+        assert_eq!(decide(&open, &resurrected, &at), Decision::Miss(Miss::Gap));
+        assert_eq!(decide(&count, &resurrected, &at), Decision::Miss(Miss::Gap));
+        // A page bounded below the head never reads it, and stands on the coverage alone.
+        let bounded = Ask::Page {
+            since_ms: T + 8 * MINUTE,
+            until_ms: Some(head_ms + 1),
+            limit: 20,
+        };
+        assert_eq!(decide(&bounded, &settled, &at), Decision::Serve);
     }
 
     #[test]

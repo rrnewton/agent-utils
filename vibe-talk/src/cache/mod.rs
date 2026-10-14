@@ -2304,4 +2304,6 @@ mod privacy_tests;
 #[cfg(test)]
 mod race_tests;
 #[cfg(test)]
+mod shadow_tests;
+#[cfg(test)]
 mod tests;

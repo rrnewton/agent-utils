@@ -659,3 +659,135 @@ async fn a_short_read_of_the_newest_end_never_makes_a_deleted_message_servable()
         "a message deleted upstream counted as servable: {counted:?}"
     );
 }
+
+/// Only part of a stretch is read again within the week: three days on, a write-token page re-reads
+/// messages 5 to 8. Five days later the week takes the rows of the part that was not, and takes
+/// that part's claim with them; the part read again stands, rows and claim.
+#[tokio::test]
+async fn a_partly_revalidated_stretch_keeps_only_the_claim_that_was_read_again() {
+    let d = deployment("cache-shadow-week-part", &testing::config_toml()).await;
+    d.fill().await;
+    let iso = vibe_talk::clock::iso_from_ms;
+    let page = |since: i64, until: i64| {
+        path(
+            READ_CHANNEL,
+            &format!("/page?since={}&until={}", iso(since), iso(until)),
+        )
+    };
+    d.clock.advance(3 * 24 * HOUR);
+    ok(
+        &d.state,
+        &page(T0 + 5 * MINUTE, T0 + 9 * MINUTE),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    d.clock.advance(5 * 24 * HOUR);
+    let cache = d.state.message_cache.cache().expect("installed");
+    cache.maintain(vibe_talk::cache::Maintenance::Hourly);
+    settled(&d.state).await;
+    let chan = ChanKey::new(LEGACY, READ_CHANNEL);
+    let claims = cache.coverage(&chan, &CacheScope::Main);
+    let before = counts(&d.state, "page");
+    ok(&d.state, &page(T0, T0 + 4 * MINUTE), READ_TOKEN).await;
+    settled(&d.state).await;
+    let after = counts(&d.state, "page");
+    assert_eq!(
+        (
+            after.would_serve - before.would_serve,
+            after.missing_rows - before.missing_rows
+        ),
+        (0, 0),
+        "the week took rows 0 to 4 but a claim still served them: {after:?}; claims {claims:?}"
+    );
+    ok(
+        &d.state,
+        &page(T0 + 5 * MINUTE, T0 + 8 * MINUTE),
+        READ_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    let last = counts(&d.state, "page");
+    assert_eq!(
+        (
+            last.would_serve - after.would_serve,
+            last.agreed - after.agreed
+        ),
+        (1, 1),
+        "the stretch read again: {last:?}; claims {claims:?}"
+    );
+}
+
+/// A count, not a window. An hour after the window was read whole, message 4 is deleted upstream,
+/// and a short write-token read of the newest three makes the head fresh. A read-token count from
+/// the first message still rests on the hour-old claim, and is not one the cache would serve.
+#[tokio::test]
+async fn a_short_newest_read_never_makes_an_hour_old_count_fresh() {
+    let d = deployment("cache-shadow-count-hour", &testing::config_toml()).await;
+    d.fill().await;
+    d.clock.advance(HOUR);
+    d.fake.delete(&d.ids[4]);
+    d.held_write(3).await;
+    d.clock.advance(5 * SECOND);
+    let iso = vibe_talk::clock::iso_from_ms;
+    ok(
+        &d.state,
+        &path(READ_CHANNEL, &format!("/count?since={}", iso(T0))),
+        READ_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    let count = counts(&d.state, "count");
+    assert_eq!(
+        (count.would_serve, count.extra_rows),
+        (0, 0),
+        "an hour-old count counted as fresh, with a deleted message in it: {count:?}"
+    );
+}
+
+/// Message 10 lies in the head's unsettled band. It is deleted (Discord's feed carries no
+/// deletions), and a write-token read of the whole window five seconds later, the latest read of
+/// the newest end, does not list it; inside the band its absence is no proof yet, so it stays in
+/// the file. What the latest read did not list is vouched for by nothing: a read-token window of
+/// five does not serve it, and neither does a count, which reads the band as a window does.
+#[tokio::test]
+async fn a_band_row_the_latest_read_did_not_list_is_never_served_in_a_window_nor_counted() {
+    let d = deployment("cache-shadow-band-count", &testing::config_toml()).await;
+    d.fill().await;
+    d.fake.delete(&d.ids[10]);
+    d.clock.advance(5 * SECOND);
+    d.held_write(50).await;
+    let cache = d.state.message_cache.cache().expect("installed");
+    let chan = ChanKey::new(LEGACY, READ_CHANNEL);
+    assert!(
+        matches!(cache.message(&chan, &d.ids[10]), Read::Served(Some(_))),
+        "inside the band an absence proves nothing yet"
+    );
+    d.clock.advance(5 * SECOND);
+    let before = d.messages();
+    d.read_window(5).await;
+    let after = d.messages();
+    assert_eq!(
+        (
+            after.would_serve - before.would_serve,
+            after.extra_rows - before.extra_rows
+        ),
+        (0, 0),
+        "a window: {after:?}"
+    );
+    let iso = vibe_talk::clock::iso_from_ms;
+    let body = ok(
+        &d.state,
+        &path(READ_CHANNEL, &format!("/count?since={}", iso(T0))),
+        READ_TOKEN,
+    )
+    .await;
+    settled(&d.state).await;
+    let count = counts(&d.state, "count");
+    assert_eq!(
+        (count.would_serve, count.extra_rows),
+        (0, 0),
+        "upstream answered {body}; the count shadow: {count:?}"
+    );
+    assert_eq!(count.misses.gap, 1, "{count:?}");
+}

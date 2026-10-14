@@ -2678,3 +2678,256 @@ async fn a_pushed_edit_whose_write_failed_is_never_vouched_for() {
     );
     assert!(!d.cache.is_suspect(&read_chan()));
 }
+
+/// A live-fed bridge filled whole, then stopped. While it is down message 2 is deleted upstream.
+/// Thirty hours on it starts again, and a write-token Flat read of only the newest three
+/// revalidates what it lists, not message 2. A read-token ask for message 2 by id is not vouched
+/// for by the live feed, which never carried that deletion.
+#[tokio::test]
+async fn a_restart_and_a_short_read_never_vouch_for_a_message_deleted_while_down() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let dir = TempDir::new("cache-fill-downtime-short");
+    {
+        let Upstream { state, .. } = upstream(true, 8);
+        let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+        get(&state, &flat_page()).await;
+        let cache = state.message_cache.cache().expect("installed");
+        assert_eq!(held(&cache), 8);
+        close(&state, cache);
+    }
+    clock.advance(30 * HOUR);
+    let Upstream {
+        state, fake, ids, ..
+    } = upstream(true, 8);
+    fake.delete(&ids[2]);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    clock.advance(MINUTE);
+    get(
+        &state,
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=flat&limit=3"),
+    )
+    .await;
+    clock.advance(MINUTE);
+    let status = call_as(
+        &state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            ids[2].as_str()
+        ),
+        testing::READ_TOKEN,
+    )
+    .await;
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.extra_rows),
+        (0, 0),
+        "upstream answered {status}; {counted:?}"
+    );
+}
+
+/// A pushed DELETION whose write fails (another connection holds the write lock past the busy
+/// timeout). The row stays in the file; the channel is in doubt at once, and, once the file takes
+/// writes, across a restart too: the file holds the record of the drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pushed_deletion_whose_write_failed_is_never_vouched_for_before_or_after_a_restart() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let dir = TempDir::new("cache-fill-failed-deletion");
+    let Upstream {
+        state, fake, ids, ..
+    } = upstream(true, 8);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(WAIT));
+    get(&state, &flat_page()).await;
+    assert_eq!(held(&cache), 8);
+
+    let path = cache.path().to_owned();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let locker = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(&path).expect("open");
+        connection.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        locked_tx.send(()).expect("tell");
+        let _ = release_rx.recv();
+        connection.execute_batch("ROLLBACK").expect("unlock");
+    });
+    locked_rx.recv().expect("locked");
+    clock.advance(MINUTE);
+    fake.delete(&ids[3]);
+    assert_eq!(
+        ingest(&state, pushed_deletion("failed-deletion", &ids[3])).await,
+        StatusCode::ACCEPTED
+    );
+    let failing = std::time::Instant::now();
+    while cache.stats().ops_failed == 0 {
+        assert!(failing.elapsed() < WAIT, "the write never failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    release_tx.send(()).expect("release");
+    locker.join().expect("locker");
+    assert!(cache.quiesce_blocking(WAIT));
+    assert!(
+        holds(&cache, &read_chan(), &ids[3]),
+        "the deletion never reached the file"
+    );
+    clock.advance(1_000);
+    let by_id = format!(
+        "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+        ids[3].as_str()
+    );
+    let status = call_as(&state, &by_id, testing::READ_TOKEN).await;
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.extra_rows),
+        (0, 0),
+        "upstream answered {status}; {counted:?}"
+    );
+    // The file took the drop once it took writes: a restart still doubts the row.
+    clock.advance(1_000);
+    close(&state, cache);
+    let Upstream { state, fake, .. } = upstream(true, 8);
+    fake.delete(&ids[3]);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    clock.advance(1_000);
+    let status = call_as(&state, &by_id, testing::READ_TOKEN).await;
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.extra_rows),
+        (0, 0),
+        "after a restart, upstream answered {status}; {counted:?}"
+    );
+}
+
+/// The band settled by time, so the settled top is just past the head. A read that began before a
+/// deletion, and saw the deleted message above the head, lands after the read that began after it:
+/// the message is held again above the head, and nothing vouches for it. An open-ended page reads
+/// on past the head, and a count to the newest end; neither serves it, as the newest page does not.
+#[tokio::test]
+async fn an_open_page_or_a_count_never_serves_an_unvouched_row_above_a_settled_head() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(false, 20, &clock).await;
+    let main = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50");
+    get(&d.state, &main).await;
+    clock.advance(11 * MINUTE);
+    let oops = d.fake.seed_at(
+        &id(READ_CHANNEL),
+        "Ada",
+        "oops, wrong channel",
+        T0 + 19 * MINUTE + 30_000,
+    );
+    let HeldRead { entered, release } = d.chat.hold_next_recent();
+    let slow = {
+        let state = d.state.clone();
+        tokio::spawn(async move {
+            call(
+                &state,
+                "GET",
+                &format!("/api/v1/channels/{READ_CHANNEL}/messages?limit=50"),
+            )
+            .await
+            .0
+        })
+    };
+    entered.await.expect("the slow read took its answer");
+    clock.advance(MINUTE);
+    d.fake.delete(&oops);
+    get(&d.state, &main).await;
+    clock.advance(1_000);
+    drop(release);
+    assert_eq!(slow.await.expect("joined"), StatusCode::OK);
+    assert!(
+        holds(&d.cache, &read_chan(), &oops),
+        "the late read put it back above the head"
+    );
+    let head = d
+        .cache
+        .head(&read_chan(), &CacheScope::Main)
+        .served()
+        .expect("a read")
+        .expect("a head");
+    assert!(
+        head.head_ms < T0 + 19 * MINUTE + 30_000 && head.settled_top() > head.head_ms,
+        "the head stayed below it, its band settled: {head:?}"
+    );
+    clock.advance(1_000);
+    let since = vibe_talk::clock::iso_from_ms(T0 + 15 * MINUTE);
+    assert_eq!(
+        call_as(
+            &d.state,
+            &format!("/api/v1/channels/{READ_CHANNEL}/page?since={since}"),
+            testing::READ_TOKEN,
+        )
+        .await,
+        StatusCode::OK
+    );
+    let page = shadow_of(&d.state, "page").await;
+    assert_eq!(
+        call_as(
+            &d.state,
+            &format!("/api/v1/channels/{READ_CHANNEL}/count?since={since}"),
+            testing::READ_TOKEN,
+        )
+        .await,
+        StatusCode::OK
+    );
+    let count = shadow_of(&d.state, "count").await;
+    assert_eq!(
+        call_as(
+            &d.state,
+            &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=10"),
+            testing::READ_TOKEN,
+        )
+        .await,
+        StatusCode::OK
+    );
+    let fallback = shadow_of(&d.state, "timeline_fallback").await;
+    for (consumer, counted) in [("page", page), ("count", count), ("fallback", fallback)] {
+        assert_eq!(
+            (counted.would_serve, counted.extra_rows),
+            (0, 0),
+            "{consumer}: {counted:?}"
+        );
+    }
+}
+
+/// A message deleted moments after it was posted stays in the file inside the band: the latest
+/// read of the newest end did not list it, and inside the band an absence proves nothing yet. A
+/// read-token count is not one the cache would serve.
+#[tokio::test]
+async fn a_count_never_counts_a_message_deleted_moments_after_it_was_posted() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(false, 20, &clock).await;
+    let oops = d.fake.seed_at(
+        &id(READ_CHANNEL),
+        "Ada",
+        "oops, wrong channel",
+        T0 + 18 * MINUTE + 30_000,
+    );
+    let main = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50");
+    get(&d.state, &main).await;
+    assert!(holds(&d.cache, &read_chan(), &oops));
+    clock.advance(5_000);
+    d.fake.delete(&oops);
+    get(&d.state, &main).await;
+    assert!(
+        holds(&d.cache, &read_chan(), &oops),
+        "inside the band an absence proves nothing yet"
+    );
+    clock.advance(1_000);
+    let status = call_as(
+        &d.state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/count?since={}",
+            vibe_talk::clock::iso_from_ms(T0)
+        ),
+        testing::READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let counted = shadow_of(&d.state, "count").await;
+    assert_eq!(
+        (counted.would_serve, counted.extra_rows, counted.misses.gap),
+        (0, 0, 1),
+        "a count the cache would serve, counting a deleted message: {counted:?}"
+    );
+}
