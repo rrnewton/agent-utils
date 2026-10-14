@@ -8168,10 +8168,15 @@ def _outstanding_absent_validate_batch(
     path = _journal_path(config)
     if path not in _outstanding_journals(config):
         return None
-    loaded, raw = _load_journal(config, selected_path=path)
-    if raw.get("kind") != "recover-absent-validate-rows":
+    try:
+        loaded, raw = _load_journal(config, selected_path=path)
+        if raw.get("kind") != "recover-absent-validate-rows":
+            return None
+        _cursor, items = _absent_validate_batch_items(config, raw)
+    except (Refusal, StateError):
+        # Not a readable absent-row batch: every caller then applies the
+        # strict rules unchanged, and status still reports the journal.
         return None
-    _cursor, items = _absent_validate_batch_items(config, raw)
     return loaded, tuple(item for item, _record, _entry in items)
 
 
