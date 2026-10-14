@@ -4256,7 +4256,7 @@ provider = "slack"
             cfg.message_cache,
             Some(MessageCacheConfig {
                 path: Some(PathBuf::from(
-                    "/srv/vibe-talk-cache/vibe-talk.message-cache.sqlite3"
+                    "/srv/vibe-talk-cache/vibe-talk.message-cache-web1.sqlite3"
                 )),
                 channels: vec![CacheChannelLimit {
                     id: ChannelId("123456789012345678".to_owned()),

@@ -81,7 +81,8 @@
 //!   same refusal confirms the loss, and the sink erases the channel and the store's summaries of
 //!   it, or erases the thread, each of whose messages the store's summaries then follow. A loss
 //!   confirmed this way is erased whoever noticed it first, a read-scope request included: the
-//!   erase removes data and writes none;
+//!   erase removes what was read and writes no text (a thread's leaves only the ids and times of
+//!   its messages, as tombstones);
 //! - **a credential refused** (any 401) suspends the provider: nothing of it is served or filled.
 //!   Its own client is asked which account it is every [`SUSPENDED_RECHECK`], and the suspension
 //!   ends when the answer matches the file (or is recorded, the file holding none). Slack's

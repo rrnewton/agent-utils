@@ -44,8 +44,10 @@
 //!
 //! A credential refused is handed straight to the listener, which suspends the provider.
 //!
-//! An erase is the one durable change a read-scope request can set off: it removes data and
-//! inserts none, and only after the server's own read confirmed the loss.
+//! An erase is the one durable change a read-scope request can set off, and only after the
+//! server's own read confirmed the loss. It removes what was read and writes no text: a channel's
+//! erase leaves nothing, and a thread's leaves only the ids and times of the messages it deleted, as
+//! the tombstones that keep a read landing late from bringing them back.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

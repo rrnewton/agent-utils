@@ -3473,9 +3473,10 @@ counts what the cache would have answered, and whether that would have matched t
 serving can be judged from numbers before anything is served (see "What the cache would have
 served" below).
 
-**Off unless an operator turns it on.** With no `[message_cache]` table, or with
-`enabled = false`, no cache file is opened and the server behaves as it did before the cache
-existed.
+**Off unless an operator turns it on.** With no `[message_cache]` table, no cache file is opened
+and the server behaves as it did before the cache existed. With `enabled = false`, no cache file is
+opened either, but the server knows of the cache: at startup it erases every cache file it made,
+Settings shows the group with its switch off, and diagnostics and the hourly log line report it.
 
 **What it depends on.**
 
@@ -3555,8 +3556,11 @@ It is **not encrypted**. Anyone who can read this account's files can read it, a
    [message_cache]
    enabled = true
    max_days = 14
-   path = "/srv/vibe-talk-cache/vibe-talk.message-cache.sqlite3"
+   path = "/srv/vibe-talk-cache/vibe-talk.message-cache-web1.sqlite3"
    ```
+
+   Name the file the way a cache file is named, `<name>.message-cache-<host>.sqlite3` (here for a
+   host called `web1`), so that the canary below is named like it.
 
    `max_days = 14`, rather than the default 90, keeps less while it is unknown how long the
    provider keeps each conversation. A conversation kept upstream for a day gets its own entry:
@@ -3576,7 +3580,9 @@ check made after the first cache file exists comes too late by construction: the
 taken. So, before the first enable:
 
 1. Create an empty file named the way a cache file is named, `canary.message-cache-<host>.sqlite3`,
-   in the directory the cache will use. Do not put it at the cache's own path.
+   in the directory the cache will use. Do not put it at the cache's own path. `<host>` is what
+   `uname -n` prints, which may be the fully qualified name. A cache `path` named some other way
+   needs a canary named the way that file is, with its first part changed.
 2. Wait for at least two of the agent's cycles.
 3. Look in the agent's own record of what it has taken (its manifest, index or listing), and
    confirm the canary's path is not there.
@@ -3715,8 +3721,9 @@ with the process.
 * **The one change a read-scope request can set off is an erase.** Suppose a provider refuses a
   read of a channel, whoever made that read. The cache stops treating the channel as one it could
   answer for, at once and in memory. Ten minutes later the server reads the channel again on its
-  own account, and only the same refusal erases what the cache held of it. That erase removes data
-  and writes none.
+  own account, and only the same refusal erases what the cache held of it. That erase removes what
+  was read and writes no text: a thread's erase leaves only the ids and times of its messages, so
+  that a read landing late cannot bring them back.
 * **Rows belong to an account.** Nothing of a provider is filled until that provider's own client
   has said, in this process, which account it is, and the file agrees. Deletions are the
   exception: see "Deletions and edits" above.

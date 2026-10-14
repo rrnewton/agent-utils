@@ -357,9 +357,10 @@ enabled = true
 # BEFORE ROLLING BACK to an older build, set enabled = false and deploy, so that this build erases
 # the file. No older build ever erases one, and builds from before summary-keep refuse this table.
 # enabled = false
-# path = "/srv/vibe-talk-cache/vibe-talk.message-cache.sqlite3"
+# path = "/srv/vibe-talk-cache/vibe-talk.message-cache-web1.sqlite3"
 #                                   # Absolute, and never [storage] path itself. The default is
-#                                   # beside the store: <store stem>.message-cache-<host>.sqlite3
+#                                   # beside the store: <store stem>.message-cache-<host>.sqlite3.
+#                                   # Name one the same way, so the canary preflight matches it
 # max_days = 90                     # 1 to 365, counted by each message's own time. 0 is refused,
 #                                   # not read as unlimited
 # max_megabytes = 256               # 16 to 4096: the file and its -wal and -shm together

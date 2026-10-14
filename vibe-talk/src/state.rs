@@ -149,8 +149,8 @@ pub struct AppState {
     /// Always present, like [`AppState::live`], so a read site never asks whether a cache exists:
     /// it asks the sink to begin a fill, under the caller's
     /// [`crate::cache::FillGrant`] or a server one, and a read-scope caller has no grant to ask
-    /// with. Only tests install a cache behind it in this build, so every fill a server makes is
-    /// refused.
+    /// with. The server installs a cache behind it at startup when its configuration enables one
+    /// ([`crate::cache::lifecycle::start`]); with none behind it, every fill is refused.
     pub message_cache: Arc<crate::cache::Sink>,
 }
 
