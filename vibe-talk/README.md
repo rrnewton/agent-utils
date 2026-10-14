@@ -111,6 +111,9 @@ to the message before, so they mark alike:
   and written in while nobody had answered it.
 * **A later message written in a thread's box** marks nothing, and nor does the main channel's box.
 
+With **Hide read** on, the first reply typed in a new thread's box marks the thread's first message
+read, so the thread view empties, the same as pressing **Done** on that message.
+
 Marking read is what the message's own read action does. Once the chat service has taken the
 reply, the message is marked Done exactly as its **Done** button would mark it: on the server, at
 once on screen in both columns, with the **Undo** chip to take it back, and with the bookmark line
