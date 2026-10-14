@@ -21,7 +21,8 @@ use vibe_talk::mcp::protocol::{dispatch, Outcome};
 use vibe_talk::model::ChannelId;
 use vibe_talk::providers::ChatRouter;
 use vibe_talk::slack::{
-    message_id_from_ts, ts_from_message_id, LIVE_FAILED_READS, LIVE_TRANSIENT_FAILED_READS,
+    message_id_from_ts, ts_from_message_id, LIVE_FAILED_READS, LIVE_LAG_READS,
+    LIVE_TRANSIENT_FAILED_READS,
 };
 use vibe_talk::state::AppState;
 use vibe_talk::testing::WRITE_TOKEN;
@@ -766,6 +767,382 @@ async fn a_thread_whose_replies_reads_keep_failing_for_a_moment_is_given_up_afte
     assert_eq!(poll.texts(), ["later"]);
     assert_eq!(poll.replies.len(), 1);
     assert_eq!(poll.replies[0]["oldest"], ts(110, 0));
+}
+
+/// The calls a run of polls made, one count a poll, and whether each left replies waiting.
+async fn run(
+    poller: &mut Poller,
+    fake: &Fake,
+    client: &dyn vibe_talk::chat::ChatClient,
+    polls: usize,
+) -> (Vec<usize>, Vec<bool>) {
+    let mut calls = Vec::new();
+    let mut behind = Vec::new();
+    for n in 1..=polls {
+        let poll = poller.poll(fake, client).await;
+        assert!(poll.published.is_empty(), "poll {n} publishes nothing");
+        calls.push(poll.replies.len());
+        behind.push(poll.tick.replies_behind);
+    }
+    (calls, behind)
+}
+
+/// `first` of `value`, then `rest` of `otherwise`.
+fn then<T: Clone>(value: T, first: usize, otherwise: T, rest: usize) -> Vec<T> {
+    let mut list = vec![value; first];
+    list.resize(first + rest, otherwise);
+    list
+}
+
+/// `LIVE_LAG_READS`, as a count of polls.
+fn lag_reads() -> usize {
+    usize::try_from(LIVE_LAG_READS).expect("a small bound")
+}
+
+/// A lenient server may ignore `oldest` on `conversations.replies`, answering every read of a
+/// thread longer than one page with its first page and `has_more: true`. Nothing on that page is
+/// new, so such a read counts towards `LIVE_LAG_READS` like any read that brings nothing, and the
+/// thread is given up after that many in a row rather than read at the head of the queue on every
+/// poll with no end, which four such threads would make of every poll.
+#[tokio::test]
+async fn a_server_that_ignores_oldest_cannot_hold_a_thread_at_the_head_for_good() {
+    let (mut state, root) = one_thread();
+    // Thirty more replies before the seed: the thread is longer than one page.
+    for i in 0..30 {
+        add_reply(&mut state, CH, &root, &ts(33, i), &format!("old {i}"));
+    }
+    state.replies_ignore_oldest = true;
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    fake.with(|state| add_reply(state, CH, &root, &ts(100, 0), "past the first page"));
+    let lag = lag_reads();
+    let (calls, behind) = run(&mut poller, &fake, &client, lag + 3).await;
+    assert_eq!(
+        calls,
+        then(1, lag, 0, 3),
+        "one call a poll up to the bound, then none while the root stays as it was"
+    );
+    assert_eq!(behind, then(true, lag - 1, false, 4));
+}
+
+/// A server that answers `conversations.replies` without `has_more` cuts a long burst of replies
+/// into pages without saying so. A read that brings new replies is followed by another while the
+/// root's latest reply has not come back, however many that takes, so the burst is read to its
+/// end: only a read that brings nothing counts towards `LIVE_LAG_READS`.
+#[tokio::test]
+async fn a_long_burst_from_a_server_that_omits_has_more_is_read_to_its_end() {
+    let (mut state, root) = one_thread();
+    state.replies_omit_has_more = true;
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    // More pages of new replies than `LIVE_LAG_READS`.
+    let burst = PAGE_CAP * (lag_reads() + 1) + PAGE_CAP / 2;
+    fake.with(|state| {
+        for i in 0..burst {
+            let i = i64::try_from(i).expect("small");
+            add_reply(state, CH, &root, &ts(100 + i, 0), &format!("burst {i}"));
+        }
+    });
+    let mut all: Vec<String> = Vec::new();
+    let mut polls = 0;
+    loop {
+        let poll = poller.poll(&fake, &client).await;
+        polls += 1;
+        assert_eq!(poll.replies.len(), 1, "one call a thread a poll");
+        all.extend(poll.texts().into_iter().map(str::to_owned));
+        if !poll.tick.replies_behind {
+            break;
+        }
+        assert!(polls < 2 * burst.div_ceil(PAGE_CAP), "the burst never ends");
+    }
+    let expected: Vec<String> = (0..burst).map(|i| format!("burst {i}")).collect();
+    assert_eq!(all, expected, "every reply once, in order");
+    assert_eq!(polls, burst.div_ceil(PAGE_CAP), "one page a poll");
+    let quiet = poller.poll(&fake, &client).await;
+    assert!(quiet.replies.is_empty(), "read to its root's latest reply");
+}
+
+/// Make the root `root` count its replies but name no `latest_reply`.
+fn forget_latest_reply(state: &mut FakeState, root: &str) {
+    state
+        .history
+        .get_mut(CH)
+        .expect("channel")
+        .iter_mut()
+        .find(|message| message["ts"] == json!(root))
+        .expect("root")
+        .as_object_mut()
+        .expect("an object")
+        .remove("latest_reply");
+}
+
+/// A root that counts its replies but names no `latest_reply` says nothing of where its thread
+/// ends, so only Slack's `has_more` says a read was cut short: the thread is read again while it
+/// says so, and taken as read once it does not.
+#[tokio::test]
+async fn a_thread_whose_root_names_no_latest_reply_is_read_on_while_slack_says_has_more() {
+    let (state, root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    fake.with(|state| {
+        for i in 0..25 {
+            add_reply(state, CH, &root, &ts(100 + i, 0), &format!("flood {i}"));
+        }
+        forget_latest_reply(state, &root);
+    });
+    let first = poller.poll(&fake, &client).await;
+    assert_eq!(first.published.len(), PAGE_CAP, "what that call returned");
+    assert!(first.tick.replies_behind, "Slack said has_more");
+    let second = poller.poll(&fake, &client).await;
+    assert_eq!(
+        second.replies.len(),
+        1,
+        "read again while Slack says has_more"
+    );
+    assert_eq!(second.replies[0]["oldest"], ts(100 + 19, 0));
+    assert_eq!(second.published.len(), 5);
+    assert!(!second.tick.replies_behind);
+    let all: Vec<String> = first
+        .published
+        .iter()
+        .chain(&second.published)
+        .map(|live| live.message.content.clone())
+        .collect();
+    let expected: Vec<String> = (0..25).map(|i| format!("flood {i}")).collect();
+    assert_eq!(all, expected, "every reply once, in order");
+    let quiet = poller.poll(&fake, &client).await;
+    assert!(quiet.replies.is_empty(), "its count has not changed since");
+}
+
+/// A read that succeeds starts a thread's run of failed reads again even when it leaves the thread
+/// waiting for more, so a thread whose reads fail now and then, between reads that each bring part
+/// of a long burst, is never given up for failures that were not in a row. Both bounds:
+/// `LIVE_FAILED_READS` for a failure that does not read as a moment, and
+/// `LIVE_TRANSIENT_FAILED_READS` for any.
+#[tokio::test]
+async fn a_read_that_succeeds_starts_the_run_of_failures_again_though_the_thread_still_waits() {
+    for transient in [false, true] {
+        let bound = if transient {
+            LIVE_TRANSIENT_FAILED_READS
+        } else {
+            LIVE_FAILED_READS
+        };
+        let (state, root) = one_thread();
+        let fake = Fake::start(state, PAGE_CAP).await;
+        let client = fake.client();
+        let mut poller = Poller::new();
+        poller.poll(&fake, &client).await;
+        let failing = |on: bool| {
+            fake.with(|state| match (transient, on) {
+                (true, true) => {
+                    state.fail_threads.insert(root.clone(), 502);
+                }
+                (true, false) => state.fail_threads.clear(),
+                (false, true) => {
+                    state.fail.insert(
+                        "conversations.replies".to_owned(),
+                        "invalid_arguments".to_owned(),
+                    );
+                }
+                (false, false) => {
+                    state.fail.remove("conversations.replies");
+                }
+            });
+        };
+
+        fake.with(|state| {
+            for i in 0..25 {
+                add_reply(state, CH, &root, &ts(100 + i, 0), &format!("flood {i}"));
+            }
+        });
+        // One failed read short of the bound...
+        failing(true);
+        for n in 1..bound {
+            let poll = poller.poll(&fake, &client).await;
+            assert!(poll.published.is_empty(), "transient {transient}, read {n}");
+            assert!(poll.tick.replies_behind, "transient {transient}, read {n}");
+        }
+        // ...then a read that brings the first page, and leaves the thread waiting for the rest...
+        failing(false);
+        let partial = poller.poll(&fake, &client).await;
+        assert_eq!(partial.published.len(), PAGE_CAP, "transient {transient}");
+        assert!(partial.tick.replies_behind, "transient {transient}");
+        // ...then one more failed read: the run started again, so the thread still waits.
+        failing(true);
+        let failed = poller.poll(&fake, &client).await;
+        assert_eq!(failed.replies.len(), 1, "transient {transient}");
+        assert!(
+            failed.tick.replies_behind,
+            "transient {transient}: given up for failures that were not in a row"
+        );
+        failing(false);
+        let rest = poller.poll(&fake, &client).await;
+        assert_eq!(rest.published.len(), 5, "transient {transient}");
+        assert_eq!(
+            rest.replies[0]["oldest"],
+            ts(100 + 19, 0),
+            "transient {transient}"
+        );
+        assert!(!rest.tick.replies_behind, "transient {transient}");
+    }
+}
+
+/// While `conversations.replies` answers `ok: false` for every thread, as during an outage of it
+/// alone, a poll stops at its first failed read: one replies call a poll, however many threads
+/// wait.
+#[tokio::test]
+async fn while_every_replies_read_is_refused_a_poll_makes_one_replies_call() {
+    let (state, roots) = six_threads();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    fake.with(|state| {
+        for (n, root) in roots.iter().enumerate().take(3) {
+            let n = i64::try_from(n).expect("small");
+            add_reply(state, CH, root, &ts(200 + n, 0), &format!("reply {n}"));
+        }
+        state.fail.insert(
+            "conversations.replies".to_owned(),
+            "internal_error".to_owned(),
+        );
+    });
+    let (calls, behind) = run(&mut poller, &fake, &client, 3).await;
+    assert_eq!(calls, [1, 1, 1], "one call a poll");
+    assert_eq!(behind, [true, true, true]);
+
+    fake.with(|state| state.fail.remove("conversations.replies"));
+    let healed = poller.poll(&fake, &client).await;
+    assert_eq!(healed.texts(), ["reply 0", "reply 1", "reply 2"]);
+    assert!(!healed.tick.replies_behind);
+}
+
+/// Take the newest reply out of the feed of the thread rooted on `root`, leaving its root as it
+/// is: the root names a latest reply its feed does not list, as when the feed lags it.
+fn hide_from_the_feed(state: &mut FakeState, root: &str) -> Value {
+    state
+        .replies
+        .get_mut(&(CH.to_owned(), root.to_owned()))
+        .expect("thread")
+        .pop()
+        .expect("a reply")
+}
+
+/// A root may name a latest reply its thread's feed does not list yet, as when the feed lags it.
+/// A read that comes back without that reply leaves the thread waiting, and the reply is published
+/// by the read after the feed lists it. A thread whose feed never does is given up after
+/// `LIVE_LAG_READS` reads in a row that bring nothing new, taken as read to what its root said.
+#[tokio::test]
+async fn a_thread_whose_feed_lags_its_root_is_read_again_until_the_reply_arrives() {
+    let (state, root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    let late = fake.with(|state| {
+        add_reply(state, CH, &root, &ts(100, 0), "late in the feed");
+        hide_from_the_feed(state, &root)
+    });
+    let lagging = poller.poll(&fake, &client).await;
+    assert_eq!(lagging.replies.len(), 1);
+    assert!(lagging.published.is_empty());
+    assert!(
+        lagging.tick.replies_behind,
+        "the root's latest reply did not come back, so the thread waits"
+    );
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), root.clone()))
+            .expect("thread")
+            .push(late);
+    });
+    let arrived = poller.poll(&fake, &client).await;
+    assert_eq!(arrived.texts(), ["late in the feed"]);
+    assert_eq!(arrived.replies[0]["oldest"], ts(32, 0));
+    assert!(!arrived.tick.replies_behind);
+
+    // A reply its feed never lists: given up after the bound.
+    fake.with(|state| {
+        add_reply(state, CH, &root, &ts(110, 0), "never in the feed");
+        hide_from_the_feed(state, &root);
+    });
+    let lag = lag_reads();
+    let (calls, behind) = run(&mut poller, &fake, &client, lag + 2).await;
+    assert_eq!(calls, then(1, lag, 0, 2));
+    assert_eq!(behind, then(true, lag - 1, false, 3));
+
+    // A later reply is read from the latest reply its root named.
+    fake.with(|state| add_reply(state, CH, &root, &ts(120, 0), "later"));
+    let later = poller.poll(&fake, &client).await;
+    assert_eq!(later.texts(), ["later"]);
+    assert_eq!(later.replies[0]["oldest"], ts(110, 0));
+}
+
+/// Only reads in a row that bring nothing count towards `LIVE_LAG_READS`: a read that brings a
+/// reply, though not yet the root's latest, starts the count again, and leaves the thread waiting
+/// for the rest without counting itself.
+#[tokio::test]
+async fn a_read_that_brings_a_reply_starts_the_run_of_reads_that_bring_none_again() {
+    let (state, root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    // The root names two replies its feed lists neither of yet.
+    let (sooner, latest) = fake.with(|state| {
+        add_reply(state, CH, &root, &ts(100, 0), "sooner");
+        add_reply(state, CH, &root, &ts(105, 0), "latest");
+        let latest = hide_from_the_feed(state, &root);
+        (hide_from_the_feed(state, &root), latest)
+    });
+    let lag = lag_reads();
+    let (calls, behind) = run(&mut poller, &fake, &client, lag - 1).await;
+    assert_eq!(calls, vec![1; lag - 1]);
+    assert_eq!(behind, vec![true; lag - 1], "one read short of the bound");
+
+    // The feed lists the sooner reply: a read that brings it starts the count again.
+    let push = |reply: Value| {
+        fake.with(|state| {
+            state
+                .replies
+                .get_mut(&(CH.to_owned(), root.clone()))
+                .expect("thread")
+                .push(reply);
+        });
+    };
+    push(sooner);
+    let partial = poller.poll(&fake, &client).await;
+    assert_eq!(partial.texts(), ["sooner"]);
+    assert!(
+        partial.tick.replies_behind,
+        "the root's latest has not come back"
+    );
+    let (calls, behind) = run(&mut poller, &fake, &client, lag - 1).await;
+    assert_eq!(calls, vec![1; lag - 1]);
+    assert_eq!(
+        behind,
+        vec![true; lag - 1],
+        "the count started again at the read that brought a reply"
+    );
+
+    push(latest);
+    let arrived = poller.poll(&fake, &client).await;
+    assert_eq!(arrived.texts(), ["latest"]);
+    assert_eq!(arrived.replies[0]["oldest"], ts(100, 0));
+    assert!(!arrived.tick.replies_behind);
 }
 
 /// A Slack deployment of one channel, whose messages are minutes old, so a catch-up of the last

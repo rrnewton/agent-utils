@@ -21,8 +21,12 @@
 //!
 //! A thread is taken as read to its root's `latest_reply` only when a message at that instant came
 //! back and Slack answered `has_more: false`. A short page proves nothing, since a server may cap
-//! any page. A thread whose latest reply does not come back (a feed that lags its root, or a reply
-//! deleted since) is read again on the next read, and given up after [`LIVE_LAG_READS`] reads.
+//! any page, and may say nothing of it: a read that brings new replies short of the latest is
+//! followed by another on the next read, however long the burst. A read that brings no new reply
+//! while more is to come proves nothing either: a feed may lag its root, a reply may have been
+//! deleted since, and a lenient server may ignore `oldest`, answering the same first page with
+//! `has_more` every time. The thread is read again, and given up after [`LIVE_LAG_READS`] such
+//! reads in a row.
 //!
 //! # A read that fails
 //!
@@ -73,8 +77,9 @@ use crate::model::{ChannelId, MessageId};
 /// Most threads whose new replies one live read reads, one `conversations.replies` call each. The
 /// rest are read by the next read, the longest waiting first.
 pub const LIVE_THREAD_READS: usize = 4;
-/// Reads of a thread in a row that reach its end without its root's latest reply before that reply
-/// is given up.
+/// Reads of a thread in a row that bring no new reply while more is to come (Slack says `has_more`,
+/// or its root's latest reply has not come back) before the thread is taken as read to its root.
+/// A read that brings a new reply starts the count again.
 pub const LIVE_LAG_READS: u32 = 3;
 /// Reads of a thread in a row that fail, other than for a moment, before its new replies are given
 /// up. A failure that reads as a moment (a lost connection, a rate limit, a 5xx) counts only
@@ -99,7 +104,8 @@ struct Place {
     /// The root's `reply_count` when the thread was last read to its end, or seen not to have
     /// moved. Zero for a thread not yet read.
     count: u64,
-    /// Reads in a row that reached the end of the thread without its root's `latest_reply`.
+    /// Reads in a row that brought no new reply while more was to come: Slack said `has_more`, or
+    /// the root's `latest_reply` had not come back.
     misses: u32,
     /// Reads in a row that failed, for any reason.
     failed: u32,
@@ -375,8 +381,10 @@ impl HttpSlackClient {
                         .expect("a place was made for every thread read");
                     place.failed = 0;
                     place.failures = 0;
+                    let progressed = !fresh.is_empty();
                     if let Some(newest) = fresh.iter().map(|raw| raw.micros).max() {
                         place.through = newest;
+                        place.misses = 0;
                     }
                     let reached = thread.latest.is_none_or(|latest| place.through >= latest);
                     found.extend(
@@ -384,11 +392,16 @@ impl HttpSlackClient {
                             .into_iter()
                             .filter(|raw| raw.is_real() && !raw.is_broadcast()),
                     );
-                    if page.has_more {
-                        held.moved.push(thread);
-                        continue;
-                    }
-                    if !reached {
+                    // More is to come when Slack says so, or when the root's latest reply has not
+                    // come back. A read that brought something new is followed by another however
+                    // long the burst. One that brought nothing proves neither: a server may ignore
+                    // `oldest` and answer the same first page with `has_more` every time, and a
+                    // feed may lag its root. Such reads count, and a run of them ends the wait.
+                    if page.has_more || !reached {
+                        if progressed {
+                            held.moved.push(thread);
+                            continue;
+                        }
                         place.misses += 1;
                         if place.misses < LIVE_LAG_READS {
                             held.moved.push(thread);

@@ -68,6 +68,12 @@ pub struct FakeState {
     pub echo_token_500: bool,
     /// Include the thread root on EVERY `conversations.replies` page, as some servers do.
     pub root_always: bool,
+    /// Ignore `oldest` on `conversations.replies`, as a lenient server may: every read of a thread
+    /// starts at its beginning.
+    pub replies_ignore_oldest: bool,
+    /// Answer `conversations.replies` with neither `has_more` nor a cursor, as a server that pages
+    /// nothing may, however much it cut the page short.
+    pub replies_omit_has_more: bool,
     /// The next posted message's microsecond offset past the newest fixture.
     pub post_counter: i64,
     /// The account's read cursor per conversation, as `conversations.info` reports `last_read`.
@@ -525,7 +531,16 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
                 && !params.contains_key("cursor");
             let mut all = vec![root.clone()];
             all.extend(replies);
-            let mut answer = window(all, &params, cap, false);
+            let mut bounds = params.clone();
+            if state.replies_ignore_oldest {
+                bounds.remove("oldest");
+            }
+            let mut answer = window(all, &bounds, cap, false);
+            if state.replies_omit_has_more {
+                let fields = answer.as_object_mut().expect("an object");
+                fields.remove("has_more");
+                fields.remove("response_metadata");
+            }
             if state.root_always && !unfiltered {
                 let messages = answer["messages"].as_array_mut().expect("messages");
                 if messages.first() != Some(&root) {

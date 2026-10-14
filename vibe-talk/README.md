@@ -1234,7 +1234,11 @@ delivered, as before, so it costs that call as well. Every thread root on that p
   waiting first, and so does a thread with more new replies than one call returns; they are read
   even after their root has left the newest page. A page the server cut short is never taken for
   the end of a thread: only `has_more: false` with the root's latest reply among what came back is.
-  Running behind on replies, and catching up, is logged once each at INFO.
+  A read that brings new replies is followed by another on the next poll, however long the burst,
+  whether or not the server says `has_more`. A read that brings none while more is to come (a
+  thread's feed behind its root, a reply deleted since, a server that ignores `oldest` and answers
+  the same first page every time) counts, and after three in a row the thread is taken as read to
+  its root's latest reply. Running behind on replies, and catching up, is logged once each at INFO.
 * **A read of a thread that fails is made again on a later poll**, from the same place, so a
   failure loses no reply. The poll reads no further thread after it, so an outage costs one call a
   poll, and a thread whose last read failed waits behind every thread whose last read did not, so
