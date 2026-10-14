@@ -82,6 +82,9 @@ struct SlowChat {
     edited: Mutex<HashMap<String, String>>,
     /// Messages the backend no longer has.
     deleted: Mutex<HashSet<String>>,
+    /// How much longer than [`FETCH`] the next timeline read takes, once: a read sent before
+    /// another that lands after it.
+    stall_next_timeline: Mutex<Duration>,
 }
 
 impl SlowChat {
@@ -186,7 +189,8 @@ impl ChatClient for SlowChat {
             }
             None => self.window(),
         };
-        tokio::time::sleep(FETCH).await;
+        let stall = std::mem::take(&mut *self.stall_next_timeline.lock().unwrap());
+        tokio::time::sleep(FETCH + stall).await;
         Ok(TimelinePage {
             messages,
             next_after: Some("native-cursor-1".to_owned()),
@@ -912,5 +916,54 @@ async fn a_purge_while_the_page_is_fetching_leaves_nothing_behind_when_the_fetch
     assert!(
         state.read_ahead.is_empty(),
         "a fetch that began before the purge put its text back"
+    );
+}
+
+/// `remote-ops-audit`, read-ahead keeps the newer copy. Two reads of the channel overlap: the first is
+/// sent before an edit nobody pushed and is slow, the second is sent after the edit and lands first.
+/// When the first lands, its copy from before the edit must not replace the newer one, or speech
+/// preparation (and a summary's window) serves the old words for as long as the memory holds them.
+#[tokio::test(start_paused = true)]
+async fn an_older_read_that_lands_after_a_newer_one_does_not_put_the_old_text_back() {
+    let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    let path = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main");
+    *chat.stall_next_timeline.lock().unwrap() = FETCH * 2;
+    let older = call(&app, "GET", &path, None);
+    let newer = async {
+        tokio::time::sleep(FETCH / 5).await;
+        // Edited upstream, and not pushed: only a read sent from now on sees it.
+        chat.edit("102", "the words as edited");
+        let answer = call(&app, "GET", &path, None).await;
+        (answer, tokio::time::Instant::now())
+    };
+    let ((older_status, older_body), ((newer_status, newer_body), newer_landed)) =
+        tokio::join!(older, newer);
+    assert_eq!(older_status, StatusCode::OK, "{older_body}");
+    assert_eq!(newer_status, StatusCode::OK, "{newer_body}");
+    assert_eq!(
+        older_body["messages"][1]["content"], "words of message 102",
+        "fixture: the older read was meant to answer with the text from before the edit"
+    );
+    assert_eq!(
+        newer_body["messages"][1]["content"], "the words as edited",
+        "fixture: the newer read was meant to answer with the edit"
+    );
+    assert!(
+        tokio::time::Instant::now() > newer_landed,
+        "fixture: the older read was meant to land last"
+    );
+    assert_eq!(chat.timelines.load(Ordering::SeqCst), 2);
+
+    let (status, body) = call(&app, "POST", &prepare_path(), Some(json!({"ids": ["102"]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        chat.windows.load(Ordering::SeqCst),
+        0,
+        "fixture: preparation fetched instead of reading what the reads left in memory"
+    );
+    assert_eq!(
+        play(&app, &body).await,
+        "the words as edited",
+        "the older read put the text from before the edit back over the newer copy"
     );
 }

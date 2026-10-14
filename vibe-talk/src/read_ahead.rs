@@ -42,6 +42,11 @@
 //! for [`RECENT_TTL`], `clear` raises a floor, and [`ReadAhead::remember`] takes the instant its
 //! fetch BEGAN and keeps nothing a tombstone or the floor is newer than. A tombstone older than
 //! [`RECENT_TTL`] is not needed: a fetch that began before it is too old to keep anything anyway.
+//!
+//! The same instant settles two fetches of one channel that overlap. A copy is replaced only by one
+//! from a fetch that began no earlier, so the read sent first, landing last with the text from
+//! before an edit nobody pushed, cannot put that text back over the edited copy the later read
+//! stored. `remote-ops-audit`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -196,8 +201,9 @@ impl ReadAhead {
     ///
     /// `fetch_began` must be taken BEFORE the fetch is sent. A message forgotten after that
     /// instant, or everything if the memory was cleared after it, is not kept: the fetch may have
-    /// read it before the change that forgot it. And the message expires [`RECENT_TTL`] after it,
-    /// not after this call, because that is the oldest the text can be.
+    /// read it before the change that forgot it. Nor is a message already held from a fetch that
+    /// began after this one: that copy is the newer. And the message expires [`RECENT_TTL`] after
+    /// it, not after this call, because that is the oldest the text can be.
     pub fn remember(
         &self,
         channel: &ChannelId,
@@ -234,6 +240,17 @@ impl ReadAhead {
                 .forgotten
                 .get(&key)
                 .is_some_and(|forgotten| *forgotten >= fetch_began)
+            {
+                continue;
+            }
+            // A copy read by a fetch that began LATER is newer text than this one. Two reads of a
+            // channel overlap, and the one sent first lands last: its copy from before an edit
+            // nobody pushed must not go back over the edited one, for speech preparation,
+            // `recall_window` and a summary's context to serve. `remote-ops-audit`.
+            if held
+                .recent
+                .get(&key)
+                .is_some_and(|kept| kept.fetched > fetch_began)
             {
                 continue;
             }
@@ -733,6 +750,60 @@ mod tests {
                 .recall_at(&channel, None, &ids(&["10"]), landed)
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_began_earlier_cannot_put_an_older_copy_back_over_a_newer_one() {
+        // `remote-ops-audit`: two fetches overlap, and the one that began first lands last.
+        let read_ahead = ReadAhead::new();
+        let channel = ChannelId("1".to_owned());
+        let early = Instant::now();
+        let late = early + Duration::from_secs(1);
+        let edited = Message {
+            content: "text of 10, edited".to_owned(),
+            ..message("10", None)
+        };
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[edited],
+            late,
+            late + Duration::from_secs(1),
+        );
+        // The earlier fetch, landing after the later one.
+        read_ahead.remember_at(
+            &channel,
+            None,
+            &[message("10", None), message("11", None)],
+            early,
+            late + Duration::from_secs(2),
+        );
+        let found = read_ahead.recall_at(&channel, None, &ids(&["10", "11"]), late);
+        assert_eq!(
+            found["10"].content, "text of 10, edited",
+            "an older copy was put back over a newer one"
+        );
+        assert_eq!(
+            found["11"].content, "text of 11",
+            "a message held by no later fetch was not kept"
+        );
+        // A copy from a fetch that began later still replaces it, and so does one that began at
+        // the same instant.
+        let later = late + Duration::from_secs(3);
+        read_ahead.remember_at(&channel, None, &[message("10", None)], later, later);
+        assert_eq!(
+            read_ahead.recall_at(&channel, None, &ids(&["10"]), later)["10"].content,
+            "text of 10"
+        );
+        let again = Message {
+            content: "text of 10, again".to_owned(),
+            ..message("10", None)
+        };
+        read_ahead.remember_at(&channel, None, &[again], later, later);
+        assert_eq!(
+            read_ahead.recall_at(&channel, None, &ids(&["10"]), later)["10"].content,
+            "text of 10, again"
         );
     }
 
