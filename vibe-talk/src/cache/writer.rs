@@ -235,6 +235,7 @@ struct Hot<'c> {
     row_insert: Statement<'c>,
     row_update: Statement<'c>,
     row_update_search: Statement<'c>,
+    row_vouch: Statement<'c>,
     row_delete: Statement<'c>,
     scope_insert: Statement<'c>,
     tomb_select: Statement<'c>,
@@ -278,6 +279,10 @@ impl<'c> Hot<'c> {
             )?,
             row_update_search: conn
                 .prepare("UPDATE message SET search_text = ?2 WHERE row_id = ?1")?,
+            row_vouch: conn.prepare(
+                "UPDATE message SET observed_ms = ?3
+                 WHERE chan = ?1 AND message_id = ?2 AND observed_ms < ?3",
+            )?,
             row_delete: conn.prepare("DELETE FROM message WHERE row_id = ?1")?,
             scope_insert: conn.prepare(
                 "INSERT INTO message_scope (chan, scope_key, created_ms, row_id)
@@ -1245,22 +1250,29 @@ impl Writer<'_> {
         };
         let scope_key = listing.scope.key();
         let stored = self.load_head(chan_id, &scope_key)?;
+        // Whether this read began no earlier than the latest read of the scope's newest end the
+        // file records. One that began earlier and lands late knows nothing that read did not:
+        // what a provider lists only ever grows, so a row it saw above that read's head has been
+        // deleted since, and what that read settled may not have been visible to it yet.
+        let latest = stored.is_none_or(|(_, checked)| listing.observed_ms >= checked);
         let head = match proof.until {
             ListEnd::Newest => {
                 let old = stored.map(|(head, _)| head);
-                let head = coverage::advance_head(old, newest, listing.observed_ms);
-                let checked = stored.map_or(listing.observed_ms, |(_, checked)| {
-                    checked.max(listing.observed_ms)
-                });
-                // A read of this scope's newest end that began after the latest drop would have
-                // listed a creation the drop left out: the head is trusted again, and the file
-                // says so though the head did not move. Otherwise the time is written only with a
-                // head that moved, so that reading an unchanged scope again writes nothing.
-                let rechecked = stored.is_some_and(|(_, checked)| {
-                    dropped.is_some_and(|d| checked <= d && d < listing.observed_ms)
-                });
-                if Some(head) != old || rechecked {
-                    self.store_head(chan_id, &scope_key, &head, checked)?;
+                let head = match old {
+                    Some(old) if !latest => old,
+                    _ => coverage::advance_head(old, newest, listing.observed_ms),
+                };
+                if latest {
+                    // The time of every latest read of the newest end is written, whether or not
+                    // the head moved: the rows of the unsettled band are vouched for by that read
+                    // alone ([`Writer::vouch_for_band`]), and a read that began after a drop would
+                    // have listed a creation the drop left out, so the head is trusted again.
+                    if Some(head) != old
+                        || stored.map(|(_, checked)| checked) != Some(listing.observed_ms)
+                    {
+                        self.store_head(chan_id, &scope_key, &head, listing.observed_ms)?;
+                    }
+                    self.vouch_for_band(chan_id, &head, listing)?;
                 }
                 Some(head)
             }
@@ -1308,6 +1320,32 @@ impl Writer<'_> {
             );
             if stamped != existing {
                 self.store_coverage(chan_id, &scope_key, &stamped)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A read of a scope's newest end, the latest yet, vouches for the rows at or above the head's
+    /// settled top that it listed: no claim holds them, only the read that listed them. Each such
+    /// row's time moves up to the read's start. A row there that it did not list keeps an older
+    /// time, and is not vouched for ([`super::shadow`]): it was deleted since an earlier read saw
+    /// it, or it was pushed before the provider listed it. Its absence is not taken as a deletion
+    /// while the band is open (a pushed copy may simply not be listed yet); the listing that
+    /// settles the band does that. A handful of rows at most: the band is two minutes wide.
+    fn vouch_for_band(
+        &mut self,
+        chan_id: i64,
+        head: &Head,
+        listing: &Listing,
+    ) -> rusqlite::Result<()> {
+        let top = head.settled_top();
+        for row in &listing.rows {
+            if rows::created_ms(&row.message).is_some_and(|created| created >= top) {
+                self.hot.row_vouch.execute(params![
+                    chan_id,
+                    row.message.id.as_str(),
+                    listing.observed_ms
+                ])?;
             }
         }
         Ok(())

@@ -2484,6 +2484,85 @@ fn revalidation_keeps_a_claim_read_within_the_week_and_drops_one_that_was_not() 
     );
 }
 
+// ---- the unsettled band ------------------------------------------------------------------------
+
+/// Every read of a scope's newest end that is the latest yet records its time, and vouches for the
+/// rows of the band it listed by moving their times up to its own. A row of the band it did not
+/// list keeps its older time; a read that began earlier and lands late moves neither the head nor
+/// that time, whatever newer row it carries.
+#[test]
+fn only_the_latest_read_of_the_newest_end_vouches_for_the_band() {
+    let fx = Fixture::new("cache-band-vouch");
+    let proof = Some(newest_proof(ListStart::At(T0 + STEP)));
+    // Written thirty seconds before m6: inside the band of any head at m6.
+    let posted = message("b1", "ada", "posted and deleted", T0 + 6 * STEP - 30_000);
+    let rows = || (1..=6).map(m).collect::<Vec<_>>();
+    let first = T0 + 7 * STEP;
+    let mut with_b1 = rows();
+    with_b1.push(posted.clone());
+    fx.list(with_b1, first, proof);
+    // A minute later b1 is gone, and the latest read lists the channel without it.
+    let second = first + 60_000;
+    fx.list(rows(), second, proof);
+    let head = fx
+        .cache
+        .head(&fx.chan, &Scope::Main)
+        .served()
+        .expect("served")
+        .expect("a head");
+    let observed = |id: &str| held(&fx, id).expect("held").observed_ms;
+    assert!(
+        held(&fx, "b1").is_some(),
+        "inside the band an absence proves nothing yet"
+    );
+    assert_eq!(observed("b1"), first, "not vouched for by the latest read");
+    assert_eq!(observed("m6"), second, "vouched for by the latest read");
+    assert_eq!(
+        observed("m3"),
+        first,
+        "below the band a claim holds it, and nothing moved"
+    );
+    // A read that began before the second one, carrying a newer message and b1, lands now.
+    let mut late = rows();
+    late.push(posted);
+    late.push(m(7));
+    fx.list(late, first + 30_000, proof);
+    assert_eq!(
+        fx.cache
+            .head(&fx.chan, &Scope::Main)
+            .served()
+            .expect("served"),
+        Some(head),
+        "the late read moved the head"
+    );
+    assert_eq!(observed("b1"), first);
+    assert_eq!(observed("m7"), first + 30_000);
+    // What a newest page of five would be answered with holds m7 and b1: neither is vouched for.
+    let ask = shadow::Ask::Timeline {
+        view: crate::threads::TimelineView::Main,
+        thread: None,
+        limit: 5,
+    };
+    let query = shadow::query(&ask, observe::Shape::DiscordNative, false).expect("a query");
+    let view = fx
+        .cache
+        .shadow_view(&fx.chan, &query)
+        .served()
+        .expect("served");
+    assert_eq!(view.head_checked_ms, Some(second));
+    let facts = shadow::Facts {
+        asked_ms: second + 1_000,
+        live_fed: false,
+        dropped_ms: None,
+        barrier: true,
+        feed: shadow::Feed::AdditionsOnly,
+    };
+    assert_eq!(
+        shadow::decide(&ask, &view, &facts),
+        shadow::Decision::Miss(shadow::Miss::Gap)
+    );
+}
+
 // ---- what the store's summaries must follow -----------------------------------------------------
 
 fn drain(events: &mut tokio::sync::mpsc::Receiver<WriterEvent>) -> Vec<WriterEvent> {

@@ -3671,7 +3671,11 @@ complete the stretch it was in. It then deletes the message from the file and le
 Only a read that began after the deletion brings the message back; a pushed change never does.
 That holds for a message the file never held as well: a read that began before a later listing
 proved a stretch without the message, and lands after it, leaves a tombstone where the message
-would have gone. An edit replaces the text, unless what the cache holds was seen later. A message
+would have gone. The last two minutes before a view's newest message are the exception, because a
+provider may list a message there late: a listing proves nothing about them, so a message missing
+from one there, or brought back by an earlier read landing late, is kept until a later listing
+settles that stretch. It is never counted as one the cache would serve unless the latest read of
+the view's newest end listed it. An edit replaces the text, unless what the cache holds was seen later. A message
 the live poller publishes counts as seen when the poller's read began, not when it published it.
 In both cases a summary of the old text is deleted from the store once the change is written.
 Turning the cache off never deletes a summary. A message the server does not re-check is deleted

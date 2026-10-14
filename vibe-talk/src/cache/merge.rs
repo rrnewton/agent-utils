@@ -19,7 +19,12 @@
 //!    to the same rule when it arrives: a copy observed before a listing of its home scope that
 //!    proved, without it, the stretch it was written in is of a message gone by then, and leaves a
 //!    tombstone instead of a row. So a read that began before a deletion never brings the message
-//!    back by landing after a read that began after it, whether or not the cache held it before.
+//!    back by landing after a read that began after it and proved the stretch it was in, whether
+//!    or not the cache held it before. The unsettled band, and anything above the head, is proved
+//!    by nothing (a provider may list a message late, and a pushed copy may come before the
+//!    listing does), so a copy there is held whatever a later listing lacked; but it is never
+//!    vouched for unless the latest read of the scope's newest end listed it
+//!    ([`super::shadow`]), and the listing that later settles its stretch takes it out.
 //! 5. **Snippets never overwrite listing text.** A bridge falls back to a short snippet when a live
 //!    event has no body, so a pushed update that is a strict prefix of the held text (a trailing
 //!    `…` ignored) changes nothing, and a pushed create of an unknown id is held as partial until

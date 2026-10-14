@@ -316,6 +316,14 @@ impl Head {
     pub fn in_band(&self, ms: i64) -> bool {
         ms >= self.unsettled_from_ms
     }
+
+    /// The top of what is settled below the head: the band's start, or just past the head once
+    /// the band has settled. A row created at or after it is held by no claim, only by the read of
+    /// the newest end that listed it.
+    #[must_use]
+    pub fn settled_top(&self) -> i64 {
+        self.unsettled_from_ms.min(self.head_ms.saturating_add(1))
+    }
 }
 
 /// A read of the newest end has landed: its newest row was created at `newest_row_ms`, and the
@@ -323,10 +331,13 @@ impl Head {
 ///
 /// Rows at or below the old head are settled for good once either settling condition holds, and
 /// rows more than [`SETTLE_MS`] older than this read's newest row are settled whatever else holds;
-/// the band never reopens, and a read that is no newer than the stored head, in either clock,
-/// changes nothing. `head_listed_ms` is the time of the latest read of the newest end, except
-/// while a band is open and no newer row has arrived: then it stays the time of the read that
-/// opened the band, which is what the ten minutes are counted from.
+/// the band never reopens. A read that began before the read that listed the stored head changes
+/// nothing, whatever it saw: what a provider lists only ever grows, so a row it saw above that
+/// head has been deleted since, and nothing it saw can settle what a later read did not.
+/// `head_listed_ms` is the time of the latest read of the newest end, except while a band is open
+/// and no newer row has arrived: then it stays the time of the read that opened the band, which is
+/// what the ten minutes are counted from. (The writer holds a read to the latest read of the
+/// newest end it has recorded, which may be later still.)
 #[must_use]
 pub fn advance_head(old: Option<Head>, newest_row_ms: i64, listed_ms: i64) -> Head {
     let Some(old) = old else {
@@ -336,7 +347,9 @@ pub fn advance_head(old: Option<Head>, newest_row_ms: i64, listed_ms: i64) -> He
             head_listed_ms: listed_ms,
         };
     };
-    if listed_ms <= old.head_listed_ms && newest_row_ms <= old.head_ms {
+    if listed_ms < old.head_listed_ms
+        || (listed_ms == old.head_listed_ms && newest_row_ms <= old.head_ms)
+    {
         return old;
     }
     let head_ms = old.head_ms.max(newest_row_ms);
@@ -372,7 +385,9 @@ pub fn advance_head(old: Option<Head>, newest_row_ms: i64, listed_ms: i64) -> He
 /// settled AS OF THAT LISTING'S OWN START.
 ///
 /// - For a listing at least as recent as the read that last set the head, that is the head's
-///   `unsettled_from_ms`: everything below it was visible to a read that started no later.
+///   `unsettled_from_ms`: everything below it was visible to a read that started no later. (A
+///   later read that left `head_listed_ms` where it was, keeping the band's clock, moved neither
+///   the head nor the band.)
 /// - For an older listing that lands late, the head may have been settled by a read it predates,
 ///   so the bound is also kept to [`SETTLE_MS`] below the listing's own newest row, which it saw.
 /// - With no head (a range read of a scope whose newest end was never read), the listing's own
@@ -588,6 +603,26 @@ mod tests {
         );
     }
 
+    /// A read that began before the one that listed the head lands late, having seen a newer row:
+    /// the later read did not list it, so it was deleted in between, and the head stays where the
+    /// later read left it, with that read's time.
+    #[test]
+    fn a_read_older_than_the_heads_never_moves_it() {
+        let head = advance_head(None, 1_000_000, 500);
+        assert_eq!(advance_head(Some(head), 1_090_000, 400), head);
+        assert_eq!(
+            advance_head(Some(head), 1_000_000 + SETTLE_MS + 1, 499),
+            head,
+            "nor settles its band"
+        );
+        // One that began with it, or after it, does.
+        assert_eq!(advance_head(Some(head), 1_090_000, 500).head_ms, 1_090_000);
+        assert_eq!(advance_head(Some(head), 1_090_000, 501).head_ms, 1_090_000);
+        assert_eq!(head.settled_top(), 1_000_000 - SETTLE_MS);
+        let settled = advance_head(Some(head), 1_000_000, 500 + SETTLE_AFTER_LOCAL_MS);
+        assert_eq!(settled.settled_top(), 1_000_001, "just past the head");
+    }
+
     /// The case that kept a busy channel unsettled for as long as it stayed busy: a message a
     /// minute, and a read of the newest end a minute, for ten hours. Each read moves the head by
     /// less than the late bound and starts less than ten minutes after the last, so neither of
@@ -645,6 +680,8 @@ mod tests {
                 }
             }
             let mut head: Option<Head> = None;
+            // When the latest read of the newest end began, as the writer records it.
+            let mut checked: Option<i64> = None;
             for listed_ms in starts {
                 let provider_now = listed_ms + skew;
                 let Some(newest) = messages
@@ -655,7 +692,12 @@ mod tests {
                 else {
                     continue; // an empty listing proves nothing, and moves nothing
                 };
-                head = Some(advance_head(head, newest, listed_ms));
+                // As the writer does: a read older than the latest moves nothing.
+                let latest = checked.is_none_or(|checked| listed_ms >= checked);
+                if latest {
+                    head = Some(advance_head(head, newest, listed_ms));
+                    checked = Some(listed_ms);
+                }
                 let bound = absence_bound(head.as_ref(), newest, listed_ms);
                 for (written, visible) in &messages {
                     assert!(

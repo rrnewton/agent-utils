@@ -2261,6 +2261,138 @@ async fn a_pollers_publish_never_inserts_a_message_a_later_listing_proved_gone()
     );
 }
 
+/// The newest page of the read channel's `main`, and what the shadow counts of it, at read scope.
+async fn fallback_of(state: &AppState) -> vibe_talk::cache::shadow::ConsumerCounts {
+    let status = call_as(
+        state,
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=10"),
+        testing::READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    shadow_of(state, "timeline_fallback").await
+}
+
+fn head_of(cache: &MessageCache) -> vibe_talk::cache::coverage::Head {
+    assert!(cache.quiesce_blocking(WAIT));
+    cache
+        .head(&read_chan(), &CacheScope::Main)
+        .served()
+        .expect("a read")
+        .expect("a head")
+}
+
+/// The most ordinary deletion there is: a message deleted moments after it was posted, so that it
+/// lies in the unsettled band of the read that began after the deletion (or above that read's
+/// newest message), where a listing proves nothing. A read that saw it began before the deletion,
+/// and lands after that listing. The message may be held again, but the head stays where the later
+/// read left it, the message is never one the cache would serve, and the listing that settles its
+/// stretch takes it out.
+#[tokio::test]
+async fn a_message_deleted_moments_after_it_was_posted_is_never_served_when_an_earlier_read_lands_late(
+) {
+    for (label, at) in [
+        ("in the band", T0 + 18 * MINUTE + 30_000),
+        ("above the head", T0 + 19 * MINUTE + 30_000),
+    ] {
+        let clock = ManualClock::at(T0 + HOUR);
+        let d = deployment(false, 20, &clock).await;
+        let oops = d
+            .fake
+            .seed_at(&id(READ_CHANNEL), "Ada", "oops, wrong channel", at);
+        let HeldRead { entered, release } = d.chat.hold_next_recent();
+        let slow = {
+            let state = d.state.clone();
+            tokio::spawn(async move {
+                call(
+                    &state,
+                    "GET",
+                    &format!("/api/v1/channels/{READ_CHANNEL}/messages?limit=50"),
+                )
+                .await
+                .0
+            })
+        };
+        entered.await.expect("the slow read took its answer");
+
+        clock.advance(MINUTE);
+        d.fake.delete(&oops);
+        get(
+            &d.state,
+            &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
+        )
+        .await;
+        assert!(!holds(&d.cache, &read_chan(), &oops), "{label}");
+        let head = head_of(&d.cache);
+
+        clock.advance(1_000);
+        drop(release);
+        assert_eq!(slow.await.expect("joined"), StatusCode::OK);
+        assert_eq!(
+            head_of(&d.cache),
+            head,
+            "{label}: the earlier read moved the head to a message the later one did not list"
+        );
+
+        clock.advance(1_000);
+        let fallback = fallback_of(&d.state).await;
+        assert_eq!(
+            (fallback.would_serve, fallback.extra_rows),
+            (0, 0),
+            "{label}: {fallback:?}"
+        );
+    }
+}
+
+/// The same with no race at all: a write-scope listing holds a just-posted message; it is deleted;
+/// a listing that began after the deletion lacks it, and its absence inside the band proves
+/// nothing yet. The message stays in the file until that stretch is settled, and is never one the
+/// cache would serve; a listing ten minutes on settles the band and takes it out.
+#[tokio::test]
+async fn a_message_deleted_moments_after_it_was_posted_is_never_served_from_the_band() {
+    for (label, at) in [
+        ("in the band", T0 + 18 * MINUTE + 30_000),
+        ("above the head", T0 + 19 * MINUTE + 30_000),
+    ] {
+        let clock = ManualClock::at(T0 + HOUR);
+        let d = deployment(false, 20, &clock).await;
+        let oops = d
+            .fake
+            .seed_at(&id(READ_CHANNEL), "Ada", "oops, wrong channel", at);
+        let main = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50");
+        get(&d.state, &main).await;
+        assert!(holds(&d.cache, &read_chan(), &oops), "{label}");
+        clock.advance(MINUTE);
+        d.fake.delete(&oops);
+        get(&d.state, &main).await;
+        assert!(
+            holds(&d.cache, &read_chan(), &oops),
+            "{label}: inside the band an absence proves nothing yet"
+        );
+        clock.advance(1_000);
+        let fallback = fallback_of(&d.state).await;
+        assert_eq!(
+            (fallback.would_serve, fallback.extra_rows),
+            (0, 0),
+            "{label}: {fallback:?}"
+        );
+        // Ten minutes on, the band settles, and the listing that settles it takes the message out.
+        clock.advance(10 * MINUTE);
+        get(&d.state, &main).await;
+        assert!(
+            tombstoned(&d.cache, &read_chan(), &oops),
+            "{label}: the listing that settled its stretch took it out"
+        );
+        clock.advance(1_000);
+        let fallback = fallback_of(&d.state).await;
+        assert_eq!(
+            (fallback.would_serve, fallback.extra_rows),
+            (1, 0),
+            "{label}: what the settled listing holds is served, and the message is not: {fallback:?}"
+        );
+    }
+}
+
 // ---- a change left out while the account is checked again ---------------------------------------
 
 /// A bridge whose identity answer the test can hold, to stand for a provider slow to say which
