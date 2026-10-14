@@ -48,6 +48,10 @@
 //!   it is the copy the latest page to show the thread showed, as for a thread already named —
 //!   never the newer-looking of the two: a page that showed a reply deleted shows fewer replies
 //!   and no later activity. After it, each later page that shows the thread.
+//! * The sentence is filed at no fewer messages than the newest copy of the thread a page showed
+//!   before that read began, so the next page showing that count does not find the thread due
+//!   again. A read that is behind — `as_of`, or a thread view that counts fewer replies than the
+//!   list — answers the same at every turn, and would otherwise be made at every interval.
 //! * After a naming read meets a provider failure — an HTTP 5xx, a read that never completed or
 //!   outlasted [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out — no thread
 //!   in that CHANNEL is read for [`CHANNEL_PAUSE`]. Other channels go on as before.
@@ -532,9 +536,9 @@ struct ChannelQueue {
 struct Waiting {
     deps: ThreadDeps,
     /// The newest copy of the thread any page has shown while it waits ([`not_older`]; an answer
-    /// that lands after a newer one does not replace it). Its id says what to read, and its reply
-    /// count stands in for the read's when that read gives none, so the sentence is not filed at
-    /// fewer messages than a page already showed.
+    /// that lands after a newer one does not replace it). Its id says what to read, and the
+    /// sentence is filed at no fewer messages than its reply count says, whatever the read at the
+    /// turn counts: a read that is behind would otherwise leave the thread due at every turn.
     snapshot: ThreadSummary,
     /// The copy of the thread the latest page to show it showed, whatever it showed, as a renamed
     /// thread's copy is kept ([`ThreadNames::refresh_copies`]): what a forward delta carries once
@@ -1378,16 +1382,24 @@ impl ThreadNames {
             .map_err(TurnFailure::Other)?;
         let renamed = kept.is_none();
         let cut_at = naming.cut_at;
-        // How many messages the thread had in the read the sentence was written from. Only when
-        // that read gives no count, the copy it was queued with, or as many as the read held if
-        // that is more.
-        let at = match read_copy.as_ref().and_then(|thread| thread.reply_count) {
-            Some(replies) => replies.saturating_add(1),
-            None => snapshot
-                .reply_count
-                .map_or(0, |replies| replies.saturating_add(1))
-                .max(messages.len() as u64),
-        };
+        // How many messages the sentence is filed at: the most of what the read at the turn
+        // counted, what the newest copy a page showed before it began counted, and how many the
+        // read held. Never fewer than a page showed: a write-scope page that shows that count
+        // again would find the thread due and queue it, and a read that is behind (a bridge's
+        // `as_of`, or a thread view that counts fewer replies than the list) answers the same at
+        // every turn, so the thread would be read and named again at every interval, for as long
+        // as it stays behind. No reply that came after the read began is counted: every page
+        // counted here landed before it began.
+        let at = [
+            read_copy.as_ref().and_then(|thread| thread.reply_count),
+            snapshot.reply_count,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|replies| replies.saturating_add(1))
+        .chain(std::iter::once(messages.len() as u64))
+        .max()
+        .unwrap_or(0);
         let record = ThreadRecord {
             // A thread that already has a name keeps it, whatever the model offered this time.
             name: kept.unwrap_or(naming.slug),

@@ -61,6 +61,9 @@ struct Upstream {
     /// Threads whose reads are answered from an older copy, with the `as_of` a bridge sends when
     /// it serves a copy it could not bring up to date.
     behind: Mutex<HashMap<String, (FakeThread, String)>>,
+    /// How many of its newest replies every thread read leaves out, count and messages both, with
+    /// no `as_of`: a provider whose thread view lags its thread list.
+    thread_view_lag: Mutex<usize>,
 }
 
 fn thread_id(channel: &str, n: usize) -> String {
@@ -232,6 +235,12 @@ impl ChatClient for Upstream {
                     Some((copy, as_of)) => (Some(copy), Some(as_of)),
                     None => (found, None),
                 };
+                let lag = *self.thread_view_lag.lock().unwrap();
+                let found = found.map(|mut thread| {
+                    let kept = thread.replies.len().saturating_sub(lag);
+                    thread.replies.truncate(kept);
+                    thread
+                });
                 let Some(thread) = found else {
                     if *self.gone_reads_empty.lock().unwrap() {
                         return Ok(TimelinePage::default());
@@ -1268,6 +1277,102 @@ async fn reply_deleted_while_waiting(same_activity: bool) {
         (&shown["reply_count"], &shown["updated_at"]),
         "the delta brought back a deleted reply: {carried}"
     );
+}
+
+// --- a read that is behind ----------------------------------------------------------------------
+
+/// How many times each of `threads` was read to name it, in order.
+fn reads_of(h: &Harness, threads: &[String]) -> Vec<usize> {
+    let reads = h.named_reads(WRITE_CHANNEL);
+    threads
+        .iter()
+        .map(|thread| reads.iter().filter(|read| *read == thread).count())
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_at_the_turn_that_says_it_is_behind_is_not_made_again_at_every_turn() {
+    // As in `a_read_at_the_turn_that_says_it_is_behind_does_not_take_back_a_newer_copy`: `older`
+    // gets a third reply while it waits, a page shows it, and the read at its turn is answered
+    // from the copy before that reply, with `as_of`. The bridge stays behind for ten minutes while
+    // a write-scope page polls the list every five seconds. The sentence must be filed at no fewer
+    // messages than the page showed: filed at the read's count, the next poll finds the thread
+    // due, and the read at every later turn answers the same.
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 2);
+    let (older, newer) = (ids[0].clone(), ids[1].clone());
+    let before = h.upstream.channels.lock().unwrap()[WRITE_CHANNEL][0].clone();
+    h.list(WRITE_CHANNEL, WRITE_TOKEN).await;
+    h.at(1).await;
+
+    reply_at(&h, &older, 10 * 60);
+    h.upstream
+        .behind
+        .lock()
+        .unwrap()
+        .insert(older.clone(), (before, "2026-10-13T08:05:00Z".to_owned()));
+    let page = h.list(WRITE_CHANNEL, READ_TOKEN).await;
+    assert_eq!(find(&page, &older).expect("listed")["reply_count"], 3);
+
+    paced(&h, (5, 605, 5), |_, _| {}).await;
+    assert_eq!(
+        reads_of(&h, &[older, newer]),
+        [1, 1],
+        "a read that says it is behind was made again at later turns"
+    );
+    assert_eq!(h.summarizer.thread_prompts().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_named_thread_whose_fresh_read_says_it_is_behind_is_read_once() {
+    // A thread is named with two replies. Ten seconds in it gets a third, which makes it due a
+    // fresh sentence, and from then on the bridge answers reads of it from the copy before that
+    // reply, with `as_of`, for ten minutes, while a write-scope page polls the list every five
+    // seconds. Before W5 this cost one read; it must not cost one every interval.
+    let h = harness();
+    let thread = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
+    h.poll(WRITE_CHANNEL, true).await;
+    h.at(1).await;
+    assert_eq!(reads_of(&h, std::slice::from_ref(&thread)), [1]);
+    let before = h.upstream.channels.lock().unwrap()[WRITE_CHANNEL][0].clone();
+
+    h.at(10).await;
+    reply_at(&h, &thread, 10 * 60);
+    h.upstream
+        .behind
+        .lock()
+        .unwrap()
+        .insert(thread.clone(), (before, "2026-10-13T08:00:00Z".to_owned()));
+    paced(&h, (10, 610, 5), |_, _| {}).await;
+    assert_eq!(
+        reads_of(&h, std::slice::from_ref(&thread)),
+        [2],
+        "the fresh read that said it was behind was made again at later turns"
+    );
+    assert_eq!(h.summarizer.thread_prompts().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_provider_whose_thread_view_counts_a_reply_fewer_than_its_list_names_each_thread_once() {
+    // No `as_of` here: the thread view simply lags the list by one reply, every time. Each thread
+    // is named once in half an hour of write-scope polls every three seconds. Filed at the read's
+    // count, a thread with 1, 3 or 7 replies on the list was due again at the next poll, for ever.
+    let h = harness();
+    let ids = h.upstream.add(WRITE_CHANNEL, 5);
+    for (thread, replies) in ids.iter().zip([1, 3, 7, 2, 10]) {
+        h.upstream.change(thread, |thread| {
+            thread.replies = (0..replies).map(|n| format!("reply {n}")).collect();
+        });
+    }
+    *h.upstream.thread_view_lag.lock().unwrap() = 1;
+
+    paced(&h, (0, 1_800, 3), |_, _| {}).await;
+    assert_eq!(
+        reads_of(&h, &ids),
+        [1, 1, 1, 1, 1],
+        "a thread whose read counted fewer replies than the list was read again"
+    );
+    assert_eq!(h.summarizer.thread_prompts().len(), ids.len());
 }
 
 // --- the order threads are read in --------------------------------------------------------------

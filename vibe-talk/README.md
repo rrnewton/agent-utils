@@ -1622,6 +1622,12 @@ channel:
   the one the latest page to show the thread showed, as for a thread already named, so a reply
   deleted while the thread waited is not brought back either. A thread deleted while it waited is
   not named, and is not carried on a delta.
+* **A read that is behind is not made again at every turn.** The sentence is filed at no fewer
+  messages than the newest copy of the thread a page showed before the read began, so the next
+  page showing that count does not find the thread due again. A read that is behind — a bridge's
+  `as_of`, or a thread view that counts fewer replies than the list — answers the same at every
+  turn, and would otherwise cost a read and a model call at every interval for as long as it
+  stayed behind.
 * **After a provider failure on a naming read — an HTTP 5xx, a read that never completed or took
   longer than five minutes, or a rate limit the client could not wait out — no thread in that
   channel is read for names for ten minutes.** Other channels go on at their own pace.
