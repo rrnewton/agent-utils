@@ -240,6 +240,25 @@ remote when that remote is listed with `--salvage-push-remote URL`, otherwise in
 local Git bundle under `worktrees/wrkslots-salvage/`. Ask the owner whether salvage may push to
 the project's remote; without it, salvaged work stays on this machine.
 
+wrkslots talks to the slot's remote itself: `create` lists the remote's branches and `remove`
+asks which of them already contain a slot's commits. If the agent's own sandbox cannot reach the
+project's remote (a proxy that refuses agent processes, for example), those commands refuse. Then
+make a local bare mirror inside the harness the primary checkout's `origin`, keep the real remote
+under another name, and refresh the mirror from a context that can reach it (herdr-run, if it is
+set up) before creating slots and after each landing:
+
+```sh
+git clone --bare --no-local "$H/$PRIMARY" "$H/mirror/$PRIMARY.git"
+git -C "$H/mirror/$PRIMARY.git" remote add upstream <real remote URL>
+git -C "$H/mirror/$PRIMARY.git" config remote.upstream.fetch '+refs/heads/<default>:refs/heads/<default>'
+git -C "$H/$PRIMARY" remote rename origin upstream
+git -C "$H/$PRIMARY" remote add origin "$H/mirror/$PRIMARY.git"
+git -C "$H/$PRIMARY" fetch origin && git -C "$H/$PRIMARY" branch -u origin/<default>
+```
+
+Add `/mirror/` to the harness `.gitignore`, and record the refresh and push commands in the
+harness `AGENTS.md`.
+
 **5.5 agentctl profiles.** Create `$H/.agentctl` with mode 0700 and
 `$H/.agentctl/profiles.json` with mode 0600, owned by the owner, as a regular file (not a link):
 
@@ -286,7 +305,8 @@ Sandbox off (`cgroup`):
 - Work and commit only in your slot, on your branch. Publish the branch as the primary
   repository's rules require.
 - When done, write a handoff (what changed, the commit, how it was validated, open questions)
-  to a file outside the slot, then run: <WS> write-handoff <slot> --agent <name> --owner-pid
+  to a file outside every Git working tree (the harness root is one; use for example
+  /tmp/<repo>-handoffs/<slot>.md), then run: <WS> write-handoff <slot> --agent <name> --owner-pid
   <pid> --expected-generation <n> --from-file <file>; and <WS> release <slot> --agent <name>
   --owner-pid <pid> --expected-generation <n>.
 - Then reply with a short summary. The coordinator stops you and removes the slot.
@@ -348,6 +368,9 @@ prompt was delivered. Expect these on the way, and handle them as described:
 - **Removal refuses** while any process still uses the slot, and for a sandboxed agent until the
   slot's time-to-live has passed. Read the refusal; it names the condition. Never delete a slot
   by hand.
+- **A slot you own yourself** (created with your own PID as owner, with no agentctl agent behind
+  it) cannot be proven dead by `bin/agent-liveness`, which finds no agentctl record and refuses.
+  As its owner, write a handoff and release it, then `read-handoff` and `remove` as coordinator.
 
 ## Phase 7: Hand off to the owner
 
