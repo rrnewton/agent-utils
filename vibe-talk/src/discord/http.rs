@@ -16,6 +16,8 @@ mod threading;
 #[path = "heads.rs"]
 mod heads;
 
+pub use heads::{heads_request, parse_heads, BRIDGE_HEAD_CHANNELS};
+
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -927,6 +929,9 @@ pub struct HttpDiscordClient {
     /// Whether the bridge looks several messages up by id itself; see [`ids_request`].
     /// remote-ops-audit W11 `#287 bulk-reads`.
     id_reads: bool,
+    /// Whether the bridge answers channel heads itself; see [`heads_request`]. remote-ops-audit
+    /// W12 `#287 bulk-reads`.
+    head_reads: bool,
     /// Which Discord server each channel belongs to, learned the first time its head is read, so
     /// every later head read of a server's channels is one request. remote-ops-audit W12
     /// `#287 bulk-reads`; see `heads`.
@@ -987,6 +992,7 @@ impl HttpDiscordClient {
             recent: config.recent,
             range_reads: config.range_reads,
             id_reads: config.id_reads,
+            head_reads: config.head_reads,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         })
@@ -1349,7 +1355,8 @@ impl ChatClient for HttpDiscordClient {
     /// with `id_reads`, which asks the bridge for every id at once ([`ids_request`]).
     ///
     /// Heads are native against Discord itself (`thread_api = "native"`): one server channel list
-    /// answers every channel of that server (W12, see `heads`).
+    /// answers every channel of that server (W12, see `heads`). On a bridge they are native only
+    /// with `head_reads`, which asks the bridge for every channel at once ([`heads_request`]).
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
         let native_or = |on: bool| {
             if on {
@@ -1361,7 +1368,7 @@ impl ChatClient for HttpDiscordClient {
         let discord_itself = self.thread_api == crate::threads::ThreadApi::Native;
         let caps = crate::chat::ReadCaps {
             by_ids: native_or(discord_itself || self.id_reads),
-            heads: native_or(discord_itself),
+            heads: native_or(discord_itself || self.head_reads),
             ..crate::chat::ReadCaps::default()
         };
         if self.range_reads {
@@ -1413,11 +1420,14 @@ impl ChatClient for HttpDiscordClient {
         looked.map_err(|error| error.with_provider(self.provider_name()))
     }
 
-    /// Discord itself reads heads from its server channel lists (remote-ops-audit W12, see
-    /// `heads`); anything else is the trait's default, a one-message read per channel.
+    /// Discord itself reads heads from its server channel lists, and a bridge with `head_reads`
+    /// answers them itself (remote-ops-audit W12, see `heads`); anything else is the trait's
+    /// default, a one-message read per channel.
     async fn channel_heads(&self, channels: &[ChannelId]) -> crate::chat::HeadAnswers {
         if self.thread_api == crate::threads::ThreadApi::Native {
             self.native_heads(channels).await
+        } else if self.head_reads {
+            self.bridge_heads(channels).await
         } else {
             crate::chat::emulated_heads(self, channels).await
         }
@@ -1543,6 +1553,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
         }
     }
 
@@ -1839,6 +1850,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         };
@@ -1865,6 +1877,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         }
@@ -2063,6 +2076,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         };
@@ -2128,6 +2142,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         };
@@ -2182,6 +2197,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         };
@@ -2240,6 +2256,7 @@ mod tests {
                 recent: crate::config::RecentReads::default(),
                 range_reads: false,
                 id_reads: false,
+                head_reads: false,
                 guilds: heads::GuildCache::default(),
                 limiter: RateLimiter::new(),
             };
@@ -2291,6 +2308,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         };
@@ -2368,6 +2386,7 @@ mod tests {
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
+            head_reads: false,
             guilds: heads::GuildCache::default(),
             limiter: RateLimiter::new(),
         };

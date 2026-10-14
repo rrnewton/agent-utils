@@ -1785,6 +1785,7 @@ model provider or a real gateway.
 | Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether `messages` reads are checked against Flat for diagnostics, one at a time once recent reads stop (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
 | Bridge range reads | `discord.range_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, `/page` through a span and `/count` since an instant ask the bridge for the window itself — see [A bridge's range reads](#a-bridges-range-reads) |
 | Bridge lookups by id | `discord.id_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, speech preparation of a thread, a thread summary's parts and a message by id ask the bridge for every message at once — see [A bridge's lookups by id](#a-bridges-lookups-by-id) |
+| Bridge channel heads | `discord.head_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, the newest message of several channels is one request to the bridge — see [A bridge's channel heads](#a-bridges-channel-heads) |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -1875,7 +1876,7 @@ or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
 `thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`,
-`recent_view_shadow`, `range_reads` and `id_reads`, with the same meaning as in `[discord]`. Slack providers
+`recent_view_shadow`, `range_reads`, `id_reads` and `head_reads`, with the same meaning as in `[discord]`. Slack providers
 also take `registered_channels_writable`, `channel_discovery` and `upstream_clear`; see [Slack](#slack). A key that
 does not apply to the provider's kind is refused by name.
 
@@ -2265,7 +2266,9 @@ included), an instant after which it KNOWS nothing in the channel changed (`unch
 order asked, a failure in its own place; the router asks each provider once for its own channels.
 
 **Who answers it natively.** Discord itself (`thread_api = "native"`), from its server channel
-lists, one request per server (see the native backend above). Every other provider answers with
+lists, one request per server (see the native backend above), and a bridge configured with
+`head_reads`, one request for every channel (see
+[A bridge's channel heads](#a-bridges-channel-heads)). Every other provider answers with
 the trait's default, one read of one message per channel, which costs exactly what reading each
 channel did, and says so (`ReadCaps::heads` is emulated); Slack is one of them, since no Slack call
 answers the newest message of several conversations. A caller that would use heads only because
@@ -2275,6 +2278,52 @@ they are cheap asks only a provider that reads them natively.
 was ADDED. It does not prove that nothing was edited or deleted: Discord's `last_message_id` moves
 only on additions. Only `unchanged_since` vouches for edits and deletes too, so nothing that must
 see them acts on a head without it, and nothing acts on a head with an `as_of`.
+
+### A bridge's channel heads
+
+**The problem.** A bridge is asked for each channel's newest messages one channel at a time, and a
+bridge in front of a slow service may spend a service call on each. A bridge that keeps its
+channels current from its own live feed already knows, without asking its service, what each
+channel's newest message is and whether anything changed there since a given moment.
+
+**What you get.** `head_reads = true` (in `[discord]`, or on a `[[providers]]` entry of kind
+`discord`, only with `thread_api = "bridge"`; off by default, refused anywhere else) asks the bridge
+for the heads of several channels in one request, and lets the callers in
+[Channel heads](#channel-heads) use them. With it off, the bridge is read exactly as before. Turn it
+on only for a bridge that implements this request: one that does not answers it with an error or a
+message list, which vibe-talk refuses as an answer it cannot read, and then reads each channel as
+it would have without heads.
+
+**The request.** `GET /heads?channels=…&channels=…`
+
+* `channels` is repeated, once per channel, at most 50 times; a longer list is several requests.
+  Ids are opaque and never joined, so they may hold any character.
+
+**The answer** is an object:
+
+```json
+{"heads": [{"channel": "id", "newest_id": "…", "newest_at": "2026-10-13T11:59:00Z",
+            "activity_at": "2026-10-13T12:00:00Z", "unchanged_since": "2026-10-13T12:00:00Z",
+            "as_of": null}]}
+```
+
+* One head per channel the bridge can answer for, in any order, each channel asked about and
+  answered once. A channel the bridge leaves out is fine: vibe-talk reads that one as before.
+* `newest_id`: the id of the channel's newest message, as `GET /channels/{id}/messages` lists it
+  (the list `after=` walks forward), or `null` when it has none.
+* `newest_at` (optional): when that message was created, RFC 3339.
+* `activity_at` (optional): the latest activity in the channel, thread replies included.
+* `unchanged_since` (optional): an instant after which the bridge KNOWS nothing in the channel
+  changed: no message created, edited or deleted, a thread reply included. Give it only while the
+  bridge's own feed of the channel has seen every change since that instant (for example, the
+  newest change its feed saw, or the moment the feed started, whichever is later); leave it out
+  when it cannot vouch for that. It is what lets a voice catch-up keep a held copy of the channel
+  instead of reading it again, so an `unchanged_since` that is wrong hides a change.
+* `as_of` (optional): present only when the head came from a copy the bridge could not bring up to
+  date; vibe-talk then acts on nothing in it. Absent means now.
+
+Every field but `channel` may be absent or `null`; an unknown field is ignored; anything else that
+cannot be read fails the request, and vibe-talk reads its channels as before.
 
 ### Local read state is ours; upstream read state is an optional provider capability
 

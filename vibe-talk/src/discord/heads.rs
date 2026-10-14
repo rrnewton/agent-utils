@@ -13,6 +13,11 @@
 //! after it, never that nothing changed, and never carries
 //! [`crate::chat::ChannelHead::unchanged_since_ms`]. The live poller, which reads only additions,
 //! may skip a channel whose head has not moved; nothing that must see edits and deletes may.
+//!
+//! A compatible bridge configured with `head_reads` answers `GET /heads?channels=…` itself
+//! ([`heads_request`]), from whatever it keeps of its channels; the README's "A bridge's channel
+//! heads" is the contract. Such a bridge may also say [`ChannelHead::unchanged_since_ms`], when
+//! its own live feed has seen every change since.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -120,11 +125,171 @@ fn native_head(value: &Value, expected: &str) -> Result<(ChannelHead, Home), Cha
     Ok((head, home))
 }
 
+/// The most channels one bridge head read names; a longer list is several requests.
+pub const BRIDGE_HEAD_CHANNELS: usize = 50;
+
+/// The longest message id a bridge head may name, as for its cursors.
+const MAX_BRIDGE_ID_LEN: usize = 2048;
+
+/// Build a compatible bridge's head read: the newest message of each of `channels`.
+/// remote-ops-audit W12 `#287 bulk-reads`.
+///
+/// `GET /heads?channels=…&channels=…`, one `channels` per channel (opaque ids may hold any
+/// character, so they are never joined). Sent only to a bridge configured with `head_reads`; the
+/// README's "A bridge's channel heads" is the contract.
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] when the configured API base is not a URL that can take a path.
+pub fn heads_request(api_base: &str, channels: &[ChannelId]) -> Result<PreparedRequest, ChatError> {
+    let mut request = get(api_base, &["heads"])?;
+    let mut url = reqwest::Url::parse(&request.url)
+        .map_err(|_| ChatError::Shape("invalid chat API base".to_owned()))?;
+    {
+        let mut query = url.query_pairs_mut();
+        for channel in channels {
+            query.append_pair("channels", channel.as_str());
+        }
+    }
+    request.url = url.into();
+    Ok(request)
+}
+
+/// Read a bridge's answer to [`heads_request`]: each channel it answered for, and its head.
+/// remote-ops-audit W12 `#287 bulk-reads`.
+///
+/// Strict, because the request is sent only on the operator's word that the bridge serves it: an
+/// answer that is not `{heads: [...]}` fails, and so does a head of a channel not asked about, a
+/// channel answered twice, or a field that cannot be read. A channel the bridge does not mention
+/// is left out, for the caller to answer as unread.
+///
+/// # Errors
+///
+/// [`ChatError::Shape`] for anything but `{heads: [{channel, newest_id, newest_at, activity_at,
+/// unchanged_since, as_of}]}`, every field but `channel` optional or null, read as above.
+pub fn parse_heads(
+    value: &Value,
+    asked: &[ChannelId],
+) -> Result<Vec<(ChannelId, ChannelHead)>, ChatError> {
+    let shape = |detail: &str| ChatError::Shape(format!("channel heads answer: {detail}"));
+    let heads = value
+        .as_object()
+        .and_then(|object| object.get("heads"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            shape(
+                "expected an object with a heads list; a bridge that does not serve GET /heads \
+                 does not read channel heads, so turn head_reads off for it",
+            )
+        })?;
+    let asked: std::collections::HashSet<&str> = asked.iter().map(ChannelId::as_str).collect();
+    let mut answered = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(heads.len());
+    for entry in heads {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| shape("every head must be an object"))?;
+        let channel = entry
+            .get("channel")
+            .and_then(Value::as_str)
+            .ok_or_else(|| shape("every head must name its channel"))?;
+        if !asked.contains(channel) {
+            return Err(shape("a head of a channel that was not asked about"));
+        }
+        if !answered.insert(channel.to_owned()) {
+            return Err(shape("a channel answered twice"));
+        }
+        let newest_id = match entry.get("newest_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= MAX_BRIDGE_ID_LEN => {
+                Some(MessageId(id.clone()))
+            }
+            Some(_) => {
+                return Err(shape(
+                    "newest_id must be null or a string of 1 to 2048 characters",
+                ))
+            }
+        };
+        let instant = |field: &str| -> Result<Option<i64>, ChatError> {
+            match entry.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(text)) => crate::clock::instant_ms(text)
+                    .map(Some)
+                    .ok_or_else(|| shape(&format!("{field} must be an RFC 3339 instant"))),
+                Some(_) => Err(shape(&format!("{field} must be an RFC 3339 instant"))),
+            }
+        };
+        let as_of = match entry.get("as_of") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(as_of)) => Some(as_of.clone()),
+            Some(_) => return Err(shape("as_of must be a string")),
+        };
+        out.push((
+            ChannelId(channel.to_owned()),
+            ChannelHead {
+                newest_id,
+                newest_at_ms: instant("newest_at")?,
+                activity_ms: instant("activity_at")?,
+                unchanged_since_ms: instant("unchanged_since")?,
+                as_of,
+            },
+        ));
+    }
+    Ok(out)
+}
+
 fn is_snowflake(raw: &str) -> bool {
     !raw.is_empty() && raw.len() <= 20 && raw.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 impl HttpDiscordClient {
+    /// A bridge's own heads, [`BRIDGE_HEAD_CHANNELS`] channels a request, each distinct channel
+    /// asked once. A request that fails, or whose answer cannot be read, fails each of its
+    /// channels; a channel the bridge does not mention is refused in its own place, so its caller
+    /// reads it as it would have without heads.
+    pub(super) async fn bridge_heads(&self, channels: &[ChannelId]) -> HeadAnswers {
+        let mut distinct: Vec<ChannelId> = Vec::new();
+        for channel in channels {
+            if !distinct.contains(channel) {
+                distinct.push(channel.clone());
+            }
+        }
+        let mut answers: HashMap<String, Result<ChannelHead, ChatError>> = HashMap::new();
+        for chunk in distinct.chunks(BRIDGE_HEAD_CHANNELS) {
+            let read = async {
+                let value = self.send(heads_request(&self.api_base, chunk)?).await?;
+                parse_heads(&value, chunk)
+            }
+            .await;
+            match read {
+                Ok(heads) => {
+                    for (channel, head) in heads {
+                        answers.insert(channel.0, Ok(head));
+                    }
+                }
+                Err(error) => {
+                    for channel in chunk {
+                        answers.insert(channel.0.clone(), Err(error.clone()));
+                    }
+                }
+            }
+        }
+        channels
+            .iter()
+            .map(|channel| {
+                let answer = answers.get(channel.as_str()).cloned().unwrap_or_else(|| {
+                    Err(ChatError::Refused(
+                        "the bridge gave no head for this channel".to_owned(),
+                    ))
+                });
+                (
+                    channel.clone(),
+                    answer.map_err(|error| error.with_provider(&self.provider_name)),
+                )
+            })
+            .collect()
+    }
+
     /// Discord's own heads: a channel not seen before (or one no server list holds) is
     /// `GET /channels/{id}`, and every other channel of a server is part of one
     /// `GET /guilds/{guild}/channels`. One request at a time, servers in the order their first
@@ -520,6 +685,146 @@ mod tests {
             ["GET /channels/401", "GET /guilds/9/channels"],
             "a thread is never looked for in its server's list"
         );
+    }
+
+    fn bridge(discord: &mut crate::config::DiscordConfig) {
+        discord.thread_api = crate::threads::ThreadApi::Bridge;
+        discord.head_reads = true;
+    }
+
+    /// The proof for a bridge with `head_reads`: every channel's head is one request, and the
+    /// bridge's word on each, its silence and its staleness included, is what comes back.
+    #[tokio::test]
+    async fn a_bridge_with_head_reads_answers_every_channel_in_one_request() {
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/heads?channels=spaces%2FA&channels=spaces%2FB&channels=spaces%2FC",
+            json!({"heads": [
+                {"channel": "spaces/C", "newest_id": "spaces/C/messages/9",
+                 "newest_at": "2026-10-13T11:00:00Z", "as_of": "2026-10-13T10:00:00Z"},
+                {"channel": "spaces/A", "newest_id": "spaces/A/messages/7",
+                 "newest_at": "2026-10-13T11:59:00Z", "activity_at": "2026-10-13T12:00:00Z",
+                 "unchanged_since": "2026-10-13T12:00:00Z"},
+            ]}),
+        );
+        let mock = mock(routes, bridge).await;
+        let channels = ids(&["spaces/A", "spaces/B", "spaces/C", "spaces/A"]);
+        assert_eq!(mock.client.read_caps(&channels[0]).heads, Support::Native);
+        let answers = mock.client.channel_heads(&channels).await;
+        assert_eq!(
+            mock.take(),
+            ["GET /heads?channels=spaces%2FA&channels=spaces%2FB&channels=spaces%2FC"],
+            "one request, each distinct channel named once"
+        );
+        let a = answers[0].1.as_ref().expect("A's head");
+        assert_eq!(
+            a.newest_id.as_ref().map(MessageId::as_str),
+            Some("spaces/A/messages/7")
+        );
+        assert_eq!(
+            a.newest_at_ms,
+            crate::clock::instant_ms("2026-10-13T11:59:00Z")
+        );
+        assert_eq!(
+            a.activity_ms,
+            crate::clock::instant_ms("2026-10-13T12:00:00Z")
+        );
+        assert_eq!(
+            a.unchanged_since_ms,
+            crate::clock::instant_ms("2026-10-13T12:00:00Z")
+        );
+        assert!(a.is_current());
+        assert!(
+            matches!(
+                answers[1].1.as_ref().map_err(ChatError::cause),
+                Err(ChatError::Refused(_))
+            ),
+            "a channel the bridge did not mention is unread: {:?}",
+            answers[1].1
+        );
+        let c = answers[2].1.as_ref().expect("C's head");
+        assert_eq!(c.as_of.as_deref(), Some("2026-10-13T10:00:00Z"));
+        assert!(!c.is_current());
+        assert_eq!(
+            answers[3].1.as_ref().ok(),
+            Some(a),
+            "a repeat answered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_list_of_channels_is_a_request_per_fifty() {
+        let channels: Vec<ChannelId> = (0..120).map(|n| ChannelId(format!("c{n}"))).collect();
+        let mut routes = Replies::new();
+        for chunk in channels.chunks(BRIDGE_HEAD_CHANNELS) {
+            let query: Vec<String> = chunk.iter().map(|c| format!("channels={c}")).collect();
+            let heads: Vec<Value> = chunk
+                .iter()
+                .map(|c| json!({"channel": c.as_str(), "newest_id": format!("{c}-m")}))
+                .collect();
+            ok(
+                &mut routes,
+                &format!("/heads?{}", query.join("&")),
+                json!({ "heads": heads }),
+            );
+        }
+        let mock = mock(routes, bridge).await;
+        let answers = mock.client.channel_heads(&channels).await;
+        assert_eq!(mock.take().len(), 3);
+        assert!(answers.iter().all(|(c, head)| head
+            .as_ref()
+            .is_ok_and(|head| head.newest_id == Some(MessageId(format!("{c}-m"))))));
+    }
+
+    #[tokio::test]
+    async fn a_bridge_answer_that_cannot_be_read_fails_each_channel_it_was_for() {
+        let mut routes = Replies::new();
+        ok(
+            &mut routes,
+            "/heads?channels=a&channels=b",
+            json!([{"id": "1", "channel_id": "a", "content": "a plain message list"}]),
+        );
+        let mock = mock(routes, bridge).await;
+        let answers = mock.client.channel_heads(&ids(&["a", "b"])).await;
+        assert!(answers.iter().all(|(_, head)| matches!(
+            head.as_ref().map_err(ChatError::cause),
+            Err(ChatError::Shape(_))
+        )));
+    }
+
+    #[test]
+    fn a_bridge_head_answer_is_read_strictly() {
+        let asked = ids(&["a", "b"]);
+        let good = parse_heads(
+            &json!({"heads": [{"channel": "a"}, {"channel": "b", "newest_id": null,
+                "newest_at": null, "activity_at": null, "unchanged_since": null, "as_of": null,
+                "something_new": true}]}),
+            &asked,
+        )
+        .expect("an empty channel, and one with nothing said");
+        assert_eq!(good.len(), 2);
+        assert!(good.iter().all(|(_, head)| *head == ChannelHead::default()));
+        for broken in [
+            json!([{"channel": "a"}]),
+            json!({"heads": {"channel": "a"}}),
+            json!({"heads": ["a"]}),
+            json!({"heads": [{"newest_id": "x"}]}),
+            json!({"heads": [{"channel": "z"}]}),
+            json!({"heads": [{"channel": "a"}, {"channel": "a"}]}),
+            json!({"heads": [{"channel": "a", "newest_id": ""}]}),
+            json!({"heads": [{"channel": "a", "newest_id": 7}]}),
+            json!({"heads": [{"channel": "a", "newest_id": "x".repeat(2049)}]}),
+            json!({"heads": [{"channel": "a", "newest_at": "yesterday"}]}),
+            json!({"heads": [{"channel": "a", "unchanged_since": 5}]}),
+            json!({"heads": [{"channel": "a", "activity_at": "soon"}]}),
+            json!({"heads": [{"channel": "a", "as_of": 5}]}),
+        ] {
+            assert!(
+                matches!(parse_heads(&broken, &asked), Err(ChatError::Shape(_))),
+                "{broken} was accepted"
+            );
+        }
     }
 
     #[tokio::test]
