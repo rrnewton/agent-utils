@@ -26,6 +26,9 @@ use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 struct Harness {
     router: axum::Router,
     discord: Arc<FakeDiscord>,
+    /// Each destination's turn to post (`#278 send-order`): a test that holds one keeps a commit
+    /// between spending its handle and posting.
+    lanes: Arc<vibe_talk::post_lanes::PostLanes>,
 }
 
 fn harness() -> Harness {
@@ -38,9 +41,15 @@ fn harness() -> Harness {
 fn harness_with(gate: PostGate) -> Harness {
     let (mut state, discord) = vibe_talk::testing::state();
     state.post_gate = Arc::new(gate);
+    harness_from(state, discord)
+}
+
+fn harness_from(state: vibe_talk::state::AppState, discord: Arc<FakeDiscord>) -> Harness {
+    let lanes = Arc::clone(&state.post_lanes);
     Harness {
         router: router(state),
         discord,
+        lanes,
     }
 }
 
@@ -935,30 +944,62 @@ async fn a_commit_whose_first_answer_was_lost_is_unconfirmed_and_one_refused_is_
 async fn the_long_poll_wakes_for_a_send_only_when_it_reads_the_send_memory() {
     let harness = Arc::new(harness());
     let proposal = propose(&harness, "on my way").await;
-    let serial = proposal["serial"].as_u64().expect("serial");
-    let reader = {
+    // The destination held, as a post ahead of this one would hold it (`#278 send-order`): the
+    // commit spends the handle and then waits its turn, so nothing pending changes from here on
+    // and only the send memory moves when the post settles. Spending the handle wakes a poll that
+    // was waiting on the proposal; the polls below start after it, so that cannot be what wakes them.
+    let turn = harness.lanes.turn(WRITE_CHANNEL, None).await;
+    let committing = {
+        let harness = Arc::clone(&harness);
+        let body = restated(&proposal);
+        tokio::spawn(async move { commit(&harness, body).await })
+    };
+    for _ in 0..300 {
+        if pending(&harness).await.is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        pending(&harness).await.is_null(),
+        "the commit never spent the handle"
+    );
+    let poll = |query: &'static str| {
         let harness = Arc::clone(&harness);
         tokio::spawn(async move {
             send(
                 &harness,
                 "GET",
-                &format!("/api/v1/post-proposals?wait=5&seen={serial}&sent_after=0"),
+                &format!("/api/v1/post-proposals?{query}"),
                 WRITE_TOKEN,
                 None,
             )
             .await
         })
     };
+    let reader = poll("wait=5&sent_after=0");
+    let other = poll("wait=5");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // A direct send changes nothing pending; only the send memory moves.
-    let (status, _) = commit(&harness, restated(&proposal)).await;
-    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !reader.is_finished() && !other.is_finished(),
+        "a poll answered before anything changed"
+    );
+    drop(turn);
     let (status, body) = tokio::time::timeout(Duration::from_secs(3), reader)
         .await
         .expect("the wait ended")
         .expect("task");
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["sends"][0]["text"], tagged("on my way"), "{body}");
+    let (status, answer) = committing.await.expect("task");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    // A poll that does not read the send memory is not woken by a send.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !other.is_finished(),
+        "a send woke a poll that does not read the send memory"
+    );
+    other.abort();
 }
 
 #[tokio::test]
@@ -1020,10 +1061,7 @@ async fn a_proposal_names_who_it_answers_and_never_the_id_when_this_server_holds
 async fn forgetting_the_stored_conversations_or_purging_empties_the_send_memory() {
     for route in ["/api/v1/conversations", "/api/v1/storage"] {
         let (state, discord, _store) = vibe_talk::testing::state_with_store();
-        let harness = Harness {
-            router: router(state),
-            discord,
-        };
+        let harness = harness_from(state, discord);
         let proposal = propose(&harness, "on my way").await;
         let (status, _) = commit(&harness, restated(&proposal)).await;
         assert_eq!(status, StatusCode::OK);
@@ -1081,10 +1119,7 @@ async fn every_answer_names_the_run_of_the_server_that_numbered_its_proposal_and
 
 fn store_harness() -> Harness {
     let (state, discord, _store) = vibe_talk::testing::state_with_store();
-    Harness {
-        router: router(state),
-        discord,
-    }
+    harness_from(state, discord)
 }
 
 async fn record(harness: &Harness, conversation: &str, body: Value) -> (StatusCode, Value) {
@@ -1174,10 +1209,7 @@ async fn a_claim_the_store_refuses_leaves_the_send_free_for_the_next_claim() {
     // the claim must be undone: otherwise every later claim of that send is told it is already in
     // a transcript, and it is in none.
     let (state, discord, store) = vibe_talk::testing::state_with_store();
-    let harness = Harness {
-        router: router(state),
-        discord,
-    };
+    let harness = harness_from(state, discord);
     let proposal = propose(&harness, "on my way").await;
     let (status, committed) = commit(&harness, restated(&proposal)).await;
     assert_eq!(status, StatusCode::OK, "{committed}");
@@ -1350,10 +1382,7 @@ fn replay_store_harness() -> Harness {
         vibe_talk::testing::config_toml()
     );
     let (state, discord, _store) = vibe_talk::testing::state_with_store_from_toml(&toml);
-    Harness {
-        router: router(state),
-        discord,
-    }
+    harness_from(state, discord)
 }
 
 /// The whole chain the page drives: a commit whose answer is lost, the page claiming the send into
