@@ -405,20 +405,13 @@ impl Fill {
 
     /// Offer a read of the channel's most recent messages through `fetch_recent_dated`, which a
     /// bridge configured so answers from its Flat view.
+    ///
+    /// The only way a recent read is offered. `fetch_recent` on such a bridge answers from the same
+    /// copy and drops its `as_of`, so what it returned would be offered as of when the read began,
+    /// however old the copy: an edit or a deletion pushed in between would be undone by it.
     pub fn offer_recent_dated(self, read: &RecentRead) {
         let observed_ms = self.observed(read.as_of.as_deref());
         let observations = observe::window(self.shape, read, self.recent_via_flat, observed_ms);
-        self.offer(observations);
-    }
-
-    /// Offer a read of the channel's most recent messages through `fetch_recent`, which no
-    /// provider answers from a Flat view and none dates.
-    pub fn offer_recent(self, messages: &[Message]) {
-        let read = RecentRead {
-            messages: messages.to_vec(),
-            ..RecentRead::default()
-        };
-        let observations = observe::window(self.shape, &read, false, self.observed_ms);
         self.offer(observations);
     }
 

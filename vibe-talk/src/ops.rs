@@ -2238,10 +2238,17 @@ pub async fn resolve(
     // stamping call. `run_find` renders a timestamp for the best match and every alternative, and
     // without this those lines would be the only ones still speaking raw UTC.
     let fill = state.message_cache.begin_for(caller, &info.id);
-    let mut messages = state.chat.fetch_recent(&info.id, limit).await?;
-    if let Some(fill) = fill {
-        fill.offer_recent(&messages);
-    }
+    let mut messages = match fill {
+        // `#208 persistent-cache`. Read dated when the cache is offered what it saw: a provider
+        // answering from a copy it keeps says how old that copy is, and what it holds is offered
+        // as of then, so an edit or a deletion pushed since is never undone by it.
+        Some(fill) => {
+            let read = state.chat.fetch_recent_dated(&info.id, limit).await?;
+            fill.offer_recent_dated(&read);
+            read.messages
+        }
+        None => state.chat.fetch_recent(&info.id, limit).await?,
+    };
     stamp(state, &mut messages);
     // `#196 auto-read-noise`. A placeholder is never the message somebody is describing, and one
     // that happened to share a word with the description would be a confident wrong answer.

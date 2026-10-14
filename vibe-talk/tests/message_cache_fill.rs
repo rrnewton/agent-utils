@@ -1282,6 +1282,170 @@ async fn a_stale_bridge_snapshot_does_not_revert_a_later_push() {
     assert!(!holds(&d.cache, &read_chan(), &gone));
 }
 
+/// A bridge configured with `recent_view = "flat"`, as the real client is: its recent read answers
+/// from the copy of the channel the bridge keeps, dated by `as_of`, and `fetch_recent` is that same
+/// read with the date dropped. A test can freeze the copy as it stood.
+struct CopyKeepingBridge {
+    inner: Arc<TimelineChat>,
+    copy: std::sync::Mutex<Option<(Vec<Message>, String)>>,
+}
+
+#[async_trait::async_trait]
+impl vibe_talk::chat::ChatClient for CopyKeepingBridge {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supports_threading(&self) -> bool {
+        true
+    }
+
+    async fn identity(&self) -> Result<vibe_talk::chat::ChatIdentity, vibe_talk::chat::ChatError> {
+        self.inner.identity().await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, vibe_talk::chat::ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+
+    async fn fetch_recent(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, vibe_talk::chat::ChatError> {
+        Ok(self.fetch_recent_dated(channel, limit).await?.messages)
+    }
+
+    async fn fetch_recent_dated(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<vibe_talk::chat::RecentRead, vibe_talk::chat::ChatError> {
+        let copy = self.copy.lock().expect("copy").clone();
+        match copy {
+            Some((messages, as_of)) => Ok(vibe_talk::chat::RecentRead {
+                messages,
+                as_of: Some(as_of),
+                exhausted: false,
+                notice: None,
+            }),
+            None => self.inner.fetch_recent_dated(channel, limit).await,
+        }
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &vibe_talk::threads::TimelineRequest,
+    ) -> Result<vibe_talk::threads::TimelinePage, vibe_talk::chat::ChatError> {
+        self.inner.fetch_timeline(channel, request).await
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, vibe_talk::chat::ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
+#[tokio::test]
+async fn a_recent_read_from_a_stale_bridge_copy_does_not_revert_a_later_push() {
+    // Through `find_message` (`ops::resolve`), and through the live poller's first read.
+    for via_poller in [false, true] {
+        let clock = ManualClock::at(T0 + HOUR);
+        let text = testing::config_toml().replace(
+            "[discord]",
+            "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9/api\"\n\
+             recent_view = \"flat\"",
+        );
+        let text = format!("{text}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n");
+        let (mut state, fake, _store) = testing::state_with_store_from_toml(&text);
+        let ids: Vec<MessageId> = (0..5)
+            .map(|n| {
+                fake.seed_at(
+                    &id(READ_CHANNEL),
+                    "Ada",
+                    &format!("message {n}"),
+                    T0 + n * MINUTE,
+                )
+            })
+            .collect();
+        let bridge = Arc::new(CopyKeepingBridge {
+            inner: Arc::new(TimelineChat::new(fake.clone())),
+            copy: std::sync::Mutex::new(None),
+        });
+        state.replace_chat(bridge.clone());
+        let dir = TempDir::new("cache-fill-stale-copy");
+        let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+        let cache = state.message_cache.cache().expect("installed");
+        get(&state, &flat_page()).await;
+        assert_eq!(held(&cache), 5);
+
+        // The bridge takes its copy now; then an edit and a deletion are pushed.
+        let copy = vibe_talk::chat::ChatClient::fetch_recent(fake.as_ref(), &id(READ_CHANNEL), 50)
+            .await
+            .expect("read");
+        let copied_at = clock.now();
+        clock.advance(10 * MINUTE);
+        let (edited, gone) = (ids[3].clone(), ids[1].clone());
+        let edit = said(&fake, &edited, "message 3, edited upstream");
+        assert_eq!(
+            ingest(&state, pushed("e1", "update", &edit)).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            ingest(&state, pushed_deletion("e2", &gone)).await,
+            StatusCode::ACCEPTED
+        );
+
+        // A write-scope read that starts after both pushes, answered from the older copy.
+        clock.advance(MINUTE);
+        *bridge.copy.lock().expect("copy") = Some((copy, vibe_talk::clock::iso_from_ms(copied_at)));
+        if via_poller {
+            let mut cursor = None;
+            poll_once(
+                state.chat.as_ref(),
+                &state.live,
+                &id(READ_CHANNEL),
+                50,
+                &mut cursor,
+            )
+            .await
+            .expect("seeded");
+        } else {
+            vibe_talk::ops::resolve(
+                &state,
+                vibe_talk::auth::Scope::Write,
+                READ_CHANNEL,
+                "message",
+                None,
+                None,
+            )
+            .await
+            .expect("resolved");
+        }
+        assert_eq!(
+            cached(&cache, &read_chan(), &edited).message.content,
+            "message 3, edited upstream",
+            "via the poller {via_poller}: the older copy's text does not come back"
+        );
+        assert!(
+            tombstoned(&cache, &read_chan(), &gone),
+            "via the poller {via_poller}: nor does the deleted message"
+        );
+        assert!(!holds(&cache, &read_chan(), &gone));
+    }
+}
+
 #[tokio::test]
 async fn a_pushed_creation_is_a_possible_snippet_until_a_read_and_a_pushed_snippet_never_overwrites_one(
 ) {

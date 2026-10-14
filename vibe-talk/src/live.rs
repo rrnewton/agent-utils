@@ -762,9 +762,12 @@ pub struct Tick {
 /// published, and a cursor moved past a message that page did not hold would skip it. The provider
 /// keeps its own place in each thread and reports each reply once; one that is also among the
 /// page's messages (a reply sent to the channel too, say) is published once, as a message.
+///
 /// **What it reads is offered to the message cache** (`#208 persistent-cache`), under the poller's
 /// own grant, when the hub has a cache attached: the seeding read as a recent window, which never
-/// says where the channel starts however short it came back, and the walk as a listing of what lay
+/// says where the channel starts however short it came back, read then through
+/// [`ChatClient::fetch_recent_dated`] so that a copy the provider keeps is offered as of when it
+/// was taken; and the walk as a listing of what lay
 /// between the cursor and the newest message it saw, but only when the walk ran out of messages
 /// rather than into [`MAX_PAGES_PER_TICK`]. See [`crate::cache::observe::forward`]. What it
 /// publishes reaches the cache through the hub as well, as every published change does.
@@ -791,14 +794,29 @@ pub async fn poll_once(
         )
     });
     let Some(seen) = *cursor else {
-        let messages = if apart {
-            chat.fetch_live(channel, limit, None).await?.messages
-        } else {
-            chat.fetch_recent(channel, limit).await?
+        let messages = match fill {
+            // `#307 slack-reply-live`: the provider's own seed, which also notes where each thread
+            // stands. It reads the conversation's own newest messages, no reply among them, as a
+            // recent read did before replies were read for it, and from no copy, so nothing dates
+            // it but the read's start.
+            Some(fill) if apart => {
+                let messages = chat.fetch_live(channel, limit, None).await?.messages;
+                fill.offer_recent_dated(&crate::chat::RecentRead {
+                    messages: messages.clone(),
+                    ..crate::chat::RecentRead::default()
+                });
+                messages
+            }
+            None if apart => chat.fetch_live(channel, limit, None).await?.messages,
+            // Dated when the cache is offered it, as every recent read the cache is offered is:
+            // a copy the provider keeps is offered as of when it was taken.
+            Some(fill) => {
+                let read = chat.fetch_recent_dated(channel, limit).await?;
+                fill.offer_recent_dated(&read);
+                read.messages
+            }
+            None => chat.fetch_recent(channel, limit).await?,
         };
-        if let Some(fill) = fill {
-            fill.offer_recent(&messages);
-        }
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
