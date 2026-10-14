@@ -158,7 +158,8 @@ def parser() -> argparse.ArgumentParser:
     rename.add_argument("new_name", metavar="NEW", help="new registered name (lowercase letters, digits, hyphens)")
     anchor = command("anchor", "Pin the terminal and foreground harness process of an agent whose record pins no "
         "harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness "
-        "process or observed native session is refused.",
+        "process or observed native session is refused. For a Muse pane or root slot relay, whose process is "
+        "pinned at launch, only record that process's launch spec.",
         "agentctl anchor reviewer", named=True)
     anchor.add_argument("--replace", action="store_true",
         help="replace anchors that no longer match (the pane may hold another program; inspect it first)")

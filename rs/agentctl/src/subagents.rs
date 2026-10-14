@@ -5160,9 +5160,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut record = self.load(agent_name)?;
         // Anchors live only in flat schema-1 records, so a nested row is rewritten in that form.
         let migrated_from = record.migrate_nested_to_flat();
+        if matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay") {
+            return self.anchor_custom_spec(record, session, migrated_from);
+        }
         if !matches!(record.adapter.as_str(), "herdr" | "herdr-foreign") {
             return Err(fail(
-                "anchor applies to native and adopted Herdr agents; custom panes pin their process at launch",
+                "anchor applies to native, adopted, and custom-pane Herdr agents",
             ));
         }
         let Some(pane) = record.pane_id.clone() else {
@@ -5236,6 +5239,112 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }))
     }
 
+    /// Record the launch spec of a custom pane from the process pinned at its launch.
+    ///
+    /// A Muse pane or a root slot relay pins its harness process when it starts, so there is
+    /// nothing to re-pin; this only reads that same process generation's command line, which
+    /// backfills a spec for a record written before launch specs existed.
+    fn anchor_custom_spec(
+        &self,
+        mut record: AgentRecord,
+        session: Option<&str>,
+        migrated_from: Option<String>,
+    ) -> Result<Value> {
+        let (Some(pane), Some(identity)) = (
+            record.pane_id.clone(),
+            record.custom_process_identity.clone(),
+        ) else {
+            return Err(fail(format!(
+                "agent '{}' has no process pinned at launch to read a launch spec from",
+                record.name
+            )));
+        };
+        if !matches!(record.lifecycle.as_str(), "running" | "launch_failed") {
+            return Err(fail(format!(
+                "agent '{}' is {}, not running",
+                record.name, record.lifecycle
+            )));
+        }
+        let _pane_lock = self.pane_lock(&pane)?;
+        if self.client.process_liveness(&identity) != ProcessLiveness::Alive {
+            return Err(fail(format!(
+                "the {} process pinned at launch of '{}' is not provably alive; revive it instead",
+                record.harness, record.name
+            )));
+        }
+        let label = match record.workspace_id.as_deref() {
+            Some(workspace) => self.client.workspace_label(workspace).ok(),
+            None => None,
+        };
+        let Some(spec) = self.captured_launch_spec(
+            &record,
+            Some(&identity),
+            "anchor",
+            label.as_deref(),
+            session,
+        )?
+        else {
+            return Err(fail(format!(
+                "cannot read the command line of the {} process pinned at launch of '{}'",
+                record.harness, record.name
+            )));
+        };
+        record.launch_spec = Some(spec);
+        self.save(&record)?;
+        Ok(json!({
+            "name": record.name,
+            "pane_id": pane,
+            "terminal_id": record.terminal_id,
+            "harness_pid": identity.pid,
+            "replaced": false,
+            "previous": {"terminal_id": record.terminal_id, "harness_pid": identity.pid},
+            "migrated_from": migrated_from,
+            "launch_spec_source": "anchor",
+        }))
+    }
+
+    /// Promote a relay launch whose harness, pinned when it started, runs behind the relay.
+    ///
+    /// Herdr cannot see through the relay, so the proof is agentctl's own: the pinned process is
+    /// alive, the relay pane still runs it, and Herdr's screen rules read that harness.
+    fn promote_relay(&self, record: AgentRecord) -> Result<Value> {
+        let (Some(pane), Some(_), Some(_), Some(identity)) = (
+            record.pane_id.clone(),
+            record.tab_id.clone(),
+            record.workspace_id.clone(),
+            record.custom_process_identity.clone(),
+        ) else {
+            return Err(fail(format!(
+                "agent {:?} has no recorded pane, tab, workspace, or pinned process",
+                record.name
+            )));
+        };
+        let _pane_lock = self.pane_lock(&pane)?;
+        if self.client.process_liveness(&identity) != ProcessLiveness::Alive {
+            return Err(fail(format!(
+                "the {} process pinned at launch of {:?} is not provably alive",
+                record.harness, record.name
+            )));
+        }
+        let mut promoted = record.clone();
+        promoted.lifecycle = "running".to_owned();
+        promoted.error = None;
+        let info = self.checked(&promoted)?;
+        if let Some(owner) =
+            self.claim_owner(&pane, info.terminal_id.as_deref(), Some(&record.name))?
+        {
+            return Err(fail(format!(
+                "pane {pane} is already registered as '{owner}'"
+            )));
+        }
+        promoted.terminal_id = info.terminal_id;
+        promoted.pane_reported_by_agentctl = true;
+        self.save(&promoted)?;
+        let mut result = self.status_record(&promoted)?;
+        result["promoted"] = json!(true);
+        Ok(result)
+    }
+
     /// Mark a `launch_failed` record running when its harness is in fact live and ours.
     ///
     /// A readiness barrier can time out while the harness runs fine, for example a resumed Codex
@@ -5261,12 +5370,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 record.lifecycle
             )));
         }
-        if record.adapter != "herdr"
+        if !matches!(record.adapter.as_str(), "herdr" | "herdr-relay")
             || record.mode != "interactive"
             || record.backend != "herdr"
             || record.nested.is_some()
         {
-            return Err(fail("promote applies to native interactive Herdr launches"));
+            return Err(fail(
+                "promote applies to native and root-slot-relay interactive Herdr launches",
+            ));
+        }
+        if record.adapter == "herdr-relay" {
+            return self.promote_relay(record);
         }
         let (Some(pane), Some(tab), Some(workspace)) = (
             record.pane_id.clone(),

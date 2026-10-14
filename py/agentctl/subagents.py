@@ -2764,9 +2764,13 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     f"promote applies to a launch_failed record; {name!r} is {record.lifecycle}"
                 )
-            if (record.adapter != "herdr" or record.mode != "interactive" or record.backend != "herdr"
-                    or record._nested_storage is not None):
-                raise AgentDeliveryError("promote applies to native interactive Herdr launches")
+            if (record.adapter not in ("herdr", "herdr-relay") or record.mode != "interactive"
+                    or record.backend != "herdr" or record._nested_storage is not None):
+                raise AgentDeliveryError(
+                    "promote applies to native and root-slot-relay interactive Herdr launches"
+                )
+            if record.adapter == "herdr-relay":
+                return self._promote_relay(record)
             if not record.pane_id or not record.tab_id or not record.workspace_id:
                 raise AgentDeliveryError(f"agent {name!r} has no recorded pane, tab, or workspace")
             pane_id = record.pane_id
@@ -5474,10 +5478,11 @@ class ManagedAgents:
                         record.session_agent = record.session_value = None
                     record._nested_storage = None
                     record._session_source = None
+                if record.adapter in ("herdr-pane", "herdr-relay"):
+                    return self._anchor_custom_spec(record, session, migrated_from)
                 if record.adapter not in ("herdr", "herdr-foreign"):
                     raise AgentDeliveryError(
-                        "anchor applies to native and adopted Herdr agents; custom panes "
-                        "pin their process at launch"
+                        "anchor applies to native, adopted, and custom-pane Herdr agents"
                     )
                 if record.pane_id is None:
                     raise AgentDeliveryError(f"agent {name!r} has no confirmed pane")
@@ -5538,6 +5543,82 @@ class ManagedAgents:
                         "migrated_from": migrated_from,
                         "launch_spec_source": None if current is None else current["source"],
                     }
+
+    def _promote_relay(self, record: AgentRecord) -> dict[str, object]:
+        """Promote a relay launch whose harness, pinned when it started, runs behind the relay.
+
+        Herdr cannot see through the relay, so the proof is agentctl's own: the pinned process
+        is alive, the relay pane still runs it, and Herdr's screen rules read that harness.
+        """
+        identity = record.custom_process_identity
+        if not record.pane_id or not record.tab_id or not record.workspace_id or identity is None:
+            raise AgentDeliveryError(
+                f"agent {record.name!r} has no recorded pane, tab, workspace, or pinned process"
+            )
+        with self._pane_lock(record.pane_id):
+            if self.client.process_liveness(identity) != "alive":
+                raise AgentDeliveryError(
+                    f"the {record.harness} process pinned at launch of {record.name!r} is not "
+                    "provably alive"
+                )
+            promoted = copy.copy(record)
+            promoted.lifecycle, promoted.error = "running", None
+            info = self._checked(promoted)
+            owner = self._claim_owner(record.pane_id, info.terminal_id, exclude=record.name)
+            if owner is not None:
+                raise AgentDeliveryError(f"pane {record.pane_id} is already registered as {owner!r}")
+            promoted.terminal_id = info.terminal_id
+            promoted.pane_reported_by_agentctl = True
+            self._save(promoted)
+            result = self._status_record(promoted)
+            result["promoted"] = True
+            return result
+
+    def _anchor_custom_spec(
+        self, record: AgentRecord, session: str | None, migrated_from: object,
+    ) -> dict[str, object]:
+        """Record the launch spec of a custom pane from the process pinned at its launch.
+
+        A Muse pane or a root slot relay pins its harness process when it starts, so there is
+        nothing to re-pin; this only reads that same process generation's command line, which
+        backfills a spec for a record written before launch specs existed.
+        """
+        identity = record.custom_process_identity
+        if record.pane_id is None or identity is None:
+            raise AgentDeliveryError(
+                f"agent {record.name!r} has no process pinned at launch to read a launch spec from"
+            )
+        if record.lifecycle not in ("running", "launch_failed"):
+            raise AgentDeliveryError(f"agent {record.name!r} is {record.lifecycle}, not running")
+        with self._pane_lock(record.pane_id):
+            if self.client.process_liveness(identity) != "alive":
+                raise AgentDeliveryError(
+                    f"the {record.harness} process pinned at launch of {record.name!r} is not "
+                    "provably alive; revive it instead"
+                )
+            label: str | None = None
+            if record.workspace_id is not None:
+                try:
+                    label = self.client.workspace_label(record.workspace_id)
+                except HerdrRunError:
+                    label = None
+            spec = self._captured_launch_spec(
+                record, identity, source="anchor", workspace_label=label, session=session,
+            )
+            if spec is None:
+                raise AgentDeliveryError(
+                    f"cannot read the command line of the {record.harness} process pinned at "
+                    f"launch of {record.name!r}"
+                )
+            record.set_launch_spec(spec)
+            self._save(record)
+            return {
+                "name": record.name, "pane_id": record.pane_id,
+                "terminal_id": record.terminal_id, "harness_pid": identity.pid,
+                "replaced": False,
+                "previous": {"terminal_id": record.terminal_id, "harness_pid": identity.pid},
+                "migrated_from": migrated_from, "launch_spec_source": "anchor",
+            }
 
     def rename(self, old: str, new: str) -> dict[str, object]:
         """Rename a live agent: registry entry, Herdr agent name and tab label together."""

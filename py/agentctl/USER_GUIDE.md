@@ -521,7 +521,11 @@ For a record that still ended as `launch_failed` while its harness runs:
 agentctl promote reviewer --expected-token TOKEN
 ```
 
-`promote` requires Herdr to report the launched harness in the recorded pane,
+For a root slot relay, which Herdr cannot see through, `promote` instead
+requires the process pinned at launch to be alive, the relay pane to still run
+it, and Herdr's screen rules to read the launched harness there.
+
+Otherwise `promote` requires Herdr to report the launched harness in the recorded pane,
 tab, workspace and cwd, the Herdr agent name to still point there, any native
 session to agree with the record and belong to no other record, and the harness
 to be the pane's only foreground process. It pins that process and terminal and
@@ -564,6 +568,11 @@ In order, it:
    boot): what was revived and where, what was promoted or refused and why, the
    units, the slot images, and the report path.
 
+Names in `exclude` are left alone and not counted (the coordinator cannot be
+excluded); use it for a record that is not meant to come back, or stop that
+record instead. A dry run never completes; its `would_complete` says whether the
+same run would.
+
 The report is `REPORT_DIR/BOOT_ID.json` (default
 `$XDG_STATE_HOME/agentctl/restore`). Exit status is 0 when the restore completed
 with no refusal, 75 otherwise. `--boot` marks the report as the boot unit's run.
@@ -577,6 +586,7 @@ schema:
   "coordinator": "coordinator",
   "also_registered": [{"registry": "/home/me/.local/state/bridge/registry", "name": "coordinator"}],
   "units": ["chat-bridge.service"],
+  "exclude": ["stale-record"],
   "startup_delay_seconds": 20,
   "herdr_wait_seconds": 300,
   "report_dir": "/home/me/.local/state/agentctl/restore",
@@ -1078,6 +1088,12 @@ agentctl recorded at start, then the one the command line selects. When the
 command line cannot be read, a replaced harness loses its old spec and
 `--session-id` is refused; the result's `launch_spec_source` says which spec,
 if any, the record now holds.
+
+For a Muse pane or a root slot relay, whose harness process is pinned when it
+starts, `anchor` re-pins nothing: it only reads that same process generation's
+command line into the launch spec, which backfills a spec for a record written
+before launch specs existed. It refuses when the pinned process is not provably
+alive or its command line cannot be read.
 
 `agentctl rename OLD NEW` changes the registry entry, the Herdr agent name, and
 the tab label of a running native agent together; an adopted agent's alias is

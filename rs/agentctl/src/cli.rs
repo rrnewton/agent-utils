@@ -89,7 +89,7 @@ enum Commands {
     /// Rename a running native or adopted agent: registry entry, Herdr agent name, and tab label together. Use it when an agent's warm context is still useful but its purpose changed; prefer a new agent otherwise. An interrupted rename refuses both names until the same command is rerun
     #[command(after_help = "Example: agentctl rename reviewer release-reviewer")]
     Rename(Rename),
-    /// Pin the terminal and foreground harness process of an agent whose record pins no harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness process or observed native session is refused
+    /// Pin the terminal and foreground harness process of an agent whose record pins no harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness process or observed native session is refused. For a Muse pane or root slot relay, whose process is pinned at launch, only record that process's launch spec
     #[command(after_help = "Example: agentctl anchor reviewer")]
     Anchor(Anchor),
     /// Mark a launch_failed record running when its harness is in fact live: Herdr reports the launched harness in the recorded pane, tab, workspace and cwd, the Herdr agent name still points there, and the harness is the pane's only foreground process. Pins that process and terminal; never touches the tab, pane, or process. Use it when a readiness wait timed out on a harness that runs fine
@@ -97,7 +97,7 @@ enum Commands {
     Promote(Promote),
     /// Bring the coordinator team back after the host restarts: remount slot images, wait for Herdr, revive the coordinator and then every dead agent from its launch spec, register the coordinator's new pane in other registries, start the configured units, and queue one recovery notice. Idempotent; writes a JSON report for the boot
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator, also_registered\n([{registry, name}]), units, startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, and timers (used by watch).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal, 75 otherwise; every step and refusal is in the report."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator, also_registered\n([{registry, name}]), units, exclude (names to leave alone), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, and timers (used by watch).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal, 75 otherwise; every step and refusal is in the report."
     )]
     Restore(Restore),
     /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr with start limits that survive a slow boot. Never enables, starts, or reloads anything
@@ -1993,6 +1993,9 @@ fn add_capabilities(value: &mut serde_json::Value) {
             }
             if matches!(adapter, Some("herdr" | "herdr-foreign")) {
                 capabilities.extend(["anchor", "rename"]);
+            } else if matches!(adapter, Some("herdr-pane" | "herdr-relay")) {
+                // A custom pane's anchor only records the launch spec of its pinned process.
+                capabilities.push("anchor");
             }
             // An adopted agent becomes revivable once a launch spec records what it runs.
             if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-relay"))

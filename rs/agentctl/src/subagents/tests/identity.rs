@@ -452,7 +452,7 @@ fn a_duplicate_claim_is_refused_at_anchor() {
 }
 
 #[test]
-fn anchor_refuses_custom_pane_adapters() {
+fn anchor_of_a_custom_pane_without_a_process_pinned_at_launch_is_refused() {
     let fixture = Fixture::new();
     fixture.start(None);
     let mut document = record(&fixture, "worker");
@@ -464,7 +464,9 @@ fn anchor_refuses_custom_pane_adapters() {
         .anchor("worker", false, None)
         .expect_err("relay");
     assert!(
-        error.to_string().contains("custom panes pin their process"),
+        error
+            .to_string()
+            .contains("has no process pinned at launch to read a launch spec from"),
         "{error}"
     );
 }

@@ -322,3 +322,80 @@ def test_rust_only_restore_commands_are_refused_by_this_edition(
     from agentctl import cli
     assert cli.main(["--registry", "/nonexistent/.agentctl", command, "--once"]) == 2
     assert f"{command} is implemented only by the Rust edition" in capsys.readouterr().err
+
+
+def relay_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Sessions, FakeManagedClient, CustomProcessIdentity]:
+    """A Codex harness started behind a root slot relay, its process pinned at launch."""
+    from .test_agentctl_sessions import _fake_wrkslots, setup as sessions_setup
+    sessions, fake, _calls = sessions_setup(tmp_path, monkeypatch)
+    identity = CustomProcessIdentity(
+        version=1, boot_id="00000000-0000-4000-8000-000000000000", pid=4242,
+        starttime_ticks=7, executable_device=1, executable_inode=2,
+    )
+
+    def start_relay(kind: str, pane_id: str, line: str, *, timeout: float = 30.0,
+                    on_observed: object = None) -> CustomProcessIdentity:
+        assert callable(on_observed)
+        on_observed(identity)
+        return identity
+
+    def report(pane: str, kind: str, state: str) -> None:
+        fake.infos[pane] = replace(fake.infos[pane], agent=kind, status=state)
+
+    monkeypatch.setattr(fake, "start_relay_agent", start_relay, raising=False)
+    monkeypatch.setattr(fake, "_harness_executable", lambda kind: f"/opt/bin/{kind}", raising=False)
+    monkeypatch.setattr(fake, "verify_relay_harness", lambda pane, expected: None, raising=False)
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("codex", "idle"), raising=False)
+    monkeypatch.setattr(fake, "report_pane_agent", report, raising=False)
+    monkeypatch.setattr(fake, "process_liveness",
+                        lambda expected: "alive" if expected == identity else "unknown", raising=False)
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, "root")))
+    sessions.start_session("worker", cwd=str(tmp_path), harness="codex", slot="s1")
+    return sessions, fake, identity
+
+
+def test_a_relay_launch_records_its_spec_and_anchor_backfills_one_from_the_pinned_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, identity = relay_worker(tmp_path, monkeypatch)
+    record = sessions.get("worker")
+    spec = record.launch_spec
+    assert spec is not None and spec["source"] == "start" and spec["executable"] == "/opt/bin/codex"
+    assert spec["argv"] == record.arguments
+    assert (spec["slot"], spec["slot_isolation"]) == ("s1", "root")
+    # A record written before launch specs existed: anchor reads the pinned process.
+    record.set_launch_spec(None)
+    sessions._save(record)
+    fake.command_lines[identity.pid] = ("/opt/bin/codex", *record.arguments)
+    result = sessions.anchor("worker")
+    assert result["launch_spec_source"] == "anchor" and result["replaced"] is False
+    backfilled = sessions.get("worker")
+    assert backfilled.custom_process_identity == identity
+    assert backfilled.launch_spec is not None and backfilled.launch_spec["argv"] == record.arguments
+    del fake.command_lines[identity.pid]
+    with pytest.raises(AgentDeliveryError, match="cannot read the command line"):
+        sessions.anchor("worker")
+    monkeypatch.setattr(fake, "process_liveness", lambda expected: "dead", raising=False)
+    with pytest.raises(AgentDeliveryError, match="not provably alive"):
+        sessions.anchor("worker")
+
+
+def test_promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _identity = relay_worker(tmp_path, monkeypatch)
+    record = sessions.get("worker")
+    record.lifecycle, record.error, record.pane_reported_by_agentctl = "launch_failed", "timed out", False
+    sessions._save(record)
+    result = sessions.promote("worker", expected_token=record.token)
+    promoted = sessions.get("worker")
+    assert result["promoted"] is True and promoted.lifecycle == "running" and promoted.error is None
+    assert promoted.pane_reported_by_agentctl is True and fake.closed == []
+    promoted.lifecycle = "launch_failed"
+    sessions._save(promoted)
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("claude", "idle"), raising=False)
+    with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+        sessions.promote("worker")
+    assert sessions.get("worker").lifecycle == "launch_failed"

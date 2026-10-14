@@ -224,6 +224,7 @@ fn restore_dry_run_changes_nothing_and_reads_slot_warnings() {
     .unwrap();
     assert_eq!(report["agents"][0]["action"], "revive");
     assert_eq!(report["complete"], false);
+    assert_eq!(report["would_complete"], true);
     assert!(host.commands().is_empty());
     assert_eq!(fs::read(registry.join("lane/agent.json")).unwrap(), before);
     assert!(!fixture.root.join("reports").exists());
@@ -597,4 +598,28 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
         "{:?}",
         host.commands()
     );
+}
+
+#[test]
+fn restore_leaves_excluded_records_alone_and_never_excludes_the_coordinator() {
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        exclude: vec!["lane".to_owned()],
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["agents"][0]["action"], "excluded");
+    assert_eq!(report["refused"], 0);
+    assert_eq!(report["complete"], true);
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    fs::write(
+        registry.join("restore.json"),
+        json!({"schema": "agentctl-restore/v1", "coordinator": "lead", "exclude": ["lead"]})
+            .to_string(),
+    )
+    .unwrap();
+    assert!(RestoreConfig::load(&registry).is_err());
 }

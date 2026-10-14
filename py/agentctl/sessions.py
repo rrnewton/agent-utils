@@ -69,6 +69,9 @@ class Sessions(ManagedAgents):
             result.append("move")
         if record.adapter in ("herdr", "herdr-foreign"):
             result.extend(("anchor", "rename"))
+        elif record.adapter in ("herdr-pane", "herdr-relay"):
+            # A custom pane's anchor only records the launch spec of its pinned process.
+            result.append("anchor")
         # An adopted agent becomes revivable once a launch spec records what it runs.
         if record.mode == "interactive" and (
                 record.adapter in ("herdr", "herdr-pane", "herdr-relay")

@@ -91,6 +91,9 @@ pub struct RestoreConfig {
     /// User units to reset and start after the agents, for example the chat bridge.
     #[serde(default)]
     pub units: Vec<String>,
+    /// Registered names restore leaves alone and does not count, for example a stale record.
+    #[serde(default)]
+    pub exclude: Vec<String>,
     /// Seconds between two lane launches (default 20).
     #[serde(default = "default_startup_delay")]
     pub startup_delay_seconds: u64,
@@ -133,6 +136,7 @@ impl RestoreConfig {
             coordinator: None,
             also_registered: Vec::new(),
             units: Vec::new(),
+            exclude: Vec::new(),
             startup_delay_seconds: default_startup_delay(),
             herdr_wait_seconds: default_herdr_wait(),
             report_dir: None,
@@ -152,6 +156,13 @@ impl RestoreConfig {
             .is_some_and(|name| !agent_name(name))
         {
             return Err(invalid("coordinator is not an agent name"));
+        }
+        if self
+            .exclude
+            .iter()
+            .any(|name| !agent_name(name) || self.coordinator.as_deref() == Some(name.as_str()))
+        {
+            return Err(invalid("exclude names agents, and never the coordinator"));
         }
         if self
             .also_registered
@@ -733,6 +744,10 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             list("skipped", &|_| String::new())
         ),
         format!(
+            "Excluded by restore.json: {}.",
+            list("excluded", &|_| String::new())
+        ),
+        format!(
             "Coordinator registered elsewhere: {}.",
             if registered.is_empty() {
                 "none".to_owned()
@@ -844,6 +859,10 @@ pub fn restore<A: ManagedApi + ?Sized>(
             .iter()
             .filter(|name| config.coordinator.as_deref() != Some(name.as_str()))
         {
+            if config.exclude.contains(name) {
+                agents.push(json!({"name": name, "action": "excluded", "reason": "listed in restore.json exclude"}));
+                continue;
+            }
             let row = recover_agent(&manager, name, options);
             let launched = matches!(row["action"].as_str(), Some("revived"));
             agents.push(row);
@@ -873,6 +892,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
     });
     report["refused"] = json!(refused);
     report["complete"] = json!(herdr_ready && coordinator_ok && !options.dry_run);
+    // A dry run never completes; this says whether the same run for real would.
+    report["would_complete"] = json!(herdr_ready && coordinator_ok && refused == 0);
     report["notice"] = Value::Null;
     if !options.dry_run && herdr_ready && coordinator_ok {
         if let Some(name) = config.coordinator.as_deref() {

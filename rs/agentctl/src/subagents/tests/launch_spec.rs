@@ -297,3 +297,100 @@ fn promote_refuses_unless_the_launched_harness_is_provably_there() {
         );
     }
 }
+
+/// A Codex harness started behind a root slot relay, its process pinned at launch.
+fn relay_worker() -> (Fixture, AgentRecord) {
+    let fixture = Fixture::new();
+    let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                slot: Some(SlotLaunch {
+                    slot: "s1".to_owned(),
+                    executable: Some(executable),
+                    ..SlotLaunch::default()
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load("worker").unwrap();
+    // The fake reports a pinned custom process alive while its pane holds it.
+    fixture.client.custom_processes.lock().unwrap().insert(
+        record.pane_id.clone().unwrap(),
+        record.custom_process_identity.clone().unwrap(),
+    );
+    (fixture, record)
+}
+
+#[test]
+fn a_relay_launch_records_its_spec_and_anchor_backfills_one_from_the_pinned_process() {
+    let (fixture, mut record) = relay_worker();
+    let spec = record.launch_spec.clone().unwrap();
+    assert_eq!(spec["source"], "start");
+    assert_eq!(spec["executable"], "/opt/bin/codex");
+    assert_eq!(spec["argv"], json!(record.arguments));
+    assert_eq!(spec["slot"], "s1");
+    assert_eq!(spec["slot_isolation"], "root");
+    // A record written before launch specs existed: anchor reads the pinned process.
+    record.launch_spec = None;
+    fixture.manager().save(&record).unwrap();
+    let identity = record.custom_process_identity.clone().unwrap();
+    let mut argv = vec!["/opt/bin/codex".to_owned()];
+    argv.extend(record.arguments.iter().cloned());
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(identity.pid, argv);
+    let result = fixture.manager().anchor("worker", false, None).unwrap();
+    assert_eq!(result["launch_spec_source"], "anchor");
+    assert_eq!(result["replaced"], false);
+    let backfilled = fixture.manager().load("worker").unwrap();
+    assert_eq!(backfilled.custom_process_identity, Some(identity.clone()));
+    assert_eq!(
+        backfilled.launch_spec.unwrap()["argv"],
+        json!(record.arguments)
+    );
+    fixture.client.command_lines.lock().unwrap().clear();
+    let error = fixture.manager().anchor("worker", false, None).unwrap_err();
+    assert!(error.to_string().contains("cannot read the command line"));
+}
+
+#[test]
+fn promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs() {
+    let (fixture, mut record) = relay_worker();
+    record.lifecycle = "launch_failed".to_owned();
+    record.error = Some("timed out".to_owned());
+    record.pane_reported_by_agentctl = false;
+    fixture.manager().save(&record).unwrap();
+    let result = fixture
+        .manager()
+        .promote("worker", Some(&record.token))
+        .unwrap();
+    assert_eq!(result["promoted"], true);
+    let promoted = fixture.manager().load("worker").unwrap();
+    assert_eq!(promoted.lifecycle, "running");
+    assert!(promoted.error.is_none());
+    assert!(promoted.pane_reported_by_agentctl);
+    assert!(fixture.client.closed.lock().unwrap().is_empty());
+    let mut failed = promoted;
+    failed.lifecycle = "launch_failed".to_owned();
+    fixture.manager().save(&failed).unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(failed.pane_id.clone().unwrap());
+    assert!(fixture.manager().promote("worker", None).is_err());
+    assert_eq!(
+        fixture.manager().load("worker").unwrap().lifecycle,
+        "launch_failed"
+    );
+}
