@@ -3473,7 +3473,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
             if (send.claimed) return json(409, { error: "send_recorded", detail: "that send is already in a transcript" });
             send.claimed = id;
             const held = page.storedTurns.get(id) || [];
-            held.push({ speaker: "sent", text: send.text, at_ms: 1_700_000_000_000, detail: { kind: "sent", ...send.detail } });
+            const at_ms = page.storeStamp(id, "sent");
+            held.push({ speaker: "sent", text: send.text, at_ms, detail: { kind: "sent", ...send.detail } });
             page.storedTurns.set(id, held);
             return json(200, { id, turn: held[held.length - 1] });
           }
@@ -3485,7 +3486,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           const detail = body.speaker === "marker" && body.marker
             ? { ...body.marker }
             : typeof body.answer === "number" ? { kind: "answer", serial: body.answer } : undefined;
-          held.push({ speaker: body.speaker, text: body.text, at_ms: 1_700_000_000_000, ...(detail ? { detail } : {}) });
+          const at_ms = page.storeStamp(id, body.speaker);
+          held.push({ speaker: body.speaker, text: body.text, at_ms, ...(detail ? { detail } : {}) });
           page.storedTurns.set(id, held);
           return json(200, { id, turn: held[held.length - 1] });
         }
@@ -3504,18 +3506,46 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           page.storedTurns.clear();
           return json(200, { forgotten });
         }
-        return json(200, {
-          conversations: [...page.storedTurns.entries()].map(([key, held]) => ({
-            id: key,
-            turns: held.length,
-            preview: held.length > 0 ? held[0].text : "",
-            started_at_ms: held.length > 0 ? held[0].at_ms : 0,
-            last_at_ms: held.length > 0 ? held[held.length - 1].at_ms : 0,
-          })),
-        });
+        // Most recently written first, as the server lists them: the head of this list is the
+        // conversation a new call resumes from.
+        const listed = [...page.storedTurns.entries()].map(([key, held]) => ({
+          id: key,
+          turns: held.length,
+          preview: held.length > 0 ? held[0].text : "",
+          started_at_ms: held.length > 0 ? held[0].at_ms : 0,
+          last_at_ms: held.length > 0 ? held[held.length - 1].at_ms : 0,
+        }));
+        listed.sort((a, b) => b.last_at_ms - a.last_at_ms || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+        return json(200, { conversations: listed });
       }
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
+  };
+  /**
+   * `#270 voice-transcript-markers`. The time the server files a row arriving now in conversation
+   * `id`, as the server stamps it: its clock, which rises a second a row past everything held —
+   * and, for a record row (`sent`, `marker`) filed in a conversation that another has been written
+   * to since, as late or later, that conversation's own last time (`store::filed_at`). Rising, and
+   * not one shared instant, because at one instant the walk's order is the conversation ids' and
+   * hides where a late row is read back.
+   */
+  page.storeStampedThrough = 1_700_000_000_000 - 1_000;
+  page.storeStamp = (id, speaker) => {
+    let newest = page.storeStampedThrough;
+    let newestOther = null;
+    for (const [key, held] of page.storedTurns) {
+      for (const turn of held) newest = Math.max(newest, Number(turn.at_ms) || 0);
+      const last = held.length > 0 ? held[held.length - 1].at_ms : null;
+      if (key !== id && last !== null) newestOther = newestOther === null ? last : Math.max(newestOther, last);
+    }
+    page.storeStampedThrough = newest + 1_000;
+    const own = page.storedTurns.get(id);
+    const ownLast = own && own.length > 0 ? own[own.length - 1].at_ms : null;
+    const record = speaker === "sent" || speaker === "marker";
+    if (record && ownLast !== null && newestOther !== null && newestOther >= ownLast) {
+      return Math.min(page.storeStampedThrough, ownLast);
+    }
+    return page.storeStampedThrough;
   };
   /** Every claim of a send the page made, as `{id, speaker, text, send}`. `#270`. */
   page.claims = [];
@@ -35556,6 +35586,97 @@ test("`#270 voice-transcript-markers`: a restored conversation start says what t
   assert.equal(legacy.getAttribute("data-ends"), "conv_two");
   assert.equal(seamLabel(legacy), "earlier conversation");
   assert.equal(seamChip(legacy), null);
+});
+
+/** The page reloaded on the same server: everything it stored, and nothing it only drew. */
+async function reloadOf(page) {
+  const reloaded = newPage();
+  reloaded.transcriptRecordsSupported = true;
+  for (const [id, held] of page.storedTurns) reloaded.storedTurns.set(id, held.map((turn) => ({ ...turn })));
+  await signIn(reloaded);
+  await reloaded.settle();
+  return reloaded;
+}
+
+/**
+ * Where each row of the transcript says it belongs: a late row, a line ending a conversation, or
+ * something said, by the words it holds. `#269`/`#270`, for rows filed late into an older call.
+ */
+const spanShapes = (page) => page.el("transcript").children.map((li) => {
+  if (li.getAttribute("data-not-sent")) return `NOT SENT ${li.getAttribute("data-not-sent")}`;
+  if (li.hasClass("sent-card")) return "CARD";
+  if (li.getAttribute("data-ends")) return `ends ${li.getAttribute("data-ends")}`;
+  const said = ["check the runner", "and the nightly?", "it passed", "thanks"].find((words) => wordsOf(li).includes(words));
+  return said || null;
+}).filter((shape) => shape !== null);
+
+test("`#269 approval-card-inline` `#270 voice-transcript-markers`: a card kept through a drop and answered in the next call is restored where it was drawn, and the next call still resumes the call it was answered in", async () => {
+  // The page files Send, Don't send and a lapse on such a card in the call it was DRAFTED in. The
+  // server stamps each row as it arrives, so the fixture does too: a row stamped later than the
+  // newer call's rows, and read back in time order, would be drawn in the middle of that call,
+  // under a line saying its later half had ended — and would make the older call the one a new
+  // call resumes from.
+  const ways = [["send", "CARD"], ["withdraw", "NOT SENT withdrawn"], ["lapse", "NOT SENT lapsed"], ["late answer", "CARD"]];
+  for (const [how, late] of ways) {
+    const live = newPage();
+    live.transcriptRecordsSupported = true;
+    const first = await startTalkingNamed(live, "conv_one");
+    await live.settle();
+    hostedHears(first, "check the runner");
+    await watchTurns(live);
+    await draftUp(live);
+    // A Send tapped in the first call whose commit reaches the server only once the next call
+    // is under way: its answer, and the send memory's word, arrive in the next call.
+    let release = null;
+    if (how === "late answer") {
+      const answering = live.commitProposal;
+      live.commitProposal = async (body) => {
+        await new Promise((resolve) => { release = resolve; });
+        return answering(body);
+      };
+      void live.el("post-confirm-send").click();
+      await watchTurns(live);
+    }
+    first.close();
+    await watchTurns(live);
+    const next = await callInto(live, "conv_two");
+    hostedHears(next, "and the nightly?");
+    hostedSays(next, "it passed");
+    await watchTurns(live);
+    if (how === "late answer") {
+      assert.ok(release, "the commit never reached the fixture");
+      release();
+    } else {
+      assert.equal(live.el("post-confirm").hidden, false, `${how}: the next call did not show the kept draft`);
+    }
+    if (how === "send") await live.el("post-confirm-send").click();
+    else if (how === "withdraw") await live.el("post-confirm-cancel").click();
+    else if (how === "lapse") live.lapseProposal();
+    await watchTurns(live, 6);
+    assert.deepEqual(live.claims.map((claim) => claim.id), late === "CARD" ? ["conv_one"] : [], `${how}: filed elsewhere`);
+    const drawn = ["check the runner", late, "ends conv_one", "and the nightly?", "it passed"];
+    assert.deepEqual(spanShapes(live), drawn, `${how}: drawn live somewhere else`);
+    const said = (id) => live.storedTurns.get(id).filter((turn) => turn.speaker === "you" || turn.speaker === "agent")
+      .map((turn) => turn.at_ms);
+    assert.ok(Math.min(...said("conv_two")) > Math.max(...said("conv_one")),
+      `${how}: the fixture stamped the two calls at one instant, which hides where a late row is read back`);
+
+    // The late row was the last thing written: a reload draws it where it was, and the next call
+    // still resumes from the call the owner was just in.
+    const reloaded = await reloadOf(live);
+    assert.deepEqual(spanShapes(reloaded), [...drawn, "ends conv_two"], `${how}: restored somewhere else`);
+    await reloaded.el("resume-toggle").setChecked(true);
+    await startTalking(reloaded);
+    await reloaded.settle();
+    assert.match(reloaded.replayCalls.at(-1) || "", /\/conversations\/conv_two\/replay$/,
+      `${how}: the next call resumed from the call the draft was made in, not the one it was answered in`);
+
+    // And the call it was answered in carried on: still one conversation after a reload.
+    hostedHears(next, "thanks");
+    await watchTurns(live);
+    const again = await reloadOf(live);
+    assert.deepEqual(spanShapes(again), [...drawn, "thanks", "ends conv_two"], `${how}: the newer call was split in two`);
+  }
 });
 
 test("`#270 voice-transcript-markers`: a step back adds no second line above a page that starts with a conversation's start marker", async () => {

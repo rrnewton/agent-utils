@@ -217,7 +217,7 @@ impl StateStore for FakeStore {
         &self,
         conversation: &ConversationId,
         turn: &Turn,
-    ) -> Result<(), StoreError> {
+    ) -> Result<i64, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
         if turn.text.chars().count() > MAX_TURN_CHARS {
@@ -235,11 +235,27 @@ impl StateStore for FakeStore {
                 self.retention.max_turns_per_conversation
             )));
         }
+        // `#270 voice-transcript-markers`. Stamped as the real store stamps it.
+        let last_of = |turns: &Vec<Turn>| turns.last().map(|t| t.at_ms);
+        let own_last = state
+            .conversations
+            .get(conversation.as_str())
+            .and_then(last_of);
+        let newest_other = state
+            .conversations
+            .iter()
+            .filter(|(id, _)| id.as_str() != conversation.as_str())
+            .filter_map(|(_, turns)| last_of(turns))
+            .max();
+        let at_ms = super::filed_at(turn, own_last, newest_other);
         state
             .conversations
             .entry(conversation.as_str().to_owned())
             .or_default()
-            .push(turn.clone());
+            .push(Turn {
+                at_ms,
+                ..turn.clone()
+            });
         state.appended += 1;
 
         if self.retention.retain_days > 0 {
@@ -261,7 +277,7 @@ impl StateStore for FakeStore {
                 None => break,
             }
         }
-        Ok(())
+        Ok(at_ms)
     }
 
     async fn conversations(&self) -> Result<Vec<ConversationSummary>, StoreError> {
