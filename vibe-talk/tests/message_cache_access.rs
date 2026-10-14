@@ -1164,3 +1164,214 @@ async fn a_revoked_credential_erases_at_once_and_a_refusal_lasting_a_day_erases(
     assert_eq!(read_main(&d.state, WRITE_CHANNEL).await, StatusCode::OK);
     assert_eq!(held(&cache, &second_chan()), 10);
 }
+
+// ---- §3.4: what reaches the file while a provider's account is not checked against it ---------
+
+use vibe_talk::live::LiveKind;
+
+/// The text the file holds for `message` of the read-only channel, once the writer has caught up.
+fn text_of(cache: &MessageCache, message: &MessageId) -> Option<String> {
+    assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+    cache
+        .message(&first_chan(), message)
+        .served()
+        .expect("a read")
+        .map(|held| held.message.content)
+}
+
+/// Whether the read-only channel is suspect, once the writer has applied everything offered: a
+/// read that lifts the suspicion does so when the writer applies it.
+fn suspect(cache: &MessageCache) -> bool {
+    assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+    cache.is_suspect(&first_chan())
+}
+
+/// The tombstones the file holds, once the writer has caught up. Counted file-wide, so a provider
+/// whose serving is suspended can be asked too.
+fn tombstones(cache: &MessageCache) -> u64 {
+    assert!(cache.quiesce_blocking(WAIT), "the writer caught up");
+    cache.counts().served().expect("counts").tombstones
+}
+
+/// Publish one change to the read-only channel as an adapter's pushed event, the message as the
+/// fake holds it (with `content` instead, when given).
+fn push(d: &Deployment, event: &str, kind: LiveKind, message: &MessageId, content: Option<&str>) {
+    let mut message = d.fake.message(message).expect("the fake holds it");
+    if let Some(content) = content {
+        message.content = content.to_owned();
+    }
+    assert!(d.state.live.publish_ingested(
+        event.to_owned(),
+        kind,
+        false,
+        &id(READ_CHANNEL),
+        message,
+    ));
+}
+
+/// Read the read-only channel's newest Main page with the write token: its forward cursor.
+async fn newest_cursor(state: &AppState) -> String {
+    let (status, page) = call(
+        state,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    page["next_after"]
+        .as_str()
+        .expect("a forward cursor")
+        .to_owned()
+}
+
+/// The provider's deltas say from now on, completely, that `gone` was deleted; read the one since
+/// `cursor` with the write token.
+async fn delta_deleting(d: &Deployment, cursor: &str, gone: &MessageId) {
+    d.fake.delete(gone);
+    d.first.inner.set_delta(vibe_talk::threads::TimelineDelta {
+        more: false,
+        complete: true,
+        deleted: vec![gone.clone()],
+        removed_threads: Vec::new(),
+    });
+    let (status, page) = call(
+        &d.state,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50&after={cursor}"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page["delta"].is_object(), "{page}");
+}
+
+/// What the shadow has counted for one consumer.
+fn shadowed(state: &AppState, consumer: &str) -> vibe_talk::cache::shadow::ConsumerCounts {
+    state
+        .message_cache
+        .shadow_counts()
+        .into_iter()
+        .find(|counts| counts.consumer == consumer)
+        .expect("a consumer the shadow counts")
+}
+
+#[tokio::test]
+async fn a_deletion_reaches_the_file_before_the_account_is_checked_and_an_edit_marks_the_channel_suspect(
+) {
+    let dir = TempDir::new("cache-access-unchecked-changes");
+    let clock = ManualClock::at(T0 + HOUR);
+    filled(&dir, &clock).await.close();
+
+    // The next start: the same account, but its provider is slow to say so.
+    let d = upstream(10, "UA1", "UB1");
+    d.first.hold_identity();
+    let state = testing::with_message_cache_unverified(d.state.clone(), dir.path(), clock.clone());
+    let d = Deployment { state, ..d };
+    let cache = d.cache();
+    assert_eq!(
+        d.state.message_cache.verification(FIRST),
+        Verification::Unverified
+    );
+    let ids = seeded(READ_CHANNEL);
+
+    // A deletion from the live feed takes the message out at once, and leaves nothing in doubt.
+    clock.advance(MINUTE);
+    push(&d, "e1", LiveKind::Delete, &ids[4], None);
+    d.fake.delete(&ids[4]);
+    assert_eq!(held(&cache, &first_chan()), 9);
+    assert!(!suspect(&cache));
+
+    // An edit waits for the account, and the channel is suspect until a later read lands.
+    d.fake.edit(&ids[5], "edited upstream");
+    push(&d, "e2", LiveKind::Update, &ids[5], None);
+    assert_eq!(text_of(&cache, &ids[5]).as_deref(), Some("a message"));
+    assert!(suspect(&cache), "the edit was left out");
+
+    // A complete delta's deletion is applied too; the rest of what reads see is not.
+    let cursor = newest_cursor(&d.state).await;
+    delta_deleting(&d, &cursor, &ids[6]).await;
+    assert_eq!(held(&cache, &first_chan()), 8);
+    assert_eq!(tombstones(&cache), 2);
+
+    // The account answers, and matches: what was deleted stays deleted, and the channel stays
+    // suspect, so the message that may have been edited is not one the cache would serve.
+    d.first.release_identity();
+    assert!(d.state.message_cache.identities_verified(WAIT).await);
+    assert_eq!(held(&cache, &first_chan()), 8);
+    assert!(suspect(&cache));
+    clock.advance(MINUTE);
+    let (status, _) = call(
+        &d.state,
+        "GET",
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            ids[5].as_str()
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(d.state.message_cache.shadow_settled(WAIT).await);
+    let counted = shadowed(&d.state, "message_by_id");
+    assert_eq!(
+        (counted.asked, counted.would_serve, counted.content_differs),
+        (1, 0, 0),
+        "{counted:?}"
+    );
+
+    // A read that began after the edit was left out lands: the head is trusted, the edit is in.
+    clock.advance(MINUTE);
+    assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+    assert!(!suspect(&cache));
+    assert_eq!(text_of(&cache, &ids[5]).as_deref(), Some("edited upstream"));
+    assert_eq!(held(&cache, &first_chan()), 8);
+}
+
+#[tokio::test]
+async fn a_deletion_reaches_the_file_while_the_provider_is_suspended() {
+    let dir = TempDir::new("cache-access-suspended-changes");
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = filled(&dir, &clock).await;
+    let cache = d.cache();
+    tokio::time::pause();
+    let ids = seeded(READ_CHANNEL);
+
+    d.first.fail("fetch_timeline", unauthorized());
+    d.first.answer(Err(unauthorized()));
+    assert_ne!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+    assert_eq!(
+        d.state.message_cache.verification(FIRST),
+        Verification::Suspended
+    );
+
+    // The adapter, which does not use the refused credential, pushes a deletion and an edit.
+    clock.advance(MINUTE);
+    push(&d, "e1", LiveKind::Delete, &ids[1], None);
+    d.fake.delete(&ids[1]);
+    assert_eq!(total(&cache), 19, "the deletion is applied at once");
+    assert_eq!(tombstones(&cache), 1);
+    assert!(!suspect(&cache));
+    d.fake.edit(&ids[2], "edited upstream");
+    push(&d, "e2", LiveKind::Update, &ids[2], None);
+    assert!(suspect(&cache), "the edit was left out");
+
+    // The credential works again, but is not checked yet: a complete delta's deletion is applied.
+    d.first.heal();
+    let cursor = newest_cursor(&d.state).await;
+    delta_deleting(&d, &cursor, &ids[3]).await;
+    assert_eq!(total(&cache), 18);
+    assert_eq!(tombstones(&cache), 2);
+
+    // Checked again, and matching: nothing deleted comes back, and the next read takes the edit.
+    d.first.answer(Ok(account("UA1")));
+    tokio::time::advance(SUSPENDED_RECHECK + PAST).await;
+    assert!(d.state.message_cache.identities_verified(WAIT).await);
+    assert_eq!(held(&cache, &first_chan()), 8);
+    assert!(suspect(&cache), "nothing has read it since");
+    clock.advance(MINUTE);
+    assert_eq!(read_main(&d.state, READ_CHANNEL).await, StatusCode::OK);
+    assert!(!suspect(&cache));
+    assert_eq!(text_of(&cache, &ids[2]).as_deref(), Some("edited upstream"));
+    assert_eq!(held(&cache, &first_chan()), 8);
+}

@@ -1034,10 +1034,52 @@ impl Writer<'_> {
             return Ok(Outcome::Stale);
         }
         if !self.routed(chan) {
+            // A deletion writes nothing of any message. One for a channel the snapshot does not
+            // name, or offered before any snapshot came (a server whose channel list could not be
+            // put together), still takes out what the file holds of it, and nothing more.
+            if observation.removes_only() {
+                self.remove_held(chan, observation)?;
+                return Ok(Outcome::Applied);
+            }
             return Ok(Outcome::Unrouted);
         }
         self.observe(chan, observation)?;
         Ok(Outcome::Applied)
+    }
+
+    /// A deletion of a channel off the route snapshot: each message it names that the file holds
+    /// is tombstoned, under the rule every deletion follows. Nothing is written for a channel or a
+    /// message the file does not hold.
+    fn remove_held(&mut self, chan: &ChanKey, observation: &Observation) -> rusqlite::Result<()> {
+        let Some(chan_id) = self.find_chan(chan)? else {
+            return Ok(());
+        };
+        let (ids, observed_ms): (Vec<&MessageId>, i64) = match observation {
+            Observation::Deleted { ids, observed_ms } => (ids.iter().collect(), *observed_ms),
+            Observation::Push {
+                push: Push::Delete { id, .. },
+                observed_ms,
+            } => (vec![id], *observed_ms),
+            _ => return Ok(()),
+        };
+        for id in ids {
+            let held = self
+                .hot
+                .row_select
+                .query_row(params![chan_id, id.as_str()], Row::from_sql)
+                .optional()?;
+            if let Some(row) = held.filter(|row| row.observed_ms <= observed_ms) {
+                self.tombstone(
+                    chan,
+                    chan_id,
+                    row.row_id,
+                    id.as_str(),
+                    row.created_ms,
+                    observed_ms,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn observe(&mut self, chan: &ChanKey, observation: &Observation) -> rusqlite::Result<()> {

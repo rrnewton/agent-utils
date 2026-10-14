@@ -67,6 +67,8 @@
 //! coverage below it, an observation whose stamp is older than an erase, and anything at all that a
 //! read-scope caller saw: such a caller is never given a stamp to write with, because every fill
 //! begins at the [`Sink`] under a [`FillGrant`] and a read-scope caller has none ([`grant`]).
+//! A deletion ([`Observation::removes_only`]) is the one observation applied to a channel off the
+//! snapshot, and then only to messages the file already holds of it.
 //!
 //! # What the durable store must follow
 //!
@@ -448,6 +450,22 @@ pub enum Observation {
 }
 
 impl Observation {
+    /// Whether this only takes messages out: a pushed deletion, or the ids a complete delta
+    /// reports deleted. It writes nothing a provider's account could have read, so it may be
+    /// applied whatever is known of that account, and to a channel the route snapshot does not
+    /// name, as far as the file already holds it.
+    #[must_use]
+    pub fn removes_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Deleted { .. }
+                | Self::Push {
+                    push: Push::Delete { .. },
+                    ..
+                }
+        )
+    }
+
     /// Roughly how many bytes this holds while queued: every string a message carries, derived
     /// ones included, because an [`Incoming`] built field by field may still hold them.
     fn estimated_bytes(&self) -> usize {
@@ -1425,6 +1443,12 @@ impl MessageCache {
             &self.shared.stats.bytes_dropped,
             u64::try_from(bytes).unwrap_or(u64::MAX),
         );
+        self.mark_suspect(chan);
+    }
+
+    /// Something seen of `chan` was not offered: its head is not trusted until a read of its
+    /// newest end that starts after now has landed. In memory only, as every suspicion is.
+    pub fn mark_suspect(&self, chan: &ChanKey) {
         lock(&self.shared.suspects).insert(chan.clone(), self.shared.clock.now_ms());
     }
 

@@ -384,8 +384,8 @@ async fn nothing_is_swept_or_filled_when_the_store_did_not_give_back_the_added_c
         state
             .message_cache
             .begin_for(vibe_talk::auth::Scope::Write, &id(READ_CHANNEL))
-            .is_none(),
-        "and nothing is filled"
+            .is_none_or(|fill| !fill.writes_rows()),
+        "and nothing is filled but deletions"
     );
 }
 
@@ -1102,6 +1102,65 @@ async fn an_unarmed_cache_is_filled_by_nothing() {
     assert!(cache.quiesce_blocking(WAIT));
     assert_eq!(cache.applied_seq(), 0, "nothing reached the writer");
     assert_eq!(held(&cache), 0);
+}
+
+#[tokio::test]
+async fn a_deletion_pushed_while_the_sink_is_unarmed_still_takes_the_message_out_of_the_file() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let dir = TempDir::new("cache-fill-unarmed-deletion");
+    let ids = {
+        let u = upstream(true, 5);
+        let state = testing::with_message_cache(u.state, dir.path(), clock.clone()).await;
+        get(&state, &flat_page()).await;
+        let cache = state.message_cache.cache().expect("installed");
+        assert_eq!(held(&cache), 5);
+        close(&state, cache);
+        u.ids
+    };
+
+    // A start whose channel list could not be put together: the sink is never armed.
+    let u = upstream(true, 5);
+    let cache = testing::install_message_cache(&u.state, dir.path(), clock.clone());
+    u.state.refresh_routes();
+    assert!(!u.state.message_cache.is_armed());
+    clock.advance(MINUTE);
+    let publish = |kind, message: Message| {
+        assert!(u.state.live.publish_ingested(
+            format!("e-{}", message.id.as_str()),
+            kind,
+            false,
+            &id(READ_CHANNEL),
+            message,
+        ));
+    };
+    // A deletion of a message the file holds takes it out; one of a message it never held writes
+    // nothing; an edit is not written.
+    let gone = u.fake.message(&ids[1]).expect("seeded");
+    publish(vibe_talk::live::LiveKind::Delete, gone);
+    publish(
+        vibe_talk::live::LiveKind::Delete,
+        message(READ_CHANNEL, T0 + 30 * MINUTE, "never held"),
+    );
+    publish(
+        vibe_talk::live::LiveKind::Update,
+        said(&u.fake, &ids[3], "edited upstream"),
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+    let counts = cache.counts().served().expect("counts");
+    assert_eq!((counts.messages, counts.tombstones), (4, 1));
+    close(&u.state, cache);
+
+    // The next start is armed: the deleted message is not there to serve, and the edit was left
+    // for a read to bring.
+    let u = upstream(true, 5);
+    let state = testing::with_message_cache(u.state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(tombstoned(&cache, &read_chan(), &ids[1]));
+    assert!(!holds(&cache, &read_chan(), &ids[1]));
+    assert_eq!(
+        cached(&cache, &read_chan(), &ids[3]).message.content,
+        "message 3"
+    );
 }
 
 // ---- changes from the live feed, and posts ------------------------------------------------------

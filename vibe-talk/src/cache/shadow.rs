@@ -18,7 +18,7 @@
 //! | Consumer | Would serve when |
 //! |---|---|
 //! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), the channel is not suspect, and the barrier passed |
-//! | `message_by_id`, `summary` | the message is held and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`] or the channel is live-fed; on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
+//! | `message_by_id`, `summary` | the message is held, the channel is not suspect (an offer dropped for it may have been this message's edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`] or the channel is live-fed; on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
 //! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), and the barrier passed; an open-ended page needs a fresh head as well |
 //! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head is as fresh as for `messages`, and the barrier passed |
 //! | `timeline_fallback` | coverage holds `limit` rows down from the head, the channel is not suspect, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
@@ -31,8 +31,8 @@
 //! - `blocked`: the cache would not read the channel or the scope at all: it is not on the route
 //!   snapshot, an erase of it is waiting, access to it is in doubt, its provider is suspended, or
 //!   the read failed;
-//! - `suspect`: an offer for the channel was dropped, and no read of its newest end that began
-//!   since has landed;
+//! - `suspect`: an offer for the channel was dropped (the queue was full, or its provider's account
+//!   was not checked against the file), and no read of its newest end that began since has landed;
 //! - `gap`: the cache does not hold what would be served: no head, a hole in the coverage, or not
 //!   the message;
 //! - `incomplete`: covered, but by reads that may have left a message out (Slack's);
@@ -514,8 +514,13 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     Ok(Decision::Serve)
 }
 
-/// One message: held, and its home scope revalidated recently enough for its provider's feed.
+/// One message: held, its channel not suspect, and its home scope revalidated recently enough for
+/// its provider's feed. A live feed that carries deletions vouches for a message only while
+/// nothing it offered was dropped.
 fn message(view: &View, facts: &Facts) -> Result<Decision, Miss> {
+    if facts.suspect {
+        return Err(Miss::Suspect);
+    }
     let row = view.rows.first().ok_or(Miss::Gap)?;
     let revalidated = view
         .coverage
@@ -1165,6 +1170,19 @@ mod tests {
             decide(&ask, &View::default(), &slack),
             Decision::Miss(Miss::Gap)
         );
+        // A suspect channel: an offer dropped for it may have been this message's deletion or
+        // edit, so neither a feed that carries deletions nor a recent check vouches for it.
+        for trusting in [fed, bridge, slack] {
+            let suspect = Facts {
+                suspect: true,
+                ..trusting
+            };
+            assert_eq!(
+                decide(&ask, &held(LISTED), &suspect),
+                Decision::Miss(Miss::Suspect),
+                "{trusting:?}"
+            );
+        }
     }
 
     #[test]

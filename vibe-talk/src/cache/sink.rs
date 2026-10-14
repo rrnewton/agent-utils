@@ -18,8 +18,8 @@
 //! channel the owner added. So nothing is sent to the cache until [`Sink::arm`] has been called,
 //! which the server does only once both lists came back from the store. Unarmed, the sink keeps
 //! the latest list and does nothing with it: no snapshot reaches the cache, so the cache sweeps
-//! nothing and its writer refuses every row, and [`Sink::begin`] refuses every fill, for the life
-//! of the process.
+//! nothing and its writer refuses every row, and every fill [`Sink::begin`] begins offers
+//! deletions alone, for the life of the process (see below).
 //!
 //! # Offering what a read saw
 //!
@@ -54,6 +54,14 @@
 //! - no answer (a transport failure, a 5xx, anything that is not an account): nothing is erased
 //!   and nothing filled, and it is asked again after a wait that doubles each time, up to
 //!   [`VERIFY_RETRY_CAP`].
+//!
+//! **Deletions are the exception.** A deletion pushed by the live feed, or reported by a complete
+//! delta, writes nothing an account could have read: it only takes a message out. So it is offered
+//! whatever is known of the account (unchecked, suspended, or the sink not armed), and a mismatch
+//! found later erases the provider anyway. Leaving it out would leave the deleted message in the
+//! file, to be served once the account is checked. Everything else such a fill would have offered
+//! is dropped, and the channel is marked suspect: its head is not trusted until a read that began
+//! afterwards has landed, since what was dropped may have been an edit.
 //!
 //! It is asked whenever a cache is put behind an armed sink, when the sink is armed with one
 //! behind it, when the providers change, and after any erase of the whole file: a fill checks the
@@ -336,6 +344,9 @@ struct Route {
 /// It carries what has to be noted BEFORE the read: the stamp that lets the writer drop what the
 /// read saw if the channel or the file is erased while it runs, and the local time the read
 /// started, which is what decides whether what it saw is newer than what the cache already holds.
+///
+/// A fill begun before the provider's account was checked against the file offers deletions
+/// alone ([`Fill::writes_rows`]): see the module documentation.
 #[derive(Debug)]
 pub struct Fill {
     grant: FillGrant,
@@ -346,6 +357,7 @@ pub struct Fill {
     cache: Arc<MessageCache>,
     shape: Shape,
     recent_via_flat: bool,
+    rows: bool,
 }
 
 impl Fill {
@@ -389,6 +401,14 @@ impl Fill {
     #[must_use]
     pub fn shape(&self) -> Shape {
         self.shape
+    }
+
+    /// Whether the fill offers what the read saw. `false` when the provider's account had not
+    /// been checked against the file when it began, or the sink was not armed: it then offers
+    /// deletions alone, and marks the channel suspect for anything else.
+    #[must_use]
+    pub fn writes_rows(&self) -> bool {
+        self.rows
     }
 
     /// Offer a `/timeline` page, raw, as the provider answered `request`.
@@ -470,9 +490,16 @@ impl Fill {
 
     /// Queue every observation, in order, under the stamp taken when the read began. A full queue
     /// drops one and marks the channel suspect; nothing here waits.
+    ///
+    /// A fill that writes no rows offers deletions alone. Anything else it leaves out marks the
+    /// channel suspect, as a full queue's drop does: it may have been an edit the file now lacks.
     fn offer(self, observations: Vec<Observation>) {
         for observation in observations {
-            self.cache.offer(self.chan.clone(), self.stamp, observation);
+            if self.rows || observation.removes_only() {
+                self.cache.offer(self.chan.clone(), self.stamp, observation);
+            } else {
+                self.cache.mark_suspect(&self.chan);
+            }
         }
     }
 }
@@ -812,22 +839,20 @@ impl Sink {
     }
 
     /// Begin a fill of `channel` under `grant`, before its upstream read starts. `None` means
-    /// nothing the read sees is offered: there is no cache, the sink is not armed, the channel is
-    /// not one the server answers for, or its provider's account has not been checked against the
-    /// file open now.
+    /// nothing the read sees is offered: there is no cache, or the channel is not one the server
+    /// answers for.
+    ///
+    /// When the sink is not armed, or the provider's account has not been checked against the
+    /// file open now (or the provider is suspended), the fill offers deletions alone
+    /// ([`Fill::writes_rows`] is `false`): see the module documentation.
     #[must_use]
     pub fn begin(&self, grant: &FillGrant, channel: &ChannelId) -> Option<Fill> {
         let cache = self.cache()?;
-        let route = {
+        let (route, armed) = {
             let routes = self.state.routes();
-            if !routes.armed {
-                return None;
-            }
-            routes.fills.get(channel)?.clone()
+            (routes.fills.get(channel)?.clone(), routes.armed)
         };
-        if !State::may_fill(&self.state, &route.key, &cache) {
-            return None;
-        }
+        let rows = armed && State::may_fill(&self.state, &route.key, &cache);
         let chan = ChanKey::new(route.key, channel.as_str());
         let stamp = cache.stamp(&chan);
         let observed_ms = cache.now_ms();
@@ -840,6 +865,7 @@ impl Sink {
             cache,
             shape: route.shape,
             recent_via_flat: route.recent_via_flat,
+            rows,
         })
     }
 
@@ -858,6 +884,9 @@ impl Sink {
     /// wait and never call back into the hub: the lock order is the feed lock, then the cache's
     /// sequencer. It takes the sink's own locks and the sequencer briefly and returns; a full
     /// queue drops the offer and marks the channel suspect, and the publish goes on regardless.
+    ///
+    /// A deletion is offered whatever is known of the provider's account; a creation or an edit
+    /// of a provider not checked against the file is dropped, and marks the channel suspect.
     pub(crate) fn offer_push(&self, channel: &ChannelId, live: &LiveMessage, producer: ServerFill) {
         if let Some(fill) = self.begin(&FillGrant::server(producer), channel) {
             fill.offer_push(live);
@@ -1680,9 +1709,13 @@ mod tests {
         let read = ChannelId(crate::testing::READ_CHANNEL.to_owned());
         let chan = ChanKey::new(crate::config::LEGACY_DISCORD_PROVIDER_KEY, read.as_str());
 
-        // Unarmed: no snapshot reached the cache, so it serves nothing and the sink fills nothing.
+        // Unarmed: no snapshot reached the cache, so it serves nothing and the sink fills nothing
+        // but deletions.
         assert!(!sink.is_armed());
-        assert!(sink.begin_for(Caller::Write, &read).is_none());
+        assert!(!sink
+            .begin_for(Caller::Write, &read)
+            .expect("a fill of deletions alone")
+            .writes_rows());
         assert!(cache.barrier_blocking(Duration::from_secs(10)));
         assert_eq!(cache.applied_seq(), 0, "no sweep was queued");
         assert_eq!(cache.newest(&chan, &Scope::Main, 5), Read::Blocked);
@@ -1697,6 +1730,7 @@ mod tests {
         let fill = sink
             .begin_for(Caller::Write, &read)
             .expect("an armed sink fills");
+        assert!(fill.writes_rows());
         assert_eq!(fill.chan(), &chan);
         assert_eq!(fill.grant().label(), "caller");
         assert!(sink.begin_for(Caller::Read, &read).is_none(), "read scope");
@@ -1925,13 +1959,18 @@ mod tests {
             account.is(crate::discord::fake::FAKE_BOT_USER_ID, None),
             "the first start records the account the provider's own client named"
         );
-        assert!(sink.begin_for(Caller::Write, &read).is_some());
+        let writes = |sink: &Sink| {
+            sink.begin_for(Caller::Write, &read)
+                .expect("a fill begins")
+                .writes_rows()
+        };
+        assert!(writes(&sink));
 
-        // The whole file erased: its account went with it, so no fill begins until the provider
-        // has been asked again, and the account recorded again.
+        // The whole file erased: its account went with it, so no fill writes a row until the
+        // provider has been asked again, and the account recorded again.
         cache.erase_file(true).expect("reopened");
         assert_eq!(sink.verification(key), Verification::Unverified);
-        assert!(sink.begin_for(Caller::Write, &read).is_none());
+        assert!(!writes(&sink));
         assert!(sink.identities_verified(WAIT).await);
         assert!(cache
             .account(key)
@@ -1939,6 +1978,6 @@ mod tests {
             .flatten()
             .expect("written again")
             .is(crate::discord::fake::FAKE_BOT_USER_ID, None));
-        assert!(sink.begin_for(Caller::Write, &read).is_some());
+        assert!(writes(&sink));
     }
 }

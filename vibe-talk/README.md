@@ -3660,7 +3660,8 @@ it was: a purge never turns the cache on, and never turns it off. Its `purged` l
 app and the configured channels hidden, and both come from the store. A store that failed to
 answer would leave the list short, and sweeping to a short list would erase every channel added in
 the app. So nothing is swept, and nothing filled, until the store has answered both. If it never
-does, the cache stays untouched for the life of the process.
+does, the only change to the file for the life of the process is a deletion the live feed pushes,
+which still takes its message out.
 
 **Deletions and edits.** The server learns that a message was deleted upstream from a pushed
 deletion, from a delta that reports it, or from the message's absence from a listing that proves
@@ -3668,6 +3669,13 @@ complete the stretch it was in. It then deletes the message from the file and le
 An edit replaces the text. In both cases a summary of the old text is deleted from the store once
 the change is written. Turning the cache off never deletes a summary. A message the server does
 not re-check is deleted within seven days anyway.
+
+A deletion is applied whatever is known of the provider's account: while it is being checked,
+while its credential is refused, and before the startup sweep. It writes nothing an account could
+have read, and an account found later to differ erases the provider anyway. Anything else seen in
+that time, an edit included, is left out, and the channel is marked suspect. Nothing is then
+trusted about its newest messages, or about any one of its messages, until a read that began
+afterwards has landed.
 
 ### Whose reads fill it
 
@@ -3688,7 +3696,8 @@ not re-check is deleted within seven days anyway.
   own account, and only the same refusal erases what the cache held of it. That erase removes data
   and writes none.
 * **Rows belong to an account.** Nothing of a provider is filled until that provider's own client
-  has said, in this process, which account it is, and the file agrees.
+  has said, in this process, which account it is, and the file agrees. Deletions are the
+  exception: see "Deletions and edits" above.
   * The first time, the account is recorded.
   * A different account erases everything held from that provider before anything new is
     written.
