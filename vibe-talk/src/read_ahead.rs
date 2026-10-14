@@ -14,13 +14,15 @@
 //!   preparation looks there first. Bounded by [`MAX_RECENT`].
 //! - [`ReadAhead::window_turn`]: when several window reads of one channel are asked together, one
 //!   of them fetches the window and the others wait for it, rather than queueing a second identical
-//!   fetch behind the first at the chat adapter. Every [`ops::messages`] read takes the turn
-//!   (`#278 timeline-single-flight`), so speech preparation, the summary route (`#208
-//!   persistent-cache`), the digest, a lookup by id and the messages route share it: a page asking
-//!   for twenty summaries at once costs one fetch, and a summary asked for right after the page's
-//!   own read is answered from here with none. A read the running fetch cannot answer — wider than
-//!   it, or made after a change it began before ([`WindowFetch`]) — does not wait for it, and reads
-//!   beside it instead.
+//!   fetch behind the first at the chat adapter. Speech preparation and the summary route (`#208
+//!   persistent-cache`) take a fetch that finishes after they were asked: a page asking for twenty
+//!   summaries at once costs one fetch, and a summary asked for right after the page's own read is
+//!   answered from here with none. Every [`ops::messages`] read takes the turn too (`#278
+//!   timeline-single-flight`), so those wait for the window the digest, a lookup by id or the
+//!   messages route is fetching; but such a read itself takes only a fetch that began after it was
+//!   asked ([`ops::Sharing`]), as it read for itself before. A read the running fetch cannot
+//!   answer — wider than it, made after a change it began before, or begun before a read that must
+//!   not take that ([`WindowFetch`]) — does not wait for it, and reads beside it instead.
 //! - [`ReadAhead::timelines`]: the same for `/timeline`, where identical requests share one read
 //!   that no caller going away can cancel, and a newest answer is kept for a few seconds. See
 //!   [`crate::timeline_flight`].
@@ -165,6 +167,8 @@ pub struct WindowRead {
     /// that has seen a change since does not take this fetch for its own: it may have missed the
     /// change.
     pub changes: Changes,
+    /// When it began, before the provider was asked.
+    pub began: Instant,
     /// When it finished.
     pub finished: Instant,
     /// How many messages it asked for ([`ops::window_limit`]).
@@ -179,11 +183,12 @@ pub struct WindowRead {
 }
 
 impl WindowRead {
-    /// What `window` read, finishing now, from a fetch that began having seen `changes`.
+    /// What `window` read, finishing now, from a fetch that began at `began` having seen `changes`.
     #[must_use]
-    pub fn of(window: &ops::Window, changes: Changes) -> Self {
+    pub fn of(window: &ops::Window, changes: Changes, began: Instant) -> Self {
         Self {
             changes,
+            began,
             finished: Instant::now(),
             limit: window.limit,
             ids: window.messages.iter().map(|m| m.id.clone()).collect(),
@@ -193,7 +198,8 @@ impl WindowRead {
 }
 
 /// The window fetch running through a channel's [`ReadAhead::window_turn`]: what it began having
-/// seen, and how wide it is. A caller it cannot answer — wider, or having seen a change since — reads
+/// seen, how wide it is, and when it began. A caller it cannot answer — wider, having seen a change
+/// since, or one that must not take a fetch begun before it was asked ([`ops::Sharing`]) — reads
 /// beside it rather than waiting for it. `#278 timeline-single-flight`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowFetch {
@@ -201,14 +207,18 @@ pub struct WindowFetch {
     pub changes: Changes,
     /// How many messages it asked for ([`ops::window_limit`]).
     pub limit: u16,
+    /// When it began, before the provider was asked.
+    pub began: Instant,
 }
 
 impl WindowFetch {
     /// Whether this fetch, when it lands, can be a window read's of `limit` messages made having
-    /// seen `changes`.
+    /// seen `changes`, which takes no fetch that began before `oldest`.
     #[must_use]
-    pub fn can_answer(&self, changes: Changes, limit: u16) -> bool {
-        self.changes == changes && self.limit >= limit
+    pub fn can_answer(&self, changes: Changes, limit: u16, oldest: Option<Instant>) -> bool {
+        self.changes == changes
+            && self.limit >= limit
+            && oldest.is_none_or(|oldest| self.began >= oldest)
     }
 }
 
@@ -546,12 +556,12 @@ impl ReadAhead {
 
     /// Wait for this channel's window fetch slot.
     ///
-    /// The guard holds what the last window fetch through this slot read, and when it finished. A
-    /// caller that finds one that finished after its own start, was at least as wide as its own
-    /// would be, and began having seen every change the caller has ([`Changes`]: pushes, purges and
-    /// this server's own posts), waited behind a fetch that has just read the window, and should use
-    /// that rather than read it again. [`ops::messages`] does
-    /// exactly that, for every caller.
+    /// The guard holds what the last window fetch through this slot read, when it began and when it
+    /// finished. A caller that finds one that finished after its own start (for [`ops::messages`],
+    /// began after it: [`ops::Sharing`]), was at least as wide as its own would be, and began having
+    /// seen every change the caller has ([`Changes`]: pushes, purges and this server's own posts),
+    /// waited behind a fetch that has just read the window, and should use that rather than read it
+    /// again. `ops::window_shared` does exactly that, for every caller.
     pub async fn window_turn(
         &self,
         channel: &ChannelId,
@@ -719,7 +729,13 @@ pub async fn messages_for_speech(
         None => {
             // The window read every caller shares, which remembers what it read for everyone else.
             let (window, joined) = crate::read_reason::ReadReason::Speech
-                .scope(ops::window_shared(state, channel.clone(), limit, began))
+                .scope(ops::window_shared(
+                    state,
+                    channel.clone(),
+                    limit,
+                    began,
+                    ops::Sharing::FinishedAfter,
+                ))
                 .await?;
             found.joined = joined;
             found.fetches = usize::from(!joined);
@@ -1057,6 +1073,7 @@ mod tests {
                 as_of: None,
             },
             Changes::default(),
+            Instant::now(),
         );
         let rebuilt = read_ahead.recall_window(&channel, &read).expect("all held");
         assert_eq!(

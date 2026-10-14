@@ -472,6 +472,57 @@ async fn preparations_that_miss_together_share_one_window_fetch() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_preparation_takes_a_messages_read_running_and_a_messages_read_takes_no_fetch_begun_before_it(
+) {
+    // `#278 timeline-single-flight`. `ops::messages` reads through the channel's window turn, so a
+    // preparation that misses waits for the window a `/messages` read is fetching and takes it, as
+    // it has taken another preparation's since #191. Round-3 review: the other way round, a
+    // `/messages` read made while a preparation's fetch runs reads beside it. Its callers (the MCP
+    // read tools, the digest, the to-do list, a lookup by id, bankruptcy) each read for themselves
+    // before, and must show an edit made upstream before they asked, pushed or not.
+    let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
+    let messages = format!("/api/v1/channels/{READ_CHANNEL}/messages");
+    let ((read_status, _), (status, body)) =
+        tokio::join!(call(&app, "GET", &messages, None), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            call(&app, "POST", &prepare_path(), Some(json!({"ids": ["101"]}))).await
+        });
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(prepared_ids(&body), ["101"]);
+    assert_eq!(
+        chat.windows.load(Ordering::SeqCst),
+        1,
+        "the preparation fetched beside the /messages read it could have waited for"
+    );
+
+    // An id read-ahead memory does not hold, so the next preparation misses and fetches.
+    let prepare = prepare_path();
+    let ((status, _), (read_status, read)) = tokio::join!(
+        call(&app, "POST", &prepare, Some(json!({"ids": ["999"]}))),
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            chat.edit("101", "edited upstream, never pushed");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            call(&app, "GET", &messages, None).await
+        }
+    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(read_status, StatusCode::OK, "{read}");
+    assert_eq!(chat.windows.load(Ordering::SeqCst), 3, "{read}");
+    let texts: Vec<&str> = read["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert!(
+        texts.contains(&"edited upstream, never pushed"),
+        "a /messages read took a preparation's fetch begun before an upstream edit: {texts:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn missing_thread_messages_are_fetched_a_few_at_a_time_and_then_remembered() {
     let (app, _state, chat) = harness(Arc::new(TimedSpeech::new(Duration::ZERO)));
     let ids: Vec<String> = (201..=210).map(|n| n.to_string()).collect();

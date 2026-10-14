@@ -1,5 +1,5 @@
-//! One upstream read for identical timeline requests, and one window fetch for concurrent window
-//! reads of a channel. `#278 timeline-single-flight`, remote-ops audit W4.
+//! One upstream read for identical timeline requests, and what a window read of a channel may take
+//! from another's fetch. `#278 timeline-single-flight`, remote-ops audit W4.
 //!
 //! Every test here COUNTS the calls that reach the provider for one thing the reader did, with
 //! `testing::CountingChat` in front of the provider: the audit's measure of an O(requesters) path.
@@ -62,6 +62,8 @@ struct Threaded {
     /// How long after a post lands upstream its answer comes back: the window in which the request
     /// that sent it can be dropped although the provider has delivered it.
     post_answer: Duration,
+    /// How much longer than any other a read of Main takes, after the channel is read.
+    main_scan: Duration,
 }
 
 impl Threaded {
@@ -70,6 +72,7 @@ impl Threaded {
             messages: Mutex::new(vec![message(10, "root", true), message(11, "reply", true)]),
             scan: None,
             post_answer: Duration::ZERO,
+            main_scan: Duration::ZERO,
         }
     }
 
@@ -138,6 +141,9 @@ impl ChatClient for Threaded {
     ) -> Result<TimelinePage, ChatError> {
         let threads = request.view == TimelineView::Threads;
         let snapshot = self.snapshot().await;
+        if request.view == TimelineView::Main {
+            tokio::time::sleep(self.main_scan).await;
+        }
         Ok(TimelinePage {
             messages: if threads { Vec::new() } else { snapshot },
             threads: if threads {
@@ -486,41 +492,59 @@ async fn a_read_token_join_never_queues_naming_and_a_write_token_one_does() {
     assert_eq!(h.chat.count_view("fetch_timeline", TimelineView::Thread), 1);
 }
 
+/// A read of `path` begun at 0 ms, a message posted upstream at 100 ms that nobody pushes, and a
+/// read of `second` at 200 ms, while the first is still running: what the second answered, and
+/// what the first did.
+async fn unpushed_message_during_a_read(
+    h: &Harness,
+    path: &str,
+    second: &str,
+) -> (Vec<String>, Vec<String>) {
+    let first = tokio::spawn(call(
+        h.app.clone(),
+        "GET",
+        path.to_owned(),
+        READ_TOKEN,
+        None,
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.upstream
+        .messages
+        .lock()
+        .unwrap()
+        .push(message(30, "from another client, not pushed", false));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, body) = get(&h.app, second, READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, early) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{early}");
+    (ids(&body), ids(&early))
+}
+
 #[tokio::test(start_paused = true)]
-async fn concurrent_window_reads_of_one_channel_share_one_fetch() {
-    // `ops::messages` goes through the channel's window turn: the digest, the to-do list, a lookup
-    // by id and the messages route asked at once read the window once.
-    let (mut state, discord) = testing::state();
-    let channel = ChannelId(WRITE_CHANNEL.to_owned());
-    discord.seed(&channel, "Grace", "first");
-    discord.seed(&channel, "Ada", "second");
-    let chat = Arc::new(CountingChat::new(discord).with_delay(READ));
-    state.replace_chat(chat.clone());
-    let app = vibe_talk::http::router(state);
+async fn a_window_read_takes_no_fetch_that_began_before_it_was_asked() {
+    // Round-3 review of #278: `ops::messages` waited behind a fetch that began before it and took
+    // it, so a message posted upstream in between, and not pushed, was missing. The MCP read tools,
+    // the digest, the to-do list, a lookup by id and bankruptcy go through it, and each read the
+    // window for itself before #278. Now it takes only a fetch that began after it was asked, and
+    // reads beside one already running.
+    let h = scanning_harness();
     let path = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
-    let answers =
-        futures_util::future::join_all((0..5).map(|_| get(&app, &path, READ_TOKEN))).await;
-    for (status, body) in &answers {
-        assert_eq!(*status, StatusCode::OK, "{body}");
-        assert_eq!(body["messages"].as_array().map(Vec::len), Some(2), "{body}");
-    }
-    assert_eq!(
-        chat.count("fetch_recent_dated"),
-        1,
-        "five window reads at once each fetched: {:?}",
-        chat.calls()
+    let (answered, early) = unpushed_message_during_a_read(&h, &path, &path).await;
+    assert!(
+        !early.contains(&"30".to_owned()),
+        "fixture: the first read saw a message posted after it was asked: {early:?}"
     );
-    // A narrower read joining a wider one is answered at its own width.
-    let (wide_path, narrow_path) = (format!("{path}?limit=20"), format!("{path}?limit=1"));
-    let (wide, narrow) = tokio::join!(get(&app, &wide_path, READ_TOKEN), async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        get(&app, &narrow_path, READ_TOKEN).await
-    });
-    assert_eq!(wide.1["messages"].as_array().map(Vec::len), Some(2));
-    assert_eq!(narrow.1["messages"].as_array().map(Vec::len), Some(1));
-    assert_eq!(narrow.1["messages"][0]["content"], "second", "the newest");
-    assert_eq!(narrow.1["complete"], false);
-    assert_eq!(chat.count("fetch_recent_dated"), 2, "{:?}", chat.calls());
+    assert!(
+        answered.contains(&"30".to_owned()),
+        "a window read 200 ms into a fetch begun before an upstream message missed it: {answered:?}"
+    );
+    assert_eq!(
+        h.chat.count("fetch_recent_dated"),
+        2,
+        "{:?}",
+        h.chat.calls()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -619,22 +643,19 @@ async fn a_timeline_read_after_this_servers_own_post_shows_the_post() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn window_reads_with_no_post_between_them_still_share_one_fetch() {
-    // The control for the two above, against the same slow scan: no post, one fetch.
+async fn a_timeline_read_with_no_post_between_still_joins_the_read_running() {
+    // The control for the timeline test above, against the same slow scan: no post, one read. (A
+    // window read made while a fetch runs is its own whether or not there was a post: see
+    // `a_window_read_takes_no_fetch_that_began_before_it_was_asked`.)
     let h = scanning_harness();
-    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/messages");
+    let path = timeline("view=main");
     let (a, b) = tokio::join!(get(&h.app, &path, READ_TOKEN), async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         get(&h.app, &path, READ_TOKEN).await
     });
     assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
     assert_eq!(ids(&a.1), ids(&b.1));
-    assert_eq!(
-        h.chat.count("fetch_recent_dated"),
-        1,
-        "{:?}",
-        h.chat.calls()
-    );
+    assert_eq!(h.chat.count("fetch_timeline"), 1, "{:?}", h.chat.calls());
 }
 
 #[tokio::test(start_paused = true)]
@@ -673,7 +694,8 @@ async fn a_pull_or_an_enter_inside_the_memo_shows_an_unpushed_upstream_change() 
     assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
     assert_eq!(h.chat.count("fetch_timeline"), 3, "{:?}", h.chat.calls());
 
-    // Two columns entering the same channel together still make one read.
+    // An opening 100 ms into another's read makes its own (see the next test); a poll 100 ms into
+    // an opening's read joins it.
     tokio::time::sleep(Duration::from_secs(4)).await;
     let enter = timeline("view=main&reason=enter");
     let (a, b) = tokio::join!(get(&h.app, &enter, READ_TOKEN), async {
@@ -681,7 +703,159 @@ async fn a_pull_or_an_enter_inside_the_memo_shows_an_unpushed_upstream_change() 
         get(&h.app, &enter, READ_TOKEN).await
     });
     assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(h.chat.count("fetch_timeline"), 5, "{:?}", h.chat.calls());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let (a, b) = tokio::join!(get(&h.app, &enter, READ_TOKEN), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        get(&h.app, &poll, READ_TOKEN).await
+    });
+    assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(h.chat.count("fetch_timeline"), 6, "{:?}", h.chat.calls());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pull_or_an_enter_joins_no_read_that_began_before_it() {
+    // Round-3 review of #278: a pull or an opening joined a read already running, however long
+    // before it began, so a message posted upstream after that read began, and not pushed, stayed
+    // hidden from the pull. The page reaches this on its own: its twenty seconds end the poll, the
+    // bridge's read runs on, and the reader pulls after "Refresh failed". Now a pull or an opening
+    // always reads for itself.
+    for reason in ["pull", "enter"] {
+        let h = scanning_harness();
+        let (answered, early) = unpushed_message_during_a_read(
+            &h,
+            &timeline("view=main&reason=poll"),
+            &timeline(&format!("view=main&reason={reason}")),
+        )
+        .await;
+        assert_eq!(
+            early,
+            ["10", "11"],
+            "fixture: the poll saw the later message"
+        );
+        assert!(
+            answered.contains(&"30".to_owned()),
+            "a {reason} 200 ms into the poll's read missed a message posted upstream at 100 ms: \
+             {answered:?}"
+        );
+        assert_eq!(
+            h.chat.count("fetch_timeline"),
+            2,
+            "{reason}: {:?}",
+            h.chat.calls()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kept_answer_is_not_handed_out_after_a_later_read_of_the_channel_has_landed() {
+    // Round-3 review of #278: Main's poll was kept; the root was edited upstream and not pushed; the
+    // thread on the right was opened, read afresh, and showed the edit; and then Main's re-read on
+    // coming back to the page was answered from the kept poll, from before the edit. The page folds
+    // each answer into one store by id, so the older copy went back over the newer on screen, until
+    // the next full read of Main. A later read of the channel, any view, now retires a kept answer.
+    let h = harness();
+    assert_eq!(
+        get(&h.app, &timeline("view=main&reason=poll"), READ_TOKEN)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    h.upstream.messages.lock().unwrap()[0].content = "root, edited".to_owned();
+    let (status, thread) = get(
+        &h.app,
+        &timeline(&format!("view=thread&thread_id={THREAD}&reason=enter")),
+        READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    assert_eq!(contents(&thread)[0], "root, edited", "fixture: {thread}");
+    let (status, main) = get(&h.app, &timeline("view=main&reason=visible"), READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{main}");
+    assert_eq!(
+        contents(&main),
+        ["root, edited", "reply"],
+        "Main was answered with text older than the thread's read had already shown"
+    );
+    assert_eq!(h.chat.count("fetch_timeline"), 3, "{:?}", h.chat.calls());
+
+    // The control: with no later read of the channel between, the kept answer still serves.
+    let poll = timeline("view=main&reason=poll");
+    assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
+    assert_eq!(h.chat.count("fetch_timeline"), 3, "{:?}", h.chat.calls());
+    // ...and a read of another channel retires nothing.
+    let other = format!(
+        "/api/v1/channels/{}/timeline?view=main&reason=poll",
+        testing::READ_CHANNEL
+    );
+    assert_eq!(get(&h.app, &other, READ_TOKEN).await.0, StatusCode::OK);
+    assert_eq!(get(&h.app, &poll, READ_TOKEN).await.0, StatusCode::OK);
     assert_eq!(h.chat.count("fetch_timeline"), 4, "{:?}", h.chat.calls());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_joined_read_overtaken_by_a_later_read_of_the_channel_is_not_handed_out() {
+    // The same for a read joined while it runs. Main's poll is slow. The root is edited upstream
+    // and not pushed, and the thread on the right is opened: its read begins after the poll's and
+    // lands first, with the edit. A re-read of Main made after the thread's read began, but before
+    // it landed, joined the poll; it is not handed the poll's older text when that lands. One made
+    // before the thread's read began is, as a read of its own would have been as old.
+    let upstream = Threaded {
+        main_scan: Duration::from_millis(900),
+        ..Threaded::scanning(Duration::from_millis(200))
+    };
+    let h = harness_over(&testing::config_toml(), Arc::new(upstream), Duration::ZERO);
+    let (poll_path, visible) = (
+        timeline("view=main&reason=poll"),
+        timeline("view=main&reason=visible"),
+    );
+    let (poll, early, thread, late) = tokio::join!(
+        get(&h.app, &poll_path, READ_TOKEN),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            get(&h.app, &visible, READ_TOKEN).await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            h.upstream.messages.lock().unwrap()[0].content = "root, edited".to_owned();
+            let thread = timeline(&format!("view=thread&thread_id={THREAD}&reason=enter"));
+            get(&h.app, &thread, READ_TOKEN).await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            get(&h.app, &visible, READ_TOKEN).await
+        },
+    );
+    for (status, body) in [&poll, &early, &thread, &late] {
+        assert_eq!(*status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(
+        contents(&poll.1)[0],
+        "root",
+        "fixture: the poll saw the edit"
+    );
+    assert_eq!(
+        contents(&thread.1)[0],
+        "root, edited",
+        "fixture: {}",
+        thread.1
+    );
+    assert_eq!(
+        contents(&early.1)[0],
+        "root",
+        "a re-read made before the thread's read began did not join the poll"
+    );
+    assert_eq!(
+        contents(&late.1)[0],
+        "root, edited",
+        "a re-read of Main made after the thread's read began was handed the poll's older text"
+    );
+    assert_eq!(
+        h.chat.count_view("fetch_timeline", TimelineView::Main),
+        2,
+        "{:?}",
+        h.chat.calls()
+    );
 }
 
 /// `path` asked `after` from now, and how long it took from when it was asked.
@@ -740,17 +914,22 @@ async fn a_window_read_that_a_running_fetch_cannot_answer_does_not_wait_for_it()
         h.chat.calls()
     );
 
-    // The control: as wide or narrower, with no change between, it still waits for that fetch and
-    // is answered by it, at no cost.
+    // As wide or narrower, with no change between: since the round-3 review this reads beside the
+    // fetch too, which began before it was asked (`a_window_read_takes_no_fetch_that_began_before_
+    // it_was_asked`). Speech preparation still waits for such a fetch and takes it: see
+    // `tests/read_ahead.rs`.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let (_, (_, waited)) = tokio::join!(
         timed_get(&h.app, &wide, Duration::ZERO),
         timed_get(&h.app, &narrow, Duration::from_millis(50)),
     );
-    assert_eq!(waited, READ - Duration::from_millis(50));
+    assert_eq!(
+        waited, READ,
+        "a window read waited for a fetch begun before it was asked"
+    );
     assert_eq!(
         h.chat.count("fetch_recent_dated"),
-        5,
+        6,
         "{:?}",
         h.chat.calls()
     );

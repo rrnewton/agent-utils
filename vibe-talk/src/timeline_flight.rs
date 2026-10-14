@@ -18,10 +18,12 @@
 //! delta, that has just landed is kept for a few seconds (`chat.timeline_memo_ms`, three by default,
 //! zero to turn the memory off), so a request arriving just after it is answered from it.
 //!
-//! An explicit refresh is never answered from that memory: pull to refresh, and opening a channel
-//! or a view ([`crate::read_reason::ReadReason::wants_fresh`]). The reader asked for the channel as
-//! it stands now, and a message posted upstream that nobody pushed would otherwise stay hidden for
-//! the memory's few seconds. Such a request still joins a read already running.
+//! An explicit refresh is never answered by a read that began before it: pull to refresh, and
+//! opening a channel or a view ([`crate::read_reason::ReadReason::wants_fresh`]), always make a read
+//! of their own. They take no kept answer, and they join no read already running, however recently
+//! it began. The reader asked for the channel as it stands now, and a message posted upstream that
+//! nobody pushed after that read began would be missing from it. A later request may join the
+//! refresh's own read.
 //!
 //! # What is shared, and what is each caller's own
 //!
@@ -41,8 +43,28 @@
 //! after any of those is a different request, so it never joins or reuses a read that began before
 //! the change. That is what keeps the page's own re-reads honest:
 //! it re-reads after a live message and after its own post, and the read that answers must be one
-//! that began after them. A change upstream that this server is not told of is invisible for at
-//! most the memory's few seconds, as it was invisible until the next read before.
+//! that began after them.
+//!
+//! A change upstream that this server is not told of is another matter. A request that is not an
+//! explicit refresh may be answered by a read that began before it — one still running, begun up to
+//! [`FLIGHT_BOUND`] earlier, or one that landed in the memory's last few seconds — and so may miss
+//! such a change until the next read shows it. That is the price of the sharing, and only the poll
+//! and the page's other background re-reads pay it; an explicit refresh never does.
+//!
+//! # Never older than a read already handed out
+//!
+//! Reads of one channel overlap: Main and a thread both carry the thread's root, and every view
+//! carries messages Flat does. The page folds every answer into one store, where a copy of a
+//! message is replaced by the next one to land. So sharing must never hand a request text older than
+//! a read the page may already have been given, or the page puts the older copy back over the newer.
+//!
+//! Reads are numbered as they begin. A request is not handed a kept answer when a read of the same
+//! channel that began after it has already landed, any view; nor the answer of a read it joined,
+//! when a read of the channel that began after that one, and before the request, landed first. It
+//! makes a read of its own instead. Whatever a request is handed therefore began after every read of
+//! the channel that began before the request and landed before the answer, as a read of its own
+//! would have. Reads that land out of the order they began in, each answering the request that made
+//! it, are as they always were.
 //!
 //! # What is kept, and the purge
 //!
@@ -51,7 +73,7 @@
 //! [`crate::read_ahead::ReadAhead::clear`]), which drops every kept answer and forgets every read
 //! running: a request after the purge reads afresh, and a read that began before it keeps nothing
 //! when it lands. A caller already waiting on such a read is still answered by it, as a page
-//! already rendering is.
+//! already rendering is. Only read numbers outlive the purge, never text.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -164,10 +186,19 @@ struct Generation {
     clears: u64,
 }
 
+/// What a read hands every caller waiting on it.
+#[derive(Clone)]
+struct Landed {
+    answer: Answer,
+    /// The number of the first read of the same channel to begin after this one that landed before
+    /// it, if one did. A caller that joined this read after that one began is not handed it.
+    overtaken_by: Option<u64>,
+}
+
 enum Entry {
     Running {
         number: u64,
-        answer: watch::Receiver<Option<Answer>>,
+        answer: watch::Receiver<Option<Landed>>,
     },
     Kept {
         number: u64,
@@ -176,9 +207,22 @@ enum Entry {
     },
 }
 
+/// A read still running, filed under its key or not: a later read of its channel that lands first
+/// marks it overtaken.
+struct Running {
+    channel: ChannelId,
+    overtaken_by: Option<u64>,
+}
+
 #[derive(Default)]
 struct Inner {
     entries: HashMap<Key, Entry>,
+    /// Every read running, by number, including one a later read has replaced under its key, or a
+    /// purge has forgotten: its callers are still waiting on it.
+    running: HashMap<u64, Running>,
+    /// Per channel, the newest read to have landed with an answer. Numbers only, never text; one per
+    /// channel ever read, which the allowlist bounds.
+    landed: HashMap<ChannelId, u64>,
     clears: u64,
     next: u64,
 }
@@ -197,6 +241,39 @@ impl Inner {
         if kept > MAX_KEPT {
             self.entries
                 .retain(|_, entry| matches!(entry, Entry::Running { .. }));
+        }
+    }
+
+    /// Whether read `number` of `channel` is older than a read of it that has already landed.
+    fn overtaken(&self, channel: &ChannelId, number: u64) -> bool {
+        self.landed
+            .get(channel)
+            .is_some_and(|landed| *landed > number)
+    }
+
+    /// File a read of `key`, beginning now, in place of whatever is filed under it.
+    fn begin(&mut self, key: &Key) -> Began {
+        let number = self.next;
+        self.next += 1;
+        let (sender, receiver) = watch::channel(None);
+        self.entries.insert(
+            key.clone(),
+            Entry::Running {
+                number,
+                answer: receiver.clone(),
+            },
+        );
+        self.running.insert(
+            number,
+            Running {
+                channel: key.channel.clone(),
+                overtaken_by: None,
+            },
+        );
+        Began {
+            number,
+            sender,
+            receiver,
         }
     }
 }
@@ -247,10 +324,12 @@ impl TimelineFlights {
     ///
     /// `changes` is what the channel had been through when the request was made
     /// ([`crate::read_ahead::ReadAhead::changes`]). `memo` is how long a read this call starts is
-    /// kept once it lands; zero keeps nothing. `fresh` refuses a kept answer, for an explicit
-    /// refresh: a read already running is still joined. `start` makes the read; it runs in a task
-    /// of its own, inside the caller's [`ReadReason`], is never cancelled by any caller going away,
-    /// and is given up after [`FLIGHT_BOUND`].
+    /// kept once it lands; zero keeps nothing. `fresh`, for an explicit refresh, makes a read of
+    /// this call's own: no kept answer, and no read already running. A kept answer or a read joined
+    /// that a later read of the channel has overtaken is refused the same way (see the module
+    /// documentation). `start` makes the read; it runs in a task of its own, inside the caller's
+    /// [`ReadReason`], is never cancelled by any caller going away, and is given up after
+    /// [`FLIGHT_BOUND`].
     pub async fn read<F, Fut>(
         self: &Arc<Self>,
         mut key: Key,
@@ -265,82 +344,138 @@ impl TimelineFlights {
             + Send
             + 'static,
     {
-        let (mut receiver, claim) = {
-            let mut inner = self.lock();
-            key.generation = Generation {
-                changes,
-                clears: inner.clears,
-            };
-            inner.prune(Instant::now());
-            match inner.entries.get(&key) {
-                Some(Entry::Kept { fetched, .. }) if !fresh => {
-                    return (Ok(Arc::clone(fetched)), Shared::Remembered);
-                }
-                Some(Entry::Running { answer, .. }) => (answer.clone(), None),
-                // Nothing for this request, or a kept answer an explicit refresh will not take:
-                // a read of its own, filed in the kept answer's place.
-                Some(Entry::Kept { .. }) | None => {
-                    let number = inner.next;
-                    inner.next += 1;
-                    let (sender, receiver) = watch::channel(None);
-                    inner.entries.insert(
-                        key.clone(),
-                        Entry::Running {
-                            number,
-                            answer: receiver.clone(),
-                        },
+        match self.take(&mut key, changes, fresh) {
+            Took::Kept(fetched) => (Ok(fetched), Shared::Remembered),
+            Took::Began(began) => (
+                wait(self.run(&key, began, memo, start)).await.answer,
+                Shared::Read,
+            ),
+            Took::Joined { receiver, seen } => {
+                let landed = wait(receiver).await;
+                if landed.answer.is_ok() && landed.overtaken_by.is_some_and(|by| by < seen) {
+                    // A read of the channel that began after the one joined, and before this
+                    // request, landed first: the page may already hold newer text than this read
+                    // brought. A read of its own instead.
+                    let began = self.lock().begin(&key);
+                    return (
+                        wait(self.run(&key, began, memo, start)).await.answer,
+                        Shared::Read,
                     );
-                    let claim = Claim {
-                        flights: Arc::clone(self),
-                        key,
-                        number,
-                        memo,
-                        sender: Some(sender),
-                    };
-                    (receiver, Some(claim))
                 }
+                (landed.answer, Shared::Joined)
             }
+        }
+    }
+
+    /// What the request `key` names, made having seen `changes`, takes: a kept answer, the read
+    /// running, or a read begun now in place of whatever is filed under it. `fresh` takes neither
+    /// of the first two, and nor does anyone a later read of the channel has overtaken.
+    fn take(&self, key: &mut Key, changes: Changes, fresh: bool) -> Took {
+        let mut inner = self.lock();
+        key.generation = Generation {
+            changes,
+            clears: inner.clears,
         };
-        let shared = match claim {
-            Some(claim) => {
-                let work = start();
-                let reason = ReadReason::current();
-                tokio::spawn(reason.scope(async move {
-                    let began = std::time::Instant::now();
-                    let answer = match tokio::time::timeout(FLIGHT_BOUND, work).await {
-                        Ok(read) => read.map(|(page, position)| {
-                            Arc::new(Fetched {
-                                page,
-                                position,
-                                began,
-                            })
-                        }),
-                        Err(_) => Err(outlasted()),
+        inner.prune(Instant::now());
+        if !fresh {
+            match inner.entries.get(key) {
+                Some(Entry::Kept {
+                    number, fetched, ..
+                }) if !inner.overtaken(&key.channel, *number) => {
+                    return Took::Kept(Arc::clone(fetched));
+                }
+                Some(Entry::Running { number, answer })
+                    if !inner.overtaken(&key.channel, *number) =>
+                {
+                    return Took::Joined {
+                        receiver: answer.clone(),
+                        seen: inner.next,
                     };
-                    claim.finish(answer);
-                }));
-                Shared::Read
+                }
+                _ => {}
             }
-            None => Shared::Joined,
+        }
+        Took::Began(inner.begin(key))
+    }
+
+    /// Run the read `began` of `key`, with `start`, in a task of its own, and keep its answer for
+    /// `memo` once it lands. Answers where that answer will come.
+    fn run<F, Fut>(
+        self: &Arc<Self>,
+        key: &Key,
+        began: Began,
+        memo: Duration,
+        start: F,
+    ) -> watch::Receiver<Option<Landed>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(TimelinePage, Option<GenericPosition>), ChatError>>
+            + Send
+            + 'static,
+    {
+        let Began {
+            number,
+            sender,
+            receiver,
+        } = began;
+        let claim = Claim {
+            flights: Arc::clone(self),
+            key: key.clone(),
+            number,
+            memo,
+            sender: Some(sender),
         };
-        let answer = match receiver.wait_for(Option::is_some).await {
-            Ok(answer) => answer.clone().unwrap_or_else(|| Err(ended())),
-            Err(_) => Err(ended()),
-        };
-        (answer, shared)
+        let work = start();
+        let reason = ReadReason::current();
+        tokio::spawn(reason.scope(async move {
+            let began = std::time::Instant::now();
+            let answer = match tokio::time::timeout(FLIGHT_BOUND, work).await {
+                Ok(read) => read.map(|(page, position)| {
+                    Arc::new(Fetched {
+                        page,
+                        position,
+                        began,
+                    })
+                }),
+                Err(_) => Err(outlasted()),
+            };
+            claim.finish(answer);
+        }));
+        receiver
     }
 
     /// Put a read's answer where later requests find it: kept for `memo`, or gone. Only the read
-    /// still filed under `key` — one a purge has not forgotten — is filed again. Answers whether it
-    /// was kept.
-    fn settle(&self, key: &Key, number: u64, answer: &Answer, memo: Duration) -> bool {
+    /// still filed under `key` — one a purge, or a later read of the same key, has not replaced —
+    /// is filed again. An answer marks every older read of the channel still running as overtaken.
+    /// Answers whether it was kept, and what had overtaken this read.
+    fn settle(
+        &self,
+        key: &Key,
+        number: u64,
+        answer: &Answer,
+        memo: Duration,
+    ) -> (bool, Option<u64>) {
         let mut inner = self.lock();
+        let overtaken_by = inner
+            .running
+            .remove(&number)
+            .and_then(|running| running.overtaken_by);
+        if answer.is_ok() {
+            let newest = inner.landed.entry(key.channel.clone()).or_insert(number);
+            *newest = (*newest).max(number);
+            for (older, running) in &mut inner.running {
+                if *older < number && running.channel == key.channel {
+                    running.overtaken_by =
+                        Some(running.overtaken_by.map_or(number, |by| by.min(number)));
+                }
+            }
+        }
         let ours = matches!(
             inner.entries.get(key),
             Some(Entry::Running { number: running, .. }) if *running == number
         );
         if !ours {
-            return false;
+            return (false, overtaken_by);
         }
         match answer {
             Ok(fetched) if !memo.is_zero() => {
@@ -352,11 +487,11 @@ impl TimelineFlights {
                         fetched: Arc::clone(fetched),
                     },
                 );
-                true
+                (true, overtaken_by)
             }
             _ => {
                 inner.entries.remove(key);
-                false
+                (false, overtaken_by)
             }
         }
     }
@@ -371,6 +506,39 @@ impl TimelineFlights {
         ) {
             inner.entries.remove(key);
         }
+    }
+}
+
+/// What a request took ([`TimelineFlights::take`]).
+enum Took {
+    /// A kept answer.
+    Kept(Arc<Fetched>),
+    /// The read running; `seen` is the number the next read would have had when it was joined, so
+    /// every read numbered below it began before the request.
+    Joined {
+        receiver: watch::Receiver<Option<Landed>>,
+        seen: u64,
+    },
+    /// A read of its own, filed and still to run.
+    Began(Began),
+}
+
+/// A read filed under its key and numbered, not yet running.
+struct Began {
+    number: u64,
+    sender: watch::Sender<Option<Landed>>,
+    receiver: watch::Receiver<Option<Landed>>,
+}
+
+/// The answer a read hands its callers when it lands.
+async fn wait(mut receiver: watch::Receiver<Option<Landed>>) -> Landed {
+    let ended = || Landed {
+        answer: Err(ended()),
+        overtaken_by: None,
+    };
+    match receiver.wait_for(Option::is_some).await {
+        Ok(landed) => landed.clone().unwrap_or_else(ended),
+        Err(_) => ended(),
     }
 }
 
@@ -393,12 +561,12 @@ struct Claim {
     key: Key,
     number: u64,
     memo: Duration,
-    sender: Option<watch::Sender<Option<Answer>>>,
+    sender: Option<watch::Sender<Option<Landed>>>,
 }
 
 impl Claim {
     fn finish(mut self, answer: Answer) {
-        let kept = self
+        let (kept, overtaken_by) = self
             .flights
             .settle(&self.key, self.number, &answer, self.memo);
         if kept {
@@ -415,7 +583,10 @@ impl Claim {
             });
         }
         if let Some(sender) = self.sender.take() {
-            sender.send_replace(Some(answer));
+            sender.send_replace(Some(Landed {
+                answer,
+                overtaken_by,
+            }));
         }
     }
 }
@@ -426,7 +597,10 @@ impl Drop for Claim {
             let answer = Err(ended());
             self.flights
                 .settle(&self.key, self.number, &answer, Duration::ZERO);
-            sender.send_replace(Some(answer));
+            sender.send_replace(Some(Landed {
+                answer,
+                overtaken_by: None,
+            }));
         }
     }
 }
@@ -639,7 +813,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_explicit_refresh_takes_no_kept_answer_but_joins_a_read_running() {
+    async fn an_explicit_refresh_takes_no_kept_answer_and_joins_no_read_running() {
+        // Round-3 review of #278: a refresh joined a read already running, however long before it
+        // began, and so missed what was posted upstream since. It reads for itself; a request that
+        // is not a refresh may join the refresh's read.
         let flights = Arc::new(TimelineFlights::new());
         let reads = Arc::new(AtomicUsize::new(0));
         let memo = Duration::from_secs(3);
@@ -652,20 +829,119 @@ mod tests {
                 counting(&reads, Ok(())),
             )
         };
+        let later = |fresh, after| async move {
+            tokio::time::sleep(after).await;
+            read(fresh).await
+        };
         assert_eq!(read(false).await.1, Shared::Read);
         assert_eq!(read(false).await.1, Shared::Remembered);
         assert_eq!(read(true).await.1, Shared::Read);
-        let ((_, first), (_, second)) = tokio::join!(read(false), async {
-            tokio::time::sleep(Duration::from_secs(4)).await;
-            read(true).await
-        });
-        assert_eq!(first, Shared::Remembered);
-        assert_eq!(second, Shared::Read);
-        let ((_, first), (_, second)) = tokio::join!(read(true), async {
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let pause = Duration::from_secs(4);
+        let soon = Duration::from_millis(100);
+        for (first, second, expected) in [
+            (false, true, (Shared::Read, Shared::Read)),
+            (true, true, (Shared::Read, Shared::Read)),
+            (true, false, (Shared::Read, Shared::Joined)),
+            (false, false, (Shared::Read, Shared::Joined)),
+        ] {
+            tokio::time::sleep(pause).await;
+            let ((_, a), (_, b)) = tokio::join!(read(first), later(second, soon));
+            assert_eq!((a, b), expected, "fresh {first}, then fresh {second}");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 8);
+    }
+
+    /// A read that takes `took` and counts itself in `reads`.
+    fn taking(reads: &Arc<AtomicUsize>, took: Duration) -> impl FnOnce() -> Read {
+        let reads = Arc::clone(reads);
+        move || {
+            Box::pin(async move {
+                reads.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(took).await;
+                Ok((TimelinePage::default(), None))
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_answer_a_later_read_of_the_channel_has_overtaken_is_not_handed_out() {
+        // Round-3 review of #278: the page folds every answer into one store, so a kept answer of
+        // Main handed out after the thread's later read had landed put Main's older copy of the
+        // root back over the thread's newer one.
+        let flights = Arc::new(TimelineFlights::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let memo = Duration::from_secs(3);
+        let read =
+            |key: Key| flights.read(key, changes(0, 0), memo, false, counting(&reads, Ok(())));
+        let elsewhere = Key::new(
+            &ChannelId("2".to_owned()),
+            &TimelineRequest::default(),
+            None,
+        );
+        assert_eq!(read(key(TimelineView::Main)).await.1, Shared::Read);
+        assert_eq!(read(key(TimelineView::Main)).await.1, Shared::Remembered);
+        assert_eq!(read(elsewhere).await.1, Shared::Read, "another channel");
+        assert_eq!(
+            read(key(TimelineView::Main)).await.1,
+            Shared::Remembered,
+            "another channel's read retired this one's kept answer"
+        );
+        assert_eq!(read(key(TimelineView::Thread)).await.1, Shared::Read);
+        assert_eq!(
+            read(key(TimelineView::Main)).await.1,
+            Shared::Read,
+            "a kept answer was handed out after a later read of the channel had landed"
+        );
+        assert_eq!(read(key(TimelineView::Main)).await.1, Shared::Remembered);
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_joined_that_a_later_read_overtook_is_handed_only_to_requests_made_before_that_one(
+    ) {
+        // A slow read of Main begins at 0 ms; a fast read of the thread begins at 100 ms and lands
+        // at 300 ms, before Main's lands at 1 s. A request for Main joined at 50 ms is handed Main's
+        // read: its own would have begun before the thread's too. One joined at 150 ms, after the
+        // thread's read began, is not: it reads for itself. And one made at 400 ms, after the
+        // thread's read landed, joins nothing.
+        let flights = Arc::new(TimelineFlights::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let memo = Duration::from_secs(3);
+        let main = |after: u64, took: u64| {
+            let (flights, reads) = (Arc::clone(&flights), Arc::clone(&reads));
+            async move {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                let start = taking(&reads, Duration::from_millis(took));
+                flights
+                    .read(key(TimelineView::Main), changes(0, 0), memo, false, start)
+                    .await
+                    .1
+            }
+        };
+        let thread = async {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            read(true).await
-        });
-        assert_eq!((first, second), (Shared::Read, Shared::Joined));
+            let start = taking(&reads, Duration::from_millis(200));
+            flights
+                .read(key(TimelineView::Thread), changes(0, 0), memo, true, start)
+                .await
+                .1
+        };
+        let (first, early, (), late, after) = tokio::join!(
+            main(0, 1_000),
+            main(50, 1_000),
+            async {
+                assert_eq!(thread.await, Shared::Read);
+            },
+            main(150, 1_000),
+            main(400, 1_000),
+        );
+        assert_eq!(first, Shared::Read);
+        assert_eq!(early, Shared::Joined, "made before the thread's read began");
+        assert_eq!(late, Shared::Read, "made after the thread's read began");
+        assert_eq!(after, Shared::Read, "made after the thread's read landed");
+        // Main's at 0 ms, the thread's, the one made at 400 ms, and the one made at 150 ms, read
+        // again when Main's landed.
         assert_eq!(reads.load(Ordering::SeqCst), 4);
     }
 

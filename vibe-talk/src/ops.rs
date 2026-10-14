@@ -378,8 +378,11 @@ impl Window {
 
 /// Recent messages of one channel, oldest first. Read scope.
 ///
-/// Read through the channel's window turn ([`window_shared`]): several asked at once, from any
-/// caller, cost one fetch. `#278 timeline-single-flight`.
+/// Read through the channel's window turn ([`window_shared`]), as [`Sharing::BeganAfter`]: it
+/// takes another caller's fetch only if that fetch began after this call did, so it shows every
+/// change made upstream before it was asked, as its own fetch would. In practice that is a fetch it
+/// waited behind from the start; one already running when it was asked is read beside, as every
+/// call read for itself before. `#278 timeline-single-flight`.
 ///
 /// # Errors
 ///
@@ -392,7 +395,26 @@ pub async fn messages(
 ) -> Result<Window, OpError> {
     let began = std::time::Instant::now();
     let channel = allowed(state, channel_id).await?;
-    Ok(window_shared(state, channel, limit, began).await?.0)
+    Ok(
+        window_shared(state, channel, limit, began, Sharing::BeganAfter)
+            .await?
+            .0,
+    )
+}
+
+/// Which fetch made by another caller a window read may take for its own ([`window_shared`]).
+/// `#278 timeline-single-flight`, remote-ops audit W4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sharing {
+    /// One that FINISHED after the caller began, though it may have begun before: speech
+    /// preparation (`#191 read-aloud-first-lag`) and a summary's context window (`#208
+    /// persistent-cache`), as they have shared since those, reading text the page has just drawn.
+    FinishedAfter,
+    /// Only one that BEGAN after the caller did: [`messages`], for the digest, the to-do list, a
+    /// lookup by id, bankruptcy, the messages route and the MCP read tools. Each read the window for
+    /// itself before `#278`, so each showed a message posted upstream a moment before it was asked,
+    /// pushed or not; a fetch that began before the ask may not have seen it.
+    BeganAfter,
 }
 
 /// [`messages`] of a channel the caller has already checked against the allowlist, read once for
@@ -400,17 +422,19 @@ pub async fn messages(
 /// another's read. `#278 timeline-single-flight`, remote-ops audit W4.
 ///
 /// Every window read takes the channel's turn ([`crate::read_ahead::ReadAhead::window_turn`]). A
-/// caller that waited behind a fetch which finished after `began`, was at least as wide as its
-/// own, and began having seen every change this caller has seen ([`crate::read_ahead::Changes`]:
-/// no live push, storage purge or post of this server's since) rebuilds that window from memory,
-/// cut to its own width, instead of reading it again. The post is counted on its own because it is
+/// caller that waited behind a fetch which `sharing` lets it take — one that finished after
+/// `began`, or for [`Sharing::BeganAfter`] one that began after it — that was at least as wide as
+/// its own, and that began having seen every change this caller has seen
+/// ([`crate::read_ahead::Changes`]: no live push, storage purge or post of this server's since)
+/// rebuilds that window from memory, cut to its own width, instead of reading it again. The post is counted on its own because it is
 /// not a push until the provider echoes it, and a caller reading right after its own post must see
 /// it.
 /// If any message of it has been forgotten since (an edit or a delete was pushed), or the fetch
 /// failed, it reads the window itself.
 ///
-/// A caller does not wait for a fetch that cannot answer it: one narrower than its own, or begun
-/// before a change it has seen ([`crate::read_ahead::WindowFetch::can_answer`]). It reads beside
+/// A caller does not wait for a fetch that cannot answer it: one narrower than its own, begun
+/// before a change it has seen, or begun before the caller where `sharing` forbids that
+/// ([`crate::read_ahead::WindowFetch::can_answer`]). It reads beside
 /// that fetch, as every window read did before, rather than waiting it out and then reading in
 /// series — twice the wait, which a voice tool's fifteen seconds behind a summary's fetch on a slow
 /// bridge cannot afford. Such a read leaves the turn's record alone.
@@ -421,14 +445,20 @@ pub(crate) async fn window_shared(
     channel: ChannelInfo,
     limit: Option<u16>,
     began: std::time::Instant,
+    sharing: Sharing,
 ) -> Result<(Window, bool), OpError> {
     // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
     // preparation compares a remembered window against (`crate::read_ahead`) are one number.
     let limit = window_limit(state, limit);
+    // The oldest a fetch this caller takes may have begun, besides finishing after it began.
+    let oldest = (sharing == Sharing::BeganAfter).then_some(began);
     if let Some(running) = state.read_ahead.window_fetch(&channel.id) {
         let mark = state.live.recent().mark(&channel.id);
-        if !running.can_answer(state.read_ahead.changes(&channel.id, mark), limit) {
-            return Ok((fetch_window(state, channel, limit, mark).await?, false));
+        if !running.can_answer(state.read_ahead.changes(&channel.id, mark), limit, oldest) {
+            return Ok((
+                fetch_window(state, channel, limit, mark, std::time::Instant::now()).await?,
+                false,
+            ));
         }
     }
     let mut turn = state.read_ahead.window_turn(&channel.id).await;
@@ -441,8 +471,9 @@ pub(crate) async fn window_shared(
             && crate::read_ahead::WindowFetch {
                 changes: read.changes,
                 limit: read.limit,
+                began: read.began,
             }
-            .can_answer(changes, limit)
+            .can_answer(changes, limit, oldest)
     }) {
         if let Some(mut messages) = state.read_ahead.recall_window(&channel.id, read) {
             // The newest `limit`, as this caller's own read would have answered.
@@ -460,28 +491,37 @@ pub(crate) async fn window_shared(
             ));
         }
     }
+    // Before the fetch, not after, like the mark: see `ReadAhead::remember`.
+    let fetch_began = std::time::Instant::now();
     let fetching = state.read_ahead.window_fetching(
         &channel.id,
-        crate::read_ahead::WindowFetch { changes, limit },
+        crate::read_ahead::WindowFetch {
+            changes,
+            limit,
+            began: fetch_began,
+        },
     );
-    let window = fetch_window(state, channel, limit, mark).await;
+    let window = fetch_window(state, channel, limit, mark, fetch_began).await;
     drop(fetching);
     let window = window?;
-    *turn = Some(crate::read_ahead::WindowRead::of(&window, changes));
+    *turn = Some(crate::read_ahead::WindowRead::of(
+        &window,
+        changes,
+        fetch_began,
+    ));
     Ok((window, false))
 }
 
 /// One window fetch, with the channel's turn held or beside a fetch that could not answer it: kept
 /// in `crate::recent` and read-ahead memory, stamped and noise-marked. `mark` was taken just
-/// before.
+/// before, and `fetch_began` just before the provider is asked: see `ReadAhead::remember`.
 async fn fetch_window(
     state: &AppState,
     channel: ChannelInfo,
     limit: u16,
     mark: crate::recent::ReadMark,
+    fetch_began: std::time::Instant,
 ) -> Result<Window, OpError> {
-    // Before the fetch, not after, like the mark: see `ReadAhead::remember`.
-    let fetch_began = std::time::Instant::now();
     // `#210 voice-catchup-speed`. Every read of a channel's newest messages is the newest copy of
     // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
     // while it ran applied again on top. See `crate::recent`.
@@ -588,8 +628,10 @@ pub async fn message_by_id_scoped(
 ///
 /// The provider read is SHARED: identical requests in flight together make one read, which no
 /// caller going away can cancel, and a newest page or delta that has just landed answers an
-/// identical request for a few seconds more. Everything after the read is this caller's own. See
-/// [`crate::timeline_flight`]. `#278 timeline-single-flight`.
+/// identical request for a few seconds more. Pull to refresh and opening a channel always read for
+/// themselves, and no request is handed a read that a later read of the channel has overtaken.
+/// Everything after the read is this caller's own. See [`crate::timeline_flight`]. `#278
+/// timeline-single-flight`.
 ///
 /// # Errors
 ///
@@ -681,7 +723,8 @@ async fn shared_timeline(
     } else {
         std::time::Duration::ZERO
     };
-    // Pull to refresh and opening a channel ask for it as it stands now: never a kept answer.
+    // Pull to refresh and opening a channel ask for it as it stands now: a read of their own, never
+    // a kept answer nor a read already running, which may have begun before a change upstream.
     let fresh = crate::read_reason::ReadReason::current().wants_fresh();
     let (state_for_read, channel_for_read) = (state.clone(), channel.clone());
     let (answer, shared) = state
@@ -3000,7 +3043,13 @@ async fn shared_window(
 ) -> Result<Window, OpError> {
     // `window_shared` remembers the window for everyone else as well.
     let (window, joined) = crate::read_reason::ReadReason::SummaryWindow
-        .scope(window_shared(state, channel, limit, began))
+        .scope(window_shared(
+            state,
+            channel,
+            limit,
+            began,
+            Sharing::FinishedAfter,
+        ))
         .await?;
     if joined {
         state.summary_counters.joined();
@@ -3083,6 +3132,56 @@ mod tests {
             "To lead team: landed it! Send it?"
         );
         assert_eq!(read_back("ops", "done?"), "To ops: done? Send it?");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_messages_read_takes_only_a_fetch_that_began_after_it_was_asked() {
+        // `#278 timeline-single-flight`, round-3 review. As `messages` reads
+        // (`Sharing::BeganAfter`): a caller asked before the running fetch began waits for it and
+        // takes it; one asked after it began reads beside it, since a change made upstream between
+        // the two would be missing. Speech preparation and a summary's context
+        // (`Sharing::FinishedAfter`) still take a fetch that finishes after they were asked.
+        let (mut state, fake) = testing::state();
+        let id = crate::model::ChannelId(WRITE_CHANNEL.to_owned());
+        fake.seed(&id, "Grace", "first");
+        let chat = std::sync::Arc::new(
+            testing::CountingChat::new(fake).with_delay(std::time::Duration::from_millis(500)),
+        );
+        state.replace_chat(chat.clone());
+        let channel = allowed(&state, WRITE_CHANNEL).await.expect("allowlisted");
+        let asked_before = std::time::Instant::now();
+        let later = |sharing, asked: Option<std::time::Instant>| {
+            let (state, channel) = (&state, channel.clone());
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let asked = asked.unwrap_or_else(std::time::Instant::now);
+                let (window, joined) = window_shared(state, channel, None, asked, sharing)
+                    .await
+                    .expect("read");
+                assert_eq!(window.messages.len(), 1);
+                joined
+            }
+        };
+        let (first, before, after, speech) = tokio::join!(
+            window_shared(
+                &state,
+                channel.clone(),
+                None,
+                std::time::Instant::now(),
+                Sharing::BeganAfter
+            ),
+            later(Sharing::BeganAfter, Some(asked_before)),
+            later(Sharing::BeganAfter, None),
+            later(Sharing::FinishedAfter, None),
+        );
+        assert!(!first.expect("read").1);
+        assert!(
+            before,
+            "a read asked before the fetch began did not take it"
+        );
+        assert!(!after, "a read asked after the fetch began took it");
+        assert!(speech, "speech preparation no longer takes a fetch running");
+        assert_eq!(chat.count("fetch_recent_dated"), 2, "{:?}", chat.calls());
     }
 
     #[tokio::test]
