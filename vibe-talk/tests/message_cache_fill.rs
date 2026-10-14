@@ -1574,9 +1574,172 @@ async fn a_message_this_server_posts_is_written_to_the_cache() {
     assert!(coverage(&d.cache, &chan, &CacheScope::Main).is_empty());
 }
 
+#[tokio::test]
+async fn a_pushed_change_landing_after_a_pushed_deletion_never_brings_the_message_back() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(true, 5, &clock).await;
+    get(&d.state, &flat_page()).await;
+    let gone = d.ids[2].clone();
+    let stale = d.fake.message(&gone).expect("held");
+    clock.advance(MINUTE);
+    d.fake.delete(&gone);
+    assert_eq!(
+        ingest(&d.state, pushed_deletion("e1", &gone)).await,
+        StatusCode::ACCEPTED
+    );
+    assert!(tombstoned(&d.cache, &read_chan(), &gone));
+
+    // Later: an adapter's retry of an earlier edit, and a creation that raced the deletion.
+    clock.advance(1_000);
+    for (event, kind) in [("e0-retried", "update"), ("e0-raced", "create")] {
+        assert_eq!(
+            ingest(&d.state, pushed(event, kind, &stale)).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(
+            tombstoned(&d.cache, &read_chan(), &gone),
+            "a pushed {kind} does not bring a deleted message back"
+        );
+        assert!(!holds(&d.cache, &read_chan(), &gone));
+    }
+}
+
 // ---- the live poller ----------------------------------------------------------------------------
 
 use vibe_talk::live::{poll_once, Tick};
+
+/// The provider as the live poller reads it: the next walk forward (a read `after` a cursor) takes
+/// its answer from the channel as it stands, then waits until the test lets it go.
+struct HeldWalk {
+    fake: Arc<FakeDiscord>,
+    gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+impl HeldWalk {
+    fn holding(fake: &Arc<FakeDiscord>) -> (Arc<Self>, HeldRead) {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let walk = Arc::new(Self {
+            fake: fake.clone(),
+            gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
+        });
+        (walk, HeldRead { entered, release })
+    }
+}
+
+#[async_trait::async_trait]
+impl vibe_talk::chat::ChatClient for HeldWalk {
+    fn provider_name(&self) -> &str {
+        vibe_talk::chat::ChatClient::provider_name(self.fake.as_ref())
+    }
+
+    async fn identity(&self) -> Result<vibe_talk::chat::ChatIdentity, vibe_talk::chat::ChatError> {
+        vibe_talk::chat::ChatClient::identity(self.fake.as_ref()).await
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, vibe_talk::chat::ChatError> {
+        let answer = vibe_talk::chat::ChatClient::fetch_page(
+            self.fake.as_ref(),
+            channel,
+            limit,
+            before,
+            after,
+        )
+        .await;
+        let gate = if after.is_some() {
+            self.gate.lock().expect("gate").take()
+        } else {
+            None
+        };
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+        answer
+    }
+
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, vibe_talk::chat::ChatError> {
+        vibe_talk::chat::ChatClient::post_message(self.fake.as_ref(), channel, content, reply_to)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_pollers_publish_never_undoes_an_edit_or_a_deletion_learned_while_its_read_was_out() {
+    // An edit a later read saw, on Discord's own API; a deletion pushed, on a bridge.
+    for bridge in [false, true] {
+        let clock = ManualClock::at(T0 + HOUR);
+        let d = deployment(bridge, 5, &clock).await;
+        let fresh = d
+            .fake
+            .seed_at(&id(READ_CHANNEL), "Ada", "tpyo", T0 + 30 * MINUTE);
+        let (walk, HeldRead { entered, release }) = HeldWalk::holding(&d.fake);
+        let mut cursor = Some(d.ids[4].numeric().expect("a snowflake"));
+        let hub = Arc::clone(&d.state.live);
+        let poll = tokio::spawn(async move {
+            poll_once(walk.as_ref(), &hub, &id(READ_CHANNEL), 50, &mut cursor)
+                .await
+                .map(|tick| tick.published)
+        });
+        entered.await.expect("the walk reached the provider");
+
+        // While the walk's page is on its way back, the cache learns the message changed.
+        clock.advance(MINUTE);
+        if bridge {
+            d.fake.delete(&fresh);
+            assert_eq!(
+                ingest(&d.state, pushed_deletion("e1", &fresh)).await,
+                StatusCode::ACCEPTED
+            );
+            assert!(tombstoned(&d.cache, &read_chan(), &fresh));
+        } else {
+            d.fake.edit(&fresh, "typo fixed");
+            get(
+                &d.state,
+                &format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50"),
+            )
+            .await;
+            assert_eq!(
+                cached(&d.cache, &read_chan(), &fresh).message.content,
+                "typo fixed"
+            );
+        }
+
+        // The walk comes back later still, and publishes the message as it read it.
+        clock.advance(MINUTE);
+        drop(release);
+        assert_eq!(poll.await.expect("joined").expect("polled"), 1);
+        if bridge {
+            assert!(
+                tombstoned(&d.cache, &read_chan(), &fresh),
+                "the deletion stands"
+            );
+            assert!(!holds(&d.cache, &read_chan(), &fresh));
+        } else {
+            assert_eq!(
+                cached(&d.cache, &read_chan(), &fresh).message.content,
+                "typo fixed",
+                "the edit stands"
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_it() {

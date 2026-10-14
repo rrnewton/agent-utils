@@ -10,7 +10,9 @@
 //!    earlier of the two), so an edit or deletion pushed while a read was running is never
 //!    reverted by that read.
 //! 3. **Deletions** delete the row and leave a [tombstone](crate::cache) holding nothing derived
-//!    from the content. Only an observation that started after the deletion brings the id back.
+//!    from the content. Only a read that started after the deletion brings the id back. A push
+//!    never does: a pushed creation or edit that lands after the deletion (an event retried, two
+//!    events racing, a poller's publish of what it read before) is of a message already gone.
 //! 4. **Absence from an exhaustive listing** of a row's HOME scope deletes it, if it was observed
 //!    before the listing started and lies below the scope's unsettled band. Absence from a listing
 //!    of another scope only removes that membership.
@@ -143,11 +145,11 @@ pub fn is_snippet_of(offered: &str, held: &str) -> bool {
     !stem.is_empty() && stem.len() < held.len() && held.starts_with(stem)
 }
 
-/// Rule 3: whether an observation that started at `observed_ms` brings back an id deleted at
-/// `deleted_ms`. Only one that started strictly later does.
+/// Rule 3: whether a copy that arrived as `arrival`, observed at `observed_ms`, brings back an id
+/// deleted at `deleted_ms`. Only a read that started strictly later does; a push never does.
 #[must_use]
-pub fn revives(deleted_ms: i64, observed_ms: i64) -> bool {
-    observed_ms > deleted_ms
+pub fn revives(arrival: Arrival, deleted_ms: i64, observed_ms: i64) -> bool {
+    !arrival.is_push() && observed_ms > deleted_ms
 }
 
 /// Rule 4: whether a home-scope row missing from an exhaustive listing is gone. Only a row the
@@ -313,10 +315,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_later_observation_revives_and_only_settled_unseen_rows_are_absent() {
-        assert!(revives(100, 101));
-        assert!(!revives(100, 100));
-        assert!(!revives(100, 50));
+    fn only_a_later_read_revives_and_only_settled_unseen_rows_are_absent() {
+        for read in [Arrival::Listing, Arrival::Rows] {
+            assert!(revives(read, 100, 101), "{read:?}");
+            assert!(!revives(read, 100, 100), "{read:?}");
+            assert!(!revives(read, 100, 50), "{read:?}");
+        }
+        // A push never does, however late it lands.
+        for push in [Arrival::PushCreate, Arrival::PushUpdate] {
+            assert!(!revives(push, 100, 101), "{push:?}");
+            assert!(!revives(push, 100, i64::MAX), "{push:?}");
+        }
         assert!(absent_is_deleted(10, 20, 500, 1_000));
         assert!(
             !absent_is_deleted(20, 20, 500, 1_000),

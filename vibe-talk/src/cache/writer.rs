@@ -1393,7 +1393,7 @@ impl Writer<'_> {
             .query_row(params![chan_id, id], |row| row.get::<_, i64>(0))
             .optional()?
         {
-            if !merge::revives(deleted_ms, observed_ms) {
+            if !merge::revives(arrival, deleted_ms, observed_ms) {
                 Stats::add(&self.shared.stats.rows_held_by_tombstone, 1);
                 return Ok(());
             }

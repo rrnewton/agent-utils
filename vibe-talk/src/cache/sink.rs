@@ -876,7 +876,9 @@ impl Sink {
     }
 
     /// Offer one change the live hub is publishing to `channel`, from `producer`: the poller, or
-    /// an adapter's pushed event.
+    /// an adapter's pushed event. `read_ms`, when given, is when the read that found it began (the
+    /// poller's): the change is offered as of then, or now if that is earlier, so a deletion or an
+    /// edit the cache learned of while that read was on its way back is not undone by it.
     ///
     /// Called by [`crate::live::LiveHub`] while it holds the channel's feed lock and BEFORE any
     /// subscriber is sent the change, so a change a subscriber could have seen is already queued,
@@ -887,8 +889,17 @@ impl Sink {
     ///
     /// A deletion is offered whatever is known of the provider's account; a creation or an edit
     /// of a provider not checked against the file is dropped, and marks the channel suspect.
-    pub(crate) fn offer_push(&self, channel: &ChannelId, live: &LiveMessage, producer: ServerFill) {
-        if let Some(fill) = self.begin(&FillGrant::server(producer), channel) {
+    pub(crate) fn offer_push(
+        &self,
+        channel: &ChannelId,
+        live: &LiveMessage,
+        producer: ServerFill,
+        read_ms: Option<i64>,
+    ) {
+        if let Some(mut fill) = self.begin(&FillGrant::server(producer), channel) {
+            if let Some(read_ms) = read_ms {
+                fill.observed_ms = fill.observed_ms.min(read_ms);
+            }
             fill.offer_push(live);
         }
     }

@@ -359,6 +359,14 @@ impl LiveHub {
     /// A publish with no subscribers is NOT a failure: the tail is what a page attaching a moment
     /// later reads, so the message is kept either way.
     pub fn publish(&self, channel: &ChannelId, message: Message) {
+        self.publish_read(channel, message, None);
+    }
+
+    /// [`LiveHub::publish`] a message a read found, the read having begun at `read_ms` by the
+    /// message cache's clock: the cache is offered it as of then, not as of now, so an edit or a
+    /// deletion the cache learned of while the read was on its way back is not undone by it.
+    /// `#208 persistent-cache`.
+    fn publish_read(&self, channel: &ChannelId, message: Message, read_ms: Option<i64>) {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
@@ -367,7 +375,7 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_inner(channel, live, false);
+        self.publish_inner(channel, live, false, read_ms);
     }
 
     /// Publish one thread reply a provider read apart from the channel's own timeline, and
@@ -380,6 +388,13 @@ impl LiveHub {
     /// its instant, and a clear through it could mark read a message vibe-talk never received. The
     /// next message of the channel's own is offered as ever.
     pub fn publish_reply(&self, channel: &ChannelId, message: Message) {
+        self.publish_reply_read(channel, message, None);
+    }
+
+    /// [`LiveHub::publish_reply`] a reply a read found, the read having begun at `read_ms` by the
+    /// message cache's clock, as [`LiveHub::publish_read`] publishes a message of the channel's own:
+    /// the cache is offered it as of then. `#208 persistent-cache`.
+    fn publish_reply_read(&self, channel: &ChannelId, message: Message, read_ms: Option<i64>) {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
@@ -388,7 +403,7 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_to_feed(channel, live, false);
+        self.publish_to_feed(channel, live, false, read_ms);
     }
 
     /// Publish one event delivered by an external adapter.
@@ -411,15 +426,21 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_inner(channel, live, true)
+        self.publish_inner(channel, live, true, None)
     }
 
-    fn publish_inner(&self, channel: &ChannelId, live: LiveMessage, deduplicate: bool) -> bool {
+    fn publish_inner(
+        &self,
+        channel: &ChannelId,
+        live: LiveMessage,
+        deduplicate: bool,
+        read_ms: Option<i64>,
+    ) -> bool {
         // Both producers reach this, so it is where a created message is noted for clearing at
         // its provider: one map update and a wake-up, after the feed lock is released.
         let created = (live.kind == LiveKind::Create)
             .then(|| (live.message.id.clone(), live.message.timestamp.clone()));
-        if !self.publish_to_feed(channel, live, deduplicate) {
+        if !self.publish_to_feed(channel, live, deduplicate, read_ms) {
             return false;
         }
         if let Some((id, timestamp)) = created {
@@ -428,7 +449,13 @@ impl LiveHub {
         true
     }
 
-    fn publish_to_feed(&self, channel: &ChannelId, live: LiveMessage, deduplicate: bool) -> bool {
+    fn publish_to_feed(
+        &self,
+        channel: &ChannelId,
+        live: LiveMessage,
+        deduplicate: bool,
+        read_ms: Option<i64>,
+    ) -> bool {
         let mut feeds = lock(&self.feeds);
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
         if deduplicate {
@@ -452,7 +479,7 @@ impl LiveHub {
             } else {
                 crate::cache::ServerFill::Poller
             };
-            sink.offer_push(channel, &live, producer);
+            sink.offer_push(channel, &live, producer, read_ms);
         }
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {
@@ -770,7 +797,8 @@ pub struct Tick {
 /// was taken; and the walk as a listing of what lay
 /// between the cursor and the newest message it saw, but only when the walk ran out of messages
 /// rather than into [`MAX_PAGES_PER_TICK`]. See [`crate::cache::observe::forward`]. What it
-/// publishes reaches the cache through the hub as well, as every published change does.
+/// publishes reaches the cache through the hub as well, as every published change does, as of when
+/// the tick's read began rather than when it is published.
 ///
 /// # Errors
 ///
@@ -786,13 +814,15 @@ pub async fn poll_once(
     cursor: &mut Option<u64>,
 ) -> Result<Tick, ChatError> {
     let apart = chat.polls_thread_replies(channel);
-    // Begun before the read, as every fill is: see `crate::cache::sink`.
+    // Begun before the read, as every fill is: see `crate::cache::sink`. What the walk publishes
+    // is offered to the cache as of then too: see `LiveHub::publish_read`.
     let fill = hub.message_cache().and_then(|sink| {
         sink.begin(
             &crate::cache::FillGrant::server(crate::cache::ServerFill::Poller),
             channel,
         )
     });
+    let read_ms = fill.as_ref().map(crate::cache::Fill::observed_ms);
     let Some(seen) = *cursor else {
         let messages = match fill {
             // `#307 slack-reply-live`: the provider's own seed, which also notes where each thread
@@ -897,9 +927,9 @@ pub async fn poll_once(
         arrivals.sort_by_key(|(id, _, _)| *id);
         for (_, message, reply) in arrivals {
             if reply {
-                hub.publish_reply(channel, message);
+                hub.publish_reply_read(channel, message, read_ms);
             } else {
-                hub.publish(channel, message);
+                hub.publish_read(channel, message, read_ms);
             }
             published += 1;
         }
