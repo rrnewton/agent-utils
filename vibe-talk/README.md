@@ -5516,7 +5516,7 @@ dark and differ only a little in hue; the light scheme's read ring has its own l
 stands at 3:1 against the lit surface. The moment of marking is drawn on the row that was marked,
 though the selection has left it: its ring turns from the solid accent to the dashed grey over a
 quarter of a second while the row fades to the read look, holds for most of a second, then lets go.
-The Done button, a swipe, `e` and Done through here (on the row it was asked from) all draw it, and
+The Done button, a swipe, `e`, Shift+E and Done through here (on the row it was asked from) all draw it, and
 every way back ends it at once: a Done the server refused, the Undo chip, `z`, the row's own button,
 or another device putting the message back — a row drawn unread never wears the grey ring. It is an
 animation from the selected look rather than a transition, because on a threaded channel a Done
@@ -5723,7 +5723,7 @@ from, so it cannot name a key the page does not answer.
 | Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft; on the channel or thread picker, back to the messages |
 | Home, End | The top of the list or its newest message, and select it |
 | `e` | Done or not Done; marked Done, the ring moves on to the next unread below |
-| Shift+E | Done through here |
+| Shift+E | Read and collapse: the selected message marked Done, as `e` marks it, and read in the chat service too where it can be, as a sent reply marks what it answers; then folded, the ring staying on it — under Collapse read, on the "… read messages …" line of a run it joins; under Hide read, on the next message, as it goes. Never puts a message back |
 | `z` | Undo the last Done |
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
@@ -5739,6 +5739,58 @@ from, so it cannot name a key the page does not answer.
 | ↑ in the empty message box | Select the newest message |
 | Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
 | Ctrl+K (Cmd+K) | Choose a channel; once chosen, the keys are back on the messages |
+
+`#295 shift-e-read-collapse`. **Shift+E reads and collapses the selected message**. It is marked read
+as a reply you send marks what it answers (`#300 reply-marks-read`, above): Done exactly as its Done
+button and `e` mark it (the same write to the server, the same Undo, and the bookmark slides the same
+way), and then, once the server has that Done, read in the chat service too where vibe-talk can move
+the service's own read marker and that marker covers no more than the channel — the marker moved
+through the message, never backward and asked only once, as a reply's mark is. A Done that fails asks
+the service nothing. On a channel whose service has no such marker, on one that is one thread of a
+larger space, or where the service cannot say what its marker covers, the message is marked Done
+here only. It is also folded as its fold control folds it, the fold kept by message id through the
+redraw that follows. In a thread or in the right column it is the message selected there.
+
+It only ever marks: on a message already Done it folds it and puts nothing back, and writes no second
+Done. It still asks for the chat service's half, the same mark a reply makes, because that Done may
+have come from `e`, the Done button or a swipe, which leave the service's marker where it was, or from
+an earlier Shift+E the service refused for a while. Where vibe-talk has moved the marker through that
+message or a later one already (a reply, *Through here*, an earlier Shift+E), the server answers from
+its own record and asks the service nothing, so pressing Shift+E again does not ask the service again.
+That record is kept in memory: after the server restarts, the first such mark asks the service once,
+and the service's own check keeps its marker from moving back. A message shows as Done the moment it
+is marked, before the server has saved it; Shift+E pressed while that Done is still being saved (the
+key twice in quick succession, or just after `e` or the Done button) waits for it, and asks the service
+only once it is saved. If that Done fails, Shift+E asks the service nothing and says nothing of a read:
+the row is unread again and the error says why.
+
+The ring stays on the message, and the list does not move under you: with the message's head on screen
+the rows above it stay put and the rows below close up; with its head scrolled off the top, its foot
+stays where it was (or, for a message taller than the screen read part way through, its head comes to
+the top). The read modes act on it as on any Done: under **Collapse read** a message that joins a run
+of read messages goes into it at once, and the ring goes to the run's *… read messages …* line (a read
+message alone between unread ones stays shown, the ring on it); under **Hide read** the message goes,
+and the ring moves on to the next message shown.
+
+The status line says where it was marked, for example *Marked read here and in Google Chat, and
+collapsed.* or *Marked read here, not in Slack, and collapsed.*, with the reason after a colon where
+there is one (the service refused or was slow, or its marker covers more than the channel). A short
+message, which has no fold, is only marked, and the line leaves out *and collapsed*. On a message
+already Done it begins *Already read here*: *Already read here and in Google Chat, and collapsed.*
+where the service's marker was through it already, *Already read here; now marked read in Google Chat
+too, and collapsed.* where Shift+E moved it, and *Already read here, not in* the service where it was
+not asked or did not take it.
+
+Shift+E used to be *Done through here*: this message and every one above it. One accidental press
+turned a detailed read history into everything read, so that act **has no key at all** now. It is
+only the ⋯ menu's **Through here** item under *Mark read*, with the Undo chip (and `z`) after it as
+before. *Clear the backlog* under Hide read has never had a key either.
+
+`make -C vibe-talk keyboard-browser` presses Shift+E in Chromium on an opened long message and
+measures that only that message was written Done, then asked of the chat service once (`after_reply`),
+and folded, with nothing on screen moving; that pressed again it writes no second Done and its mark is
+answered by the server's record without reaching the service; and that `e` asks the chat service
+nothing.
 
 A click on a message selects it without a ring, so the next key starts there. PgUp, PgDn and Space
 stay the browser's, and once the page comes to rest the ring moves to the first message shown whole.
@@ -5914,7 +5966,8 @@ with the word *Bookmark* in it, drawn just above one message.
 - **It advances with your Done, and with nothing else.** A Done (`e`, the Done button, a swipe, a
   message read aloud to its end, or a reply you sent to it) on the message right under the line
   slides the line down past messages already Done to the next one still to read, the one `e` selects
-  next; below the newest message when everything after it is Done. *Done through here* (Shift+E) at
+  next; below the newest message when everything after it is Done. Shift+E marks one message as `e`
+  does, and moves the line the same way. *Done through here* (the ⋯ menu) at
   or below the line lands it below that message. Undo puts it back. New messages, putting a message
   back, and reads never move it. A Done in a thread view slides along the thread's rows, but never
   past a message of Main's still to read: the line then goes above that message, where Main's reader

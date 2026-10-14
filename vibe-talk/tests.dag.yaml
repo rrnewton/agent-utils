@@ -377,7 +377,9 @@ steps:
   # refused (`#248 composer-key`); "," and Ctrl+, open Settings with its screen focused, PgDn scrolls it and Escape
   # returns to the list unmoved; in the message box PgUp pages the list and Ctrl+Home/End jump it; then
   # the keymap: j, k and the arrows move a visible focus ring the list follows, e marks Done on the
-  # server and moves on to the next unread, PgDn brings the ring to the page, Enter folds, and -> enters
+  # server and moves on to the next unread, PgDn brings the ring to the page, Shift+E marks one opened
+  # message alone Done on the server, asks the chat service once to mark it read, and folds it with
+  # neither the list nor the message moving (`#295 shift-e-read-collapse`), Enter folds, and -> enters
   # a thread that <- and Esc leave, back on the message it was opened from; Ctrl+K opens the channel
   # picker, Esc leaves it for the list, a channel chosen from it gives the keys back to the list, and
   # Help left by "," after "?" still goes back to Settings from Settings; `#281 view-keys`: Ctrl+1 to

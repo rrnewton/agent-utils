@@ -24,13 +24,17 @@ under a person's fingers, and measures the list that is on screen:
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
   Ctrl+End take the list to its top and its newest message -> the keymap: Home selects the first
   message with a ring drawn round it (real focus, `:focus-visible`), j, k and the arrows move the
-  ring and the list follows it, e marks the selected message Done on the server and moves on to the
-  next unread, Enter opens and closes a long message, PgDn moves the ring to the first message the
-  page shows, and -> on a message in a thread enters the thread, <- comes back to the message it
-  was opened from, and so does Esc -> Ctrl+K opens the channel picker and Esc leaves it for the
-  list; a channel chosen from it gives the keys back to the list, so j and the arrows move the ring
-  rather than the picker -> "?" then "," leaves Help, and Help opened from Settings afterwards still
-  goes back to Settings.
+  ring and the list follows it, e marks the selected message Done on the server (and asks the chat
+  service nothing) and moves on to the next unread, PgDn moves the ring to the first message the page
+  shows, Shift+E on a long message opened with Enter marks that message alone Done on the server,
+  then asks the chat service once to mark it read (`after_reply`), and folds it, the ring staying on
+  it, no other message changed and neither the list nor the message moving by a pixel, and pressed
+  again writes no second Done and asks the server's floor, which asks the service nothing (`#295
+  shift-e-read-collapse`), Enter opens and closes a long message, and -> on a message in a thread
+  enters the thread, <- comes back to the message it was opened from, and so does Esc -> Ctrl+K
+  opens the channel picker and Esc leaves it for the list; a channel chosen from it gives the keys
+  back to the list, so j and the arrows move the ring rather than the picker -> "?" then "," leaves
+  Help, and Help opened from Settings afterwards still goes back to Settings.
 
 `#281 view-keys`: Ctrl+1 to Ctrl+4 choose Main, All, the thread list and two columns, pressed with the
 focus in the channel's message box with a draft in it, in the search field with words typed, and inside
@@ -87,6 +91,9 @@ EPOCH = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
 OWNER = {"author": "vibe-talk", "author_id": "1000000000000000009", "author_is_bot": True}
 AGENT = {"author": "ci-bot", "author_id": "1000000000000000001", "author_is_bot": True}
 MESSAGES = 60
+# `#295 shift-e-read-collapse`. A second long message, well up from the foot of the list, for Shift+E to
+# mark and fold with rows above and below it on screen.
+SHIFT_E_AT = 20
 THREAD_ID = "spaces/A/threads/release"
 THREAD_REPLIES = 6
 Json = dict[str, object]
@@ -126,6 +133,12 @@ class FakeApi:
     threads: list[Json] = field(default_factory=list)
     # Every message the page tried to send (`/reply` is the route of every send), as its route.
     send_posts: list[str] = field(default_factory=list)
+    # Every ask to move the chat service's read marker, as its body (`#295 shift-e-read-collapse`).
+    upstream_posts: list[Json] = field(default_factory=list)
+    # The asks that reached the service itself, by message id: the server's floor for a mark asked
+    # `after_reply` (src/reply_read.rs), the newest message marked through, answers the rest itself.
+    service_marks: list[str] = field(default_factory=list)
+    marked_through: int | None = None
 
     def __post_init__(self) -> None:
         root_id = f"88000000000000{MESSAGES // 2:04d}"
@@ -137,7 +150,7 @@ class FakeApi:
             who = AGENT if n % 3 else OWNER
             if n == MESSAGES // 2:
                 self.messages.append(message(n, message_id, "Release train: where are we?", OWNER, root))
-            elif n == MESSAGES - 8:
+            elif n in (MESSAGES - 8, SHIFT_E_AT):
                 self.messages.append(message(n, message_id, LONG, AGENT, None))
             else:
                 text = f"Step {n}: checked the dashboards and the logs; nothing out of the ordinary."
@@ -159,7 +172,9 @@ class FakeApi:
                            "local_only": True},
             "conversational_voice": {"name": "Test voice provider"},
             "replay_enabled": False, "self_author_id": None, "owner_author_id": None,
-            "channel_discovery_supported": False, "upstream_read_mark_supported": False,
+            # `#295 shift-e-read-collapse`: a chat service whose read marker the server can move, so
+            # Shift+E's read reaches it, as a sent reply's does (`#300 reply-marks-read`).
+            "channel_discovery_supported": False, "upstream_read_mark_supported": True,
             "speech_prep_enabled": False,
         }
 
@@ -200,6 +215,28 @@ class FakeApi:
     def send(self, path: str) -> None:
         with self.lock:
             self.send_posts.append(path)
+
+    def upstream_read(self, body: Json) -> Json:
+        message_id = str(body.get("message_id"))
+        position = int(message_id)
+        with self.lock:
+            self.upstream_posts.append(body)
+            outcome = "marked"
+            if body.get("after_reply") is True and self.marked_through is not None and position <= self.marked_through:
+                outcome = "already_marked" if position == self.marked_through else "behind"
+            else:
+                self.service_marks.append(message_id)
+                self.marked_through = max(position, self.marked_through or 0)
+        return {"channel": CHANNEL, "through": message_id, "outcome": outcome,
+                "upstream_read_notice": "The source chat provider's read cursor was moved through this message."}
+
+    def service_marked(self) -> list[str]:
+        with self.lock:
+            return list(self.service_marks)
+
+    def upstream_reads(self) -> list[Json]:
+        with self.lock:
+            return [dict(body) for body in self.upstream_posts]
 
     def sends(self) -> list[str]:
         with self.lock:
@@ -250,6 +287,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.json(401, {"error": "unauthorized", "detail": "unknown token"})
             elif path == f"/api/v1/channels/{CHANNEL['id']}/dismiss" and isinstance(raw, dict):
                 self.json(200, api.dismiss({str(key): value for key, value in raw.items()}))
+            elif path == f"/api/v1/channels/{CHANNEL['id']}/upstream-read" and isinstance(raw, dict):
+                self.json(200, api.upstream_read({str(key): value for key, value in raw.items()}))
             elif path.endswith("/reply"):
                 # Recorded and refused: no step here means to send, so any send at all is the failure.
                 api.send(path)
@@ -728,6 +767,8 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
             break
         walk.page.wait_for_timeout(20)
     check(api.dismissals()[before:] == [[done]], f"e did not mark {done} Done on the server: {api.dismissals()}")
+    # e leaves the chat service's read marker alone; Shift+E, below, is the key that moves it.
+    check(api.upstream_reads() == [], f"e asked the chat service to mark a message read: {api.upstream_reads()}")
     marked = walk.page.evaluate("(id) => document.querySelector(`#discord-log > li[data-id='${id}']`).dataset.archived", done)
     check(marked == "true", f"the message e marked does not show as Done: {marked!r}")
     check(after["id"] == ids[14], f"after e the ring went to {after['id']}, not the next unread {ids[14]}")
@@ -737,6 +778,8 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
     paged = ringed(walk, "PageDown", "PgDn")
     check(paged["id"] != after["id"] and number(paged, "top") >= -1,
           f"after PgDn the ring stayed on {after['id']} rather than following the page: {paged}")
+
+    shift_e(walk, api, ids[SHIFT_E_AT])
 
     # Enter on the long message: open, then closed again.
     long_id = ids[MESSAGES - 8]
@@ -777,6 +820,111 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
     walk.notes.append(f"the keymap: Home, j/k and the arrows moved a visible focus ring the list followed, e marked "
                       f"{done} Done on the server and moved on to the next unread, PgDn brought the ring to the page, "
                       "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
+
+
+# `#295 shift-e-read-collapse`. Every message row's Done and fold, the list's scroll, the row's place on
+# screen and the status line: what Shift+E may change, and what it must leave alone.
+SHIFT_E_JS = """(id) => {
+  const area = document.getElementById('scroll-area');
+  const row = document.querySelector(`#discord-log > li[data-id='${id}']`);
+  const states = {};
+  for (const li of document.querySelectorAll('#discord-log > li[data-id]')) {
+    if (li.dataset.id !== id) states[li.dataset.id] = `${li.dataset.archived || ''}/${li.dataset.collapsed || ''}`;
+  }
+  const box = row.getBoundingClientRect();
+  return {top: area.scrollTop, max: area.scrollHeight - area.clientHeight, rowTop: box.top - area.getBoundingClientRect().top,
+          height: box.height, archived: row.dataset.archived || null, collapsed: row.dataset.collapsed || null,
+          states, status: document.getElementById('status').textContent,
+          above: row.previousElementSibling ? row.previousElementSibling.getBoundingClientRect().top : null};
+}"""
+
+
+def shift_e_state(walk: Walk, target: str) -> Json:
+    value = walk.page.evaluate(SHIFT_E_JS, target)
+    assert isinstance(value, dict)
+    return value
+
+
+def shift_e(walk: Walk, api: FakeApi, target: str) -> None:
+    """Shift+E on an opened long message: Done on the server for it alone, folded, the ring on it, nothing moved."""
+    press(walk.cdp, "Home")
+    for _ in range(SHIFT_E_AT + 5):
+        if ring(walk)["id"] == target:
+            break
+        press(walk.cdp, "j")
+    check(ring(walk)["id"] == target, f"Shift+E's message was not reached: {ring(walk)}")
+    opened = ringed(walk, "Enter", "Enter before Shift+E")
+    check(opened["collapsed"] == "false", f"Enter did not open the message for Shift+E: {opened}")
+    walk.settled()
+    before = shift_e_state(walk, target)
+    check(number(before, "max") - number(before, "top") > 100,
+          f"the list is at its foot, where a fold must move it; this proves nothing: {before}")
+    check(number(before, "rowTop") >= 0, f"the message's head is not on screen: {before}")
+    marked = len(api.dismissals())
+    asked = len(api.upstream_reads())
+    press(walk.cdp, "Shift+e")
+    for _ in range(100):
+        if len(api.dismissals()) > marked:
+            break
+        walk.page.wait_for_timeout(20)
+    # Said once the chat service has answered: "Marked read here ...", after the Done's own words. Polled
+    # rather than awaited, so a page that says something else fails on the checks below, which say what.
+    for _ in range(250):
+        if str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("Marked read here"):
+            break
+        walk.page.wait_for_timeout(20)
+    walk.settled()
+    after = shift_e_state(walk, target)
+    walk.shot("keymap-shift-e")
+    check(walk.last_key().get("prevented") is True, f"the page did not take Shift+E: {walk.last_key()}")
+    check(api.dismissals()[marked:] == [[target]],
+          f"Shift+E did not mark exactly {target} Done on the server: {api.dismissals()[marked:]}")
+    # Read in the chat service too, as a sent reply's mark: once, `after_reply`, after the Done.
+    check(api.upstream_reads()[asked:] == [{"message_id": target, "after_reply": True}],
+          f"Shift+E did not ask the chat service to mark {target} read once: {api.upstream_reads()[asked:]}")
+    check(after["status"] == "Marked read here and in Google Chat, and collapsed.",
+          f"the status line does not say the message was marked read here and in the chat service: {after['status']!r}")
+    check(after["archived"] == "true" and after["collapsed"] == "true",
+          f"Shift+E did not leave the message Done and folded: {after}")
+    check(number(after, "height") < number(before, "height") - 20, f"the folded message is no shorter: {before} -> {after}")
+    was, now = before["states"], after["states"]
+    assert isinstance(was, dict) and isinstance(now, dict)
+    changed = [f"{key} {was.get(key)} -> {value}" for key, value in now.items() if was.get(key) != value]
+    check(not changed and was == now, f"Shift+E changed another message: {changed}")
+    check(abs(number(after, "top") - number(before, "top")) <= 1, f"Shift+E scrolled the list: {before['top']} -> {after['top']}")
+    check(abs(number(after, "rowTop") - number(before, "rowTop")) <= 1,
+          f"the message moved under the reader: {before['rowTop']} -> {after['rowTop']}")
+    check(before["above"] is None or abs(number(after, "above") - number(before, "above")) <= 1,
+          f"the message above moved: {before['above']} -> {after['above']}")
+    row = ring(walk)
+    check(row["id"] == target and row["visible"] is True, f"after Shift+E the ring is not on {target}: {row}")
+    check(api.service_marked() == [target], f"the chat service's marker was not moved through {target} once: {api.service_marked()}")
+
+    # Pressed again on the message, Done and marked through already: no second Done, and the service's
+    # half asked again as a reply's mark, which the server's floor answers without asking the service.
+    asks = len(api.upstream_reads())
+    press(walk.cdp, "Shift+e")
+    # Said once the server has answered; polled rather than awaited, so a page that says something else
+    # fails on the checks below, which say what it did.
+    for _ in range(250):
+        if str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("Already read"):
+            break
+        walk.page.wait_for_timeout(20)
+    walk.settled()
+    again = shift_e_state(walk, target)
+    check(api.dismissals()[marked:] == [[target]], f"Shift+E on a Done message wrote another Done: {api.dismissals()[marked:]}")
+    check(api.upstream_reads()[asks:] == [{"message_id": target, "after_reply": True}],
+          f"Shift+E on a Done message was not asked of the server's floor as a reply's mark: {api.upstream_reads()[asks:]}")
+    check(api.service_marked() == [target], f"Shift+E on a message marked through asked the service again: {api.service_marked()}")
+    check(again["status"] == "Already read here and in Google Chat, and collapsed.",
+          f"the status line does not say the message was read already in both places: {again['status']!r}")
+    check(again["archived"] == "true" and again["collapsed"] == "true", f"the second Shift+E changed the message: {again}")
+    check(ring(walk)["id"] == target, f"the second Shift+E moved the ring off {target}: {ring(walk)}")
+    walk.notes.append(f"Shift+E (#295 shift-e-read-collapse) marked {target} alone Done on the server, asked the chat "
+                      "service once to mark it read (after_reply), and folded it "
+                      f"({number(before, 'height'):.0f}px -> {number(after, 'height'):.0f}px), the ring still on it, the "
+                      "list and the message not moved by a pixel, no other message changed; pressed again it wrote no "
+                      "second Done, and the server's floor answered the service's half without asking the service")
 
 
 # `#239 single-selection`. Every row the browser draws lit, across every list the keys move through,

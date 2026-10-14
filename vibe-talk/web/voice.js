@@ -7859,16 +7859,94 @@ function doneFromKeyboard(target) {
   return true;
 }
 
-/** Shift+E: Done through here (`#202 read-through-here`), the act of the ⋯ menu, then on to the next unread below. */
-function throughHereFromKeyboard(target) {
+/**
+ * Shift+E: read and collapse (`#295 shift-e-read-collapse`). The owner's idiom for "dealt with, and
+ * give me the room back": the selected message marked read — Done, as its Done button and e mark it,
+ * and in the chat service too where it can be, as a sent reply marks what it answers — and folded, as
+ * its fold control folds it (`readAndCollapse`). In a thread, or in the right column, the message
+ * selected there. Only ever a mark: a message already Done stays Done and is folded all the same. The
+ * selection stays on the message, and the list does not move under the reader (`foldForRead`). The
+ * read modes treat it as any Done: under Collapse read a message that joins a run of read messages
+ * leaves the selection on the run's line, and under Hide read it goes, the selection to the next row.
+ *
+ * IT USED TO BE DONE THROUGH HERE (`#202 read-through-here`): every message above as well, which one
+ * press by accident turned into a read history lost, and Undo once saved it. That act now has no key
+ * at all; it is the ⋯ menu's Through here alone, with its Undo.
+ */
+function readCollapseFromKeyboard(target) {
   const { pane, row, took } = rowForAct(target);
-  const messages = row ? rowMessages(row) : [];
-  if (!pane || !row || messages.length === 0) return took;
-  const rows = paneRows(pane);
-  const at = rows.indexOf(row);
-  const next = unreadAfter(rows, at);
-  guardQuietly(() => markReadThroughHere(row, String(messages[messages.length - 1].id)))();
-  landAfterDone(pane, next && next.getAttribute("data-id"), idsOf(row)[0], at);
+  const ids = row ? idsOf(row) : [];
+  if (!pane || !row || ids.length === 0) return took;
+  guardQuietly(() => readAndCollapse(pane, row, ids))();
+  return true;
+}
+
+/**
+ * Shift+E's act on `row`: folded first, while it is the row on screen, then marked read. The fold is
+ * recorded by message id (`setFolded`), so the row a Done redraws is drawn folded too.
+ *
+ * Marked read as a sent reply marks what it answers (`#300 reply-marks-read`): Done (`markRowDone`),
+ * and once the server has that Done, the chat service's own read marker moved through the row's
+ * newest message, where its provider lets the server move it and the marker covers no more than the
+ * channel (`markReadInService`) — forward only and asked once, by the server's floor. A Done that
+ * fails asks the service nothing: the failure is said, and the row is unread again.
+ *
+ * A MESSAGE ALREADY DONE is not marked Done again, nor put back: Shift+E is only ever a mark. Its
+ * chat service's half is still asked, the same `after_reply` mark, because the Done may have come
+ * from `e`, the Done button or a swipe, which leave the service's marker where it was, or from an
+ * earlier Shift+E whose service refused it for a while. Where the server has marked that message or a
+ * later one already — a reply, Through here, an earlier Shift+E — its floor answers `already_marked`
+ * or `behind` and asks the service nothing (src/reply_read.rs), so pressing it again costs the
+ * service no read of its marker.
+ *
+ * DONE HERE IS NOT YET SAVED while its write is on its way: a message is drawn Done the moment it is
+ * marked. Shift+E pressed again meanwhile, or after `e` or the Done button, waits for that Done to be
+ * saved before it asks the service anything, and asks, and says, nothing once it has failed
+ * (`doneSaved`): the service's marker cannot be moved back, and the failure is said by the act it
+ * failed for.
+ *
+ * The status line says where the message was marked, and that it was collapsed, once the service has
+ * answered; nothing over another channel the reader has gone to meanwhile.
+ */
+async function readAndCollapse(pane, row, ids) {
+  const channel = String(el("discord-channel").value);
+  const folded = foldForRead(pane, row);
+  const wasDone = ids.every((id) => archivedIds.has(id));
+  if (!wasDone) await markRowDone(ids, row);
+  if (wasDone && !(await doneSaved(ids))) return;
+  const mark = await markReadInService(channel, ids[ids.length - 1]);
+  if (channel !== String(el("discord-channel").value)) return;
+  const also = folded ? ", and collapsed" : "";
+  setStatus(wasDone ? doneReadWords(mark, also) : serviceReadWords(mark, also));
+}
+
+/**
+ * Fold `row` for Shift+E with what the reader is looking at left where it was (`#280
+ * scroll-stability`), and answer whether it is folded now. A short message has no fold, and a row
+ * showing its links in place of its text is not folded out of sight (`actOnRow`).
+ *
+ * With its head on screen it is the fold control's own act: held by `preservingScroll`, the rows above
+ * stay and the rows below close up under it. With its head scrolled off the top that would carry the
+ * folded row off the screen and lift the rows below up past the place being read, so there its foot
+ * holds when the foot is on screen, and the rows below stay where they are; a row taller than the
+ * screen, read part way through, brings its head to the top of the list, the rows after it below.
+ * A reader on the newest line stays on it, as `preservingScroll` keeps them.
+ */
+function foldForRead(pane, row) {
+  const entry = row.foldEntry;
+  if (!entry || showingLinks(row)) return Boolean(entry && isFolded(entry));
+  if (isFolded(entry)) return true;
+  const area = pane.scroller();
+  const head = pane.head();
+  const was = row.getBoundingClientRect();
+  if (was.top >= head - 1 || atBottom(area)) {
+    preservingScroll(() => setFolded(entry, true));
+  } else {
+    setFolded(entry, true);
+    const now = row.getBoundingClientRect();
+    area.scrollTop += was.bottom <= pane.foot() ? now.bottom - was.bottom : now.top - head;
+  }
+  renderScrollTools();
   return true;
 }
 
@@ -8805,11 +8883,16 @@ const KEYMAP = [
     rowControls: ["done-button"],
     run: (event, target) => doneFromKeyboard(target),
   },
+  // `#295 shift-e-read-collapse`. No row button: the Done button only marks and the fold only folds,
+  // and this does both. Done through here, which this key was, has no key at all now.
   {
     group: KEYS_MESSAGE, chords: [{ key: "e", shift: true }],
-    does: "Done through here: this message and every one above it",
-    rowControls: ["row-read-through-button"],
-    run: (event, target) => throughHereFromKeyboard(target),
+    does: "Read and collapse: marks the message Done, as e does, and read in the chat service too where it " +
+      "can be, as a sent reply does; folds it; the selection stays on it. Under Collapse read, a message that " +
+      "joins a run of read messages leaves the selection on the run's “… read messages …” line; under Hide " +
+      "read it goes, and the selection moves to the next message. Never puts one back. " +
+      "Done through here, which this key used to be, is in the ⋯ menu only",
+    run: (event, target) => readCollapseFromKeyboard(target),
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "b", shift: true }],
@@ -28080,15 +28163,26 @@ async function toggleArchived(ids, row = null) {
   if (all.length > 0 && all.every((id) => archivedIds.has(id))) {
     await restoreMessages(all);
   } else {
-    // `#245 done-feedback`. BEFORE the dismissal redraws the row as read, so the change is one the
-    // browser can animate rather than a jump; taken back if the Done did not take.
-    flashDone(row);
-    try {
-      await dismissMessages({ messages: all });
-    } catch (error) {
-      unflashDone(row);
-      throw error;
-    }
+    await markRowDone(all, row);
+  }
+}
+
+/**
+ * Mark ONE row's messages Done: the half of `toggleArchived` that marks, and the Done of Shift+E's read
+ * (`#295 shift-e-read-collapse`), so the key's Done cannot drift from the Done button's. The page's
+ * state, the server's record and the bookmark's slide are `dismissMessages`'s, the same for every way
+ * in. The chat service's own read marker is not this function's: Shift+E asks for it after this has
+ * taken (`markReadInService`), as a sent reply does; `e` and the Done button leave it.
+ */
+async function markRowDone(ids, row = null) {
+  // `#245 done-feedback`. BEFORE the dismissal redraws the row as read, so the change is one the
+  // browser can animate rather than a jump; taken back if the Done did not take.
+  flashDone(row);
+  try {
+    await dismissMessages({ messages: ids });
+  } catch (error) {
+    unflashDone(row);
+    throw error;
   }
 }
 
@@ -28111,8 +28205,9 @@ async function toggleArchived(ids, row = null) {
 //     transition has no earlier style to start from. A row still selected keeps its grey ring: the
 //     fading phase lets go only of a ring the selection is not drawing anyway.
 //   * Every way of marking comes through it: the Done button, the e key and a swipe through
-//     `toggleArchived`, Done through here (Shift+E, or the ⋯ menu) on the row it was asked from,
-//     and a sent reply's Done (`markAnsweredDone`) on the row standing for the message it answers.
+//     `toggleArchived`, Shift+E's read and collapse (`markRowDone`), Done through here (the ⋯ menu)
+//     on the row it was asked from, and a sent reply's Done (`markAnsweredDone`) on the row standing
+//     for the message it answers.
 //   * EVERY WAY BACK ENDS IT AT ONCE, though its timers have most of a second to run: a Done the
 //     server refused, the Undo chip, z, the row's own button, or another device putting the message
 //     back. A row drawn unread never wears the grey ring (`drawDoneFlash`).
@@ -28292,6 +28387,48 @@ function queueInboxWrite(task) {
 }
 
 /**
+ * `#295 shift-e-read-collapse`. The Done of each message still on its way to the server, by message
+ * id: settled, saved or not, once its write has settled and what a failure takes back is taken back.
+ * `dismissMessages` marks a message Done here at once, before its write is even sent, so being Done
+ * here does not say the Done is saved; what may follow only a saved Done waits on this (`doneSaved`).
+ *
+ * @type {Map<string, Promise<void>>}
+ */
+const doneSaving = new Map();
+
+/**
+ * Note `ids`' Done as on its way (`doneSaving`), and answer what to call once it has settled.
+ *
+ * @param {string[]} ids
+ * @returns {() => void}
+ */
+function noteDoneSaving(ids) {
+  let settle = () => {};
+  /** @type {Promise<void>} */
+  const saving = new Promise((resolve) => { settle = resolve; });
+  for (const id of ids) doneSaving.set(id, saving);
+  return () => {
+    for (const id of ids) if (doneSaving.get(id) === saving) doneSaving.delete(id);
+    settle();
+  };
+}
+
+/**
+ * Whether every one of `ids` is Done here with its Done saved: a Done of any of them still on its way
+ * to the server waited for first (`doneSaving`), then the ids looked at again, since a Done that
+ * failed has put them back, as has a put back (Undo, `e`) made meanwhile. `#295 shift-e-read-collapse`.
+ *
+ * @param {string[]} ids
+ */
+async function doneSaved(ids) {
+  for (;;) {
+    const saving = [...new Set(ids.map((id) => doneSaving.get(String(id))).filter(Boolean))];
+    if (saving.length === 0) return ids.every((id) => archivedIds.has(String(id)));
+    await Promise.all(saving);
+  }
+}
+
+/**
  * Mark messages as dealt with, remember the exact set, and settle the list.
  *
  * `bump` is what the Done does to the bookmark (`#240 reading-bookmark`): by default, for messages
@@ -28321,6 +28458,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   for (const id of requested) {
     archivedIds.add(id);
   }
+  // Done here from now on, and saved only once the write below is (`doneSaved`).
+  const saved = noteDoneSaving(requested);
   const held = markHeldDone(requested, true, doneSettlesHere());
   // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
   const column = activeColumn;
@@ -28368,6 +28507,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
     throw error;
+  } finally {
+    // Once a failure has been taken back, so what waits on it (`doneSaved`) finds the messages put
+    // back. It runs after the lines below, which leave the Done as it is.
+    saved();
   }
   settleHeldDone(held, true);
   const stored = (payload.messages || requested).map(String);
@@ -30652,7 +30795,8 @@ function unseenColumnReply() {
 //     message, asked `after_reply` so the server never moves it back behind a message already marked
 //     and never asks twice for one (src/reply_read.rs). Never where that marker covers more than the
 //     channel — one thread of a larger space, or a service that cannot say — since nobody pressed
-//     anything to clear messages this page never received.
+//     anything to clear messages this page never received. Shift+E's read (`#295
+//     shift-e-read-collapse`, `readAndCollapse`) is this same mark, through `markReadInService`.
 //   * A VOICE AGENT'S REPLY follows the same rule, marked by the server, which posts it: see
 //     src/reply_read.rs. This page shows its Done at its next read of the channel.
 
@@ -30763,63 +30907,116 @@ function channelIsOneThread(channel) {
 }
 
 /**
- * What the status line says when the server asked the chat service nothing for a reply's mark,
- * by the `outcome` it answered: the service's marker covers more than the channel, or the service
- * cannot say whether it does. `#300 reply-marks-read`.
+ * Why the chat service was not asked to move its read marker for a mark that follows a Done, by the
+ * server's `outcome`, or by the page's own word for a channel it holds as one thread: the service's
+ * marker covers more than the channel, or the service cannot say whether it does. Null for any other
+ * outcome. `#300 reply-marks-read`.
  *
  * @param {unknown} outcome
- * @param {string} service
  * @returns {string | null}
  */
-function replyMarkNotAsked(outcome, service) {
+function serviceMarkNotAsked(outcome) {
   if (outcome === "thread_channel") {
-    return `Marked read here, not in ${service}: this channel is one thread of a larger space there, ` +
-      "and its read marker covers the whole space.";
+    return "this channel is one thread of a larger space there, and its read marker covers the whole space.";
   }
   if (outcome === "scope_unknown") {
-    return `Marked read here, not in ${service}: it cannot say whether its read marker covers more ` +
-      "than this channel.";
+    return "it cannot say whether its read marker covers more than this channel.";
   }
   return null;
 }
 
 /**
- * Mark read what `entry`, a send just confirmed, marks (`marksRead`): Done, and then, where its
- * channel's provider has one, the provider's own read marker moved through it. The second waits for
- * the first and is not asked when the Done failed, as "Mark read through here" goes. See the section
- * note. `#300 reply-marks-read`.
+ * The chat service's half of marking message `id` of `channel` read, asked only once its Done here
+ * has been saved: by a confirmed send (`markSentRead`) and by Shift+E (`readAndCollapse`), so the
+ * two marks are one act. `#300 reply-marks-read`, `#295 shift-e-read-collapse`.
+ *
+ * Where the channel's provider lets the server move its own read marker (what offers the "⋯" menu's
+ * "In <service> only"), that marker moved through the message, asked `after_reply` so the server
+ * never moves it back behind a message already marked and never asks the service twice for one
+ * (src/reply_read.rs).
  *
  * Never where that marker is wider than the channel: on a channel that is one thread of a larger
  * space it would mark every earlier message of the whole space read in the service's own app,
  * messages this page never received, and nobody pressed anything to ask for that. The page does not
  * ask for a channel it holds as one thread (`channelIsOneThread`), and the server, which asks the
- * service what its marker covers, refuses the rest (`replyMarkNotAsked`). The Done stands either way.
+ * service what its marker covers, refuses the rest (`serviceMarkNotAsked`). The Done stands either way.
  *
- * The provider's half failing is said on the status line, not in the error banner: nobody pressed
- * anything for it, the Done it follows stands, and the chat service refusing it for a while (Google
- * Chat allows a bridge about two reads of its marker a minute) must not put a banner over every reply.
+ * Never a throw: the service's half failing is for the status line, not the error banner. Nobody
+ * pressed anything for it alone, the Done it follows stands, and the chat service refusing it for a
+ * while (Google Chat allows a bridge about two reads of its marker a minute) must not put a banner
+ * over every mark.
+ *
+ * @param {string} channel
+ * @param {string} id
+ * @returns {Promise<{service: string, asked: boolean, marked: boolean, already: boolean, why: string}>}
+ *   `asked`, whether this page asked the server at all; `marked`, whether the service's marker is
+ *   through the message now; `already`, whether it was before this asked, by the server's answer that
+ *   it had marked this message or a later one and asked the service nothing; `why`, the reason it is
+ *   not marked, where there is one to say.
+ */
+async function markReadInService(channel, id) {
+  const service = chatServiceOf(channel);
+  const none = { service, asked: false, marked: false, already: false, why: "" };
+  if (!channelMarksUpstream(channel)) return none;
+  if (channelIsOneThread(channel)) return { ...none, why: serviceMarkNotAsked("thread_channel") || "" };
+  try {
+    const answer = await api(`/api/v1/channels/${encodeURIComponent(channel)}/upstream-read`, {
+      method: "POST", body: { message_id: String(id), after_reply: true },
+    });
+    const outcome = answer && answer.outcome;
+    const why = serviceMarkNotAsked(outcome);
+    return { ...none, asked: true, marked: !why, already: outcome === "already_marked" || outcome === "behind",
+      why: why || "" };
+  } catch (error) {
+    return { ...none, asked: true, why: readableFailure(error, service) };
+  }
+}
+
+/**
+ * The status line's words for a message marked read here, by what its chat service did
+ * (`markReadInService`), with `also` — Shift+E's ", and collapsed" — said of the message after where
+ * it was marked.
+ *
+ * @param {{service: string, marked: boolean, why: string}} mark
+ * @param {string} [also]
+ */
+function serviceReadWords(mark, also = "") {
+  if (mark.marked) return `Marked read here and in ${mark.service}${also}.`;
+  return `Marked read here, not in ${mark.service}${also}${mark.why ? `: ${mark.why}` : "."}`;
+}
+
+/**
+ * `serviceReadWords` for a message that was Done here before Shift+E was pressed on it
+ * (`readAndCollapse`): "already" said of here, and of the chat service only where the server answered
+ * that its marker was through the message before it was asked. `#295 shift-e-read-collapse`.
+ *
+ * @param {{service: string, marked: boolean, already: boolean, why: string}} mark
+ * @param {string} [also]
+ */
+function doneReadWords(mark, also = "") {
+  if (mark.marked && mark.already) return `Already read here and in ${mark.service}${also}.`;
+  if (mark.marked) return `Already read here; now marked read in ${mark.service} too${also}.`;
+  return `Already read here, not in ${mark.service}${also}${mark.why ? `: ${mark.why}` : "."}`;
+}
+
+/**
+ * Mark read what `entry`, a send just confirmed, marks (`marksRead`): Done, and then the chat
+ * service's own read marker moved through it where it can be (`markReadInService`). The second waits
+ * for the first and is not asked when the Done failed, as "Mark read through here" goes. See the
+ * section note. `#300 reply-marks-read`.
  *
  * @param {{channel: string, marksRead: string}} entry
  */
 async function markSentRead(entry) {
   const id = String(entry.marksRead);
   await markAnsweredDone(entry.channel, id);
-  // The Done's own words already say it was not marked in the chat service.
-  if (!channelMarksUpstream(entry.channel) || channelIsOneThread(entry.channel)) return;
-  const service = chatServiceOf(entry.channel);
-  let said = `Marked read here and in ${service}.`;
-  try {
-    const answer = await api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/upstream-read`, {
-      method: "POST", body: { message_id: id, after_reply: true },
-    });
-    said = replyMarkNotAsked(answer && answer.outcome, service) || said;
-  } catch (error) {
-    said = `Marked read here, not in ${service}: ${readableFailure(error, service)}`;
-  }
+  const mark = await markReadInService(entry.channel, id);
+  // Nothing asked: the Done's own words already say it was not marked in the chat service.
+  if (!mark.asked) return;
   // Said over the Done's own words, which say it was not marked in the chat service. Only for the
   // channel on screen: a reply that finished after the reader moved on says nothing over another.
   if (entry.channel !== String(el("discord-channel").value)) return;
-  setStatus(said + (bookmarkAnchor(entry.channel) ? " b goes back to your bookmark." : ""));
+  setStatus(serviceReadWords(mark) + (bookmarkAnchor(entry.channel) ? " b goes back to your bookmark." : ""));
 }
 
 // --- the conversation a reply goes into ---------------------------------------------------------

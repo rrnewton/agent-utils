@@ -20689,11 +20689,650 @@ test("e MARKS THE SELECTED MESSAGE DONE and moves on to the next unread below; e
   const calls = page.dismissCalls.length;
   await pressHere(page, "e", { repeat: true });
   assert.equal(page.dismissCalls.length, calls, "a held e marked another message Done");
-  // Shift+E: Done through here, the ⋯ menu's act.
+  // A held Shift+E likewise: one read and collapse, not one on every repeat (`#295 shift-e-read-collapse`).
+  await pressHere(page, "E", { shiftKey: true, repeat: true });
+  assert.equal(page.dismissCalls.length, calls, "a held Shift+E marked another message Done");
+});
+
+// --- `#295 shift-e-read-collapse` --------------------------------------------------------------
+//
+// The owner, 2026-10-14: Shift+E marked everything above the selected message read (Done through
+// here), which destroyed a detailed read history when pressed by accident; Undo saved it once. That
+// act keeps no key, only its ⋯ item and its Undo, and Shift+E is his idiom for ONE message: mark it
+// read and collapse it, to give the room back. tests/keyboard_browser.py presses the real key in
+// Chromium.
+
+/** Every row's Done and fold, by id: what a key that acts on one message must leave alone elsewhere. */
+const rowStates = (page, list = "discord-log") => Object.fromEntries(page.el(list).children.map((li) =>
+  [li.getAttribute("data-id"), `${li.getAttribute("data-archived")}/${li.getAttribute("data-collapsed")}`]));
+
+/** `rowStates` with message `id` left out. */
+const othersOf = (states, id) => Object.fromEntries(Object.entries(states).filter(([key]) => key !== id));
+
+/** The line in `readAndCollapse` that marks Done only a message not Done already. */
+const DONE_UNLESS_DONE = "  if (!wasDone) await markRowDone(ids, row);\n";
+
+/**
+ * A channel of thirty long messages at its top, message 3 selected and opened with Enter, then Shift+E.
+ * Answers the page and what was measured just before the key. `arrange` sets the page up before it
+ * signs in: whether its chat service has a read marker the server can move, for one.
+ */
+async function readCollapseOnThree(script = SCRIPT, arrange = null) {
+  const opened = await openThree(script, arrange);
+  const event = await pressHere(opened.page, "E", { shiftKey: true });
+  return { ...opened, event };
+}
+
+/** `readCollapseOnThree` short of the key: message 3 selected and opened, and what was measured then. */
+async function openThree(script = SCRIPT, arrange = null) {
+  const page = newPage(new Map(), script);
+  if (arrange) arrange(page);
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await press(page, area, "ArrowDown");
+  await pressHere(page, "j");
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), "3");
+  await pressHere(page, "Enter");
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "false", "Enter did not open message 3");
+  const before = {
+    states: rowStates(page), scrollTop: area.scrollTop, top: channelRow(page, "3").getBoundingClientRect().top,
+    dismissed: page.dismissCalls.length, height: channelRow(page, "3").getBoundingClientRect().height,
+  };
+  return { page, area, before };
+}
+
+test("Shift+E MARKS THE SELECTED MESSAGE DONE AND COLLAPSES IT, and nothing else changes (#295)", async () => {
+  const { page, area, before, event } = await readCollapseOnThree();
+  assert.equal(event.defaulted, false, "Shift+E on a selected message was left to the browser");
+  // The per-message read: exactly the request the row's Done button and e make, for this one message.
+  assert.deepStrictEqual(page.dismissCalls.slice(before.dismissed), [{ messages: ["3"] }],
+    "Shift+E did not mark exactly the selected message Done");
+  assert.deepStrictEqual(page.restoreCalls, [], "Shift+E put something back");
+  const row = channelRow(page, "3");
+  assert.equal(row.getAttribute("data-archived"), "true", "Shift+E did not mark the message Done");
+  assert.equal(row.getAttribute("data-collapsed"), "true", "Shift+E did not collapse the message");
+  assert.ok(row.getBoundingClientRect().height < before.height, "the collapsed message takes as much room as before");
+  // Nothing else: every other row as it was, the selection on the message, and the list where it was.
+  assert.deepStrictEqual(othersOf(rowStates(page), "3"), othersOf(before.states, "3"), "Shift+E changed another message");
+  assert.equal(selectedId(page), "3", "Shift+E moved the selection off the message");
+  assert.equal(area.scrollTop, before.scrollTop, "Shift+E scrolled the list");
+  assert.equal(row.getBoundingClientRect().top, before.top, "the message moved under the reader");
+  // This chat service has no read marker the server can move: nothing is asked of it, and the status
+  // line says the message was marked here only, as the Done's own words do.
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "a service with no read marker was asked to move it");
+  assert.equal(page.el("status").textContent, "Marked read here, not in Discord, and collapsed.",
+    "nothing said what Shift+E did, or where it marked the message");
+  // The fold is the message's, by id, as the fold control's is: a redraw draws it folded.
+  await refreshDiscord(page, tallChannel(30));
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "true", "a redraw opened the message again");
+  // Pressed again, on a message already Done and folded: it is only ever a mark, and puts nothing back.
+  const marked = page.dismissCalls.length;
   await pressHere(page, "E", { shiftKey: true });
-  const through = page.dismissCalls[page.dismissCalls.length - 1];
-  assert.ok(through && (through.through || (through.messages || []).length > 1),
-    `Shift+E did not mark through the selected message: ${JSON.stringify(through)}`);
+  assert.deepStrictEqual(page.restoreCalls, [], "Shift+E on a Done message put it back");
+  assert.equal(page.dismissCalls.length, marked, "Shift+E on a Done message wrote another Done");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "true");
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "a service with no read marker was asked to move it");
+  assert.equal(page.el("status").textContent, "Already read here, not in Discord, and collapsed.");
+  // Opened again and Shift+E: folded, still Done.
+  await pressHere(page, "Enter");
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "false");
+  await pressHere(page, "E", { shiftKey: true });
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "true", "Shift+E did not fold a Done message");
+  assert.deepStrictEqual(page.restoreCalls, [], "Shift+E on an open Done message put it back");
+  // Its Done is the last Done, and z (the Undo chip) puts back exactly that message.
+  await pressHere(page, "z");
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages), [["3"]], "z did not undo the Shift+E's Done");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "false");
+});
+
+test("Shift+E's negative controls: a key that does not fold, one that toggles, and the old Done through here all fail (#295)", async () => {
+  // Without the fold: the message stays open.
+  const unfolded = await readCollapseOnThree(brokenScript("const folded = foldForRead(pane, row);", "const folded = false;"));
+  assert.equal(channelRow(unfolded.page, "3").getAttribute("data-collapsed"), "false",
+    "the negative control folded the message anyway, so the check above proves nothing");
+  // As a toggle, the e key's act: a second press puts the message back.
+  const toggled = await readCollapseOnThree(brokenScript(DONE_UNLESS_DONE, "  await toggleArchived(ids, row);\n"));
+  await pressHere(toggled.page, "E", { shiftKey: true });
+  assert.notDeepStrictEqual(toggled.page.restoreCalls, [],
+    "the negative control's toggle put nothing back, so the check above proves nothing");
+  // The old act: every message above is marked too.
+  const through = await readCollapseOnThree(brokenScript("guardQuietly(() => readAndCollapse(pane, row, ids))();",
+    "guardQuietly(() => markReadThroughHere(row, ids[ids.length - 1]))();"));
+  assert.notDeepStrictEqual(othersOf(rowStates(through.page), "3"), othersOf(through.before.states, "3"),
+    "the negative control's Done through here changed no other message, so the check above proves nothing");
+});
+
+/**
+ * Message 5 of thirty long messages opened, the list scrolled so that its head is `above` pixels over
+ * the top of the screen and its foot on it, then Shift+E. Answers how far message 6, the line below
+ * it, moved, and where message 5 ended up.
+ */
+async function readCollapseScrolledPast(script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await press(page, area, "ArrowDown");
+  for (let i = 0; i < 4; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), "5");
+  await pressHere(page, "Enter");
+  const row = channelRow(page, "5");
+  const height = row.getBoundingClientRect().height;
+  // Its foot 100px down the screen, so its head is above the top: read most of the way through.
+  area.scrollTop += row.getBoundingClientRect().bottom - 100;
+  const was = row.getBoundingClientRect();
+  assert.ok(was.top < -LINE_PX && was.bottom === 100, `message 5 is not scrolled part way past: ${JSON.stringify(was)}`);
+  assert.ok(height > 100 + LINE_PX * 2, "message 5 is too short for this case");
+  const next = channelRow(page, "6").getBoundingClientRect().top;
+  await pressHere(page, "E", { shiftKey: true });
+  const now = row.getBoundingClientRect();
+  return { page, row, moved: channelRow(page, "6").getBoundingClientRect().top - next, foot: now.bottom - was.bottom, now };
+}
+
+test("Shift+E ON A MESSAGE READ PART WAY PAST keeps the line below where it was, and the folded message on screen (#280, #295)", async () => {
+  const { page, row, moved, foot, now } = await readCollapseScrolledPast();
+  assert.equal(row.getAttribute("data-collapsed"), "true", "Shift+E did not collapse the message");
+  assert.equal(row.getAttribute("data-archived"), "true", "Shift+E did not mark the message Done");
+  assert.equal(moved, 0, `the message below moved ${moved}px under the reader`);
+  assert.equal(foot, 0, `the collapsed message's foot moved ${foot}px`);
+  assert.ok(now.bottom > 0, "the collapsed message went off the top of the screen");
+  assert.equal(selectedId(page), "5");
+  // The control: the fold control's own hold, on the row's head, wherever that head is. Holding a
+  // head that is off the screen carries the folded message off it, and lifts the rest up past the
+  // place being read.
+  const control = await readCollapseScrolledPast(brokenScript("if (was.top >= head - 1 || atBottom(area)) {", "if (true) {"));
+  assert.notEqual(control.moved, 0, "the negative control held the line below too, so this fixture cannot tell them apart");
+  assert.ok(control.now.bottom <= 0, "the negative control kept the folded message on screen, so the check above proves nothing");
+});
+
+/** A message taller than the screen opened, read part way through with ↓, then Shift+E. */
+async function readCollapseTall(script = SCRIPT) {
+  const huge = "a line of the agent's long report. ".repeat(320);
+  const page = newPage(new Map(), script);
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1", content: SHORT_MESSAGE }),
+    message({ id: "2", content: huge }),
+    ...tallChannel(6).map((m, i) => ({ ...m, id: String(10 + i) })),
+  ]);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await press(page, area, "j");
+  await pressHere(page, "j");
+  await pressHere(page, "Enter");
+  const row = channelRow(page, "2");
+  for (let i = 0; i < 4; i += 1) await pressHere(page, "ArrowDown");
+  const was = row.getBoundingClientRect();
+  assert.equal(selectedId(page), "2");
+  assert.ok(was.top < 0 && was.bottom > SCROLL_VIEWPORT_PX, `the message does not span the screen: ${JSON.stringify(was)}`);
+  await pressHere(page, "E", { shiftKey: true });
+  // The top of the list is under what floats over its head, the freshness pill and the glass.
+  const head = Math.max(0, ...["channel-freshness", "search-float"].map((id) => page.el(id))
+    .filter((node) => !node.hidden).map((node) => node.getBoundingClientRect().bottom));
+  return { page, row, head, top: row.getBoundingClientRect().top };
+}
+
+test("Shift+E ON A MESSAGE TALLER THAN THE SCREEN, read part way through, brings its head to the top (#280, #295)", async () => {
+  const { page, row, head, top } = await readCollapseTall();
+  assert.equal(row.getAttribute("data-collapsed"), "true");
+  assert.equal(top, head, "the collapsed message's head is not at the top of the list");
+  assert.equal(channelRow(page, "10").getBoundingClientRect().top, row.getBoundingClientRect().bottom,
+    "the message after it is not right below it");
+  // The control: its foot held, though the foot is below the screen. The list runs back up past
+  // everything the reader had read, and the folded message is nowhere near the top.
+  const control = await readCollapseTall(brokenScript("now.bottom - was.bottom : now.top - head;",
+    "now.bottom - was.bottom : now.bottom - was.bottom;"));
+  assert.notEqual(control.top, head,
+    "the negative control also brought the folded message to the top, so the check above proves nothing");
+});
+
+test("Shift+E on a short message, which has no fold, marks it and says only that (#295)", async () => {
+  const page = await keyboardPageAtTop(backlog(4));
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await pressHere(page, "j");
+  const id = selectedId(page);
+  await pressHere(page, "E", { shiftKey: true });
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [id] }]);
+  assert.equal(page.el("status").textContent, "Marked read here, not in Discord.");
+  assert.equal(selectedId(page), id);
+});
+
+test("Shift+E UNDER COLLAPSE READ joins the message to the read run round it, the selection on the run's line; UNDER HIDE READ the selection goes on to the next message (#221, #295)", async () => {
+  // Collapse read: unread, two read, unread, two read, then unread. Shift+E on the unread one between
+  // the runs joins them, as its Done button's Done does, and the selection is left on what the reader
+  // sees there: the line of the run, which the message is now inside.
+  const page = newPage();
+  const messages = joiningChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < 3 && selectedId(page) !== messages[3].id; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), messages[3].id, "the premise is the unread message between the runs selected");
+  await pressHere(page, "E", { shiftKey: true });
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [messages[3].id] }], "Shift+E marked more than its message");
+  assert.equal(readRunLineOf(rowWithId(page, messages[1].id)).textContent, "… 5 read messages …",
+    "the runs did not join round the message Shift+E marked");
+  assert.equal(rowWithId(page, messages[3].id).hidden, true, "the message is still drawn outside the run");
+  assert.equal(selectedId(page), messages[1].id, "the selection is not on the run's line");
+  // A read message alone between unread ones is shown, Collapse read's own rule: there the selection
+  // stays on it.
+  for (let i = 0; i < 6 && selectedId(page) !== messages[8].id; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), messages[8].id);
+  await pressHere(page, "E", { shiftKey: true });
+  await page.settle();
+  assert.equal(rowWithId(page, messages[8].id).getAttribute("data-archived"), "true");
+  assert.equal(rowWithId(page, messages[8].id).hasAttribute("data-read-run"), false, "a read message alone was collapsed");
+  assert.equal(selectedId(page), messages[8].id, "the selection left a read message still shown");
+
+  // Hide read: the message goes, and the selection with it to the next message shown.
+  const hide = await keyboardPageAtTop();
+  await turnTodoOn(hide);
+  hide.el("scroll-area").scrollTop = 0;
+  await press(hide, hide.el("scroll-area"), "ArrowDown");
+  await pressHere(hide, "j");
+  assert.equal(selectedId(hide), "2");
+  await pressHere(hide, "E", { shiftKey: true });
+  await hide.settle();
+  assert.deepStrictEqual(hide.dismissCalls, [{ messages: ["2"] }], "Shift+E marked more than its message");
+  assert.ok(!channelRow(hide, "2") || channelRow(hide, "2").hidden, "Hide read still shows the message Shift+E marked");
+  assert.equal(selectedId(hide), "3", "the selection did not go on to the next message");
+});
+
+test("Shift+E IN THE RIGHT COLUMN acts on the message selected there, and on nothing in Main (#295)", async () => {
+  const page = newPage();
+  const data = threadData();
+  // The thread's messages long enough to fold.
+  const messages = data.messages.map((m) => ({ ...m, content: longMessage(m.content) }));
+  page.threadingSupported = true;
+  page.threads = data.threads.map((t) => ({ ...t, root: messages.find((m) => m.id === t.root.id) }));
+  page.messages = messages;
+  page.upstreamReadMarkSupported = true;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await twoColumns(page);
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  const main = rowStates(page);
+  await press(page, page.el("side-scroll"), "ArrowDown");
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), "202", `the thread's answer is not selected: ${selectedId(page)}`);
+  await pressHere(page, "Enter");
+  assert.equal(sideRow(page, "202").getAttribute("data-collapsed"), "false", "Enter did not open the answer");
+  await pressHere(page, "E", { shiftKey: true });
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["202"] }], "Shift+E in the right column marked something else");
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "202", after_reply: true }],
+    "Shift+E in the right column did not mark its message read in the chat service");
+  assert.equal(sideRow(page, "202").getAttribute("data-archived"), "true");
+  assert.equal(sideRow(page, "202").getAttribute("data-collapsed"), "true", "Shift+E did not collapse the right column's message");
+  assert.deepStrictEqual(rowStates(page), main, "Shift+E in the right column changed a message of Main");
+  assert.equal(selectedId(page), "202");
+});
+
+// Shift+E's read is the one a sent reply makes (`#300 reply-marks-read`): Done here, then the chat
+// service's own read marker moved through the message where the server can move it, asked
+// `after_reply` so the server keeps it forward and asks once. Never after a Done that failed, and never
+// on a channel that is one thread of a larger space. A message already Done is not written Done again,
+// and its service half is still asked, which the server's floor answers without asking the service
+// where it has marked through that message already.
+
+/** `readCollapseOnThree` on a page whose chat service has a read marker the server can move. */
+const readCollapseMarked = (script = SCRIPT, arrange = null) =>
+  readCollapseOnThree(script, (page) => { page.upstreamReadMarkSupported = true; if (arrange) arrange(page); });
+
+/** The line in `readAndCollapse` that asks the chat service, taken out for a negative control. */
+const ASKS_SERVICE = "  const mark = await markReadInService(channel, ids[ids.length - 1]);\n";
+
+/**
+ * The server's floor for a mark asked `after_reply`, as src/reply_read.rs keeps it, on this fake: per
+ * channel, the newest message marked through. A message at or before it is answered `already_marked`
+ * or `behind`, and the service is not asked; any other mark is asked of the service, and moves the
+ * floor forward. The owner's own mark, asked without `after_reply`, is always asked of the service.
+ * Answers the list of message ids that reached the service.
+ */
+function serverFloor(page) {
+  const asked = [];
+  let through = null;
+  page.upstreamReadResponse = (body) => {
+    const id = BigInt(body.message_id);
+    let outcome = "marked";
+    if (body.after_reply && through !== null && id <= through) {
+      outcome = id === through ? "already_marked" : "behind";
+    } else {
+      asked.push(String(body.message_id));
+      if (through === null || id > through) through = id;
+    }
+    return json(200, { channel: CHANNEL, through: body.message_id, ...(body.after_reply ? { outcome } : {}),
+      upstream_read_notice: "The source chat provider's read cursor was moved through this message." });
+  };
+  return asked;
+}
+
+/**
+ * Shift+E on message 3 with the server's floor, then again on it once opened, then e on message 4 and
+ * Shift+E on it. Answers the page, the floor's asks of the service, and the status line after each.
+ */
+async function readCollapseTwice(script = SCRIPT) {
+  let asked = null;
+  const { page, before } = await readCollapseMarked(script, (p) => { asked = serverFloor(p); });
+  const said = [page.el("status").textContent];
+  await pressHere(page, "Enter");
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "false", "the premise is the message opened again");
+  await pressHere(page, "E", { shiftKey: true });
+  said.push(page.el("status").textContent);
+  const again = { dismissed: page.dismissCalls.length - before.dismissed, asked: [...asked] };
+  await pressHere(page, "j");
+  assert.equal(selectedId(page), "4");
+  await pressHere(page, "e");
+  assert.equal(page.dismissCalls.at(-1).messages.join(), "4", "the premise is e marking message 4 Done");
+  const afterE = page.upstreamReadCalls.length;
+  await pressHere(page, "k");
+  assert.equal(selectedId(page), "4");
+  await pressHere(page, "E", { shiftKey: true });
+  said.push(page.el("status").textContent);
+  return { page, before, asked, said, again, afterE };
+}
+
+test("Shift+E MARKS THE MESSAGE READ IN THE CHAT SERVICE where the server can move its marker: asked once, after the Done, as a reply's mark (#295, #300)", async () => {
+  const { page, before } = await readCollapseMarked();
+  assert.deepStrictEqual(page.dismissCalls.slice(before.dismissed), [{ messages: ["3"] }], "the premise is the Done");
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "3", after_reply: true }],
+    "Shift+E did not ask the chat service to mark the message read, as a reply's mark");
+  const dismissed = page.requests.findIndex((one) => one.endsWith("/dismiss"));
+  const marked = page.requests.findIndex((one) => one.endsWith("/upstream-read"));
+  assert.ok(dismissed >= 0 && marked > dismissed, "the chat service was asked before the Done was saved");
+  assert.equal(page.el("status").textContent, "Marked read here and in Discord, and collapsed.",
+    "the status line does not say the chat service was marked");
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "true");
+  assert.equal(page.el("error").hidden, true, `the mark put up the error banner: ${page.el("error").textContent}`);
+
+  // THE CONTROLS. Where the service has no marker the server can move, nothing is asked (the first
+  // test above): without the provider's word checked, it is asked all the same. Without the ask,
+  // Shift+E is the branch as it was before #300: Done here only.
+  const { page: unmarked } = await readCollapseOnThree(brokenScript(
+    "  if (!channelMarksUpstream(channel)) return none;\n", ""));
+  assert.deepStrictEqual(unmarked.upstreamReadCalls, [{ message_id: "3", after_reply: true }],
+    "with the provider's word unchecked nothing was asked, so the first test's check cannot see it");
+  const { page: unasked } = await readCollapseMarked(brokenScript(ASKS_SERVICE,
+    "  const mark = { service: \"Discord\", asked: false, marked: false, already: false, why: \"\" };\n"));
+  assert.deepStrictEqual(unasked.upstreamReadCalls, [], "with the ask taken out it still asked, so this test cannot see it");
+});
+
+test("Shift+E ON A MESSAGE ALREADY DONE writes no second Done, and asks the service only what the server's floor has not marked: never again after a Shift+E, once after e (#295, #300)", async () => {
+  // DECIDED: a message already Done is not marked Done again, but its chat service's half is asked,
+  // `after_reply`, so the server's floor answers for a message it has marked through already and asks
+  // the service nothing. A Done made by e, which leaves the service's marker, is read there by Shift+E.
+  const { page, before, asked, said, again, afterE } = await readCollapseTwice();
+  assert.equal(said[0], "Marked read here and in Discord, and collapsed.");
+  // Pressed again on message 3, Done and marked through already.
+  assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "true", "Shift+E did not fold the Done message");
+  assert.equal(again.dismissed, 1, "Shift+E on a Done message wrote another Done");
+  assert.deepStrictEqual(page.upstreamReadCalls.slice(0, 2), [{ message_id: "3", after_reply: true },
+    { message_id: "3", after_reply: true }], "the second press was not asked as a reply's mark is, for the server's floor");
+  assert.deepStrictEqual(again.asked, ["3"], "the second press on a message marked through asked the service again");
+  assert.equal(said[1], "Already read here and in Discord, and collapsed.");
+  assert.deepStrictEqual(page.restoreCalls, [], "Shift+E on a Done message put it back");
+  // e asks the service nothing; Shift+E then on the message e marked Done reads it there, once.
+  assert.equal(afterE, 2, "e asked the chat service");
+  assert.equal(page.dismissCalls.length, before.dismissed + 2, "Shift+E on the message e marked Done wrote another Done");
+  assert.deepStrictEqual(page.upstreamReadCalls.at(-1), { message_id: "4", after_reply: true });
+  assert.deepStrictEqual(asked, ["3", "4"], "Shift+E on a message e marked Done did not read it in the service");
+  assert.equal(said[2], "Already read here; now marked read in Discord too, and collapsed.");
+
+  // THE CONTROLS. Without the already-Done check the second press writes a second Done. Without the
+  // service's half for a Done message, the message e marked is never read in the service. Without
+  // `after_reply`, the server's floor is not consulted, and the second press asks the service again.
+  const twice = await readCollapseTwice(brokenScript(DONE_UNLESS_DONE, "  await markRowDone(ids, row);\n"));
+  assert.equal(twice.again.dismissed, 2,
+    "with the already-Done check taken out the second press wrote no second Done, so this test cannot see it");
+  const skipped = await readCollapseTwice(brokenScript(ASKS_SERVICE, "  const mark = wasDone ? { service: \"Discord\", " +
+    "asked: false, marked: false, already: false, why: \"\" } : await markReadInService(channel, ids[ids.length - 1]);\n"));
+  assert.deepStrictEqual(skipped.asked, ["3"],
+    "with a Done message asking nothing the message e marked was read in the service, so this test cannot see it");
+  const owner = await readCollapseTwice(brokenScript("body: { message_id: String(id), after_reply: true }",
+    "body: { message_id: String(id) }"));
+  assert.deepStrictEqual(owner.again.asked, ["3", "3"],
+    "without after_reply the second press did not reach the service, so this fake cannot tell the floor is used");
+});
+
+test("Shift+E asks the chat service nothing after a Done that failed, and the failure is said (#295, #300)", async () => {
+  const refuse = (page) => {
+    page.inboxWriteHook = async (kind) => (kind === "dismiss"
+      ? json(502, { error: "store_error", detail: "the store is read-only" }) : null);
+  };
+  const { page } = await readCollapseMarked(SCRIPT, refuse);
+  await page.settle();
+  assert.equal(page.dismissCalls.length >= 1, true, "the premise is a Done asked for");
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "the chat service was asked after a Done that failed");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "false", "a Done that failed left the row Done");
+  assert.equal(page.el("error").hidden, false, "a Done that failed said nothing");
+  assert.doesNotMatch(page.el("status").textContent, /^Marked read/, "a Done that failed was said as a read");
+  // THE CONTROL: with the failure swallowed, the service is asked all the same.
+  const { page: control } = await readCollapseMarked(brokenScript(DONE_UNLESS_DONE,
+    "  if (!wasDone) await markRowDone(ids, row).catch(() => {});\n"), refuse);
+  await control.settle();
+  assert.equal(control.upstreamReadCalls.length, 1,
+    "with the failure swallowed nothing was asked, so this test cannot see it");
+});
+
+// A message is drawn Done the moment it is marked, before its write has even been sent. Shift+E pressed
+// on it again meanwhile — the key twice in quick succession, or after e or the Done button — must not
+// take that for a saved Done: the chat service's marker, once moved, cannot be moved back.
+
+/** The line in `readAndCollapse` that waits for a Done still being saved, taken out for a negative control. */
+const WAITS_FOR_SAVE = "  if (wasDone && !(await doneSaved(ids))) return;\n";
+
+/**
+ * Message 3 opened and its Done made by `first`, Shift+E or e, held on its way to the server; Shift+E
+ * pressed on it meanwhile; then the Done answered `answer`, or saved where that is null. Answers the
+ * page, what was asked of the chat service while the Done was on its way, and the server's floor's asks
+ * of the service.
+ */
+async function readCollapseWhileSaving(answer, first, script = SCRIPT) {
+  let release = () => {};
+  let asked = null;
+  const { page, before } = await openThree(script, (p) => {
+    p.upstreamReadMarkSupported = true;
+    asked = serverFloor(p);
+    p.inboxWriteHook = async (kind) => (kind === "dismiss"
+      ? new Promise((resolve) => { release = () => resolve(answer); }) : null);
+  });
+  if (first === "e") {
+    await pressHere(page, "e");
+    await pressHere(page, "k");
+  } else {
+    await pressHere(page, "E", { shiftKey: true });
+  }
+  assert.deepStrictEqual(page.dismissCalls.slice(before.dismissed), [{ messages: ["3"] }],
+    `the premise is ${first}'s Done of message 3 on its way`);
+  assert.equal(selectedId(page), "3");
+  assert.equal(channelRow(page, "3").getAttribute("data-archived"), "true", "the premise is the message drawn Done already");
+  await pressHere(page, "E", { shiftKey: true });
+  const whileSaving = [...page.upstreamReadCalls];
+  release();
+  await page.settle();
+  await page.settle();
+  return { page, before, whileSaving, asked };
+}
+
+test("SHIFT+E PRESSED WHILE A DONE IS STILL BEING SAVED asks the chat service only once it is saved, and nothing, and says no read, once it has failed (#295, #300)", async () => {
+  const failing = json(502, { error: "store_error", detail: "the store is read-only" });
+  for (const first of ["Shift+E", "e"]) {
+    const failed = await readCollapseWhileSaving(failing, first);
+    assert.deepStrictEqual(failed.whileSaving, [], `Shift+E after ${first} asked the chat service before the Done was saved`);
+    assert.deepStrictEqual(failed.page.upstreamReadCalls, [], `Shift+E after ${first} asked the chat service after the Done failed`);
+    assert.deepStrictEqual(failed.asked, [], "the chat service's marker was moved for a Done that failed");
+    assert.equal(channelRow(failed.page, "3").getAttribute("data-archived"), "false", "a Done that failed left the row Done");
+    assert.equal(failed.page.el("error").hidden, false, "a Done that failed said nothing");
+    assert.doesNotMatch(failed.page.el("status").textContent, /read here/, "a Done that failed was said as a read");
+    // Saved: asked once it is, as `after_reply`, and the service reached once for both presses.
+    const saved = await readCollapseWhileSaving(null, first);
+    assert.deepStrictEqual(saved.whileSaving, [], `Shift+E after ${first} asked the chat service before the Done was saved`);
+    assert.equal(saved.page.dismissCalls.length, saved.before.dismissed + 1, "Shift+E on a message being saved wrote a second Done");
+    assert.ok(saved.page.upstreamReadCalls.length >= 1 && saved.page.upstreamReadCalls.every((call) =>
+      call.message_id === "3" && call.after_reply === true), `the saved Done was not marked in the chat service as a reply's mark: ${
+      JSON.stringify(saved.page.upstreamReadCalls)}`);
+    assert.deepStrictEqual(saved.asked, ["3"], "the chat service was not reached exactly once");
+    assert.match(saved.page.el("status").textContent, /read here and in Discord, and collapsed\.$|^Already read here; now marked read in Discord too, and collapsed\.$/,
+      "the saved Done's mark in the chat service was not said");
+    assert.equal(channelRow(saved.page, "3").getAttribute("data-archived"), "true");
+    assert.equal(saved.page.el("error").hidden, true, `the mark put up the error banner: ${saved.page.el("error").textContent}`);
+  }
+
+  // THE CONTROLS. Without the wait, the second press takes the Done being saved for a saved one and
+  // asks the service at once, so its marker moves for a Done that then fails, and a read is said.
+  // Waiting without looking again asks it once the Done has failed.
+  for (const first of ["Shift+E", "e"]) {
+    const unwaited = await readCollapseWhileSaving(failing, first, brokenScript(WAITS_FOR_SAVE, ""));
+    assert.deepStrictEqual(unwaited.whileSaving, [{ message_id: "3", after_reply: true }],
+      `without the wait Shift+E after ${first} did not ask before the Done was saved, so this test cannot see it`);
+    assert.match(unwaited.page.el("status").textContent, /read here/,
+      "without the wait no read was said, so this test cannot see it");
+  }
+  const unlooked = await readCollapseWhileSaving(failing, "Shift+E",
+    brokenScript("if (saving.length === 0) return ids.every((id) => archivedIds.has(String(id)));",
+      "if (saving.length === 0) return true;"));
+  assert.deepStrictEqual(unlooked.whileSaving, [], "the control waited no longer");
+  assert.deepStrictEqual(unlooked.asked, ["3"],
+    "waiting without looking again asked nothing after the failed Done, so this test cannot see it");
+});
+
+test("Shift+E on a channel that is one thread of a larger space marks it Done and asks the service nothing, and says why (#295, #300)", async () => {
+  const run = async (script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = true;
+    const data = scopedData();
+    serveScoped(page, data.summary);
+    await signIn(page);
+    await showDiscord(page, data.messages.slice(0, 3));
+    page.el("scroll-area").scrollTop = 0;
+    await press(page, page.el("scroll-area"), "ArrowDown");
+    await pressHere(page, "j");
+    assert.equal(selectedId(page), "302");
+    await pressHere(page, "E", { shiftKey: true });
+    await page.settle();
+    return page;
+  };
+  const page = await run();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["302"] }], "the Done did not stand");
+  assert.deepStrictEqual(page.upstreamReadCalls, [],
+    "Shift+E in one thread of a larger space asked to move the whole space's read marker");
+  assert.equal(page.el("status").textContent,
+    "Marked read here, not in Discord: this channel is one thread of a larger space there, and its read marker covers the whole space.");
+  // THE CONTROL: without the page's own check it asks.
+  const control = await run(brokenScript("  if (channelIsOneThread(channel)) return", "  if (false) return"));
+  assert.deepStrictEqual(control.upstreamReadCalls, [{ message_id: "302", after_reply: true }],
+    "with the check taken out nothing was asked, so this test cannot see it");
+});
+
+test("Shift+E says a chat service that refused or did not ask, with the reason, and the Done stands; a combined row is marked through its newest message (#295, #300)", async () => {
+  // The server's answer that it asked the service nothing: the status line says not marked there, and why.
+  const notAsked = (body) => json(200, { channel: CHANNEL, through: body.message_id, outcome: "scope_unknown",
+    upstream_read_notice: "The source chat provider was not asked to move its read cursor." });
+  const { page } = await readCollapseMarked(SCRIPT, (p) => { p.upstreamReadResponse = notAsked; });
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "3", after_reply: true }], "the premise is the server asked");
+  assert.equal(page.el("status").textContent,
+    "Marked read here, not in Discord, and collapsed: it cannot say whether its read marker covers more than this channel.");
+  // The service refusing: said on the status line, not in the error banner, and the Done stands.
+  const down = (p) => { p.upstreamReadResponse = () => json(503, { error: "upstream_unavailable", detail: "Google Chat returned HTTP 429" }); };
+  const { page: refused } = await readCollapseMarked(SCRIPT, down);
+  assert.match(refused.el("status").textContent, /^Marked read here, not in Discord, and collapsed: /,
+    "a mark the service refused was not said, or was said as a success");
+  assert.equal(refused.el("error").hidden, true, `a refused mark put up the error banner: ${refused.el("error").textContent}`);
+  assert.equal(channelRow(refused, "3").getAttribute("data-archived"), "true", "a refused mark took the Done back");
+
+  // A combined row: Done for every message in it, and the service's marker through the newest.
+  const combined = newPage();
+  combined.upstreamReadMarkSupported = true;
+  await signIn(combined);
+  const rows = await showDiscord(combined, [
+    message({ id: "8000000000000000100", content: "first half", timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8000000000000000101", content: "second half", timestamp: "2026-08-19T04:31:01.000Z" }),
+  ]);
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  await press(combined, combined.el("scroll-area"), "ArrowDown");
+  await pressHere(combined, "E", { shiftKey: true });
+  await combined.settle();
+  assert.deepStrictEqual(combined.dismissCalls, [{ messages: ["8000000000000000100", "8000000000000000101"] }]);
+  assert.deepStrictEqual(combined.upstreamReadCalls, [{ message_id: "8000000000000000101", after_reply: true }],
+    "the chat service's marker stopped before the end of the combined row");
+  assert.equal(combined.el("status").textContent, "Marked read here and in Discord.", "a short row said it was collapsed");
+});
+
+test("NO KEY MARKS EVERY MESSAGE ABOVE ONE READ ANY MORE: not Shift+E, nor any key the page answers (#295)", async () => {
+  // In the table the keys are answered from, nothing names the act, its ⋯ item, or the backlog's clear.
+  const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
+  assert.ok(table, "web/voice.js has no KEYMAP table");
+  assert.doesNotMatch(table[1], /markReadThroughHere|throughHere|row-read-through-button|clearBacklog|clear-backlog/,
+    "a key still reaches Done through here or Clear the backlog");
+  // Done through here's one caller is its ⋯ item's click: the definition and that call, nothing else.
+  assert.equal([...SCRIPT_CODE.matchAll(/\bmarkReadThroughHere\(/g)].length, 2,
+    "Done through here has a caller besides its ⋯ item");
+  // Every chord of every binding in the table, pressed on the newest of six unread messages: nothing
+  // marks more than that one message, and nothing marks through a boundary.
+  const chords = [...table[1].matchAll(/\{\s*key:\s*"((?:[^"\\]|\\.)+)"([^}]*)\}/g)].map((m) => ({
+    key: JSON.parse(`"${m[1]}"`), shiftKey: /shift:\s*true/.test(m[2]), ctrlKey: /mod:\s*true/.test(m[2]),
+    altKey: /alt:\s*true/.test(m[2]),
+  }));
+  assert.ok(chords.length >= 40, `only ${chords.length} chords were found in KEYMAP`);
+  assert.ok(chords.some((c) => c.key === "e" && c.shiftKey), "Shift+E is not among the chords swept");
+  const sweep = async (script, only = null) => {
+    const wide = [];
+    for (const chord of only ? chords.filter(only) : chords) {
+      const page = newPage(new Map(), script);
+      await signIn(page);
+      await showDiscord(page, backlog(6));
+      await press(page, page.el("scroll-area"), "End");
+      const { key, ...fields } = chord;
+      await pressHere(page, key, fields);
+      await page.settle();
+      for (const call of page.dismissCalls) {
+        if (call.through !== undefined || (call.messages || []).length > 1) wide.push({ chord, call });
+      }
+    }
+    return wide;
+  };
+  assert.deepStrictEqual(await sweep(SCRIPT), [], "a key marked more than the message it was pressed on");
+  // The control: Shift+E as it was. The sweep has to see it.
+  const old = brokenScript("guardQuietly(() => readAndCollapse(pane, row, ids))();",
+    "guardQuietly(() => markReadThroughHere(row, ids[ids.length - 1]))();");
+  const caught = await sweep(old, (c) => c.key === "e");
+  assert.ok(caught.some(({ chord }) => chord.shiftKey), "the sweep did not catch the old Shift+E, so it proves nothing");
+});
+
+test("DONE THROUGH HERE STILL WORKS FROM ITS ⋯ ITEM, with its Undo, and announces no key (#202, #295)", async () => {
+  const page = await keyboardPage();
+  const item = readThroughButton(channelRow(page, "5"));
+  assert.ok(item, "the ⋯ menu has no Through here");
+  assert.equal(item.getAttribute("aria-keyshortcuts"), null, "the ⋯ item still announces a key");
+  assert.equal(item.textContent, "Through here");
+  await item.click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["1", "2", "3", "4", "5"]],
+    "Through here did not mark the message and every one above it");
+  for (const id of ["1", "5"]) assert.equal(channelRow(page, id).getAttribute("data-archived"), "true");
+  assert.equal(channelRow(page, "6").getAttribute("data-archived"), "false", "Through here marked a message below it");
+  assert.equal(page.el("status").textContent, "Marked 5 messages read.");
+  assert.equal(page.el("undo-dismiss").hidden, false, "Through here offered no Undo");
+  assert.equal(page.el("undo-dismiss-label").textContent, "Undo Done (5)");
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages), [["1", "2", "3", "4", "5"]],
+    "the Undo did not put back exactly what Through here marked");
+  for (const id of ["1", "5"]) assert.equal(channelRow(page, id).getAttribute("data-archived"), "false");
+  // And z, the Undo from the keyboard, as before.
+  await readThroughButton(channelRow(page, "3")).click();
+  await page.settle();
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.at(-1).messages, ["1", "2", "3"], "z did not undo Through here");
 });
 
 // --- `#245 done-feedback` ------------------------------------------------------------------------
@@ -20752,7 +21391,7 @@ test("A DONE THE SERVER REFUSED takes the moment back, so an unread row never we
   assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 0, "a timer was left to draw a Done that never happened");
 });
 
-test("the Done button, a swipe and Done through here draw it too, on the row they acted on (#245)", async () => {
+test("the Done button, a swipe, Done through here and Shift+E draw it too, on the row they acted on (#245, #295)", async () => {
   const page = await keyboardPageAtTop();
   await doneButton(channelRow(page, "4")).click();
   assert.equal(flashOf(page, "4"), "marking", "the Done button marked a row and drew nothing");
@@ -20765,15 +21404,30 @@ test("the Done button, a swipe and Done through here draw it too, on the row the
   await page.settle();
   assert.equal(channelRow(page, "6").getAttribute("data-archived"), "true", "the swipe marked nothing");
   assert.equal(flashOf(page, "6"), "marking", "a swipe marked a row and drew nothing");
-  // Shift+E from row 9: every row above it is marked, and the one the reader is on is the one drawn.
-  page.el("scroll-area").scrollTop = 0;
-  await press(page, page.el("scroll-area"), "ArrowDown");
-  for (let i = 0; i < 8; i += 1) await pressHere(page, "j");
-  const boundary = selectedId(page);
-  await pressHere(page, "E", { shiftKey: true });
+  // Done through here from row 9's ⋯ menu: every row above it is marked, and the one it was asked
+  // from is the one drawn.
+  const boundary = "9";
+  await readThroughButton(channelRow(page, boundary)).click();
+  await page.settle();
   assert.equal(channelRow(page, "7").getAttribute("data-archived"), "true", "Done through here marked nothing");
   assert.equal(flashOf(page, boundary), "marking", "Done through here drew nothing on the row it was asked from");
   assert.equal(flashOf(page, "7"), null, "every row Done through here marked was flashed, not the one asked from");
+  // Shift+E's read and collapse (`#295 shift-e-read-collapse`) on row 12, with rows 10 and 11 still to
+  // read above it: it marks row 12 alone, through `markRowDone`, and draws the moment on that row. Done
+  // through here, which Shift+E used to be, marks 10 and 11 too and draws only 12: that is the
+  // difference these lines see, where a row Done and drawn on 12 alone would be true of both.
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  for (let i = 0; i < 11; i += 1) await pressHere(page, "j");
+  assert.equal(selectedId(page), "12");
+  for (const id of ["10", "11"]) assert.equal(channelRow(page, id).getAttribute("data-archived"), "false", `the premise is ${id} unread`);
+  await pressHere(page, "E", { shiftKey: true });
+  assert.deepStrictEqual(page.dismissCalls.at(-1), { messages: ["12"] }, "Shift+E did not write row 12 alone Done");
+  assert.equal(flashOf(page, "12"), "marking", "Shift+E marked a row and drew nothing");
+  for (const id of ["10", "11"]) {
+    assert.equal(channelRow(page, id).getAttribute("data-archived"), "false", `Shift+E marked row ${id} above it Done`);
+    assert.equal(flashOf(page, id), null, `Shift+E drew the moment on row ${id}, which it was not pressed on`);
+  }
 });
 
 test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done through here (#245)", async () => {
@@ -20806,9 +21460,9 @@ test("THE UNDO CHIP NAMES THE MESSAGE it would put back, and counts a Done throu
   assert.equal(page.el("undo-dismiss-label").text(), "Undo");
   assert.equal(page.el("undo-dismiss-label").children.length, 0, "the name outlived the dismissal it named");
   assert.equal(page.el("undo-dismiss").hasAttribute("aria-label"), false, "the name outlived the dismissal it named");
-  // Several rows at once are counted, not named after one of them.
-  for (let i = 0; i < 3; i += 1) await pressHere(page, "j");
-  await pressHere(page, "E", { shiftKey: true });
+  // Several rows at once are counted, not named after one of them: Done through here, from the ⋯ menu.
+  await readThroughButton(channelRow(page, "4")).click();
+  await page.settle();
   assert.match(page.el("undo-dismiss-label").textContent, /^Undo Done \(\d+\)$/);
   assert.equal(page.el("undo-dismiss-label").textContent, `Undo Done (${page.dismissCalls.at(-1).messages.length})`);  assert.equal(page.el("undo-dismiss").getAttribute("title"), page.el("undo-dismiss-label").textContent);
 });
@@ -48159,17 +48813,21 @@ test("`#240 reading-bookmark`: Done through here at or below the line slides it 
   await throughHere(other, bid(2));
   assert.deepStrictEqual(bookmarkAt(other), { id: bid(4), place: "above" }, "a Done above the line moved it");
   assert.equal(other.bookmarkCalls.length, calls);
-  // Shift+E from the keyboard is the same act, and the selection lands where the line does.
+  // Shift+E is not this act any more (`#295 shift-e-read-collapse`): it marks the one message, and the
+  // line moves as e's Done moves it, from the message right under it to the next one still to read.
   const keys = newPage();
   await signIn(keys);
   await showDiscord(keys, backlog(6));
   keys.el("scroll-area").scrollTop = 0;
-  await bookmarkRow(keys, bid(0));
+  await bookmarkRow(keys, bid(1));
   await press(keys, keys.el("scroll-area"), "ArrowDown");
   await pressHere(keys, "j");
+  assert.equal(selectedId(keys), bid(1));
   await pressHere(keys, "E", { shiftKey: true });
-  assert.deepStrictEqual(bookmarkAt(keys), { id: bid(2), place: "above" });
-  assert.equal(selectedId(keys), bid(2), "the selection and the bookmark parted company");
+  assert.deepStrictEqual(keys.dismissCalls.map((call) => call.messages), [[bid(1)]],
+    "Shift+E marked more than the message it was pressed on");
+  assert.deepStrictEqual(bookmarkAt(keys), { id: bid(2), place: "above" }, "Shift+E did not slide the line as e does");
+  assert.equal(selectedId(keys), bid(1), "Shift+E moved the selection off the message");
 });
 
 test("`#240 reading-bookmark`: e moves the bookmark and the selection together, and z takes both back", async () => {
@@ -50435,7 +51093,7 @@ test("`#300 reply-marks-read`: a Reply's mark at the provider follows its Done, 
   assert.deepStrictEqual(plain.dismissCalls, [{ messages: [target] }]);
   assert.deepStrictEqual(plain.upstreamReadCalls, [], "a provider with no marker was asked to move it");
   // THE CONTROL: the provider's word is what keeps the page from asking.
-  const control = await run(false, brokenScript("!channelMarksUpstream(entry.channel) || ", ""));
+  const control = await run(false, brokenScript("  if (!channelMarksUpstream(channel)) return none;\n", ""));
   await replyAndSend(control, target, "on it");
   assert.equal(control.upstreamReadCalls.length, 1, "with the check taken out nothing was asked, so this test cannot see it");
 });
@@ -50465,7 +51123,7 @@ test("`#300 reply-marks-read`: a Reply in a channel that is one thread of a larg
   assert.equal(rowOf(page, "302").getAttribute("data-archived"), "true", "the answered row is not drawn read");
 
   // THE CONTROL: without the page's own check it asks, and only the server would stand in the way.
-  const control = await run(brokenScript(" || channelIsOneThread(entry.channel)", ""));
+  const control = await run(brokenScript("  if (channelIsOneThread(channel)) return", "  if (false) return"));
   await replyAndSend(control, "302", "answering in the conversation");
   assert.deepStrictEqual(control.upstreamReadCalls, [{ message_id: "302", after_reply: true }],
     "with the check taken out nothing was asked, so this test cannot see it");
@@ -50498,7 +51156,7 @@ test("`#300 reply-marks-read`: a reply's mark the server did not ask of the serv
     /^Marked read here, not in Discord: it cannot say whether its read marker covers more than this channel\./);
 
   // THE CONTROL: without the outcome read, the status line claims the service was marked.
-  const control = await run(brokenScript("    said = replyMarkNotAsked(answer && answer.outcome, service) || said;\n", ""));
+  const control = await run(brokenScript("    const why = serviceMarkNotAsked(outcome);", "    const why = null;"));
   control.upstreamReadResponse = notAsked("thread_channel");
   await replyAndSend(control, target, "on it");
   assert.match(control.el("status").textContent, /^Marked read here and in Discord\./,
