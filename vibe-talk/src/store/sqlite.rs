@@ -359,6 +359,18 @@ pub const MIGRATIONS: &[&str] = &[
         set_at_ms INTEGER NOT NULL
     ) STRICT;
     ",
+    // v17 — what a transcript row records beyond words. `#270 voice-transcript-markers`.
+    //
+    // ONE nullable column and nothing else: every existing row reads NULL, an ordinary turn. It
+    // holds `super::TurnDetail` as JSON, written only by this server — a `sent` row from its own
+    // copy of the send, a `marker` from a request it validated, the tag on a spoken yes the page
+    // acted on. No new table: these rows are turns, so retention, forgetting a conversation and
+    // the purge reach them exactly as they reach what was said. ADD COLUMN rewrites nothing.
+    //
+    // This step's place in the ladder is all that numbers it; the tests find it by what it does.
+    "
+    ALTER TABLE turns ADD COLUMN detail TEXT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -876,23 +888,29 @@ impl StateStore for SqliteStore {
                     retention.max_turns_per_conversation
                 )));
             }
+            // The preview is the first turn that offers one: a record row offers none
+            // (`super::preview_for`), so a conversation that starts with a marker takes its
+            // preview from the first thing said in it.
             transaction
                 .execute(
                     "INSERT INTO conversations (id, started_at_ms, last_at_ms, preview)
                      VALUES (?1, ?2, ?2, ?3)
-                     ON CONFLICT(id) DO UPDATE SET last_at_ms = ?2",
-                    rusqlite::params![&id, turn.at_ms, super::preview_of(&turn.text)],
+                     ON CONFLICT(id) DO UPDATE SET
+                        last_at_ms = ?2,
+                        preview = CASE WHEN preview = '' THEN ?3 ELSE preview END",
+                    rusqlite::params![&id, turn.at_ms, super::preview_for(&turn)],
                 )
                 .map_err(backend)?;
+            let detail = turn.detail.as_ref().map(super::TurnDetail::to_stored);
             transaction
                 .execute(
-                    "INSERT INTO turns (conversation_id, seq, speaker, text, at_ms)
+                    "INSERT INTO turns (conversation_id, seq, speaker, text, at_ms, detail)
                      VALUES (
                         ?1,
                         (SELECT IFNULL(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?1),
-                        ?2, ?3, ?4
+                        ?2, ?3, ?4, ?5
                      )",
-                    rusqlite::params![&id, turn.speaker.as_str(), &turn.text, turn.at_ms],
+                    rusqlite::params![&id, turn.speaker.as_str(), &turn.text, turn.at_ms, detail],
                 )
                 .map_err(backend)?;
             prune(&transaction, retention)?;
@@ -952,7 +970,7 @@ impl StateStore for SqliteStore {
             }
             let mut statement = connection
                 .prepare(
-                    "SELECT speaker, text, at_ms FROM turns
+                    "SELECT speaker, text, at_ms, detail FROM turns
                      WHERE conversation_id = ?1 ORDER BY seq ASC",
                 )
                 .map_err(backend)?;
@@ -962,16 +980,18 @@ impl StateStore for SqliteStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 })
                 .map_err(backend)?;
             let mut out = Vec::new();
             for row in rows {
-                let (speaker, text, at_ms) = row.map_err(backend)?;
+                let (speaker, text, at_ms, detail) = row.map_err(backend)?;
                 out.push(Turn {
                     speaker: Speaker::parse(&speaker)?,
                     text,
                     at_ms,
+                    detail: super::TurnDetail::from_stored(detail.as_deref()),
                 });
             }
             Ok(out)
@@ -983,6 +1003,7 @@ impl StateStore for SqliteStore {
         &self,
         limit: u16,
         before: Option<&TranscriptCursor>,
+        records: bool,
     ) -> Result<TranscriptPage, StoreError> {
         let limit = limit.clamp(1, MAX_TRANSCRIPT_PAGE);
         let before = before.cloned();
@@ -999,15 +1020,35 @@ impl StateStore for SqliteStore {
                 // drives `turns_by_time` with it directly — the unrolled one is three disjuncts
                 // that have to be proved equivalent to the index order by hand every time this is
                 // read.
-                let sql = if before.is_some() {
-                    "SELECT conversation_id, seq, speaker, text, at_ms FROM turns
-                     WHERE (at_ms, conversation_id, seq) < (?2, ?3, ?4)
-                     ORDER BY at_ms DESC, conversation_id DESC, seq DESC
-                     LIMIT ?1"
-                } else {
-                    "SELECT conversation_id, seq, speaker, text, at_ms FROM turns
-                     ORDER BY at_ms DESC, conversation_id DESC, seq DESC
-                     LIMIT ?1"
+                //
+                // Record rows are left out IN THE READ when the caller did not ask for them, not
+                // afterwards: filtering a page after the LIMIT would hand back short pages, and a
+                // page of nothing but markers would read as the end of the record.
+                let sql = match (before.is_some(), records) {
+                    (true, true) => {
+                        "SELECT conversation_id, seq, speaker, text, at_ms, detail FROM turns
+                         WHERE (at_ms, conversation_id, seq) < (?2, ?3, ?4)
+                         ORDER BY at_ms DESC, conversation_id DESC, seq DESC
+                         LIMIT ?1"
+                    }
+                    (true, false) => {
+                        "SELECT conversation_id, seq, speaker, text, at_ms, NULL FROM turns
+                         WHERE (at_ms, conversation_id, seq) < (?2, ?3, ?4)
+                           AND speaker IN ('you', 'agent', 'note')
+                         ORDER BY at_ms DESC, conversation_id DESC, seq DESC
+                         LIMIT ?1"
+                    }
+                    (false, true) => {
+                        "SELECT conversation_id, seq, speaker, text, at_ms, detail FROM turns
+                         ORDER BY at_ms DESC, conversation_id DESC, seq DESC
+                         LIMIT ?1"
+                    }
+                    (false, false) => {
+                        "SELECT conversation_id, seq, speaker, text, at_ms, NULL FROM turns
+                         WHERE speaker IN ('you', 'agent', 'note')
+                         ORDER BY at_ms DESC, conversation_id DESC, seq DESC
+                         LIMIT ?1"
+                    }
                 };
                 let mut statement = connection.prepare(sql).map_err(backend)?;
                 let read = |row: &rusqlite::Row<'_>| {
@@ -1017,6 +1058,7 @@ impl StateStore for SqliteStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 };
                 let mapped = match &before {
@@ -1033,7 +1075,7 @@ impl StateStore for SqliteStore {
                 }
                 .map_err(backend)?;
                 for row in mapped {
-                    let (conversation, seq, speaker, text, at_ms) = row.map_err(backend)?;
+                    let (conversation, seq, speaker, text, at_ms, detail) = row.map_err(backend)?;
                     rows.push(RecordedTurn {
                         conversation: ConversationId::parse(&conversation)?,
                         seq,
@@ -1041,6 +1083,7 @@ impl StateStore for SqliteStore {
                             speaker: Speaker::parse(&speaker)?,
                             text,
                             at_ms,
+                            detail: super::TurnDetail::from_stored(detail.as_deref()),
                         },
                     });
                 }
@@ -2294,6 +2337,7 @@ mod tests {
             speaker,
             text: text.to_owned(),
             at_ms,
+            detail: None,
         }
     }
 
@@ -2326,7 +2370,10 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor = None;
         loop {
-            let page = store.transcript(1, cursor.as_ref()).await.expect("page");
+            let page = store
+                .transcript(1, cursor.as_ref(), false)
+                .await
+                .expect("page");
             for entry in &page.turns {
                 seen.push(entry.turn.text.clone());
             }
@@ -2385,7 +2432,7 @@ mod tests {
                 .expect("append");
         }
 
-        let page = store.transcript(3, None).await.expect("page");
+        let page = store.transcript(3, None, false).await.expect("page");
         assert_eq!(
             page.turns
                 .iter()
@@ -2452,6 +2499,7 @@ mod tests {
                     speaker: Speaker::You,
                     text: "the first thing said".to_owned(),
                     at_ms: 1_000,
+                    detail: None,
                 },
             )
             .await
@@ -2463,6 +2511,7 @@ mod tests {
                     speaker: Speaker::You,
                     text: "said later".to_owned(),
                     at_ms: 2_000,
+                    detail: None,
                 },
             )
             .await
@@ -2497,6 +2546,7 @@ mod tests {
                         speaker: Speaker::You,
                         text: n.to_owned(),
                         at_ms: at,
+                        detail: None,
                     },
                 )
                 .await
@@ -2534,6 +2584,7 @@ mod tests {
                     speaker: Speaker::You,
                     text: "old".to_owned(),
                     at_ms: two_days_ago,
+                    detail: None,
                 },
             )
             .await
@@ -5632,6 +5683,220 @@ mod tests {
                     None
                 )
                 .await,
+            Err(StoreError::Unavailable(_))
+        ));
+    }
+
+    // --- #270 voice-transcript-markers ---------------------------------------------------------
+
+    use super::super::{NotSentWhy, Recap, RecapNone, StartRecord, TurnDetail};
+
+    /// A row the voice page records about its own conversation, as the server would store it.
+    fn marker(detail: TurnDetail) -> Turn {
+        Turn::record(Speaker::Marker, "", Some(detail))
+    }
+
+    fn sent(serial: u64, text: &str) -> Turn {
+        let mut record = super::super::tests::sent_record(serial);
+        record.text_chars = u32::try_from(text.chars().count()).expect("short");
+        Turn::record(
+            Speaker::Sent,
+            text,
+            Some(TurnDetail::Sent(Box::new(record))),
+        )
+    }
+
+    fn start(why: RecapNone) -> TurnDetail {
+        TurnDetail::ConversationStart(StartRecord {
+            recap: Recap::NotSent { why, dropped: 0 },
+            previous_end: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_detail_step_arrives_on_a_file_at_the_previous_schema_with_every_turn_ordinary() {
+        let at = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("ADD COLUMN detail"))
+            .expect("the detail step");
+        let dir = TempDir::new("sqlite-detail-migrate");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..at] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO conversations VALUES ('conv', 1, 2, 'what happened?');
+                     INSERT INTO turns VALUES ('conv', 1, 'you', 'what happened?', 1);
+                     INSERT INTO turns VALUES ('conv', 2, 'agent', 'the runner stalled', 2);",
+                )
+                .expect("a conversation");
+            connection
+                .pragma_update(None, "user_version", i64::try_from(at).expect("small"))
+                .expect("stamp old schema");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        let turns = store.turns(&id("conv")).await.expect("turns");
+        assert_eq!(turns.len(), 2, "the upgrade lost a turn");
+        assert!(turns.iter().all(|turn| turn.detail.is_none()));
+        store
+            .append_turn(&id("conv"), &sent(3, "ship it"))
+            .await
+            .expect("a record row on the upgraded file");
+        assert_eq!(
+            store.turns(&id("conv")).await.expect("turns")[2].detail,
+            sent(3, "ship it").detail
+        );
+    }
+
+    /// The same script against any store, so the real one and the fake can be held to one answer.
+    async fn record_script(store: &dyn StateStore) -> Vec<String> {
+        let mut said = Vec::new();
+        let rows = [
+            marker(start(RecapNone::Unsupported)),
+            Turn::now(Speaker::Agent, "To lead team: ship it. Send it?"),
+            Turn::record(Speaker::You, "yes", Some(TurnDetail::Answer { serial: 7 })),
+            Turn::now(Speaker::Agent, "One moment."),
+            sent(7, "ship it"),
+            marker(TurnDetail::NotSent {
+                why: NotSentWhy::Lapsed,
+                serial: 8,
+            }),
+            Turn::now(Speaker::Note, "the call ended"),
+        ];
+        for row in &rows {
+            store.append_turn(&id("conv"), row).await.expect("append");
+        }
+        // Round trip: everything as written, detail included.
+        let back = store.turns(&id("conv")).await.expect("turns");
+        said.push(format!("{back:?}").replace(char::is_numeric, "#"));
+        for (stored, written) in back.iter().zip(&rows) {
+            assert_eq!(stored.speaker, written.speaker);
+            assert_eq!(stored.text, written.text);
+            assert_eq!(stored.detail, written.detail, "{:?}", written.speaker);
+        }
+        // The preview is the first thing said, never the marker that opened the conversation.
+        let listed = store.conversations().await.expect("list");
+        said.push(listed[0].preview.clone());
+        assert_eq!(listed[0].preview, "To lead team: ship it. Send it?");
+        assert_eq!(
+            listed[0].turns, 7,
+            "record rows are turns, and count as turns"
+        );
+
+        // Without records: one row at a time, so every page boundary is crossed, and no row is
+        // a record or carries a detail.
+        let mut walked = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store
+                .transcript(1, cursor.as_ref(), false)
+                .await
+                .expect("page");
+            for entry in &page.turns {
+                assert!(!entry.turn.speaker.is_record(), "{entry:?}");
+                assert_eq!(entry.turn.detail, None, "a detail reached an old page");
+                walked.push(entry.turn.text.clone());
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+        }
+        assert_eq!(
+            walked,
+            [
+                "the call ended",
+                "One moment.",
+                "yes",
+                "To lead team: ship it. Send it?"
+            ],
+            "the walk without records lost or reordered a turn"
+        );
+        said.push(walked.join("|"));
+        // With records: all seven, details whole.
+        let page = store.transcript(50, None, true).await.expect("page");
+        assert_eq!(page.turns.len(), 7);
+        assert_eq!(page.turns[2].turn.detail, rows[4].detail);
+        said.push(format!("{}", page.turns.len()));
+
+        // Forgetting the conversation takes its record rows with it.
+        store
+            .forget_conversation(&id("conv"))
+            .await
+            .expect("forget");
+        assert!(store
+            .transcript(50, None, true)
+            .await
+            .expect("page")
+            .turns
+            .is_empty());
+        store
+            .append_turn(&id("again"), &marker(start(RecapNone::Off)))
+            .await
+            .expect("append");
+        let listed = store.conversations().await.expect("list");
+        assert_eq!(listed[0].preview, "", "a marker became the preview");
+        store.purge_everything().await.expect("purge");
+        assert!(store
+            .transcript(50, None, true)
+            .await
+            .expect("page")
+            .turns
+            .is_empty());
+        said
+    }
+
+    #[tokio::test]
+    async fn record_rows_round_trip_stay_out_of_an_old_pages_walk_and_go_with_their_conversation() {
+        let dir = TempDir::new("sqlite-record-rows");
+        let real = store(&dir, Retention::default());
+        let fake = crate::store::fake::FakeStore::new();
+        assert_eq!(record_script(&real).await, record_script(&fake).await);
+    }
+
+    #[tokio::test]
+    async fn a_stored_detail_that_does_not_parse_reads_as_none_and_the_row_survives() {
+        let dir = TempDir::new("sqlite-detail-unreadable");
+        let store = store(&dir, Retention::default());
+        store
+            .append_turn(&id("conv"), &sent(1, "ship it"))
+            .await
+            .expect("append");
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard
+                .execute(
+                    "UPDATE turns SET detail = '{\"kind\":\"from_a_later_version\"}'",
+                    [],
+                )
+                .expect("rewrite");
+        }
+        let turns = store.turns(&id("conv")).await.expect("turns");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].speaker, Speaker::Sent);
+        assert_eq!(turns[0].text, "ship it");
+        assert_eq!(turns[0].detail, None);
+        let page = store.transcript(5, None, true).await.expect("page");
+        assert_eq!(page.turns[0].turn.detail, None);
+    }
+
+    #[tokio::test]
+    async fn the_disabled_store_refuses_record_rows_like_any_other() {
+        let disabled = crate::store::disabled::DisabledStore;
+        assert!(matches!(
+            disabled.append_turn(&id("conv"), &sent(1, "ship it")).await,
+            Err(StoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            disabled.transcript(5, None, true).await,
             Err(StoreError::Unavailable(_))
         ));
     }
