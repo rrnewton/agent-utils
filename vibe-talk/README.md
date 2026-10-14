@@ -1646,7 +1646,12 @@ the one thing this route exists to do is tell those apart.
       "compared": 40, "stale": 1, "raced": 1, "mismatched": 1, "id_mismatches": 1,
       "hash_mismatches": 0 }
   ],
-  "upstream": { … }   // how long each provider has taken; see "How long upstream takes" below
+  "upstream": { … },  // how long each provider has taken; see "How long upstream takes" below
+  // Only with a [message_cache] table: whether a cache is open, what it holds and its writer has
+  // done (drops, batch p50/p99), each provider's standing, and, per consumer, what its shadow
+  // counted it would have served. Numbers and provider keys; never a channel id, a message id
+  // or text. One `info` line an hour carries the same figures.
+  "message_cache": { … }
 }
 ```
 
