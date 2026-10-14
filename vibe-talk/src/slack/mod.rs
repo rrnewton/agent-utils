@@ -12,7 +12,9 @@
 //! | `conversations.replies` | a thread's messages, thread membership checks, exact lookups |
 //!
 //! A lookup of several messages by id reads `conversations.history` or `conversations.replies`
-//! a run of timestamps a call (`slack/lookup.rs`).
+//! a run of timestamps a call (`slack/lookup.rs`). A read of several threads reads each thread's
+//! newest page in one `conversations.replies` window, and after an instant only the threads whose
+//! root moved (`slack/threads.rs`).
 //! | `chat.postMessage` | every post, in a conversation or in a thread |
 //! | `users.info` | an author's display name when the message does not carry one |
 //! | `users.conversations` | the channel browser |
@@ -48,6 +50,7 @@ pub mod ids;
 mod lookup;
 pub mod mrkdwn;
 mod range;
+mod threads;
 mod timeline;
 
 pub use client::{HttpSlackClient, SLACK_MAX_TEXT_CHARS};

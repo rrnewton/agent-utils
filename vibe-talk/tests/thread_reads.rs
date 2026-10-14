@@ -17,6 +17,8 @@
 //! (`#286 naming-budget`). So the test runs on tokio's paused clock at the default interval, and
 //! the fixture records that order and that pause, as the code before `fetch_threads` made them.
 
+mod slack_fake;
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1045,6 +1047,279 @@ async fn reading_twenty_threads_of_a_bridge_channel_is_one_request_to_the_bridge
         assert_eq!(
             page.messages[0].content,
             format!("the bridge says hello in {id}")
+        );
+    }
+}
+
+// --- Slack ---------------------------------------------------------------------------------------
+
+const SLACK_CH: &str = "C0SLACK01";
+
+/// A Slack conversation of `roots.len()` threads, root `n` posted at second `100 * n`, each with
+/// the replies listed for it (seconds after the root), and one ordinary message between each.
+fn slack_threads(roots: &[&[i64]]) -> slack_fake::FakeState {
+    let mut state = slack_fake::FakeState::default();
+    let mut list = Vec::new();
+    for (n, replies) in roots.iter().enumerate() {
+        let at = 100 * i64::try_from(n).expect("small");
+        let mut root = slack_fake::profiled(
+            &slack_fake::ts(at, 0),
+            "UADA00001",
+            "Ada",
+            &format!("root {n} starts here"),
+        );
+        let replies: Vec<(String, String)> = replies
+            .iter()
+            .map(|after| {
+                (
+                    slack_fake::ts(at + after, 0),
+                    format!("reply {after} under root {n}"),
+                )
+            })
+            .collect();
+        slack_fake::thread(&mut state, SLACK_CH, &mut root, &replies);
+        list.push(root);
+        list.push(slack_fake::profiled(
+            &slack_fake::ts(at + 50, 0),
+            "UADA00001",
+            "Ada",
+            &format!("between {n}"),
+        ));
+    }
+    state.history.insert(SLACK_CH.to_owned(), list);
+    state
+}
+
+fn slack_root(n: i64) -> String {
+    slack_fake::ts(100 * n, 0)
+}
+
+fn slack_ms(seconds: i64) -> i64 {
+    (slack_fake::BASE_SECS + seconds) * 1000
+}
+
+/// remote-ops-audit W14, Slack: a thread's newest page is one `conversations.replies` read where
+/// the thread view makes two (its root, then the window), and the answer is the thread view's own,
+/// cursors and all. A thread that is not in the conversation fails in its own place.
+#[tokio::test]
+async fn slack_reads_each_threads_newest_page_in_one_replies_call() {
+    let fake =
+        slack_fake::Fake::start(slack_threads(&[&[1, 2], &[5], &[1, 2, 3, 4], &[9]]), 200).await;
+    let client = fake.client();
+    let channel = channel(SLACK_CH);
+    assert_eq!(client.read_caps(&channel).many_threads, Support::Native);
+    let mut asks: Vec<ThreadAsk> = (0..4)
+        .map(|n| ThreadAsk::newest(slack_root(n), 3))
+        .collect();
+    asks.push(ThreadAsk::newest(slack_fake::ts(77, 0), 3));
+    let answers = client.fetch_threads(&channel, &asks).await;
+    assert_eq!(fake.calls("conversations.replies"), 5, "one each");
+    assert_eq!(fake.calls("conversations.history"), 0);
+    assert!(matches!(
+        answers[4].1.as_ref().map_err(ChatError::cause),
+        Err(ChatError::Status { status: 404, .. })
+    ));
+    for n in 0..4 {
+        let viewed = client
+            .fetch_timeline(&channel, &asks[n].request())
+            .await
+            .expect("the thread view");
+        assert_eq!(
+            answers[n].1.as_ref().expect("a page"),
+            &viewed,
+            "thread {n}: exactly the thread view's newest page"
+        );
+    }
+    assert!(
+        answers[2].1.as_ref().expect("a page").has_more,
+        "five messages, three a page"
+    );
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        5 + 8,
+        "the four thread view reads it replaces cost two calls each"
+    );
+}
+
+/// remote-ops-audit W14, Slack's skip-list: after an instant, the roots come from one history page
+/// shared by every thread asked about; a thread whose root says no reply came after the instant
+/// costs no read of its replies, and one that moved costs one `conversations.replies` read with
+/// `oldest` at the instant. Every answer is a delta of additions, never a whole thread.
+#[tokio::test]
+async fn slack_reads_after_an_instant_only_the_threads_whose_root_moved() {
+    // Roots at 0, 100, ..., 500; the instant is second 150. Thread 0's replies are all older;
+    // thread 1 has one reply older and two newer; thread 3 is wholly newer; 4 and 5 too, quietly.
+    let fake = slack_fake::Fake::start(
+        slack_threads(&[&[10, 20], &[10, 60, 70], &[], &[5], &[], &[3]]),
+        200,
+    )
+    .await;
+    let client = fake.client();
+    let channel = channel(SLACK_CH);
+    let newer_than_ms = slack_ms(150);
+    let asks: Vec<ThreadAsk> = [0, 1, 3]
+        .iter()
+        .map(|n| ThreadAsk {
+            id: slack_root(*n),
+            newer_than_ms: Some(newer_than_ms),
+            limit: 50,
+        })
+        .collect();
+    let answers = client.fetch_threads(&channel, &asks).await;
+
+    assert_eq!(
+        fake.calls("conversations.history"),
+        1,
+        "one page finds every root"
+    );
+    let replies = fake.requests("conversations.replies");
+    assert_eq!(
+        replies
+            .iter()
+            .map(|params| (params["ts"].clone(), params.get("oldest").cloned()))
+            .collect::<Vec<_>>(),
+        [
+            (slack_root(1), Some(slack_fake::ts(150, 999))),
+            (slack_root(3), Some(slack_fake::ts(150, 999))),
+        ],
+        "only the threads that moved, each from the instant"
+    );
+    let contents = |at: usize| -> Vec<String> {
+        answers[at]
+            .1
+            .as_ref()
+            .expect("a page")
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect()
+    };
+    assert!(
+        contents(0).is_empty(),
+        "nothing newer: no read of its replies"
+    );
+    assert_eq!(
+        contents(1),
+        ["reply 60 under root 1", "reply 70 under root 1"]
+    );
+    assert_eq!(
+        contents(2),
+        ["root 3 starts here", "reply 5 under root 3"],
+        "a root newer than the instant is news too"
+    );
+    for (at, _) in answers.iter().enumerate() {
+        let page = answers[at].1.as_ref().expect("a page");
+        assert_eq!(
+            page.delta,
+            Some(TimelineDelta {
+                more: false,
+                complete: false,
+                deleted: Vec::new(),
+                removed_threads: Vec::new(),
+            }),
+            "{at}: additions only, never a deletion"
+        );
+        assert!(!page.has_more && page.next_before.is_none() && page.next_after.is_none());
+        let summary = page.thread.as_ref().expect("its summary");
+        assert!(
+            summary.root.is_some(),
+            "{at}: the root came with the history page"
+        );
+    }
+
+    // One thread alone reads its own root rather than a history page.
+    let before = (
+        fake.calls("conversations.history"),
+        fake.calls("conversations.replies"),
+    );
+    let alone = client.fetch_threads(&channel, &asks[..1]).await;
+    assert!(alone[0].1.as_ref().expect("a page").messages.is_empty());
+    assert_eq!(
+        (
+            fake.calls("conversations.history"),
+            fake.calls("conversations.replies")
+        ),
+        (before.0, before.1 + 1),
+        "its root, and nothing more for a thread that did not move"
+    );
+}
+
+/// The shared history read never costs more than reading each root would: it stops a page short
+/// of the number of threads, and a root it did not reach is read on its own.
+#[tokio::test]
+async fn slack_reads_a_root_the_shared_history_page_did_not_reach_on_its_own() {
+    // Two messages a page: the newest four messages are roots 3 and 2 and what is between them.
+    let fake = slack_fake::Fake::start(slack_threads(&[&[5], &[5], &[5], &[5]]), 2).await;
+    let client = fake.client();
+    let channel = channel(SLACK_CH);
+    let asks: Vec<ThreadAsk> = [0, 3]
+        .iter()
+        .map(|n| ThreadAsk {
+            id: slack_root(*n),
+            newer_than_ms: Some(slack_ms(1_000)),
+            limit: 50,
+        })
+        .collect();
+    let answers = client.fetch_threads(&channel, &asks).await;
+    assert_eq!(
+        fake.calls("conversations.history"),
+        1,
+        "two threads: one page at most"
+    );
+    let replies = fake.requests("conversations.replies");
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(
+        replies[0]["ts"],
+        slack_root(0),
+        "the root the page did not reach"
+    );
+    assert!(answers
+        .iter()
+        .all(|(_, page)| page.as_ref().expect("a page").messages.is_empty()));
+}
+
+/// Twenty threads of one Slack conversation read together: one `fetch_threads`, and each thread
+/// costs one `conversations.replies` read where the thread view made two, through a server whose
+/// pages hold twenty rows, as the Slack shim's do. At naming's limit of fifty.
+///
+/// Thread naming does not read through this (`#286 naming-budget`): each thread is named only from
+/// a read made at its own turn, one per channel per interval.
+#[tokio::test]
+async fn reading_twenty_slack_threads_reads_each_once_instead_of_twice() {
+    let replies: Vec<&[i64]> = (0..20).map(|_| &[1_i64, 2][..]).collect();
+    let fake = slack_fake::Fake::start(slack_threads(&replies), 20).await;
+    let client = Arc::new(fake.client());
+    let counting = CountingChat::new(Arc::clone(&client) as Arc<dyn ChatClient>);
+    let channel = channel(SLACK_CH);
+    let asks: Vec<ThreadAsk> = (0..20)
+        .map(|n| ThreadAsk::newest(slack_root(n), 50))
+        .collect();
+    let answers = counting.fetch_threads(&channel, &asks).await;
+    assert_eq!(counting.count("fetch_threads"), 1);
+    assert_eq!(counting.count("fetch_timeline"), 0);
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        20,
+        "one replies read a thread, where the thread view made two"
+    );
+    assert_eq!(fake.calls("conversations.history"), 0, "no history read");
+    assert_eq!(answers.len(), 20);
+    for (n, (id, page)) in answers.iter().enumerate() {
+        assert_eq!(*id, slack_root(i64::try_from(n).expect("small")));
+        let texts: Vec<&str> = page
+            .as_ref()
+            .expect("a page")
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                format!("root {n} starts here"),
+                format!("reply 1 under root {n}"),
+                format!("reply 2 under root {n}"),
+            ]
         );
     }
 }

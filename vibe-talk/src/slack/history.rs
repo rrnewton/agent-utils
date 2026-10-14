@@ -99,7 +99,7 @@ pub(super) fn nearest(raws: &[Raw], want: usize, toward: Toward) -> Vec<Raw> {
 }
 
 /// A bound one hour past the present, standing in for "no upper bound" where one must be named.
-fn far_future_micros() -> i64 {
+pub(super) fn far_future_micros() -> i64 {
     jiff::Timestamp::now()
         .as_microsecond()
         .saturating_add(3_600_000_000)
@@ -558,7 +558,7 @@ impl HttpSlackClient {
     }
 
     /// Where a previous call proved the stretch after `cursor` empty, if it did.
-    fn proven_from(&self, key: &str, cursor: i64) -> Option<i64> {
+    pub(super) fn proven_from(&self, key: &str, cursor: i64) -> Option<i64> {
         let mut proven = self
             .proven
             .lock()

@@ -54,7 +54,7 @@ pub const DISCOVERY_PAGES: usize = 10;
 /// The page size asked of `users.conversations`.
 const DISCOVERY_PAGE_LIMIT: u16 = 100;
 /// The longest one timeline request may take, all of its requests together.
-const TIMELINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+pub(super) const TIMELINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// The conversation kinds the channel browser lists.
 const DISCOVERY_TYPES: &str = "public_channel,private_channel,mpim,im";
 
@@ -184,7 +184,7 @@ fn validate_request(request: &TimelineRequest) -> Result<(), ChatError> {
 }
 
 /// A thread id from a caller, as a canonical root `ts`.
-fn thread_ts(thread_id: &str) -> Result<String, ChatError> {
+pub(super) fn thread_ts(thread_id: &str) -> Result<String, ChatError> {
     ids::canonical_ts(thread_id)
         .filter(|canonical| canonical == thread_id)
         .ok_or_else(|| refused("a Slack thread id is its root ts, such as 1700000000.000100"))
@@ -440,7 +440,7 @@ impl HttpSlackClient {
         Ok(page)
     }
 
-    fn forward_cursor(
+    pub(super) fn forward_cursor(
         &self,
         channel: &ChannelId,
         request: &TimelineRequest,
@@ -677,7 +677,7 @@ impl HttpSlackClient {
         })
     }
 
-    fn cursor(
+    pub(super) fn cursor(
         &self,
         channel: &ChannelId,
         request: &TimelineRequest,
@@ -1064,7 +1064,7 @@ impl HttpSlackClient {
         Ok(root)
     }
 
-    async fn summary(&self, channel: &ChannelId, root: &Raw) -> ThreadSummary {
+    pub(super) async fn summary(&self, channel: &ChannelId, root: &Raw) -> ThreadSummary {
         let message = self
             .messages(channel, std::slice::from_ref(root))
             .await

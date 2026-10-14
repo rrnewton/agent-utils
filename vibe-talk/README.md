@@ -2479,7 +2479,15 @@ every thread is still checked against the channel and read on its own, two at a 
 parent channel is read once for all of them rather than once per thread (three requests a thread
 instead of the thread view's four), and after an instant a thread whose `last_message_id` has not
 moved costs that check alone, one that moved one `after=` read more, and a root is read only when
-it is itself newer than the instant. Every other provider answers with the trait's default, one thread view read per thread, at most two in flight,
+it is itself newer than the instant. Slack, which has no read of several threads either: a
+thread's newest page is one `conversations.replies` window read, its root the first message of it,
+where the thread view reads the root first and then the window (one call a thread of up to a page
+instead of two; a longer thread is read by the thread view, as before); and after an instant the
+roots come from one `conversations.history` page shared by every thread asked about (never more
+pages than reading each root would cost), a thread whose root's `latest_reply` is not after the
+instant costs no read of its replies, and one that moved costs one `conversations.replies` read
+with `oldest` at the instant. A channel narrowed to one Slack thread is read by the default. Every
+other provider answers with the trait's default, one thread view read per thread, at most two in flight,
 which costs exactly what reading each thread did, and says so (`ReadCaps::many_threads` is
 emulated). A caller that would gather its thread reads into one only to save calls gathers them
 only for a provider that reads them natively.

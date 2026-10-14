@@ -926,6 +926,11 @@ impl ChatClient for HttpSlackClient {
     /// newest messages of several conversations at once, so a read of several is the trait's
     /// default, one history read per channel, and a catch-up reads Slack channels one by one as
     /// before.
+    ///
+    /// A read of several threads of a conversation is native (remote-ops-audit W14, see
+    /// `super::threads`): a thread's newest page costs one `conversations.replies` window read
+    /// instead of the thread view's two, and after an instant a thread whose root has not moved
+    /// costs no read of its replies.
     fn read_caps(&self, _channel: &ChannelId) -> crate::chat::ReadCaps {
         crate::chat::ReadCaps {
             range: crate::chat::Support::Native,
@@ -933,7 +938,7 @@ impl ChatClient for HttpSlackClient {
             heads: crate::chat::Support::Emulated,
             heads_cover_edits: false,
             many_channels: crate::chat::Support::Emulated,
-            many_threads: crate::chat::Support::Emulated,
+            many_threads: crate::chat::Support::Native,
             page_rows: super::range::PAGE_ROWS,
         }
     }
@@ -961,6 +966,27 @@ impl ChatClient for HttpSlackClient {
         self.lookup(channel, thread, ids)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    async fn fetch_threads(
+        &self,
+        channel: &ChannelId,
+        asks: &[crate::chat::ThreadAsk],
+    ) -> crate::chat::ThreadAnswers {
+        self.threads(channel, asks)
+            .await
+            .into_iter()
+            .map(|(id, answer)| {
+                (
+                    id,
+                    answer.map_err(|error| match error {
+                        // The emulated path for a narrowed channel already labelled its errors.
+                        ChatError::Provider { .. } => error,
+                        error => error.with_provider(&self.provider_name),
+                    }),
+                )
+            })
+            .collect()
     }
 
     async fn post_message(
