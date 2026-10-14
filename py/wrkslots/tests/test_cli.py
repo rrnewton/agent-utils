@@ -52,6 +52,7 @@ def test_every_command_help_explains_effect_and_inputs() -> None:
         "register",
         "import-existing",
         "adopt",
+        "transfer-owner",
         "recover-unbound-owner",
         "relocate-repository",
         "heartbeat",

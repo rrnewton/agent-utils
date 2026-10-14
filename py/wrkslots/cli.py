@@ -24319,6 +24319,114 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cgroup_in_slot_box(cgroup_path: str, slot_type: str, slot: str) -> bool:
+    """Is this control group inside the slot's own box, the slice ``run`` creates for it?
+
+    That slice is nested under whatever slice enclosed the process that boxed the slot, so
+    it is ``wrkslots-LABEL.slice`` or ``PREFIX-wrkslots-LABEL.slice`` at any depth. The label
+    is systemd-escaped (``kvm-foo`` becomes ``kvm\\x2dfoo``), so no other slot's slice can
+    end the same way.
+    """
+
+    from wrkslots.sandbox import SandboxError, systemd_escape
+
+    label = slot if slot_type == "agent" else f"{slot_type}:{slot}"
+    try:
+        own = f"wrkslots-{systemd_escape(label)}.slice"
+    except SandboxError:
+        return False
+    return any(
+        component == own or component.endswith(f"-{own}")
+        for component in cgroup_path.split("/")
+    )
+
+
+def _cmd_transfer_owner(args: argparse.Namespace) -> int:
+    """Hand a slot whose recorded owner is provably dead to its live successor.
+
+    After a reboot, or after any death of an agent that is then resumed, the slot still
+    names the dead process generation. The successor must either be in the caller's
+    process ancestry (the agent transfers its own slot) or run inside the slot's own box,
+    which only a process wrkslots boxed to this slot can do. A live, released, or
+    indeterminate recorded owner is refused.
+    """
+
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    _validate_name(args.agent, "agent")
+    successor = _read_process_identity(args.owner_pid)
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, archives = _validate_global_state(config)
+        _assert_command_registry_storage(config, states, args)
+        before = _global_rows(states, archives)
+        state = _load_active(config)
+        record = _find_record(state, args.slot)
+        _expected_generation(record, args.expected_generation)
+        if record.agent != args.agent:
+            raise Refusal(
+                f"ownership mismatch for slot {args.slot}: expected {record.agent}, got {args.agent}"
+            )
+        if record.owner == successor:
+            print(
+                f"already owned slot={record.slot} agent={record.agent} "
+                f"generation={record.generation} owner_pid={successor.pid}"
+            )
+            return 0
+        previous_state, detail = _process_state(record.owner)
+        if record.owner is not None and previous_state != "dead":
+            raise Refusal(
+                f"slot {record.slot} owner is {previous_state}: {detail}; transfer-owner "
+                "only replaces an owner that is provably dead"
+            )
+        released, void_reason = _owner_release_state(
+            config, record, _load_events(config, record.machine)
+        )
+        if released is not None and void_reason is None:
+            raise Refusal(
+                f"slot {record.slot} generation {record.generation} was released by its owner; "
+                "a released generation is waiting for removal and is not transferred"
+            )
+        try:
+            _assert_caller_process(successor, "owner")
+            basis = "caller-ancestry"
+        except Refusal:
+            if not _cgroup_in_slot_box(successor.cgroup_path, record.slot_type, record.slot):
+                raise Refusal(
+                    f"owner PID {successor.pid} is neither in the invoking process ancestry nor "
+                    f"inside slot {record.slot}'s own box (control group {successor.cgroup_path})"
+                ) from None
+            basis = "slot-box"
+        if _read_process_identity(successor.pid) != successor:
+            raise Refusal("owner process generation changed during transfer-owner")
+        transferred = dataclasses.replace(record, owner=successor, heartbeat_at=_utc_now())
+        _write_active_state(
+            config,
+            _replace_record(state, transferred),
+            action="owner-transferred",
+            slot=transferred.slot,
+            evidence={
+                "owner": _identity_to_obj(successor),
+                "previous_owner": None if record.owner is None else _identity_to_obj(record.owner),
+                "previous_owner_state": previous_state,
+                "basis": basis,
+            },
+        )
+        after_states, after_archives = _validate_global_state(config)
+        _assert_only_slot_changed(
+            before,
+            _global_rows(after_states, after_archives),
+            args.slot,
+        )
+    print(
+        f"transferred slot={transferred.slot} agent={transferred.agent} "
+        f"generation={transferred.generation} owner_pid={successor.pid} basis={basis} "
+        f"previous={previous_state}"
+    )
+    return 0
+
+
 def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -52564,7 +52672,7 @@ def _build_parser() -> argparse.ArgumentParser:
 Read-only: status, doctor, audit, import-existing without --apply, and
 clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
 but does not mutate registry state.
-Mutating: init, create, register, import-existing --apply, adopt,
+Mutating: init, create, register, import-existing --apply, adopt, transfer-owner,
 recover-unbound-owner, relocate-repository --apply, heartbeat, hold, unhold,
 clean-caches deletion, finish,
 write-handoff, release, read-handoff, retire-pending, remove,
@@ -53242,6 +53350,36 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     _add_task_scope_options(adopt)
     adopt.set_defaults(handler=_cmd_adopt)
+
+    transfer = subparsers.add_parser(
+        "transfer-owner",
+        help="hand a slot whose recorded owner is provably dead to its live successor",
+        description=(
+            "Replace a slot's recorded owner with a live successor, for an agent resumed after "
+            "its owner process died (for example across a reboot, where 'agentctl restore' "
+            "calls this with the revived harness). Refuses unless the recorded owner is "
+            "provably dead (its boot ended, or its PID exited or was reused) or none is "
+            "recorded, the generation was not released, and the successor is in the invoking "
+            "process ancestry or runs inside this slot's own box. Changes nothing else: "
+            "generation, checkouts, holds and handoffs stay as they were."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    transfer.add_argument("slot", help="active slot whose owner died")
+    transfer.add_argument(
+        "--agent", required=True, metavar="AGENT", help="agent name already recorded on the slot"
+    )
+    transfer.add_argument(
+        "--owner-pid", type=int, required=True, metavar="PID", help="live successor PID to bind"
+    )
+    transfer.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation; refuses stale callers",
+    )
+    transfer.set_defaults(handler=_cmd_transfer_owner)
 
     recover_unbound = subparsers.add_parser(
         "recover-unbound-owner",

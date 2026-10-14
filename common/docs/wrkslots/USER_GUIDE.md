@@ -654,6 +654,31 @@ the acknowledged artifact. A direct-child checkout handoff is likewise moved by 
 identity-bound retired path before its fenced slot is removed; pathname recreation preserves both
 copies and refuses. The exact handoff bytes remain in append-only history.
 
+## Handing a slot to the successor of a dead owner
+
+An agent can die and come back: the host reboots, or a supervisor resumes the same conversation in a
+new process. The slot still names the dead process generation, so its liveness evidence says
+nothing about the agent that is working in it again. `transfer-owner` binds the successor:
+
+```sh
+wrkslots transfer-owner kvm-20261012 --agent kvm --owner-pid 4242 --expected-generation 1
+```
+
+It refuses unless the recorded owner is provably dead (its boot ended, or its PID exited or was
+reused) or none is recorded, the agent name and generation match, and the generation was not
+released with `release`. The successor must be in the invoking process ancestry (the agent
+transfers its own slot), or run inside this slot's own box: a control group under the slice `run`
+and `shell-command` create for the slot (`wrkslots-LABEL.slice`, or `PREFIX-wrkslots-LABEL.slice`
+at any depth, where LABEL is the systemd-escaped slot name). The second form lets a supervisor such
+as `agentctl restore` transfer a slot to a harness it revived inside that slot's box. A live,
+indeterminate or released owner is refused. Only the owner and heartbeat change, recorded as an
+`owner-transferred` active-state event that names the previous owner, its state, and the basis.
+
+`agentctl restore` uses `hold` with the reason `reboot: agent NAME waits for agentctl restore` for
+the slot of every running agent after it detects a restart, transfers the slot to the agent's
+revived harness, and then releases that hold. A slot whose agent cannot be revived stays held, so
+no cleanup path retires it before an operator looks.
+
 ## Giving a slot back while the owner keeps running
 
 An agent that finishes with a slot often keeps running, for example to take its next task in a new
