@@ -24,10 +24,6 @@ use std::path::{Path, PathBuf};
 /// cache, and that machine's "off" never matches its name.
 #[must_use]
 pub fn default_path(store_path: &Path, host: &str) -> PathBuf {
-    let stem = store_path.file_stem().map_or_else(
-        || "vibe-talk".to_owned(),
-        |s| s.to_string_lossy().into_owned(),
-    );
     let host: String = host
         .chars()
         .map(|c| {
@@ -43,10 +39,21 @@ pub fn default_path(store_path: &Path, host: &str) -> PathBuf {
     } else {
         host
     };
-    let name = format!("{stem}.message-cache-{host}.sqlite3");
+    let name = format!("{}{host}.sqlite3", default_name_prefix(store_path));
     store_path
         .parent()
         .map_or_else(|| PathBuf::from(&name), |dir| dir.join(&name))
+}
+
+/// What the name of every default cache path of the store at `store_path` begins with, whatever the
+/// host: `<store stem>.message-cache-`. Another store's cache beside it never does.
+#[must_use]
+pub fn default_name_prefix(store_path: &Path) -> String {
+    let stem = store_path.file_stem().map_or_else(
+        || "vibe-talk".to_owned(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    format!("{stem}.message-cache-")
 }
 
 /// This machine's host name, for [`default_path`].

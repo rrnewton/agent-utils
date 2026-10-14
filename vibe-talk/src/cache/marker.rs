@@ -141,17 +141,24 @@ pub fn startup_action(
 }
 
 /// Every cache file this server made that may still be on disk: each registered path, and each file
-/// in `default_dir` named like a cache whose header says it is one.
-fn candidates(sidecar: &Sidecar, default_dir: Option<&Path>) -> Vec<PathBuf> {
+/// beside `store_file` named like one of that store's default cache paths, for any host
+/// ([`file::default_name_prefix`]), whose header says it is one. Another store's cache in the same
+/// directory is another server's, and is never a candidate: that server may only be stopped, or
+/// in the middle of a deploy, and its file is its own to erase.
+fn candidates(sidecar: &Sidecar, store_file: Option<&Path>) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = sidecar.paths.clone();
-    if let Some(dir) = default_dir {
+    let beside = store_file.and_then(|store| {
+        let dir = store.parent().filter(|dir| !dir.as_os_str().is_empty())?;
+        Some((dir, file::default_name_prefix(store)))
+    });
+    if let Some((dir, prefix)) = beside {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let named_like_one = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains(".message-cache-") && n.ends_with(".sqlite3"));
+                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".sqlite3"));
                 if named_like_one
                     && schema::read_header(&path).is_ok_and(|h| h == schema::Header::Ours)
                     && !found.contains(&path)
@@ -164,11 +171,11 @@ fn candidates(sidecar: &Sidecar, default_dir: Option<&Path>) -> Vec<PathBuf> {
     found
 }
 
-/// Erase every registered cache path, and every file in `default_dir` named like a cache whose
-/// header says it is one. Returns the bytes removed.
+/// Erase every registered cache path, and every file beside the store at `store_file` named like
+/// one of its default cache paths whose header says it is one. Returns the bytes removed.
 #[must_use]
-pub fn erase_registered(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
-    erase_registered_except(sidecar, default_dir, None)
+pub fn erase_registered(sidecar: &Sidecar, store_file: Option<&Path>) -> u64 {
+    erase_registered_except(sidecar, store_file, None)
 }
 
 /// [`erase_registered`], leaving `except` alone: the file a cache handle in this process holds,
@@ -176,10 +183,10 @@ pub fn erase_registered(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
 #[must_use]
 pub fn erase_registered_except(
     sidecar: &Sidecar,
-    default_dir: Option<&Path>,
+    store_file: Option<&Path>,
     except: Option<&Path>,
 ) -> u64 {
-    candidates(sidecar, default_dir)
+    candidates(sidecar, store_file)
         .iter()
         .filter(|path| except.is_none_or(|kept| kept != path.as_path()))
         .map(|path| erase_one(path))
@@ -189,8 +196,8 @@ pub fn erase_registered_except(
 /// The bytes the files [`erase_registered`] would erase hold now: what a cache left from an
 /// earlier configuration occupies while the configuration says nothing about one.
 #[must_use]
-pub fn present_bytes(sidecar: &Sidecar, default_dir: Option<&Path>) -> u64 {
-    candidates(sidecar, default_dir)
+pub fn present_bytes(sidecar: &Sidecar, store_file: Option<&Path>) -> u64 {
+    candidates(sidecar, store_file)
         .iter()
         .filter(|path| match schema::read_header(path) {
             Ok(header) => matches!(header, schema::Header::Ours | schema::Header::Empty),
@@ -259,13 +266,13 @@ pub struct Reconciled {
 pub fn reconcile_at_start(
     config: Option<&MessageCacheConfig>,
     sidecar_file: &Path,
-    default_dir: Option<&Path>,
+    store_file: Option<&Path>,
     now_ms: i64,
 ) -> Result<Reconciled, String> {
     let mut sidecar = load(sidecar_file)?;
     let action = startup_action(config, &sidecar, now_ms);
     let erased_bytes = if action == StartupAction::EraseAll {
-        erase_registered(&sidecar, default_dir)
+        erase_registered(&sidecar, store_file)
     } else {
         0
     };
@@ -278,7 +285,7 @@ pub fn reconcile_at_start(
         store(sidecar_file, &sidecar)?;
     }
     let present_bytes = if action == StartupAction::Leave {
-        present_bytes(&sidecar, default_dir)
+        present_bytes(&sidecar, store_file)
     } else {
         0
     };
@@ -431,7 +438,7 @@ mod tests {
         for path in [&foreign, &open_one, &stale] {
             sidecar.register(path);
         }
-        let erased = erase_registered(&sidecar, Some(&dir));
+        let erased = erase_registered(&sidecar, Some(&dir.join("s.sqlite3")));
         assert!(erased > 0);
         assert_eq!(std::fs::read(&foreign).expect("kept"), b"their notes");
         assert!(
@@ -448,25 +455,35 @@ mod tests {
         let scratch = crate::testing::TempDir::new("cache-marker-present");
         let dir = scratch.path().join("c");
         file::ensure_private_dir(&dir).expect("dir");
+        let store = dir.join("s.sqlite3");
         let foreign = dir.join("x.message-cache-h.sqlite3");
         std::fs::write(&foreign, b"their notes").expect("write");
-        let kept = dir.join("kept.message-cache-h.sqlite3");
+        // This store's default cache files, on this host and on an earlier host name.
+        let kept = dir.join("s.message-cache-h.sqlite3");
         drop(MessageCache::open(crate::cache::CacheOptions::new(&kept)).expect("make one"));
-        let gone = dir.join("gone.message-cache-h.sqlite3");
+        let gone = dir.join("s.message-cache-older.sqlite3");
         drop(MessageCache::open(crate::cache::CacheOptions::new(&gone)).expect("make one"));
+        // Another store's cache in the same directory: another server's file.
+        let neighbour = dir.join("other.message-cache-h.sqlite3");
+        drop(MessageCache::open(crate::cache::CacheOptions::new(&neighbour)).expect("make one"));
         let mut sidecar = Sidecar::default();
         sidecar.register(&foreign);
         let both = file::bytes_on_disk(&kept) + file::bytes_on_disk(&gone);
         assert!(both > 0);
         assert_eq!(
-            present_bytes(&sidecar, Some(&dir)),
+            present_bytes(&sidecar, Some(&store)),
             both,
-            "a foreign file was counted"
+            "a foreign file, or another store's cache, was counted"
         );
         assert_eq!(present_bytes(&Sidecar::default(), None), 0);
-        let erased = erase_registered_except(&sidecar, Some(&dir), Some(&kept));
+        let erased = erase_registered_except(&sidecar, Some(&store), Some(&kept));
         assert!(erased > 0);
         assert!(kept.exists() && !gone.exists() && foreign.exists());
+        assert!(neighbour.exists(), "another store's cache was erased");
+        let left = file::bytes_on_disk(&kept);
+        assert_eq!(erase_registered(&Sidecar::default(), Some(&store)), left);
+        assert!(!kept.exists());
+        assert!(neighbour.exists(), "another store's cache was erased");
     }
 
     #[test]

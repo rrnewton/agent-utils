@@ -102,6 +102,10 @@ async fn enabled_false_at_startup_erases_registered_and_default_directory_files(
     leave_a_cache_at(&unregistered);
     let foreign = dir.join("state").join("notes.message-cache-x.sqlite3");
     std::fs::write(&foreign, b"somebody's notes").expect("write");
+    // And another store's cache beside this one: another server's file, which it may only have
+    // stopped holding for a deploy.
+    let neighbour = dir.join("state").join("neighbour.message-cache-h.sqlite3");
+    leave_a_cache_at(&neighbour);
     marker::register(&sidecar(dir), &elsewhere).expect("register");
 
     let clock = ManualClock::at(T0);
@@ -120,6 +124,7 @@ async fn enabled_false_at_startup_erases_registered_and_default_directory_files(
         b"somebody's notes",
         "a file that is not a cache was touched"
     );
+    assert!(neighbour.exists(), "another store's cache was erased");
     assert!(state.message_cache.cache().is_none());
     assert!(!default_cache(dir).exists(), "a disabled cache was created");
     assert!(

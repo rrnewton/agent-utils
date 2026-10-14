@@ -3590,8 +3590,10 @@ because it cannot know which agents run on its host.
 
 * **Turning it off for a host.** Set `enabled = false` in the overlay and restart. At startup the
   server erases every cache file this store's server ever made, and logs the bytes removed. That
-  means each path the sidecar lists, and each file in the store's directory that is named like a
-  cache and whose header says it is one. A file the server did not make is left alone.
+  means each path the sidecar lists, and each file in the store's directory that is named like one
+  of this store's default cache files (`<store name>.message-cache-<host>.sqlite3`, for any host)
+  and whose header says it is one. A file the server did not make is left alone, and so is another
+  store's cache in the same directory, which belongs to another server.
 * **Removing the table is not the same.** With no `[message_cache]` table, nothing is opened, but
   nothing is erased at first either. At every start the server warns that a message cache of that
   many bytes, left from an earlier configuration, is present and unused. It erases the cache once

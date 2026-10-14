@@ -130,8 +130,6 @@ struct Files {
     sidecar: PathBuf,
     /// The cache file the configuration names, or the default one beside the store.
     cache: PathBuf,
-    /// The store's directory, where a cache at the default path would be.
-    default_dir: Option<PathBuf>,
 }
 
 impl Files {
@@ -142,10 +140,6 @@ impl Files {
             cache: table
                 .and_then(|table| table.path.clone())
                 .unwrap_or_else(|| super::file::default_path(store, &super::file::host_name())),
-            default_dir: store
-                .parent()
-                .filter(|dir| !dir.as_os_str().is_empty())
-                .map(Path::to_owned),
         }
     }
 }
@@ -364,7 +358,7 @@ impl Lifecycle {
                 // The marker is written: from here on nothing is reported as a failure.
                 bytes += marker::erase_registered_except(
                     &registry,
-                    files.default_dir.as_deref(),
+                    Some(files.store.as_path()),
                     held.as_deref(),
                 );
                 Ok(bytes)
@@ -435,7 +429,7 @@ impl Lifecycle {
                 let registry = marker::load(&files.sidecar).unwrap_or_default();
                 marker::erase_registered_except(
                     &registry,
-                    files.default_dir.as_deref(),
+                    Some(files.store.as_path()),
                     held.as_deref(),
                 )
             })
@@ -600,7 +594,7 @@ pub async fn start_with(config: &Config, sink: &Sink, clock: Arc<dyn Clock>) -> 
             // leaves no trace: not even a sidecar recording that the table is absent.
             let never_had_one = table.is_none()
                 && std::fs::symlink_metadata(&files.sidecar).is_err()
-                && marker::present_bytes(&marker::Sidecar::default(), files.default_dir.as_deref())
+                && marker::present_bytes(&marker::Sidecar::default(), Some(files.store.as_path()))
                     == 0;
             if never_had_one {
                 return Ok(None);
@@ -608,7 +602,7 @@ pub async fn start_with(config: &Config, sink: &Sink, clock: Arc<dyn Clock>) -> 
             marker::reconcile_at_start(
                 table.as_ref(),
                 &files.sidecar,
-                files.default_dir.as_deref(),
+                Some(files.store.as_path()),
                 now_ms,
             )
             .map(Some)
