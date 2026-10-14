@@ -488,7 +488,8 @@ steps:
   # before the press — first drawn on its card, then only upward through several places, the thread
   # fading in under it, the line following it and the thread's scroll position fixed; real Ctrl+3 and a
   # card's replies button: the same card heading the thread across the window, fixed while it scrolls,
-  # the X, Esc and <- back to the list; nothing moving under reduced motion; and on a 412x915 phone by
+  # the X, Esc and <- back to the list; the card opened on the right, then real Ctrl+1 and a thread from the
+  # picker: the first Esc back to Main; nothing moving under reduced motion; and on a 412x915 phone by
   # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall, most of it the glide's waits.
   - group: check
     job: thread-card-header-browser
