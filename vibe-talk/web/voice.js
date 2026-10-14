@@ -1726,18 +1726,29 @@ function foldedTextLine(body, text) {
     : [{ runs: drawn(""), rh: null }]);
 }
 
-// Every message that has a fold control, in the order it was rendered. Kept rather than re-queried
-// so that "collapse all" is one pass over what exists; `liveFolds` drops the entries whose <li> has
-// left the document, which is what a cleared transcript and a re-read channel both do.
-const foldables = [];
+// A message with a fold control carries its fold on its own row, `li.foldEntry` (`foldable`), and
+// whatever acts on the folds of a list reads them off the list's rows (`foldsOf`). NO LIST OF FOLDS
+// IS KEPT BESIDE THE ROWS. One was, pruned of rows gone from the page only when something read it,
+// and it was wrong both ways (`#301 semicolon-expand-cycle`): a view the page held while another
+// showed lost its folds from it and came back with nothing for the chips, the keys or Summaries to
+// act on; and once Expand all stopped reading it, each poll's rebuild of the channel added an entry
+// per long message, each holding its thrown-away row, for as long as the page stayed open — a
+// thousand a poll on a long channel — while the row being read aloud was looked for through all of
+// them on every draw. The rows are the record: a row thrown away takes its fold with it, and a
+// row drawn again brings its fold back.
 
-function liveFolds() {
-  for (let i = foldables.length - 1; i >= 0; i -= 1) {
-    if (!foldables[i].li.parentNode) {
-      foldables.splice(i, 1);
-    }
-  }
-  return foldables;
+/** The lists a message with a fold control is drawn in: the call's transcript, and the channel's in both columns. */
+const FOLD_LISTS = ["transcript", "discord-log", "pinned-log", "side-log", "side-pinned-log"];
+
+/**
+ * The folds of the messages in `list`, in its order: each row's own.
+ *
+ * @param {Element | null} list
+ * @returns {any[]}
+ */
+function foldsOf(list) {
+  if (!list) return [];
+  return /** @type {any[]} */ ([...list.children]).filter((li) => li.foldEntry).map((li) => li.foldEntry);
 }
 
 /**
@@ -1869,7 +1880,8 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     li.append(entry.note);
     applySummaryState(entry);
   }
-  // `#249 search-highlight`. The row's fold, for the line the search puts under a folded message.
+  // The row's fold, the one record of it (`foldsOf`), for everything that acts on folds — the line
+  // the search puts under a folded message (`#249 search-highlight`) among them.
   li.foldEntry = entry;
   // Folded UNLESS the reader had already opened this message. The rebuild is invisible to them;
   // a message that was open before the poll is open after it.
@@ -1884,7 +1896,6 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     renderScrollTools();
   }));
   meta.append(fold);
-  foldables.push(entry);
   return fold;
 }
 
@@ -2106,7 +2117,7 @@ function summaryNoteText() {
 /** Every row's summary line brought back into agreement with what the server has said. */
 function renderSummaries() {
   preservingScroll(() => {
-    for (const entry of liveFolds()) {
+    for (const entry of FOLD_LISTS.flatMap((id) => foldsOf(leftEl(id)))) {
       applySummaryState(entry);
       setFolded(entry, isFolded(entry));
     }
@@ -2143,10 +2154,9 @@ function summaryTargets() {
   const area = el("scroll-area");
   const top = area.getBoundingClientRect().top - SUMMARY_LOOKAHEAD_PX;
   const bottom = top + (area.clientHeight || 0) + 2 * SUMMARY_LOOKAHEAD_PX;
-  const list = shownChannelList();
-  return liveFolds().filter((entry) => {
+  return foldsOf(shownChannelList()).filter((entry) => {
     // Not a row of a collapsed run of read messages, which is not on screen. `#221 read-modes`.
-    if (!entry.id || entry.li.parentNode !== list || entry.li.hasAttribute("data-read-run")) {
+    if (!entry.id || entry.li.hasAttribute("data-read-run")) {
       return false;
     }
     const box = entry.li.getBoundingClientRect();
@@ -2492,12 +2502,8 @@ function visibleFolds() {
   // Nor a thread's rows in the right column while it shows the cards: they are not on screen.
   // `#301 semicolon-expand-cycle`, whose keys work in either column.
   if (sideActive && columns.side.mode !== "thread") return [];
-  // By the rows of the list, each holding its own fold (`foldable`), not by the list of folds: a view
-  // this page held, drawn again, comes back without its folds in that list, and so, as `#301
-  // semicolon-expand-cycle` found, the chips and the keys had nothing to fold in All after a visit to Main.
-  const rows = /** @type {any[]} */ ([...visibleList().children]);
   // Nor the rows of a collapsed run of read messages, whose text is behind its line. `#221 read-modes`.
-  return rows.filter((li) => li.foldEntry && !li.hasAttribute("data-read-run")).map((li) => li.foldEntry);
+  return foldsOf(visibleList()).filter((entry) => !entry.li.hasAttribute("data-read-run"));
 }
 
 /** How many redraws are under way that pass over the scroll tools once, at their end. `#226`. */
@@ -15995,8 +16001,9 @@ function entryHeadRow(first) {
 function landOnFirstUnread() {
   const first = [...el("discord-log").children].find((row) => drawnOnItsOwn(row) && !rowIsRead(row));
   if (!first) return false;
-  // Opened by its own control, which every row keeps whether or not the list of folds still holds
-  // it — a view this page held, drawn again, comes back without its folds in that list.
+  // Opened by its own control, as a tap opens it. (It went by the control when the page also kept a
+  // list of folds, which a view held and drawn again came back missing from; the rows are the one
+  // record now, `foldsOf`.)
   const fold = childByClass(first, "fold");
   if (fold && first.getAttribute("data-collapsed") === "true") fold.click();
   if (!landAtFoot(first)) placeEntryLanding(entryHeadRow(first), first);
@@ -20555,7 +20562,8 @@ function renderChannelRows() {
     // every row, and a freshly built row starts folded. So a long message being read aloud folded
     // itself on the next poll, every time, while its own audio was still playing. Hearing the
     // whole message and being shown a clamped third of it is the wrong pair.
-    const entry = foldables.find((held) => held.li === row);
+    // The row's own fold, on a row drawn again from a held view as on one just built. `#301`.
+    const entry = /** @type {any} */ (row).foldEntry;
     if (isReading && entry && isFolded(entry)) {
       setFolded(entry, false);
     }

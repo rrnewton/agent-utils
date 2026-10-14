@@ -22041,6 +22041,105 @@ test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: AT THE FOOT OF TH
   assert.ok(unheld.moved < -100, `the keeper left an unheld reader at ${unheld.moved}px, so this cannot see it`);
 });
 
+/**
+ * The size of every collection `script` keeps at its top level — each `const` or `let` that starts as
+ * `[]`, a Map or a Set — on `page`, by name.
+ */
+function keptSizes(page, script) {
+  const sizes = {};
+  for (const [, name] of script.matchAll(/^(?:const|let) ([A-Za-z_$][\w$]*) = (?:\[\]|new (?:Map|Set)\()/gm)) {
+    const value = page.pure(name);
+    sizes[name] = Array.isArray(value) ? value.length : value.size;
+  }
+  return sizes;
+}
+
+test("`#301 semicolon-expand-cycle` x `#226 page-energy-profile`: NOTHING THE PAGE KEEPS GROWS as a channel that does not change is polled and its views shown again — no list of folds outlives its rows", async () => {
+  // Once Expand all read the folds off the rows, nothing pruned the list of folds the page kept beside
+  // them, and every poll's rebuild added an entry per long message, each holding its thrown-away row:
+  // 1,000 more a poll on a channel of 1,000, for as long as the page stayed open, and the row being read
+  // aloud was looked for through every one of them on every draw.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    threadHistory(page, { replies: 8, size: 20, top: 4, content: (i) => longMessage(`reply ${i}`),
+      posted: (i) => longMessage(`post ${i}`) });
+    await signIn(page);
+    await showDiscord(page, page.messages);
+    const area = page.el("scroll-area");
+    // Main, All again from what the page held, and a poll: every way the rows are drawn again.
+    const round = async () => {
+      await press(page, area, "1", { ctrlKey: true });
+      await page.settle();
+      assert.equal(page.el("thread-select").value, "main");
+      await press(page, area, "2", { ctrlKey: true });
+      await page.settle();
+      assert.equal(page.el("thread-select").value, "flat");
+      page.expireTimers(DISCORD_POLL_MS);
+      await page.settle();
+    };
+    // Once first, so that each view has been read and what the page keeps of it is in.
+    await round();
+    const long = () => page.el("discord-log").children.filter((li) => li.getAttribute("data-collapsed") !== null).length;
+    const before = { long: long(), sizes: keptSizes(page, script) };
+    for (let i = 0; i < 4; i += 1) await round();
+    const after = keptSizes(page, script);
+    assert.equal(long(), before.long, "the channel drew a different number of long messages");
+    const grew = Object.keys(after).filter((name) => after[name] > before.sizes[name])
+      .map((name) => `${name} ${before.sizes[name]} -> ${after[name]}`);
+    return { long: before.long, grew };
+  };
+  const real = await run(SCRIPT);
+  assert.ok(real.long >= 12, `the channel drew ${real.long} long messages`);
+  assert.deepStrictEqual(real.grew, [], "something the page keeps grew with every poll of a channel that did not change");
+  // Neither a fixture too small to see it nor a list this test does not read: THE CONTROL keeps a list of
+  // folds beside the rows again, never pruned, and the test names it.
+  const kept = brokenScript("const FOLD_LISTS = [", "const foldsKept = [];\nconst FOLD_LISTS = [")
+    .replace("  meta.append(fold);\n  return fold;\n", "  meta.append(fold);\n  foldsKept.push(entry);\n  return fold;\n");
+  assert.ok(kept.includes("foldsKept.push(entry)"), "the control no longer finds where a fold is made");
+  const leaky = await run(kept);
+  assert.equal(leaky.grew.length, 1, `the control grew ${leaky.grew.join(", ")}`);
+  assert.match(leaky.grew[0], /^foldsKept \d+ -> \d+$/);
+  const [from, to] = leaky.grew[0].split(" ").filter((word) => /^\d+$/.test(word)).map(Number);
+  assert.ok(to - from >= 4 * leaky.long, `the control's list grew by ${to - from}, not a long message's row a round`);
+});
+
+test("`#301 semicolon-expand-cycle` x `#49 cached-summaries`: ALL, DRAWN AGAIN from what the page held, has its long messages summarised under Summaries", async () => {
+  // A view held while another showed came back with its folds missing from the list of folds the page
+  // kept, and Summaries asked about the rows of that list: the replies All shows were never summarised
+  // until a poll drew them afresh. The rows are the record now, and Summaries reads them.
+  const page = newPage();
+  threadHistory(page, { replies: 8, size: 20, top: 4, content: (i) => longMessage(`reply ${i}`),
+    posted: (i) => longMessage(`post ${i}`) });
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  const area = page.el("scroll-area");
+  const replies = page.messages.filter((m) => m.thread && !m.thread.is_root).map((m) => String(m.id));
+  assert.equal(page.el("thread-select").value, "flat", "the channel did not open in All");
+  await press(page, area, "1", { ctrlKey: true });
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "main");
+  await turnSummariesOn(page);
+  // Main draws none of the thread's replies, so none has been asked about.
+  assert.deepStrictEqual(replies.filter((id) => asksFor(page, id) > 0), []);
+  assert.ok(page.summaryAsks.length > 0, "Summaries asked about nothing in Main");
+  const served = page.pagesServed.length;
+  await press(page, area, "2", { ctrlKey: true });
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat");
+  // The premise: All is the rows the page held, not a page read for it again.
+  assert.equal(page.pagesServed.length, served, "All was read again, so its rows are not the held ones");
+  // Summaries asks as the list scrolls: the reader scrolls a little, as the browser's scroll event
+  // after the held place is put back would.
+  area.scrollTop -= 40;
+  await area.dispatch("scroll");
+  await page.settle();
+  const asked = replies.filter((id) => asksFor(page, id) > 0);
+  assert.ok(asked.length >= 2, `All, shown again, asked about ${asked.length} of the replies on screen`);
+  for (const id of asked) {
+    assert.equal(summaryText(channelRow(page, id)), `a short line about ${id}`, `reply ${id} does not show its summary`);
+  }
+});
+
 test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chosen from — Main, All or a thread in one column, or two columns — and never to a thread opened from it", async () => {
   // The owner, of the Threads screen the list replaced: "rather ESC works". A view is left the way it was come to.
   const page = await threadPage();
