@@ -1356,23 +1356,48 @@ async fn unserving_range_bridge(
     (base, seen)
 }
 
-/// What `/count?since=` and `/page?since=` answered, the fields a caller reads.
-async fn count_and_page(router: &axum::Router, since: i64) -> (Value, Value) {
-    let (status, count) = get(
-        router,
-        &format!("/api/v1/channels/{READ_CHANNEL}/count?since={}", iso(since)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{count}");
-    let (status, page) = get(
-        router,
-        &format!(
-            "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=10",
-            iso(since)
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{page}");
+/// Which of `/count?since=` and `/page?since=` [`count_and_page`] asks first.
+#[derive(Clone, Copy, Debug)]
+enum First {
+    Count,
+    Page,
+}
+
+/// What `/count?since=` and `/page?since=` answered, the fields a caller reads, asking `first`
+/// first: what one route learns of a bridge (that it does not serve range reads, say) can change
+/// how the other reads it.
+async fn count_and_page(router: &axum::Router, since: i64, first: First) -> (Value, Value) {
+    let count = || async {
+        let (status, count) = get(
+            router,
+            &format!("/api/v1/channels/{READ_CHANNEL}/count?since={}", iso(since)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{count}");
+        count
+    };
+    let page = || async {
+        let (status, page) = get(
+            router,
+            &format!(
+                "/api/v1/channels/{READ_CHANNEL}/page?since={}&limit=10",
+                iso(since)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        page
+    };
+    let (count, page) = match first {
+        First::Count => {
+            let count = count().await;
+            (count, page().await)
+        }
+        First::Page => {
+            let page = page().await;
+            (count().await, page)
+        }
+    };
     let ids = |list: &Value| -> Vec<String> {
         list.as_array()
             .expect("messages")
@@ -1400,6 +1425,12 @@ async fn count_and_page(router: &axum::Router, since: i64) -> (Value, Value) {
 /// message list. `/count` and `/page` then answer exactly what they answer with the setting off,
 /// from the reads they always made, rather than fail. The bridge is not asked for a range read
 /// again while that is remembered, so the next reads cost what they cost with the setting off.
+///
+/// Fix round 2: each route is asked FIRST on a deployment of its own, so each answers the step the
+/// bridge did not serve itself, before anything is remembered. Asked second, a route only ever
+/// read a bridge already known not to serve range reads, and `/page`'s reading of an unserved step
+/// as the setting off reads it (rather than as a native step, which says `has_more` on a short one)
+/// went untested.
 #[tokio::test]
 async fn a_bridge_that_does_not_serve_range_reads_is_read_as_before() {
     let since = BASE_MS + 10 * MINUTE_MS;
@@ -1414,7 +1445,7 @@ async fn a_bridge_that_does_not_serve_range_reads_is_read_as_before() {
     let state = bridge_deployment(&base, "");
     assert_eq!(state.chat.read_caps(&channel).range, Support::Emulated);
     let router = vibe_talk::http::router(state);
-    let today = count_and_page(&router, since).await;
+    let today = count_and_page(&router, since, First::Count).await;
     assert_eq!(today.0["counted"], 2, "{today:?}");
     let today_asked = std::mem::take(&mut *seen.lock().expect("log"));
     assert!(today_asked.iter().all(|asked| !asked.contains("since=")));
@@ -1426,14 +1457,32 @@ async fn a_bridge_that_does_not_serve_range_reads_is_read_as_before() {
         Unserved::PlainList,
     ] {
         let (base, seen) = unserving_range_bridge(messages.clone(), unserved).await;
+        let router = vibe_talk::http::router(bridge_deployment(&base, "range_reads = true"));
+        assert_eq!(
+            count_and_page(&router, since, First::Page).await,
+            today,
+            "{unserved:?}: `/page` first gives the answers made without the setting"
+        );
+        let asked = std::mem::take(&mut *seen.lock().expect("log"));
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|asked| asked.contains("since="))
+                .count(),
+            1,
+            "{unserved:?}: asked once, by `/page`, then remembered: {asked:?}"
+        );
+        assert!(asked[0].contains("since="), "{unserved:?}: {asked:?}");
+
+        let (base, seen) = unserving_range_bridge(messages.clone(), unserved).await;
         let state = bridge_deployment(&base, "range_reads = true");
         let chat = Arc::clone(&state.chat);
         assert_eq!(chat.read_caps(&channel).range, Support::Native);
         let router = vibe_talk::http::router(state);
         assert_eq!(
-            count_and_page(&router, since).await,
+            count_and_page(&router, since, First::Count).await,
             today,
-            "{unserved:?}: the answers made without the setting"
+            "{unserved:?}: `/count` first gives the answers made without the setting"
         );
         let asked = std::mem::take(&mut *seen.lock().expect("log"));
         assert_eq!(
@@ -1452,7 +1501,11 @@ async fn a_bridge_that_does_not_serve_range_reads_is_read_as_before() {
         );
 
         // Remembered: the same reads again cost exactly what they cost without the setting.
-        assert_eq!(count_and_page(&router, since).await, today, "{unserved:?}");
+        assert_eq!(
+            count_and_page(&router, since, First::Count).await,
+            today,
+            "{unserved:?}"
+        );
         let again = std::mem::take(&mut *seen.lock().expect("log"));
         assert_eq!(again, today_asked, "{unserved:?}");
     }
