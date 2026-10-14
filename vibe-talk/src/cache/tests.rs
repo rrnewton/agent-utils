@@ -2433,6 +2433,7 @@ fn revalidation_never_leaves_a_claim_or_a_head_over_rows_it_deleted() {
     let facts = shadow::Facts {
         asked_ms: now + 1,
         live_fed: false,
+        fed_since_ms: None,
         dropped_ms: None,
         barrier: true,
         feed: shadow::Feed::AdditionsOnly,
@@ -2553,6 +2554,7 @@ fn only_the_latest_read_of_the_newest_end_vouches_for_the_band() {
     let facts = shadow::Facts {
         asked_ms: second + 1_000,
         live_fed: false,
+        fed_since_ms: None,
         dropped_ms: None,
         barrier: true,
         feed: shadow::Feed::AdditionsOnly,

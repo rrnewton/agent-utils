@@ -519,6 +519,8 @@ struct ShadowTask {
     ask: Ask,
     feed: shadow::Feed,
     live_fed: bool,
+    /// [`MessageCache::fed_since_ms`] when the ask was made.
+    fed_since_ms: Option<i64>,
     asked_ms: i64,
     evaluated: tokio::task::JoinHandle<Evaluated>,
     progress: Arc<ShadowProgress>,
@@ -587,6 +589,7 @@ impl ShadowTask {
             ask,
             feed,
             live_fed,
+            fed_since_ms,
             asked_ms,
             evaluated,
             progress,
@@ -612,6 +615,7 @@ impl ShadowTask {
                         let facts = shadow::Facts {
                             asked_ms,
                             live_fed,
+                            fed_since_ms,
                             dropped_ms,
                             barrier,
                             feed,
@@ -962,6 +966,7 @@ impl Sink {
         // Both noted now, before the request's own read starts: the time the rule decides at, and
         // the offers the barrier waits for, none of them the request's own.
         let asked_ms = cache.now_ms();
+        let fed_since_ms = Some(cache.fed_since_ms());
         let target = cache.enqueued_seq();
         let weak = Arc::downgrade(&cache);
         drop(cache);
@@ -988,6 +993,7 @@ impl Sink {
                 ask,
                 feed: shadow::Feed::of(route.shape),
                 live_fed,
+                fed_since_ms,
                 asked_ms,
                 evaluated,
                 progress: Arc::clone(progress),

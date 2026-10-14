@@ -1028,6 +1028,10 @@ pub(crate) struct Shared {
     /// ended: the writer checkpoints the log itself when this is small, so that its own copy,
     /// and its sync, are cheap.
     pub(crate) log_backlog: AtomicI64,
+    /// Local time, by [`Shared::clock`], the file now open was opened in this process: since then,
+    /// every change the live feed offered for a channel was written or recorded as left out. What
+    /// happened before (while the server was down, or the cache off) never reached the file.
+    pub(crate) opened_ms: AtomicI64,
     /// Erases asked for and not yet applied, with the sequence number that applies them
     /// (`u64::MAX` until it is known, or when the writer could not be asked).
     pub(crate) erasing: Mutex<HashMap<Erasing, u64>>,
@@ -1304,6 +1308,7 @@ impl MessageCache {
             search_text_current: AtomicBool::new(true),
             readers_in_use: AtomicUsize::new(0),
             log_backlog: AtomicI64::new(i64::MAX),
+            opened_ms: AtomicI64::new(i64::MAX),
             erasing: Mutex::new(HashMap::new()),
             sweep: Mutex::new(None),
             erase_failed: Mutex::new(HashSet::new()),
@@ -1356,6 +1361,16 @@ impl MessageCache {
     #[must_use]
     pub fn now_ms(&self) -> i64 {
         self.shared.clock.now_ms()
+    }
+
+    /// Since when, by [`MessageCache::now_ms`]'s clock, every change the live feed has offered for
+    /// a channel was written to the file or recorded as left out ([`MessageCache::mark_suspect`]):
+    /// when the file now open was opened in this process. A change made before then, while the
+    /// server was down or the cache off, never reached the file, so the feed vouches for nothing
+    /// seen before it.
+    #[must_use]
+    pub fn fed_since_ms(&self) -> i64 {
+        self.shared.opened_ms.load(Ordering::SeqCst)
     }
 
     /// Replace the route snapshot the writer gates on, and sweep every channel and provider not
@@ -2214,6 +2229,9 @@ impl Drop for MessageCache {
 /// Open the file at `path` for `shared`: create it `0600` if absent, recognise it, rebuild one of
 /// ours that cannot be used, start its writer, and open its readers.
 fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
+    shared
+        .opened_ms
+        .store(shared.clock.now_ms(), Ordering::SeqCst);
     let mut rebuilt = false;
     let connection = loop {
         file::create_if_absent(path).map_err(CacheError::Filesystem)?;

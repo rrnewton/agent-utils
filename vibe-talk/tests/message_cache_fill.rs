@@ -2541,3 +2541,55 @@ async fn a_short_flat_page_never_vouches_for_an_older_message_whose_pushed_edit_
     );
     assert!(!cache.is_suspect(&read_chan()));
 }
+
+// ---- the live feed vouches only for what it has carried -----------------------------------------
+
+/// A live-fed bridge, filled, then stopped. While no server runs, a message is deleted upstream:
+/// no push reaches anything, and nothing records a drop. The next start, past the bridge's
+/// twenty-four hours, asks for the message by id: the live feed that carries deletions has carried
+/// none of that downtime's, so it vouches for nothing seen before this start.
+#[tokio::test]
+async fn a_deletion_made_while_the_server_was_down_is_never_vouched_for() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let dir = TempDir::new("cache-fill-downtime");
+    {
+        let Upstream { state, .. } = upstream(true, 8);
+        let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+        get(&state, &flat_page()).await;
+        let cache = state.message_cache.cache().expect("installed");
+        assert_eq!(held(&cache), 8);
+        close(&state, cache);
+    }
+    clock.advance(25 * HOUR);
+    let Upstream {
+        state, fake, ids, ..
+    } = upstream(true, 8);
+    fake.delete(&ids[2]);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    clock.advance(MINUTE);
+    let by_id =
+        |id: &MessageId| format!("/api/v1/channels/{READ_CHANNEL}/messages/{}", id.as_str());
+    let status = call_as(&state, &by_id(&ids[2]), testing::READ_TOKEN).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.extra_rows),
+        (0, 0),
+        "a message deleted while the server was down is vouched for: {counted:?}"
+    );
+    assert_eq!(counted.misses.stale_head, 1, "{counted:?}");
+
+    // A read of the whole channel since this start revalidates what it lists, and from then on
+    // the feed carries every deletion: a message it lists is vouched for, past the read's own
+    // twenty-four hours too.
+    get(&state, &flat_page()).await;
+    clock.advance(25 * HOUR);
+    let status = call_as(&state, &by_id(&ids[3]), testing::READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK);
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.agreed),
+        (1, 1),
+        "seen since this start, on a live feed that carries deletions: {counted:?}"
+    );
+}

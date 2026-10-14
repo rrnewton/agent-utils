@@ -18,7 +18,7 @@
 //! | Consumer | Would serve when |
 //! |---|---|
 //! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, every row served at or above the head's settled top (which no claim holds) was listed by the latest read of the scope's newest end, the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), nothing served is in doubt (see below), and the barrier passed |
-//! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`] or the channel is live-fed; on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
+//! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since this process opened the file (a deletion made before then, while the server was down, reached nothing); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
 //! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
 //! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the head is as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
 //! | `timeline_fallback` | coverage holds `limit` rows down from the head, with every row above the settled top listed by the latest read of the newest end as for `messages`, nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
@@ -383,6 +383,10 @@ pub struct Facts {
     pub asked_ms: i64,
     /// Whether a live producer feeds the channel: its provider is polled, or adapters push.
     pub live_fed: bool,
+    /// Since when every change the live feed offered for the channel reached the file or was
+    /// recorded as left out: when this process opened the file ([`super::MessageCache::fed_since_ms`]).
+    /// A live feed vouches for nothing seen before it. `None` when not known: then for nothing.
+    pub fed_since_ms: Option<i64>,
     /// The latest local time an offer for the channel was dropped in this process, if one was.
     /// The rule takes the later of this and the file's [`View::dropped_ms`].
     pub dropped_ms: Option<i64>,
@@ -524,6 +528,16 @@ fn fresh(head: &Head, facts: &Facts) -> bool {
     facts.asked_ms.saturating_sub(head.head_listed_ms) <= within
 }
 
+/// Whether the live feed has carried every edit and deletion since local time `at_ms`: the
+/// provider's feed carries them, a live producer feeds the channel, and the feed's current run (the
+/// file's opening in this process) began no later than `at_ms`. A change made before the run began
+/// (while the server was down, say) reached nothing, and no drop records it.
+fn fed_since(at_ms: i64, facts: &Facts) -> bool {
+    facts.feed == Feed::Deletions
+        && facts.live_fed
+        && facts.fed_since_ms.is_some_and(|since| at_ms >= since)
+}
+
 /// A newest window, or a newest page: coverage contiguous from the head down to `limit` rows.
 fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result<Decision, Miss> {
     let dropped = dropped(view, facts);
@@ -562,7 +576,9 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
 
 /// One message: held, seen since the channel's latest drop, and its home scope revalidated recently
 /// enough for its provider's feed. A live feed that carries deletions vouches for a message only
-/// when nothing it offered since the message was seen was dropped.
+/// when nothing it offered since the message was seen was dropped, and only when it has been
+/// running since the message was seen, or its home scope revalidated: a deletion made before then
+/// reached nothing.
 fn message(view: &View, facts: &Facts) -> Result<Decision, Miss> {
     let row = view.rows.first().ok_or(Miss::Gap)?;
     if !trusted(row, dropped(view, facts)) {
@@ -576,8 +592,12 @@ fn message(view: &View, facts: &Facts) -> Result<Decision, Miss> {
     let within = |limit_ms: i64| {
         revalidated.is_some_and(|full_ms| facts.asked_ms.saturating_sub(full_ms) <= limit_ms)
     };
+    let fed = fed_since(
+        revalidated.map_or(row.observed_ms, |full_ms| full_ms.max(row.observed_ms)),
+        facts,
+    );
     match facts.feed {
-        Feed::Deletions if facts.live_fed || within(REVALIDATED_BRIDGE_MS) => Ok(Decision::Serve),
+        Feed::Deletions if fed || within(REVALIDATED_BRIDGE_MS) => Ok(Decision::Serve),
         Feed::Deletions if revalidated.is_none() => Err(Miss::Gap),
         Feed::Deletions => Err(Miss::StaleHead),
         Feed::AdditionsOnly if within(REVALIDATED_ADDITIONS_ONLY_MS) => Ok(Decision::Serve),
@@ -1042,6 +1062,7 @@ mod tests {
         Facts {
             asked_ms,
             live_fed: false,
+            fed_since_ms: None,
             dropped_ms: None,
             barrier: true,
             feed: Feed::AdditionsOnly,
@@ -1331,14 +1352,67 @@ mod tests {
             decide(&ask, &held(LISTED - REVALIDATED_BRIDGE_MS - 1), &bridge),
             Decision::Miss(Miss::StaleHead)
         );
+        // A live feed that carries deletions vouches for the message, however long ago its home
+        // scope was revalidated, when it has run since the message was seen.
         let fed = Facts {
             live_fed: true,
+            fed_since_ms: Some(LISTED - HOUR),
             ..bridge
         };
         assert_eq!(
             decide(&ask, &held(LISTED - REVALIDATED_BRIDGE_MS - 1), &fed),
             Decision::Serve
         );
+        // Not when it began after: a deletion made before (while the server was down) reached
+        // nothing. Then the twenty-four hours decide.
+        let restarted = Facts {
+            fed_since_ms: Some(LISTED + 1),
+            ..fed
+        };
+        assert_eq!(
+            decide(&ask, &held(LISTED - REVALIDATED_BRIDGE_MS - 1), &restarted),
+            Decision::Miss(Miss::StaleHead)
+        );
+        assert_eq!(
+            decide(&ask, &held(LISTED - 3 * HOUR), &restarted),
+            Decision::Serve
+        );
+        // A home scope revalidated since the feed began vouches as a sighting does.
+        let reread = View {
+            rows: vec![CachedMessage {
+                observed_ms: LISTED - 2 * REVALIDATED_BRIDGE_MS,
+                ..row(3)
+            }],
+            ..held(LISTED + 2)
+        };
+        assert_eq!(
+            decide(
+                &ask,
+                &reread,
+                &Facts {
+                    asked_ms: LISTED + REVALIDATED_BRIDGE_MS + 3,
+                    ..restarted
+                }
+            ),
+            Decision::Serve
+        );
+        // Nor does a feed that does not say when it began, nor one that carries no deletions.
+        for unknown in [
+            Facts {
+                fed_since_ms: None,
+                ..fed
+            },
+            Facts {
+                feed: Feed::AdditionsOnly,
+                ..fed
+            },
+        ] {
+            assert_ne!(
+                decide(&ask, &held(LISTED - REVALIDATED_BRIDGE_MS - 1), &unknown),
+                Decision::Serve,
+                "{unknown:?}"
+            );
+        }
         let unclaimed = View {
             coverage: Vec::new(),
             ..held(LISTED)
