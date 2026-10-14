@@ -604,6 +604,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#292 reply-marks-read` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
+  # Reply docked in the left column on a Main message and in the right on a thread's reply, sent with
+  # Enter, each marks the message it answers Done on the server, asks the provider to mark it
+  # `after_reply` after that Done, says so on the status line and draws the row read; a later message
+  # in an answered thread's box marks nothing; and the first reply typed in a new thread, opened from
+  # the grey Thread on the right, marks its root read in both columns, the second nothing. Measured on
+  # 2026-10-14: about 5s wall.
+  - group: check
+    job: reply-marks-read-browser
+    desc: a docked Reply and a new thread's first reply mark what they answer read, Done and at the provider, and a later thread message marks nothing, in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/reply_marks_read_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#252 thread-button-state` in the browser engine, at 412x915 by touch and 1280x800 with a mouse: on
   # Main, in the dark scheme and the light, a new message's Thread tag -- the thread Google Chat names
   # for every message, which nobody has answered -- is drawn exactly as Reply beside it (border, ink,
