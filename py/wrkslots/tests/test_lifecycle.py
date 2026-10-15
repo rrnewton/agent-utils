@@ -8268,7 +8268,11 @@ def test_batch_maps_filter_input_ceiling_grows_with_the_selected_trees(
     process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
     observed: list[tuple[int, int]] = []
 
-    def root_command(program: Path, arguments: Sequence[str], **kwargs: object):
+    def root_command(
+        program: Path,
+        arguments: Sequence[str],
+        **kwargs: object,
+    ) -> tuple[int, bytes, bytes]:
         data = kwargs["input_data"]
         limit = kwargs["input_limit"]
         assert isinstance(data, bytes) and isinstance(limit, int)
