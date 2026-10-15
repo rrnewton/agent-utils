@@ -92,8 +92,13 @@ pub struct Incoming {
     /// The scope this message belongs to by nature: where an exhaustive listing that lacks it
     /// means it was deleted.
     pub home: Scope,
-    /// The provider's edit time, when it reports one.
+    /// The provider's edit time, when it reports one: [`Message::edited_timestamp`], read as an
+    /// instant.
     pub edited_ms: Option<i64>,
+    /// Whether every copy of this message its provider gives reports its edits, so that a copy
+    /// with no edit time is of a message not edited when it was read ([`super::merge`], rule 2).
+    /// Set by [`super::observe`] for the providers that do.
+    pub reports_edits: bool,
 }
 
 impl Incoming {
@@ -107,11 +112,23 @@ impl Incoming {
         message.content_html = String::new();
         message.heading = None;
         message.noise = false;
+        let edited_ms = message
+            .edited_timestamp
+            .as_deref()
+            .and_then(crate::clock::instant_ms);
         Self {
             message,
             home,
-            edited_ms: None,
+            edited_ms,
+            reports_edits: false,
         }
+    }
+
+    /// The same copy, from a provider whose every copy reports the message's edits or not.
+    #[must_use]
+    pub fn reporting_edits(mut self, reports_edits: bool) -> Self {
+        self.reports_edits = reports_edits;
+        self
     }
 }
 

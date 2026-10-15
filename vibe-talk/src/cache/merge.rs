@@ -8,7 +8,14 @@
 //!    AND either it was observed later than the held one or its provider edit time is later. A
 //!    listing is observed when its read STARTED (for a snapshot that says how old it is, the
 //!    earlier of the two), so an edit or deletion pushed while a read was running is never
-//!    reverted by that read.
+//!    reverted by that read. A message once edited stays edited, and its edit time only moves
+//!    later, so a copy whose edit time is older than the held copy's is of an earlier version and
+//!    never replaces it, however late it was observed; and where every copy a provider gives
+//!    reports the message's edits ([`Offered::reports_edits`]), a copy that reports none is of a
+//!    version older than a held copy that reports one, and one that reports an edit is newer than
+//!    a held copy that reports none. That is what keeps a copy a provider served from memory (a
+//!    Slack reply Flat last read in full up to a quarter of an hour before, offered as seen at the
+//!    window's start) from putting back text a later read had already replaced.
 //! 3. **Deletions** delete the row and leave a [tombstone](crate::cache) holding nothing derived
 //!    from the content. Only a read that started after the deletion brings the id back. A push
 //!    never does: a pushed creation or edit that lands after the deletion (an event retried, two
@@ -77,6 +84,11 @@ pub struct Offered<'a> {
     pub observed_ms: i64,
     /// Provider edit time, when reported.
     pub edited_ms: Option<i64>,
+    /// Whether every copy of the message its provider gives reports its edits, so that a copy
+    /// without an edit time is of a message not edited when it was read: Slack's, and Discord's
+    /// own API. A bridge's copies may come by paths that cannot say (a pushed event), so its are
+    /// compared by edit time only where both copies carry one.
+    pub reports_edits: bool,
     /// How it arrived.
     pub arrival: Arrival,
     /// Whether the sender marked it as possibly a snippet.
@@ -97,6 +109,18 @@ pub enum Verdict {
     },
 }
 
+/// Which of two copies of one message is the later version by their provider edit times, when
+/// that can be told: `Less` when the offered copy is the earlier. See rule 2.
+#[must_use]
+pub fn edit_order(held: &Held<'_>, offered: &Offered<'_>) -> Option<std::cmp::Ordering> {
+    match (offered.edited_ms, held.edited_ms) {
+        (Some(offered_ms), Some(held_ms)) => Some(offered_ms.cmp(&held_ms)),
+        (Some(_), None) if offered.reports_edits => Some(std::cmp::Ordering::Greater),
+        (None, Some(_)) if offered.reports_edits => Some(std::cmp::Ordering::Less),
+        _ => None,
+    }
+}
+
 /// Rules 2 and 5 for a message the cache already holds.
 #[must_use]
 pub fn content_verdict(held: &Held<'_>, offered: &Offered<'_>) -> Verdict {
@@ -115,16 +139,17 @@ pub fn content_verdict(held: &Held<'_>, offered: &Offered<'_>) -> Verdict {
     {
         return Verdict::Keep;
     }
+    let order = edit_order(held, offered);
+    // An earlier version never replaces a later one, however late it was seen.
+    if order == Some(std::cmp::Ordering::Less) {
+        return Verdict::Keep;
+    }
     // Any listing replaces what a push may have cut short.
     if held.partial && listing {
         return Verdict::Replace { partial: false };
     }
     let newer_observation = offered.observed_ms > held.observed_ms;
-    let newer_edit = match (offered.edited_ms, held.edited_ms) {
-        (Some(offered), Some(held)) => offered > held,
-        (Some(_), None) => true,
-        _ => false,
-    };
+    let newer_edit = order == Some(std::cmp::Ordering::Greater);
     if newer_observation || newer_edit {
         Verdict::Replace {
             partial: offered.arrival.is_push() && offered.partial,
@@ -225,6 +250,7 @@ mod tests {
                 content_hash: &hash,
                 observed_ms,
                 edited_ms: None,
+                reports_edits: false,
                 arrival,
                 partial: false,
             },
@@ -259,6 +285,7 @@ mod tests {
             content_hash: &hash,
             observed_ms: 40,
             edited_ms: Some(200),
+            reports_edits: false,
             arrival: Arrival::Listing,
             partial: false,
         };
@@ -271,6 +298,66 @@ mod tests {
             ..offered
         };
         assert_eq!(content_verdict(&h, &older_edit), Verdict::Keep);
+    }
+
+    /// A copy whose edit time is older than the held copy's is an earlier version, observed late:
+    /// kept out. Where the provider's copies always report edits, one that reports none is older
+    /// than a held copy that reports one, and one that reports one is newer than a held copy that
+    /// reports none; elsewhere a missing edit time says nothing, and the observation decides.
+    #[test]
+    fn an_earlier_version_never_replaces_a_later_one_however_late_it_was_seen() {
+        let (held_hash, mut h) = held("the reply as edited", 50, false);
+        h.content_hash = &held_hash;
+        h.edited_ms = Some(100);
+        let stale = crate::cache::rows::content_hash("an earlier reply");
+        let offered = |edited_ms: Option<i64>, reports_edits: bool, arrival: Arrival| Offered {
+            content: "an earlier reply",
+            content_hash: &stale,
+            observed_ms: 90,
+            edited_ms,
+            reports_edits,
+            arrival,
+            partial: false,
+        };
+        for arrival in [Arrival::Listing, Arrival::Rows, Arrival::PushUpdate] {
+            assert_eq!(
+                content_verdict(&h, &offered(Some(60), false, arrival)),
+                Verdict::Keep,
+                "{arrival:?}: an older edit time"
+            );
+            assert_eq!(
+                content_verdict(&h, &offered(None, true, arrival)),
+                Verdict::Keep,
+                "{arrival:?}: no edit, from a provider that always reports one"
+            );
+            assert_eq!(
+                content_verdict(&h, &offered(None, false, arrival)),
+                Verdict::Replace { partial: false },
+                "{arrival:?}: no edit time from a path that cannot say; the later observation wins"
+            );
+        }
+        // Held unedited: a copy reporting an edit is newer, however early it was seen, where the
+        // provider always reports edits; elsewhere the observation decides.
+        let (unedited_hash, mut unedited) = held("first words", 50, false);
+        unedited.content_hash = &unedited_hash;
+        let early = |reports_edits: bool| Offered {
+            observed_ms: 10,
+            edited_ms: Some(30),
+            ..offered(Some(30), reports_edits, Arrival::Listing)
+        };
+        assert_eq!(
+            content_verdict(&unedited, &early(true)),
+            Verdict::Replace { partial: false }
+        );
+        assert_eq!(content_verdict(&unedited, &early(false)), Verdict::Keep);
+        // An older edit time keeps out even a listing over a partial row.
+        let (partial_hash, mut partial) = held("the reply as edited", 50, true);
+        partial.content_hash = &partial_hash;
+        partial.edited_ms = Some(100);
+        assert_eq!(
+            content_verdict(&partial, &offered(Some(60), false, Arrival::Listing)),
+            Verdict::Keep
+        );
     }
 
     #[test]

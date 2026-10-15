@@ -17,7 +17,7 @@
 //!
 //! | Consumer | Would serve when |
 //! |---|---|
-//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the head was listed at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
+//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the latest read of the scope's newest end began at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
 //! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since this process opened the file (a deletion made before then, while the server was down, reached nothing); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
 //! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), the band is vouched for as for `messages`, no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
 //! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the band is vouched for as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
@@ -532,9 +532,17 @@ fn reuse_ms(facts: &Facts) -> i64 {
     }
 }
 
-/// Whether the head was listed within the reuse period: no creation is missing from its top.
-fn fresh(head: &Head, facts: &Facts) -> bool {
-    facts.asked_ms.saturating_sub(head.head_listed_ms) <= reuse_ms(facts)
+/// Whether the scope's newest end was read within the reuse period: no creation is missing from
+/// its top. Judged by the latest read of the newest end the file records, not by the head's own
+/// listing time: while a band is open and nothing newer has come, the head keeps the time of the
+/// read that opened the band, which is what the band's ten minutes are counted from, and a quiet
+/// channel read every few seconds would otherwise look stale for those ten minutes.
+fn fresh(view: &View, head: &Head, facts: &Facts) -> bool {
+    let checked = view
+        .head_checked_ms
+        .unwrap_or(head.head_listed_ms)
+        .max(head.head_listed_ms);
+    facts.asked_ms.saturating_sub(checked) <= reuse_ms(facts)
 }
 
 /// Whether the claims a window or a count rests on still stand: their edits and deletions were
@@ -627,7 +635,7 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     }
     // Fresh, the window as a whole: its head, and the claims under it.
     if needs_fresh
-        && (!fresh(&head, facts) || cover.is_some_and(|cover| !current(cover.full_ms, facts)))
+        && (!fresh(view, &head, facts) || cover.is_some_and(|cover| !current(cover.full_ms, facts)))
     {
         return Err(Miss::StaleHead);
     }
@@ -698,7 +706,7 @@ fn page(
     if !cover.complete {
         return Err(Miss::Incomplete);
     }
-    if open && !view.head.is_some_and(|head| fresh(&head, facts)) {
+    if open && !view.head.is_some_and(|head| fresh(view, &head, facts)) {
         return Err(Miss::StaleHead);
     }
     Ok(Decision::Serve)
@@ -719,7 +727,7 @@ fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     if !cover.complete {
         return Err(Miss::Incomplete);
     }
-    if !fresh(&head, facts) || !current(cover.full_ms, facts) {
+    if !fresh(view, &head, facts) || !current(cover.full_ms, facts) {
         return Err(Miss::StaleHead);
     }
     Ok(Decision::Serve)

@@ -362,11 +362,17 @@ impl LiveHub {
         self.publish_read(channel, message, None);
     }
 
-    /// [`LiveHub::publish`] a message a read found, the read having begun at `read_ms` by the
-    /// message cache's clock: the cache is offered it as of then, not as of now, so an edit or a
-    /// deletion the cache learned of while the read was on its way back is not undone by it.
+    /// [`LiveHub::publish`] a message a read found, the read having begun at `read` (its time by
+    /// the message cache's clock, and its stamp): the cache is offered it as of then, not as of
+    /// now, so an edit or a deletion the cache learned of while the read was on its way back is not
+    /// undone by it, and an erase made meanwhile drops it as it drops the read's own offers.
     /// `#208 persistent-cache`.
-    fn publish_read(&self, channel: &ChannelId, message: Message, read_ms: Option<i64>) {
+    fn publish_read(
+        &self,
+        channel: &ChannelId,
+        message: Message,
+        read: Option<crate::cache::ReadStart>,
+    ) {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
@@ -375,7 +381,7 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_inner(channel, live, false, read_ms);
+        self.publish_inner(channel, live, false, read);
     }
 
     /// Publish one thread reply a provider read apart from the channel's own timeline, and
@@ -391,10 +397,15 @@ impl LiveHub {
         self.publish_reply_read(channel, message, None);
     }
 
-    /// [`LiveHub::publish_reply`] a reply a read found, the read having begun at `read_ms` by the
-    /// message cache's clock, as [`LiveHub::publish_read`] publishes a message of the channel's own:
-    /// the cache is offered it as of then. `#208 persistent-cache`.
-    fn publish_reply_read(&self, channel: &ChannelId, message: Message, read_ms: Option<i64>) {
+    /// [`LiveHub::publish_reply`] a reply a read found, the read having begun at `read`, as
+    /// [`LiveHub::publish_read`] publishes a message of the channel's own: the cache is offered it
+    /// as of then. `#208 persistent-cache`.
+    fn publish_reply_read(
+        &self,
+        channel: &ChannelId,
+        message: Message,
+        read: Option<crate::cache::ReadStart>,
+    ) {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
@@ -403,7 +414,7 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_to_feed(channel, live, false, read_ms);
+        self.publish_to_feed(channel, live, false, read);
     }
 
     /// Publish one event delivered by an external adapter.
@@ -434,13 +445,13 @@ impl LiveHub {
         channel: &ChannelId,
         live: LiveMessage,
         deduplicate: bool,
-        read_ms: Option<i64>,
+        read: Option<crate::cache::ReadStart>,
     ) -> bool {
         // Both producers reach this, so it is where a created message is noted for clearing at
         // its provider: one map update and a wake-up, after the feed lock is released.
         let created = (live.kind == LiveKind::Create)
             .then(|| (live.message.id.clone(), live.message.timestamp.clone()));
-        if !self.publish_to_feed(channel, live, deduplicate, read_ms) {
+        if !self.publish_to_feed(channel, live, deduplicate, read) {
             return false;
         }
         if let Some((id, timestamp)) = created {
@@ -454,7 +465,7 @@ impl LiveHub {
         channel: &ChannelId,
         live: LiveMessage,
         deduplicate: bool,
-        read_ms: Option<i64>,
+        read: Option<crate::cache::ReadStart>,
     ) -> bool {
         let mut feeds = lock(&self.feeds);
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
@@ -479,7 +490,7 @@ impl LiveHub {
             } else {
                 crate::cache::ServerFill::Poller
             };
-            sink.offer_push(channel, &live, producer, read_ms);
+            sink.offer_push(channel, &live, producer, read);
         }
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {
@@ -828,7 +839,7 @@ pub async fn poll_once(
             channel,
         )
     });
-    let read_ms = fill.as_ref().map(crate::cache::Fill::observed_ms);
+    let read_start = fill.as_ref().map(crate::cache::Fill::read_start);
     let Some(seen) = *cursor else {
         let messages = match fill {
             // `#307 slack-reply-live`: the provider's own seed, which also notes where each thread
@@ -936,9 +947,9 @@ pub async fn poll_once(
         arrivals.sort_by_key(|(id, _, _)| *id);
         for (_, message, reply) in arrivals {
             if reply {
-                hub.publish_reply_read(channel, message, read_ms);
+                hub.publish_reply_read(channel, message, read_start.clone());
             } else {
-                hub.publish_read(channel, message, read_ms);
+                hub.publish_read(channel, message, read_start.clone());
             }
             published += 1;
         }

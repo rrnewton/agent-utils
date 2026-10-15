@@ -138,6 +138,14 @@ impl Shape {
     fn complete(self) -> bool {
         !matches!(self, Self::Slack | Self::SlackThread)
     }
+
+    /// Whether every copy of a message this provider gives reports the message's edits (Slack's
+    /// `edited`, Discord's `edited_timestamp`), so that a copy without one is of a message not
+    /// edited when it was read ([`super::merge`], rule 2). A bridge's copies may reach the server
+    /// by a path that cannot say, such as an adapter's pushed event.
+    fn reports_edits(self) -> bool {
+        !matches!(self, Self::Bridge)
+    }
 }
 
 /// Which kind of read a timeline page answered.
@@ -426,10 +434,10 @@ pub fn single(
 pub fn pushed(shape: Shape, live: &LiveMessage, observed_ms: i64) -> Observation {
     let push = match live.kind {
         LiveKind::Create | LiveKind::Update => Push::Upsert {
-            message: Box::new(Incoming::new(
-                live.message.clone(),
-                home(shape, &live.message, None),
-            )),
+            message: Box::new(
+                Incoming::new(live.message.clone(), home(shape, &live.message, None))
+                    .reporting_edits(shape.reports_edits()),
+            ),
             update: live.kind == LiveKind::Update,
             partial: false,
         },
@@ -629,7 +637,10 @@ fn newest(messages: &[Message]) -> Option<i64> {
 fn incoming(shape: Shape, messages: &[Message], thread_view: Option<&str>) -> Vec<Incoming> {
     messages
         .iter()
-        .map(|message| Incoming::new(message.clone(), home(shape, message, thread_view)))
+        .map(|message| {
+            Incoming::new(message.clone(), home(shape, message, thread_view))
+                .reporting_edits(shape.reports_edits())
+        })
         .collect()
 }
 
