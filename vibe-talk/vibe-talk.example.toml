@@ -216,6 +216,10 @@ writable = false
 # speech engine controls actual synthesis; check its offline voice settings if required.
 # Environment: VIBE_TALK_READ_ALOUD_BACKEND
 backend = "elevenlabs"
+# This server's own route to a conversation.backend = "websocket" bridge, when the browser reaches it
+# by another ingress or by a path: read-aloud with backend = "conversation" dials it, and so does the
+# hello that asks the bridge whether it takes a recap (see [replay]), whatever the backend above.
+# websocket_url = "ws://127.0.0.1:7070/ws?mode=voice"
 
 [speakable]
 # Rewrite message bodies before anything says them out loud. ON when this section is absent.
@@ -289,6 +293,9 @@ enabled = true
 # A path means the page's own host, which suits a bridge behind the same front door as the page:
 # websocket_url = "/ws?mode=voice"
 # label = "WebSocket voice provider"
+# A bridge that can resume a conversation lists "replay" in session_started.capabilities and takes
+# the replay frame; see [replay] below. With a path above, set read_aloud.websocket_url (above) to
+# this server's own route to the same bridge, so it can ask; it cannot dial the page's host.
 #
 # "Ask me before the voice agent sends" (#264 voice-send-approval). ON by default: the agent's
 # post_reply only proposes a message, reads it back and asks "Send it?", and nothing is posted
@@ -505,8 +512,18 @@ enabled = true
 # what this does instead is hand the NEW call a written record of the earlier one: a
 # reconstruction, not a continuation, and the app says which of the two you got.
 #
-# Only the ElevenLabs backend can carry a replay. With conversation.backend = "websocket" there is
-# no frame for it, so the page is told replay is off and the server warns at startup.
+# The ElevenLabs backend always carries a replay. A conversation.backend = "websocket" bridge carries
+# it only once it says so (#331 resume-on-websocket): its session_started lists
+#   "capabilities": ["replay"]
+# and it then takes, as the client's first frame after session_started,
+#   {"type":"replay","text":"<preamble + fenced record>","lines":N,"dropped":N,"words":N}
+# -- the same text the ElevenLabs path sends, within max_chars / max_turns below -- gives `text` to
+# its model as context (not a user turn), and answers with exactly one
+#   {"type":"replay_ack","accepted":true}   or   {"type":"replay_ack","accepted":false,"reason":"..."}
+# This server asks the bridge at startup (one session: read session_started, send quit) at
+# read_aloud.websocket_url, or at conversation.websocket_url when that is an absolute ws:// or wss://
+# URL. Until the bridge lists replay, the page is told replay is off and Settings shows the switch
+# disabled, saying why. The README's "Conversational voice providers" section is the protocol.
 #
 # OFF by default, and the reason is privacy rather than caution: every new call re-sends earlier
 # conversation content — your own speech AND any Discord text the agent read out to you,

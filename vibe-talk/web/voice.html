@@ -441,6 +441,18 @@
                 web/voice.js.
               -->
               <div id="voice-composer">
+                <!--
+                  `#331 resume-on-websocket`. What the call in progress was given of the
+                  conversation before it, said from the moment that is settled until the call ends:
+                  "Caught the agent up with 1,240 words from earlier" once the voice service has
+                  acknowledged the record, "Sent the agent …" where nothing acknowledges one, or
+                  "Started fresh: …" and why. At the head of the call's box, under the turns and
+                  outside the list, so nothing that walks the turns meets it and nothing stands
+                  between them, a send card and the box (`#269 approval-card-inline`); it gives way
+                  while a card is up. The "new conversation" line above the call keeps the same
+                  fact after the call, and after a reload (`renderCallRecap` in web/voice.js).
+                -->
+                <p id="call-recap" class="call-recap" role="status" hidden></p>
                 <textarea id="compose-text" rows="3" autocomplete="off" enterkeyhint="send"
                           placeholder="Message the agent…" aria-label="Message the agent"></textarea>
                 <button id="send-text" type="button"
@@ -1083,10 +1095,18 @@
                   that matters. Why a state happens and what would change it is in the `?`'s entry.
                 -->
                 <p id="resume-state" class="hint" aria-live="polite"></p>
+                <!--
+                  `#331 resume-on-websocket`. Where this server cannot resume — the operator has
+                  replay off, or the voice bridge has not said it takes a recap — the switch is
+                  DISABLED and its reason stands right under it, read with it by a screen reader
+                  (`aria-describedby`): never a live control that does nothing. Shipped disabled, so
+                  it is live only once client-config says it may be (`renderResumeState`).
+                -->
                 <label class="toggle">
-                  <input id="resume-toggle" type="checkbox" />
+                  <input id="resume-toggle" type="checkbox" aria-describedby="resume-unavailable" disabled />
                   Tell a new call what was already said
                 </label>
+                <p id="resume-unavailable" class="toggle-why" hidden></p>
                 <p class="hint">Off by default: it re-sends earlier conversation content to the voice vendor.</p>
               </section>
 
@@ -2410,10 +2430,25 @@
                 in this server's configuration to resume one that long.
               </p>
               <p class="hint">
-                The line above each new call says what it was sent: <em>412-word recap sent</em>,
-                <em>no recap sent</em> when resuming is on but nothing went (the line says why), or
-                <em>recap unsupported</em> where the voice service has no way to take one. Sent, not
-                heard: neither way of handing one over is acknowledged.
+                Where this server cannot resume, the switch is <strong>disabled</strong>, with the
+                reason under it: resuming is turned off in the server's configuration, or the voice
+                service <em>does not take a recap</em>, or <em>has not said it takes a recap</em>. A
+                voice service run by this deployment takes one only once it says so; this server
+                asks it, and until it answers the switch stays disabled.
+              </p>
+              <p class="hint">
+                While a call lasts, the line under it says what that call was given:
+                <em>Caught the agent up with 1,240 words from earlier</em> once the voice service has
+                said it took the record, <em>Sent the agent 1,240 words from earlier</em> where
+                nothing says so, with how many older lines did not fit, or <em>Started fresh</em> and
+                why — resuming is off, nothing earlier, the record would not load or was too long,
+                or the voice service took none or refused it.
+              </p>
+              <p class="hint">
+                The line above each new call keeps it afterwards: <em>412-word recap sent</em>,
+                <em>no recap sent</em> when resuming is on but nothing went (the line says why),
+                <em>recap refused</em> when the voice service turned it down, or
+                <em>recap unsupported</em> where the voice service has no way to take one.
               </p>
             </details>
 

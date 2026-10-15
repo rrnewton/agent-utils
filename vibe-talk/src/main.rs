@@ -692,10 +692,17 @@ async fn main() -> anyhow::Result<()> {
     ) {
         tracing::warn!("{warning}");
     }
-    // A replay the voice backend cannot carry is reported off to the page; say why, once.
-    if let Some(warning) = vibe_talk::replay::unusable_warning(&config.replay, &config.conversation)
-    {
-        tracing::warn!("{warning}");
+    // `#331 resume-on-websocket`. With replay on and a `vibe-talk-v1` bridge, a recap goes only to a
+    // bridge that says it takes one; the hello is asked below, once the server is assembled, and
+    // its answer is logged when it comes.
+    let voice_bridge = Arc::new(vibe_talk::voice_bridge::BridgeHello::for_config(&config));
+    if vibe_talk::voice_bridge::needed(&config) {
+        tracing::info!(
+            asking = voice_bridge.url().is_some(),
+            "replay.enabled is true with conversation.backend = \"websocket\": Resuming is offered \
+             only once the voice bridge lists replay in its session_started, so this server asks it \
+             (one session, ended with quit, nothing said) and reports Resuming off until it answers"
+        );
     }
     let conversation = vibe_talk::conversation::provider(
         &config.conversation,
@@ -728,6 +735,7 @@ async fn main() -> anyhow::Result<()> {
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
+        voice_bridge,
         message_cache,
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
@@ -784,6 +792,11 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => tracing::warn!(%error, "could not restore the hidden configured channels"),
     }
     state.refresh_routes();
+    // `#331 resume-on-websocket`. The first hello, in the background so a slow bridge never holds
+    // the server's start; client-config asks again when this answer is old.
+    if vibe_talk::voice_bridge::needed(&state.config) {
+        state.voice_bridge.refresh_if_stale();
+    }
     for entry in providers.entries() {
         if entry.live_poll_seconds > 0 {
             tokio::spawn(vibe_talk::live::poll_forever(

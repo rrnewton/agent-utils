@@ -143,6 +143,11 @@ pub struct AppState {
     /// `#272 voice-agent-instructions`; see [`crate::voice_prompt::OverrideAnswers`]. In memory and
     /// short-lived, so a call's start does not wait on the vendor every time.
     pub agent_override: Arc<crate::voice_prompt::OverrideAnswers>,
+    /// What the deployment's `vibe-talk-v1` bridge last said it accepts, and the one ask of it that
+    /// may be under way. `#331 resume-on-websocket`; see [`crate::voice_bridge`]. Asked only when
+    /// replay is on with that backend, and read by client-config to decide whether a new call can
+    /// be handed the earlier conversation.
+    pub voice_bridge: Arc<crate::voice_bridge::BridgeHello>,
     /// The handle every message-cache fill goes through. `#208 persistent-cache`; see
     /// [`crate::cache::sink`].
     ///
