@@ -115,12 +115,18 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      under Settings, the list was laid out short of the card, in a window short of the dock, and the
      reader's place clamped to that: a reader at the foot of Main was left 549px above it at 393x852, Send
      off the screen and the jump offered, and 626px above the call's view's.
+ 20. All with Summarise and Expand all up over its foot (`#280 scroll-stability`): a reader 40 or 60px above
+     the foot goes to Settings and comes back by Back or Esc on the same row within a pixel, and with a long
+     draft opened by More that is all they see, with the card where it stood; one at the foot is at it
+     again. The chips are measured at nothing while their screen is hidden, and the room the lists keep
+     for them went with that: the list came back 36px short, the reader within the slack of its foot,
+     and the chips' report took them to it, card or no card.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
 9, 10 and 18 once (point 18 with a reader 30 and 60px up each list, by Send and settled elsewhere, and
 five ways through the thread list, at 393x852, and one case of each list at the other two); point 19 at
-393x852, eleven trips, and four at 375x667; the docked card alone at 667x375 and 375x330; points 11 to 13,
+393x852, eleven trips, and four at 375x667; point 20 at 393x852; the docked card alone at 667x375 and 375x330; points 11 to 13,
 15 and 16 at 393x852; and points 8, 11 to 15 and 17 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
@@ -1220,6 +1226,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             if size in (PHONES[0], PHONES[2]):
                 listed += "; " + settings_trip_case(page, url, voice, api, size,
                                                     SETTINGS_TRIPS if size == PHONES[0] else SETTINGS_TRIPS_FEW)
+            if size == PHONES[0]:
+                listed += "; " + chips_room_case(page, url, voice, api, size)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -2409,6 +2417,90 @@ def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
     return (f"{where}: a reader at the foot of {', '.join(lists)} at it again, Send tappable, and one"
             f" {' and '.join(str(up) for up in ups)}px up who saw only the card with it where it stood, by the gear"
             " or Settings and Help, and Back or Esc")
+
+
+# Point 20: the chips over the foot of the list on screen, by id, and the room the lists keep for them.
+CHIPS_JS = """() => {
+  const shown = (id) => {
+    const n = document.getElementById(id);
+    return Boolean(n && !n.hidden && n.getClientRects().length);
+  };
+  return { summarise: shown('summarise'), expand: shown('expand-all'),
+           room: getComputedStyle(document.getElementById('channel-composer')).marginTop };
+}"""
+
+
+def chips_room_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> str:
+    """Point 20, on the phone: All with Summarise and Expand all up, a reader 40 or 60px above its foot goes to
+    Settings and comes back where they were, with no card and with a long draft opened by More that is all
+    they see; one at the foot is at it again. The chips are measured at nothing while their screen is hidden,
+    and the room the lists keep for them used to go with that, so the list came back short of it and the
+    reader within the slack of its foot."""
+    width, height = size
+    where = f"{width}x{height}, Settings and back with the chips up"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        # Three long messages in the channel, which bring up Summarise and Expand all.
+        api.posted.extend(channel_message(n, "codex", LONG_DRAFT) for n in (30, 31, 32))
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        view_key(page, "Meta", 2, None, None)
+        chips = page.evaluate(CHIPS_JS)
+        check(chips["summarise"] is True and chips["expand"] is True and chips["room"] != "0px",
+              f"{where}: the premise, Summarise and Expand all up over All, the channel's box keeping room: {chips}")
+        for card in (False, True):
+            if card:
+                propose(page, api, 201, LONG_DRAFT)
+                page.wait_for_timeout(HOLD_MS + 200)
+                page.evaluate("() => document.getElementById('post-confirm-more').click()")
+                page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                                       timeout=5000)
+                page.wait_for_timeout(300)
+            for up in (0, 40, 60):
+                for back in ("back", "esc"):
+                    page.evaluate(UP_THE_LIST_JS, up)
+                    page.wait_for_timeout(400)
+                    before = page.evaluate(CARD_ALONE_JS)
+                    first = still(page)["first"]
+                    alone = " who sees only the card" if card and up else ""
+                    check(rect(before, "gap") == up and (not card or up == 0 or before["row"] is False),
+                          f"{where}: the premise, a reader {up}px up All{alone}: {before}")
+                    page.click("#open-settings")
+                    page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+                    page.wait_for_timeout(400)
+                    if back == "back":
+                        page.click("#close-settings")
+                    else:
+                        page.keyboard.press("Escape")
+                    page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+                    page.wait_for_timeout(500)
+                    after = page.evaluate(CARD_ALONE_JS)
+                    now = still(page)["first"]
+                    label = (("with the opened card" if card else "with no card") +
+                             (", by Back" if back == "back" else ", by Esc"))
+                    if up == 0:
+                        check(rect(after, "gap") <= 1 and after["jump"] is None and (not card or after["sendHit"]),
+                              f"{where}: {label}, a reader at All's foot came back {rect(after, 'gap'):.0f}px above it")
+                    elif card:
+                        check(after["card"] is not None and abs(rect(after, "card") - rect(before, "card")) <= 1,
+                              f"{where}: {label}, the card a reader {up}px up All saw alone moved from"
+                              f" {rect(before, 'card'):.0f} to {rect(after, 'card'):.0f}px against the list (now"
+                              f" {rect(after, 'gap'):.0f}px above the foot)")
+                    else:
+                        check(same_row(first, now) and abs(rect(after, "gap") - up) <= 1,
+                              f"{where}: {label}, a reader {up}px up All on {first} came back on {now},"
+                              f" {rect(after, 'gap'):.0f}px above the foot")
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: a trip to Settings posted or withdrew the draft ({api.commits}, {api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader 40 and 60px up All with Summarise and Expand all up where they were by Back and Esc,"
+            " card or no card, and one at its foot at it again")
 
 
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
