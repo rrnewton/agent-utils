@@ -33,6 +33,13 @@
 //! A body longer than `--max-chunk-bytes` (default 11,000; Slack accepts at most 12,000) is
 //! posted as several consecutive messages in the same thread, split at line breaks where
 //! possible. The receipt names the first message.
+//!
+//! # Warm worker
+//!
+//! With `--warm-socket=PATH`, the helper posts thread replies through a spare client that a
+//! long-lived warm worker (the same executable with `--role=warm-worker`) started ahead of time,
+//! and asks that worker to start one before each reaction; see [`crate::warm`]. The ledger and
+//! everything above apply unchanged: the worker only replaces the client run of one post.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -55,6 +62,15 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const LEDGER_VERSION: u64 = 1;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024;
 const SLACK_MAX_BODY_BYTES: usize = 12_000;
+
+/// What this run of the executable does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The bridge's one-shot outbound helper: one request line in, one response line out.
+    Helper,
+    /// The long-lived warm worker that holds spare clients: see [`crate::warm`].
+    WarmWorker,
+}
 
 /// Which transport the helper uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +108,14 @@ pub struct OutboundConfig {
     pub max_chunk_bytes: usize,
     /// Diagnostics file.
     pub diagnostics_log: Option<PathBuf>,
+    /// What this run does.
+    pub role: Role,
+    /// The warm worker's socket, when one is used.
+    pub warm_socket: Option<PathBuf>,
+    /// The most spare clients the warm worker holds at once.
+    pub warm_max_spares: usize,
+    /// How long the warm worker keeps an unused spare.
+    pub warm_ttl: Duration,
 }
 
 impl OutboundConfig {
@@ -115,6 +139,10 @@ impl OutboundConfig {
             timeout: Duration::from_millis(25_000),
             max_chunk_bytes: 11_000,
             diagnostics_log: None,
+            role: Role::Helper,
+            warm_socket: None,
+            warm_max_spares: 2,
+            warm_ttl: Duration::from_secs(300),
         };
         for argument in arguments {
             let (name, value) = argument
@@ -205,6 +233,41 @@ impl OutboundConfig {
                         .ok_or_else(|| "--max-chunk-bytes must be 1000 to 12000".to_owned())?;
                 }
                 "--diagnostics-log" => config.diagnostics_log = Some(PathBuf::from(value)),
+                "--role" => {
+                    config.role = match value {
+                        "helper" => Role::Helper,
+                        "warm-worker" => Role::WarmWorker,
+                        _ => return Err("--role must be helper or warm-worker".to_owned()),
+                    };
+                }
+                "--warm-socket" => {
+                    let path = PathBuf::from(value);
+                    if !path.is_absolute() {
+                        return Err("--warm-socket must be an absolute path".to_owned());
+                    }
+                    if value.len() > crate::warm::MAX_SOCKET_PATH_BYTES {
+                        return Err(format!(
+                            "--warm-socket must be at most {} bytes",
+                            crate::warm::MAX_SOCKET_PATH_BYTES
+                        ));
+                    }
+                    config.warm_socket = Some(path);
+                }
+                "--warm-max-spares" => {
+                    config.warm_max_spares = value
+                        .parse()
+                        .ok()
+                        .filter(|count| (1..=8).contains(count))
+                        .ok_or_else(|| "--warm-max-spares must be 1 to 8".to_owned())?;
+                }
+                "--warm-ttl-seconds" => {
+                    let seconds: u64 = value
+                        .parse()
+                        .ok()
+                        .filter(|seconds| (1..=3_600).contains(seconds))
+                        .ok_or_else(|| "--warm-ttl-seconds must be 1 to 3600".to_owned())?;
+                    config.warm_ttl = Duration::from_secs(seconds);
+                }
                 _ => return Err(format!("unknown argument {name}")),
             }
         }
@@ -217,7 +280,58 @@ impl OutboundConfig {
         if config.transport == HelperTransport::Cli && config.cli.is_none() {
             return Err("--cli is required for the cli transport".to_owned());
         }
+        if config.role == Role::WarmWorker {
+            if config.warm_socket.is_none() {
+                return Err("--role=warm-worker requires --warm-socket".to_owned());
+            }
+            if config.transport != HelperTransport::Cli {
+                return Err("--role=warm-worker requires the cli transport".to_owned());
+            }
+            if config.app_id.is_none() {
+                return Err("--role=warm-worker requires --app-id".to_owned());
+            }
+        }
         Ok(config)
+    }
+
+    fn cli_transport(&self) -> Result<CliTransport, String> {
+        CliTransport::new(CliOptions {
+            program: self.cli.clone().ok_or("--cli is required")?,
+            environment: self.cli_environment.clone(),
+            timeout: self.timeout,
+            tail: TailOptions::default(),
+        })
+    }
+
+    /// Run the warm worker these arguments describe until it fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the arguments are not a warm worker's or its socket cannot be
+    /// served.
+    pub fn serve_warm(&self) -> Result<(), String> {
+        let (Role::WarmWorker, Some(socket), Some(app_id), Some(cli)) = (
+            self.role,
+            self.warm_socket.clone(),
+            self.app_id.clone(),
+            self.cli.clone(),
+        ) else {
+            return Err("these arguments do not describe a warm worker".to_owned());
+        };
+        crate::warm::serve(
+            self.cli_transport()?,
+            cli,
+            app_id,
+            self.format,
+            self.channels.clone(),
+            self.timeout,
+            crate::warm::WarmSettings {
+                socket,
+                max_spares: self.warm_max_spares,
+                ttl: self.warm_ttl,
+            },
+            Diagnostics::new(self.diagnostics_log.clone(), "slack-warm"),
+        )
     }
 
     /// Build the selected transport.
@@ -228,13 +342,25 @@ impl OutboundConfig {
     pub fn transport(&self) -> Result<Box<dyn SlackTransport>, String> {
         match self.transport {
             HelperTransport::WebApi => Ok(Box::new(WebApiTransport)),
-            HelperTransport::Cli => CliTransport::new(CliOptions {
-                program: self.cli.clone().ok_or("--cli is required")?,
-                environment: self.cli_environment.clone(),
-                timeout: self.timeout,
-                tail: TailOptions::default(),
-            })
-            .map(|transport| Box::new(transport) as Box<dyn SlackTransport>),
+            HelperTransport::Cli => {
+                let inner = Box::new(self.cli_transport()?) as Box<dyn SlackTransport>;
+                match (&self.warm_socket, &self.app_id, &self.cli) {
+                    (Some(socket), Some(app_id), Some(cli)) => {
+                        Ok(Box::new(crate::warm::WarmTransport::new(
+                            inner,
+                            crate::warm::WarmClient::new(
+                                socket.clone(),
+                                cli.clone(),
+                                app_id.clone(),
+                                self.format,
+                                self.timeout,
+                                Diagnostics::new(self.diagnostics_log.clone(), "slack-outbound"),
+                            ),
+                        )))
+                    }
+                    _ => Ok(inner),
+                }
+            }
         }
     }
 }
@@ -907,5 +1033,50 @@ mod tests {
         );
         assert!(OutboundConfig::parse(&["--as-user=1".to_owned()]).is_err());
         assert!(OutboundConfig::parse(&arguments[..3]).is_err());
+        assert_eq!(config.role, Role::Helper);
+        assert_eq!(config.warm_socket, None);
+    }
+
+    #[test]
+    fn parses_warm_worker_arguments() {
+        let base = [
+            "--cli=/usr/bin/slack",
+            "--app-id=A0BRVKV248L",
+            "--channel=C0C91RW5FAR",
+            "--ledger=/var/lib/x",
+        ]
+        .map(str::to_owned);
+        let with = |extra: &[&str]| {
+            let mut arguments = base.to_vec();
+            arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+            OutboundConfig::parse(&arguments)
+        };
+        let worker = with(&[
+            "--role=warm-worker",
+            "--warm-socket=/run/user/1/slack-warm.sock",
+            "--warm-max-spares=3",
+            "--warm-ttl-seconds=120",
+        ])
+        .expect("a warm worker");
+        assert_eq!(worker.role, Role::WarmWorker);
+        assert_eq!(worker.warm_max_spares, 3);
+        assert_eq!(worker.warm_ttl, Duration::from_secs(120));
+        // A helper may name the socket; a worker must.
+        assert!(with(&["--warm-socket=/run/user/1/slack-warm.sock"]).is_ok());
+        assert!(with(&["--role=warm-worker"]).is_err());
+        assert!(with(&["--warm-socket=relative.sock"]).is_err());
+        assert!(with(&[&format!("--warm-socket=/{}", "s".repeat(107))]).is_err());
+        assert!(with(&["--warm-max-spares=0"]).is_err());
+        assert!(with(&["--warm-max-spares=9"]).is_err());
+        assert!(with(&["--warm-ttl-seconds=0"]).is_err());
+        assert!(with(&["--warm-ttl-seconds=3601"]).is_err());
+        assert!(with(&["--role=other"]).is_err());
+        let mut no_app = base.to_vec();
+        no_app.remove(1);
+        no_app.extend([
+            "--role=warm-worker".to_owned(),
+            "--warm-socket=/run/user/1/slack-warm.sock".to_owned(),
+        ]);
+        assert!(OutboundConfig::parse(&no_app).is_err());
     }
 }

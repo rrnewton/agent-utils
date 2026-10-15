@@ -36,8 +36,8 @@ use crate::transport::{
 
 /// Largest accepted stream line; longer lines are dropped with a notice.
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
-const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_STDERR_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_STDERR_BYTES: usize = 64 * 1024;
 const TAIL_STOP_GRACE: Duration = Duration::from_secs(3);
 
 /// Optional tail settings, passed through to the client when set.
@@ -355,13 +355,10 @@ fn stop_child(child: &mut Child, grace: Duration) -> Result<(), String> {
         return Ok(());
     }
     terminate(child.id());
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(format!("waiting for the stream process failed: {error}")),
-        }
+    match wait_until(child, Instant::now() + grace) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => return Err(format!("waiting for the stream process failed: {error}")),
     }
     child
         .kill()
@@ -378,6 +375,91 @@ fn terminate(process_id: u32) {
     // has not yet reaped, so it cannot have been reused.
     unsafe {
         libc::kill(process_id, libc::SIGTERM);
+    }
+}
+
+/// Wait for `child` to exit until `deadline`, and reap it. Returns `None` when the deadline
+/// passes first; the child is then still running and unreaped.
+///
+/// The wait blocks on a pidfd, so it costs no wakeups while the child runs. On a kernel without
+/// `pidfd_open` it falls back to checking every 10 ms.
+///
+/// # Errors
+///
+/// Returns the error of a failed wait.
+pub fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    match pidfd_open(child.id()) {
+        Ok(pidfd) => loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if poll_readable(&pidfd, remaining)? {
+                // A readable pidfd means the process has exited; this reaps it.
+                return child.wait().map(Some);
+            }
+            if Instant::now() >= deadline {
+                return child.try_wait();
+            }
+        },
+        Err(_) => loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            );
+        },
+    }
+}
+
+#[allow(unsafe_code)]
+fn pidfd_open(process_id: u32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let process_id = libc::pid_t::try_from(process_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id out of range"))?;
+    // SAFETY: `pidfd_open` takes a PID and flags and returns a new descriptor or -1; it reads no
+    // memory of ours. The PID is an unreaped child of this process, so it names that child.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = i32::try_from(descriptor)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pidfd out of range"))?;
+    // SAFETY: the kernel just returned this descriptor, and nothing else owns it.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) })
+}
+
+/// Wait up to `timeout` for `descriptor` to become readable; `true` when it did.
+#[allow(unsafe_code)]
+fn poll_readable(descriptor: &std::os::fd::OwnedFd, timeout: Duration) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut entry = libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Round up, so a wait never ends just before its deadline and spins.
+    let millis = timeout
+        .as_micros()
+        .div_ceil(1_000)
+        .min(u128::from(i32::MAX.unsigned_abs()));
+    let millis = i32::try_from(millis).unwrap_or(i32::MAX);
+    loop {
+        // SAFETY: `entry` is one valid, initialised pollfd that outlives the call.
+        let ready = unsafe { libc::poll(&mut entry, 1, millis) };
+        if ready >= 0 {
+            return Ok(ready > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -426,10 +508,10 @@ fn pump_stderr(stderr: impl Read + Send + 'static, sender: Sender<Pumped>) {
 
 /// A finished non-streaming invocation.
 #[derive(Debug)]
-struct Completed {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct Completed {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -442,7 +524,10 @@ enum RunFailure {
     Wait(io::Error),
 }
 
-fn collect(stream: impl Read + Send + 'static, limit: usize) -> thread::JoinHandle<Vec<u8>> {
+pub(crate) fn collect(
+    stream: impl Read + Send + 'static,
+    limit: usize,
+) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut buffer = Vec::new();
         let _ = stream
@@ -484,20 +569,17 @@ fn run_bounded(
         MAX_STDERR_BYTES,
     );
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RunFailure::Timeout);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RunFailure::Wait(error));
-            }
+    let status = match wait_until(&mut child, deadline) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunFailure::Timeout);
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunFailure::Wait(error));
         }
     };
     if let Some(writer) = writer {
@@ -645,6 +727,71 @@ fn run_failure(failure: RunFailure, write: bool) -> TransportError {
     }
 }
 
+/// The client arguments of one post, whose body the client reads from standard input.
+#[must_use]
+pub(crate) fn post_arguments(
+    app_id: &AppId,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    format: TextFormat,
+) -> Vec<String> {
+    let body_flag = match format {
+        TextFormat::Markdown => "--markdown=file://-",
+        TextFormat::Text => "--text=file://-",
+    };
+    let mut arguments = vec![
+        "slack.message".to_owned(),
+        "send".to_owned(),
+        format!("--channel-id={channel_id}"),
+        body_flag.to_owned(),
+    ];
+    if let Some(thread_ts) = thread_ts {
+        arguments.push(format!("--thread-ts={thread_ts}"));
+    }
+    arguments.push(format!("--as={app_id}"));
+    arguments.push("--output=json".to_owned());
+    arguments
+}
+
+/// The result of one finished post: the new message's `ts`, or the failure.
+pub(crate) fn post_outcome(completed: &Completed) -> Result<String, TransportError> {
+    if !completed.status.success() {
+        return Err(exit_failure(completed, true));
+    }
+    let parsed = first_json_value(&completed.stdout).ok_or_else(|| {
+        TransportError::unknown(
+            "receipt_unreadable",
+            "the client reported success without readable output",
+        )
+    })?;
+    if parsed.get("status").and_then(Value::as_str) == Some("error") {
+        return Err(exit_failure(completed, true));
+    }
+    find_string(&parsed, &["message_ts", "ts"], 0)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            TransportError::unknown(
+                "receipt_unreadable",
+                "the client reported success without a message ts",
+            )
+        })
+}
+
+impl CliTransport {
+    /// The configured client, with its environment, ready for `arguments`.
+    pub(crate) fn client_command(&self, arguments: &[String]) -> Command {
+        let mut command = self.command();
+        command.args(arguments);
+        command
+    }
+
+    /// The configured client's options.
+    #[must_use]
+    pub fn options(&self) -> &CliOptions {
+        &self.options
+    }
+}
+
 impl SlackTransport for CliTransport {
     fn open_stream(
         &mut self,
@@ -683,44 +830,11 @@ impl SlackTransport for CliTransport {
     }
 
     fn post_message(&mut self, post: &PostMessage<'_>) -> Result<String, TransportError> {
-        let body_flag = match post.format {
-            TextFormat::Markdown => "--markdown=file://-",
-            TextFormat::Text => "--text=file://-",
-        };
-        let mut arguments = vec![
-            "slack.message".to_owned(),
-            "send".to_owned(),
-            format!("--channel-id={}", post.channel_id),
-            body_flag.to_owned(),
-        ];
-        if let Some(thread_ts) = post.thread_ts {
-            arguments.push(format!("--thread-ts={thread_ts}"));
-        }
-        arguments.push(format!("--as={}", post.app_id));
-        arguments.push("--output=json".to_owned());
+        let arguments = post_arguments(post.app_id, post.channel_id, post.thread_ts, post.format);
         let completed = self
             .run(&arguments, Some(post.text.as_bytes()))
             .map_err(|failure| run_failure(failure, true))?;
-        if !completed.status.success() {
-            return Err(exit_failure(&completed, true));
-        }
-        let parsed = first_json_value(&completed.stdout).ok_or_else(|| {
-            TransportError::unknown(
-                "receipt_unreadable",
-                "the client reported success without readable output",
-            )
-        })?;
-        if parsed.get("status").and_then(Value::as_str) == Some("error") {
-            return Err(exit_failure(&completed, true));
-        }
-        find_string(&parsed, &["message_ts", "ts"], 0)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                TransportError::unknown(
-                    "receipt_unreadable",
-                    "the client reported success without a message ts",
-                )
-            })
+        post_outcome(&completed)
     }
 
     fn add_reaction(

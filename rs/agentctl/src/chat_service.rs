@@ -950,6 +950,12 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     if let Some(transport) = ack_transport.as_mut() {
         transport.set_cancellation(ack_cancellation.clone());
     }
+    // The ✅ receipt reactions get their own transport and worker, so they never wait behind an
+    // acknowledgement's helper run: see `AckLane`.
+    let receipt_transport = ack_transport
+        .as_ref()
+        .map(CommandOutboundTransport::try_clone_generation)
+        .transpose()?;
     let ack_queue = ack_transport
         .as_ref()
         .map(|_| Arc::new(AckQueue::default()));
@@ -988,17 +994,20 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         initial_provider_join_timeout,
         outbound_join_timeout,
     )?;
-    let ack_worker = if let Some(transport) = ack_transport {
-        match spawn_ack_worker(
-            state.clone(),
-            ack_queue.expect("ACK transport has a queue"),
+    let ack_worker = if let (Some(transport), Some(receipt_transport)) =
+        (ack_transport, receipt_transport)
+    {
+        match spawn_ack_workers(
+            &state,
+            ack_queue.as_ref().expect("ACK transport has a queue"),
             transport,
-            Arc::clone(&stop),
-            Arc::clone(&output_wake),
+            receipt_transport,
+            &stop,
+            &output_wake,
             |line| service_log(line),
         ) {
             Ok(worker) => Some(worker),
-            Err(error) => {
+            Err((error, started)) => {
                 let deadline = begin_service_stop(
                     &stop,
                     &cancellation,
@@ -1007,6 +1016,12 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
                 );
                 signal_handle.close();
                 let _ = join_worker_until(signal_thread, "chat signal", deadline);
+                if let Some(worker) = started {
+                    if let Err(cleanup) = join_ack_worker_until(worker, &ack_cancellation, deadline)
+                    {
+                        return Err(ChatServiceError::Worker(format!("{error}; {cleanup}")));
+                    }
+                }
                 return Err(ChatServiceError::Io(error));
             }
         }
@@ -1040,7 +1055,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
             signal_handle.close();
             let _ = join_worker_until(signal_thread, "chat signal", deadline);
             if let Some(worker) = ack_worker {
-                if let Err(cleanup) = join_ack_worker_until(worker, &ack_cancellation, deadline) {
+                if let Err(cleanup) = join_ack_workers_until(worker, &ack_cancellation, deadline) {
                     return Err(ChatServiceError::Worker(format!("{error}; {cleanup}")));
                 }
             }
@@ -1098,7 +1113,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         stop.record_cleanup_error(error.to_string());
     }
     if let Some(worker) = ack_worker {
-        if let Err(error) = join_ack_worker_until(worker, &ack_cancellation, shutdown_deadline) {
+        if let Err(error) = join_ack_workers_until(worker, &ack_cancellation, shutdown_deadline) {
             stop.record_cleanup_error(error.to_string());
         }
     }
@@ -1179,7 +1194,37 @@ struct AckQueue {
 enum AckWork {
     Request(String),
     Receipt(String),
+    /// List the saved acknowledgements, and the saved receipt reactions, again.
     Reconcile,
+    /// List the saved receipt reactions again.
+    ReceiptReconcile,
+}
+
+/// Which work one reaction worker takes from the [`AckQueue`]. `chat run` runs one worker for
+/// each, so a ✅ receipt reaction never waits behind an acknowledgement: each reaction is one
+/// outbound helper run, and on some providers one run takes more than a second.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AckLane {
+    /// Acknowledgements, and the rescans that list them again.
+    Acknowledgements,
+    /// ✅ receipt reactions, and the rescans that list them again.
+    Receipts,
+}
+
+impl AckLane {
+    fn thread_name(self) -> &'static str {
+        match self {
+            Self::Acknowledgements => "agentctl-chat-ack",
+            Self::Receipts => "agentctl-chat-receipt",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Acknowledgements => "chat ACK",
+            Self::Receipts => "chat receipt",
+        }
+    }
 }
 
 impl AckQueue {
@@ -1208,7 +1253,9 @@ impl AckQueue {
             state.retained.insert(key.clone());
             state.pending.push_back(key);
         }
-        self.changed.notify_one();
+        // Each lane's worker waits on this condition variable for its own work, so every
+        // change wakes both.
+        self.changed.notify_all();
     }
 
     /// Queue the ✅ receipt reactions saved under `keys`, as `enqueue` queues acknowledgements.
@@ -1240,7 +1287,7 @@ impl AckQueue {
             state.receipts_retained.insert(key.clone());
             state.receipts.push_back(key);
         }
-        self.changed.notify_one();
+        self.changed.notify_all();
     }
 
     /// Hold the ✅ receipt reaction saved under `key` until `due`, as a failed one is held: a
@@ -1257,7 +1304,7 @@ impl AckQueue {
             return;
         }
         state.receipt_retry_at.insert(key, due);
-        self.changed.notify_one();
+        self.changed.notify_all();
     }
 
     fn stop(&self) {
@@ -1269,7 +1316,8 @@ impl AckQueue {
         self.changed.notify_all();
     }
 
-    fn next(&self) -> Option<AckWork> {
+    /// The next work for `lane`'s worker, waiting until there is some; `None` once stopped.
+    fn next(&self, lane: AckLane) -> Option<AckWork> {
         let mut state = self
             .state
             .lock()
@@ -1280,53 +1328,53 @@ impl AckQueue {
             if state.stopped {
                 return None;
             }
-            if let Some(key) = state.pending.pop_front() {
-                return Some(AckWork::Request(key));
-            }
-            // Acknowledgements that did not fit, or whose retry is due, come before any receipt
-            // reaction.
-            if state.rescan {
-                state.rescan = false;
-                return Some(AckWork::Reconcile);
-            }
             let now = Instant::now();
-            if state.retry_at.values().any(|retry| *retry <= now) {
-                state.retry_at.retain(|_, deadline| *deadline > now);
-                return Some(AckWork::Reconcile);
-            }
-            // Before the receipt rescan, which lists the saved receipt reactions again: a rescan
-            // that came first would find the queued ones already queued and ask for another.
-            if let Some(key) = state.receipts.pop_front() {
-                return Some(AckWork::Receipt(key));
-            }
-            if state.receipt_rescan {
-                state.receipt_rescan = false;
-                return Some(AckWork::Reconcile);
-            }
-            let next_retry = state
-                .retry_at
-                .values()
-                .chain(state.receipt_retry_at.values())
-                .min()
-                .copied();
-            if let Some(retry) = next_retry {
-                let now = Instant::now();
-                if retry <= now {
-                    state.retry_at.retain(|_, deadline| *deadline > now);
-                    state.receipt_retry_at.retain(|_, deadline| *deadline > now);
-                    return Some(AckWork::Reconcile);
+            let next_retry = match lane {
+                AckLane::Acknowledgements => {
+                    if let Some(key) = state.pending.pop_front() {
+                        return Some(AckWork::Request(key));
+                    }
+                    // Acknowledgements that did not fit, or whose retry is due, are listed again.
+                    if state.rescan {
+                        state.rescan = false;
+                        return Some(AckWork::Reconcile);
+                    }
+                    if state.retry_at.values().any(|retry| *retry <= now) {
+                        state.retry_at.retain(|_, deadline| *deadline > now);
+                        return Some(AckWork::Reconcile);
+                    }
+                    state.retry_at.values().min().copied()
                 }
-                state = self
-                    .changed
-                    .wait_timeout(state, retry - now)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .0;
-            } else {
-                state = self
+                AckLane::Receipts => {
+                    // Before the receipt rescan, which lists the saved receipt reactions again: a
+                    // rescan that came first would find the queued ones already queued and ask
+                    // for another.
+                    if let Some(key) = state.receipts.pop_front() {
+                        return Some(AckWork::Receipt(key));
+                    }
+                    if state.receipt_rescan {
+                        state.receipt_rescan = false;
+                        return Some(AckWork::ReceiptReconcile);
+                    }
+                    if state.receipt_retry_at.values().any(|retry| *retry <= now) {
+                        state.receipt_retry_at.retain(|_, deadline| *deadline > now);
+                        return Some(AckWork::ReceiptReconcile);
+                    }
+                    state.receipt_retry_at.values().min().copied()
+                }
+            };
+            state = match next_retry {
+                Some(retry) => {
+                    self.changed
+                        .wait_timeout(state, retry.saturating_duration_since(now))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                }
+                None => self
                     .changed
                     .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            };
         }
     }
 
@@ -1347,7 +1395,7 @@ impl AckQueue {
         } else {
             state.retry_at.remove(key);
         }
-        self.changed.notify_one();
+        self.changed.notify_all();
     }
 
     /// Note that the worker finished with the ✅ receipt reaction under `key`, as `finished`
@@ -1369,7 +1417,7 @@ impl AckQueue {
         } else {
             state.receipt_retry_at.remove(key);
         }
-        self.changed.notify_one();
+        self.changed.notify_all();
     }
 }
 
@@ -1394,9 +1442,57 @@ fn queue_saved_receipts(queue: &AckQueue, attempts: Vec<(String, Option<u64>)>) 
     queue.enqueue_receipts(due);
 }
 
-/// Start the ACK worker thread. It writes each failed acknowledgement as one line through `log`;
-/// production passes `service_log`.
+/// The two reaction workers of `chat run`: see [`AckLane`].
+struct AckWorkers {
+    acknowledgements: ServiceWorker,
+    receipts: ServiceWorker,
+}
+
+/// Start both reaction workers, each with its own outbound transport, so that neither lane's
+/// helper runs wait for the other's. Each writes its failed reactions through `log`; production
+/// passes `service_log`. If the second cannot start, the error comes with the first worker, which
+/// the caller joins once it has stopped the service.
+#[allow(clippy::too_many_arguments)]
+fn spawn_ack_workers(
+    state: &BridgeState,
+    queue: &Arc<AckQueue>,
+    acknowledgement_transport: impl chat_runtime::ReactionTransport + Send + 'static,
+    receipt_transport: impl chat_runtime::ReactionTransport + Send + 'static,
+    stop: &Arc<StopState>,
+    output_wake: &SharedWake,
+    log: impl Fn(fmt::Arguments<'_>) + Clone + Send + 'static,
+) -> Result<AckWorkers, (io::Error, Option<ServiceWorker>)> {
+    let acknowledgements = spawn_ack_worker(
+        AckLane::Acknowledgements,
+        state.clone(),
+        Arc::clone(queue),
+        acknowledgement_transport,
+        Arc::clone(stop),
+        Arc::clone(output_wake),
+        log.clone(),
+    )
+    .map_err(|error| (error, None))?;
+    match spawn_ack_worker(
+        AckLane::Receipts,
+        state.clone(),
+        Arc::clone(queue),
+        receipt_transport,
+        Arc::clone(stop),
+        Arc::clone(output_wake),
+        log,
+    ) {
+        Ok(receipts) => Ok(AckWorkers {
+            acknowledgements,
+            receipts,
+        }),
+        Err(error) => Err((error, Some(acknowledgements))),
+    }
+}
+
+/// Start the reaction worker thread of `lane`. It writes each failed reaction as one line
+/// through `log`; production passes `service_log`.
 fn spawn_ack_worker(
+    lane: AckLane,
     state: BridgeState,
     queue: Arc<AckQueue>,
     mut transport: impl chat_runtime::ReactionTransport + Send + 'static,
@@ -1406,10 +1502,10 @@ fn spawn_ack_worker(
 ) -> io::Result<ServiceWorker> {
     let (done_sender, done) = mpsc::sync_channel(1);
     let handle = thread::Builder::new()
-        .name("agentctl-chat-ack".to_owned())
+        .name(lane.thread_name().to_owned())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                while let Some(work) = queue.next() {
+                while let Some(work) = queue.next(lane) {
                     match work {
                         AckWork::Request(key) => {
                             let result = state.ensure_ack(&key, &mut transport);
@@ -1443,11 +1539,24 @@ fn spawn_ack_worker(
                                 wake_output(&output_wake);
                             }
                         },
+                        AckWork::ReceiptReconcile => match state.receipt_reaction_attempts() {
+                            Ok(attempts) => queue_saved_receipts(&queue, attempts),
+                            Err(error) => log(format_args!(
+                                "agentctl: chat receipt reactions could not be listed: {error}"
+                            )),
+                        },
                     }
                 }
             }));
             if let Err(panic) = result {
-                stop.record_cleanup_error("ACK worker panicked; operation outcome is uncertain");
+                stop.record_cleanup_error(match lane {
+                    AckLane::Acknowledgements => {
+                        "ACK worker panicked; operation outcome is uncertain"
+                    }
+                    AckLane::Receipts => {
+                        "receipt reaction worker panicked; operation outcome is uncertain"
+                    }
+                });
                 stop.stop();
                 wake_output(&output_wake);
                 std::panic::resume_unwind(panic);
@@ -1462,6 +1571,15 @@ fn join_ack_worker_until(
     cancellation: &OutboundCancellation,
     deadline: Instant,
 ) -> Result<(), ChatServiceError> {
+    join_lane_worker_until(worker, AckLane::Acknowledgements, cancellation, deadline)
+}
+
+fn join_lane_worker_until(
+    worker: ServiceWorker,
+    lane: AckLane,
+    cancellation: &OutboundCancellation,
+    deadline: Instant,
+) -> Result<(), ChatServiceError> {
     // Keep a small part of the existing outer margin for cancellation and process reaping if
     // normal bounded completion unexpectedly stalls. Never cancel an admitted ACK on SIGTERM.
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1473,7 +1591,25 @@ fn join_ack_worker_until(
     ) {
         cancellation.cancel();
     }
-    join_worker_until(worker, "chat ACK", deadline)
+    join_worker_until(worker, lane.label(), deadline)
+}
+
+/// Join both reaction workers by `deadline`, as [`join_ack_worker_until`] joins one. Both share
+/// `cancellation`, and both are joined even when the first fails; the first failure is returned.
+fn join_ack_workers_until(
+    workers: AckWorkers,
+    cancellation: &OutboundCancellation,
+    deadline: Instant,
+) -> Result<(), ChatServiceError> {
+    let acknowledgements = join_lane_worker_until(
+        workers.acknowledgements,
+        AckLane::Acknowledgements,
+        cancellation,
+        deadline,
+    );
+    let receipts =
+        join_lane_worker_until(workers.receipts, AckLane::Receipts, cancellation, deadline);
+    acknowledgements.and(receipts)
 }
 
 fn connected_provider_join_timeout(timeouts: ProcessPhaseTimeouts) -> Duration {
@@ -5866,6 +6002,24 @@ mod tests {
         submitted: mpsc::Sender<(String, String, String)>,
     }
 
+    /// The acknowledgement and the ✅ receipt reaction that `submissions` reports next, in
+    /// whichever order their workers made them; each is (message, emoji, operation ID).
+    fn two_reactions(
+        submissions: &mpsc::Receiver<(String, String, String)>,
+    ) -> ((String, String, String), (String, String, String)) {
+        let first = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first reaction");
+        let second = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second reaction");
+        if first.1 == "\u{2705}" {
+            (second, first)
+        } else {
+            (first, second)
+        }
+    }
+
     impl chat_runtime::ReactionTransport for EmojiObservingTransport {
         fn ensure_reaction(
             &mut self,
@@ -5886,6 +6040,88 @@ mod tests {
     }
 
     #[test]
+    fn a_receipt_reaction_does_not_wait_behind_an_acknowledgement_in_flight() {
+        // Each reaction is one outbound helper run, which on some providers takes more than a
+        // second, so the ✅ receipt has a worker and a transport of its own. Here the
+        // acknowledgement's helper run is held; the receipt reaction for the same request is
+        // added and removed from the state while it is still held.
+        let (state, key, root) = state_with_request();
+        assert_eq!(
+            state
+                .save_receipt_reactions(&[format!("chat-{key}")])
+                .expect("save receipt reaction")
+                .saved,
+            vec![key.clone()]
+        );
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (started, starts) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (submitted, submissions) = mpsc::channel();
+        let workers = spawn_ack_workers(
+            &state,
+            &queue,
+            ObservedReactionTransport {
+                started,
+                release: Some(released),
+            },
+            EmojiObservingTransport { submitted },
+            &stop,
+            &Arc::new(Mutex::new(None)),
+            captured_service_log,
+        )
+        .map_err(|(error, _)| error)
+        .expect("spawn reaction workers");
+        queue.enqueue([key.clone()]);
+        let acknowledgement = starts
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the acknowledgement started");
+        queue.enqueue_receipts([key.clone()]);
+        let receipt = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receipt reaction ran while the acknowledgement was held");
+        assert_eq!(receipt.0, "spaces/example/messages/one");
+        assert_eq!(receipt.1, "\u{2705}");
+        assert_ne!(receipt.2, acknowledgement.1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state
+            .pending_receipt_reactions()
+            .expect("pending receipts")
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the receipt was not recorded");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            state.inspect_request(&key).expect("request")["acknowledgement"]["phase"],
+            "sending",
+            "the acknowledgement is still held"
+        );
+        release.send(true).expect("finish the acknowledgement");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.inspect_request(&key).expect("request")["acknowledgement"]["phase"] != "acked" {
+            assert!(
+                Instant::now() < deadline,
+                "the acknowledgement did not finish"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.stop();
+        join_ack_workers_until(
+            workers,
+            &OutboundCancellation::new().expect("cancellation"),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("join reaction workers");
+        assert!(starts.try_recv().is_err(), "the acknowledgement ran once");
+        assert!(submissions.try_recv().is_err(), "the receipt ran once");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn async_ack_does_not_block_later_intake_or_delivery_and_shutdown_owns_inflight() {
         let (state, key, root) = state_with_request();
         let queue = Arc::new(AckQueue::default());
@@ -5896,6 +6132,7 @@ mod tests {
         let (started, starts) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let worker = spawn_ack_worker(
+            AckLane::Acknowledgements,
             state.clone(),
             Arc::clone(&queue),
             ObservedReactionTransport {
@@ -5985,15 +6222,19 @@ mod tests {
             ..StopState::default()
         });
         let (submitted, submissions) = mpsc::channel();
-        let worker = spawn_ack_worker(
-            state.clone(),
-            Arc::clone(&queue),
+        let workers = spawn_ack_workers(
+            &state,
+            &queue,
+            EmojiObservingTransport {
+                submitted: submitted.clone(),
+            },
             EmojiObservingTransport { submitted },
-            Arc::clone(&stop),
-            Arc::new(Mutex::new(None)),
+            &stop,
+            &Arc::new(Mutex::new(None)),
             captured_service_log,
         )
-        .expect("spawn ACK worker");
+        .map_err(|(error, _)| error)
+        .expect("spawn reaction workers");
         queue.enqueue([key.clone()]);
         let recording = RecordingDelivery::default();
         let mut transport = None;
@@ -6018,20 +6259,20 @@ mod tests {
             report.errors
         );
 
-        let acknowledgement = submissions
-            .recv_timeout(Duration::from_secs(5))
-            .expect("acknowledgement");
-        let receipt = submissions
-            .recv_timeout(Duration::from_secs(5))
-            .expect("receipt reaction");
+        // The two reactions run on separate workers, so either may come first.
+        let (acknowledgement, receipt) = two_reactions(&submissions);
         assert_eq!(acknowledgement.0, "spaces/example/messages/one");
         assert_eq!(acknowledgement.1, "🤖");
         assert_eq!(receipt.0, "spaces/example/messages/one");
         assert_eq!(receipt.1, "\u{2705}");
         assert_ne!(receipt.2, acknowledgement.2);
         stop.stop();
-        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(5))
-            .expect("join ACK worker");
+        join_ack_workers_until(
+            workers,
+            &OutboundCancellation::new().expect("cancellation"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("join reaction workers");
         assert!(
             submissions.try_recv().is_err(),
             "each reaction is added once"
@@ -6065,31 +6306,34 @@ mod tests {
             ..StopState::default()
         });
         let (submitted, submissions) = mpsc::channel();
-        let worker = spawn_ack_worker(
-            state.clone(),
-            Arc::clone(&queue),
+        let workers = spawn_ack_workers(
+            &state,
+            &queue,
+            EmojiObservingTransport {
+                submitted: submitted.clone(),
+            },
             EmojiObservingTransport { submitted },
-            Arc::clone(&stop),
-            Arc::new(Mutex::new(None)),
+            &stop,
+            &Arc::new(Mutex::new(None)),
             captured_service_log,
         )
-        .expect("spawn ACK worker");
+        .map_err(|(error, _)| error)
+        .expect("spawn reaction workers");
         // A rescan lists the saved acknowledgements and receipt reactions again.
         queue.state.lock().expect("queue state").rescan = true;
-        queue.changed.notify_one();
-        let acknowledgement = submissions
-            .recv_timeout(Duration::from_secs(5))
-            .expect("acknowledgement");
-        let receipt = submissions
-            .recv_timeout(Duration::from_secs(5))
-            .expect("receipt reaction");
+        queue.changed.notify_all();
+        let (acknowledgement, receipt) = two_reactions(&submissions);
         assert_eq!(acknowledgement.1, "🤖");
         assert_eq!(receipt.0, "spaces/example/messages/one");
         assert_eq!(receipt.1, "\u{2705}");
         assert_ne!(receipt.2, acknowledgement.2);
         stop.stop();
-        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(5))
-            .expect("join ACK worker");
+        join_ack_workers_until(
+            workers,
+            &OutboundCancellation::new().expect("cancellation"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("join reaction workers");
         assert!(state
             .pending_receipt_reactions()
             .expect("nothing waits")
@@ -6556,17 +6800,21 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             ack_queue: Some(Arc::clone(&queue)),
             ..StopState::default()
         });
-        let worker = spawn_ack_worker(
-            state.clone(),
-            Arc::clone(&queue),
+        let workers = spawn_ack_workers(
+            &state,
+            &queue,
             AckOnlyTransport {
                 receipts: Arc::clone(&receipts),
             },
-            Arc::clone(&stop),
-            Arc::new(Mutex::new(None)),
+            AckOnlyTransport {
+                receipts: Arc::clone(&receipts),
+            },
+            &stop,
+            &Arc::new(Mutex::new(None)),
             captured_service_log,
         )
-        .expect("spawn ACK worker");
+        .map_err(|(error, _)| error)
+        .expect("spawn reaction workers");
         queue.enqueue([key.clone()]);
         queue.enqueue_receipts([key.clone()]);
         let deadline = Instant::now() + HANG_GUARD;
@@ -6583,7 +6831,12 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         queue_saved_receipts(&queue, state.receipt_reaction_attempts().expect("attempts"));
         assert!(queue.state.lock().expect("queue state").receipts.is_empty());
         stop.stop();
-        join_worker_until(worker, "ACK", Instant::now() + HANG_GUARD).expect("join worker");
+        join_ack_workers_until(
+            workers,
+            &OutboundCancellation::new().expect("cancellation"),
+            Instant::now() + HANG_GUARD,
+        )
+        .expect("join workers");
         assert_eq!(receipts.load(std::sync::atomic::Ordering::SeqCst), 1);
         let status = state.status().expect("status");
         assert_eq!(status["receipt_reactions"]["refused"], 1);
@@ -7187,31 +7440,47 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
     }
 
     #[test]
-    fn receipt_reactions_queue_after_acknowledgements_and_before_a_rescan() {
+    fn each_reaction_lane_takes_only_its_own_work_in_order() {
+        use AckLane::{Acknowledgements, Receipts};
         let queue = AckQueue::default();
         queue.enqueue_receipts(["receipt".to_owned()]);
         queue.enqueue(["request".to_owned()]);
         queue.state.lock().expect("queue state").receipt_rescan = true;
-        assert!(matches!(queue.next(), Some(AckWork::Request(key)) if key == "request"));
-        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
-        assert!(matches!(queue.next(), Some(AckWork::Reconcile)));
+        assert!(
+            matches!(queue.next(Acknowledgements), Some(AckWork::Request(key)) if key == "request")
+        );
+        // A queued receipt reaction comes before the receipt rescan.
+        assert!(matches!(queue.next(Receipts), Some(AckWork::Receipt(key)) if key == "receipt"));
+        assert!(matches!(
+            queue.next(Receipts),
+            Some(AckWork::ReceiptReconcile)
+        ));
 
-        // Acknowledgements that overflowed the queue are listed again before any receipt.
+        // Acknowledgements that overflowed the queue are listed again by their own lane, and a
+        // receipt reaction does not wait for them: its lane takes it at once.
         let queue = AckQueue::default();
         queue.enqueue((0..=ACK_QUEUE_CAPACITY).map(|index| format!("request-{index}")));
         queue.enqueue_receipts(["receipt".to_owned()]);
+        assert!(matches!(queue.next(Receipts), Some(AckWork::Receipt(key)) if key == "receipt"));
         for index in 0..ACK_QUEUE_CAPACITY {
             let key = format!("request-{index}");
-            assert!(matches!(queue.next(), Some(AckWork::Request(actual)) if actual == key));
+            assert!(
+                matches!(queue.next(Acknowledgements), Some(AckWork::Request(actual)) if actual == key)
+            );
             queue.finished(&key, false);
         }
-        assert!(matches!(queue.next(), Some(AckWork::Reconcile)));
-        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+        assert!(matches!(
+            queue.next(Acknowledgements),
+            Some(AckWork::Reconcile)
+        ));
 
-        // An acknowledgement whose retry is due is listed again before any receipt.
+        // An acknowledgement whose retry is due is listed again by its lane; the receipt lane
+        // still takes its reaction.
         let queue = AckQueue::default();
         queue.enqueue(["request".to_owned()]);
-        assert!(matches!(queue.next(), Some(AckWork::Request(key)) if key == "request"));
+        assert!(
+            matches!(queue.next(Acknowledgements), Some(AckWork::Request(key)) if key == "request")
+        );
         queue.finished("request", true);
         queue.enqueue_receipts(["receipt".to_owned()]);
         {
@@ -7221,9 +7490,39 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 .expect("a past instant");
             state.retry_at.insert("request".to_owned(), due);
         }
-        assert!(matches!(queue.next(), Some(AckWork::Reconcile)));
-        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+        assert!(matches!(queue.next(Receipts), Some(AckWork::Receipt(key)) if key == "receipt"));
+        assert!(matches!(
+            queue.next(Acknowledgements),
+            Some(AckWork::Reconcile)
+        ));
 
+        // A receipt reaction whose retry falls due is listed again by the receipt lane alone:
+        // the acknowledgement lane keeps waiting until the queue stops.
+        {
+            let mut state = queue.state.lock().expect("queue state");
+            let due = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a past instant");
+            state.receipt_retry_at.insert("old-receipt".to_owned(), due);
+        }
+        thread::scope(|scope| {
+            let waiting = scope.spawn(|| queue.next(Acknowledgements));
+            assert!(matches!(
+                queue.next(Receipts),
+                Some(AckWork::ReceiptReconcile)
+            ));
+            thread::sleep(Duration::from_millis(50));
+            assert!(
+                !waiting.is_finished(),
+                "the acknowledgement lane took receipt work"
+            );
+            queue.stop();
+            assert!(waiting.join().expect("acknowledgement lane").is_none());
+        });
+
+        let queue = AckQueue::default();
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        assert!(matches!(queue.next(Receipts), Some(AckWork::Receipt(key)) if key == "receipt"));
         // A reaction in flight, or one that failed a moment ago, is not queued again.
         queue.enqueue_receipts(["receipt".to_owned()]);
         assert!(queue.state.lock().expect("queue state").receipts.is_empty());
@@ -7236,7 +7535,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         }
         queue.receipt_finished("receipt", false);
         queue.enqueue_receipts(["receipt".to_owned()]);
-        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+        assert!(matches!(queue.next(Receipts), Some(AckWork::Receipt(key)) if key == "receipt"));
 
         // A full queue leaves the rest saved, for a rescan to list.
         let queue = AckQueue::default();
@@ -7265,6 +7564,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         let (started, starts) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let worker = spawn_ack_worker(
+            AckLane::Acknowledgements,
             state.clone(),
             Arc::clone(&queue),
             ObservedReactionTransport {
@@ -7314,6 +7614,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         });
         let (started, starts) = mpsc::channel();
         let worker = spawn_ack_worker(
+            AckLane::Acknowledgements,
             reopened.clone(),
             queue,
             ObservedReactionTransport {
@@ -7360,6 +7661,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         });
         let (started, starts) = mpsc::channel();
         let worker = spawn_ack_worker(
+            AckLane::Acknowledgements,
             state.clone(),
             queue,
             ObservedReactionTransport {

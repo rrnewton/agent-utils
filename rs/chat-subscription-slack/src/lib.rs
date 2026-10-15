@@ -7,7 +7,9 @@
 //!   ([`plugin`]).
 //! * `agentctl-slack-outbound` is the bridge's one-shot `outbound_command`. Each run reads one
 //!   JSON request line, posts a reply into the request's Slack thread or adds the
-//!   acknowledgement reaction, and writes one JSON response line ([`outbound`]).
+//!   acknowledgement reaction, and writes one JSON response line ([`outbound`]). Run with
+//!   `--role=warm-worker`, the same executable is a long-lived worker that keeps a Slack client
+//!   started for a likely reply, so the helper's post skips the client's start-up ([`warm`]).
 //!
 //! Both talk to Slack through the small [`transport::SlackTransport`] interface. The
 //! [`cli::CliTransport`] implementation runs an installed Slack command-line client whose path
@@ -27,6 +29,7 @@ pub mod ids;
 pub mod outbound;
 pub mod plugin;
 pub mod transport;
+pub mod warm;
 
 /// Release version reported in diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

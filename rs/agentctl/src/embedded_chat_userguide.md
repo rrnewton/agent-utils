@@ -1545,13 +1545,15 @@ other until a ✅ has been saved since; `chat run` logs that line, and `chat
 tick` prints it in its report. A pass also lists the keys whose ✅ it lost in
 `receipts_lost`.
 
-In `chat run`, the worker that adds reaction ACKs, described under
-Configuration, adds the ✅ reactions too, one at a time through its bounded
-queue, after every ACK it has waiting, including those that did not fit in its
-queue and those whose retry is due. A ✅ that does not fit stays saved, and the
-worker lists the saved ones again after draining its queue. A failed or
-uncertain ✅ keeps its file and its operation ID and waits at least 60 seconds
-before the worker tries it again; the file records when that attempt was made,
+In `chat run`, a second worker, beside the one that adds reaction ACKs
+described under Configuration, adds the ✅ reactions, one at a time through its
+own bounded queue and its own outbound helper runs, so a ✅ never waits behind
+an ACK: each reaction is one helper run, which can take more than a second, and
+a request's ✅ can be added before its ACK has finished. A ✅ that does not fit
+stays saved, and the worker lists the saved ones again after draining its
+queue. A failed or uncertain ✅ keeps its file and its operation ID and waits at
+least 60 seconds before the worker tries it again; the file records when that
+attempt was made,
 so a restart waits out the rest of the 60 seconds too. A ✅ that the outbound
 helper refuses as not applied and not retryable, as a helper that accepts only
 the configured `ack_reaction` does, is not tried again: its file is removed,
@@ -1839,11 +1841,67 @@ environment) or, for non-secret values, set it in `cli_environment`.
 | `--cli-env=NAME=VALUE` | none | Extra non-secret client environment, repeatable. |
 | `--diagnostics-log=PATH` | stderr | Private diagnostics file. |
 | `--transport=cli\|web-api` | `cli` | `web-api` refuses every request. |
+| `--warm-socket=PATH` | none | Use the warm worker listening at this absolute path (at most 107 bytes); see below. |
+| `--role=helper\|warm-worker` | `helper` | `warm-worker` runs the long-lived warm worker instead of answering one request. |
+| `--warm-max-spares=N` | 2 | Warm worker only: 1–8 spare clients held at once. |
+| `--warm-ttl-seconds=N` | 300 | Warm worker only: 1–3600; an unused spare is killed after this long. |
 
 The Slack app must be invited to the channel and needs permission to post and
 react (`chat:write`, `reactions:write`) and, for reconciling uncertain posts,
 to read the channel's history (`groups:history` for a private channel). Without
 history access an uncertain post is simply re-posted after the window.
+
+### Warm worker (optional)
+
+Each helper run starts the Slack command-line client once per operation, and
+most of a post's time is the client starting up: measured on one host, a post
+took 1.2 to 2.2 seconds, of which about a second passed before the client read
+its body. The client cannot serve several operations from one process, so the
+helper cannot keep one. The warm worker instead starts the client's post for a
+thread before the reply exists and holds it, waiting for the body on its
+standard input; a reply through it skips the start-up. Measured against the
+same channel on that host, replies posted through it took 0.93 to 1.05 seconds
+from request to receipt, against 1.88 to 2.17 seconds for the helper's own
+client run.
+
+Run the worker as its own long-lived service with the helper's arguments plus
+`--role=warm-worker` and `--warm-socket=PATH`, and add the same
+`--warm-socket=PATH` to the helper's arguments. When the helper adds a
+reaction to a message (normally the 👀 acknowledgement, at admission), it first
+asks the worker to start a spare for a reply in that message's thread. When it
+posts a reply into a thread, it asks the worker to post it through the spare
+for exactly that app, client, format, channel and thread. The worker writes the
+reply to the spare only after it has answered that it holds one and the helper
+has confirmed, so until then the helper knows nothing was posted: if there is
+no spare, no worker is running, or the worker does not answer within 2 seconds
+(a stopped or hung worker), the helper posts with its own client run, as it
+does without a worker. After the helper confirms, a failure the worker proves
+was not applied is retried that way if it is retryable, is not a rate limit,
+and came within 4 seconds. Any other failure, including an answer lost after
+the confirmation, keeps an unknown outcome, so the ledger above decides, and a
+fallback never posts a reply twice. A reply to a message inside a thread goes to the
+thread root, which has no spare, so it takes the helper's own run, and the spare
+started for the message expires unused.
+
+A spare not used within `--warm-ttl-seconds` is killed, as is the oldest when
+`--warm-max-spares` are held; a killed spare posts nothing, because it dies
+before its input closes and the client refuses an empty body. Spares die with
+the worker. Each spare costs what one waiting client costs: on the measured
+host about 330 to 390 MB resident (215 to 275 MB private) and 0.5% of one core,
+for at most the time to live; the worker itself waits in `accept` and on a
+condition variable and costs nothing while idle. The worker holds
+`PATH.lock` exclusively, so a second worker for the same socket exits with
+status 1; a worker whose arguments are invalid exits with status 2.
+
+```ini
+# ~/.config/systemd/user/agentctl-slack-warm.service (example)
+[Service]
+ExecStart=/path/to/agentctl-slack-outbound --role=warm-worker \
+  --warm-socket=/path/to/state/warm.sock --cli=/path/to/slack-client \
+  --app-id=A0123456789 --channel=C0123456789 --ledger=/path/to/state/ledger \
+  --diagnostics-log=/path/to/state/logs/warm.log
+Restart=on-failure
+```
 
 ### A second bridge for one test agent
 
