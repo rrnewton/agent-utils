@@ -20,7 +20,10 @@ under a person's fingers, and measures the list that is on screen:
   every time, and Ctrl+Enter off any box goes there too, a held one sending nothing from the box it
   reached, from the list or from Reply; on the call's view Ctrl+S goes to the agent's box ->
   "," opens Settings with its screen focused, PgDn scrolls Settings, Escape returns to the list
-  where the reader was; Ctrl+, does the same -> in the channel's message box, PgUp pages the list
+  where the reader was; Ctrl+, does the same -> `#332 settings-voice-agent-section`: on Settings, Tab
+  from Resuming's ? goes through Resuming, Live messages and Reading full messages in channel view in
+  the order they are read, each ? before the control it is about, and Shift+Tab comes back the same
+  way -> in the channel's message box, PgUp pages the list
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
   Ctrl+End take the list to its top and its newest message -> the keymap: Home selects the first
   message with a ring drawn round it (real focus, `:focus-visible`), j, k and the arrows move the
@@ -352,6 +355,8 @@ NAMED_KEYS: dict[str, tuple[str, int, str]] = {
     "/": ("Slash", 191, "/"), "?": ("Slash", 191, "?"), ",": ("Comma", 188, ","),
     ";": ("Semicolon", 186, ";"), ":": ("Semicolon", 186, ":"), ".": ("Period", 190, "."),
     "[": ("BracketLeft", 219, "["), "]": ("BracketRight", 221, "]"),
+    # Typing nothing: a raw key down, which is what moves the focus.
+    "Tab": ("Tab", 9, ""),
 }
 MODIFIERS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
 
@@ -685,6 +690,44 @@ def settings_keys(walk: Walk) -> None:
         check(abs(number(back, "top") - number(before, "top")) <= 2,
               f"back from Settings the list was at {back['top']}, not where the reader left it ({before['top']})")
     walk.notes.append('"," and Ctrl+, opened Settings with its screen focused, PgDn scrolled it, Escape came back unmoved')
+
+
+# `#332 settings-voice-agent-section`. The Tab stops from Resuming through Reading full messages in
+# channel view, as the page suite pins them in the markup (`SETTINGS_TAB_STOPS` there).
+SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages",
+                      "help-link-speech-prep-relay", "relay-to-agent", "help-link-speech-prep",
+                      "settings-audio-source"]
+
+
+def settings_tab_order(walk: Walk) -> None:
+    """Tab walks the three settings that read a message out in reading order, each ? first; Shift+Tab walks back."""
+    opened = walk.key(",", "screen-settings")
+    check(opened["screen"] == "settings", f'"," did not open Settings: {opened}')
+    # A control the page has disabled is no Tab stop, and the server decides whether one is: the
+    # walk expects the stops that are live on this page, in the pinned order.
+    stops = [stop for stop in SETTINGS_TAB_STOPS
+             if not walk.page.evaluate("(id) => document.getElementById(id).disabled === true", stop)]
+    check(len(stops) >= len(SETTINGS_TAB_STOPS) - 1, f"too many of the stops are disabled to walk: {stops}")
+    walk.page.focus(f"#{stops[0]}")
+    forward = [walk.state("screen-settings")["focus"]]
+    for _ in stops[1:]:
+        reached = walk.key("Tab", "screen-settings")
+        check(walk.page.evaluate(
+            "() => { const b = document.activeElement.getBoundingClientRect(); "
+            "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+            "return b.top >= s.top - 1 && b.bottom <= s.bottom + 1; }"),
+            f"Tab reached #{reached['focus']} without bringing it onto the screen")
+        forward.append(reached["focus"])
+    check(forward == stops, f"Tab went {forward}, not {stops}")
+    walk.shot("settings-tab-order")
+    back = [forward[-1]]
+    for _ in stops[1:]:
+        back.append(walk.key("Shift+Tab", "screen-settings")["focus"])
+    check(back == stops[::-1], f"Shift+Tab went {back}, not {stops[::-1]}")
+    out = walk.key("Escape")
+    check(out["screen"] == "main", f"Escape did not leave Settings after the Tab walk: {out}")
+    walk.notes.append(f"Tab went through Resuming, Live messages and Reading full messages in channel view in "
+                      f"order, each ? before its control ({len(stops)} stops), and Shift+Tab came back")
 
 
 def composer_keys(walk: Walk) -> None:
@@ -1453,6 +1496,7 @@ def main() -> int:
             held_send_key(walk, api)
             call_view_write_keys(walk)
             settings_keys(walk)
+            settings_tab_order(walk)
             composer_keys(walk)
             keymap_keys(walk, api)
             single_selection(walk, api)
