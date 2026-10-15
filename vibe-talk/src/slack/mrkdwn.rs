@@ -14,6 +14,8 @@
 //! | `<!date^…|fallback>` | `fallback` |
 //! | `<@U123>` | `<@U123>`, unchanged |
 //! | `&amp;` `&lt;` `&gt;` | `&` `<` `>` |
+//! | `&gt; question` then `answer` | `> question`, a blank line, then `answer` |
+//! | `&gt;&gt;&gt; a` then `b` | `> a` then `> b` |
 //!
 //! User mentions are kept verbatim because vibe-talk's mention syntax is the same `<@id>`: a reply
 //! that quotes one notifies the same person in Slack. Who it names travels beside the body, in
@@ -24,6 +26,9 @@
 //! characters and the speech preparer strips them either way; what they MEAN differs — `*a*` is
 //! bold in Slack and italic in Markdown — and that is settled where bodies are drawn, by
 //! [`crate::render::Markup::asterisk_is_bold`].
+//!
+//! A quote ends where Slack ends it ([`end_quotes`], `#322 slack-quote-lines`): in Slack a `>`
+//! quotes its own line and no other, and `>>>` quotes the rest of the message.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -57,6 +62,74 @@ pub fn to_markdown_with(text: &str, channels: &HashMap<String, String>) -> Strin
         }
     }
     out.push_str(&decode_entities(rest));
+    end_quotes(out)
+}
+
+/// End every quote where Slack ends it. `#322 slack-quote-lines`.
+///
+/// In Slack a line that starts with `>` is quoted, and only that line: the owner's answer written
+/// straight under a quoted question is drawn under the quote, not in it. CommonMark, which the page,
+/// the speech preparer and the voice agent read, makes the line after a quoted one more of the
+/// quote — a lazy continuation — unless a blank line comes between. So a blank line is put between
+/// a quoted line and the unquoted line that follows it, and nowhere else: a quote of several lines
+/// that each start with `>` stays one quote, and a quote that ends the message changes nothing.
+///
+/// `>>>` quotes everything after it to the end of the message, in Slack, so from that line on
+/// every line is written with a `>` of its own and the quote is one quote, blank lines included.
+/// CommonMark read the three as three quotes inside one another.
+///
+/// Inside a code block the lines are code, `>` included, and are left as they are: a block starts
+/// and ends at each ```` ``` ````, wherever on a line it is written, as Slack's do. An unquoted line
+/// indented four columns or more is not given a blank line either, since after one it would be
+/// read as a block of code: such a line stays in the quote, as before.
+fn end_quotes(markdown: String) -> String {
+    if !markdown.contains('>') {
+        return markdown;
+    }
+    let mut out = String::with_capacity(markdown.len() + 16);
+    let mut in_code = false;
+    let mut after_quote = false;
+    let mut rest_quoted = false;
+    for (index, line) in markdown.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if rest_quoted {
+            out.push('>');
+            if !line.is_empty() {
+                out.push(' ');
+                out.push_str(line);
+            }
+            continue;
+        }
+        let starts_in_code = in_code;
+        if line.matches("```").count() % 2 == 1 {
+            in_code = !in_code;
+        }
+        if starts_in_code {
+            after_quote = false;
+            out.push_str(line);
+            continue;
+        }
+        if let Some(after) = line.strip_prefix(">>>") {
+            rest_quoted = true;
+            let after = after.strip_prefix(' ').unwrap_or(after);
+            out.push('>');
+            if !after.is_empty() {
+                out.push(' ');
+                out.push_str(after);
+            }
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let quoted = indent < 4 && line[indent..].starts_with('>');
+        let blank = line.trim_matches([' ', '\t']).is_empty();
+        if after_quote && !quoted && !blank && indent < 4 && !line.starts_with('\t') {
+            out.push('\n');
+        }
+        out.push_str(line);
+        after_quote = quoted;
+    }
     out
 }
 
@@ -381,5 +454,134 @@ mod tests {
                 "64 KiB of angle brackets took {took:?}"
             );
         }
+    }
+
+    /// The page's rendering of a Slack body, as a Slack provider's channel is drawn.
+    fn drawn(slack: &str) -> String {
+        crate::render::to_html(&super::to_markdown(slack), crate::render::Markup::Slack)
+    }
+
+    #[test]
+    fn a_quoted_line_ends_at_the_line_under_it() {
+        // `#322 slack-quote-lines`: the owner's answer under a quoted question.
+        let slack = "&gt; Should we ship it today?\nYes, after the smoke test.";
+        assert_eq!(
+            super::to_markdown(slack),
+            "> Should we ship it today?\n\nYes, after the smoke test."
+        );
+        let html = drawn(slack);
+        assert_eq!(
+            html,
+            "<blockquote>\n<p>Should we ship it today?</p>\n</blockquote>\n\
+             <p>Yes, after the smoke test.</p>\n",
+            "the answer was drawn inside the quote"
+        );
+        // Negative control: without the blank line CommonMark swallows the answer.
+        let swallowed = crate::render::to_html(
+            "> Should we ship it today?\nYes, after the smoke test.",
+            crate::render::Markup::Slack,
+        );
+        assert!(
+            swallowed.contains("today?<br />\nYes") || swallowed.contains("today?<br>\nYes"),
+            "{swallowed}"
+        );
+    }
+
+    #[test]
+    fn several_quoted_lines_stay_one_quote_and_end_once() {
+        let slack =
+            "&gt; first line\n&gt; second line\n&gt;\n&gt; after a gap\nmy answer\nand more of it";
+        assert_eq!(
+            super::to_markdown(slack),
+            "> first line\n> second line\n>\n> after a gap\n\nmy answer\nand more of it"
+        );
+        let html = drawn(slack);
+        assert_eq!(html.matches("<blockquote>").count(), 1, "{html}");
+        let (quote, after) = html.split_once("</blockquote>").expect("a quote");
+        assert!(
+            quote.contains("second line") && quote.contains("after a gap"),
+            "{html}"
+        );
+        assert!(
+            after.contains("my answer") && after.contains("and more of it"),
+            "{html}"
+        );
+        assert!(!quote.contains("my answer"), "{html}");
+    }
+
+    #[test]
+    fn a_quote_at_the_end_or_a_blank_line_after_it_changes_nothing() {
+        for text in [
+            "&gt; only a quote",
+            "a question\n&gt; quoted at the end",
+            "&gt; a quote\n\nalready apart",
+            "no quote at all",
+            "a &gt; b in the middle of a line\nnext",
+        ] {
+            assert!(
+                !super::to_markdown(text).contains("\n\n\n"),
+                "{text:?} grew a second blank line"
+            );
+            assert_eq!(
+                super::to_markdown(text).matches('\n').count(),
+                text.matches('\n').count(),
+                "{text:?} was given a blank line"
+            );
+        }
+        assert_eq!(super::to_markdown("&gt; only a quote"), "> only a quote");
+    }
+
+    #[test]
+    fn quotes_between_answers_each_end_at_their_own_line() {
+        assert_eq!(
+            super::to_markdown("&gt; one?\nyes\n&gt; two?\nno"),
+            "> one?\n\nyes\n> two?\n\nno"
+        );
+        let html = drawn("&gt; one?\nyes\n&gt; two?\nno");
+        assert_eq!(html.matches("<blockquote>").count(), 2, "{html}");
+        assert!(!html.contains("<p>one?<br"), "{html}");
+    }
+
+    #[test]
+    fn three_brackets_quote_the_rest_of_the_message() {
+        assert_eq!(
+            super::to_markdown("intro\n&gt;&gt;&gt; quoted\nall of\n\nthis too"),
+            "intro\n> quoted\n> all of\n>\n> this too"
+        );
+        let html = drawn("&gt;&gt;&gt; quoted\nall of\n\nthis too");
+        assert_eq!(html.matches("<blockquote>").count(), 1, "{html}");
+        assert!(html.trim_end().ends_with("</blockquote>"), "{html}");
+        assert!(html.contains("this too"), "{html}");
+    }
+
+    #[test]
+    fn a_quote_inside_code_is_code_and_is_left_alone() {
+        for text in [
+            "```\n&gt; not a quote\nstill code\n```",
+            "see ```&gt; not a quote\nstill code``` done",
+        ] {
+            assert_eq!(
+                super::to_markdown(text).matches('\n').count(),
+                text.matches('\n').count(),
+                "{text:?}"
+            );
+        }
+        // After the block closes, quotes are quotes again.
+        assert_eq!(
+            super::to_markdown("```\ncode\n```\n&gt; q\nanswer"),
+            "```\ncode\n```\n> q\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn an_indented_line_after_a_quote_is_not_made_into_code() {
+        // A blank line before it would make it an indented code block.
+        assert_eq!(
+            super::to_markdown("&gt; q\n    indented"),
+            "> q\n    indented"
+        );
+        assert_eq!(super::to_markdown("&gt; q\n\tindented"), "> q\n\tindented");
+        // Up to three spaces before the marker is still a quote, and still ended.
+        assert_eq!(super::to_markdown("  &gt; q\nanswer"), "  > q\n\nanswer");
     }
 }

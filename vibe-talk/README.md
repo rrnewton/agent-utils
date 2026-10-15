@@ -1171,7 +1171,10 @@ escaped, as `@everyone` is suppressed on Discord.
 
 **What is shown.** Joins, leaves, topic changes and other system events are left out; ordinary,
 bot, file-share, `/me` and thread-broadcast messages are kept. Slack's link, channel and
-group-mention markup is rewritten into the markdown the rest of the app reads.
+group-mention markup is rewritten into the markdown the rest of the app reads. A quote ends where
+Slack ends it (`#322 slack-quote-lines`): a `>` quotes its own line and no other, so an answer
+written straight under a quoted line is drawn under the quote, not in it, while a quote of several
+lines that each start with `>` stays one quote, and `>>>` quotes the rest of the message.
 
 **Mentions.** `#318 slack-mention-names`. A user mention stays `<@U…>` in the message's text, so a
 reply that quotes it notifies the same person and what is posted is what was written; but it is
