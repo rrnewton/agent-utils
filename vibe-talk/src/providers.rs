@@ -99,7 +99,7 @@ impl ChatRouter {
 
     /// [`ChatRouter::new`], timing each entry's client into `profile` under the entry's key, and
     /// reporting each outcome to a new [`AccessWatch`] that nothing listens to yet. The watch reads
-    /// every entry's failures as a Discord-protocol provider's until told otherwise
+    /// no entry's 403 or 404 as a lost channel until told the entry's dialect
     /// ([`AccessWatch::set_dialect`]), as [`ChatRouter::from_config`] tells it for each provider.
     ///
     /// For a builder that hands the same profile to a provider's own client first, as
@@ -142,10 +142,11 @@ impl ChatRouter {
         }
     }
 
-    /// A router with a single provider under the legacy key, as every pre-router deployment had.
+    /// A router with a single provider under the legacy key, as every pre-router deployment had:
+    /// a Discord-protocol one, whose failures the watch reads as such.
     #[must_use]
     pub fn single(client: Arc<dyn ChatClient>, namespace: &str, live_poll_seconds: u64) -> Self {
-        Self::new(
+        let router = Self::new(
             vec![ProviderEntry {
                 key: crate::config::LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
                 namespace: namespace.to_owned(),
@@ -153,7 +154,12 @@ impl ChatRouter {
                 live_poll_seconds,
             }],
             None,
-        )
+        );
+        router.access.set_dialect(
+            crate::config::LEGACY_DISCORD_PROVIDER_KEY,
+            crate::cache::access::Dialect::DiscordProtocol,
+        );
+        router
     }
 
     /// Build every configured provider's client.

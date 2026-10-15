@@ -433,6 +433,22 @@ pub(crate) async fn messages_for(
     limit: Option<u16>,
     wants: Wants,
 ) -> Result<Window, OpError> {
+    read_window(state, caller, channel_id, limit, wants, false)
+        .await
+        .map(|(window, _)| window)
+}
+
+/// [`messages_for`]. With `look_further`, a read for one message ([`Wants::Message`]) that the
+/// window does not hold leaves its shadow evaluation uncompared and hands it back, noted, for the
+/// caller to compare with what it finds where it looks next (`#319 slack-reply-by-id`).
+async fn read_window(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    limit: Option<u16>,
+    wants: Wants,
+    look_further: bool,
+) -> Result<(Window, Option<crate::cache::HeldShadow>), OpError> {
     let channel = allowed(state, channel_id).await?;
     // Clamped once: the size fetched, the size `crate::recent` records, and the size speech
     // preparation compares a remembered window against (`crate::read_ahead`) are one number.
@@ -451,8 +467,17 @@ pub(crate) async fn messages_for(
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let read = crate::recent_view::read(state, &channel.id, limit).await?;
     // Before the read is offered, so the shadow knows which offers are this read's own.
+    let mut held = None;
     if let Some(shadow) = shadow {
-        shadow.compare(Upstream::of(&read.messages, !read.exhausted));
+        let upstream = Upstream::of(&read.messages, !read.exhausted);
+        match &wants {
+            Wants::Message(_, id)
+                if look_further && !read.messages.iter().any(|message| message.id == *id) =>
+            {
+                held = Some(shadow.hold(upstream));
+            }
+            _ => shadow.compare(upstream),
+        }
     }
     if let Some(fill) = fill {
         fill.offer_recent_dated(&read);
@@ -477,12 +502,15 @@ pub(crate) async fn messages_for(
     state
         .read_ahead
         .remember(&channel.id, None, &messages, fetch_began);
-    Ok(Window {
-        channel,
-        messages,
-        limit,
-        as_of: read.as_of,
-    })
+    Ok((
+        Window {
+            channel,
+            messages,
+            limit,
+            as_of: read.as_of,
+        },
+        held,
+    ))
 }
 
 /// How many messages [`messages`] asks the chat backend for, given what the caller asked for.
@@ -549,7 +577,9 @@ async fn message_by_id_for(
     // answers for this one exactly, wherever it is in the channel; any other is read for the recent
     // window, as before.
     let wanted = MessageId(message_id.to_owned());
-    let channel =
+    // A read that did not find the id leaves its shadow evaluation uncompared (`held`): the answer
+    // the request gives may yet come from the thread below.
+    let (channel, held) =
         if configured(state, channel_id).is_ok_and(|channel| looks_up_by_ids(state, &channel.id)) {
             let channel = allowed(state, channel_id).await?;
             let shadow = state.message_cache.shadow(
@@ -568,32 +598,38 @@ async fn message_by_id_for(
                 &[message_id.to_owned()],
                 limit,
                 shadow.map(|shadow| (wanted.clone(), shadow)),
+                true,
             )
             .await?;
             if let Some(message) = looked.messages.into_iter().next().flatten() {
                 return Ok((channel, message));
             }
-            channel
+            (channel, looked.unanswered)
         } else {
-            let window = messages_for(
+            let (window, held) = read_window(
                 state,
                 caller,
                 channel_id,
                 limit,
                 Wants::Message(consumer, wanted.clone()),
+                true,
             )
             .await?;
             if let Some(message) = window.messages.into_iter().find(|m| m.id == wanted) {
                 return Ok((window.channel, message));
             }
-            window.channel
+            (window.channel, held)
         };
     let Some(thread) = known_thread(state, &channel.id, &wanted).await else {
+        if let Some(held) = held {
+            held.nothing_more();
+        }
         return Err(OpError::UnknownMessage);
     };
     // A thread this server was told of rather than one the caller chose: a read of it that finds
     // nothing there, or refuses the id for it, is the same answer the channel gave. The read above
-    // was already shadowed for this ask, so this one is not counted again.
+    // was already shadowed for this ask, so this one is not counted again: what it finds is what
+    // that evaluation is compared with, the answer the request gives.
     match message_in_thread(state, caller, channel, message_id, limit, &thread, None).await {
         Err(OpError::Chat(error))
             if matches!(
@@ -601,9 +637,18 @@ async fn message_by_id_for(
                 ChatError::Status { status: 404, .. } | ChatError::Refused(_)
             ) =>
         {
+            if let Some(held) = held {
+                held.nothing_more();
+            }
             Err(OpError::UnknownMessage)
         }
-        answer => answer,
+        Ok((channel, message)) => {
+            if let Some(held) = held {
+                held.found(Upstream::of(std::slice::from_ref(&message), true));
+            }
+            Ok((channel, message))
+        }
+        failed => failed,
     }
 }
 
@@ -730,6 +775,7 @@ async fn message_in_thread(
             &[message_id.to_owned()],
             limit,
             shadow.map(|shadow| (wanted, shadow)),
+            false,
         )
         .await?;
         let message = looked
@@ -779,6 +825,9 @@ pub struct Looked {
     pub messages: Vec<Option<Message>>,
     /// Upstream reads made: the lookup itself, and one for each id it did not see.
     pub reads: usize,
+    /// The shadow evaluation of the id the lookup did not find, when the caller asked to look
+    /// further: noted, uncompared, for the caller to compare with what it finds next.
+    pub unanswered: Option<crate::cache::HeldShadow>,
 }
 
 /// `ids` of `channel`, or of one `thread` of it, in one [`crate::chat::ChatClient::fetch_messages`]
@@ -796,12 +845,17 @@ pub struct Looked {
 /// when given, is the evaluation of what the message cache would have answered for one of `ids`
 /// (`#208 persistent-cache`, [`crate::cache::shadow`]): it is handed what the provider answered for
 /// that id as soon as the provider has: the message it found, or nothing at all where it proved
-/// there is none; for an id it did not see, what the read that looks it up instead found.
+/// there is none; for an id it did not see, what the read that looks it up instead found. With
+/// `look_further`, the caller looks for an id neither finds somewhere else afterwards (the thread
+/// the server knows it to be a reply in, `#319 slack-reply-by-id`): such an id's evaluation is
+/// handed back noted and uncompared in [`Looked::unanswered`], for the caller to compare with the
+/// answer it ends up giving.
 ///
 /// # Errors
 ///
 /// [`OpError::Chat`] for an invalid thread id, a failed read, or a lookup that answered for ids it
 /// was not asked; the errors of [`messages`].
+#[allow(clippy::too_many_arguments)]
 pub async fn lookup_messages(
     state: &AppState,
     caller: crate::auth::Scope,
@@ -810,6 +864,7 @@ pub async fn lookup_messages(
     ids: &[String],
     limit: Option<u16>,
     shadow: Option<(MessageId, crate::cache::Shadowed)>,
+    look_further: bool,
 ) -> Result<Looked, OpError> {
     use crate::chat::Lookup;
 
@@ -834,6 +889,7 @@ pub async fn lookup_messages(
     // Compared before anything this lookup reads is offered to the cache, as every shadowed read
     // is. An id the provider did not see waits for the read that looks it up instead.
     let mut shadow = shadow;
+    let mut unanswered = None;
     if let Some((shadowed, evaluation)) = shadow.take() {
         match wanted
             .iter()
@@ -842,6 +898,9 @@ pub async fn lookup_messages(
         {
             Some(Lookup::Found(message)) => {
                 evaluation.compare(Upstream::of(std::slice::from_ref(message), true));
+            }
+            Some(Lookup::Absent) if look_further => {
+                unanswered = Some(evaluation.hold(Upstream::of(&[], false)));
             }
             Some(Lookup::Absent) => evaluation.compare(Upstream::of(&[], false)),
             Some(Lookup::Unseen) => shadow = Some((shadowed, evaluation)),
@@ -892,7 +951,12 @@ pub async fn lookup_messages(
                     if let (Some(evaluation), Some(window)) =
                         (shadow_for(&mut shadow, id), window.as_deref())
                     {
-                        evaluation.compare(Upstream::of(window, true));
+                        let upstream = Upstream::of(window, true);
+                        if look_further && !window.iter().any(|message| message.id == *id) {
+                            unanswered = Some(evaluation.hold(upstream));
+                        } else {
+                            evaluation.compare(upstream);
+                        }
                     }
                     window
                         .as_ref()
@@ -925,6 +989,7 @@ pub async fn lookup_messages(
     Ok(Looked {
         messages: answered,
         reads,
+        unanswered,
     })
 }
 
@@ -3980,6 +4045,7 @@ pub async fn summarize_message_scoped(
                 &ids,
                 limit,
                 shadow.map(|shadow| (wanted, shadow)),
+                false,
             )
             .await?
             .messages

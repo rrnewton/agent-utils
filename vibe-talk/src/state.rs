@@ -279,6 +279,15 @@ impl AppState {
     /// For tests and tools that assemble their own provider set; `main` builds the router from
     /// configuration instead.
     pub fn replace_providers(&mut self, providers: Arc<ChatRouter>) {
+        // `#208 persistent-cache`: each configured provider's failures are read as its kind says,
+        // as `ChatRouter::from_config` has them read, so a router assembled by hand hears what its
+        // providers refuse in the same dialects.
+        for provider in &self.config.providers {
+            providers.access().set_dialect(
+                &provider.key,
+                crate::cache::access::Dialect::of(&provider.kind),
+            );
+        }
         self.chat = providers.clone();
         self.providers = providers;
         self.refresh_routes();

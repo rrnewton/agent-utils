@@ -3268,12 +3268,17 @@ pub async fn purge_storage(
     // `#208 persistent-cache`. The message cache file is not in the store, and is erased with it:
     // reopened empty while the cache is on, and the owner's switch, which lives beside the store
     // rather than in it, left as it is.
+    // The purge runs whatever the configuration says, since a table taken out leaves an earlier
+    // configuration's file for days and this is what erases it then; it is told of only when it
+    // erased something, so that a server with no cache logs what it did before the cache existed.
     if let Some(lifecycle) = state.message_cache.lifecycle() {
         let bytes = lifecycle.purge(&state.message_cache).await;
-        tracing::info!(
-            bytes,
-            "the store was erased, and every message cache file this server made with it"
-        );
+        if bytes > 0 {
+            tracing::info!(
+                bytes,
+                "the store was erased, and every message cache file this server made with it"
+            );
+        }
     }
     state.post_gate.forget_sends();
     if forgotten > 0 {

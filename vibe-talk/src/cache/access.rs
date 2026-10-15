@@ -15,7 +15,12 @@
 //!   `not_in_channel` (the channel) and `thread_not_found` (the thread read) count: a 403 or 404
 //!   that carries no Slack code at all was not Slack's answer but that of something in between (a
 //!   shim route that is gone, an intermediary refusing the destination, a wrong `api_base`), and
-//!   says nothing about access;
+//!   says nothing about access. On a Discord-protocol provider, only one whose body is the
+//!   provider's own error, a JSON object (Discord's `{"message", "code"}`, or a bridge's), counts:
+//!   an HTML page or a line of text in front of it is an intermediary's (a proxy's 404 would
+//!   otherwise erase every channel it was asked for);
+//! - **a provider whose kind nobody gave** ([`Dialect::Unknown`]) is heard only for a 401, never
+//!   for good: nothing it answers is read as a lost channel;
 //! - **everything else is excluded**: never a block, never an erase. That is every post, a single
 //!   message's lookup, a read cursor moved or cleared (whose 404 means the provider no longer holds
 //!   that one message), the identity and directory calls, any 400, Slack's 403 or 404 with no code,
@@ -92,9 +97,13 @@ const THREAD_LOST: &str = "thread_not_found";
 /// can look like a Slack one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Dialect {
-    /// Discord, or a bridge speaking its API: an HTTP 403 or 404 is the provider's own answer
-    /// about what was read.
+    /// A provider whose kind nobody gave: the watch reads none of its 403s and 404s as a lost
+    /// channel, and a 401 as the credential refused, never for good. The least a failure can be
+    /// made to say, so that a provider wired in without its kind can never set off an erase.
     #[default]
+    Unknown,
+    /// Discord, or a bridge speaking its API: an HTTP 403 or 404 whose body is the provider's own
+    /// error, a JSON object, is its answer about what was read.
     DiscordProtocol,
     /// Slack's Web API, or a bridge speaking its method subset: the provider answers in codes,
     /// which its client writes into the failure's body ([`slack_code`]). A 403 or 404 that carries
@@ -141,10 +150,15 @@ pub fn classify(dialect: Dialect, op: &str, thread: Option<&str>, error: &ChatEr
     };
     let channel_read = CHANNEL_READS.contains(&op);
     match dialect {
+        Dialect::Unknown => match status {
+            401 => Signal::CredentialRefused { revoked: false },
+            _ => Signal::Excluded,
+        },
         Dialect::DiscordProtocol => match status {
             401 => Signal::CredentialRefused { revoked: false },
-            // The provider's own refusal of a channel read, of the thread it read.
-            403 | 404 if channel_read => Signal::ChannelLost {
+            // The provider's own refusal of a channel read, of the thread it read. A body that is
+            // not a JSON object is an intermediary's, whatever its status.
+            403 | 404 if channel_read && providers_own_error(body) => Signal::ChannelLost {
                 thread: thread.map(str::to_owned),
             },
             _ => Signal::Excluded,
@@ -170,6 +184,15 @@ pub fn classify(dialect: Dialect, op: &str, thread: Option<&str>, error: &ChatEr
             }
         }
     }
+}
+
+/// Whether a Discord-protocol provider's failure body is its own error: a JSON object, as Discord
+/// answers (`{"message": "Unknown Channel", "code": 10003}`) and a bridge speaking its API does in
+/// its own words. An HTML page, a line of text or nothing at all was written by something in
+/// between: a proxy refusing the destination, a route that is gone.
+#[must_use]
+pub fn providers_own_error(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| value.is_object())
 }
 
 /// The Slack `error` code in a failure's body, when the body has the shape the Slack client gives
@@ -217,6 +240,10 @@ impl Suspect {
 }
 
 /// What acts on what the watch hears: the message cache's sink.
+///
+/// [`AccessListener::block`], [`AccessListener::unblock`] and [`AccessListener::confirmed`] are
+/// called with the watch's lock on its doubts held, so that a block and the doubt it stands for
+/// are raised and lifted together: they must be quick, and must not call back into the watch.
 #[async_trait]
 pub trait AccessListener: Send + Sync {
     /// Stop serving `suspect`'s scope from the cache.
@@ -273,18 +300,29 @@ impl AccessWatch {
 
     /// Have `listener` act on what the watch hears from now on, in place of any other; `None`
     /// stops it. Held weakly: a listener that is gone hears nothing.
+    ///
+    /// Every scope in doubt now is blocked afresh by the new listener, under the doubts lock, as a
+    /// doubt raised from now on would be: a listener begun since a doubt was raised (a cache opened
+    /// since) holds no block of it, and a doubt cleared while it is told of one must not leave a
+    /// block behind with nothing left to lift it.
     pub fn listen(&self, listener: Option<Weak<dyn AccessListener>>) {
+        let doubts = self.inner.doubts();
         *self
             .inner
             .listener
             .write()
             .unwrap_or_else(PoisonError::into_inner) = listener;
+        if let Some(listener) = self.inner.listener() {
+            for suspect in doubts.keys() {
+                listener.block(suspect);
+            }
+        }
     }
 
     /// Read `provider_key`'s failures as `dialect` from now on: what its configured kind says
-    /// ([`Dialect::of`]). [`crate::providers::ChatRouter::from_config`] sets every provider's. A
-    /// provider never set is read as a Discord-protocol one, as every router built without a
-    /// configuration is.
+    /// ([`Dialect::of`]). [`crate::providers::ChatRouter::from_config`] sets every provider's, and
+    /// [`crate::providers::ChatRouter::single`] its one Discord-protocol provider's. A provider
+    /// never set is read as [`Dialect::Unknown`]: no 403 or 404 of its says a channel is lost.
     pub fn set_dialect(&self, provider_key: &str, dialect: Dialect) {
         self.inner
             .dialects
@@ -331,20 +369,17 @@ impl AccessWatch {
                     channel: channel.clone(),
                     thread: thread.map(str::to_owned),
                 };
-                let mut cleared = Vec::new();
+                // Unblocked under the lock that raising a doubt takes too: a refusal heard meanwhile
+                // raises its new doubt, and blocks, only after this, so a scope in doubt is never
+                // left unblocked.
+                let mut doubts = self.inner.doubts();
+                for candidate in [Some(suspect(None)), thread.map(|t| suspect(Some(t)))]
+                    .into_iter()
+                    .flatten()
                 {
-                    let mut doubts = self.inner.doubts();
-                    for candidate in [Some(suspect(None)), thread.map(|t| suspect(Some(t)))]
-                        .into_iter()
-                        .flatten()
-                    {
-                        if doubts.remove(&candidate).is_some() {
-                            cleared.push(candidate);
-                        }
+                    if doubts.remove(&candidate).is_some() {
+                        listener.unblock(&candidate);
                     }
-                }
-                for suspect in &cleared {
-                    listener.unblock(suspect);
                 }
             }
             Err(error) => match classify(self.inner.dialect(provider_key), op, thread, error) {
@@ -368,6 +403,10 @@ impl AccessWatch {
     }
 
     /// Doubt `suspect`, unless it is doubted already: block it, and have the server confirm it.
+    ///
+    /// Blocked under the doubts lock, as a doubt is cleared and unblocked under it: the block and
+    /// the doubt are raised together, and lifted together, so no clearing of an older doubt can
+    /// lift the block of a newer one.
     fn suspect(&self, listener: &Arc<dyn AccessListener>, suspect: Suspect) {
         let doubt = {
             let mut doubts = self.inner.doubts();
@@ -379,9 +418,9 @@ impl AccessWatch {
                 since: tokio::time::Instant::now(),
             };
             doubts.insert(suspect.clone(), doubt);
+            listener.block(&suspect);
             doubt
         };
-        listener.block(&suspect);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(confirm(Arc::downgrade(&self.inner), suspect, doubt));
         }
@@ -417,14 +456,13 @@ impl Watch {
             .is_some_and(|held| held.id == doubt.id)
     }
 
-    /// End `doubt` about `suspect`, if it still stands. Whether it did.
-    fn end(&self, suspect: &Suspect, doubt: Doubt) -> bool {
+    /// End `doubt` about `suspect`, if it still stands, and act on its end with `then` under the
+    /// same lock, so that a newer doubt raised meanwhile is raised, and blocked, only after it.
+    fn end(&self, suspect: &Suspect, doubt: Doubt, then: impl FnOnce()) {
         let mut doubts = self.doubts();
         if doubts.get(suspect).is_some_and(|held| held.id == doubt.id) {
             doubts.remove(suspect);
-            true
-        } else {
-            false
+            then();
         }
     }
 }
@@ -459,15 +497,11 @@ async fn confirm(watch: Weak<Watch>, suspect: Suspect, doubt: Doubt) {
                     &error,
                 ) == lost =>
             {
-                if watch.end(&suspect, doubt) {
-                    listener.confirmed(&suspect);
-                }
+                watch.end(&suspect, doubt, || listener.confirmed(&suspect));
                 return;
             }
             Some(Ok(())) | None => {
-                if watch.end(&suspect, doubt) {
-                    listener.unblock(&suspect);
-                }
+                watch.end(&suspect, doubt, || listener.unblock(&suspect));
                 return;
             }
             Some(Err(_)) => at = tokio::time::Instant::now() + CONFIRM_AFTER,
@@ -547,8 +581,51 @@ provider = "team"
         assert_eq!(router.access().dialect("team"), Dialect::Slack);
         assert_eq!(
             AccessWatch::new().dialect("unset"),
-            Dialect::DiscordProtocol,
-            "a router built without a configuration"
+            Dialect::Unknown,
+            "a provider nobody gave a kind"
+        );
+        // A router of one provider under the legacy key is a Discord-protocol one.
+        let fake = Arc::new(crate::discord::fake::FakeDiscord::new());
+        let single = crate::providers::ChatRouter::single(fake, "ns", 0);
+        assert_eq!(
+            single
+                .access()
+                .dialect(crate::config::LEGACY_DISCORD_PROVIDER_KEY),
+            Dialect::DiscordProtocol
+        );
+    }
+
+    /// A provider whose kind nobody gave reads as the least erasing dialect: a 401 is still the
+    /// credential refused, never for good, and no 403 or 404, whatever its body, is a lost
+    /// channel or thread.
+    #[test]
+    fn a_provider_nobody_gave_a_kind_never_loses_a_channel() {
+        let unknown = |op: &str, thread: Option<&str>, error: &ChatError| {
+            classify(Dialect::Unknown, op, thread, error)
+        };
+        for error in [
+            status(404, "{\"message\": \"Unknown Channel\", \"code\": 10003}"),
+            status(403, "{\"message\": \"Missing Access\", \"code\": 50001}"),
+            coded(404, "conversations.history", "channel_not_found"),
+            coded(404, "conversations.replies", "thread_not_found"),
+        ] {
+            for op in CHANNEL_READS {
+                for thread in [None, Some("77")] {
+                    assert_eq!(
+                        unknown(op, thread, &error),
+                        Signal::Excluded,
+                        "{op}: {error}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            unknown(
+                "fetch_timeline",
+                None,
+                &coded(401, "auth.test", "token_revoked")
+            ),
+            Signal::CredentialRefused { revoked: false }
         );
     }
 
@@ -633,29 +710,65 @@ provider = "team"
         }
     }
 
-    /// A Discord-protocol provider's 403 or 404 is its own answer, whatever its body looks like:
-    /// the body is never read for a Slack code, which a bridge's error text may happen to mimic.
+    /// A Discord-protocol provider's 403 or 404 is its own answer when its body is its own error,
+    /// a JSON object, whatever that says: the body is never read for a Slack code, which a bridge's
+    /// error text may happen to mimic.
     #[test]
-    fn a_discord_protocol_refusal_counts_whatever_its_body_looks_like() {
-        for code in ["missing_scope", "message_not_found", "channel_not_found"] {
+    fn a_discord_protocol_refusal_counts_whatever_its_json_says() {
+        for body in [
+            "{\"message\": \"conversations.history answered missing_scope\", \"code\": 0}",
+            "{\"message\": \"message_not_found\"}",
+            "{\"detail\": \"Unknown Channel\"}",
+            "{}",
+        ] {
             assert_eq!(
-                discord(
-                    "fetch_timeline",
-                    None,
-                    &coded(404, "conversations.history", code)
-                ),
+                discord("fetch_timeline", None, &status(404, body)),
                 lost(None),
-                "{code}"
+                "{body}"
             );
         }
         assert_eq!(
             discord(
                 "fetch_timeline",
                 Some("77"),
-                &coded(404, "conversations.history", "channel_not_found")
+                &status(404, "{\"error\": \"channel_not_found\"}")
             ),
             lost(Some("77")),
             "nor does a code in its body widen a thread's doubt to the channel"
+        );
+    }
+
+    /// A Discord-protocol provider's 403 or 404 whose body is not a JSON object was written by
+    /// something in front of it: a proxy's HTML page, a line of text refusing the destination, an
+    /// empty answer, Slack-shaped text. From any read of a channel's messages, of the channel or of
+    /// one thread, it is never a doubt about access: an intermediary's 404 would otherwise erase
+    /// every channel it was asked for.
+    #[test]
+    fn a_discord_protocol_refusal_without_the_providers_own_body_says_nothing_about_access() {
+        for error in [
+            status(404, "<html><body><h1>404 Not Found</h1></body></html>"),
+            status(403, "Forbidden: destination not allowed"),
+            status(404, ""),
+            status(404, "Not Found"),
+            status(404, "[]"),
+            status(404, "\"Unknown Channel\""),
+            coded(404, "conversations.history", "channel_not_found"),
+            status(404, "<html>404</html>").with_provider("Discord"),
+        ] {
+            for op in CHANNEL_READS {
+                for thread in [None, Some("77")] {
+                    assert_eq!(
+                        discord(op, thread, &error),
+                        Signal::Excluded,
+                        "{op} {thread:?}: {error}"
+                    );
+                }
+            }
+        }
+        // A 401 is the credential refused whatever its body.
+        assert_eq!(
+            discord("fetch_timeline", None, &status(401, "<html>401</html>")),
+            Signal::CredentialRefused { revoked: false }
         );
     }
 
@@ -863,8 +976,10 @@ provider = "team"
         }
     }
 
+    /// A watch with a listener, reading provider `p` as a Discord-protocol one.
     fn listening() -> (AccessWatch, Arc<Notes>) {
         let watch = AccessWatch::new();
+        watch.set_dialect("p", Dialect::DiscordProtocol);
         let notes = Arc::new(Notes::default());
         let listener: Arc<dyn AccessListener> = notes.clone();
         watch.listen(Some(Arc::downgrade(&listener)));
@@ -1049,9 +1164,17 @@ provider = "team"
         run_tasks().await;
         assert_eq!(notes.take(), ["probe s/C1", "unblock s/C1"]);
 
-        // The same failures from a Discord-protocol provider are its own refusal.
+        // The same failures from a Discord-protocol provider are an intermediary's too; its own
+        // error, a JSON object, is its refusal.
         watch.report("p", "fetch_recent", Some(&channel()), None, Err(&page));
+        watch.report("p", "fetch_recent", Some(&channel()), None, Err(&refused));
+        assert!(notes.take().is_empty(), "nothing blocked");
+        watch.report("p", "fetch_recent", Some(&channel()), None, Err(&missing()));
         assert_eq!(notes.take(), ["block p/C1"]);
+        // And a provider nobody gave a kind loses nothing, whatever it answers.
+        watch.report("u", "fetch_recent", Some(&channel()), None, Err(&missing()));
+        assert!(notes.take().is_empty(), "nothing blocked");
+        assert_eq!(watch.suspects().len(), 1);
     }
 
     #[tokio::test]
@@ -1083,5 +1206,87 @@ provider = "team"
         }
         assert!(notes.take().is_empty());
         assert!(watch.suspects().is_empty());
+    }
+
+    /// A listener whose unblock, once armed, says it has begun and then waits to be let go, as a
+    /// slow one would: the moment a refusal heard on another thread can race it.
+    #[derive(Default)]
+    struct Gate {
+        blocked: Mutex<std::collections::HashSet<String>>,
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl AccessListener for Gate {
+        fn block(&self, suspect: &Suspect) {
+            self.blocked
+                .lock()
+                .expect("blocked")
+                .insert(suspect.channel.as_str().to_owned());
+        }
+        fn unblock(&self, suspect: &Suspect) {
+            if let Some(entered) = self.entered.lock().expect("entered").take() {
+                let _ = entered.send(());
+            }
+            let hold = self.hold.lock().expect("hold").take();
+            if let Some(hold) = hold {
+                let _ = hold.recv_timeout(Duration::from_secs(10));
+            }
+            self.blocked
+                .lock()
+                .expect("blocked")
+                .remove(suspect.channel.as_str());
+        }
+        async fn probe(&self, _suspect: &Suspect) -> Option<Result<(), ChatError>> {
+            None
+        }
+        fn confirmed(&self, _suspect: &Suspect) {}
+        fn credential_refused(&self, _provider_key: &str, _revoked: bool) {}
+    }
+
+    /// A read that succeeds clears the old doubt about a channel and is unblocking it when a
+    /// refusal heard on another thread raises a new one. The new doubt must leave the channel
+    /// blocked: unblocked, it would be served for up to [`CONFIRM_AFTER`] while in doubt.
+    #[test]
+    fn r5_a_new_doubt_raised_while_an_old_one_clears_stays_blocked() {
+        let watch = AccessWatch::new();
+        watch.set_dialect("p", Dialect::DiscordProtocol);
+        let gate = Arc::new(Gate::default());
+        let listener: Arc<dyn AccessListener> = gate.clone();
+        watch.listen(Some(Arc::downgrade(&listener)));
+        let channel = channel();
+        let missing = missing();
+        watch.report("p", "fetch_timeline", Some(&channel), None, Err(&missing));
+        assert!(gate.blocked.lock().expect("blocked").contains("C1"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
+        *gate.entered.lock().expect("entered") = Some(entered_tx);
+        *gate.hold.lock().expect("hold") = Some(hold_rx);
+        std::thread::scope(|scope| {
+            // A read that succeeded clears the old doubt, and is about to unblock.
+            scope.spawn(|| watch.report("p", "fetch_timeline", Some(&channel), None, Ok(())));
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the unblock began");
+            // A refusal heard meanwhile, on another thread, raises a new doubt and blocks.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let (watch, channel, missing) = (&watch, &channel, &missing);
+            scope.spawn(move || {
+                watch.report("p", "fetch_page", Some(channel), None, Err(missing));
+                let _ = done_tx.send(());
+            });
+            // It either finishes at once, or waits for the unblock to end: either way the
+            // unblock is let go after.
+            let _ = done_rx.recv_timeout(Duration::from_millis(300));
+            hold_tx.send(()).expect("the unblock is waiting");
+        });
+        let in_doubt = watch.suspects();
+        let blocked = gate.blocked.lock().expect("blocked").clone();
+        assert_eq!(in_doubt.len(), 1, "the new doubt stands");
+        assert!(
+            blocked.contains("C1"),
+            "a channel in doubt is left unblocked: in doubt {in_doubt:?}, blocked {blocked:?}"
+        );
     }
 }

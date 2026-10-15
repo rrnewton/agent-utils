@@ -15,7 +15,9 @@
 //! - **Control operations** (an erase, a sweep, maintenance) run alone, after the batch before
 //!   them has committed and been published, and are published themselves as soon as their own
 //!   short transaction commits. An erase detaches the channel's rows from its name (no read can
-//!   reach them from then on) and leaves deleting them to background steps.
+//!   reach them from then on) and leaves deleting them to background steps. An erase the file
+//!   refuses is owed: what it covers stays blocked, and a background step tries it again after a
+//!   backoff until the file takes it.
 //! - **Background work runs in steps** of about [`STEP`], one transaction each, alternating with
 //!   the queue so that neither starves the other: the rows of erased channels, expired
 //!   tombstones, the age and revalidation pass, eviction, rebuilding `search_text`, compacting the
@@ -64,9 +66,10 @@ use super::rows::{self, Extra};
 use super::schema::sqlite_code;
 use super::structure;
 use super::{
-    file, lock, CacheError, ChanKey, DropRecord, Envelope, Erasing, Incoming, ListEnd, ListStart,
-    Listing, Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp, Stats,
-    ThreadRecord, WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP, TOMBSTONE_KEEP_MS,
+    file, lock, CacheError, ChanKey, Currency, DropRecord, Envelope, Erasing, Incoming, ListEnd,
+    ListStart, Listing, Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp,
+    Stats, ThreadRecord, WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP,
+    TOMBSTONE_KEEP_MS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -439,6 +442,18 @@ enum Outcome {
     Failed,
 }
 
+/// What became of one row offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Upserted {
+    /// Written or found unchanged, or not a row the file keeps; or a copy seen before a later
+    /// listing of its home scope proved its stretch without it, which leaves a tombstone.
+    Written,
+    /// Refused: a tombstone the file holds came after the copy was seen. When the tombstone is
+    /// the cache's own (an erase of another scope the message belongs to), the message may still
+    /// be listed where the copy was.
+    HeldByTombstone,
+}
+
 /// The age and revalidation pass, in progress.
 #[derive(Debug)]
 struct Expire {
@@ -519,6 +534,9 @@ struct Work {
     /// A drop the process remembers may be missing from the file: its own write, or the write of
     /// an observation it stands for, failed ([`Writer::drops_step`]).
     drops: bool,
+    /// Erases whose transaction failed, tried again after a backoff until they succeed
+    /// ([`Writer::owed_step`]). What each covers is blocked meanwhile ([`Shared::erase_failed`]).
+    owed: Vec<Owed>,
     /// Deleted text may still be in the write-ahead log.
     checkpoint: bool,
     /// Not before this: the last `TRUNCATE` found a reader.
@@ -532,10 +550,37 @@ struct Work {
     compact_again: bool,
 }
 
+/// An erase the file refused (a full disk, a lock held too long), owed until it succeeds: a cache
+/// that cannot forget something must not serve it either, and must go on trying to forget it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Owed {
+    Channels(Vec<ChanKey>),
+    Provider(String),
+    Scope {
+        chan: ChanKey,
+        scope_key: String,
+    },
+    /// A sweep to the route snapshot, owed as of the latest snapshot.
+    Sweep,
+}
+
+impl Owed {
+    /// What it keeps blocked while it is owed.
+    fn blocks(&self) -> Vec<Erasing> {
+        match self {
+            Self::Channels(chans) => chans.iter().cloned().map(Erasing::Channel).collect(),
+            Self::Provider(key) => vec![Erasing::Provider(key.clone())],
+            Self::Scope { chan, .. } => vec![Erasing::Channel(chan.clone())],
+            Self::Sweep => vec![Erasing::Sweep],
+        }
+    }
+}
+
 /// One kind of background step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Task {
     Drops,
+    Owed,
     Erase,
     Tombstones,
     Expire,
@@ -552,6 +597,7 @@ impl Task {
     fn name(self) -> &'static str {
         match self {
             Self::Drops => "drop record",
+            Self::Owed => "owed erase",
             Self::Erase => "erase",
             Self::Tombstones => "tombstones",
             Self::Expire => "age limit",
@@ -641,6 +687,9 @@ impl Writer<'_> {
 
     fn pending(&self) -> bool {
         let w = &self.work;
+        // An erase the file refused (`owed`) is not counted: it waits out a backoff between tries,
+        // and a file that goes on refusing would keep anything that waits for the writer to be
+        // idle waiting for ever. What it covers stays blocked meanwhile.
         w.erase
             || w.drops
             || w.tombstones.is_some()
@@ -897,31 +946,27 @@ impl Writer<'_> {
         match op {
             Op::Erase { chans } => {
                 let result = self.transaction(|w| w.detach(&chans));
-                if result.is_err() {
-                    let mut failed = lock(&self.shared.erase_failed);
-                    failed.extend(chans.into_iter().map(Erasing::Channel));
-                }
+                self.owe_if_failed(&result, Owed::Channels(chans));
                 self.report("erase", result);
             }
             Op::EraseProvider { provider_key } => {
                 let result = self.transaction(|w| w.erase_provider(&provider_key));
-                if result.is_err() {
-                    lock(&self.shared.erase_failed).insert(Erasing::Provider(provider_key));
-                }
+                self.owe_if_failed(&result, Owed::Provider(provider_key));
                 self.report("provider erase", result);
             }
             Op::EraseScope { chan, scope_key } => {
                 let result = self.transaction(|w| w.erase_scope(&chan, &scope_key));
-                if result.is_err() {
-                    lock(&self.shared.erase_failed).insert(Erasing::Channel(chan));
-                }
+                self.owe_if_failed(&result, Owed::Scope { chan, scope_key });
                 self.report("scope erase", result);
             }
             Op::RetainOnly { routes } => {
                 let result = self.transaction(|w| w.retain_only(&routes));
-                if result.is_err() {
-                    lock(&self.shared.erase_failed).insert(Erasing::Sweep);
+                if result.is_ok() && self.work.owed.contains(&Owed::Sweep) {
+                    // A sweep to the latest snapshot is every sweep owed.
+                    self.work.owed.retain(|owed| *owed != Owed::Sweep);
+                    self.owed_blocks();
                 }
+                self.owe_if_failed(&result, Owed::Sweep);
                 self.report("sweep", result);
             }
             Op::SetAccount {
@@ -975,6 +1020,66 @@ impl Writer<'_> {
             Op::Observe { .. } | Op::Close { .. } => {}
         }
         Stats::add(&self.shared.stats.ops_applied, 1);
+    }
+
+    /// An erase whose transaction failed is owed, and what it covers blocked, until a later step
+    /// carries it out ([`Writer::owed_step`]).
+    fn owe_if_failed(&mut self, result: &rusqlite::Result<()>, owed: Owed) {
+        if result.is_err() {
+            if !self.work.owed.contains(&owed) {
+                self.work.owed.push(owed);
+            }
+            self.owed_blocks();
+        }
+    }
+
+    /// Block exactly what the erases still owed cover: every failure is one of them, and nothing
+    /// else writes [`Shared::erase_failed`] but a file erase, which clears it.
+    fn owed_blocks(&self) {
+        let blocked: HashSet<Erasing> = self.work.owed.iter().flat_map(Owed::blocks).collect();
+        *lock(&self.shared.erase_failed) = blocked;
+    }
+
+    /// Carry out the erases the file refused, in the order they were asked for, as far as the file
+    /// takes them. What one that succeeds covers is served again; one that fails, and every one
+    /// after it, stays owed, and the step is tried again after the backoff. A sweep is to the
+    /// latest route snapshot.
+    fn owed_step(&mut self) -> rusqlite::Result<()> {
+        let owed = std::mem::take(&mut self.work.owed);
+        let mut left = Vec::new();
+        let mut failure = None;
+        for erase in owed {
+            if failure.is_some() {
+                left.push(erase);
+                continue;
+            }
+            let result = match &erase {
+                Owed::Channels(chans) => self.transaction(|w| w.detach(chans)),
+                Owed::Provider(key) => self.transaction(|w| w.erase_provider(key)),
+                Owed::Scope { chan, scope_key } => {
+                    self.transaction(|w| w.erase_scope(chan, scope_key))
+                }
+                Owed::Sweep => {
+                    let routes = self
+                        .shared
+                        .routes
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    match routes {
+                        Some(routes) => self.transaction(|w| w.retain_only(&routes)),
+                        None => Ok(()),
+                    }
+                }
+            };
+            if let Err(error) = result {
+                failure = Some(error);
+                left.push(erase);
+            }
+        }
+        self.work.owed = left;
+        self.owed_blocks();
+        failure.map_or(Ok(()), Err)
     }
 
     fn routed(&self, chan: &ChanKey) -> bool {
@@ -1181,8 +1286,19 @@ impl Writer<'_> {
         stamp: Stamp,
         observation: &Observation,
     ) -> rusqlite::Result<Outcome> {
-        if !self.shared.epochs.current(chan, stamp) {
-            return Ok(Outcome::Stale);
+        match self.shared.epochs.currency(chan, stamp) {
+            Currency::Current => {}
+            Currency::Stale => return Ok(Outcome::Stale),
+            // Begun before an erase of one scope of the channel, whose other scopes keep their
+            // rows: a deletion it carries still takes out what is left, and anything else is left
+            // out as a full queue's drop is, the channel in doubt from now on. Dropped silently, a
+            // pushed edit or deletion of a message the erase kept would leave the old row for the
+            // feed to vouch for.
+            Currency::ScopeErased if observation.removes_only() => {}
+            Currency::ScopeErased => {
+                self.lost(chan);
+                return Ok(Outcome::Stale);
+            }
         }
         if !self.routed(chan) {
             // A deletion writes nothing of any message. One for a channel the snapshot does not
@@ -1287,6 +1403,7 @@ impl Writer<'_> {
                         *partial,
                         None,
                     )
+                    .map(drop)
                 }
                 Push::Delete { id, created_ms } => {
                     self.delete_id(chan, chan_id, id, *created_ms, *observed_ms)
@@ -1314,13 +1431,16 @@ impl Writer<'_> {
     ) -> rusqlite::Result<()> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(listing.rows.len());
         let mut newest: Option<i64> = None;
+        // The instants of the rows this listing carried that the file will not hold, because a
+        // tombstone that came after the read began held them back.
+        let mut held_back: Vec<i64> = Vec::new();
         for row in &listing.rows {
             let Some(created) = rows::created_ms(&row.message) else {
                 continue;
             };
             seen.insert(row.message.id.as_str());
             newest = Some(newest.map_or(created, |n| n.max(created)));
-            self.upsert(
+            let upserted = self.upsert(
                 chan,
                 chan_id,
                 cutoff,
@@ -1331,6 +1451,9 @@ impl Writer<'_> {
                 false,
                 Some(&listing.scope),
             )?;
+            if upserted == Upserted::HeldByTombstone {
+                held_back.push(created);
+            }
         }
         // No proof, no claim; and an empty listing proves nothing even with one, because a
         // provider can answer a proven stretch with an empty page that is not its last.
@@ -1348,6 +1471,17 @@ impl Writer<'_> {
             ListStart::ScopeStart => 0,
             ListStart::At(ms) => ms,
         };
+        // Where the stretch the file now holds whole, of what the listing carried, begins: above
+        // the newest row it carried that the file will not hold. A tombstone that came after the
+        // read began may be the cache's own, an erase of another scope the message belongs to (a
+        // Slack reply also sent to the channel, whose thread was erased), and then the message is
+        // still listed here upstream: no claim of this read may go on saying the file holds every
+        // message there ([`Writer::give_up_instants`]).
+        let listed_whole_from = held_back
+            .iter()
+            .filter(|&&instant| instant >= from)
+            .map(|instant| instant.saturating_add(1))
+            .fold(from, i64::max);
         let head = match proof.until {
             ListEnd::Newest => {
                 let old = stored.map(|stored| stored.head);
@@ -1364,7 +1498,7 @@ impl Writer<'_> {
                     let record = HeadRecord {
                         head,
                         checked_ms: listing.observed_ms,
-                        checked_from_ms: Some(from),
+                        checked_from_ms: Some(listed_whole_from),
                     };
                     if stored != Some(record) {
                         self.store_head(chan_id, &scope_key, &record)?;
@@ -1404,13 +1538,15 @@ impl Writer<'_> {
                 complete: proof.complete,
                 source: proof.source,
             };
+            // The claim, less each instant whose row it carried and the file will not hold: what
+            // other claims say of such an instant is left as it is.
+            let pieces = held_back.iter().fold(vec![claim], |pieces, &instant| {
+                coverage::puncture(&pieces, instant)
+            });
             let existing = self.load_coverage(chan_id, &scope_key)?;
-            let stamped = coverage::stamp(
-                &existing,
-                claim,
-                head.map(|h| h.head_ms),
-                &Params::default(),
-            );
+            let stamped = pieces.into_iter().fold(existing.clone(), |stored, piece| {
+                coverage::stamp(&stored, piece, head.map(|h| h.head_ms), &Params::default())
+            });
             if stamped != existing {
                 self.store_coverage(chan_id, &scope_key, &stamped)?;
             }
@@ -1602,14 +1738,14 @@ impl Writer<'_> {
         arrival: Arrival,
         offered_partial: bool,
         listed_in: Option<&Scope>,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<Upserted> {
         let message = &incoming.message;
         let Some(created) = rows::created_ms(message) else {
-            return Ok(());
+            return Ok(Upserted::Written);
         };
         if created < cutoff {
             Stats::add(&self.shared.stats.rows_too_old, 1);
-            return Ok(());
+            return Ok(Upserted::Written);
         }
         let id = message.id.as_str();
         if let Some(deleted_ms) = self
@@ -1620,7 +1756,7 @@ impl Writer<'_> {
         {
             if !merge::revives(arrival, deleted_ms, observed_ms) {
                 Stats::add(&self.shared.stats.rows_held_by_tombstone, 1);
-                return Ok(());
+                return Ok(Upserted::HeldByTombstone);
             }
             self.hot.tomb_delete.execute(params![chan_id, id])?;
         }
@@ -1646,7 +1782,7 @@ impl Writer<'_> {
                     .execute(params![chan_id, id, created, listed_ms])?;
                 self.orphan(chan, id, None);
                 Stats::add(&self.shared.stats.rows_held_by_tombstone, 1);
-                return Ok(());
+                return Ok(Upserted::Written);
             }
         }
         let (row_id, created) = match held {
@@ -1710,7 +1846,8 @@ impl Writer<'_> {
                 .scope_insert
                 .execute(params![chan_id, scope_key, created, row_id])?;
         }
-        self.thread_from_row(chan_id, incoming, created, observed_ms)
+        self.thread_from_row(chan_id, incoming, created, observed_ms)?;
+        Ok(Upserted::Written)
     }
 
     /// Rules 2 and 5 for a message the file holds, and what a read after a drop vouches for. The
@@ -1728,23 +1865,27 @@ impl Writer<'_> {
         offered_partial: bool,
     ) -> rusqlite::Result<()> {
         let message = &incoming.message;
-        let verdict = merge::content_verdict(
-            &Held {
-                content: &held.content,
-                content_hash: &held.content_hash,
-                observed_ms: held.observed_ms,
-                edited_ms: held.edited_ms,
-                partial: held.content_partial,
-            },
-            &Offered {
-                content: &message.content,
-                content_hash: hash,
-                observed_ms,
-                edited_ms: incoming.edited_ms,
-                arrival,
-                partial: offered_partial,
-            },
-        );
+        let held_copy = Held {
+            content: &held.content,
+            content_hash: &held.content_hash,
+            observed_ms: held.observed_ms,
+            edited_ms: held.edited_ms,
+            partial: held.content_partial,
+        };
+        let offered_copy = Offered {
+            content: &message.content,
+            content_hash: hash,
+            observed_ms,
+            edited_ms: incoming.edited_ms,
+            reports_edits: incoming.reports_edits,
+            arrival,
+            partial: offered_partial,
+        };
+        let verdict = merge::content_verdict(&held_copy, &offered_copy);
+        // A copy of an earlier version than the one held (rule 2's edit times), however late it
+        // was seen: it changes nothing of the message but what only ever accumulates.
+        let earlier_version =
+            merge::edit_order(&held_copy, &offered_copy) == Some(std::cmp::Ordering::Less);
         let mut next = held.clone();
         match verdict {
             Verdict::Keep => {
@@ -1766,6 +1907,11 @@ impl Writer<'_> {
                 next.edited_ms = later(held.edited_ms, incoming.edited_ms);
             }
         }
+        // The same words with a later edit time (edited, and edited back): the time moves on, so
+        // that a copy of the words in between is known to be older.
+        if hash == held.content_hash {
+            next.edited_ms = later(held.edited_ms, incoming.edited_ms);
+        }
         // A read that began after the channel's latest drop, and found the text the file holds,
         // vouches for the row again: whatever the dropped offer said of it (an edit, a deletion)
         // came before this read. Only then does a read of unchanged text move the time, so that
@@ -1776,9 +1922,11 @@ impl Writer<'_> {
         {
             next.observed_ms = next.observed_ms.max(observed_ms);
         }
-        // The rest of the message follows the newer observation; an older one changes nothing
-        // but what only ever accumulates.
-        if observed_ms >= held.observed_ms || matches!(verdict, Verdict::Replace { .. }) {
+        // The rest of the message follows the newer observation; an older one, or a copy of an
+        // earlier version, changes nothing but what only ever accumulates.
+        if (observed_ms >= held.observed_ms && !earlier_version)
+            || matches!(verdict, Verdict::Replace { .. })
+        {
             let held_extra: Extra = serde_json::from_str(&held.extra).unwrap_or_default();
             next.author.clone_from(&message.author);
             message.author_id.0.clone_into(&mut next.author_id);
@@ -2036,7 +2184,7 @@ impl Writer<'_> {
     /// channel is in `main`; a thread's root is in its thread), and there it may still be listed
     /// upstream: the erase is the cache's doing, not a deletion. So every other scope it belongs
     /// to gives up what it claimed of the instant the message was created
-    /// ([`Writer::give_up_instant`]): none may go on saying it holds every message there with one
+    /// ([`Writer::give_up_instants`]): none may go on saying it holds every message there with one
     /// of them removed.
     fn erase_scope(&mut self, chan: &ChanKey, scope_key: &str) -> rusqlite::Result<()> {
         let Some(chan_id) = self.find_chan(chan)? else {
@@ -2092,8 +2240,14 @@ impl Writer<'_> {
             self.tombstone(chan, chan_id, row_id, &message_id, created_ms, now)?;
         }
         self.flush_deletes()?;
+        // Each other scope gives up every such instant at once: its coverage is rewritten once,
+        // however many of the erased messages it held.
+        let mut by_scope: HashMap<String, Vec<i64>> = HashMap::new();
         for (other, created_ms) in elsewhere {
-            self.give_up_instant(chan_id, &other, created_ms)?;
+            by_scope.entry(other).or_default().push(created_ms);
+        }
+        for (other, instants) in by_scope {
+            self.give_up_instants(chan_id, &other, &instants)?;
         }
         for table in ["message_scope", "coverage", "scope_head"] {
             self.conn.execute(
@@ -2110,28 +2264,36 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// The cache removed a message of `scope_key` created at `created_ms` that the scope may still
-    /// hold upstream. Below the head's settled top, the scope's claims over that instant go
+    /// The cache removed messages of `scope_key` created at `instants` that the scope may still
+    /// hold upstream. Below the head's settled top, the scope's claims over those instants go
     /// ([`coverage::puncture`]), as [`Writer::raise_floor`] trims them under rows evicted or
     /// expired; at or above it, where only the latest read of the newest end vouches for anything,
-    /// that read no longer vouches for any stretch reaching down to the instant: where its listing
-    /// began moves up past it. Either way the scope stops saying it holds every message there,
-    /// until a read lists that stretch again.
-    fn give_up_instant(
+    /// that read no longer vouches for any stretch reaching down to one of them: where its listing
+    /// began moves up past the newest. Either way the scope stops saying it holds every message
+    /// there, until a read lists that stretch again; and a read that lists it and finds such a
+    /// message held back by the erase's tombstone gives the instant up again ([`Writer::listing`]).
+    fn give_up_instants(
         &self,
         chan_id: i64,
         scope_key: &str,
-        created_ms: i64,
+        instants: &[i64],
     ) -> rusqlite::Result<()> {
+        let Some(newest) = instants.iter().copied().max() else {
+            return Ok(());
+        };
         let existing = self.load_coverage(chan_id, scope_key)?;
-        let punctured = coverage::puncture(&existing, created_ms);
+        let punctured = instants
+            .iter()
+            .fold(existing.clone(), |intervals, &instant| {
+                coverage::puncture(&intervals, instant)
+            });
         if punctured != existing {
             self.store_coverage(chan_id, scope_key, &punctured)?;
         }
         self.conn.execute(
             "UPDATE scope_head SET checked_from_ms = ?3
              WHERE chan = ?1 AND scope_key = ?2 AND checked_from_ms <= ?3",
-            params![chan_id, scope_key, created_ms.saturating_add(1)],
+            params![chan_id, scope_key, newest.saturating_add(1)],
         )?;
         Ok(())
     }
@@ -2220,6 +2382,8 @@ impl Writer<'_> {
                     .is_some_and(|since| now >= since + TRUNCATE_PATIENCE));
         if w.drops {
             Some(Task::Drops)
+        } else if !w.owed.is_empty() {
+            Some(Task::Owed)
         } else if log_due || truncate_due {
             Some(Task::Checkpoint)
         } else if merging_due {
@@ -2271,6 +2435,7 @@ impl Writer<'_> {
         self.unflushed = 0;
         let result = match task {
             Task::Drops => self.drops_step(),
+            Task::Owed => self.owed_step(),
             Task::Erase => self.erase_step(deadline),
             Task::Tombstones => self.tombstone_step(),
             Task::Expire => self.expire_step(deadline),
@@ -2319,12 +2484,12 @@ impl Writer<'_> {
         true
     }
 
-    /// Give up a step that failed. What the owner asked to forget is never given up: an erase, a
-    /// compaction owed by markers, and a rebuild are retried after the backoff, the compaction
-    /// from its start; and nor is a drop the file must remember.
+    /// Give up a step that failed. What the owner asked to forget is never given up: an erase, an
+    /// erase the file refused, a compaction owed by markers, and a rebuild are retried after the
+    /// backoff, the compaction from its start; and nor is a drop the file must remember.
     fn abandon(&mut self, task: Task) {
         match task {
-            Task::Drops | Task::Erase | Task::Rebuild => {}
+            Task::Drops | Task::Owed | Task::Erase | Task::Rebuild => {}
             Task::Tombstones => self.work.tombstones = None,
             Task::Expire => self.work.expire = None,
             Task::Evict => self.work.evict = None,
