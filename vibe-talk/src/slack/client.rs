@@ -719,7 +719,12 @@ impl Raw {
             spoken_time: String::new(),
             // Slack has no reply pointer; a reply is thread membership, carried in `thread`.
             reply_to: None,
-            content: super::mrkdwn::to_markdown(self.str_field("text").unwrap_or_default()),
+            // The words, then a line for each file the message shares: a post that is only a file
+            // has no words at all (`#313 slack-file-posts`, `super::files`).
+            content: super::files::body(
+                super::mrkdwn::to_markdown(self.str_field("text").unwrap_or_default()),
+                self.value.get("files"),
+            ),
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,

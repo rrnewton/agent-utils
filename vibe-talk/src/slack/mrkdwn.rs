@@ -164,7 +164,9 @@ fn user_mention_at(text: &str) -> Option<&str> {
 /// may be drawn with a short label (`#227 github-link-abbrev`).
 ///
 /// A link that overlaps any of the byte ranges in `code` is left as written: the renderer passes
-/// the code spans and blocks comrak found, where the text is shown exactly as typed.
+/// the code spans and blocks comrak found, where the text is shown exactly as typed. So is one
+/// whose `<` is escaped with a backslash, which Markdown reads as the character itself: that is how
+/// a Slack file's name keeps the characters it has (`#313 slack-file-posts`, `super::files`).
 #[must_use]
 pub fn angle_links_outside<'t>(text: &'t str, code: &[Range<usize>]) -> Cow<'t, str> {
     let mut out = String::new();
@@ -172,7 +174,19 @@ pub fn angle_links_outside<'t>(text: &'t str, code: &[Range<usize>]) -> Cow<'t, 
     let mut from = 0;
     while let Some(found) = text[from..].find('<') {
         let at = from + found;
+        // The backslashes before this `<` run back no further than the previous `<`, so counting
+        // them reads each character once over the whole text.
+        let escaped = text[from..at]
+            .bytes()
+            .rev()
+            .take_while(|&byte| byte == b'\\')
+            .count()
+            % 2
+            == 1;
         from = at + 1;
+        if escaped {
+            continue;
+        }
         let Some((length, href, label)) = angle_link_at(&text[at..]) else {
             continue;
         };
@@ -287,6 +301,20 @@ mod tests {
         assert_eq!(
             angle_links("<https://example.com|example.com>"),
             "[example.com](<https://example.com>)"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_bracket_is_escaped_is_left_as_written() {
+        // Markdown reads `\<` as the character: a file's name escaped to draw as it is.
+        assert_eq!(
+            angle_links("\\<https://a.test|b\\> then <https://c.test|d>"),
+            "\\<https://a.test|b\\> then [d](<https://c.test>)"
+        );
+        // An escaped backslash escapes nothing after it.
+        assert_eq!(
+            angle_links("\\\\<https://a.test|b>"),
+            "\\\\[b](<https://a.test>)"
         );
     }
 

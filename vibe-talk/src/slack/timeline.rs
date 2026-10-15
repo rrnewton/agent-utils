@@ -199,10 +199,16 @@ pub(super) fn cursor_micros(id: &MessageId) -> Result<i64, ChatError> {
     })
 }
 
-/// The first line of a root, trimmed to [`THREAD_TITLE_CHARS`].
-fn title(root: Option<&Message>) -> String {
-    let line = root
-        .and_then(|root| root.content.lines().map(str::trim).find(|l| !l.is_empty()))
+/// The first line of a root, trimmed to [`THREAD_TITLE_CHARS`]; for a root that is only files, its
+/// first file's name and kind as text (`#313 slack-file-posts`), since a file line's Markdown would
+/// show its address.
+fn title(raw: &Raw, root: Option<&Message>) -> String {
+    let files = super::files::plain_title(&raw.value);
+    let line = files
+        .as_deref()
+        .or_else(|| {
+            root.and_then(|root| root.content.lines().map(str::trim).find(|l| !l.is_empty()))
+        })
         .unwrap_or("");
     if line.is_empty() {
         return "Thread".to_owned();
@@ -1167,7 +1173,7 @@ impl HttpSlackClient {
             .next();
         ThreadSummary {
             id: root.ts.clone(),
-            title: title(message.as_ref()),
+            title: title(root, message.as_ref()),
             root: message,
             reply_count: Some(root.reply_count()),
             reply_count_exact: true,

@@ -1190,6 +1190,17 @@ replies included, and on the messages and replies the live poll delivers. No sco
 A compatible bridge passes `reactions` through as Slack sends it. One that omits the field shows no
 reactions, exactly as before reactions were read.
 
+**Files.** `#313 slack-file-posts`. A message that shares files shows a line for each, after its
+own words when it has any: a paperclip, the file's name, linked to the file's page in Slack, and its
+kind as Slack names it — `📎 screenshot.png · PNG`. So a post that is only a pasted screenshot or an
+uploaded log is no longer an empty row, in Main, All, a thread, the thread list (whose card names
+the thread by its first file) and as it arrives live. The line is part of the message's text, so
+the voice reads the name and kind (never the address), Copy text copies it, and search finds it.
+vibe-talk never fetches a file, a thumbnail or a preview: the line is made from what the message
+already says about its files. A name is shown exactly as written, Markdown characters and all; a
+deleted file shows as "a deleted file"; a file whose link the message's words already hold is not
+listed twice; past ten files the rest are counted on one more line.
+
 ### Limits
 
 * **No native Slack socket.** vibe-talk opens no Events API or Socket Mode connection. By default,
@@ -1410,6 +1421,11 @@ is what one push does at Slack:
 
 A bridge may cap any page below the `limit` asked for, as long as `has_more` and
 `response_metadata.next_cursor` say so.
+
+A message's `files` array is read for each file's `name` (else `title`), its kind (`pretty_type`,
+else `filetype`, else `mimetype`) and its `permalink`, linked only when it is an `http(s)` address.
+None of them is required: a bridge that sends only `{"id": …, "name": …}` gets the name, and one
+with no name at all gets "a file". Nothing else of a file is read, and no file is fetched.
 
 ## Checking a deployment
 
@@ -5890,9 +5906,10 @@ outside the text boxes, and is turned off with the other single-key shortcuts.
 
 - **What is copied** is the message as written: its raw text, every message of a combined row in order,
   the same as the ⋯ menu's Copy text. A summarised row copies the message, not its summary, and a folded
-  row copies all of it, not the opening lines it shows. Messages carry no attachments of their own here,
-  and every link a message has is in its text, so its addresses are copied with it. Beside the plain
-  text goes a rich flavour, the body as the page renders it, for editors that paste formatting.
+  row copies all of it, not the opening lines it shows. Messages carry no attachments of their own here
+  (a Slack file is a line of the text, linked to its page in Slack), and every link a message has is
+  in its text, so its addresses are copied with it. Beside the plain text goes a rich flavour, the
+  body as the page renders it, for editors that paste formatting.
 - **Where the browser keeps its copy**: with any text selected on the page, Ctrl+C copies that text, as
   it always has, and `y` does nothing, so it never copies the message in place of a selection you made;
   with the focus in a text box (the message boxes, the search) it is the box's copy. With

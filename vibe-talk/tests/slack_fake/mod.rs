@@ -241,6 +241,27 @@ pub fn profiled(ts: &str, user: &str, display: &str, text: &str) -> Value {
         "user_profile": {"display_name": display, "real_name": format!("{display} Real")}})
 }
 
+/// A file object as Slack describes one in a message's `files`: `id`, `name`, `pretty_type` and the
+/// `permalink` of its page in Slack, plus the fields that ARE the file (`url_private`, a
+/// thumbnail), which the client must never fetch, pointed at `file_host`.
+/// `#313 slack-file-posts`.
+pub fn file(id: &str, name: &str, pretty_type: &str, file_host: &str) -> Value {
+    json!({"id": id, "created": BASE_SECS, "timestamp": BASE_SECS, "name": name, "title": name,
+        "mimetype": "application/octet-stream", "filetype": pretty_type.to_ascii_lowercase(),
+        "pretty_type": pretty_type, "user": "UADA00001", "mode": "hosted", "size": 1024,
+        "url_private": format!("{file_host}files-pri/T0000TEAM-{id}/{name}"),
+        "url_private_download": format!("{file_host}files-pri/T0000TEAM-{id}/download/{name}"),
+        "thumb_360": format!("{file_host}files-tmb/T0000TEAM-{id}/{name}_360.png"),
+        "permalink": format!("https://example.slack.com/files/UADA00001/{id}/{name}")})
+}
+
+/// A message sharing `files`, with `text` beside them (empty for a post that is only files), as
+/// Slack's own client posts an upload: no subtype, `upload: true`. `#313 slack-file-posts`.
+pub fn file_post(ts: &str, user: &str, display: &str, text: &str, files: Vec<Value>) -> Value {
+    json!({"type": "message", "ts": ts, "user": user, "text": text, "upload": true,
+        "files": files, "user_profile": {"display_name": display}})
+}
+
 /// A system event of `subtype`.
 pub fn system(ts: &str, subtype: &str) -> Value {
     json!({"type": "message", "subtype": subtype, "ts": ts, "user": "USYSTEM01",
@@ -275,14 +296,24 @@ pub fn thread(
 /// Post a reply in the existing thread rooted on `root` of `conversation`, as somebody else would,
 /// and make its root say what Slack's then says: one more reply, the latest at `ts`.
 pub fn add_reply(state: &mut FakeState, conversation: &str, root: &str, ts: &str, text: &str) {
+    add_reply_message(
+        state,
+        conversation,
+        root,
+        json!({"type": "message", "ts": ts, "thread_ts": root, "user": "UREPLIER1",
+            "text": text, "user_profile": {"display_name": "Replier"}}),
+    );
+}
+
+/// [`add_reply`] with the whole reply given, such as one sharing a file. Its `thread_ts` is set to
+/// `root`.
+pub fn add_reply_message(state: &mut FakeState, conversation: &str, root: &str, mut reply: Value) {
+    reply["thread_ts"] = json!(root);
     let replies = state
         .replies
         .entry((conversation.to_owned(), root.to_owned()))
         .or_default();
-    replies.push(
-        json!({"type": "message", "ts": ts, "thread_ts": root, "user": "UREPLIER1",
-            "text": text, "user_profile": {"display_name": "Replier"}}),
-    );
+    replies.push(reply);
     let count = replies.len();
     let latest = replies
         .iter()

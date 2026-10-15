@@ -49,6 +49,9 @@
 //! `slack/live.rs`). A reply's edit or deletion, and a reply in a thread rooted further back, are
 //! read when the thread, Flat or the newest messages are read.
 //!
+//! A file a message shares is a line of its body, its name and kind linked to Slack's page for it
+//! (`#313 slack-file-posts`, `slack/files.rs`). No file, thumbnail or preview is ever fetched.
+//!
 //! There is no manual "Mark read in Slack" on a message. The one upstream write besides posting is
 //! the automatic clear of [`crate::upstream_clear`], off unless the deployment sets
 //! `upstream_clear`: it moves the conversation's read cursor forward, never back, and cannot mark
@@ -57,6 +60,7 @@
 
 mod clear;
 mod client;
+mod files;
 mod history;
 pub mod ids;
 mod live;
