@@ -29590,6 +29590,82 @@ test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a foll
   assert.equal(control, false, "the model does not grow the room, so this test says nothing");
 });
 
+test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list as it was, so a reader up the channel within that room of its foot stays where they were and one at the foot stays there, though the chips are measured at nothing while their screen is hidden; there the status pill stands at the foot", async () => {
+  // From review, in Chromium at 393x852: All with Summarise and Expand all up, a reader 40 or 60px above
+  // its foot went to Settings and came back at the foot, card or no card. The chips are hidden with the
+  // main screen and measured at nothing, and that nothing, written where the lists read their room, took
+  // the room out of the list on Settings. Shown again, the list was 36px short, the reader within the
+  // slack of its foot, and the chips' report then took them to it. The fixture lays out no CSS, so the
+  // room is modelled where the browser makes it: the lists' boxes read `--scroll-tools-clearance` from
+  // #screen-main where it is set there and from #frame-body otherwise, and the channel's box is two lines
+  // taller while what it reads is not nothing. The chips are measured at nothing while the main screen is
+  // hidden, as a browser measures a box it does not lay out, and the list's place is kept while hidden and
+  // clamped as it is shown (`clampedAsShownLikeChromium`).
+  const ROOM_TEXT = "r".repeat(CHARS_PER_LINE * 2);
+  const run = async (script) => {
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    await signIn(page);
+    await showDiscord(page, tallChannel());
+    const area = page.el("scroll-area");
+    clampedAsShownLikeChromium(page, area);
+    const screen = page.el("screen-main");
+    const frame = page.el("frame-body");
+    const box = page.el("channel-composer");
+    const tools = page.el("scroll-tools");
+    const room = () => screen.style.getPropertyValue("--scroll-tools-clearance") ||
+      frame.style.getPropertyValue("--scroll-tools-clearance");
+    for (const node of [screen, frame]) {
+      const write = node.style.setProperty;
+      node.style.setProperty = (name, value) => {
+        write(name, value);
+        if (name === "--scroll-tools-clearance") box.textContent = room() && room() !== "0px" ? ROOM_TEXT : "";
+      };
+    }
+    const measureChips = () => {
+      const height = screen.hidden ? 0 : tools.height();
+      for (const observer of page.resizeObservers) {
+        if (observer.targets.includes(tools)) observer.callback([{ target: tools, contentRect: { height } }]);
+      }
+      page.expireTimers(0);
+    };
+    tools.textContent = "Summarise Expand all";
+    measureChips();
+    assert.equal(box.textContent, ROOM_TEXT, "the premise: the chips' room is in the channel's box");
+    const gap = () => area.scrollHeight - area.scrollTop - area.clientHeight;
+    const result = {};
+    // At the foot, and up past the slack but within it once the room is taken out.
+    for (const up of [0, 2 * LINE_PX + 10]) {
+      await scrollToGap(page, up);
+      const before = `${gap()} ${rowOnScreen(page)}`;
+      await page.el("open-settings").click();
+      await page.settle();
+      measureChips();
+      result.pillAtFoot = frame.style.getPropertyValue("--scroll-tools-clearance") === "0px";
+      await page.el("close-settings").click();
+      await page.settle();
+      measureChips();
+      result[`up${up}`] = page.screen() === "main" && `${gap()} ${rowOnScreen(page)}` === before;
+    }
+    // And on the main screen the room still follows the chips: gone with them, and back.
+    tools.textContent = "";
+    for (const kid of tools.children) kid.hidden = true;
+    measureChips();
+    result.roomGoes = box.textContent === "";
+    for (const kid of tools.children) kid.hidden = false;
+    tools.textContent = "Summarise Expand all";
+    measureChips();
+    result.roomBack = box.textContent === ROOM_TEXT;
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { up0: true, up50: true, pillAtFoot: true, roomGoes: true, roomBack: true });
+  // THE CONTROL: the room written only where the status pill reads it. The reader 50px up is taken to the
+  // foot on the way back, and only they are.
+  const unheld = await run(brokenScript(
+    '    if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);\n', ""));
+  assert.deepStrictEqual(unheld, { ...real, up50: false });
+});
+
 test("a thread opened from All is a filter of what All holds, with no request, and Back restores All", async () => {
   const page = await threadPage();
   page.el("channel-view-flat").click();
