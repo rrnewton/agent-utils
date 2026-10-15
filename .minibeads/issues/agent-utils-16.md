@@ -1,6 +1,6 @@
 ---
 title: 'old-checkout-cleanup: land and remove local work'
-status: in_progress
+status: closed
 priority: 1
 issue_type: chore
 assignee: gpt-6
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T03:55:15.315366091+00:00
-updated_at: 2026-10-02T21:37:45.408829213+00:00
+updated_at: 2026-10-15T19:34:17.384194062+00:00
+closed_at: 2026-10-15T19:34:17.384193962+00:00
 claimed_at: 2026-09-25T04:17:03.192733505+00:00
 claimed_until: 2026-09-27T04:17:03.192544933+00:00
 ---

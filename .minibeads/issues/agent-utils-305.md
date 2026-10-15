@@ -1,13 +1,14 @@
 ---
 title: 'image-slot-test-time: the wrkslots component tests overrun their 600 s validation step inside an image slot'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - wrkslots
 - validation
 created_at: 2026-10-14T18:04:05.797795834+00:00
-updated_at: 2026-10-14T18:04:05.797795834+00:00
+updated_at: 2026-10-15T19:34:17.405641449+00:00
+closed_at: 2026-10-15T19:34:17.405641309+00:00
 ---
 
 # Description

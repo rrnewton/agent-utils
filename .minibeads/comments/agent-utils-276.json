@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-276-c28139c2f82",
+    "issue_id": "agent-utils-276",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Duplicate of #331 resume-on-websocket part (3): the websocket conversation backend is the vibe-talk-v1 endpoint, and #331 defines the replay frame and capability exchange for it.",
+    "created_at": "2026-10-15T19:34:17.395040456Z",
+    "updated_at": "2026-10-15T19:34:17.395040456Z"
+  }
+]

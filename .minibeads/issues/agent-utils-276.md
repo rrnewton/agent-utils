@@ -1,12 +1,13 @@
 ---
 title: 'v1-replay-carrier: give a vibe-talk-v1 voice backend a way to carry a replay recap'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-13T16:05:16.234851291+00:00
-updated_at: 2026-10-13T16:05:16.234851291+00:00
+updated_at: 2026-10-15T19:34:17.398429989+00:00
+closed_at: 2026-10-15T19:34:17.398429859+00:00
 ---
 
 # Description

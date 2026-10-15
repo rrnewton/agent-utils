@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-309-c2031584517",
+    "issue_id": "agent-utils-309",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] From the PR #262 wrkslots-final-review drain (2026-10-15): on main only agent-slot removal judges nested repositories. 'wrkslots remove --validate-complete' passes allow_git_metadata=True and deletes any nested .git inside cache globs without examining it, including one whose core.worktree points outside the cache. This issue's acceptance should cover the removal side as well as audit's prediction. The September branch's attempt is preserved as archived/wrkslots-final-review (47301bd5) for reference; it was superseded, not needed.",
+    "created_at": "2026-10-15T19:34:17.415536498Z",
+    "updated_at": "2026-10-15T19:34:17.415536498Z"
+  }
+]

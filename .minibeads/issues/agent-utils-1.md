@@ -1,13 +1,14 @@
 ---
 title: 'mobile-chat-reader: finish the mobile chat client handoff'
-status: open
+status: closed
 priority: 0
 issue_type: epic
 labels:
 - vibe-talk
 - handoff
 created_at: 2026-09-25T01:31:11.140627899+00:00
-updated_at: 2026-09-25T02:07:55.156864999+00:00
+updated_at: 2026-10-15T19:34:17.391393955+00:00
+closed_at: 2026-10-15T19:34:17.391393804+00:00
 ---
 
 # Description

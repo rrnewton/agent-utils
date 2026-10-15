@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-305-c0318c4073c",
+    "issue_id": "agent-utils-305",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Commit 3ce8b4cb split the 600 s wrkslots component step into two shards estimated at 330 s each. Unverified: the shards have not been timed inside an image slot yet; reopen with the measurement if either overruns.",
+    "created_at": "2026-10-15T19:34:17.401619030Z",
+    "updated_at": "2026-10-15T19:34:17.401619030Z"
+  }
+]

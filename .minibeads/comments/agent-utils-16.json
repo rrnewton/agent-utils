@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-16-c44488ffd5c",
+    "issue_id": "agent-utils-16",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Done by the 2026-10-15 consolidation into the dev-agent-utils wrkslots harness: the old checkout is deleted (every branch preserved on GitHub under archived/ or proven on main; leftover unreachable commits kept in a local bundle), the stranded commit became #329 wrkviz-transcript-container, and the second old checkout holds no repository any more. Unverified: whether the 2026-10-02 recovery bundle still exists.",
+    "created_at": "2026-10-15T19:34:17.380309993Z",
+    "updated_at": "2026-10-15T19:34:17.380309993Z"
+  }
+]

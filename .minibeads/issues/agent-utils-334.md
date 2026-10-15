@@ -1,12 +1,13 @@
 ---
 title: 'timeline-single-flight: share one provider read among identical timeline requests'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.632164209+00:00
-updated_at: 2026-10-15T15:52:38.632164209+00:00
+updated_at: 2026-10-15T19:34:17.412312283+00:00
+closed_at: 2026-10-15T19:34:17.412312163+00:00
 ---
 
 # Description

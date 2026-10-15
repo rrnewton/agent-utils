@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-334-c6d5c8cbcca",
+    "issue_id": "agent-utils-334",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Decided not to port (analysis 2026-10-15). Identical concurrent timeline requests do still each reach the provider (ops::timeline calls the chat client directly), but the page already sends one read at a time per page and W7 stopped re-polling given-up reads. In 43 h of a bridge-backed deployment's access log, only 13 overlapping same-view pairs started within 1 s (two pages), about 0.3 per hour and under 0.1% of upstream timeline reads; the archived design's 3 s memo would have caught only reads it must not share. Porting about 4,400 lines for that is not worth it. The work stays on GitHub as archived/vt/timeline-single-flight. Reopen if a deployment's log shows identical reads starting together at a material rate.",
+    "created_at": "2026-10-15T19:34:17.408862078Z",
+    "updated_at": "2026-10-15T19:34:17.408862078Z"
+  }
+]
