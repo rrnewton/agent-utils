@@ -18762,8 +18762,18 @@ function allReachesThread(id, summary) {
 /**
  * A held view missed what the stream delivered while it was hidden; the store did not. True when
  * that changed the rows on screen.
+ *
+ * ...or what another view's read brought. `#333 page-live-reads-remainder`. The rows are compared
+ * word for word, not only by which messages they are (`sameMessage`): a read of one view that
+ * brings an edited copy of a message another held view shows — an agent's placeholder edited into
+ * its answer, read in its thread — left that view drawing the old words when it was shown again, or
+ * in the other column, until its own next read, up to a poll later. `#306 done-stale-across-views`
+ * closed the same gap for Done.
+ *
+ * `words` false compares ids alone, as before: for a read overtaken by a read of the same view
+ * queued behind it, which is what draws that view (`discordQueuedLoads`).
  */
-function catchUpHeldView() {
+function catchUpHeldView(words = true) {
   const projected = threadingSupported ? projectView() : null;
   if (!projected) return false;
   const cover = channelCanon.views.get(viewKey());
@@ -18776,7 +18786,9 @@ function catchUpHeldView() {
   const threads = channelView === "threads";
   const held = threads ? timelineThreads : timelineMessages;
   const ids = (items) => items.map((item) => String(item.id)).join("\n");
-  if (ids(projected) === ids(held)) return false;
+  const unchanged = ids(projected) === ids(held) &&
+    (!words || projected.every((item, at) => item === held[at] || sameMessage(held[at], item)));
+  if (unchanged) return false;
   if (threads) {
     timelineThreads = projected;
     el("thread-list").replaceChildren(...threadCards(projected));
@@ -21498,7 +21510,8 @@ async function loadTimeline(options) {
           // the store has it, so that view is current from its next showing.
           canon.views.get(viewKey(view, thread)).landedHidden = true;
           if (context === channelContextKey()) {
-            catchUpHeldView();
+            // Words and all, unless that read is queued behind this one: it draws them.
+            catchUpHeldView(!discordQueuedLoads.has(steps.column));
             renderChannelFreshness();
           } else if (view === "flat") {
             catchUpFromAll();
@@ -21636,7 +21649,8 @@ function foldLateTimelinePage(payload, read) {
     // the runs of read messages are decided by it.
     const landing = entryLandingMark();
     noteArchived(payload, false);
-    catchUpHeldView();
+    // Words and all, unless a read of this view is queued behind this one: it draws them.
+    catchUpHeldView(!discordQueuedLoads.has(activeColumn));
     renderChannelFreshness();
     if (entryReadOwed === read.context) entryReadOwed = null;
     if (landing) keepEntryLanding(landing);
