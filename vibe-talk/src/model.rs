@@ -433,6 +433,17 @@ impl Message {
         }
     }
 
+    /// The thread this message is a reply in, when the provider said it is one: never a thread's
+    /// root, which is one of the channel's own messages. `#319 slack-reply-by-id`: what a listing
+    /// hands back with a reply's id, so a read of it by id can be scoped to the thread it is in.
+    #[must_use]
+    pub fn reply_thread(&self) -> Option<&str> {
+        self.thread
+            .as_ref()
+            .filter(|thread| !thread.is_root)
+            .map(|thread| thread.id.as_str())
+    }
+
     /// When this message was created, in Unix milliseconds: from its snowflake, falling back to
     /// its reported timestamp. `None` when neither can be read.
     ///

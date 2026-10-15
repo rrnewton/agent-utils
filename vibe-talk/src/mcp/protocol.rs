@@ -879,12 +879,13 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
 /// again here is how four render sites end up disagreeing. See `crate::clock`.
 fn digest_line(entry: &crate::summary::DigestEntry) -> String {
     format!(
-        "[{} | {} | exact {} | {} {}] {}\n",
+        "[{} | {} | exact {} | {} {}{}] {}\n",
         entry.id,
         entry.spoken_time,
         entry.timestamp,
         entry.author,
         entry.author_id.mention(),
+        untrusted::thread_field(entry.thread_id.as_deref()),
         entry.summary
     )
 }
@@ -1254,22 +1255,24 @@ async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
         }
     );
     let mut body = format!(
-        "[BEST | {} | {} | exact {} | {} {}] {}\n",
+        "[BEST | {} | {} | exact {} | {} {}{}] {}\n",
         best.message.id.as_str(),
         best.message.spoken(),
         best.message.timestamp,
         best.message.author,
         best.message.author_id.mention(),
+        untrusted::thread_field(best.message.reply_thread()),
         best.message.content
     );
     for alternative in &resolution.alternatives {
         body.push_str(&format!(
-            "[ALTERNATIVE | {} | {} | exact {} | {} {}] {}\n",
+            "[ALTERNATIVE | {} | {} | exact {} | {} {}{}] {}\n",
             alternative.message.id.as_str(),
             alternative.message.spoken(),
             alternative.message.timestamp,
             alternative.message.author,
             alternative.message.author_id.mention(),
+            untrusted::thread_field(alternative.message.reply_thread()),
             alternative.message.content
         ));
     }
@@ -1279,8 +1282,18 @@ async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
 async fn run_read(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let message_id = arg_id(args, "message_id").unwrap_or_default();
-    let (info, message) =
-        ops::message_by_id(state, &channel_id, &message_id, arg_u16(args, "limit")).await?;
+    // `#319 slack-reply-by-id`. A reply's line names its thread, and a model that passes it back
+    // reads the reply there. One that does not still finds a reply in a thread this server knows
+    // of: see `ops::message_by_id`.
+    let thread_id = arg_id(args, "thread_id");
+    let (info, message) = ops::message_by_id_scoped(
+        state,
+        &channel_id,
+        &message_id,
+        arg_u16(args, "limit"),
+        thread_id.as_deref(),
+    )
+    .await?;
     let id = message.id.clone();
     Ok(format!(
         "Message {} from {}:\n{}",

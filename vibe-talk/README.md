@@ -1177,6 +1177,17 @@ grey **Thread** start it, by posting with `thread_ts` set to the message's `ts`.
 mentions (`<@U…>`) in a posted message notify anyone: `<!here>`, `<!channel>` and the like are
 escaped, as `@everyone` is suppressed on Discord.
 
+**Reading a reply by its id.** `#319 slack-reply-by-id`. Slack's history holds no thread reply,
+so a reply is found by its id only within its thread. Every listing says which thread a reply is in
+— `thread_id` on the entries of the digest and the catch-up, `thread` on each message of `/todo`
+and `/messages`, and `| thread <thread id>` on the voice tools' lines — and a read by id that is
+given it reads the reply there, in one call. Given none, the read looks among the conversation's
+own messages first, as before, and then in the thread the server already knows the reply to be in:
+from the newest messages it holds (what the digest, the to-do list and the catch-up were drawn
+from), what it read aloud in the last half minute, a pin, or the bookmark. That costs one more call,
+and an id no listing placed in a thread costs none: it is `unknown_message` after the one read of
+history.
+
 **What is shown.** Joins, leaves, topic changes and other system events are left out; ordinary,
 bot, file-share, `/me` and thread-broadcast messages are kept. Slack's link, channel and
 group-mention markup is rewritten into the markdown the rest of the app reads. A quote ends where
@@ -3505,8 +3516,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/voice-end` | **write** | how a call that opened ended — `hang_up`, `error_frame`, `server_closed`, `connection_lost` or `suspended` — as one content-free line, `voice_call_ended` — see "How a call ended" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
-| GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
-| GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
+| GET | `/api/v1/channels/{id}/messages/{message_id}?thread_id=` | read | one message in full; `thread_id` names the thread a reply is in, and without it a reply is still found in the thread this server knows it to be in — from the reads it holds, a pin or the bookmark — at the cost of one read of that thread (`#319 slack-reply-by-id`) |
+| GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message; a reply in a thread carries `thread_id`, as the entries of `/api/v1/activity` do |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=&hours=&render=&reason=` | read | **one step of a walk**, saying that it is one; `render=html` adds each message's `content_html`, which the page asks for and the voice agent's `read_page` does not; optional `reason=` says what the read is for, for the access log and the upstream profile only (`remote-ops-audit`), as on the next two routes |
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=&reason=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
@@ -6796,7 +6807,7 @@ endpoint should have.
 | `read_page` | read | automatic | One step of a walk: a page that says it is a page, plus the cursor for the next one. `hours` reads from that many hours ago to now. |
 | `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. `hours` counts from that many hours ago. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
-| `read_message` | read | automatic | One known message by id. |
+| `read_message` | read | automatic | One known message by id; `thread_id` for a reply in a thread, which the reply's line gives as `\| thread <thread id>`. |
 | `post_reply` | **write** | **requires approval**, unless the owner turned it off | *Proposes* a post as the bot, and nothing is sent until the owner confirms it outside the model's tools — or, with "Ask me before the voice agent sends" off, posts it at once and says `SENT`. |
 
 They are deliberately thin, with one exception. With a real model in the loop the model should

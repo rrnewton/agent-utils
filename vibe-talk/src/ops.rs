@@ -456,10 +456,18 @@ pub fn window_limit(state: &AppState, limit: Option<u16>) -> u16 {
 /// On a provider that looks messages up by id itself ([`looks_up_by_ids`]), anywhere in the
 /// channel: one lookup, and the window only when the lookup did not see the id.
 ///
+/// `#319 slack-reply-by-id`. A reply in a thread is not among a channel's own messages on every
+/// provider: Slack's history holds no reply, so a lookup there proves a reply absent although the
+/// digest, the to-do list and the catch-up all listed it. When neither the lookup nor the window
+/// has the id, it is looked for once more in the thread this server already knows it to be a
+/// reply in ([`known_thread`]): one read of that thread. With no thread known nothing more is read,
+/// and the answer is [`OpError::UnknownMessage`] as before.
+///
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::UnknownMessage`] when the id is not in the fetched
-/// window (or the provider proved it absent), or [`OpError::Chat`].
+/// window (or the provider proved it absent) and is not a reply in a thread this server knows of,
+/// or [`OpError::Chat`].
 pub async fn message_by_id(
     state: &AppState,
     channel_id: &str,
@@ -469,31 +477,92 @@ pub async fn message_by_id(
     // remote-ops-audit W11 `#287 bulk-reads`. A provider that looks messages up by id itself
     // answers for this one exactly, wherever it is in the channel; any other is read for the recent
     // window, as before.
-    if configured(state, channel_id).is_ok_and(|channel| looks_up_by_ids(state, &channel.id)) {
-        let channel = allowed(state, channel_id).await?;
-        let looked =
-            lookup_messages(state, &channel, None, &[message_id.to_owned()], limit).await?;
-        let message = looked
-            .messages
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or(OpError::UnknownMessage)?;
-        return Ok((channel, message));
-    }
-    let window = messages(state, channel_id, limit).await?;
+    let channel =
+        if configured(state, channel_id).is_ok_and(|channel| looks_up_by_ids(state, &channel.id)) {
+            let channel = allowed(state, channel_id).await?;
+            let looked =
+                lookup_messages(state, &channel, None, &[message_id.to_owned()], limit).await?;
+            if let Some(message) = looked.messages.into_iter().next().flatten() {
+                return Ok((channel, message));
+            }
+            channel
+        } else {
+            let window = messages(state, channel_id, limit).await?;
+            let wanted = MessageId(message_id.to_owned());
+            if let Some(message) = window.messages.into_iter().find(|m| m.id == wanted) {
+                return Ok((window.channel, message));
+            }
+            window.channel
+        };
     let wanted = MessageId(message_id.to_owned());
-    let message = window
-        .messages
-        .into_iter()
-        .find(|m| m.id == wanted)
-        .ok_or(OpError::UnknownMessage)?;
-    Ok((window.channel, message))
+    let Some(thread) = known_thread(state, &channel.id, &wanted).await else {
+        return Err(OpError::UnknownMessage);
+    };
+    // A thread this server was told of rather than one the caller chose: a read of it that finds
+    // nothing there, or refuses the id for it, is the same answer the channel gave.
+    match message_in_thread(state, channel, message_id, limit, &thread).await {
+        Err(OpError::Chat(error))
+            if matches!(
+                error.cause(),
+                ChatError::Status { status: 404, .. } | ChatError::Refused(_)
+            ) =>
+        {
+            Err(OpError::UnknownMessage)
+        }
+        answer => answer,
+    }
+}
+
+/// The thread this server already knows `id` to be a reply in, in `channel`, when it knows one.
+/// `#319 slack-reply-by-id`.
+///
+/// Asked only once a read of the channel has not found the id, and it reads nothing upstream:
+/// the channel's held recent window ([`crate::recent`], what the digest, the to-do list and the
+/// catch-up were drawn from, with the replies pushed since), what speech preparation fetched in the
+/// last half minute ([`crate::read_ahead`]), and then the store, whose pins and bookmark keep the
+/// thread of the message they name. A thread's root is not a reply in it: it is one of the
+/// channel's own messages, and the read that missed it already answered for it.
+async fn known_thread(state: &AppState, channel: &ChannelId, id: &MessageId) -> Option<String> {
+    let reply_in = |message: &Message| message.reply_thread().map(str::to_owned);
+    let held = state.live.recent().snapshot(channel).held;
+    if let Some(thread) = held
+        .as_ref()
+        .and_then(|held| held.messages.iter().find(|message| message.id == *id))
+        .and_then(reply_in)
+    {
+        return Some(thread);
+    }
+    if let Some(thread) = state
+        .read_ahead
+        .recall(channel, None, std::slice::from_ref(&id.0))
+        .get(id.as_str())
+        .and_then(reply_in)
+    {
+        return Some(thread);
+    }
+    // A store that is absent or failing knows nothing: the read answers as it did without it.
+    if let Ok(pins) = state.store.pins(channel).await {
+        if let Some(thread) = pins
+            .pins
+            .iter()
+            .map(|pin| &pin.snapshot)
+            .find(|pin| pin.message_id == *id && !pin.thread_root)
+            .and_then(|pin| pin.thread_id.clone())
+        {
+            return Some(thread);
+        }
+    }
+    let bookmark = state.store.bookmark(channel).await.ok()?;
+    bookmark
+        .anchor
+        .filter(|anchor| anchor.message_id == *id)
+        .and_then(|anchor| anchor.thread_id)
 }
 
 /// Look up a message within an explicitly selected thread, or the ordinary channel window.
 ///
-/// The parent channel allowlist is checked before the backend verifies thread membership.
+/// The parent channel allowlist is checked before the backend verifies thread membership. Without
+/// a thread, [`message_by_id`], which also finds a reply in a thread this server knows of.
 pub async fn message_by_id_scoped(
     state: &AppState,
     channel_id: &str,
@@ -505,6 +574,17 @@ pub async fn message_by_id_scoped(
         return message_by_id(state, channel_id, message_id, limit).await;
     };
     let channel = allowed(state, channel_id).await?;
+    message_in_thread(state, channel, message_id, limit, thread_id).await
+}
+
+/// `message_id` in `thread_id` of `channel`, which the caller has checked against the allowlist.
+async fn message_in_thread(
+    state: &AppState,
+    channel: ChannelInfo,
+    message_id: &str,
+    limit: Option<u16>,
+    thread_id: &str,
+) -> Result<(ChannelInfo, Message), OpError> {
     validate_thread_id(thread_id)?;
     if looks_up_by_ids(state, &channel.id) {
         let looked = lookup_messages(

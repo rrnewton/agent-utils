@@ -50,6 +50,12 @@ pub struct DigestEntry {
     pub full_length: usize,
     /// Whether the summary dropped anything.
     pub truncated: bool,
+    /// The thread this message is a reply in, when it is one: what a by-id read of it is scoped
+    /// to (`thread_id`). Absent for one of the channel's own messages, a thread's root included.
+    /// `#319 slack-reply-by-id`: a provider whose channel feed holds no reply, as Slack's history
+    /// holds none, finds a reply by id only within its thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 /// Condense a message body to at most `max_chars` characters of speakable text.
@@ -94,6 +100,7 @@ pub fn digest_entry(message: &Message, max_chars: usize) -> DigestEntry {
         truncated: summary.ends_with('…'),
         summary,
         full_length: message.content.chars().count(),
+        thread_id: message.reply_thread().map(str::to_owned),
     }
 }
 

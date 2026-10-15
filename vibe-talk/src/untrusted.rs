@@ -65,6 +65,16 @@ pub fn fenced(body: &str) -> String {
     out
 }
 
+/// The field a listed line carries for a reply in a thread — ` | thread <thread id>` — or nothing
+/// for one of the channel's own messages. `#319 slack-reply-by-id`.
+///
+/// A handle like the message id beside it: what `read_message` takes as `thread_id`, so a reply
+/// read by id is looked for in its thread, and never anything to say aloud.
+#[must_use]
+pub fn thread_field(thread: Option<&str>) -> String {
+    thread.map_or_else(String::new, |thread| format!(" | thread {thread}"))
+}
+
 /// Render a batch of messages as a fenced, labelled block for a model prompt.
 ///
 /// This function PRINTS [`Message::spoken_time`]; it must never compute one. The zone conversion
@@ -84,7 +94,7 @@ pub fn render_for_model(messages: &[Message]) -> String {
         // attached to the thing being replied to, so there is nothing to search for and nothing
         // to guess. See `crate::model::Message::author_id`.
         body.push_str(&format!(
-            "[{} | {} | exact {}{} | {} {}] {}{}\n",
+            "[{} | {} | exact {}{} | {} {}{}] {}{}\n",
             message.id.as_str(),
             message.spoken(),
             message.timestamp,
@@ -95,6 +105,7 @@ pub fn render_for_model(messages: &[Message]) -> String {
             },
             neutralize(&message.author),
             neutralize(&message.author_id.mention()),
+            neutralize(&thread_field(message.reply_thread())),
             neutralize(&message.content),
             mentioned(message)
         ));
