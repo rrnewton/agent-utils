@@ -1,12 +1,13 @@
 ---
 title: 'slack-group-dm-names: name a Slack group DM by its members, not its channel handle'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.392870939+00:00
-updated_at: 2026-10-15T06:03:00.392870939+00:00
+updated_at: 2026-10-15T08:01:29.252517426+00:00
+closed_at: 2026-10-15T08:01:29.252517305+00:00
 ---
 
 # Description
