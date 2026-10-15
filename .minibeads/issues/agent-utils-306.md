@@ -1,12 +1,13 @@
 ---
 title: 'done-stale-across-views: a Done made in one view shows as not done in another view loaded earlier'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T19:25:04.974901824+00:00
-updated_at: 2026-10-14T19:25:04.974901824+00:00
+updated_at: 2026-10-15T08:33:57.463478432+00:00
+closed_at: 2026-10-15T08:33:57.463478262+00:00
 ---
 
 # Description
