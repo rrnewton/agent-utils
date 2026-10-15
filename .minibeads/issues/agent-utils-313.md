@@ -1,12 +1,13 @@
 ---
 title: 'slack-file-posts: show a line for a Slack post that is only a file'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T04:34:05.349358894+00:00
-updated_at: 2026-10-15T04:34:05.349358894+00:00
+updated_at: 2026-10-15T04:53:45.505917295+00:00
+closed_at: 2026-10-15T04:53:45.505917175+00:00
 ---
 
 # Description
