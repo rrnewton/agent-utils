@@ -1,12 +1,13 @@
 ---
 title: 'refused-undo-restores-done: a refused Undo puts back a Done the server also refused'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T13:11:36.506972276+00:00
-updated_at: 2026-10-15T13:11:36.506972276+00:00
+updated_at: 2026-10-15T19:26:44.578277577+00:00
+closed_at: 2026-10-15T19:26:44.578277437+00:00
 ---
 
 # Description
