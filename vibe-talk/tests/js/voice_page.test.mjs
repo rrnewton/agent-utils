@@ -61236,12 +61236,12 @@ test("`#315 removed-reply-target`: after a reload during the outage, a reply to 
 // The read of All the page makes for Main's counts can be sent before an upstream removal or edit and
 // land after Main's own read has brought it. It was folded over the store whatever the store had lost
 // or replaced since, and brought the removed message back onto Main, or put back the text from before
-// the edit, until the next full read. Now a late page of All is folded only over the store's copies as
-// they were when it was sent (`pageFold`, `heldUnchanged`, the check `heldAsSent` makes of a placing
-// read), and never takes a message removed upstream after it was sent (`removedSince`). And a placing
-// page that is not folded gives a message the stream left unplaced its whole copy where the store's is
-// still the one it was sent over: a bridge that streams its answer by editing it is placed with the
-// text it had reached, not the text it was first pushed with.
+// the edit, until the next full read. Now a late page of All is folded only over the store's copies
+// older than it (`pageFold`, `copyOlderThan`; `#310 stale-live-read-flicker` put them in the order reads
+// were sent), and never takes a message removed upstream after it was sent (`removedSince`). And a
+// placing page that is not folded gives a message the stream left unplaced its whole copy where the
+// store's is older: a bridge that streams its answer by editing it is placed with the text it had
+// reached, not the text it was first pushed with.
 
 /** The read of All for Main's counts sent, and held (`heldAllReads`), past the interval: a quiet reply outruns the store. */
 async function countsReadOut(script) {
@@ -61406,7 +61406,7 @@ for (const main of ["delta", "newest"]) {
 
     // THE CONTROL, as #308 left it: the store's copy takes only the answer's thread record. Where Main's
     // newest page took the bare copy out, the answer puts it back whole either way.
-    const control = await run(brokenScript("    if (held && held.get(id) === stored) return copy;\n", ""));
+    const control = await run(brokenScript("    if (held && copyOlderThan(stored, id, number, held)) {\n", "    if (false) {\n"));
     const controlled = savedMessage(control.page, "300");
     if (main === "delta") {
       assert.equal(controlled.content, "the bridge's answer, in the first discussion",
@@ -61469,8 +61469,7 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 
   // THE CONTROL: taking every message the store has not held, the read for the counts puts it back.
   const control = await run(brokenScript(
-    "      return !holds.has(id) && (answeredThread(message) !== null || !newerPage(canon, \"main\", number));\n",
-    "      return !holds.has(id);\n"));
+    "      return answeredThread(message) !== null || !newerPage(canon, \"main\", number);\n", "      return true;\n"));
   assert.ok(shownIds(control.page).includes("400"), "the read for the counts left the message out anyway, so this test cannot see it");
 });
 
@@ -61480,8 +61479,8 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 // never reported it, and the message stayed on Main, and saved, until the next newest page fifteen
 // minutes on. A removal replayed from the stream's tail asks for no read at all.
 const REMOVED_LEFT_TO_ITS_READ = [
-  "    answers: (message) => removedSince(canon, String(message.id), number) || !unchanged || unchanged.has(String(message.id)),\n",
-  "    answers: (message) => !removedSince(canon, String(message.id), number) && (!unchanged || unchanged.has(String(message.id))),\n"];
+  "    answers: (message) => removedSince(canon, String(message.id), number) || !held || older(String(message.id)),\n",
+  "    answers: (message) => !removedSince(canon, String(message.id), number) && (!held || older(String(message.id))),\n"];
 
 for (const removal of ["after", "before", "tail"]) {
   const named = { after: "answered after the removal", before: "answered before the removal",
@@ -61561,8 +61560,8 @@ for (const removal of ["after", "before", "tail"]) {
 // answer, taken before the second message existed, landed after the stream had drawn it, and redrew the
 // column without it until the second message's own read put it back: a message the reader saw arrive
 // disappeared and came back (against `#280 scroll-stability`). The column's own newest page is now
-// folded only over the store's copies as they were when it was sent (`pageFold`), as a late read of All
-// is (`#316 late-counts-resurrect`): a message the store gained since is newer than it, and stays.
+// folded only over the store's copies older than it (`pageFold`, `copyOlderThan`), as a late read of All
+// is (`#316 late-counts-resurrect`): a message the stream delivered after it was sent is newer, and stays.
 
 for (const view of ["flat", "main"]) {
   test(`\`#310 stale-live-read-flicker\`: a second live message drawn while the first one's read is out stays drawn when that read lands late (${view === "flat" ? "All" : "Main"})`, async () => {
@@ -61625,5 +61624,112 @@ for (const view of ["flat", "main"]) {
     const control = await run(brokenScript("      const held = heldNow(canon);\n", "      const held = null;\n"));
     assert.ok(!control.landed.ids.includes("301"), "the late read left the second message drawn anyway, so this test cannot see it");
     assert.ok(shownIds(control.page).includes("301"), "the control's second read did not put the message back");
+  });
+}
+
+// Ordered by when each read was sent (`copyOrder`), not by whether a copy changed while the page was out.
+// The read of All for Main's counts, sent first and answered after an edit, landing while Main's newer
+// newest page is out, replaced the store's copy; Main's page, answered after the next edit or a removal,
+// took that for a copy newer than itself, and refused its own copy, or the removal, until the next
+// newest page: fifteen minutes on a server whose deltas carry edits and deletions, since the polls
+// between are deltas from the refused page's cursor.
+
+for (const change of ["edit", "remove"]) {
+  test(`\`#310 stale-live-read-flicker\`: Main's newest page takes its ${change === "edit" ? "copy of an edit" : "removal of a message"} over the copy an older read of All brought while it was out`, async () => {
+    const run = async (script) => {
+      const { page, server, quietReply } = await heldAllReads(script);
+      const inner = page.timeline;
+      // The read for the counts, held: the server takes its answer at `take`, and the page has it at `give`.
+      /** @type {{take: null | (() => Promise<void>), give: null | (() => void)}} */
+      const counts = { take: null, give: null };
+      /** @type {Array<() => void>} */
+      const mainHeld = [];
+      let holdMain = false;
+      page.timeline = (path, options) => {
+        const url = new URL(path, "http://fixture.test");
+        if (url.searchParams.get("reason") === "counts") {
+          return new Promise((resolve) => {
+            /** @type {any} */
+            let answer = null;
+            counts.take = async () => {
+              const response = await server.answer(path);
+              const body = await response.text();
+              answer = { ...response, text: async () => body };
+            };
+            counts.give = () => resolve(answer);
+          });
+        }
+        if (holdMain && url.searchParams.get("view") === "main" && !url.searchParams.get("after")) {
+          // Answered as the server has the channel when asked, and handed over later.
+          const answer = Promise.resolve(inner(path, options)).then(async (response) => {
+            const body = await response.text();
+            return { ...response, text: async () => body };
+          });
+          return new Promise((resolve) => mainHeld.push(() => resolve(answer)));
+        }
+        return inner(path, options);
+      };
+      page.setClock(page.clock() + COUNTS_ALL_READ_MS + 1000);
+      quietReply();
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.ok(counts.take, "fixture: All was not read for Main's counts");
+      // The server answers the read for the counts after a first edit of the message...
+      server.edit("200", { content: "the announcement, edited once" });
+      await counts.take();
+      // ...then it changes again upstream — by a provider that pushes no removals, for a removal — and
+      // Main's poll, its cursor refused, reads its newest page, which is held.
+      if (change === "edit") server.edit("200", { content: "the announcement, edited twice" });
+      else server.remove("200");
+      server.refuse = { status: 410, error: "cursor_expired" };
+      holdMain = true;
+      page.setClock(page.clock() + DISCORD_POLL_MS);
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(mainHeld.length, 1, "fixture: Main's newest page was not held");
+      holdMain = false;
+      // The older read lands first, over the store as it was when it was sent...
+      counts.give?.();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(savedMessage(page, "200").content, "the announcement, edited once",
+        "fixture: the read for the counts did not bring the first edit");
+      // ...then Main's newer page.
+      mainHeld.shift()();
+      for (let i = 0; i < 4; i += 1) await page.settle();
+      const landed = { saved: savedMessage(page, "200"), shown: shownIds(page) };
+      // And three polls after, deltas from that page's cursor.
+      for (let poll = 0; poll < 3; poll += 1) {
+        page.setClock(page.clock() + DISCORD_POLL_MS);
+        await pollOnce(page);
+        for (let i = 0; i < 3; i += 1) await page.settle();
+      }
+      assert.ok(server.reads.slice(-3).every((read) => read.after !== null), "fixture: the polls after were not deltas");
+      return { page, landed };
+    };
+    const { page, landed } = await run(SCRIPT);
+    if (change === "edit") {
+      assert.equal(landed.saved && landed.saved.content, "the announcement, edited twice",
+        "Main's newer page did not bring the second edit");
+      assert.ok(bodyOf(rowOf(page, "200")).text().includes("edited twice"), "Main does not show the second edit");
+      assert.equal(savedMessage(page, "200").content, "the announcement, edited twice", "the second edit is gone three polls later");
+    } else {
+      assert.ok(!landed.shown.includes("200"), "Main's newer page did not take the removed message off Main");
+      assert.equal(landed.saved, null, "Main's newer page did not take the removed message out of the store");
+      assert.ok(!shownIds(page).includes("200"), "the removed message is back on Main three polls later");
+    }
+    assert.equal(savedMessage(page, "250").content, "a quiet reply in the second discussion", "the read for the counts brought nothing");
+
+    // THE CONTROL, as the page was: a copy replaced while the page was out taken for newer than it, the
+    // page refuses its own, and the polls after, deltas from its cursor, never bring it.
+    const control = await run(brokenScript("  if (at !== undefined) return at < number;\n", ""));
+    if (change === "edit") {
+      assert.equal(control.landed.saved.content, "the announcement, edited once",
+        "Main's page brought the second edit anyway, so this test cannot see it");
+      assert.equal(savedMessage(control.page, "200").content, "the announcement, edited once");
+    } else {
+      assert.ok(control.landed.shown.includes("200") && control.landed.saved,
+        "Main's page took the message out anyway, so this test cannot see it");
+      assert.ok(shownIds(control.page).includes("200"));
+    }
   });
 }

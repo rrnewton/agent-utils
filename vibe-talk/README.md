@@ -289,11 +289,10 @@ read does not ask again; and never while the page is hidden. A read that fails w
 five minutes. Discord's own threads never ask, having no exact counts. On a Slack channel where agents
 keep answering while you sit on Main, that is a read about every five minutes: some 130 of Slack's
 calls an hour on top of Main's own refresh. Behind a slow chat service that read can land after
-Main's own reads have moved on, so it changes only what the page still holds as it held it when
-the read was sent (`#316 late-counts-resurrect`): it never brings back a message removed upstream
-since, nor puts back the text from before an edit Main's read has brought, nor takes away a message
-that arrived while it was out. It still brings the replies the page did not hold, which is what the
-counts need.
+Main's own reads have moved on, so it changes only what the page holds from before it was sent
+(`#316 late-counts-resurrect`): it never brings back a message removed upstream since, nor puts back
+the text from before an edit a later read of Main has brought, nor takes away a message that arrived
+while it was out. It still brings the replies the page did not hold, which is what the counts need.
 
 **Slack's All brings the replies of at most ten threads per page**, the ten most recently active
 among its messages, and says so in its notice. A thread past those ten is on the page with its count
@@ -5602,9 +5601,12 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
 - **A message arriving live is followed only by a reader already on the newest line**, asked before it
   goes in; everyone else is left exactly where they are and offered the jump to it.
 - **A message the stream has drawn stays drawn** (`#310 stale-live-read-flicker`). A read asked before it
-  arrived, landing after, changes only what the page held as it held it when the read went out: it
-  never takes away a message that arrived meanwhile. Two live messages a moment apart used to have the
-  first one's read redraw the list without the second for a dozen frames.
+  arrived, landing after, never takes away a message that arrived meanwhile. Two live messages a moment
+  apart used to have the first one's read redraw the list without the second for a dozen frames. Reads
+  are ordered by when they were sent, not when they land: each copy of a message the page holds is as
+  new as the read that brought it, or as the moment the stream delivered it, and a read changes only
+  copies older than itself. So a read sent earlier that lands while a later one is out does not stop
+  the later one from bringing an edit or a removal.
 - **In the right column, a reader on the newest line stays on it** when what is in the list changes size
   under them with nothing scrolled — above all the card under the pointer drawn whole — and a reader up
   the list is held by the card or row they are on. Main keeps `#207 scrollback-jump`'s rule: a newest
