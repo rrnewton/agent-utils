@@ -58,6 +58,10 @@
 //! `slack/live.rs`). A reply's edit or deletion, and a reply in a thread rooted further back, are
 //! read when the thread, Flat or the newest messages are read.
 //!
+//! An emoji written in a message is Slack's short name between colons, and a standard one is read
+//! as the emoji it names (`#321 slack-emoji-shortcodes`, `slack/emoji.rs`); a custom emoji's name
+//! stays as written, and nothing is changed in what is posted.
+//!
 //! A file a message shares is a line of its body, its name and kind linked to Slack's page for it
 //! (`#313 slack-file-posts`, `slack/files.rs`). No file, thumbnail or preview is ever fetched.
 //!
@@ -69,6 +73,7 @@
 
 mod clear;
 mod client;
+mod emoji;
 mod files;
 mod groups;
 mod history;

@@ -16,6 +16,8 @@
 //! | `&amp;` `&lt;` `&gt;` | `&` `<` `>` |
 //! | `&gt; question` then `answer` | `> question`, a blank line, then `answer` |
 //! | `&gt;&gt;&gt; a` then `b` | `> a` then `> b` |
+//! | `:crab:` `:wave::skin-tone-3:` | `🦀` `👋🏼` |
+//! | `:party-parrot:`, a custom emoji | `:party-parrot:`, unchanged |
 //!
 //! User mentions are kept verbatim because vibe-talk's mention syntax is the same `<@id>`: a reply
 //! that quotes one notifies the same person in Slack. Who it names travels beside the body, in
@@ -28,7 +30,9 @@
 //! [`crate::render::Markup::asterisk_is_bold`].
 //!
 //! A quote ends where Slack ends it ([`end_quotes`], `#322 slack-quote-lines`): in Slack a `>`
-//! quotes its own line and no other, and `>>>` quotes the rest of the message.
+//! quotes its own line and no other, and `>>>` quotes the rest of the message. A standard emoji
+//! shortcode is the emoji it names, outside code and words (`super::emoji`, `#321
+//! slack-emoji-shortcodes`); a custom emoji's stays as written.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -44,8 +48,9 @@ pub fn to_markdown(text: &str) -> String {
 /// `#318 slack-mention-names`.
 #[must_use]
 pub fn to_markdown_with(text: &str, channels: &HashMap<String, String>) -> String {
+    let text = super::emoji::shortcodes(text);
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut rest: &str = &text;
     while let Some(open) = rest.find('<') {
         out.push_str(&decode_entities(&rest[..open]));
         let after = &rest[open + 1..];

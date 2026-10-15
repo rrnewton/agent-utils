@@ -1190,6 +1190,14 @@ mention Slack sends without its name, `<#C…>` or `<#C…|>`, is named from `co
 mention carries its handle and is shown as `@ops`. A pin keeps the text it was pinned with, and
 draws its mentions by id.
 
+**Emoji.** `#321 slack-emoji-shortcodes`. Slack sends every emoji in a message as its short name
+between colons, and the app shows a standard one as the emoji itself — `:crab:` as 🦀,
+`:wave::skin-tone-3:` as 👋🏼 — from the same table of Slack's names the reactions below use, so the
+voice says the emoji rather than its name between two colons, and Copy text copies it. A workspace's
+custom emoji stays `:name:`, as its reactions do. So does a shortcode inside code, and one touching a
+letter or a digit, so a time such as `10:100:20` or an address such as `fe80::a:b` keeps its
+characters. What you post is sent exactly as you wrote it, colons and all.
+
 **Reactions.** `#312 slack-reactions`. Slack lists each message's reactions on every read of it,
 as `reactions: [{name, count, users}]`, and the app shows them under the message in every view,
 replies included, and on the messages and replies the live poll delivers. No scope beyond the
