@@ -1084,4 +1084,86 @@ provider = "team"
         assert!(notes.take().is_empty());
         assert!(watch.suspects().is_empty());
     }
+
+    /// A listener whose unblock, once armed, says it has begun and then waits to be let go, as a
+    /// slow one would: the moment a refusal heard on another thread can race it.
+    #[derive(Default)]
+    struct Gate {
+        blocked: Mutex<std::collections::HashSet<String>>,
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl AccessListener for Gate {
+        fn block(&self, suspect: &Suspect) {
+            self.blocked
+                .lock()
+                .expect("blocked")
+                .insert(suspect.channel.as_str().to_owned());
+        }
+        fn unblock(&self, suspect: &Suspect) {
+            if let Some(entered) = self.entered.lock().expect("entered").take() {
+                let _ = entered.send(());
+            }
+            let hold = self.hold.lock().expect("hold").take();
+            if let Some(hold) = hold {
+                let _ = hold.recv_timeout(Duration::from_secs(10));
+            }
+            self.blocked
+                .lock()
+                .expect("blocked")
+                .remove(suspect.channel.as_str());
+        }
+        async fn probe(&self, _suspect: &Suspect) -> Option<Result<(), ChatError>> {
+            None
+        }
+        fn confirmed(&self, _suspect: &Suspect) {}
+        fn credential_refused(&self, _provider_key: &str, _revoked: bool) {}
+    }
+
+    /// A read that succeeds clears the old doubt about a channel and is unblocking it when a
+    /// refusal heard on another thread raises a new one. The new doubt must leave the channel
+    /// blocked: unblocked, it would be served for up to [`CONFIRM_AFTER`] while in doubt.
+    #[test]
+    fn r5_a_new_doubt_raised_while_an_old_one_clears_stays_blocked() {
+        let watch = AccessWatch::new();
+        watch.set_dialect("p", Dialect::DiscordProtocol);
+        let gate = Arc::new(Gate::default());
+        let listener: Arc<dyn AccessListener> = gate.clone();
+        watch.listen(Some(Arc::downgrade(&listener)));
+        let channel = channel();
+        let missing = missing();
+        watch.report("p", "fetch_timeline", Some(&channel), None, Err(&missing));
+        assert!(gate.blocked.lock().expect("blocked").contains("C1"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
+        *gate.entered.lock().expect("entered") = Some(entered_tx);
+        *gate.hold.lock().expect("hold") = Some(hold_rx);
+        std::thread::scope(|scope| {
+            // A read that succeeded clears the old doubt, and is about to unblock.
+            scope.spawn(|| watch.report("p", "fetch_timeline", Some(&channel), None, Ok(())));
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the unblock began");
+            // A refusal heard meanwhile, on another thread, raises a new doubt and blocks.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let (watch, channel, missing) = (&watch, &channel, &missing);
+            scope.spawn(move || {
+                watch.report("p", "fetch_page", Some(channel), None, Err(missing));
+                let _ = done_tx.send(());
+            });
+            // It either finishes at once, or waits for the unblock to end: either way the
+            // unblock is let go after.
+            let _ = done_rx.recv_timeout(Duration::from_millis(300));
+            hold_tx.send(()).expect("the unblock is waiting");
+        });
+        let in_doubt = watch.suspects();
+        let blocked = gate.blocked.lock().expect("blocked").clone();
+        assert_eq!(in_doubt.len(), 1, "the new doubt stands");
+        assert!(
+            blocked.contains("C1"),
+            "a channel in doubt is left unblocked: in doubt {in_doubt:?}, blocked {blocked:?}"
+        );
+    }
 }

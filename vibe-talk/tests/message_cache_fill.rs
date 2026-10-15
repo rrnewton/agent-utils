@@ -3526,3 +3526,328 @@ async fn a_read_of_several_channels_at_once_is_rows_only_on_a_bridge_and_nothing
         }
     }
 }
+
+// ---- `#297 cache-coverage-races` ----------------------------------------------------------------
+
+/// Edit the reply at `reply_ts` of the thread rooted at `root` upstream: its text, and Slack's
+/// record of the edit. Its root says nothing of it.
+fn edit_slack_reply(fake: &slack_fake::Fake, root: &str, reply_ts: &str, text: &str) {
+    fake.with(|s| {
+        for r in s
+            .replies
+            .get_mut(&(SLACK_CH.to_owned(), root.to_owned()))
+            .expect("thread")
+        {
+            if r["ts"] == serde_json::json!(reply_ts) {
+                r["text"] = serde_json::json!(text);
+                r["edited"] =
+                    serde_json::json!({"user": "UREPLIER1", "ts": slack_fake::ts(200, 0)});
+            }
+        }
+    });
+}
+
+/// A Slack window answers a thread reply from Flat's memory, which keeps a reply's text up to
+/// `FLAT_RECONCILE` after an edit, yet offers it as seen at the window's start. Learned first by a
+/// lookup by id, the edit must stand: the copy from memory reports no edit, which every Slack copy
+/// of an edited message does, so it is the older version, however late it was seen. (The review's
+/// probe `review_probe_a_slack_window_from_flat_memory_never_reverts_an_edit_a_lookup_learned`.)
+#[tokio::test]
+async fn a_slack_window_from_flat_memory_never_reverts_an_edit_a_lookup_learned() {
+    let (fixture, root) = slack_conversation_with_a_thread();
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-flat-memory-window");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let reply_ts = slack_fake::ts(70, 0);
+    let reply = slack_id(&reply_ts);
+    // 1. A window: Flat's memory now holds the reply as first written.
+    vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+        .await
+        .expect("a window");
+    assert_eq!(
+        cached(&cache, &slack_chan(), &reply).message.content,
+        "an earlier reply"
+    );
+    // 2. The reply is edited upstream; its root says nothing of it.
+    edit_slack_reply(&fake, &root, &reply_ts, "the reply as edited");
+    clock.advance(MINUTE);
+    // 3. A lookup by id sees the edit, and the cache takes it.
+    let (_, looked) = vibe_talk::ops::message_by_id_scoped(
+        &state,
+        vibe_talk::auth::Scope::Write,
+        SLACK_CH,
+        reply.as_str(),
+        None,
+        Some(&root),
+    )
+    .await
+    .expect("looked up");
+    assert_eq!(looked.content, "the reply as edited");
+    assert_eq!(
+        cached(&cache, &slack_chan(), &reply).message.content,
+        "the reply as edited"
+    );
+    clock.advance(MINUTE);
+    // 4. A window a minute later: Flat's memory answers the reply as it was.
+    let window =
+        vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+            .await
+            .expect("a window");
+    let upstream_text = window
+        .messages
+        .iter()
+        .find(|m| m.id == reply)
+        .map(|m| m.content.clone());
+    assert_eq!(
+        upstream_text.as_deref(),
+        Some("an earlier reply"),
+        "the window answered the reply from Flat's memory"
+    );
+    assert_eq!(
+        cached(&cache, &slack_chan(), &reply).message.content,
+        "the reply as edited",
+        "the cache reverted an edit it had learned"
+    );
+}
+
+/// The same for a Slack Flat page, which answers the reply from the same memory. (The review's
+/// probe `review_probe_flat_page_variant`.)
+#[tokio::test]
+async fn a_slack_flat_page_from_flat_memory_never_reverts_an_edit_a_lookup_learned() {
+    let (fixture, root) = slack_conversation_with_a_thread();
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-flat-memory-page");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let reply_ts = slack_fake::ts(70, 0);
+    let reply = slack_id(&reply_ts);
+    let flat = format!("/api/v1/channels/{SLACK_CH}/timeline?view=flat&limit=20");
+    get(&state, &flat).await;
+    assert_eq!(
+        cached(&cache, &slack_chan(), &reply).message.content,
+        "an earlier reply"
+    );
+    edit_slack_reply(&fake, &root, &reply_ts, "the reply as edited");
+    clock.advance(MINUTE);
+    let (_, looked) = vibe_talk::ops::message_by_id_scoped(
+        &state,
+        vibe_talk::auth::Scope::Write,
+        SLACK_CH,
+        reply.as_str(),
+        None,
+        Some(&root),
+    )
+    .await
+    .expect("looked up");
+    assert_eq!(looked.content, "the reply as edited");
+    clock.advance(MINUTE);
+    let page = get(&state, &flat).await;
+    let upstream_text = page["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["id"] == serde_json::json!(reply.as_str()))
+        .map(|m| m["content"].clone());
+    assert_eq!(
+        upstream_text,
+        Some(serde_json::json!("an earlier reply")),
+        "the page answered the reply from Flat's memory"
+    );
+    assert_eq!(
+        cached(&cache, &slack_chan(), &reply).message.content,
+        "the reply as edited",
+        "the cache reverted an edit it had learned"
+    );
+}
+
+/// `#319 slack-reply-by-id`: a lookup by id of a reply proves it absent from Slack's history, and
+/// the server then finds it in the thread it knows the reply to be in, and answers with it. The
+/// shadow's comparison is with that answer: compared with the lookup's empty one, the reply the
+/// cache would have served was counted as a row upstream no longer lists.
+#[tokio::test]
+async fn a_reply_found_in_the_thread_the_server_knows_is_compared_with_that_answer() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    let root = slack_fake::ts(60, 0);
+    // Two replies, far enough apart that the first lies below the band of the thread's head.
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut list[1],
+        &[
+            (slack_fake::ts(70, 0), "an earlier reply".to_owned()),
+            (slack_fake::ts(290, 0), "a later reply".to_owned()),
+        ],
+    );
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-known-thread-shadow");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let reply = slack_id(&slack_fake::ts(70, 0));
+    // The server's recent window of the channel holds the reply, and so names its thread; and a
+    // read of the thread proves the stretch the reply is in.
+    vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+        .await
+        .expect("a window");
+    get(
+        &state,
+        &format!("/api/v1/channels/{SLACK_CH}/timeline?view=thread&thread_id={root}&limit=50"),
+    )
+    .await;
+    // Everything those reads offered is written before the ask, so that its evaluation never
+    // waits on the writer.
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(WAIT));
+    clock.advance(5 * 1_000);
+    let (_, found) = vibe_talk::ops::message_by_id(
+        &state,
+        vibe_talk::auth::Scope::Read,
+        SLACK_CH,
+        reply.as_str(),
+        None,
+    )
+    .await
+    .expect("found in its thread");
+    assert_eq!(found.content, "an earlier reply");
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.asked, counted.would_serve),
+        (1, 1),
+        "held, its thread revalidated moments ago: {counted:?}"
+    );
+    assert_eq!(
+        (counted.compared, counted.agreed, counted.extra_rows),
+        (1, 1, 0),
+        "compared with the reply the request answered with: {counted:?}"
+    );
+}
+
+/// The live poller offers what its walk read as of when the walk began (`LiveHub::publish_read`),
+/// and under the stamp taken then: a channel erased while the walk was on its way back must not
+/// get back, from the walk's publish, a message read before the erase.
+#[tokio::test]
+async fn a_pollers_publish_never_lands_after_an_erase_made_while_its_read_was_out() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = deployment(false, 5, &clock).await;
+    let fresh = d
+        .fake
+        .seed_at(&id(READ_CHANNEL), "Ada", "a new message", T0 + 30 * MINUTE);
+    let (walk, HeldRead { entered, release }) = HeldWalk::holding(&d.fake);
+    let mut cursor = Some(d.ids[4].numeric().expect("a snowflake"));
+    let hub = Arc::clone(&d.state.live);
+    let poll = tokio::spawn(async move {
+        poll_once(walk.as_ref(), &hub, &id(READ_CHANNEL), 50, &mut cursor)
+            .await
+            .map(|tick| tick.published)
+    });
+    entered.await.expect("the walk reached the provider");
+    // While the walk's page is on its way back, the channel is erased (access to it confirmed
+    // lost, say).
+    clock.advance(MINUTE);
+    d.cache.erase_channels(std::slice::from_ref(&read_chan()));
+    assert!(d.cache.quiesce_blocking(WAIT));
+    clock.advance(MINUTE);
+    drop(release);
+    assert_eq!(poll.await.expect("joined").expect("polled"), 1);
+    assert!(
+        !holds(&d.cache, &read_chan(), &fresh),
+        "what the walk read before the erase was written after it"
+    );
+    assert_eq!(held(&d.cache), 0, "nothing of the erased channel is held");
+}
+
+// ---- review round 1 probe (scratch) ----
+
+/// An unpolled Slack provider whose adapter pushes full events. A message was edited once (a read
+/// brought Slack's `edited`), then edited again; the adapter pushes the second edit as an update
+/// with no edit time, as a normalized event may. The cache must take the text it was told.
+#[tokio::test]
+async fn rr1_an_adapter_pushed_slack_edit_without_an_edit_time_is_taken() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    list[3]["text"] = serde_json::json!("first edit");
+    list[3]["edited"] = serde_json::json!({"user": "UADA00001", "ts": slack_fake::ts(200, 0)});
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("rr1-adapter-edit");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let text = format!(
+        r#"
+[auth]
+read_token = "{read}"
+write_token = "{WRITE_TOKEN}"
+
+[ingest]
+token = "{INGEST_TOKEN}"
+
+[[providers]]
+key = "{SLACK}"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = true
+"#,
+        read = testing::READ_TOKEN,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(WAIT));
+    let window =
+        vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+            .await
+            .expect("a window");
+    let target = slack_id(&slack_fake::ts(180, 0));
+    let mut edit = window
+        .messages
+        .iter()
+        .find(|m| m.id == target)
+        .expect("held")
+        .clone();
+    assert_eq!(edit.content, "first edit");
+    assert!(edit.edited_timestamp.is_some(), "the read brought the edit time");
+    assert!(cache.quiesce_blocking(WAIT));
+    assert_eq!(cached(&cache, &slack_chan(), &target).message.content, "first edit");
+    clock.advance(MINUTE);
+    edit.content = "second edit".to_owned();
+    edit.edited_timestamp = None;
+    let status = ingest(&state, pushed("e1", "update", &edit)).await;
+    eprintln!("ingest answered {status}");
+    assert!(status.is_success(), "{status}");
+    assert!(cache.quiesce_blocking(WAIT));
+    assert_eq!(
+        cached(&cache, &slack_chan(), &target).message.content,
+        "second edit",
+        "the cache threw away an edit the adapter pushed"
+    );
+}
