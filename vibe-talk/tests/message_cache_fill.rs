@@ -608,11 +608,24 @@ async fn slack_deployment_of(
     clock: &Arc<ManualClock>,
     channel: &str,
 ) -> AppState {
+    slack_deployment_with(fake, dir, clock, channel, "").await
+}
+
+/// [`slack_deployment_of`], with `tables` (TOML) added to its configuration.
+async fn slack_deployment_with(
+    fake: &slack_fake::Fake,
+    dir: &TempDir,
+    clock: &Arc<ManualClock>,
+    channel: &str,
+    tables: &str,
+) -> AppState {
     let text = format!(
         r#"
 [auth]
 read_token = "{read}"
 write_token = "{WRITE_TOKEN}"
+
+{tables}
 
 [[providers]]
 key = "{SLACK}"
@@ -3767,4 +3780,64 @@ async fn a_pollers_publish_never_lands_after_an_erase_made_while_its_read_was_ou
         "what the walk read before the erase was written after it"
     );
     assert_eq!(held(&d.cache), 0, "nothing of the erased channel is held");
+}
+
+/// An adapter may push full events for a provider this server does not poll, Slack included (the
+/// poller is off unless `live_poll_seconds` is set), and the contract lets an event leave a
+/// message's `edited_timestamp` out when its path cannot say. A message edited once, which a read
+/// brought with Slack's `edited`, then edited again, the adapter pushing the second edit with no
+/// edit time: the cache must take the text it was told. (The review's probe
+/// `rr1_an_adapter_pushed_slack_edit_without_an_edit_time_is_taken`.)
+#[tokio::test]
+async fn an_adapters_pushed_slack_edit_without_an_edit_time_is_taken() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    list[3]["text"] = serde_json::json!("first edit");
+    list[3]["edited"] = serde_json::json!({"user": "UADA00001", "ts": slack_fake::ts(200, 0)});
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-adapter-edit");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let ingest_table = format!("[ingest]\ntoken = \"{INGEST_TOKEN}\"");
+    let state = slack_deployment_with(&fake, &dir, &clock, SLACK_CH, &ingest_table).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let window =
+        vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+            .await
+            .expect("a window");
+    let target = slack_id(&slack_fake::ts(180, 0));
+    let mut edit = window
+        .messages
+        .iter()
+        .find(|m| m.id == target)
+        .expect("held")
+        .clone();
+    assert_eq!(edit.content, "first edit");
+    assert!(
+        edit.edited_timestamp.is_some(),
+        "the read brought the edit time"
+    );
+    assert_eq!(
+        cached(&cache, &slack_chan(), &target).message.content,
+        "first edit"
+    );
+    clock.advance(MINUTE);
+    edit.content = "second edit".to_owned();
+    edit.edited_timestamp = None;
+    let status = ingest(&state, pushed("e1", "update", &edit)).await;
+    assert!(status.is_success(), "{status}");
+    assert_eq!(
+        cached(&cache, &slack_chan(), &target).message.content,
+        "second edit",
+        "the cache threw away an edit the adapter pushed"
+    );
 }

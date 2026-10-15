@@ -139,13 +139,27 @@ impl Shape {
         !matches!(self, Self::Slack | Self::SlackThread)
     }
 
-    /// Whether every copy of a message this provider gives reports the message's edits (Slack's
-    /// `edited`, Discord's `edited_timestamp`), so that a copy without one is of a message not
-    /// edited when it was read ([`super::merge`], rule 2). A bridge's copies may reach the server
-    /// by a path that cannot say, such as an adapter's pushed event.
+    /// Whether every copy of a message this provider's reads give reports the message's edits
+    /// (Slack's `edited`, Discord's `edited_timestamp`), so that a copy without one is of a message
+    /// not edited when it was read ([`super::merge`], rule 2). A bridge's copies may reach the
+    /// server by a path that cannot say. So may a change an adapter pushes, whatever the provider
+    /// ([`pushed`]): its copy is never taken as reporting edits.
     fn reports_edits(self) -> bool {
         !matches!(self, Self::Bridge)
     }
+}
+
+/// Who told the server of a change from the live feed ([`pushed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushedBy {
+    /// The live poller, from its own read of the provider: a copy as the provider's reads give it.
+    Poller,
+    /// A provider adapter, pushing to the ingest routes. Its event may have come by a path that
+    /// cannot say whether the message was edited (the contract lets `edited_timestamp` be absent
+    /// for exactly that), so a copy without an edit time says nothing about one, whatever the
+    /// provider: as with a bridge, the later observation decides between two copies unless both
+    /// carry an edit time.
+    Adapter,
 }
 
 /// Which kind of read a timeline page answered.
@@ -429,14 +443,15 @@ pub fn single(
 /// What one change from the live feed tells the cache: a creation or an edit carries the message,
 /// at its home by the provider's shape; a deletion carries its id. A push is never a claim about
 /// any scope, and a creation of a message the cache does not hold is kept as possibly a snippet
-/// until a read replaces it (the writer's rule, not this one's).
+/// until a read replaces it (the writer's rule, not this one's). Only the poller's copy, which its
+/// own read brought, reports edits as the provider's reads do ([`PushedBy`]).
 #[must_use]
-pub fn pushed(shape: Shape, live: &LiveMessage, observed_ms: i64) -> Observation {
+pub fn pushed(shape: Shape, live: &LiveMessage, by: PushedBy, observed_ms: i64) -> Observation {
     let push = match live.kind {
         LiveKind::Create | LiveKind::Update => Push::Upsert {
             message: Box::new(
                 Incoming::new(live.message.clone(), home(shape, &live.message, None))
-                    .reporting_edits(shape.reports_edits()),
+                    .reporting_edits(by == PushedBy::Poller && shape.reports_edits()),
             ),
             update: live.kind == LiveKind::Update,
             partial: false,
@@ -1194,7 +1209,12 @@ mod tests {
             (Shape::Slack, LiveKind::Delete, root("m100", T, 0), "push delete m100 created=None"),
         ];
         for (shape, kind, message, expected) in cases {
-            let got = [pushed(shape, &live(kind, message), OBSERVED)];
+            let got = [pushed(
+                shape,
+                &live(kind, message),
+                PushedBy::Adapter,
+                OBSERVED,
+            )];
             assert_eq!(describe(&got), [expected], "{shape:?} {kind:?}");
             every_observation_is_at(&got, OBSERVED);
         }

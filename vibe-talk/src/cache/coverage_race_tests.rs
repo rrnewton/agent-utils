@@ -9,6 +9,11 @@
 //! - **R6-C**: the same erase must not discard a pushed deletion or edit of a message it kept, nor
 //!   leave the feed vouching for the row that change would have replaced.
 //! - **R5-A**: a window asked moments after a read of the newest end is not stale.
+//!
+//! And what the reviews of the fix itself found:
+//!
+//! - **An adapter's edit with no edit time**: the edit times that keep an older copy out must not
+//!   throw away an edit an adapter pushes, for any provider, with no edit time.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -624,4 +629,80 @@ fn an_erase_the_file_refuses_is_tried_again_until_it_is_carried_out() {
     }
     fx.settle();
     assert_eq!(fx.cache.counts().served().expect("counts").messages, 0);
+}
+
+/// The text the cache holds for `id` in `fx`'s channel, read for a lookup by id as `shape` reads
+/// it.
+fn held_by_id(fx: &Fixture, id: &str, shape: observe::Shape) -> Option<String> {
+    let ask = shadow::Ask::Message {
+        consumer: shadow::Consumer::MessageById,
+        id: MessageId(id.to_owned()),
+    };
+    let query = shadow::query(&ask, shape, false).expect("a query");
+    let view = fx
+        .cache
+        .shadow_view(&fx.chan, &query)
+        .served()
+        .expect("served");
+    view.rows.first().map(|r| r.message.content.clone())
+}
+
+/// An adapter may push full events for a provider this server does not poll, a Slack or a
+/// Discord channel included, and its event may carry no edit time: the contract lets a copy that
+/// came by a path that cannot say leave `edited_timestamp` out. A message edited once (a read
+/// brought its edit time), then edited again, the adapter pushing the second edit with no edit
+/// time: the cache must take the text it was told, and never vouch for the text edited away. The
+/// poller's copy, which its own read brought, reports edits as the provider's reads do, so one
+/// with no edit time is still the older version. (The review's probe
+/// `rr1_an_adapter_pushed_edit_without_an_edit_time_is_not_thrown_away`.)
+#[test]
+fn an_adapters_pushed_edit_without_an_edit_time_is_never_thrown_away() {
+    use crate::live::{LiveKind, LiveMessage};
+    for shape in [observe::Shape::Slack, observe::Shape::DiscordNative] {
+        for by in [observe::PushedBy::Adapter, observe::PushedBy::Poller] {
+            let fx = Fixture::new("cache-adapter-edit");
+            let first = T0 + 6 * STEP + SEC;
+            fx.clock.set(first);
+            let mut rows: Vec<Message> = (1..=6).map(m).collect();
+            rows[2].content = "first edit".to_owned();
+            rows[2].edited_timestamp = Some(crate::clock::iso_from_ms(T0 + 5 * STEP));
+            let id = rows[2].id.0.clone();
+            fx.list(
+                rows.clone(),
+                first,
+                Some(newest_proof(ListStart::At(T0 + STEP))),
+            );
+            // The second edit is pushed a minute later, with no edit time.
+            let at = first + 60 * SEC;
+            fx.clock.set(at);
+            let mut edited = rows[2].clone();
+            edited.content = "second edit".to_owned();
+            edited.edited_timestamp = None;
+            let live = LiveMessage {
+                event_id: "e1".to_owned(),
+                kind: LiveKind::Update,
+                historical: false,
+                message: edited,
+                self_posted: false,
+            };
+            fx.offer(&fx.chan, observe::pushed(shape, &live, by, at));
+            let content = held_by_id(&fx, &id, shape);
+            match by {
+                observe::PushedBy::Adapter => {
+                    assert_eq!(
+                        content.as_deref(),
+                        Some("second edit"),
+                        "{shape:?}: the cache threw away an edit the adapter pushed"
+                    );
+                }
+                observe::PushedBy::Poller => {
+                    assert_eq!(
+                        content.as_deref(),
+                        Some("first edit"),
+                        "{shape:?}: a copy the poller read with no edit time is the older version"
+                    );
+                }
+            }
+        }
+    }
 }
