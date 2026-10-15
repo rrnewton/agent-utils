@@ -610,6 +610,7 @@ pub async fn messages_for_speech(
                         &missing,
                         limit,
                         None,
+                        false,
                     ))
                     .await?
             };

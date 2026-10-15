@@ -341,6 +341,15 @@ struct Route {
     recent_via_flat: bool,
 }
 
+/// When a read whose finds the live hub publishes began ([`Fill::read_start`]): the channel as the
+/// cache named it then, the stamp taken then, and the local time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadStart {
+    chan: ChanKey,
+    stamp: Stamp,
+    observed_ms: i64,
+}
+
 /// One upstream read's permission to offer what it sees, taken by [`Sink::begin`] before the read
 /// starts.
 ///
@@ -397,6 +406,17 @@ impl Fill {
     #[must_use]
     pub fn observed_ms(&self) -> i64 {
         self.observed_ms
+    }
+
+    /// When the read began, and its stamp: what a change the live hub publishes from it is offered
+    /// under ([`Sink::offer_push`]).
+    #[must_use]
+    pub fn read_start(&self) -> ReadStart {
+        ReadStart {
+            chan: self.chan.clone(),
+            stamp: self.stamp,
+            observed_ms: self.observed_ms,
+        }
     }
 
     /// The cache the fill offers to, while it is still installed or held elsewhere.
@@ -603,9 +623,69 @@ impl Shadowed {
             task.settle(Some((upstream, enqueued)));
         }
     }
+
+    /// Note upstream's first answer as [`Shadowed::compare`] would, what was queued by now with
+    /// it, and leave the comparison to the caller, which may yet find the answer elsewhere: a
+    /// lookup by id that missed a reply which the server then finds in the thread it knows the
+    /// reply to be in (`#319 slack-reply-by-id`). Compared against that first answer, the reply the
+    /// request then answers with would be counted as a row upstream no longer lists.
+    ///
+    /// Call it where [`Shadowed::compare`] would be called: as soon as upstream has answered, and
+    /// before the request offers the cache what it read.
+    #[must_use]
+    pub fn hold(mut self, upstream: Upstream) -> HeldShadow {
+        let task = self.task.take();
+        let enqueued = task
+            .as_ref()
+            .and_then(|task| task.cache.upgrade())
+            .map(|cache| cache.enqueued_seq());
+        HeldShadow {
+            task,
+            first: Some(upstream),
+            enqueued,
+        }
+    }
 }
 
 impl Drop for Shadowed {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.settle(None);
+        }
+    }
+}
+
+/// A shadow evaluation whose comparison waits for the request's final answer
+/// ([`Shadowed::hold`]): compared with what the request found elsewhere
+/// ([`HeldShadow::found`]), or with upstream's first answer when it found nothing more
+/// ([`HeldShadow::nothing_more`]). Dropped without either, because the further read failed, it is
+/// counted with no comparison. Whichever, what was queued when upstream first answered decides
+/// whether the evaluation read the request's own writes.
+#[derive(Debug)]
+pub struct HeldShadow {
+    task: Option<ShadowTask>,
+    first: Option<Upstream>,
+    enqueued: Option<u64>,
+}
+
+impl HeldShadow {
+    /// The request answered with what it found elsewhere: compare with that.
+    pub fn found(mut self, upstream: Upstream) {
+        if let Some(task) = self.task.take() {
+            task.settle(Some((upstream, self.enqueued)));
+        }
+    }
+
+    /// The request found nothing more: compare with upstream's first answer, as
+    /// [`Shadowed::compare`] would have.
+    pub fn nothing_more(mut self) {
+        if let (Some(task), Some(first)) = (self.task.take(), self.first.take()) {
+            task.settle(Some((first, self.enqueued)));
+        }
+    }
+}
+
+impl Drop for HeldShadow {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.settle(None);
@@ -923,9 +1003,12 @@ impl Sink {
     }
 
     /// Offer one change the live hub is publishing to `channel`, from `producer`: the poller, or
-    /// an adapter's pushed event. `read_ms`, when given, is when the read that found it began (the
+    /// an adapter's pushed event. `read`, when given, is when the read that found it began (the
     /// poller's): the change is offered as of then, or now if that is earlier, so a deletion or an
-    /// edit the cache learned of while that read was on its way back is not undone by it.
+    /// edit the cache learned of while that read was on its way back is not undone by it; and under
+    /// that read's stamp, so an erase made while it was on its way back drops the change as it
+    /// drops the read's own offers. (A channel the cache names otherwise now, its provider changed
+    /// meanwhile, is offered under its name now.)
     ///
     /// Called by [`crate::live::LiveHub`] while it holds the channel's feed lock and BEFORE any
     /// subscriber is sent the change, so a change a subscriber could have seen is already queued,
@@ -941,11 +1024,14 @@ impl Sink {
         channel: &ChannelId,
         live: &LiveMessage,
         producer: ServerFill,
-        read_ms: Option<i64>,
+        read: Option<ReadStart>,
     ) {
         if let Some(mut fill) = self.begin(&FillGrant::server(producer), channel) {
-            if let Some(read_ms) = read_ms {
-                fill.observed_ms = fill.observed_ms.min(read_ms);
+            if let Some(read) = read {
+                fill.observed_ms = fill.observed_ms.min(read.observed_ms);
+                if read.chan == fill.chan {
+                    fill.stamp = read.stamp;
+                }
             }
             fill.offer_push(live);
         }
@@ -1446,11 +1532,9 @@ impl State {
         for key in &suspended {
             cache.suspend_provider(key);
         }
+        // What is in doubt now is blocked afresh as the listener is installed.
         let listener: Weak<dyn AccessListener> = Arc::downgrade(state) as Weak<dyn AccessListener>;
         router.access().listen(Some(listener));
-        for suspect in router.access().suspects() {
-            state.block(&suspect);
-        }
     }
 
     /// The cache's name for a suspect's channel, and the scope in doubt when it is one thread.

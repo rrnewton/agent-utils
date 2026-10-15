@@ -799,11 +799,17 @@ async fn main() -> anyhow::Result<()> {
         providers.profile(),
     )));
     // `#208 persistent-cache`. One line an hour of the message cache's figures, and of what its
-    // shadow counted it would have served; numbers only, and none without a `[message_cache]`
-    // table.
-    tokio::spawn(vibe_talk::cache::sink::log_every_hour(Arc::clone(
-        &state.message_cache,
-    )));
+    // shadow counted it would have served; numbers only. Without a `[message_cache]` table there
+    // is nothing to write, and no task is started: such a server runs as it did before the cache.
+    if state
+        .message_cache
+        .lifecycle()
+        .is_some_and(|lifecycle| lifecycle.configured())
+    {
+        tokio::spawn(vibe_talk::cache::sink::log_every_hour(Arc::clone(
+            &state.message_cache,
+        )));
+    }
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

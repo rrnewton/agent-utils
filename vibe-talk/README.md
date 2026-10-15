@@ -3571,8 +3571,9 @@ It is **not encrypted**. Anyone who can read this account's files can read it, a
 
 ### Turning it on for a host
 
-**The cache stays off until #297 cache-coverage-races is closed.** Enabling it before then only
-fills the file and measures what it would have served: nothing is answered from it.
+**Enabling it only fills the file and measures what it would have served:** nothing is answered
+from it in this build. The races that would have let it claim more than it holds were closed in
+#297 cache-coverage-races.
 
 1. **Deploy this build first, without the table, and let it run.** A build from before
    `summary-keep` refuses to start with a `[message_cache]` table at all (an unknown section). The
@@ -3693,7 +3694,7 @@ it was: a purge never turns the cache on, and never turns it off. Its `purged` l
 | Erase in Settings (`DELETE /api/v1/message-cache`); the storage purge | The open file, replaced by a fresh one while the cache is on. The purge also erases every other cache file this server made |
 | A channel taken off the list: removed or hidden in Settings, or deleted from the configuration | That channel's messages, and the store's summaries of it |
 | At every start, and whenever the list changes: anything not on the list (a channel no longer listed, a hidden one, one under a provider key that no longer exists) | Those channels' messages, and the store's summaries of every channel no longer listed under any provider |
-| A provider refuses a read of a channel or a thread (a 403 or 404; from Slack, only `channel_not_found`, `not_in_channel` or `thread_not_found`, never a 403 or 404 that carries no Slack code, which something in front of Slack answered), and the server's own read, ten minutes later, is refused the same way | That channel and the store's summaries of it; or that thread's messages and the store's summaries of them |
+| A provider refuses a read of a channel or a thread (a 403 or 404; from Slack, only `channel_not_found`, `not_in_channel` or `thread_not_found`, never a 403 or 404 that carries no Slack code, which something in front of Slack answered; from a Discord-protocol provider, only one whose body is its own JSON error, never an HTML page or a line of text, which something in front of it answered), and the server's own read, ten minutes later, is refused the same way | That channel and the store's summaries of it; or that thread's messages and the store's summaries of them |
 | A provider refuses the credential for 24 hours, or Slack answers `account_inactive` or `token_revoked`; a provider's account is no longer the one the file's messages were read as | Everything held from that provider |
 | A file from an incompatible schema, or a file of ours that SQLite cannot read | The file, rebuilt empty |
 
@@ -3738,6 +3739,11 @@ for one whose write to the file failed (a full disk, an I/O error, another progr
 file): either marks the channel suspect at once, and the file records it as soon as it takes
 writes again, at the latest as the server stops. A record the file still cannot take then is lost
 with the process.
+
+An erase the file refuses the same way is not given up: what it covers is not read from the cache,
+and the server tries the erase again, a second or more apart, until the file takes it. That is in
+memory only: a server stopped before then, with the file still refusing, starts again with the rows
+it could not erase, until the refusal that asked for the erase is heard again.
 
 ### Whose reads fill it
 
@@ -3831,7 +3837,7 @@ the cache would never answer, such as Slack's Flat view, is not counted at all.
 A Slack window upstream carries thread replies (`#307 slack-reply-live`), and the cache answers a
 window from the channel's own messages. Where it would have served one, the replies upstream
 listed in the stretch both answers cover count as missing rows: a serving build has to answer
-those windows from the threads too, or not at all. That is open in #297 cache-coverage-races.
+those windows from the threads too, or not at all, as #297 cache-coverage-races records.
 
 `backfill` and `timeline_fallback_ms` are read and checked, and do nothing in this build. There is
 no backfill yet, and nothing is answered from the cache when a timeline read is slow.

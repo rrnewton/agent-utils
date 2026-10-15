@@ -72,7 +72,13 @@
 //! read-scope caller saw: such a caller is never given a stamp to write with, because every fill
 //! begins at the [`Sink`] under a [`FillGrant`] and a read-scope caller has none ([`grant`]).
 //! A deletion ([`Observation::removes_only`]) is the one observation applied to a channel off the
-//! snapshot, and then only to messages the file already holds of it.
+//! snapshot, and then only to messages the file already holds of it; and the one applied although
+//! its read began before an erase of one scope of its channel, whose other scopes keep their rows
+//! (anything else such a read saw is recorded as left out, [`MessageCache::mark_suspect`]).
+//!
+//! Nor does a listing claim an instant whose row it carried and the file does not hold because a
+//! tombstone made after the read began held it back: that tombstone may be the cache's own, an
+//! erase of another scope the message belongs to, and the message still listed here upstream.
 //!
 //! # What the durable store must follow
 //!
@@ -137,7 +143,7 @@ pub use file::default_path;
 pub use grant::{FillGrant, ServerFill};
 pub use rows::{CachedMessage, ChanKey, Incoming, Scope};
 pub use search_text::{PlainText, Rendered, SearchTextSource};
-pub use sink::{Fill, Shadowed, Sink};
+pub use sink::{Fill, HeldShadow, ReadStart, Shadowed, Sink};
 
 use crate::model::{ChannelId, MessageId};
 
@@ -326,10 +332,28 @@ impl RouteSnapshot {
 
 /// Where a write may land, captured when its upstream read started. The writer drops an
 /// observation whose stamp is older than an erase of its file or channel.
+///
+/// An erase of one scope of the channel (a thread whose access is lost) is counted apart, because
+/// the channel's other scopes keep their rows: an observation begun before it is dropped too, but
+/// a deletion it carries is still applied to what is left, and anything else it carried is
+/// recorded as left out ([`MessageCache::mark_suspect`]), as a full queue's drop is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     generation: u64,
     epoch: u64,
+    scope_epoch: u64,
+}
+
+/// How an observation's stamp stands against the erases since its read began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Currency {
+    /// No erase of its file, its channel, its provider or any scope of its channel came after.
+    Current,
+    /// Only erases of single scopes of its channel came after: the channel's other scopes kept
+    /// their rows.
+    ScopeErased,
+    /// Its file, its channel or its provider was erased after.
+    Stale,
 }
 
 /// Where an exhaustive listing begins.
@@ -835,12 +859,14 @@ impl Stats {
     }
 }
 
-/// File generation and per-channel epochs. A stamp holds both; an erase bumps one.
+/// File generation and per-channel epochs. A stamp holds them; an erase bumps one.
 #[derive(Debug, Default)]
 pub(crate) struct Epochs {
     generation: AtomicU64,
     channels: Mutex<HashMap<ChanKey, u64>>,
     providers: Mutex<HashMap<String, u64>>,
+    /// Erases of single scopes, per channel.
+    scopes: Mutex<HashMap<ChanKey, u64>>,
 }
 
 impl Epochs {
@@ -852,8 +878,9 @@ impl Epochs {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// A channel's epoch: its own count plus its provider's, so bumping either moves it.
-    pub(crate) fn epoch(&self, chan: &ChanKey) -> u64 {
+    /// What the erases of the whole channel have counted: its own count plus its provider's, so
+    /// bumping either moves it.
+    fn channel_epoch(&self, chan: &ChanKey) -> u64 {
         let own = lock(&self.channels).get(chan).copied().unwrap_or(0);
         let provider = lock(&self.providers)
             .get(&chan.provider_key)
@@ -862,8 +889,24 @@ impl Epochs {
         own.wrapping_add(provider)
     }
 
+    /// What the erases of single scopes of the channel have counted.
+    fn scope_epoch(&self, chan: &ChanKey) -> u64 {
+        lock(&self.scopes).get(chan).copied().unwrap_or(0)
+    }
+
+    /// A channel's epoch as a read checks it: every erase of the channel, its provider or any of
+    /// its scopes moves it, so a read that ran across any of them is not served.
+    pub(crate) fn epoch(&self, chan: &ChanKey) -> u64 {
+        self.channel_epoch(chan)
+            .wrapping_add(self.scope_epoch(chan))
+    }
+
     pub(crate) fn bump_channel(&self, chan: &ChanKey) {
         *lock(&self.channels).entry(chan.clone()).or_insert(0) += 1;
+    }
+
+    pub(crate) fn bump_scope(&self, chan: &ChanKey) {
+        *lock(&self.scopes).entry(chan.clone()).or_insert(0) += 1;
     }
 
     pub(crate) fn bump_provider(&self, provider_key: &str) {
@@ -883,12 +926,20 @@ impl Epochs {
     pub(crate) fn stamp(&self, chan: &ChanKey) -> Stamp {
         Stamp {
             generation: self.generation(),
-            epoch: self.epoch(chan),
+            epoch: self.channel_epoch(chan),
+            scope_epoch: self.scope_epoch(chan),
         }
     }
 
-    pub(crate) fn current(&self, chan: &ChanKey, stamp: Stamp) -> bool {
-        stamp.generation == self.generation() && stamp.epoch == self.epoch(chan)
+    /// How `stamp` stands against the erases since it was taken.
+    pub(crate) fn currency(&self, chan: &ChanKey, stamp: Stamp) -> Currency {
+        if stamp.generation != self.generation() || stamp.epoch != self.channel_epoch(chan) {
+            Currency::Stale
+        } else if stamp.scope_epoch != self.scope_epoch(chan) {
+            Currency::ScopeErased
+        } else {
+            Currency::Current
+        }
     }
 }
 
@@ -1035,13 +1086,15 @@ pub(crate) struct Shared {
     /// happened before (while the server was down, or the cache off) never reached the file.
     pub(crate) opened_ms: AtomicI64,
     /// Erases asked for and not yet applied, with the sequence number that applies them
-    /// (`u64::MAX` until it is known, or when the writer could not be asked).
+    /// (`u64::MAX` when the writer could not be asked). An erase holds this lock from before its
+    /// epochs move until its record is written ([`MessageCache::queue_erase`]).
     pub(crate) erasing: Mutex<HashMap<Erasing, u64>>,
     /// The latest sweep: until the writer has applied it, only channels routed continuously since
     /// before the oldest sweep still pending may be read.
     pub(crate) sweep: Mutex<Option<Sweep>>,
-    /// Erases the writer could not carry out. What they cover stays blocked until the file is
-    /// erased: a cache that cannot forget a channel must not serve it either.
+    /// Erases the writer could not carry out. What they cover stays blocked until a later try
+    /// carries them out, or the file is erased: a cache that cannot forget a channel must not serve
+    /// it either. Written by the writer alone, from the erases it still owes.
     pub(crate) erase_failed: Mutex<HashSet<Erasing>>,
     /// What may not be served while access to it is in doubt: see [`MessageCache::block_channel`].
     pub(crate) blocks: Mutex<Blocks>,
@@ -1543,6 +1596,32 @@ impl MessageCache {
         }
     }
 
+    /// Queue an erase, and record in `pending` which operation applies it. Called with the lock
+    /// on [`Shared::erasing`] held from before the erase's epochs moved, which every read's check
+    /// takes too ([`MessageCache::blocked`]): so a read that starts in between waits for the
+    /// record, and two erases of one thing, made at once, are recorded in the order they were
+    /// queued, a later one's sequence never lowered by an earlier one's.
+    ///
+    /// - Queued: blocked until the writer has applied that operation.
+    /// - No file open: nothing is recorded, and any record of the same erase goes. The file it
+    ///   would have erased is gone, or going: a file erase is under way, and the one it opens, if
+    ///   any, holds nothing.
+    /// - The writer gone: it never applies the erase, so what it covers stays blocked until the
+    ///   file is erased (`u64::MAX`).
+    fn queue_erase(&self, pending: &mut HashMap<Erasing, u64>, keys: &[Erasing], op: Op) {
+        let Some(inner) = self.current() else {
+            for key in keys {
+                pending.remove(key);
+            }
+            return;
+        };
+        let seq = self.control_on(&inner, op).unwrap_or(u64::MAX);
+        for key in keys {
+            let held = pending.entry(key.clone()).or_insert(seq);
+            *held = (*held).max(seq);
+        }
+    }
+
     /// Erase channels: bump their epochs, so new reads skip them and fills already running are
     /// dropped, then queue the erase. A channel with nothing held costs nothing.
     ///
@@ -1553,33 +1632,33 @@ impl MessageCache {
         if chans.is_empty() {
             return;
         }
-        // Blocked for reads before the epoch moves, and until the writer has applied the erase:
+        // Blocked for reads from before the epoch moves until the writer has applied the erase:
         // a read that starts in between must not find the rows still there and serve them.
         let mut pending = lock(&self.shared.erasing);
         for chan in chans {
-            pending.insert(Erasing::Channel(chan.clone()), u64::MAX);
             self.shared.epochs.bump_channel(chan);
         }
-        drop(pending);
-        let seq = self.control(Op::Erase {
-            chans: chans.to_vec(),
-        });
-        // A writer that could not be asked never applies it: stay blocked.
-        let mut pending = lock(&self.shared.erasing);
-        for chan in chans {
-            pending.insert(Erasing::Channel(chan.clone()), seq.unwrap_or(u64::MAX));
-        }
+        let keys: Vec<Erasing> = chans.iter().cloned().map(Erasing::Channel).collect();
+        self.queue_erase(
+            &mut pending,
+            &keys,
+            Op::Erase {
+                chans: chans.to_vec(),
+            },
+        );
     }
 
     /// Erase everything one provider's channels hold, and its account row.
     pub fn erase_provider(&self, provider_key: &str) {
-        let key = Erasing::Provider(provider_key.to_owned());
-        lock(&self.shared.erasing).insert(key.clone(), u64::MAX);
+        let mut pending = lock(&self.shared.erasing);
         self.shared.epochs.bump_provider(provider_key);
-        let seq = self.control(Op::EraseProvider {
-            provider_key: provider_key.to_owned(),
-        });
-        lock(&self.shared.erasing).insert(key, seq.unwrap_or(u64::MAX));
+        self.queue_erase(
+            &mut pending,
+            &[Erasing::Provider(provider_key.to_owned())],
+            Op::EraseProvider {
+                provider_key: provider_key.to_owned(),
+            },
+        );
     }
 
     /// Erase one scope of a channel, such as a thread whose access is lost: each message whose
@@ -1587,17 +1666,21 @@ impl MessageCache {
     /// the store's summaries of it follow), and the scope's memberships, coverage, head and thread
     /// record are dropped. The channel's other scopes keep what they hold.
     ///
-    /// The channel is blocked for reads until the writer has applied it, and its epoch moves, so a
-    /// fill of the channel already running is dropped.
+    /// The channel is blocked for reads until the writer has applied it, and its scope epoch moves:
+    /// a fill of the channel already running is dropped, though a deletion it carries is applied
+    /// and anything else it carried recorded as left out, since the channel's other scopes keep
+    /// their rows ([`Stamp`]).
     pub fn erase_scope(&self, chan: &ChanKey, scope: &Scope) {
-        let key = Erasing::Channel(chan.clone());
-        lock(&self.shared.erasing).insert(key.clone(), u64::MAX);
-        self.shared.epochs.bump_channel(chan);
-        let seq = self.control(Op::EraseScope {
-            chan: chan.clone(),
-            scope_key: scope.key(),
-        });
-        lock(&self.shared.erasing).insert(key, seq.unwrap_or(u64::MAX));
+        let mut pending = lock(&self.shared.erasing);
+        self.shared.epochs.bump_scope(chan);
+        self.queue_erase(
+            &mut pending,
+            &[Erasing::Channel(chan.clone())],
+            Op::EraseScope {
+                chan: chan.clone(),
+                scope_key: scope.key(),
+            },
+        );
     }
 
     /// Serve nothing of `chan` until [`MessageCache::unblock`]: access to it is in doubt. Its rows
@@ -1966,10 +2049,11 @@ impl MessageCache {
     /// of the file (or of `chan`, when given) happened while it ran.
     ///
     /// The order matters. The channel's epoch is noted FIRST and only then is the channel checked
-    /// for a pending erase: an erase marks itself pending before it bumps the epoch, so whatever
-    /// moment it lands at, either the check sees it pending, or the epoch noted here is older than
-    /// the one the read finds when its SQL is done. Checked the other way round, an erase landing
-    /// between the two would leave a stale read looking current once the writer had applied it.
+    /// for a pending erase: an erase holds the lock that check takes from before it bumps the
+    /// epoch until it has recorded itself pending, so whatever moment it lands at, either the
+    /// check sees it pending, or the epoch noted here is older than the one the read finds when
+    /// its SQL is done. Checked the other way round, an erase landing between the two would leave
+    /// a stale read looking current once the writer had applied it.
     pub(crate) fn read<T>(
         &self,
         chan: Option<&ChanKey>,
@@ -2297,6 +2381,8 @@ fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
     })
 }
 
+#[cfg(test)]
+mod coverage_race_tests;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
