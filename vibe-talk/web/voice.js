@@ -29221,9 +29221,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       mirrorArchived(mirrored.filter((id) => !kept.has(id)), false);
       guardQuietly(refreshAfterInboxChange)();
     });
-    // ...and in every view held, from the store the lines above took it back in, and in the left column
-    // when it was made in the right one and that has stopped showing its thread since, which the
-    // other column's line above does not reach. `#306 done-stale-across-views`.
+    // ...and in every view held, from the store the lines above took it back in; in the left column
+    // when it was made in the right one and that has stopped showing its thread since; and in the right
+    // column when it was made in the left one and the right one shows its thread again since. The
+    // other column's line above reaches neither. `#306 done-stale-across-views`.
     followDoneEverywhere(requested, column);
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
@@ -29328,9 +29329,10 @@ async function restoreMessages(ids) {
       mirrorArchived(mirrored.filter((id) => !kept.has(id)), true);
       guardQuietly(refreshAfterInboxChange)();
     });
-    // ...and in every view held, from the store the lines above took it back in, and in the left column
-    // when it was made in the right one and that has stopped showing its thread since, which the
-    // other column's line above does not reach. `#306 done-stale-across-views`.
+    // ...and in every view held, from the store the lines above took it back in; in the left column
+    // when it was made in the right one and that has stopped showing its thread since; and in the right
+    // column when it was made in the left one and the right one shows its thread again since. The
+    // other column's line above reaches neither. `#306 done-stale-across-views`.
     followDoneEverywhere(restored, column);
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
@@ -29388,6 +29390,15 @@ function mirrorArchived(ids, done) {
 // the write was on its way, a refusal taken back in the right column left the left column showing it
 // as made, and the next write from the left saved that over the store. So the left column's own copy
 // is brought into line here too then, and its rows drawn again where they say otherwise.
+//
+// The mirror image, found in the fourth review round: a Done or an Undo made in the left column while
+// the right column's thread was put away reached the right column's copy (above), but nothing told the
+// `mirrorArchived` of the act; so when the right column showed the thread again (its thread opened
+// again, or two columns brought back) while the write was on its way, a refusal taken back in the left
+// column left the right one showing it as made. A reply from there then wrote no Done, its message
+// looking Done already, and asked the chat service to mark a message read whose Done had failed; and
+// the next write from the right saved the refused state over the store. So the right column showing a
+// thread is brought into line here too, after an act made in the left column.
 
 /**
  * Every copy of the read state of `ids` that the page holds out of sight, into line with the store's
@@ -29399,7 +29410,11 @@ function mirrorArchived(ids, done) {
  * `madeIn` is the column the Done or the Undo was made in. Made in the right column, which no longer
  * shows a thread (its thread closed, or two columns put away, while the write was on its way), the
  * left column on screen is brought into line as well, and drawn again: `mirrorArchived`, which tells it
- * while the right column shows a thread, does nothing then.
+ * while the right column shows a thread, does nothing then. Made in the left column, the right column
+ * showing a thread is brought into line, and drawn again where its rows say otherwise: a thread shown
+ * again since the act (its thread opened again, or two columns brought back) holds the copy brought
+ * into line while it was put away, which the `mirrorArchived` of the act never changed, so the
+ * `mirrorArchived` taking it back changes nothing in it.
  *
  * @param {string[]} ids
  * @param {typeof activeColumn} madeIn
@@ -29430,6 +29445,13 @@ function followDoneEverywhere(ids, madeIn) {
       // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
       if (rowsMissDone()) renderCachedTimeline();
       else syncUnreadReplies();
+    });
+  }
+  if (madeIn !== columns.side && sideShowing()) {
+    inColumn(columns.side, () => {
+      archivedIds = caughtUp(archivedIds);
+      // Its rows, or under Hide read which rows it draws. A thread draws no counts of unread replies.
+      if (rowsMissDone()) renderCachedTimeline();
     });
   }
   if (sideColumnUp()) renderSideColumn();

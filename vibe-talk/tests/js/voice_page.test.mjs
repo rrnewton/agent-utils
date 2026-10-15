@@ -60564,6 +60564,187 @@ test("`#306 done-stale-across-views`: a Done or an Undo made in the right column
   }
 });
 
+// The mirror image, found in the fourth review round of #306. A Done or an Undo made in the left column
+// while the right column's thread is put away reaches the right column's copy at once (above), which
+// leaves nothing for the `mirrorArchived` that takes a refusal back to change. With the thread shown on
+// the right again (opened again, or two columns brought back) while the write was on its way, a refusal
+// was taken back on the left only: the right column kept showing it as made; a Reply sent from there
+// wrote no Done, its message looking Done already, and asked the chat service to mark read a message
+// whose Done the server had refused; and the next write from the right saved the refused state over
+// the store.
+
+/** The right column's own catch-up after a Done or an Undo made in the left column, taken out for a negative control. */
+const RIGHT_FOLLOWS = ["  if (madeIn !== columns.side && sideShowing()) {", "  if (false) {"];
+/** ...its rows drawn again where they disagree with its copy, taken out. */
+const RIGHT_REDRAWS = ["      if (rowsMissDone()) renderCachedTimeline();\n    });\n  }\n  if (sideColumnUp())",
+  "    });\n  }\n  if (sideColumnUp())"];
+
+/** The right column's thread closed, Main on the left beside the cards; then opened again from its root's tag. */
+const closedThenReopened = {
+  away: closeTheThread,
+  view: "columns",
+  back: async (page) => { await threadBadge(channelRow(page, "201")).click(); },
+  says: "its thread opened again",
+};
+/** Two columns put away, All in one column; then brought back, the thread on the right again. */
+const columnsOffThenOn = { away: putColumnsAway, view: "flat", back: putColumnsAway, says: "two columns brought back" };
+
+/**
+ * Two columns over the channel of `threadData`, thread one & two on the right; that thread put away
+ * (`how.away`); a Done on root 201 in the left column, or for `kind` "restore" an Undo of a Done on it
+ * saved first, its write held on its way to the server; the thread shown on the right again
+ * (`how.back`); then the write refused, or with `saved` saved. `arrange` is given the page before it
+ * signs in; `before` is done once the thread is on the right, before it is put away. Answers the page
+ * and the timeline reads made by the time the write was answered.
+ */
+async function answeredFromTheLeft(kind, how, { script = SCRIPT, arrange = null, before = null, saved = false } = {}) {
+  const { page } = await twoColumnServer(arrange, script);
+  await threadBadge(channelRow(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the premise is the thread on the right");
+  if (before) await before(page);
+  await how.away(page);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, how.view, "the premise is the right column's thread put away");
+  if (kind === "restore") {
+    await doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }], "the premise is a Done saved, to undo");
+  }
+  let release = null;
+  page.inboxWriteHook = async (asked) => (asked === kind && release === null
+    ? new Promise((resolve) => {
+      release = () => resolve(saved ? null : json(502, { error: "store_error", detail: "the store is read-only" }));
+    })
+    : null);
+  // Not waited for: the button's act ends with its write, which is held.
+  const pressed = doneButton(channelRow(page, "201")).click();
+  await page.settle();
+  assert.ok(release, `the premise is the ${kind} on its way`);
+  const made = String(kind === "dismiss");
+  // Drawn so at once; under Hide read a Done takes its row off at once.
+  const drawn = channelRow(page, "201");
+  if (drawn) assert.equal(drawn.getAttribute("data-archived"), made, "the premise is the act drawn at once");
+  else assert.ok(kind === "dismiss" && before === hideRead, "the premise is the act drawn at once");
+  await how.back(page);
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), drawn ? ["201", "202"] : ["202"], "the premise is the thread on the right again, showing the act");
+  if (drawn) {
+    assert.equal(sideRow(page, "201").getAttribute("data-archived"), made, "the premise is the right column showing the act as made");
+  }
+  const reads = page.timelineCalls.length;
+  release();
+  await pressed.catch(() => {});
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(page.el("error").hidden, saved, `the premise is the ${kind} ${saved ? "saved" : "refused, and said"}`);
+  return { page, reads };
+}
+
+/** Whether message `id` is drawn Done in the right column's thread. */
+const sideDoneDrawn = (page, id) => sideRow(page, id).getAttribute("data-archived");
+
+test("`#306 done-stale-across-views`: a Done or an Undo made in the left column while the right column's thread is put away, and refused once it is shown again, is taken back on the right at once, and a later write from the right does not save it", async () => {
+  for (const how of [closedThenReopened, columnsOffThenOn]) {
+    for (const kind of ["dismiss", "restore"]) {
+      const was = String(kind === "restore");
+      const { page, reads } = await answeredFromTheLeft(kind, how);
+      assert.equal(sideDoneDrawn(page, "201"), was, `a ${kind} the server refused shows on the right as made, ${how.says}`);
+      assert.equal(doneButton(sideRow(page, "201")).text(), kind === "restore" ? "Unarchive" : "Done",
+        `the right column's button offers what the refused ${kind} made, ${how.says}`);
+      assert.equal(doneDrawn(page, "201"), was, `a ${kind} the server refused shows on the left as made, ${how.says}`);
+      assert.deepStrictEqual(page.timelineCalls.slice(reads), [], `the right column waited on a read to take back the refused ${kind}`);
+      // A later write from the right, which saves the snapshot from the right column's copy.
+      await doneButton(sideRow(page, "202")).click();
+      await page.settle();
+      assert.equal(savedDone(page, "201"), kind === "restore",
+        `a later write from the right saved the ${kind} the server refused into the device's snapshot, ${how.says}`);
+      assert.equal(sideDoneDrawn(page, "201"), was, `a later write from the right drew the refused ${kind} again, ${how.says}`);
+      assert.equal(doneDrawn(page, "201"), was, `a later write from the right drew the refused ${kind} again on the left, ${how.says}`);
+
+      // Saved, the act stands on both sides and in the snapshot.
+      const made = String(kind === "dismiss");
+      const kept = await answeredFromTheLeft(kind, how, { saved: true });
+      assert.equal(sideDoneDrawn(kept.page, "201"), made, `a ${kind} the server saved shows on the right as not made, ${how.says}`);
+      assert.equal(doneDrawn(kept.page, "201"), made, `a ${kind} the server saved shows on the left as not made, ${how.says}`);
+      await doneButton(sideRow(kept.page, "202")).click();
+      await kept.page.settle();
+      assert.equal(savedDone(kept.page, "201"), kind === "dismiss",
+        `a later write from the right left the ${kind} the server saved out of the snapshot, ${how.says}`);
+    }
+  }
+  // Under Hide read, the root a refused Done took off the right column's thread is back on it at once.
+  const hidden = await answeredFromTheLeft("dismiss", columnsOffThenOn, { before: hideRead });
+  assert.deepStrictEqual(sideIds(hidden.page), ["201", "202"],
+    "under Hide read the right column leaves out the root whose Done the server refused");
+  assert.equal(sideDoneDrawn(hidden.page, "201"), "false");
+
+  // THE CONTROLS. Without the right column's copy brought into line, it shows the refusal as made, and
+  // its next write saves it. With the copy brought into line but its rows not drawn again, it shows it
+  // as made still, though the snapshot is right.
+  for (const how of [closedThenReopened, columnsOffThenOn]) {
+    for (const kind of ["dismiss", "restore"]) {
+      const made = String(kind === "dismiss");
+      const unfollowed = await answeredFromTheLeft(kind, how, { script: brokenScript(...RIGHT_FOLLOWS) });
+      assert.equal(sideDoneDrawn(unfollowed.page, "201"), made,
+        `without the right column brought into line it showed the refused ${kind} taken back, ${how.says}, so this test cannot see it`);
+      await doneButton(sideRow(unfollowed.page, "202")).click();
+      await unfollowed.page.settle();
+      assert.equal(savedDone(unfollowed.page, "201"), kind === "dismiss",
+        `without the right column brought into line the snapshot kept the refused ${kind} out, ${how.says}, so this test's claim about it is untested`);
+      const undrawn = await answeredFromTheLeft(kind, how, { script: brokenScript(...RIGHT_REDRAWS) });
+      assert.equal(sideDoneDrawn(undrawn.page, "201"), made,
+        `without the right column's rows drawn again it showed the refused ${kind} taken back, ${how.says}, so this test cannot see it`);
+    }
+  }
+  for (const [patch, without] of [[RIGHT_FOLLOWS, "the right column brought into line"], [RIGHT_REDRAWS, "its rows drawn again"]]) {
+    const control = await answeredFromTheLeft("dismiss", columnsOffThenOn, { script: brokenScript(...patch), before: hideRead });
+    assert.deepStrictEqual(sideIds(control.page), ["202"],
+      `without ${without} Hide read brought the root back on the right, so this test cannot see it`);
+  }
+});
+
+test("`#306 done-stale-across-views`: a Reply sent from the right column on a message whose Done, made in the left column, the server refused once the thread was shown again writes its Done before it asks the chat service", async () => {
+  // `#300 reply-marks-read`: a confirmed send marks its message Done, and only once that is saved asks
+  // the chat service to move its own read marker, which cannot be moved back.
+  const run = async (how, script = SCRIPT) => {
+    let asked = null;
+    const { page } = await answeredFromTheLeft("dismiss", how, {
+      script,
+      arrange: (fresh) => { fresh.upstreamReadMarkSupported = true; asked = serverFloor(fresh); },
+    });
+    assert.equal(page.dealtWith.has("201"), false, "the premise is the server holding no Done for 201");
+    page.inboxWriteHook = null;
+    await replyAndSend(page, "201", "on it", "side-log");
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(page.repliesPosted.at(-1).body.reply_to, "201", "the premise is the reply sent and confirmed");
+    return { page, asked };
+  };
+  for (const how of [closedThenReopened, columnsOffThenOn]) {
+    const { page, asked } = await run(how);
+    assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }, { messages: ["201"] }],
+      `the reply wrote no Done for a message whose Done the server refused, ${how.says}`);
+    assert.equal(page.dealtWith.has("201"), true, `the reply's Done did not reach the server, ${how.says}`);
+    const dismissed = page.requests.map((one, at) => (one.endsWith("/dismiss") ? at : -1)).filter((at) => at >= 0);
+    const marked = page.requests.findIndex((one) => one.endsWith("/upstream-read"));
+    assert.ok(dismissed.length === 2 && marked > dismissed[1], `the chat service was asked before the reply's Done was written, ${how.says}`);
+    assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "201", after_reply: true }]);
+    assert.deepStrictEqual(asked, ["201"]);
+    assert.match(page.el("status").textContent, /^Marked read here and in Discord\./);
+    assert.equal(sideDoneDrawn(page, "201"), "true", `the reply's Done does not show on the right, ${how.says}`);
+    assert.equal(doneDrawn(page, "201"), "true", `the reply's Done does not show on the left, ${how.says}`);
+  }
+  // THE CONTROL: without the right column brought into line, the refused Done still shows there, so the
+  // reply writes none and asks the chat service to mark read a message the server holds no Done for.
+  for (const how of [closedThenReopened, columnsOffThenOn]) {
+    const { page, asked } = await run(how, brokenScript(...RIGHT_FOLLOWS));
+    assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }],
+      `without the right column brought into line the reply wrote a Done, ${how.says}, so this test cannot see it`);
+    assert.deepStrictEqual(asked, ["201"],
+      `without the right column brought into line the chat service was not asked, ${how.says}, so this test cannot see it`);
+    assert.equal(page.dealtWith.has("201"), false);
+  }
+});
+
 // --- `#311 sent-read-waits-for-done` ------------------------------------------------------------
 //
 // Found in review of #295 shift-e-read-collapse. A confirmed send marks read what it answers: Done,

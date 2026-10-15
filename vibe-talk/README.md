@@ -310,9 +310,9 @@ page cannot place at all — read long ago or new, it cannot tell — are taken 
 the Pinned list or either column is drawn so at once in every other view the page holds: Main or All
 loaded earlier in the session, a thread opened before, the right column's thread while two columns are
 put away or show their cards, and the cards' counts of unread replies. Nothing is read for it. A Done or
-an Undo the server refuses is taken back in all of them, the left column included when it was made in
-the right one and that column's thread was closed, or two columns were put away, while it was on its
-way. `#306 done-stale-across-views`; `make -C vibe-talk done-sync-browser` checks it in Chromium on a
+an Undo the server refuses is taken back in all of them, both columns included whatever the right one
+did while it was on its way: its thread closed or opened again, or two columns put away or brought
+back. `#306 done-stale-across-views`; `make -C vibe-talk done-sync-browser` checks it in Chromium on a
 phone, frame by frame as the view is chosen.
 
 Known limits of the counts (`#222 unread-replies`):
