@@ -666,7 +666,11 @@ _FIND_LINK_SELECTION_BYTES_LIMIT = 24 * 1024
 _PROCESS_CENSUS_OBSERVATION_LIMIT = 4 * 1024 * 1024
 # The maps filter receives one exact inode key per selected-tree identity. An
 # eight-tree production cohort used 1,373,358 bytes on 2026-09-24. This remains
-# a per-command ceiling inside the separate operation-wide input budget.
+# a per-command ceiling inside the separate operation-wide input budget, and
+# it is PER SELECTED TREE (_process_census_selection_bytes_limit): one finished
+# validation checkout with its Cargo build held 388,911 inodes (4,666,010 bytes
+# of keys) on 2026-10-15, and a batch of four such checkouts refused every
+# removal with "privileged read-only census input exceeds 16777216 bytes".
 _PROCESS_CENSUS_SELECTION_BYTES_LIMIT = 16 * 1024 * 1024
 # GNU find cannot consume an inode set on stdin. A bounded set of covering
 # ranges keeps the privileged descriptor producer target-aware without risking
@@ -51779,6 +51783,17 @@ BEGIN {
 '''
 
 
+def _process_census_selection_bytes_limit(selected_trees: int) -> int:
+    """The maps filter's input ceiling: one allowance per selected tree.
+
+    Like the batch census's stderr allowance, one tree, or none, gets one
+    allowance and each further tree adds one more; the operation-wide input
+    budget still bounds the census as a whole.
+    """
+
+    return _PROCESS_CENSUS_SELECTION_BYTES_LIMIT * max(1, selected_trees)
+
+
 def _batch_maps_inode_matches(
     processes: Sequence[_AbsentProcessObservation], targets: Mapping[Path, str],
     inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
@@ -51805,7 +51820,7 @@ def _batch_maps_inode_matches(
             Path("/usr/bin/gawk"),
             arguments,
             input_data=pattern_input,
-            input_limit=_PROCESS_CENSUS_SELECTION_BYTES_LIMIT,
+            input_limit=_process_census_selection_bytes_limit(len(targets)),
             budget=budget,
         )
         if rc or stderr:

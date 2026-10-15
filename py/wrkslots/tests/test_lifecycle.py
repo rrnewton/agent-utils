@@ -8255,6 +8255,55 @@ def test_batch_maps_filter_uses_its_bounded_selection_input_ceiling(
     assert observed["budget"] is budget
 
 
+def test_batch_maps_filter_input_ceiling_grows_with_the_selected_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four finished checkouts must fit where one allowance would not.
+
+    2026-10-15: one validation checkout held 388,911 inodes (4,666,010 bytes
+    of maps keys), and a batch of four refused every removal with
+    "privileged read-only census input exceeds 16777216 bytes".
+    """
+
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    observed: list[tuple[int, int]] = []
+
+    def root_command(program: Path, arguments: Sequence[str], **kwargs: object):
+        data = kwargs["input_data"]
+        limit = kwargs["input_limit"]
+        assert isinstance(data, bytes) and isinstance(limit, int)
+        observed.append((len(data), limit))
+        if len(data) > limit:
+            raise wrkslots.Refusal(f"privileged read-only census input exceeds {limit} bytes")
+        return 0, b"", b""
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", root_command)
+    # A small allowance stands in for 16 MiB so the test needs no million inodes.
+    monkeypatch.setattr(wrkslots, "_PROCESS_CENSUS_SELECTION_BYTES_LIMIT", 1000)
+    trees = {tmp_path / f"checkout-{n}": str(tmp_path / f"checkout-{n}") for n in range(4)}
+    # About 300 bytes of inode keys per tree: each tree alone fits one
+    # allowance, all four together do not.
+    inodes = {
+        (48, 10**10 + 1000 * tree + item): ((str(path), "selected file"),)
+        for tree, path in enumerate(trees)
+        for item in range(25)
+    }
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=22,
+        stdout_limit=4096,
+        stderr_limit=4096,
+        input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+
+    assert wrkslots._batch_maps_inode_matches((process,), trees, inodes, budget) == ()
+
+    ((sent, limit),) = observed
+    assert limit == 4 * 1000
+    assert 1000 < sent <= limit
+    assert wrkslots._process_census_selection_bytes_limit(0) == 1000
+    assert wrkslots._process_census_selection_bytes_limit(1) == 1000
+
+
 def test_batch_network_namespace_links_require_complete_generation_bound_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
