@@ -267,6 +267,7 @@ fn message(id: &str, content: &str) -> Message {
         noise: false,
         reactions: None,
         heading: None,
+        mentions: Vec::new(),
     }
 }
 

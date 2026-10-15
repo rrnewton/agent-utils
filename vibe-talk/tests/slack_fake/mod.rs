@@ -85,6 +85,9 @@ pub struct FakeState {
     pub last_read: HashMap<String, String>,
     /// `conversations.info` reports this conversation with `is_member: false`.
     pub not_member: Vec<String>,
+    /// The `name` `conversations.info` reports for a conversation; `general` for one not here.
+    /// `#318 slack-mention-names`.
+    pub conversation_names: HashMap<String, String>,
     /// Every `conversations.mark`, in order: conversation and `ts`.
     pub marks: Vec<(String, String)>,
     /// `chat.postMessage` calls, numbered from 1, answered with HTTP 502, as a gateway that timed
@@ -518,7 +521,11 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
         ),
         "conversations.info" => {
             if state.history.contains_key(&channel) {
-                let mut info = json!({"id": channel, "name": "general", "is_archived": false});
+                let name = state
+                    .conversation_names
+                    .get(&channel)
+                    .map_or("general", String::as_str);
+                let mut info = json!({"id": channel, "name": name, "is_archived": false});
                 if let Some(cursor) = state.last_read.get(&channel) {
                     info["last_read"] = json!(cursor);
                 }

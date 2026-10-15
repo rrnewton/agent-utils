@@ -1042,6 +1042,7 @@ mod tests {
                     noise: false,
                     reactions: None,
                     heading: None,
+                    mentions: Vec::new(),
                 }])
             }
             async fn post_message(

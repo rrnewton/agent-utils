@@ -612,8 +612,13 @@ fn judge(
                 .record(channel, &message.author_id, &message.id, tag);
         }
         let confirmed = |tag: &str| app.headings.confirmed(channel, &message.author_id, tag);
-        (message.content_html, message.heading) =
-            crate::render::headed_body(&message.content, markup, message.author_is_bot, &confirmed);
+        (message.content_html, message.heading) = crate::render::headed_body(
+            &message.content,
+            markup,
+            message.author_is_bot,
+            &confirmed,
+            &message.mentions,
+        );
     }
 }
 
@@ -2201,6 +2206,7 @@ mod tests {
             noise: false,
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         }
     }
 }

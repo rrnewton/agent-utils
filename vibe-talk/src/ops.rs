@@ -307,7 +307,7 @@ fn stamp(state: &AppState, messages: &mut [Message]) {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     for message in messages {
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
-        message.spoken_content = prepared_body(state, &message.content, now_ms);
+        message.spoken_content = prepared_body(state, &message.content, &message.mentions, now_ms);
     }
 }
 
@@ -328,13 +328,22 @@ fn stamp(state: &AppState, messages: &mut [Message]) {
 /// [`Message::spoken_body`] answers both with the raw body. So one branch here turns the pass off
 /// for the page, the digest, the model and the audio route at once, and no reader learns a second
 /// way to be given nothing.
-pub(crate) fn prepared_body(state: &AppState, content: &str, now_ms: i64) -> String {
+///
+/// `mentions` names the people the body's mentions name ([`Message::mentions`]), and each is said
+/// as the name. `#318 slack-mention-names`.
+pub(crate) fn prepared_body(
+    state: &AppState,
+    content: &str,
+    mentions: &[crate::model::MentionName],
+    now_ms: i64,
+) -> String {
     if !state.config.speakable.enabled {
         return String::new();
     }
+    let named = crate::speakable::with_mention_names(content, mentions);
     let said = state
         .spoken_names
-        .for_speech(content, now_ms, &state.config.timezone);
+        .for_speech(&named, now_ms, &state.config.timezone);
     if said == content {
         String::new()
     } else {

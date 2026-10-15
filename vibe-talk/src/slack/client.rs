@@ -127,6 +127,9 @@ pub struct HttpSlackClient {
     /// learned, so the channel browser names it by its members without asking again. `#317
     /// slack-group-dm-names`; see `super::groups`.
     pub(super) group_members: GroupMembers,
+    /// The names of channels messages mention without naming them. `#318 slack-mention-names`;
+    /// see `super::mentions`.
+    pub(super) channel_names: super::mentions::ChannelNames,
     /// Conversations in which a thread root has been seen, so `has_threads` does not flicker
     /// between pages that happen to contain none.
     threaded: Mutex<HashSet<String>>,
@@ -199,6 +202,7 @@ impl HttpSlackClient {
             self_user_id: Mutex::new(None),
             users: Mutex::new(HashMap::new()),
             group_members: GroupMembers::default(),
+            channel_names: super::mentions::ChannelNames::default(),
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
             flat_memory: Mutex::default(),
@@ -462,6 +466,23 @@ impl HttpSlackClient {
             .contains(conversation)
     }
 
+    /// Whether `id`'s name is in the cache, found or not, and still trusted: looking it up costs no
+    /// call. `#318 slack-mention-names`.
+    pub(super) fn knows_user(&self, id: &str) -> bool {
+        self.users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .is_some_and(|cached| {
+                let ttl = if cached.name.is_some() {
+                    USER_CACHE_TTL
+                } else {
+                    USER_FAILURE_TTL
+                };
+                cached.at.elapsed() < ttl
+            })
+    }
+
     /// An author's display name and bot flag from `users.info`, cached; `None` when unknown.
     ///
     /// Never fails a read: a lookup that fails, including on a rate limit, degrades to the raw id
@@ -549,11 +570,16 @@ impl HttpSlackClient {
     ///
     /// Order is preserved. A message with no author of any kind is omitted, with a warning. Every
     /// read of a message passes through here, so each carries the reactions Slack reported on it,
-    /// marked where the owner is among those who reacted (`#312 slack-reactions`).
+    /// marked where the owner is among those who reacted (`#312 slack-reactions`), and who each of
+    /// its mentions names (`#318 slack-mention-names`): the people are looked up with the
+    /// authors, at most [`super::mentions::MENTION_LOOKUPS_MAX`] of them not already known, and
+    /// the channels a mention gives no name are named from `conversations.info`.
     pub(super) async fn messages(&self, channel: &ChannelId, raws: &[Raw]) -> Vec<Message> {
         let mut wanted: Vec<&str> = raws.iter().filter_map(Raw::lookup_needed).collect();
         wanted.sort_unstable();
         wanted.dedup();
+        let mentioned = self.mentions_to_look_up(raws, &wanted);
+        wanted.extend(mentioned);
         let lookups: Vec<_> = wanted.iter().map(|id| self.user(id)).collect();
         let found: Vec<Option<(String, bool)>> = futures_util::stream::iter(lookups)
             .buffered(4)
@@ -564,9 +590,11 @@ impl HttpSlackClient {
             .zip(found)
             .filter_map(|(id, found)| found.map(|found| ((*id).to_owned(), found)))
             .collect();
+        let channels = self.mentioned_channels(raws).await;
         raws.iter()
             .filter_map(|raw| {
-                let message = raw.to_message(channel, &resolved, self.owner_user_id.as_deref());
+                let message =
+                    raw.to_message(channel, &resolved, &channels, self.owner_user_id.as_deref());
                 if message.is_none() {
                     tracing::warn!(ts = %raw.ts, "omitting a Slack message with no author");
                 }
@@ -696,12 +724,17 @@ impl Raw {
     }
 
     /// Map onto the server's [`Message`] for `channel`, for an owner whose Slack id is `owner`.
+    ///
+    /// `resolved` holds the names looked up by user id, for authors and mentions alike, and
+    /// `channels` the names of channels mentioned without one, by channel id.
     pub fn to_message(
         &self,
         channel: &ChannelId,
         resolved: &HashMap<String, (String, bool)>,
+        channels: &HashMap<String, String>,
         owner: Option<&str>,
     ) -> Option<Message> {
+        let text = self.str_field("text").unwrap_or_default();
         let id = ids::micros_message_id(self.micros)?;
         let author_id = self.author_id()?.to_owned();
         let looked_up = resolved.get(&author_id);
@@ -743,7 +776,7 @@ impl Raw {
             // The words, then a line for each file the message shares: a post that is only a file
             // has no words at all (`#313 slack-file-posts`, `super::files`).
             content: super::files::body(
-                super::mrkdwn::to_markdown(self.str_field("text").unwrap_or_default()),
+                super::mrkdwn::to_markdown_with(text, channels),
                 self.value.get("files"),
             ),
             spoken_content: String::new(),
@@ -754,6 +787,9 @@ impl Raw {
             // slack-reactions`; see `super::reactions`.
             reactions: super::reactions::parse(self.value.get("reactions"), owner),
             heading: None,
+            // Who each `<@U…>` in the words names, so the page and speech can say. `#318
+            // slack-mention-names`; see `super::mentions`.
+            mentions: super::mentions::names_for(text, resolved),
         })
     }
 }

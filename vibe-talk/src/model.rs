@@ -268,6 +268,73 @@ pub struct Message {
     /// exactly as before when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heading: Option<Heading>,
+    /// Who each user mention in `content` names, as the provider resolved it: `<@U0123ABCD>` is
+    /// "Ada Lovelace". `#318 slack-mention-names`.
+    ///
+    /// `content` keeps the mention itself, `<@id>`, on purpose: a reply that quotes it notifies the
+    /// same person, and a post says exactly what was written. The name is for showing and saying:
+    /// [`crate::render`] draws the chip as `@Ada Lovelace`, speech says "Ada Lovelace" where it
+    /// said "a mention" ([`crate::ops`]), and a model is shown the name beside the mention
+    /// ([`crate::untrusted::render_for_model`]).
+    ///
+    /// Empty from a provider that resolves none, and a mention whose name could not be had is
+    /// simply not listed: it is drawn as its id and said as "a mention", as before. UNTRUSTED:
+    /// each name is chosen by the person it names.
+    ///
+    /// NOT SENT TO THE PAGE. What the page shows of it is already in `content_html` and
+    /// `spoken_content`, which are made from it on the server, so a second copy of every name
+    /// would be bytes down a phone's connection that say nothing new. The cache keeps it.
+    #[serde(skip)]
+    pub mentions: Vec<MentionName>,
+}
+
+/// Who one user mention names. `#318 slack-mention-names`; see [`Message::mentions`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionName {
+    /// The mentioned account's id, exactly as it appears inside `<@…>` in `content`.
+    pub id: String,
+    /// Its display name, one line of plain text. UNTRUSTED: chosen by the person it names.
+    pub name: String,
+}
+
+impl MentionName {
+    /// `text` with each user mention that `mentions` names written as `prefix` and the name:
+    /// `<@U0123ABCD> can you look` as `@Ada Lovelace can you look` with `@`. A mention the list
+    /// does not name, a role and a channel are left as written.
+    #[must_use]
+    pub fn write_names<'t>(
+        text: &'t str,
+        mentions: &[MentionName],
+        prefix: &str,
+    ) -> std::borrow::Cow<'t, str> {
+        if mentions.is_empty() || !text.contains("<@") {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find("<@") {
+            out.push_str(&rest[..at]);
+            let tail = &rest[at..];
+            let named = crate::discord::markup::mention_at(tail).and_then(|(length, chip)| {
+                let id = chip.strip_prefix('@')?;
+                let mention = mentions.iter().find(|mention| mention.id == id)?;
+                Some((length, mention.name.as_str()))
+            });
+            match named {
+                Some((length, name)) => {
+                    out.push_str(prefix);
+                    out.push_str(name);
+                    rest = &tail[length..];
+                }
+                None => {
+                    out.push_str("<@");
+                    rest = &tail[2..];
+                }
+            }
+        }
+        out.push_str(rest);
+        std::borrow::Cow::Owned(out)
+    }
 }
 
 /// What a message's first line says about it, lifted out for the row's header. `#242
@@ -453,6 +520,7 @@ mod tests {
             noise: false,
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         }
     }
 

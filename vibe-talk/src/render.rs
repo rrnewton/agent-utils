@@ -90,7 +90,7 @@ use comrak::{Arena, Options};
 
 use crate::config::Config;
 use crate::heading::HeadingTags;
-use crate::model::{ChannelInfo, Message};
+use crate::model::{ChannelInfo, MentionName, Message};
 
 /// How one provider writes message text, where that differs from GitHub-flavoured Markdown.
 ///
@@ -225,8 +225,13 @@ pub fn fill(
     }
     for message in messages {
         let confirmed = |tag: &str| headings.confirmed(&channel.id, &message.author_id, tag);
-        (message.content_html, message.heading) =
-            headed_body(&message.content, markup, message.author_is_bot, &confirmed);
+        (message.content_html, message.heading) = headed_body(
+            &message.content,
+            markup,
+            message.author_is_bot,
+            &confirmed,
+            &message.mentions,
+        );
     }
 }
 
@@ -276,15 +281,18 @@ pub fn fill_pins<'p>(
             Cow::Borrowed(&snapshot.content)
         };
         let confirmed = |tag: &str| headings.confirmed(&channel.id, &snapshot.author_id, tag);
+        // A pin keeps the text it was pinned with and not who its mentions named: its chips are
+        // drawn by id.
         (pin.content_html, pin.heading) =
-            headed_body(&text, markup, snapshot.author_is_bot, &confirmed);
+            headed_body(&text, markup, snapshot.author_is_bot, &confirmed, &[]);
     }
 }
 
 /// [`body_html`] together with the heading the text opens with, when one is found and its words
 /// can be marked in the body. `#242 rich-headers`. `bot` and `confirmed` are
 /// [`crate::heading::extract`]'s: whether the author is a bot account, and whether a paren tag
-/// counts.
+/// counts. `mentions` names the people the text's mentions name, whose chips are drawn with
+/// their names ([`to_html_named`]).
 ///
 /// THE BODY IS NOT CUT. The words the heading restates, `text[..cut]`, stay in it, so a page that
 /// does not show the heading draws exactly what it drew before. They are marked instead, so a page
@@ -304,8 +312,9 @@ pub fn headed_body(
     markup: Markup,
     bot: bool,
     confirmed: &dyn Fn(&str) -> bool,
+    mentions: &[MentionName],
 ) -> (String, Option<crate::model::Heading>) {
-    let html = to_html(text, markup);
+    let html = to_html_named(text, markup, mentions);
     let plain = html == plain_html(text);
     let Some(found) = crate::heading::extract(text, bot, confirmed) else {
         return (if plain { String::new() } else { html }, None);
@@ -314,7 +323,7 @@ pub fn headed_body(
     if plain {
         return (String::new(), Some(heading));
     }
-    match mark_restated(&html, &text[..found.cut], markup) {
+    match mark_restated(&html, &text[..found.cut], markup, mentions) {
         Some(marked) => (marked, Some(heading)),
         None => (html, None),
     }
@@ -331,8 +340,13 @@ pub const RESTATED_CLASS: &str = "rh-src";
 /// else. What follows it must be the rest of the line (a space), the line's end (a line break), or
 /// the paragraph's end. The marked string is then put through the sanitizer again and must come out
 /// unchanged, so nothing reaches the page that the sanitizer did not write.
-fn mark_restated(html: &str, prefix: &str, markup: Markup) -> Option<String> {
-    let alone = to_html(prefix, markup);
+fn mark_restated(
+    html: &str,
+    prefix: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+) -> Option<String> {
+    let alone = to_html_named(prefix, markup, mentions);
     let words = alone.strip_prefix("<p>")?.strip_suffix("</p>\n")?;
     if words.contains("<p>") || words.contains("</p>") {
         return None;
@@ -371,6 +385,14 @@ pub fn body_html(text: &str, markup: Markup) -> String {
 /// note, the [`plain_html`] the page would draw without it.
 #[must_use]
 pub fn to_html(text: &str, markup: Markup) -> String {
+    to_html_named(text, markup, &[])
+}
+
+/// [`to_html`], drawing each user mention that `mentions` names as the person's name rather than
+/// their id: `<@U0123ABCD>` is the chip `@Ada Lovelace`. `#318 slack-mention-names`. A mention it
+/// does not name is drawn by id, as every mention was before.
+#[must_use]
+pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
     if text.len() > MAX_RENDERED_BYTES {
         return plain_html(text);
     }
@@ -392,7 +414,7 @@ pub fn to_html(text: &str, markup: Markup) -> String {
             }
         }
     }
-    adjust(&arena, root, &source, &inserted, markup);
+    adjust(&arena, root, &source, &inserted, markup, mentions);
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
         return plain_html(text);
@@ -675,6 +697,7 @@ fn adjust<'a>(
     source: &str,
     inserted: &[usize],
     markup: Markup,
+    mentions: &[MentionName],
 ) {
     let lines = line_starts(source);
     nest_lists(
@@ -751,7 +774,7 @@ fn adjust<'a>(
                 label_link(node);
             }
             NodeValue::Text(text) => {
-                let pieces = mention_pieces(text);
+                let pieces = mention_pieces(text, mentions);
                 drop(ast);
                 if pieces.iter().any(|piece| matches!(piece, Piece::Chip(_))) {
                     replace_with(arena, node, pieces);
@@ -874,14 +897,15 @@ fn merge_text<'a>(root: &'a AstNode<'a>) {
     }
 }
 
-/// One piece of a text node: words, or a chip.
+/// One piece of a text node: words, or a chip and the text it shows.
 enum Piece {
     Text(String),
     Chip(String),
 }
 
-/// A text node's text, cut at every mention.
-fn mention_pieces(text: &str) -> Vec<Piece> {
+/// A text node's text, cut at every mention. A user mention `mentions` names shows `@` and the
+/// name; any other shows its id with `@` or `#`.
+fn mention_pieces(text: &str, mentions: &[MentionName]) -> Vec<Piece> {
     let mut pieces = Vec::new();
     let mut plain = String::new();
     let mut rest = text;
@@ -893,7 +917,13 @@ fn mention_pieces(text: &str) -> Vec<Piece> {
                 if !plain.is_empty() {
                     pieces.push(Piece::Text(std::mem::take(&mut plain)));
                 }
-                pieces.push(Piece::Chip(chip));
+                let named = chip.strip_prefix('@').and_then(|id| {
+                    mentions
+                        .iter()
+                        .find(|mention| mention.id == id)
+                        .map(|mention| format!("@{}", mention.name))
+                });
+                pieces.push(Piece::Chip(named.unwrap_or(chip)));
                 rest = &tail[length..];
             }
             None => {
@@ -911,16 +941,19 @@ fn mention_pieces(text: &str) -> Vec<Piece> {
 
 /// Put `pieces` where `node` was.
 ///
-/// A chip is a raw node, written verbatim: its text is the mention's id with `@` or `#`, which
-/// [`crate::discord::markup::mention_at`] admits only as ASCII letters and digits, so there is
-/// nothing in it to escape — and the sanitizer still reads it, keeping the `span` and its one
-/// allowed class and nothing else.
+/// A chip is a raw node: its text is the mention's id with `@` or `#`, which
+/// [`crate::discord::markup::mention_at`] admits only as ASCII letters and digits, or `@` and the
+/// name of the person it names, which is anybody's choice and is escaped here. The sanitizer still
+/// reads it, keeping the `span` and its one allowed class and nothing else.
 fn replace_with<'a>(arena: &'a Arena<'a>, node: &'a AstNode<'a>, pieces: Vec<Piece>) {
     for piece in pieces {
         let value = match piece {
             Piece::Text(text) => NodeValue::Text(text.into()),
             Piece::Chip(chip) => {
-                NodeValue::Raw(format!("<span class=\"{MENTION_CLASS}\">{chip}</span>"))
+                let mut raw = format!("<span class=\"{MENTION_CLASS}\">");
+                escape_text(&mut raw, &chip);
+                raw.push_str("</span>");
+                NodeValue::Raw(raw)
             }
         };
         node.insert_before(arena.alloc(value.into()));
@@ -1725,6 +1758,53 @@ mod tests {
             format!("<p><a href=\"https://example.com/g.png\" {LINK}>the graph</a></p>\n")
         );
         assert!(!html("![x](javascript:alert(1))").contains("<a"));
+    }
+
+    #[test]
+    fn a_named_mention_is_drawn_as_the_name_escaped_and_any_other_by_its_id() {
+        // `#318 slack-mention-names`.
+        let named = |id: &str, name: &str| crate::model::MentionName {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        };
+        let mentions = [
+            named("U0ADA0001", "Ada Lovelace"),
+            named("U0EVIL001", "<b>bold</b> & co"),
+        ];
+        assert_eq!(
+            super::to_html_named(
+                "hi <@U0ADA0001>, <@U0EVIL001> and <@U0GHOST01> in <#C0123>",
+                Markup::Slack,
+                &mentions
+            ),
+            "<p>hi <span class=\"mention\">@Ada Lovelace</span>, <span class=\"mention\">@&lt;b&gt;bold\
+             &lt;/b&gt; &amp; co</span> and <span class=\"mention\">@U0GHOST01</span> in \
+             <span class=\"mention\">#C0123</span></p>\n"
+        );
+        // The negative control: with no names, every mention is its id, as before.
+        assert_eq!(
+            to_html("hi <@U0ADA0001>", Markup::Slack),
+            "<p>hi <span class=\"mention\">@U0ADA0001</span></p>\n"
+        );
+        // A name inside code is not a mention at all.
+        assert_eq!(
+            super::to_html_named("`<@U0ADA0001>`", Markup::Slack, &mentions),
+            "<p><code>&lt;@U0ADA0001&gt;</code></p>\n"
+        );
+        // A heading still finds the words it restates when the line names somebody.
+        let (html, heading) = super::headed_body(
+            "[build-bot] <@U0ADA0001> please look",
+            Markup::Slack,
+            true,
+            &|_| true,
+            &mentions,
+        );
+        assert_eq!(
+            html,
+            "<p><span class=\"rh-src\">[build-bot] </span><span class=\"mention\">@Ada \
+             Lovelace</span> please look</p>\n"
+        );
+        assert!(heading.is_some(), "{html}");
     }
 
     #[test]
@@ -2836,7 +2916,7 @@ mod tests {
     // ---- `#242 rich-headers`: the words a heading restates, marked --------------------------
 
     fn headed(text: &str, markup: Markup) -> (String, Option<crate::model::Heading>) {
-        super::headed_body(text, markup, true, &|_| true)
+        super::headed_body(text, markup, true, &|_| true, &[])
     }
 
     /// `html` with the restated words unmarked: what the page draws with rich headers off.

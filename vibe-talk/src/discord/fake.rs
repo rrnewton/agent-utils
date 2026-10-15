@@ -402,6 +402,7 @@ impl FakeDiscord {
             content: content.to_owned(),
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         });
         id
     }

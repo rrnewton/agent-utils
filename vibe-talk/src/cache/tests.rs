@@ -823,6 +823,44 @@ fn a_copy_that_cannot_see_reactions_never_erases_held_ones() {
 }
 
 #[test]
+fn a_copy_that_named_no_mention_never_erases_names_a_read_found() {
+    // `#318 slack-mention-names`. A live copy, or one from a path that resolves no names, keeps
+    // the names a read found; a copy that names them anew replaces them.
+    let fx = Fixture::new("cache-mention-names");
+    let ada = |name: &str| {
+        vec![crate::model::MentionName {
+            id: "U0ADA0001".to_owned(),
+            name: name.to_owned(),
+        }]
+    };
+    let named = Message {
+        content: "ask <@U0ADA0001>".to_owned(),
+        mentions: ada("Ada Lovelace"),
+        ..m(1)
+    };
+    fx.list(vec![named], T0, None);
+    let unnamed = Message {
+        content: "ask <@U0ADA0001>".to_owned(),
+        ..m(1)
+    };
+    fx.list(vec![unnamed], T0 + 100, None);
+    assert_eq!(
+        held(&fx, "m1").expect("held").message.mentions,
+        ada("Ada Lovelace")
+    );
+    let renamed = Message {
+        content: "ask <@U0ADA0001>".to_owned(),
+        mentions: ada("Ada King"),
+        ..m(1)
+    };
+    fx.list(vec![renamed], T0 + 200, None);
+    assert_eq!(
+        held(&fx, "m1").expect("held").message.mentions,
+        ada("Ada King")
+    );
+}
+
+#[test]
 fn a_message_reads_back_exactly_as_the_client_produced_it_minus_derived_fields() {
     let fx = Fixture::new("cache-roundtrip");
     let mut original = reply("r9", "m1", "hello **there**", T0 + 7);
@@ -835,6 +873,12 @@ fn a_message_reads_back_exactly_as_the_client_produced_it_minus_derived_fields()
         count: 1,
         owner_reacted: true,
     }]);
+    // `#318 slack-mention-names`: who a mention names comes back with the message.
+    original.content = "hello **there** <@U0ADA0001>".to_owned();
+    original.mentions = vec![crate::model::MentionName {
+        id: "U0ADA0001".to_owned(),
+        name: "Ada Lovelace".to_owned(),
+    }];
     let mut decorated = original.clone();
     decorated.spoken_time = "09:51".to_owned();
     decorated.spoken_content = "hello there".to_owned();

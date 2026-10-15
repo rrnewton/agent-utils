@@ -39,6 +39,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         }),
         reactions: None,
         heading: None,
+        mentions: Vec::new(),
     }
 }
 

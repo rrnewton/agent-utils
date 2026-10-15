@@ -892,6 +892,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         noise: false,
         reactions: parse_reactions(value.get("reactions")),
         heading: None,
+        mentions: Vec::new(),
     })
 }
 

@@ -79,6 +79,7 @@ fn message(id: &str) -> Message {
         noise: false,
         reactions: None,
         heading: None,
+        mentions: Vec::new(),
     }
 }
 

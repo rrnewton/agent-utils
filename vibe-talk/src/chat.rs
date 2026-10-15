@@ -2270,6 +2270,7 @@ mod lookup_tests {
             thread: None,
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         }
     }
 
@@ -2601,6 +2602,7 @@ mod threads_tests {
             reply_to: None,
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         }
     }
 

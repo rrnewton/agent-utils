@@ -202,6 +202,7 @@ mod tests {
             noise: false,
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         }
     }
 

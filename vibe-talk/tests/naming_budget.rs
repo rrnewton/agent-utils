@@ -91,6 +91,7 @@ fn message(channel: &str, id: &str, content: &str) -> Message {
         noise: false,
         reactions: None,
         heading: None,
+        mentions: Vec::new(),
     }
 }
 

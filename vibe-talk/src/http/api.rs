@@ -454,6 +454,7 @@ pub async fn ingest_event(
                 noise: false,
                 reactions: None,
                 heading: None,
+                mentions: Vec::new(),
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }
@@ -505,6 +506,7 @@ pub async fn ingest_event(
         message.spoken_content = ops::prepared_body(
             &state,
             &message.content,
+            &message.mentions,
             jiff::Timestamp::now().as_millisecond(),
         );
     }
@@ -3993,7 +3995,11 @@ pub async fn prepare_speech(
         let Some(message) = found.messages.get(id) else {
             continue;
         };
-        let said = crate::speakable::for_speech(&message.content, now, &state.config.timezone);
+        let said = crate::speakable::for_speech(
+            &crate::speakable::with_mention_names(&message.content, &message.mentions),
+            now,
+            &state.config.timezone,
+        );
         if said.trim().is_empty() {
             continue;
         }

@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ChannelId, Message, MessageId, Reaction, UserId};
+use crate::model::{ChannelId, MentionName, Message, MessageId, Reaction, UserId};
 use crate::threads::MessageThread;
 
 /// A channel as the cache names it: the provider it belongs to, and its id there.
@@ -139,6 +139,9 @@ pub(crate) struct Extra {
     /// Reaction tallies, when the source could see them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reactions: Option<Vec<Reaction>>,
+    /// Who the message's mentions name, as [`Message::mentions`]. `#318 slack-mention-names`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mentions: Vec<MentionName>,
 }
 
 /// Provider creation time, derived as `ops::message_ms` derives it: the id's own time first (a
@@ -203,6 +206,7 @@ pub(crate) fn reconstruct(
         noise: false,
         reactions: extra.reactions,
         heading: None,
+        mentions: extra.mentions,
     }
 }
 

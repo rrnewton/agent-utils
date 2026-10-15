@@ -1262,6 +1262,7 @@ impl Writer<'_> {
                     timestamp: message.timestamp.clone(),
                     thread: message.thread.clone(),
                     reactions: message.reactions.clone(),
+                    mentions: message.mentions.clone(),
                 })
                 .unwrap_or_else(|_| "{}".to_owned());
                 let search_text = self.search_text(&chan.provider_key, message);
@@ -1385,6 +1386,13 @@ impl Writer<'_> {
                 thread: message.thread.clone().or(held_extra.thread),
                 // A copy that could not see reactions never erases ones a read brought.
                 reactions: message.reactions.clone().or(held_extra.reactions),
+                // Nor does a copy that named no mention erase the names a read found: a name is
+                // only drawn for a mention the text still holds. `#318 slack-mention-names`.
+                mentions: if message.mentions.is_empty() {
+                    held_extra.mentions
+                } else {
+                    message.mentions.clone()
+                },
             })
             .unwrap_or(held.extra.clone());
         }

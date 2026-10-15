@@ -103,6 +103,7 @@ fn message(
         noise: false,
         reactions: None,
         heading: None,
+        mentions: Vec::new(),
     }
 }
 

@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `<https://x|label>` | `[label](https://x)` |
 //! | `<https://x>` | `https://x` |
-//! | `<#C123|general>` / `<#C123>` | `#general` / `#C123` |
+//! | `<#C123|general>` / `<#C123>` | `#general` / `#general` when its name could be read, else `#C123` |
 //! | `<!here>` `<!channel>` `<!everyone>` | `@here` `@channel` `@everyone` |
 //! | `<!subteam^S1|@ops>` | `@ops` |
 //! | `<!date^…|fallback>` | `fallback` |
@@ -16,18 +16,29 @@
 //! | `&amp;` `&lt;` `&gt;` | `&` `<` `>` |
 //!
 //! User mentions are kept verbatim because vibe-talk's mention syntax is the same `<@id>`: a reply
-//! that quotes one notifies the same person in Slack, and the speech preparer already reads it as
-//! "a mention". Emphasis markers are left alone here, because the two dialects use the same
+//! that quotes one notifies the same person in Slack. Who it names travels beside the body, in
+//! [`crate::model::Message::mentions`], so the page draws it and speech says it as the person's
+//! name (`#318 slack-mention-names`, [`super::mentions`]). A channel mention Slack sends without its
+//! name, `<#C123>` or `<#C123|>`, is given the name `conversations.info` reports for it, when the
+//! read could learn one. Emphasis markers are left alone here, because the two dialects use the same
 //! characters and the speech preparer strips them either way; what they MEAN differs — `*a*` is
 //! bold in Slack and italic in Markdown — and that is settled where bodies are drawn, by
 //! [`crate::render::Markup::asterisk_is_bold`].
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// Rewrite Slack `mrkdwn` into the Discord-markdown forms the rest of the server reads.
 #[must_use]
 pub fn to_markdown(text: &str) -> String {
+    to_markdown_with(text, &HashMap::new())
+}
+
+/// [`to_markdown`], naming a channel mentioned without its name from `channels`, by id.
+/// `#318 slack-mention-names`.
+#[must_use]
+pub fn to_markdown_with(text: &str, channels: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('<') {
@@ -35,7 +46,7 @@ pub fn to_markdown(text: &str) -> String {
         let after = &rest[open + 1..];
         match after.find(['>', '<']) {
             Some(close) if after.as_bytes()[close] == b'>' => {
-                out.push_str(&token(&after[..close]));
+                out.push_str(&token(&after[..close], channels));
                 rest = &after[close + 1..];
             }
             _ => {
@@ -50,7 +61,7 @@ pub fn to_markdown(text: &str) -> String {
 }
 
 /// One `<…>` token, without its brackets.
-fn token(inner: &str) -> String {
+fn token(inner: &str, channels: &HashMap<String, String>) -> String {
     let (target, label) = match inner.split_once('|') {
         Some((target, label)) => (target, Some(decode_entities(label))),
         None => (inner, None),
@@ -61,7 +72,13 @@ fn token(inner: &str) -> String {
         return format!("<@{user}>");
     }
     if let Some(channel) = target.strip_prefix('#') {
-        return format!("#{}", label.unwrap_or_else(|| channel.to_owned()));
+        // Slack may send a channel mention with an empty label, `<#C123|>`, which is no name at
+        // all: the name the read looked up, else the id, as with no label.
+        let name = label
+            .filter(|label| !label.trim().is_empty())
+            .or_else(|| channels.get(channel).cloned())
+            .unwrap_or_else(|| channel.to_owned());
+        return format!("#{name}");
     }
     if let Some(special) = target.strip_prefix('!') {
         return match special {
@@ -250,11 +267,32 @@ fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::HashMap;
 
     use super::angle_links_outside;
 
     fn angle_links(text: &str) -> Cow<'_, str> {
         angle_links_outside(text, &[])
+    }
+
+    #[test]
+    fn a_channel_mention_is_named_by_its_label_else_by_the_name_looked_up_else_by_its_id() {
+        // `#318 slack-mention-names`. An empty label is no name: it used to read as a bare `#`.
+        let looked_up: HashMap<String, String> =
+            [("C0456EFGH".to_owned(), "ops".to_owned())].into();
+        assert_eq!(
+            super::to_markdown_with(
+                "<#C0123ABCD|general> <#C0456EFGH> <#C0456EFGH|> <#C0789IJKL|> <#C0789IJKL>",
+                &looked_up
+            ),
+            "#general #ops #ops #C0789IJKL #C0789IJKL"
+        );
+        assert_eq!(super::to_markdown("<#C0789IJKL|>"), "#C0789IJKL");
+        // A user group carries its handle; a user mention is kept as it is.
+        assert_eq!(
+            super::to_markdown("<!subteam^S0123|@ops> <!subteam^S0456|eng> <@U0123ABCD>"),
+            "@ops @eng <@U0123ABCD>"
+        );
     }
 
     #[test]

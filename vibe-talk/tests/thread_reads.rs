@@ -93,6 +93,7 @@ impl Thread {
             reply_to: None,
             reactions: None,
             heading: None,
+            mentions: Vec::new(),
         }
     }
 

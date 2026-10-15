@@ -7,7 +7,7 @@
 //! | Method | Used for |
 //! |---|---|
 //! | `auth.test` | [`crate::chat::ChatClient::identity`], and the account this client posts as |
-//! | `conversations.info` | verifying a conversation before it is registered |
+//! | `conversations.info` | verifying a conversation before it is registered, and naming a channel a message mentions without its name |
 //! | `conversations.history` | a conversation's main timeline, the thread list, reply targets |
 //! | `conversations.replies` | a thread's messages, thread membership checks, exact lookups |
 //!
@@ -18,7 +18,7 @@
 //! replies of only the threads whose root moved (`slack/live.rs`); a read of the newest messages
 //! adds the replies Flat holds for the threads active among them (`slack/timeline.rs`).
 //! | `chat.postMessage` | every post, in a conversation or in a thread |
-//! | `users.info` | an author's display name when the message does not carry one |
+//! | `users.info` | an author's display name when the message does not carry one, and who a mention names |
 //! | `users.conversations` | the channel browser |
 //! | `conversations.members` | a group DM's members, to name it by them in the channel browser (`slack/groups.rs`) |
 //! | `conversations.mark` | clearing unread in Slack, only with `upstream_clear` on (`slack/clear.rs`) |
@@ -33,6 +33,14 @@
 //! [`crate::model::MessageId`] that orders, pages and dates exactly as the `ts` does; see
 //! [`ids`]. A whole conversation's channel id is its Slack id, and a channel narrowed to one
 //! thread is `"{conversation}~{thread_ts}"`. Thread ids in the thread APIs are root `ts` values.
+//!
+//! # Mentions
+//!
+//! A user mention stays `<@U…>` in a message's body, so a reply that quotes it notifies the same
+//! person; each read also says who it names, from the `users.info` cache, so the page draws
+//! `@Ada Lovelace` and speech says the name (`#318 slack-mention-names`, `slack/mentions.rs`). At
+//! most 25 people a read are looked up who have not been already, best effort. A channel mention
+//! Slack sends without its name is named from `conversations.info`.
 //!
 //! # Reactions
 //!
@@ -67,6 +75,7 @@ mod history;
 pub mod ids;
 mod live;
 mod lookup;
+mod mentions;
 pub mod mrkdwn;
 mod range;
 mod reactions;

@@ -165,6 +165,21 @@ impl SharedNames {
     }
 }
 
+/// `content` with each user mention that `mentions` names replaced by that name, so speech says
+/// the person rather than "a mention": `<@U0123ABCD> can you look` is said "Ada Lovelace can you
+/// look". `#318 slack-mention-names`.
+///
+/// Before [`for_speech`], which then reads the name as the words it is. A mention the list does
+/// not name is left for [`for_speech`] to say as "a mention", as before; so are a role and a
+/// channel.
+#[must_use]
+pub fn with_mention_names<'c>(
+    content: &'c str,
+    mentions: &[crate::model::MentionName],
+) -> std::borrow::Cow<'c, str> {
+    crate::model::MentionName::write_names(content, mentions, "")
+}
+
 /// Rewrite a message so it can be read aloud, naming opaque strings in a fresh table.
 ///
 /// `now_ms` is the instant to measure "ago" against, passed in rather than read from the clock so
@@ -1046,6 +1061,27 @@ mod tests {
 
     fn say(text: &str) -> String {
         for_speech(text, NOW, &eastern())
+    }
+
+    #[test]
+    fn a_named_mention_is_said_as_the_name_and_any_other_as_a_mention() {
+        // `#318 slack-mention-names`.
+        let ada = [crate::model::MentionName {
+            id: "U0ADA0001".to_owned(),
+            name: "Ada Lovelace".to_owned(),
+        }];
+        let said = |text: &str| say(&super::with_mention_names(text, &ada));
+        assert_eq!(
+            said("<@U0ADA0001> can you look? thanks <@U0ADA0001>!"),
+            "Ada Lovelace can you look? thanks Ada Lovelace!"
+        );
+        assert_eq!(said("ask <@U0GHOST01>"), "ask a mention");
+        assert_eq!(said("<@&123> and <#456>"), "a role and a channel");
+        // Nothing to name: the very same text, not a copy.
+        assert!(matches!(
+            super::with_mention_names("ask <@U0ADA0001>", &[]),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

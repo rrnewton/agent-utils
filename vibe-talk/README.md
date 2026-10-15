@@ -1173,6 +1173,18 @@ escaped, as `@everyone` is suppressed on Discord.
 bot, file-share, `/me` and thread-broadcast messages are kept. Slack's link, channel and
 group-mention markup is rewritten into the markdown the rest of the app reads.
 
+**Mentions.** `#318 slack-mention-names`. A user mention stays `<@U…>` in the message's text, so a
+reply that quotes it notifies the same person and what is posted is what was written; but it is
+drawn as the person's name, `@Ada Lovelace`, said as "Ada Lovelace" rather than "a mention", and
+shown to the voice agent beside the mention as `(mentions: <@U…> is Ada Lovelace)`. The name comes
+from `users.info`, through the same cache as authors' names (an hour, a failure five minutes);
+a read looks up at most 25 people not already known, best effort, and a later read names the
+rest. A mention nobody can name is drawn as its id and said as "a mention", as before. A channel
+mention Slack sends without its name, `<#C…>` or `<#C…|>`, is named from `conversations.info`
+(at most ten channels a read, remembered for an hour) and shown as `#name`; a user group's
+mention carries its handle and is shown as `@ops`. A pin keeps the text it was pinned with, and
+draws its mentions by id.
+
 **Reactions.** `#312 slack-reactions`. Slack lists each message's reactions on every read of it,
 as `reactions: [{name, count, users}]`, and the app shows them under the message in every view,
 replies included, and on the messages and replies the live poll delivers. No scope beyond the
@@ -1421,11 +1433,11 @@ is what one push does at Slack:
 | Method | Parameters used |
 |---|---|
 | `auth.test` | — |
-| `conversations.info` | `channel`; with `upstream_clear` on, its `channel` must carry `last_read` |
+| `conversations.info` | `channel`; with `upstream_clear` on, its `channel` must carry `last_read`; also asked for the `name` of a channel a message mentions without one |
 | `conversations.history` | `channel`, `limit`, `cursor`, `oldest`, `latest`, `inclusive`; with `live_poll_seconds` set, each poll reads the newest page with no `oldest`, and a thread's new replies arrive live only when its root there carries `thread_ts` and `reply_count`, and its thread is read when the root's `latest_reply` moves (or, for a root that names none, when its count changes); see [Live thread replies](#live-thread-replies) |
 | `conversations.replies` | `channel`, `ts`, `limit`, `cursor`, `oldest`, `latest`, `inclusive`; with `live_poll_seconds` set, also read by each poll for at most four threads whose root moved, with `oldest` at the newest reply already delivered |
 | `chat.postMessage` | `channel`, `text`, `thread_ts` |
-| `users.info` | `user` |
+| `users.info` | `user`; for authors, the people messages mention, and group DM members |
 | `users.conversations` | `types`, `limit`, `cursor`, `exclude_archived` |
 | `conversations.mark` | `channel`, `ts`; called only with `upstream_clear` on, and answering `{ok:true}` |
 | `conversations.members` | `channel`, `limit`, `cursor`; called by the channel browser for each group DM, to name it by its members; a bridge without it leaves group DMs named by their handles |
@@ -4803,7 +4815,8 @@ per line, and drew lists as literal dashes and ran paragraphs together; it rende
 live stream, a post's answer and the pins — and sends it beside the text as `content_html`:
 
 1. The provider's own syntax is turned into Markdown first. Every provider's mention, `<@id>` or
-   `<#id>`, becomes a chip showing the id; a `<https://…|label>` link from Google Chat or Slack
+   `<#id>`, becomes a chip showing the id, or, for a user the provider named
+   (`#318 slack-mention-names`), `@` and the person's name; a `<https://…|label>` link from Google Chat or Slack
    becomes a link named by its label — or, when the label is the address itself, a link whose
    text is its address — except inside code, where it is shown as written.
 2. [comrak](https://github.com/kivikakk/comrak) parses GitHub-flavoured Markdown — tables,

@@ -30,7 +30,7 @@ use super::history::{Feed, SCAN_PAGE_LIMIT};
 use super::ids::{self, ChannelRef};
 use crate::chat::{ChatError, RegisteredChannel};
 use crate::directory::{DirectoryEntry, DirectoryPage, DirectoryRequest, MAX_NAME_CHARS};
-use crate::model::{ChannelId, Message, MessageId};
+use crate::model::{ChannelId, MentionName, Message, MessageId};
 use crate::threads::{ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView};
 
 /// The most entries one timeline page returns.
@@ -201,13 +201,17 @@ pub(super) fn cursor_micros(id: &MessageId) -> Result<i64, ChatError> {
 
 /// The first line of a root, trimmed to [`THREAD_TITLE_CHARS`]; for a root that is only files, its
 /// first file's name and kind as text (`#313 slack-file-posts`), since a file line's Markdown would
-/// show its address.
+/// show its address. A mention in it is written as the person's name, `@Ada Lovelace`, where the
+/// read could name it (`#318 slack-mention-names`).
 fn title(raw: &Raw, root: Option<&Message>) -> String {
     let files = super::files::plain_title(&raw.value);
+    let named = root.map(|root| MentionName::write_names(&root.content, &root.mentions, "@"));
     let line = files
         .as_deref()
         .or_else(|| {
-            root.and_then(|root| root.content.lines().map(str::trim).find(|l| !l.is_empty()))
+            named
+                .as_deref()
+                .and_then(|text| text.lines().map(str::trim).find(|l| !l.is_empty()))
         })
         .unwrap_or("");
     if line.is_empty() {

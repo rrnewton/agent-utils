@@ -44,6 +44,7 @@ fn message(id: &str) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         heading: None,
+        mentions: Vec::new(),
         noise: false,
         reactions: None,
     }
