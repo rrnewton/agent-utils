@@ -691,10 +691,18 @@ class FakeElement {
     return this.tagName === "#text" ? 3 : 1;
   }
 
-  /** The height of everything inside, ignoring any clamp on this element itself. */
+  /**
+   * The height of everything inside, ignoring any clamp on this element itself.
+   *
+   * `#269 approval-card-inline` x `#280 scroll-stability`. An element a test gives `wrapAt`, a function
+   * saying how many characters a line of it holds where it stands now, wraps its own text at that: the
+   * one way this model draws something at another width, as two columns draw the left column's list at
+   * half the window's.
+   */
   contentHeight() {
+    const perLine = typeof this.wrapAt === "function" ? this.wrapAt() : CHARS_PER_LINE;
     const own = this.textContent.length
-      ? Math.ceil(this.textContent.length / CHARS_PER_LINE) * LINE_PX
+      ? Math.ceil(this.textContent.length / perLine) * LINE_PX
       : 0;
     // A line drawn between rows is placed outside its row's box, in a margin the row keeps for it.
     return this.children.reduce((total, kid) => total + (kid.isRowSeam() ? 0 : kid.outerHeight()), own);
@@ -65271,6 +65279,202 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHOSE SCRE
   const always = await run(brokenScript(
     "  const card = seen.length === 0 ? channelCard() : null;\n", "  const card = channelCard();\n"));
   assert.deepStrictEqual(always, { ...real, byRow: false });
+});
+
+// `#269 approval-card-inline` x `#280 scroll-stability`, from review of the rebase onto #304 back-gesture-in-app.
+// Two columns draw the left column at half the window's width, and the send card at the foot of its list
+// with it: a long draft opened by More was 519px tall in All at 1280x800 in Chromium and 580px beside a
+// thread. The change of layout read the reader's place only once the column had narrowed, so a reader at
+// the foot of All, card open, read as 61px above it, on two replies Main lacks: Ctrl+4 put Main back where
+// it was last left, 326px above its foot, Send off screen, and Ctrl+2 left All 436px above its foot. A
+// reader at the foot of Main, whose view no change switches, was left 61px above it as the card grew.
+
+/**
+ * `draftOverThreads` at a desk wide enough for two columns, with a draft of 316 characters opened by More
+ * on the card. In one column a line of its words holds the fixture's 40 characters, and in two columns'
+ * left column 30, so it is 8 lines in one and 11 in two: 60px taller, past the slack.
+ */
+async function openedDraftColumns(script) {
+  const DRAFT = "The release notes, as agreed: the runner fix landed and the nightly is green. ".repeat(4);
+  const parts = await draftOverThreads(script, 60);
+  const { page, card, main, settled } = parts;
+  page.wideDesk = true;
+  page.propose(proposal({ serial: 61, handle: "hAnDlE-wrap-000000000061", text: DRAFT }));
+  await page.settle();
+  const layout = () => page.el("screen-main").getAttribute("data-columns");
+  page.el("post-confirm-text").wrapAt = () => (layout() === "two" ? 30 : CHARS_PER_LINE);
+  await page.el("post-confirm-more").click();
+  await settled();
+  assert.ok(!card.hasAttribute("data-folded") && card.parentNode === page.el("pane-discord"),
+    "the premise: the draft is opened, the next message of the channel's list");
+  const picker = page.el("thread-select");
+  const key = async (digit) => {
+    await press(page, focused(page) || main, digit, { metaKey: true });
+    await settled();
+  };
+  return {
+    ...parts,
+    layout,
+    key,
+    opened: card.outerHeight(),
+    gap: () => main.scrollHeight - main.scrollTop - main.clientHeight,
+    sendShown: () => {
+      const box = page.el("post-confirm-send").getBoundingClientRect();
+      const top = main.getBoundingClientRect().top;
+      return box.height > 0 && box.top >= top && box.bottom <= top + main.clientHeight;
+    },
+    toView: async (view) => {
+      if (layout() !== null || picker.value !== (view === "1" ? "main" : "flat")) await key(view);
+    },
+    /** The reader with message `id`'s row `offset` px above the top of the list. */
+    onRow: async (id, offset) => {
+      const row = page.el("discord-log").children.find((li) => li.getAttribute("data-id") === id);
+      main.scrollTop = row.offsetTop() + offset;
+      await main.dispatch("scroll");
+      await settled();
+    },
+  };
+}
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: TWO COLUMNS COMING AND GOING, the send card at the foot of the left column drawn at their narrower width, keep a reader at the foot of Main or All at its foot with Send on screen, by Cmd-4 and back, Main held from a visit up the list; and one up either on their row", async () => {
+  const run = async (script) => {
+    const { page, card, main, settled, layout, key, opened, gap, sendShown, toView, onRow } = await openedDraftColumns(script);
+    const result = {};
+    for (const [name, view] of [["Main", "1"], ["All", "2"]]) {
+      // At the foot, Main held from a visit up its list, so that where it was left is no help.
+      await toView("1");
+      main.scrollTop = main.scrollHeight - main.clientHeight - 200;
+      await main.dispatch("scroll");
+      await settled();
+      await toView(view);
+      main.scrollTop = main.scrollHeight;
+      await main.dispatch("scroll");
+      await settled();
+      const seen = rowOnScreen(page);
+      assert.ok(gap() === 0 && sendShown() && (view === "1" || /^\d*[13579]@/.test(String(seen))),
+        `the premise: a reader at ${name}'s foot with Send on screen, in All on a reply Main lacks (${seen})`);
+      await key("4");
+      assert.ok(layout() === "two" && card.outerHeight() - opened > BOTTOM_SLACK_PX,
+        `the premise: two columns, the card more than the slack taller in their left column (${card.outerHeight()} from ${opened})`);
+      const two = gap() === 0 && sendShown() && page.el("jump-newest").hidden;
+      await key(view);
+      result[`foot${name}`] = two && layout() === null && gap() === 0 && sendShown() && page.el("jump-newest").hidden;
+
+      // Up the list, on a thread's root, which Main draws too: on it, where it stood, in two columns and back.
+      await toView(view);
+      await onRow("326", 5);
+      const before = rowOnScreen(page);
+      assert.ok(before === "326@-5" && gap() > BOTTOM_SLACK_PX, `the premise: a reader up ${name} on a root (${before}, ${gap()}px up)`);
+      await key("4");
+      const kept = rowOnScreen(page) === before && layout() === "two";
+      await key(view);
+      result[`up${name}`] = kept && layout() === null && rowOnScreen(page) === before;
+    }
+    result.untouched = page.proposalCommits.length === 0 && page.proposalCancels.length === 0 && !card.hidden;
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { footMain: true, upMain: true, footAll: true, upAll: true, untouched: true });
+
+  // THE CONTROLS. The place read once the layout has changed: the card has grown under the reader at Main's
+  // foot, who is left its growth above it, Send off screen. The one at All's foot reads as up All on a reply
+  // Main lacks, and is at Main's foot only as a reader who could see the card and none of Main's rows.
+  const READ_BEFORE = '  const left = screen.getAttribute("data-columns") !== want ? leftColumnPlace() : null;\n';
+  const unread = await run(brokenScript(READ_BEFORE, "  const left = null;\n"));
+  assert.deepStrictEqual(unread, { ...real, footMain: false });
+  // As the page was before, neither: Main stays where it was left, and All is drawn as far up on the way back.
+  const before = await run(brokenFurther(brokenScript(READ_BEFORE, "  const left = null;\n"),
+    "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();\n",
+    "    if (keepPlace) keepReaderPlace(place);\n"));
+  assert.deepStrictEqual(before, { ...real, footMain: false, footAll: false });
+  // The place read before, but not put back where the left column's view stays: All's reader is kept by the
+  // switch to Main, and Main's is left as the card grows.
+  const unkept = await run(brokenScript('  if (left && next !== "list") keepLeftColumnPlace(left, leftBack);\n', ""));
+  assert.deepStrictEqual(unkept, { ...real, footMain: false });
+});
+
+// `#269 approval-card-inline` x `#280 scroll-stability`, from the same review. A change of layout keeps the
+// place it reads, but not always where it goes: Main lacks All's replies, so a reader up All near its foot is
+// at Main's foot in two columns, and the card is taller in their narrower left column, so a reader near
+// Main's foot there is at its foot in one. The way back read them as on the newest line and took them to the
+// foot: in Chromium a reader 40px up All with a long draft opened by More, and 30px up with no draft at all.
+// And the reader up All, Main held from an earlier visit, was put where that visit left Main: 326px above its
+// foot in Chromium, Send off screen.
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM A CHANGE OF LAYOUT THAT COULD NOT KEEP THEIR PLACE, the left column's reader is where they were — up All near its foot, the card in view, at Main's foot by Cmd-4, Main held up its list, and on their row by Cmd-2, up Main near its foot in two columns by Cmd-1 and Cmd-4 — unless they moved in between; and Cmd-1 takes the reader up All to Main's foot as well", async () => {
+  const run = async (script) => {
+    const { page, card, main, settled, layout, key, gap, sendShown, toView, onRow } = await openedDraftColumns(script);
+    const result = {};
+    const cardInView = () => {
+      const box = card.getBoundingClientRect();
+      const top = main.getBoundingClientRect().top;
+      return box.bottom > top && box.top < top + main.clientHeight;
+    };
+    // Main left up its list, so that where it was left is no help.
+    await toView("1");
+    main.scrollTop = main.scrollHeight - main.clientHeight - 200;
+    await main.dispatch("scroll");
+    await settled();
+    // Up All on its last reply, which Main lacks, the card in view: at Main's foot in two columns, which is
+    // only geometry, Send on screen.
+    await toView("2");
+    await onRow("331", 5);
+    const upAll = rowOnScreen(page);
+    assert.ok(upAll === "331@-5" && gap() > BOTTOM_SLACK_PX && cardInView(),
+      `the premise: a reader up All on a reply, the card in view (${upAll}, ${gap()}px up)`);
+    await key("4");
+    result.allAway = layout() === "two" && gap() === 0 && sendShown();
+    await key("2");
+    result.allBack = layout() === null && rowOnScreen(page) === upAll;
+    // ...and by Cmd-1, in one column, Main left up its list again.
+    await toView("1");
+    main.scrollTop = main.scrollHeight - main.clientHeight - 200;
+    await main.dispatch("scroll");
+    await settled();
+    await toView("2");
+    await onRow("331", 5);
+    await key("1");
+    result.allToMain = layout() === null && gap() === 0 && sendShown();
+
+    // Up Main in two columns nearer its foot than the card grows there: at Main's foot in one column.
+    await key("1");
+    await key("4");
+    main.scrollTop = main.scrollHeight - main.clientHeight - 40;
+    await main.dispatch("scroll");
+    await settled();
+    const upMain = rowOnScreen(page);
+    assert.ok(layout() === "two" && gap() === 40, `the premise: a reader 40px up Main in two columns (${upMain})`);
+    await key("1");
+    assert.ok(layout() === null && gap() === 0, `the premise: at Main's foot in one column, the card shorter (${gap()}px)`);
+    await key("4");
+    result.mainBack = layout() === "two" && rowOnScreen(page) === upMain;
+
+    // One who moves between the two is placed where they moved to.
+    await key("2");
+    await onRow("331", 5);
+    await key("4");
+    main.scrollTop = main.scrollHeight - main.clientHeight - 100;
+    await main.dispatch("scroll");
+    await settled();
+    const moved = rowOnScreen(page);
+    await key("2");
+    result.moved = layout() === null && rowOnScreen(page) === moved && gap() > BOTTOM_SLACK_PX;
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { allAway: true, allBack: true, allToMain: true, mainBack: true, moved: true });
+
+  // THE CONTROLS. No place held for the way back: both are taken to the foot they were left at.
+  const unheld = await run(brokenScript(
+    "  const leftBack = left && heldLeft && heldLeft.from === next && sameLeftPlace(left, heldLeft.placed) ? heldLeft.left : null;\n",
+    "  const leftBack = null;\n"));
+  assert.deepStrictEqual(unheld, { ...real, allBack: false, mainBack: false });
+  // A switch that finds none of the reader's rows leaving Main where it was last left, the card in view or
+  // not: 200px up its list, Send off screen, by Cmd-4 and by Cmd-1. The way back still finds All as it was.
+  const left = await run(brokenScript(
+    "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();\n",
+    "    if (keepPlace) keepReaderPlace(place);\n"));
+  assert.deepStrictEqual(left, { ...real, allAway: false, allToMain: false });
 });
 
 // --- `#303 voice-post-prefix` with `#269 approval-card-inline` and `#270 voice-transcript-markers` --
