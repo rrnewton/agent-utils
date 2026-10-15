@@ -14734,10 +14734,15 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
  * `takes` its copy of, and those it `answers` for — takes out as deleted where it does not carry them.
  * `#316 late-counts-resurrect`.
  *
- * NEVER A MESSAGE REMOVED UPSTREAM AFTER IT WAS SENT (`removedSince`). It is older than the removal:
- * it takes no copy of the message, and does not take it out either, which the read behind the
- * removal does. The read of All for Main's counts, sent before a removal and landing after Main's
- * read had taken the message out, brought it back onto Main until the next full read.
+ * NEVER A MESSAGE REMOVED UPSTREAM AFTER IT WAS SENT (`removedSince`), AND THAT ONE ALWAYS OUT. It is
+ * older than the removal, so it takes no copy of the message: the read of All for Main's counts, sent
+ * before a removal and landing after Main's read had taken the message out, brought it back onto Main
+ * until the next full read. And it takes the message out, whatever it carries: the removal is newer,
+ * and says the message is gone. That used to be left to the read behind the removal, which may never
+ * say it: a newest page sent before the removal and answered after it does not carry the message, and
+ * its cursor is past the deletion, so the read behind the removal, a delta from that cursor, did not
+ * report it either, and the message stayed shown and saved until the next newest page, up to
+ * `TIMELINE_RECONCILE_MS` later. A removal from the stream's replay tail asks for no read at all.
  *
  * AND WITH `held` — the store's copies as the read was sent (`heldNow`) — ONLY OVER THE COPIES THE
  * STORE STILL HOLDS AS THEY WERE: the check a placing read is folded by (`heldAsSent`), message by
@@ -14745,12 +14750,12 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
  * has not held at all — unless that is on the main channel and a newest page of Main sent after it has
  * landed, which speaks for it and did not leave it in the store, as an answer of All that is not folded
  * puts back nothing such a page took out (`placeFromPage`). It answers only for the messages held
- * unchanged. A copy replaced since — an edit Main's read brought, a thread record, a count — is newer
- * than the page, which put back the text from before the edit; a message taken out since it would put
- * back; and one gained since it was sent too early to speak for, and took out as deleted (`#310
- * stale-live-read-flicker`). Of what it does not take, a message the stream left unplaced still takes
- * its thread record (`placeFromPage`), and the counts, which come of the replies it brings that the
- * store never held, are what such a read is for.
+ * unchanged, and those removed since. A copy replaced since — an edit Main's read brought, a thread
+ * record, a count — is newer than the page, which put back the text from before the edit; a message
+ * taken out since it would put back; and one gained since it was sent too early to speak for, and took
+ * out as deleted (`#310 stale-live-read-flicker`). Of what it does not take, a message the stream left
+ * unplaced still takes its thread record (`placeFromPage`), and the counts, which come of the replies it
+ * brings that the store never held, are what such a read is for.
  *
  * @param {any} canon
  * @param {VibeTalk.TimelineResponse} payload
@@ -14770,7 +14775,7 @@ function pageFold(canon, payload, held) {
       return !holds.has(id) && (answeredThread(message) !== null || !newerPage(canon, "main", number));
     },
     /** @param {any} message */
-    answers: (message) => !removedSince(canon, String(message.id), number) && (!unchanged || unchanged.has(String(message.id))),
+    answers: (message) => removedSince(canon, String(message.id), number) || !unchanged || unchanged.has(String(message.id)),
   };
 }
 

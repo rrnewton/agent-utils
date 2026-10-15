@@ -61473,3 +61473,83 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
     "      return !holds.has(id);\n"));
   assert.ok(shownIds(control.page).includes("400"), "the read for the counts left the message out anyway, so this test cannot see it");
 });
+
+// A newest page of Main sent before a removal the stream reported takes the message out when it lands,
+// whatever it carries. It used to leave that to the read behind the removal: a page answered after the
+// removal does not carry the message, and its cursor is past the deletion, so that read, a delta from it,
+// never reported it, and the message stayed on Main, and saved, until the next newest page fifteen
+// minutes on. A removal replayed from the stream's tail asks for no read at all.
+const REMOVED_LEFT_TO_ITS_READ = [
+  "    answers: (message) => removedSince(canon, String(message.id), number) || !unchanged || unchanged.has(String(message.id)),\n",
+  "    answers: (message) => !removedSince(canon, String(message.id), number) && (!unchanged || unchanged.has(String(message.id))),\n"];
+
+for (const removal of ["after", "before", "tail"]) {
+  const named = { after: "answered after the removal", before: "answered before the removal",
+    tail: "the removal replayed from the stream's tail, the page answered after it" }[removal];
+  test(`\`#316 late-counts-resurrect\`: a message removed upstream while Main's newest page is out leaves Main and the store when that page lands (${named})`, async () => {
+    const run = async (script) => {
+      const { page, server } = await forwardPage({}, null, script);
+      const inner = page.timeline;
+      /** @type {Array<() => void>} */
+      const held = [];
+      let hold = false;
+      page.timeline = (path, options) => {
+        const url = new URL(path, "http://fixture.test");
+        if (!hold || url.searchParams.get("view") !== "main" || url.searchParams.get("after")) return inner(path, options);
+        hold = false;
+        // Answered after the removal: the server takes the read as it hands it over. Before: at once.
+        if (removal !== "before") return new Promise((resolve) => held.push(() => resolve(inner(path, options))));
+        const answer = Promise.resolve(inner(path, options)).then(async (response) => {
+          const body = await response.text();
+          return { ...response, text: async () => body };
+        });
+        return new Promise((resolve) => held.push(() => resolve(answer)));
+      };
+      // One poll that is a delta, so the page knows this server's deltas carry edits and deletions.
+      server.post(message({ id: "290", content: "posted before the removal" }));
+      page.setClock(page.clock() + DISCORD_POLL_MS);
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      // Main's poll reads its newest page, its cursor refused, and that read is held.
+      server.refuse = { status: 410, error: "cursor_expired" };
+      hold = true;
+      page.setClock(page.clock() + DISCORD_POLL_MS);
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(held.length, 1, "fixture: Main's newest page was not held");
+      // The message is removed upstream, and the stream says so.
+      server.remove("200");
+      const tail = removal === "tail" ? { replayed: true, from_tail: true } : {};
+      await deliver(page, page.stream(), sseDelete("del-200", CHANNEL.id, "200", tail));
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.ok(shownIds(page).includes("200"), "fixture: the message left Main before Main's page landed");
+      held.shift()();
+      for (let i = 0; i < 4; i += 1) {
+        await page.settle();
+        page.expireTimers(50);
+      }
+      const landed = { shown: shownIds(page), saved: savedMessage(page, "200") };
+      // And three polls after, deltas from that page's cursor.
+      for (let poll = 0; poll < 3; poll += 1) {
+        page.setClock(page.clock() + DISCORD_POLL_MS);
+        await pollOnce(page);
+        for (let i = 0; i < 3; i += 1) await page.settle();
+      }
+      return { page, server, landed };
+    };
+    const { page, server, landed } = await run(SCRIPT);
+    assert.deepStrictEqual(landed.shown, ["201", "203", "290"], "the removed message is still on Main once Main's page landed");
+    assert.equal(landed.saved, null, "the removed message is still in the saved store once Main's page landed");
+    assert.deepStrictEqual(shownIds(page), ["201", "203", "290"], "the removed message is still on Main three polls later");
+    assert.equal(savedMessage(page, "200"), null, "the removed message is still in the saved store three polls later");
+    assert.ok(server.reads.slice(-3).every((read) => read.after !== null), "fixture: the polls after were not deltas");
+    if (removal === "before") return;
+
+    // THE CONTROL: the removal left to the read behind it, the message stays, on Main and saved, through
+    // every poll after.
+    const control = await run(brokenScript(...REMOVED_LEFT_TO_ITS_READ));
+    assert.ok(control.landed.shown.includes("200"), "the message left Main anyway, so this test cannot see it");
+    assert.ok(control.landed.saved, "the message left the store anyway, so this test cannot see it");
+    assert.ok(shownIds(control.page).includes("200") && savedMessage(control.page, "200"));
+  });
+}

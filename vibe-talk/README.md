@@ -4444,8 +4444,11 @@ Updates use `kind: "update"` with the complete current message. Deletes use
 `{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
 They become `event: message_update` and `event: message_delete`; the page re-reads the authoritative
 window while preserving its scroll position, rather than leaving a stale row or trying to patch a
-derived combined row in place. Creates remain `event: message`, so existing polling producers and
-older clients keep their wire contract.
+derived combined row in place. A removal is believed from then on: the first newest page to land
+takes the message out, even one sent before the removal (`#316 late-counts-resurrect`). One answered
+after the removal does not carry the message, and its cursor is past the deletion, so the re-read,
+which continues from that cursor, would never report it. Creates remain `event: message`, so existing
+polling producers and older clients keep their wire contract.
 
 SSE resume ids are event ids, not message-order cursors. Adapter ids are namespaced with `push:` on
 that internal wire so even a numeric provider event id cannot be mistaken for a numeric message
