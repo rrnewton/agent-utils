@@ -5606,7 +5606,11 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   are ordered by when they were sent, not when they land: each copy of a message the page holds is as
   new as the read that brought it, or as the moment the stream delivered it, and a read changes only
   copies older than itself. So a read sent earlier that lands while a later one is out does not stop
-  the later one from bringing an edit or a removal.
+  the later one from bringing an edit or a removal. The stream carries no edits, though: its copy is
+  newer only in being there. A read that carries the message still brings its text, so a bot's
+  placeholder, drawn and then edited to its answer while a read was out, shows the answer when that
+  read lands. A reply count or a thread record the stream puts on a message makes it no newer than it
+  was.
 - **In the right column, a reader on the newest line stays on it** when what is in the list changes size
   under them with nothing scrolled — above all the card under the pointer drawn whole — and a reader up
   the list is held by the card or row they are on. Main keeps `#207 scrollback-jump`'s rule: a newest

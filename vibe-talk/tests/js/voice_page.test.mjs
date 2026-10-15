@@ -61406,7 +61406,7 @@ for (const main of ["delta", "newest"]) {
 
     // THE CONTROL, as #308 left it: the store's copy takes only the answer's thread record. Where Main's
     // newest page took the bare copy out, the answer puts it back whole either way.
-    const control = await run(brokenScript("    if (held && copyOlderThan(stored, id, number, held)) {\n", "    if (false) {\n"));
+    const control = await run(brokenScript("    if (held && copyOlderThan(stored, id, number, held, true)) {\n", "    if (false) {\n"));
     const controlled = savedMessage(control.page, "300");
     if (main === "delta") {
       assert.equal(controlled.content, "the bridge's answer, in the first discussion",
@@ -61733,3 +61733,253 @@ for (const change of ["edit", "remove"]) {
     }
   });
 }
+
+// A copy the stream made says nothing newer than the store's copy it was built on (`copyBuiltOn`,
+// `postedCopies`). The stream carries no edits: its copy of a message is the message as it was posted,
+// and a count or a thread record it puts on the store's copy changes nothing else. Stamped as new as the
+// moment it went into the store, such a copy made a newest page sent before then refuse its own, though
+// that page, answered after an edit, carried the newer text; the polls after, deltas from that page's
+// cursor, already past the edit, never brought it, and the old text stayed shown and saved until the next
+// newest page, fifteen minutes on a server whose deltas carry edits.
+
+/**
+ * The forward-capable channel read in `view`, Main or All, with one delta poll behind it, so the page knows
+ * the server's deltas carry edits and deletions; then the view's next poll, its cursor refused, reads its
+ * newest page, which is held. `land` hands that page over, answered as the server has the channel then.
+ *
+ * @param {string} script
+ * @param {"main" | "flat"} view
+ */
+async function newestPageOut(script, view) {
+  const { page, server } = await forwardPage({}, null, script);
+  if (view === "flat") await pickThread(page, "flat");
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(page.el("thread-select").value, view, "fixture: not the view meant");
+  const inner = page.timeline;
+  /** @type {Array<() => void>} */
+  const held = [];
+  let hold = false;
+  page.timeline = (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    if (!hold || url.searchParams.get("view") !== view || url.searchParams.get("after")) return inner(path, options);
+    hold = false;
+    return new Promise((resolve) => held.push(() => resolve(inner(path, options))));
+  };
+  server.post(message({ id: "290", content: "posted before the newest page was sent" }));
+  page.setClock(page.clock() + DISCORD_POLL_MS);
+  await pollOnce(page);
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  server.refuse = { status: 410, error: "cursor_expired" };
+  hold = true;
+  page.setClock(page.clock() + DISCORD_POLL_MS);
+  await pollOnce(page);
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(held.length, 1, "fixture: the view's newest page was not held");
+  const land = async () => {
+    held.shift()();
+    for (let i = 0; i < 6; i += 1) {
+      await page.settle();
+      page.expireTimers(50);
+    }
+  };
+  return { page, server, land };
+}
+
+/** Three polls, deltas from the cursor of the page that landed last: message `id`'s saved text after each. */
+async function threePolls(page, server, id) {
+  /** @type {Array<string | null>} */
+  const texts = [];
+  for (let poll = 0; poll < 3; poll += 1) {
+    page.setClock(page.clock() + DISCORD_POLL_MS);
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    const saved = savedMessage(page, id);
+    texts.push(saved && saved.content);
+  }
+  assert.ok(server.reads.slice(-3).every((read) => read.after !== null), "fixture: the polls after were not deltas");
+  return texts;
+}
+
+/** The text of message `id`'s row in the column, or null if it has none. */
+const rowText = (page, id) => {
+  const row = rowOf(page, id);
+  return row ? bodyOf(row).text() : null;
+};
+
+test("`#310 stale-live-read-flicker`: Main's newest page brings the edit of a message the stream drew while it was out", async () => {
+  const answer = "Here is the answer.";
+  const run = async (script) => {
+    const { page, server, land } = await newestPageOut(script, "main");
+    // A bot posts its placeholder, which the stream draws, and edits it to its answer, pushed as an update.
+    const placeholder = message({ id: "310", content: "Working…" });
+    server.post({ ...placeholder });
+    await deliver(page, page.stream(), sseMessage(placeholder));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.ok(rowOf(page, "310"), "fixture: the stream did not draw the placeholder");
+    server.edit("310", { content: answer });
+    await deliver(page, page.stream(), sseUpdate("upd-310", { ...placeholder, content: answer }));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    // Main's page, answered after the edit, lands.
+    await land();
+    const saved = savedMessage(page, "310");
+    const landed = { saved: saved && saved.content, row: rowText(page, "310") };
+    return { page, landed, polls: await threePolls(page, server, "310") };
+  };
+  const { page, landed, polls } = await run(SCRIPT);
+  assert.equal(landed.saved, answer, "Main's newest page did not bring the edit");
+  assert.ok(landed.row && landed.row.includes(answer), `Main does not show the edit: ${JSON.stringify(landed.row)}`);
+  assert.deepStrictEqual(polls, [answer, answer, answer], "the edit is gone in the polls after");
+  assert.ok((rowText(page, "310") || "").includes(answer), "Main does not show the edit three polls later");
+
+  // THE CONTROL: the stream's copy taken for newer in what it says than every read sent before it arrived,
+  // Main's page refuses its own, and the polls after, deltas from its cursor, never bring the edit.
+  const control = await run(brokenScript("  if (says && postedCopies.has(copy)) return true;\n", ""));
+  assert.equal(control.landed.saved, "Working…", "Main's page brought the edit anyway, so this test cannot see it");
+  assert.deepStrictEqual(control.polls, ["Working…", "Working…", "Working…"]);
+});
+
+for (const change of ["edit", "pushed edit", "removal"]) {
+  const named = { edit: "edit", "pushed edit": "edit, pushed as an update,", removal: "removal" }[change];
+  test(`\`#310 stale-live-read-flicker\`: Main's newest page brings a root's ${named} though a live reply moved its count on while the page was out`, async () => {
+    const edited = "first thread root, edited";
+    const run = async (script) => {
+      const { page, server, land } = await newestPageOut(script, "main");
+      const first = page.messages.find((m) => m.id === "201").thread;
+      if (change !== "removal") {
+        server.edit("201", { content: edited });
+        if (change === "pushed edit") {
+          await deliver(page, page.stream(), sseUpdate("upd-201", page.messages.find((m) => m.id === "201")));
+          for (let i = 0; i < 3; i += 1) await page.settle();
+        }
+      }
+      // A reply to it arrives on the stream, and the store's copy of the root counts it.
+      const reply = message({ id: "260", content: "a live reply", thread: { ...first, is_root: false } });
+      server.post(reply);
+      server.edit("201", { thread: { ...first, reply_count: 2 } });
+      await deliver(page, page.stream(), sseMessage(reply));
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(savedMessage(page, "201").thread.reply_count, 2, "fixture: the live reply did not move the root's count on");
+      // Removed upstream after that, by a provider that pushes no removals.
+      if (change === "removal") server.remove("201");
+      // Main's page, answered now, lands.
+      await land();
+      const landed = { saved: savedMessage(page, "201"), shown: shownIds(page) };
+      return { page, landed, polls: await threePolls(page, server, "201") };
+    };
+    const { page, landed, polls } = await run(SCRIPT);
+    if (change === "removal") {
+      assert.ok(!landed.shown.includes("201"), "Main's newest page did not take the removed root off Main");
+      assert.equal(landed.saved, null, "Main's newest page did not take the removed root out of the store");
+      assert.deepStrictEqual(polls, [null, null, null], "the removed root is back in the polls after");
+      assert.ok(!shownIds(page).includes("201"), "the removed root is back on Main three polls later");
+    } else {
+      assert.equal(landed.saved && landed.saved.content, edited, "Main's newest page did not bring the root's edit");
+      assert.equal(landed.saved.thread.reply_count, 2, "Main's newest page lost the live reply from the root's count");
+      assert.deepStrictEqual(polls, [edited, edited, edited], "the root's edit is gone in the polls after");
+      assert.ok((rowText(page, "201") || "").includes(edited), "Main does not show the root's edit three polls later");
+    }
+
+    // THE CONTROL: the root's count stamped as new as the moment the live reply moved it on, Main's page,
+    // sent before then, refuses its copy of the root, or its removal, and the polls after never bring it.
+    const control = await run(brokenScript("    buildCopyOn(counted, root);\n", "    orderCopy(counted, orderNow());\n"));
+    if (change === "removal") {
+      assert.ok(control.landed.shown.includes("201") && control.landed.saved,
+        "Main's page took the root out anyway, so this test cannot see it");
+      assert.ok(shownIds(control.page).includes("201"));
+    } else {
+      assert.equal(control.landed.saved.content, "first thread root", "Main's page brought the edit anyway, so this test cannot see it");
+      assert.deepStrictEqual(control.polls, ["first thread root", "first thread root", "first thread root"]);
+    }
+  });
+}
+
+test("`#310 stale-live-read-flicker`: All's newest page brings a bridge's finished answer though the stream placed it while the page was out", async () => {
+  const finished = "the bridge's answer, finished";
+  const run = async (script) => {
+    const { page, server, land } = await newestPageOut(script, "flat");
+    // The bridge pushes its reply without a thread record, then edits it, and the edit's copy on the
+    // stream names its thread, which places it (`placeFromEdit`).
+    const { first, pushed } = bridgeReply(page, server);
+    await deliver(page, page.stream(), sseMessage(pushed));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    server.edit("300", { content: finished });
+    await deliver(page, page.stream(),
+      sseUpdate("upd-300", { ...pushed, content: finished, thread: { ...first, is_root: false, reply_count: 2 } }));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    const placed = savedMessage(page, "300");
+    assert.ok(placed && placed.thread && placed.thread.id === first.id, "fixture: the edit's copy did not place the reply");
+    assert.equal(placed.content, pushed.content, "fixture: the reply's text changed before All's page landed");
+    // All's page, answered after the edit, lands.
+    await land();
+    const saved = savedMessage(page, "300");
+    const landed = { saved: saved && saved.content, row: rowText(page, "300") };
+    return { page, landed, polls: await threePolls(page, server, "300") };
+  };
+  const { page, landed, polls } = await run(SCRIPT);
+  assert.equal(landed.saved, finished, "All's newest page did not bring the finished answer");
+  assert.ok(landed.row && landed.row.includes(finished), `All does not show the finished answer: ${JSON.stringify(landed.row)}`);
+  assert.deepStrictEqual(polls, [finished, finished, finished], "the finished answer is gone in the polls after");
+  assert.ok((rowText(page, "300") || "").includes(finished), "All does not show the finished answer three polls later");
+
+  // THE CONTROL: the thread record the stream put on stamped as new as the moment it went in, All's page,
+  // sent before then, refuses its copy, and the polls after never bring the finished text.
+  const control = await run(brokenScript("    buildCopyOn(placed, held);\n", "    orderCopy(placed, orderNow());\n"));
+  assert.equal(control.landed.saved, "the bridge's answer, in the first discussion",
+    "All's page brought the finished answer anyway, so this test cannot see it");
+  assert.deepStrictEqual(control.polls, Array(3).fill("the bridge's answer, in the first discussion"));
+});
+
+// Not every copy the stream made is older than every page: a count or a thread record put on a copy that a
+// read sent after the page brought is as new as that read (`copyBuiltOn`), and a page sent before it,
+// answered before the edit that read brought, would undo the edit.
+
+test("`#316 late-counts-resurrect`: a read of All for Main's counts does not undo an edit Main's poll brought, though a live reply moved that root's count on since", async () => {
+  const edited = "first thread root, edited while the read for the counts was out";
+  const run = async (script) => {
+    const { page, server, held } = await countsReadOut(script);
+    // A copy of its own, so the read for the counts already taken keeps the text it was taken with.
+    const at = page.messages.findIndex((m) => m.id === "201");
+    page.messages[at] = { ...page.messages[at] };
+    const first = page.messages[at].thread;
+    server.edit("201", { content: edited });
+    page.setClock(page.clock() + DISCORD_POLL_MS);
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(savedMessage(page, "201").content, edited, "fixture: Main's poll did not bring the edit");
+    // A reply to it arrives on the stream, and the store's copy of the root counts it. The read behind
+    // the reply is held, so the read for the counts lands first.
+    const inner = page.timeline;
+    /** @type {Array<() => void>} */
+    const live = [];
+    page.timeline = (path, options) => {
+      if (new URL(path, "http://fixture.test").searchParams.get("reason") !== "live") return inner(path, options);
+      return new Promise((resolve) => live.push(() => resolve(inner(path, options))));
+    };
+    const reply = message({ id: "260", content: "a live reply", thread: { ...first, is_root: false } });
+    server.post(reply);
+    server.edit("201", { thread: { ...first, reply_count: 2 } });
+    await deliver(page, page.stream(), sseMessage(reply));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(savedMessage(page, "201").thread.reply_count, 2, "fixture: the live reply did not move the root's count on");
+    held.counts[0]();
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    const saved = savedMessage(page, "201");
+    const landed = { saved: saved && saved.content, count: saved && saved.thread.reply_count, row: rowText(page, "201") };
+    page.timeline = inner;
+    while (live.length) live.shift()();
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return { page, landed };
+  };
+  const { page, landed } = await run(SCRIPT);
+  assert.equal(landed.saved, edited, "the read for the counts put back the root's text from before the edit");
+  assert.ok(landed.row && landed.row.includes(edited), "Main shows the root as it was before the edit");
+  assert.equal(landed.count, 2, "the read for the counts lost the live reply from the root's count");
+  assert.equal(savedMessage(page, "201").content, edited, "the edit is gone once the read behind the reply landed");
+
+  // THE CONTROL: the root's count taken for older in what it says than any page, as a live message is, the
+  // read for the counts takes its copy of the root over it, from before the edit.
+  const control = await run(brokenScript("    buildCopyOn(counted, root);\n",
+    "    buildCopyOn(counted, root);\n    postedCopies.add(counted);\n"));
+  assert.equal(control.landed.saved, "first thread root", "the edit survived anyway, so this test cannot see it");
+});
+
