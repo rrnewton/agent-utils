@@ -1,12 +1,13 @@
 ---
 title: 'slack-quote-lines: a Slack quote swallows the line after it'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.411080221+00:00
-updated_at: 2026-10-15T06:03:00.411080221+00:00
+updated_at: 2026-10-15T06:54:49.493283909+00:00
+closed_at: 2026-10-15T06:54:49.493283749+00:00
 ---
 
 # Description
