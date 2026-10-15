@@ -4595,6 +4595,17 @@ const TUNING_BANDS = {
     "Under four, a hand on the mouse settling, or a pointer standing still as the card drawn whole moves " +
     "from under it, drops the glide the reader waits for; past twenty-four, a mouse that crossed a card " +
     "and stopped in the gap beside it counts as resting on it, and Main moves after the pointer has gone"],
+  // `#338 column-overscroll`. The room past the right column's foot.
+  OVERSCROLL_REST_MS: [80, 400,
+    "how long the wheel rests at the right column's foot before a turn of it goes on past the foot. " +
+    "Under about a tenth of a second, the turns of one spin of a wheel come further apart than that " +
+    "and a fling to the newest card overshoots into the blank room; past four tenths, a reader who " +
+    "stopped at the foot and turns the wheel again finds it does nothing"],
+  OVERSCROLL_IDLE_MS: [300, 2000,
+    "how long the room opened at the foot stays with the reader resting at the foot, not in it. " +
+    "Under a third of a second, a smooth scroll the key or the wheel started is still on its way into " +
+    "the room when it is taken away; past two seconds, the list keeps blank room below a reader who " +
+    "has gone back to reading at the foot"],
   // `#264 voice-send-approval`.
   SPOKEN_YES_SETTLE_MS: [800, 2000,
     "how long a heard yes waits for more before it sends. Under about a second, 'yes... wait' has " +
@@ -59393,7 +59404,7 @@ test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the car
   // not a rounding — and the reader up the cards and the window losing height come out the same.
   const threadOnly = await run(brokenScript(
     "    if (sideColumnUp() && currentView === \"discord\" && columns.side.mode === \"list\") {\n" +
-    "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;\n" +
+    "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
     "      return;\n    }\n",
     ""));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");

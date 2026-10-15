@@ -1077,6 +1077,9 @@ let helpReturn = "settings";
 
 function showScreen(name) {
   const previous = currentScreen;
+  // `#338 column-overscroll`. The room past the right column's foot goes with the main screen: a reader who
+  // was in it comes back to the foot.
+  if (name !== "main") closeOverscroll();
   // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
   // reader's message is noted now, for a reopen. `#189 restore-ui-state`.
   if (currentScreen === "main" && name !== "main") holdChannelPlace();
@@ -1559,7 +1562,8 @@ function scrollToNewest() {
   const area = el("scroll-area");
   // A message a filter change held in place is let go: the reader is going somewhere else. `#243`.
   filterHold = null;
-  area.scrollTop = area.scrollHeight;
+  // `#338 column-overscroll`: a reader in the room past the right column's foot is on that line already.
+  followFoot(area);
   setJumpNewest(false);
 }
 
@@ -1570,11 +1574,257 @@ function scrollToNewest() {
  * scrollTop === scrollHeight however hard `scrollToNewest` pushes. The slack absorbs that, plus
  * sub-pixel layout and a thumb that stopped a few pixels short — at which point the reader still
  * means "I am at the bottom", and the page should still follow.
+ *
+ * `#338 column-overscroll`. Measured from the foot of the rows, so a reader anywhere in the room open
+ * past the right column's foot is parked on the newest message too (`footGap`).
  */
 const BOTTOM_SLACK_PX = 24;
 
 function atBottom(area, slack = BOTTOM_SLACK_PX) {
-  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0) <= slack;
+  return footGap(area) <= slack;
+}
+
+// --- room past the foot of the right column ---------------------------------------------------
+//
+// `#338 column-overscroll`. The owner, 2026-10-15: on a desktop monitor the newest thread in the right
+// column sits at the very bottom of the screen, which is where the reader's attention is but the least
+// comfortable place to read. So the foot stays where a list opens and is followed from, and the wheel
+// and the page keys go on PAST it, into blank room, until the last card's top is at half the column's
+// height: the card being read can be brought to the middle of the screen.
+//
+// THE ROOM IS OPENED BY THE READER GOING ON DOWN FROM THE FOOT, and only then. #side-overscroll, the
+// last thing in the right column's scroller, has no height at all until a reader resting at the foot
+// turns the wheel down, presses PgDn or Space, or ↓ past the last message (`openOverscroll`); it is then
+// given the height that lets the last card's top come up to the middle, in the same task as that event
+// and before the browser scrolls for it, so that very scroll goes into it. So every list opens, lands
+// and is followed exactly as before, its scrollbar at the bottom at the foot (`#280 scroll-stability`:
+// "the thread view also feels like it is not starting out scrolled all the way to the bottom"), and
+// nothing the page does to place a reader — a landing, a jump to a row, the glide — can put them past
+// the foot. The foot holds the scroll that got there: a turn of the wheel opens the room only after
+// the wheel has rested (`OVERSCROLL_REST_MS`), and a held key never does, so a fling to the newest
+// stops on it, and the next turn goes on.
+//
+// WHILE IT IS OPEN IT IS THE FOOT. `footGap` measures from the foot of the rows, so `atBottom` holds
+// anywhere in the room: the jump stays down, and the reader is a reader on the newest line to every
+// rule that follows one (`#280 scroll-stability`). Followed, they are not moved while the foot is still
+// on screen: a reply arriving opens in the room under the card they are reading, and only one taller
+// than they are past the foot takes them on to it (`followFoot`). The room is fitted again to the last
+// card whenever the rows change (`fitOverscroll`), so it always ends where that card's top reaches
+// the middle, and a reader at its end stays at it.
+//
+// IT IS CLOSED when the reader goes back up past the foot (it is below the screen then, so nothing on
+// screen moves), when they come to rest at the foot without going into it, when the column shows
+// something else — another thread, the cards, another layout, channel, view or screen — and by the
+// reader's own way to the newest line, End and the Newest chip, which land on the foot as a list opens.
+//
+// AT A DESK ONLY: web/voice.css gives #side-overscroll a box in the desktop regime alone, and the script
+// asks whether it has one (`overscrollOffered`), as it asks whether the right column has (`sideHasBox`).
+
+/**
+ * The room open past the foot of the right column: its height in px, what the column showed as it was
+ * opened (`overscrollContext`), and the wait to close it once the reader rests at the foot. Null while
+ * closed.
+ *
+ * @type {{px: number, context: string, idle: ReturnType<typeof setTimeout> | null} | null}
+ */
+let overscroll = null;
+
+/** How long the wheel rests before a turn of it at the foot opens the room: longer than between its turns. */
+const OVERSCROLL_REST_MS = 150;
+
+/** How long the room stays open with the reader resting at the foot, not in it, before it closes. */
+const OVERSCROLL_IDLE_MS = 700;
+
+/** When the wheel last turned over the right column (`Event.timeStamp`), for `OVERSCROLL_REST_MS`. */
+let overscrollWheelAt = -Infinity;
+
+/**
+ * Since when the right column's list has been at its foot, by its scroll events (`Event.timeStamp`), or null
+ * while it is not. The browser scrolls for a turn of the wheel before the page hears of the turn, so a list
+ * found at its foot may have been brought there by that very turn: only one that has rested there as long
+ * as the wheel rests (`OVERSCROLL_REST_MS`) was there before it.
+ *
+ * @type {number | null}
+ */
+let overscrollFootSince = null;
+
+/** What the right column shows, for the room opened over it: the room closes on anything else. */
+function overscrollContext() {
+  return JSON.stringify([columnsShown, threadListShown, currentScreen, currentView, columns.side.mode,
+    sideUnreadOnly, inColumn(columns.side, () => [channelContextKey(), pinnedOnly])]);
+}
+
+/** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
+function overscrollOffered() {
+  const room = leftEl("side-overscroll");
+  return currentScreen === "main" && currentView === "discord" && sideColumnUp() &&
+    typeof room.getClientRects === "function" && room.getClientRects().length > 0;
+}
+
+/**
+ * How far `area` scrolls past the foot of its rows: the room open in the right column over what it shows
+ * now, else 0. A room left open over something else is closed here, before anything measures by it.
+ *
+ * @param {HTMLElement} area
+ */
+function overscrollRoom(area) {
+  if (overscroll === null || area !== leftEl("side-scroll")) return 0;
+  if (overscroll.context !== overscrollContext() || !overscrollOffered()) {
+    closeOverscroll();
+    return 0;
+  }
+  return overscroll.px;
+}
+
+/**
+ * How far the rows of `area` run below what it shows: 0 at the foot, and below 0 past it, in the room
+ * open there (`overscrollRoom`).
+ *
+ * @param {HTMLElement} area
+ */
+function footGap(area) {
+  return area.scrollHeight - overscrollRoom(area) - area.scrollTop - (area.clientHeight || 0);
+}
+
+/**
+ * The scroll position of the foot of `area`: its newest row, and the box under it, at the bottom of what
+ * it shows.
+ *
+ * @param {HTMLElement} area
+ */
+function footTop(area) {
+  return Math.max(0, area.scrollHeight - overscrollRoom(area) - (area.clientHeight || 0));
+}
+
+/** Close the room. Below the screen whenever the reader is not in it, so nothing on screen moves then. */
+function closeOverscroll() {
+  if (overscroll === null) return;
+  if (overscroll.idle !== null) clearTimeout(overscroll.idle);
+  overscroll = null;
+  leftEl("side-overscroll").style.height = "";
+}
+
+/**
+ * The last card of the right column that is drawn: its last thread card over the cards, else the last row
+ * of its thread, a reply still in the outbox under it included. Null where none is drawn.
+ */
+function lastColumnCard() {
+  const lists = columns.side.mode === "thread"
+    ? inColumn(columns.side, () => [el("outgoing-log"), shownChannelList()])
+    : [leftEl("side-cards")];
+  for (const list of lists) {
+    const rows = [...list.children];
+    for (let at = rows.length - 1; at >= 0; at -= 1) {
+      if (rows[at].getBoundingClientRect().height > 0) return rows[at];
+    }
+  }
+  return null;
+}
+
+/**
+ * The room `area` needs past its foot for the top of its last card to come up to half its height: as
+ * much as half of it, less how far above the end of the rows (the room's own top) that card's top is,
+ * and the scroller's padding under them. 0 where the card is already at the middle or above at the foot.
+ *
+ * @param {HTMLElement} area
+ */
+function overscrollFit(area) {
+  const last = lastColumnCard();
+  if (!last) return 0;
+  const pad = typeof window.getComputedStyle === "function"
+    ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0;
+  const above = leftEl("side-overscroll").getBoundingClientRect().top - last.getBoundingClientRect().top;
+  return Math.max(0, Math.round((area.clientHeight || 0) / 2 - above - pad));
+}
+
+/**
+ * Close the room once the reader has rested at the foot without going into it. Waited for again on every
+ * scroll while the room is open.
+ */
+function waitOverscrollIdle() {
+  if (overscroll === null) return;
+  if (overscroll.idle !== null) clearTimeout(overscroll.idle);
+  overscroll.idle = setTimeout(() => {
+    if (overscroll === null) return;
+    overscroll.idle = null;
+    const area = leftEl("side-scroll");
+    if (overscrollRoom(area) > 0 && area.scrollTop <= footTop(area) + 1) closeOverscroll();
+  }, OVERSCROLL_IDLE_MS);
+}
+
+/**
+ * Open the room for the reader of `area` going on down from its foot — a turn of the wheel, a page key,
+ * Space, ↓ past the last message — in the same task as that event, before the browser scrolls for it.
+ * Only in the right column at a desk, only from the foot, and only where the last card is not already at
+ * the middle at the foot and the room gives the list somewhere to go. Whether the room is open.
+ *
+ * @param {HTMLElement} area
+ */
+function openOverscroll(area) {
+  if (area !== leftEl("side-scroll")) return false;
+  if (overscrollRoom(area) > 0) {
+    waitOverscrollIdle();
+    return true;
+  }
+  if (!overscrollOffered() || footGap(area) > 1) return false;
+  const px = overscrollFit(area);
+  if (px < 1) return false;
+  overscroll = { px, context: overscrollContext(), idle: null };
+  leftEl("side-overscroll").style.height = `${px}px`;
+  // A list too short to scroll even with the room has nowhere to go.
+  if (area.scrollHeight - (area.clientHeight || 0) <= footTop(area) + 1) {
+    closeOverscroll();
+    return false;
+  }
+  waitOverscrollIdle();
+  return true;
+}
+
+/**
+ * Fit the open room to the last card again, after the rows or the column changed size: closed where the
+ * reader is back up above the foot, or the last card is at the middle or above at the foot.
+ *
+ * @param {HTMLElement} area
+ */
+function fitOverscroll(area) {
+  if (overscrollRoom(area) === 0 || overscroll === null) return;
+  const px = overscrollFit(area);
+  if (px < 1 || area.scrollTop < footTop(area) - 1) {
+    closeOverscroll();
+    return;
+  }
+  if (Math.abs(px - overscroll.px) < 1) return;
+  overscroll.px = px;
+  leftEl("side-overscroll").style.height = `${px}px`;
+}
+
+/**
+ * Keep the reader of `area` on its newest line: at the foot, where `scrollTop = scrollHeight` always put
+ * them. A reader in the room past the right column's foot is on that line already, and stays exactly
+ * where they are while the foot is still on screen, the room fitted to the last card first: a reply that
+ * came in opens in the room, under the card they are reading. One taller than they are past the foot
+ * takes them on to the foot, and the room closes behind them. `#338 column-overscroll`.
+ *
+ * @param {HTMLElement} area
+ */
+function followFoot(area) {
+  if (overscrollRoom(area) > 0) {
+    fitOverscroll(area);
+    if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;
+    closeOverscroll();
+  }
+  area.scrollTop = area.scrollHeight;
+}
+
+/**
+ * Take the reader of `area` to its foot, out of the room past it: a landing, and the reader's own way to
+ * the newest line, which put them where a list opens. `#338 column-overscroll`.
+ *
+ * @param {HTMLElement} area
+ */
+function toFoot(area) {
+  if (area === leftEl("side-scroll")) closeOverscroll();
+  area.scrollTop = area.scrollHeight;
 }
 
 /** The list the reader is actually looking at. Both panes share one scrolling element. */
@@ -3020,7 +3270,10 @@ function renderJumpNewest() {
   // and taking that zero for "at the newest" would forget where the list was left.
   if (currentScreen === "main") {
     const area = el("scroll-area");
-    const gap = area.scrollHeight - area.scrollTop - (area.clientHeight || 0);
+    // `#338 column-overscroll`. From the foot of the rows, the room past it fitted to them first: a reader
+    // in that room is at the newest, and is offered no way down to where they already are.
+    if (sideActive) fitOverscroll(area);
+    const gap = footGap(area);
     if (gap <= BOTTOM_SLACK_PX) {
       // At the newest, which is also all of a list too short to scroll. Nothing is below to jump
       // to, and nothing that arrived is still unseen.
@@ -7975,7 +8228,7 @@ function pageStep(area) {
 /** To the end of `area`. On the main screen exactly what the Newest chip does, which End is. */
 function toNewest(area) {
   if (area === el("scroll-area")) jumpToNewest();
-  else area.scrollTop = area.scrollHeight;
+  else toFoot(area);
 }
 
 /**
@@ -7985,6 +8238,8 @@ function toNewest(area) {
  */
 function jumpToNewest() {
   endFilterWalk();
+  // `#338 column-overscroll`. Onto the foot, out of any room past it: where the list opens.
+  if (el("scroll-area") === leftEl("side-scroll")) closeOverscroll();
   scrollToNewest();
 }
 
@@ -8025,6 +8280,7 @@ function routeScrollKey(event, target) {
   if (isTextField(target)) {
     if (paging && !event.shiftKey && !event.metaKey && !scrollsItself(target)) {
       swallow(event);
+      openOverscrollForKey(area, event);
       scrollForKey(area, key);
     }
     return;
@@ -8033,11 +8289,13 @@ function routeScrollKey(event, target) {
     const picker = String(target.tagName || "").toUpperCase() === "SELECT";
     if (picker && (paging || key === "Home" || key === "End") && !event.shiftKey && !event.metaKey) {
       swallow(event);
+      openOverscrollForKey(area, event);
       scrollForKey(area, key);
     }
     return;
   }
   if (target && nodeWithin(area, target)) {
+    openOverscrollForKey(area, event);
     const pane = currentScreen === "main" ? paneFor(target) : null;
     if (pane && pane.row === target && (paging || key === " ")) {
       followPageScroll(pane, target, key === "PageUp" || (key === " " && Boolean(event.shiftKey)));
@@ -8045,7 +8303,21 @@ function routeScrollKey(event, target) {
     return;
   }
   if (key === " " && pressedBySpace(target)) return;
+  openOverscrollForKey(area, event);
   if (typeof area.focus === "function") area.focus({ preventScroll: true });
+}
+
+/**
+ * `#338 column-overscroll`. A key about to scroll `area` down — PgDn, Space, ↓ — opens the room past the
+ * right column's foot first, for a reader resting there: pressed afresh, never repeating as it is held, so
+ * a held key stops on the foot as a fling of the wheel does, and the next press goes on.
+ *
+ * @param {HTMLElement} area
+ * @param {KeyboardEvent} event
+ */
+function openOverscrollForKey(area, event) {
+  const down = event.key === "PageDown" || event.key === "ArrowDown" || (event.key === " " && !event.shiftKey);
+  if (down && !event.repeat && !event.metaKey) openOverscroll(area);
 }
 
 /** Ctrl+Home and Ctrl+End (Cmd on a Mac): the list to its top or its newest line, from anywhere. */
@@ -8085,8 +8357,11 @@ const READ_STEP = 0.5;
  * Starts from what is on screen when nothing is selected or the selection has been scrolled away,
  * never from a row far off: ↓ takes the top message showing, ↑ the bottom one. In a thread just
  * entered (`#221 read-modes`) the first key takes the message the entry landed on.
+ *
+ * `#338 column-overscroll`. ↓ past the last message of the right column, pressed afresh at its foot
+ * (`held` is the key repeating), goes on into the room past it, as PgDn does.
  */
-function stepSelection(pane, node, direction) {
+function stepSelection(pane, node, direction, held = false) {
   const rows = paneRows(pane);
   if (rows.length === 0) return false;
   const area = pane.scroller();
@@ -8118,6 +8393,7 @@ function stepSelection(pane, node, direction) {
   // Past the last message the list still has the box to write in below it, and past the first the
   // walk back to older history above: the key scrolls on toward either, as the arrow always did.
   if (!next) {
+    if (direction > 0 && !held) openOverscroll(area);
     area.scrollTop += direction * step;
     return true;
   }
@@ -8151,11 +8427,11 @@ function stepMenu(node, direction) {
   return true;
 }
 
-/** ↓/j or ↑/k, wherever the focus is: the items of a menu, else the selection in the pane. */
-function stepFromKeyboard(target, direction) {
+/** ↓/j or ↑/k, wherever the focus is: the items of a menu, else the selection in the pane. `held`: the key repeating. */
+function stepFromKeyboard(target, direction, held = false) {
   if (stepMenu(target, direction)) return true;
   const pane = paneFor(target);
-  return pane ? stepSelection(pane, target, direction) : false;
+  return pane ? stepSelection(pane, target, direction, held) : false;
 }
 
 /** The pane the keys move and its current row. */
@@ -9162,7 +9438,7 @@ const KEYMAP = [
   {
     group: KEYS_MOVING, chords: [{ key: "ArrowDown" }, { key: "j" }], repeats: true,
     does: "The next message. One taller than the screen is scrolled through first",
-    run: (event, target) => stepFromKeyboard(target, 1),
+    run: (event, target) => stepFromKeyboard(target, 1, Boolean(event.repeat)),
   },
   {
     group: KEYS_MOVING, chords: [{ key: "ArrowUp" }, { key: "k" }], repeats: true,
@@ -10575,8 +10851,7 @@ function cardAloneOnScreen() {
 /** Take the cards to their foot again, above the card docked under them. */
 function keepCardsAtFoot() {
   if (!threadListOnScreen()) return;
-  const area = leftEl("side-scroll");
-  area.scrollTop = area.scrollHeight;
+  followFoot(leftEl("side-scroll"));
 }
 
 /**
@@ -19018,7 +19293,8 @@ function landAtFoot(first) {
   if (rows[rows.length - 1] !== first) return false;
   const area = el("scroll-area");
   const was = area.scrollTop;
-  area.scrollTop = area.scrollHeight;
+  // A landing: on the foot, never in the room past it (`#338 column-overscroll`).
+  toFoot(area);
   if (drawnTop(first) < floatingClearance(area) + REPLY_LANDING_GAP_PX - 1) {
     area.scrollTop = was;
     return false;
@@ -36176,6 +36452,8 @@ function leaveThreadList(next = "one") {
 
 /** Show what the right column is showing — the cards or the thread — and say so in its heading. */
 function renderSideMode() {
+  // `#338 column-overscroll`. The room past the foot was the rows that were shown: what comes lands on its foot.
+  closeOverscroll();
   const thread = columns.side.mode === "thread";
   if (leftEl("side-list").hidden === !thread) leftEl("side-list").hidden = thread;
   if (leftEl("side-pane").hidden === thread) leftEl("side-pane").hidden = !thread;
@@ -36397,7 +36675,7 @@ function placeCardAnchor(anchor) {
   if (!anchor) return false;
   const area = leftEl("side-scroll");
   if (anchor.newest) {
-    area.scrollTop = area.scrollHeight;
+    followFoot(area);
     return true;
   }
   const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
@@ -41687,7 +41965,11 @@ inColumn(columns.side, () => {
     onComposerKey(event, guardQuietly(sendChannelMessage))));
   el("load-older").addEventListener("click", inThisColumn(guardQuietly(olderControlPressed)));
   el("clear-backlog").addEventListener("click", inThisColumn(guardQuietly(clearBacklog)));
-  el("jump-newest").addEventListener("click", inThisColumn(scrollToNewest));
+  // `#338 column-overscroll`. The reader's own way to the newest line lands on the foot, as End does.
+  el("jump-newest").addEventListener("click", inThisColumn(() => {
+    closeOverscroll();
+    scrollToNewest();
+  }));
   // What the left column's scroll listener does, for this list: the jump, the way back to a reply,
   // the step back at the top, and the summaries of what has come into view.
   el("scroll-area").addEventListener("scroll", inThisColumn(() => {
@@ -42097,11 +42379,17 @@ if (typeof window.ResizeObserver === "function") {
     sideDue = true;
     setTimeout(() => {
       sideDue = false;
+      // `#338 column-overscroll`. The room past the foot fitted to the rows as they now are, the cards' too.
+      fitOverscroll(leftEl("side-scroll"));
       if (sideShowing()) inColumn(columns.side, renderJumpNewest);
       scheduleColumnLinks();
     }, 0);
   });
-  for (const box of [leftEl("side-scroll"), ...leftEl("side-scroll").children]) sideGeometry.observe(box);
+  // Not the room past the foot itself, which only this page sizes: a size it is given while an observer
+  // of its neighbours is being told of theirs is one the browser could not report in the same frame.
+  for (const box of [leftEl("side-scroll"), ...leftEl("side-scroll").children]) {
+    if (box !== leftEl("side-overscroll")) sideGeometry.observe(box);
+  }
 }
 /**
  * How much stands under the main screen's lists, for the dock-growth keepers below: the dock, and the
@@ -42250,7 +42538,7 @@ if (typeof window.ResizeObserver === "function") {
     const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
     sideUnderLists = now;
     if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {
-      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
+      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
       return;
     }
     if (!sideShowing()) return;
@@ -42260,7 +42548,7 @@ if (typeof window.ResizeObserver === "function") {
         return;
       }
       if (keepFilterHold()) return;
-      if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;
+      if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
     });
   }).observe(leftEl("side-scroll"));
 }
@@ -42320,11 +42608,12 @@ if (typeof window.ResizeObserver === "function") {
     const context = contextOf();
     if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight &&
         was.context === context && !atBottom(area, 1) && free()) {
-      area.scrollTop = area.scrollHeight;
+      followFoot(area);
     }
     note(context);
   });
-  for (const box of area.children) footKeeper.observe(box);
+  // Not the room past the foot (`#338 column-overscroll`), which is the page's own and no content.
+  for (const box of area.children) if (box !== leftEl("side-overscroll")) footKeeper.observe(box);
 }
 // `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
 // without a redraw: the window resized or turned, the reading column dragged, the reader's type
@@ -42374,6 +42663,37 @@ el("scroll-area").addEventListener("touchcancel", pullCancel, PASSIVE);
 // to the page draws them again, as a hidden page draws none.
 leftEl("scroll-area").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
 leftEl("side-scroll").addEventListener("scroll", scheduleColumnLinks, PASSIVE);
+// `#338 column-overscroll`. A turn of the wheel down at the right column's foot opens the room past it, once
+// both the wheel and the list have rested there (`OVERSCROLL_REST_MS`): the scroll that brought the reader to
+// the foot, a fling's included, stops on it. Passive, so the browser scrolls for the wheel without waiting for
+// this page: it has already found the list at its end and moved nothing by the time the room opens, so the
+// turn that opened it is scrolled here, by as much as the browser would have; the turns after it the browser
+// scrolls into the room itself.
+leftEl("side-scroll").addEventListener("wheel", (/** @type {WheelEvent} */ event) => {
+  const rested = event.timeStamp - overscrollWheelAt >= OVERSCROLL_REST_MS;
+  overscrollWheelAt = event.timeStamp;
+  if (!rested || event.deltaY <= 0 || event.ctrlKey || overscroll !== null) return;
+  const area = leftEl("side-scroll");
+  // A list too short to scroll has no scroll events, and rests at its foot as it rests at its head.
+  const resting = overscrollFootSince !== null
+    ? event.timeStamp - overscrollFootSince >= OVERSCROLL_REST_MS
+    : area.scrollHeight - (area.clientHeight || 0) <= 1;
+  if (!resting || !openOverscroll(area)) return;
+  // A line is 40px, as Chromium scrolls one; a page is what a page key moves (`pageStep`).
+  const px = event.deltaMode === 1 ? event.deltaY * 40 : event.deltaMode === 2 ? event.deltaY * pageStep(area) : event.deltaY;
+  if (typeof area.scrollBy === "function") area.scrollBy({ top: px, behavior: "smooth" });
+  else area.scrollTop += px;
+}, PASSIVE);
+// ...and goes back below the screen as the reader goes back up past the foot, or once they have rested at
+// the foot without going into it (`waitOverscrollIdle`).
+leftEl("side-scroll").addEventListener("scroll", (event) => {
+  const area = leftEl("side-scroll");
+  if (footGap(area) > 1) overscrollFootSince = null;
+  else if (overscrollFootSince === null) overscrollFootSince = event.timeStamp;
+  if (overscroll === null || overscrollRoom(area) === 0) return;
+  if (area.scrollTop < footTop(area) - 1) closeOverscroll();
+  else waitOverscrollIdle();
+}, PASSIVE);
 document.addEventListener("visibilitychange", scheduleColumnLinks);
 
 /**

@@ -6536,6 +6536,14 @@ textarea {
     margin-inline: auto;
   }
 
+  /* `#338 column-overscroll`. The room past the right column's foot, at a desk: drawn, with no height
+     until web/voice.js gives it one (`openOverscroll`), so the last card can be brought to the middle of
+     a tall monitor. By its parent as well as its id, so it outranks the rule that takes it away
+     elsewhere (beside #side-scroll, later in this file). A phone's thread list has none. */
+  #side-scroll > #side-overscroll {
+    display: block;
+  }
+
   /*
    * `#218 desktop-dock`. THE DOCK, AT DESKTOP SIZE.
    *
@@ -7375,6 +7383,13 @@ textarea {
 #side-pane {
   max-width: var(--reading-width);
   margin-inline: auto;
+}
+
+/* `#338 column-overscroll`. The room past the foot: none, except at a desk (the desktop regime above). */
+#side-overscroll {
+  display: none;
+  height: 0;
+  pointer-events: none;
 }
 
 #side-tools {
