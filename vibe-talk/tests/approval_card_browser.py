@@ -107,13 +107,21 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      goes, which left them as far above the foot as they were, and then the room and the jump's
      further: 182px for one 40px up. So is one who saw only the card as Meta+3 docked it under the
      thread list, once it has gone from there, on the way back by Esc, Meta+1 or Meta+2.
+ 19. On the phone, a long draft opened by More docks under Settings, and the way back finds the reader where
+     they were: one at the foot of Main, of All and of the call's view at the foot again, Send tappable and
+     no jump, and one 40 and 200px up Main and All, who sees the card and no row, with the card where it
+     stood, within a pixel, and Send as tappable as it was, now and a second later. Settings is reached by
+     its gear, or by the gear and Help, and left by Back or Esc. Shown again with the card still docked
+     under Settings, the list was laid out short of the card, in a window short of the dock, and the
+     reader's place clamped to that: a reader at the foot of Main was left 549px above it at 393x852, Send
+     off the screen and the jump offered, and 626px above the call's view's.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
 9, 10 and 18 once (point 18 with a reader 30 and 60px up each list, by Send and settled elsewhere, and
-five ways through the thread list, at 393x852, and one case of each list at the other two); the docked
-card alone at 667x375 and 375x330; points 11 to 13, 15 and 16 at 393x852; and points 8, 11 to 15 and 17
-at 1280x800 with a mouse.
+five ways through the thread list, at 393x852, and one case of each list at the other two); point 19 at
+393x852, eleven trips, and four at 375x667; the docked card alone at 667x375 and 375x330; points 11 to 13,
+15 and 16 at 393x852; and points 8, 11 to 15 and 17 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1209,6 +1217,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                 listed += "; " + opened_card_case(page, url, voice, api, size)
             listed += "; " + card_alone_case(page, url, voice, api, size,
                                              CARD_ALONE_CASES if size == PHONES[0] else CARD_ALONE_FEW)
+            if size in (PHONES[0], PHONES[2]):
+                listed += "; " + settings_trip_case(page, url, voice, api, size,
+                                                    SETTINGS_TRIPS if size == PHONES[0] else SETTINGS_TRIPS_FEW)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -2289,6 +2300,115 @@ def card_alone_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
             " the card, at the foot with no jump a second after Send and after the draft was settled elsewhere"
             + ("; and those who saw only it as Meta+3 docked it, on the way back by Esc, Meta+1 and Meta+2 once it"
                " had gone from under the cards" if listed else ""))
+
+
+# Point 19's trips, (list, px up, how Settings is left for, how the reader comes back): at the foot of each list,
+# and 40 and 200px up Main and All, where a reader sees the opened card and no row; every way there and back
+# from each list. Settings is reached by its gear, or by the gear and then Help's button there; Back is the
+# screen's own button (Help's and then Settings'), Esc the key (from Help to Settings and from Settings back).
+SETTINGS_TRIPS: tuple[tuple[str, int, str, str], ...] = (
+    ("Main", 0, "gear", "back"), ("Main", 0, "help", "esc"),
+    ("Main", 40, "gear", "esc"), ("Main", 200, "help", "back"),
+    ("All", 0, "gear", "esc"), ("All", 0, "help", "back"),
+    ("All", 40, "gear", "back"), ("All", 200, "help", "esc"),
+    ("the call's view", 0, "gear", "back"), ("the call's view", 0, "help", "esc"),
+    ("the call's view", 40, "gear", "esc"),
+)
+SETTINGS_TRIPS_FEW: tuple[tuple[str, int, str, str], ...] = (
+    ("Main", 0, "gear", "back"), ("All", 0, "help", "esc"),
+    ("Main", 40, "gear", "esc"), ("the call's view", 0, "gear", "back"),
+)
+
+
+def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                       trips: tuple[tuple[str, int, str, str], ...]) -> str:
+    """Point 19, on the phone: a reader of a long draft opened by More goes to Settings, docking the card there,
+    and comes back where they were: at the foot of Main, All or the call's view with Send tappable and no jump,
+    and one who saw only the card with it where it stood, within a pixel. Shown again with the card still
+    docked under Settings, the list was laid out short of the card and the reader's place clamped to it."""
+    width, height = size
+    where = f"{width}x{height}, Settings and back with the draft opened by More"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        propose(page, api, 191, LONG_DRAFT)
+        page.wait_for_timeout(HOLD_MS + 200)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        # Opened by More without taking the focus onto the card, as a finger leaves it.
+        page.evaluate("() => document.getElementById('post-confirm-more').click()")
+        page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                               timeout=5000)
+        page.wait_for_timeout(300)
+        for view, up, there, back in trips:
+            on_call = view == "the call's view"
+            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+                page.click("#view-switch")
+                page.wait_for_timeout(400)
+            if not on_call:
+                view_key(page, "Meta", 1 if view == "Main" else 2, None, None)
+            page.evaluate(UP_THE_LIST_JS, up)
+            page.wait_for_timeout(400)
+            before = page.evaluate(CARD_ALONE_JS)
+            if up == 0:
+                check(before["call"] is on_call and rect(before, "gap") <= 1 and before["sendHit"] is True and
+                      not before["folded"],
+                      f"{where}: the premise, a reader at the foot of {view}, Send tappable: {before}")
+            else:
+                check(before["call"] is on_call and not before["folded"] and before["row"] is False and
+                      rect(before, "height") > rect(before, "list") and rect(before, "card") < 0,
+                      f"{where}: the premise, a reader {up}px up {view} who sees the opened card and no row: {before}")
+            how = (("the gear" if there == "gear" else "the gear and Help") +
+                   (" and Back" if back == "back" else " and Esc"))
+            page.click("#open-settings")
+            page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+            page.wait_for_timeout(300)
+            docked = page.evaluate("() => { const c = document.getElementById('post-confirm');"
+                                   " return [c.parentElement.id, c.getAttribute('data-place'), c.hidden]; }")
+            check(docked == ["frame-body", "dock", False],
+                  f"{where}: the premise, the card docked under Settings: {docked}")
+            if there == "help":
+                page.click("#open-help")
+                page.wait_for_function("() => currentScreen === 'help'", timeout=5000)
+                page.wait_for_timeout(300)
+                if back == "back":
+                    page.click("#close-help")
+                else:
+                    page.keyboard.press("Escape")
+                page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+                page.wait_for_timeout(200)
+            if back == "back":
+                page.click("#close-settings")
+            else:
+                page.keyboard.press("Escape")
+            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            for when in ("", " a second later"):
+                page.wait_for_timeout(1000 if when else 400)
+                after = page.evaluate(CARD_ALONE_JS)
+                if up == 0:
+                    check(rect(after, "gap") <= 1 and after["sendHit"] is True and after["jump"] is None,
+                          f"{where}: {how} left a reader who was at the foot of {view} {rect(after, 'gap'):.0f}px above"
+                          f" it{when}, Send tappable {after['sendHit']}, the card's top at {rect(after, 'card'):.0f}px"
+                          f" against the list, the jump saying {after['jump']!r}")
+                else:
+                    check(after["card"] is not None and abs(rect(after, "card") - rect(before, "card")) <= 1 and
+                          after["sendHit"] == before["sendHit"],
+                          f"{where}: {how} moved the card a reader {up}px up {view} saw alone from"
+                          f" {rect(before, 'card'):.0f} to {rect(after, 'card'):.0f}px against the list{when}"
+                          f" (Send tappable {before['sendHit']} then {after['sendHit']})")
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: a trip to Settings posted or withdrew the draft ({api.commits}, {api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    lists = sorted({view for view, _, _, _ in trips}, key=["Main", "All", "the call's view"].index)
+    ups = sorted({up for _, up, _, _ in trips if up})
+    return (f"{where}: a reader at the foot of {', '.join(lists)} at it again, Send tappable, and one"
+            f" {' and '.join(str(up) for up in ups)}px up who saw only the card with it where it stood, by the gear"
+            " or Settings and Help, and Back or Esc")
 
 
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:

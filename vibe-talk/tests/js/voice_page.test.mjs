@@ -64595,8 +64595,8 @@ test("`#269 approval-card-inline` x `#281 view-keys`: CMD-3 AND CMD-4 WHILE A SE
   // THE CONTROLS. The card placed as before the thread list: it stays at the foot of Main, behind the
   // cards, where nobody can see it.
   const behind = await run(brokenScript(
-    "  if (currentScreen === \"main\" && !threadListOnScreen()) {",
-    "  if (currentScreen === \"main\") {"));
+    "  if (screen === \"main\" && !(threadListShown && currentView === \"discord\")) {",
+    "  if (screen === \"main\") {"));
   assert.equal(behind.docked, false, "the control docked the card too, so this test cannot see it left behind");
   // Docked only once the cards have been opened: they open at the foot the card then covers. (The
   // dock-growth keeper takes them the rest of the way once the browser reports the sizes.)
@@ -65720,6 +65720,145 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM A CHANGE 
     "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();\n",
     "    if (keepPlace) keepReaderPlace(place);\n"));
   assert.deepStrictEqual(left, { ...real, allAway: false, allToMain: false });
+});
+
+// `#269 approval-card-inline` x `#280 scroll-stability`, from review. On a phone with a long draft opened by
+// More, a reader at the foot of Main or All went to Settings and came back 549px above the foot at 393x852,
+// Send about 900px below the screen and the jump offered, and every reader who saw only the card with them.
+// The main screen was shown again with the card still docked under Settings, and Chromium laid the list out
+// at once, short of the card and in a window short of the dock: it put the reader's place back clamped to
+// that. The card came back to the list's foot a moment later, and the reader was left where the clamp put
+// them. This fixture lays out a hidden list as it lays out a shown one, so the test lays that browser
+// behaviour on.
+
+/**
+ * A browser's own handling of a list on a screen hidden and shown again: it keeps the list's scroll position
+ * while the screen is hidden, laying nothing out and so clamping nothing, and puts it back the first time
+ * the list is laid out again, clamped to the list as it then stands. The page lays the list out in the same
+ * task as it shows the screen (`renderJumpNewest` reads it), so the clamp is made as the screen is shown.
+ */
+function clampedAsShownLikeChromium(page, main) {
+  const screen = page.el("screen-main");
+  const position = Object.getOwnPropertyDescriptor(FakeElement.prototype, "scrollTop");
+  let hidden = screen.hidden;
+  Object.defineProperty(main, "scrollTop", {
+    configurable: true,
+    get: () => position.get.call(main),
+    set: (value) => {
+      if (!hidden) position.set.call(main, value);
+    },
+  });
+  Object.defineProperty(screen, "hidden", {
+    configurable: true,
+    get: () => hidden,
+    set: (value) => {
+      const showing = hidden && !value;
+      hidden = Boolean(value);
+      if (showing) position.set.call(main, position.get.call(main));
+    },
+  });
+}
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM SETTINGS, a reader of a long draft opened by More is where they were — at the foot of Main, of All and of the call's view with Send on screen, and one who saw only the card on it where it stood — by the gear or through Help, and back by Back or Esc, though the browser lays the list out as the screen is shown; with no card they were already", async () => {
+  // Thirty lines of words in the fixture's layout: as More lays a long draft out, taller than the list.
+  const TALL_DRAFT = "The release notes for this week, as agreed, with every target named. ".repeat(18);
+  const routes = { gearBack: [false, "back"], gearEsc: [false, "esc"], helpBack: [true, "back"], helpEsc: [true, "esc"] };
+  const run = async (script, drafted = true) => {
+    const { page, card, main, settled } = await draftOverThreads(script, 60, { proposed: drafted });
+    clampedAsShownLikeChromium(page, main);
+    if (drafted) {
+      page.propose(proposal({ serial: 70, handle: "hAnDlE-tall-0000000070", text: TALL_DRAFT }));
+      await page.settle();
+      await page.el("post-confirm-more").click();
+      await settled();
+      assert.ok(!card.hasAttribute("data-folded") && card.outerHeight() > main.clientHeight + 100,
+        "the premise: the draft is opened, and the card is taller than the list");
+    }
+    const picker = page.el("thread-select");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    const cardTop = () => card.getBoundingClientRect().top - main.getBoundingClientRect().top;
+    const sendShown = () => {
+      const box = page.el("post-confirm-send").getBoundingClientRect();
+      return !card.hidden && box.height > 0 && box.top >= 0 && box.bottom <= main.clientHeight;
+    };
+    const place = () => ({ gap: gap(), row: rowOnScreen(page), card: drafted ? cardTop() : null, send: sendShown() });
+    const trip = async ([throughHelp, back]) => {
+      await page.el("open-settings").click();
+      await settled();
+      assert.ok(page.screen() === "settings" && (!drafted || card.parentNode === page.el("frame-body")),
+        `the premise: Settings is up${drafted ? ", the card docked under it" : ""}`);
+      if (throughHelp) {
+        await page.el("open-help").click();
+        await settled();
+        assert.equal(page.screen(), "help", "the premise: Help is up");
+        if (back === "back") await page.el("close-help").click();
+        else await press(page, focused(page), "Escape");
+        await settled();
+        assert.equal(page.screen(), "settings", "the premise: Help went back to Settings");
+      }
+      if (back === "back") await page.el("close-settings").click();
+      else await press(page, focused(page), "Escape");
+      await settled();
+      assert.equal(page.screen(), "main", "the premise: the main screen is back");
+    };
+    const result = {};
+    for (const [view, digit] of [["Main", "1"], ["All", "2"]]) {
+      for (const up of [0, 40, 150]) {
+        for (const [route, how] of Object.entries(routes)) {
+          if (picker.value !== (digit === "1" ? "main" : "flat")) {
+            await press(page, focused(page) || main, digit, { metaKey: true });
+            await settled();
+          }
+          main.scrollTop = main.scrollHeight - main.clientHeight - up;
+          await main.dispatch("scroll");
+          await settled();
+          const before = place();
+          if (drafted) {
+            assert.ok(card.parentNode === page.el("pane-discord") && before.gap === up &&
+              (up === 0 ? before.send : before.row === null && before.card < 0),
+              `the premise: a reader ${up}px up ${view} ${up === 0 ? "with Send on screen" : "who sees the card and no row"} (${route})`);
+          } else {
+            assert.ok(before.gap === up && before.row !== null, `the premise: a reader ${up}px up ${view} on a row (${route})`);
+          }
+          await trip(how);
+          result[`${view}${up}${route}`] = JSON.stringify(place()) === JSON.stringify(before) &&
+            (!drafted || card.parentNode === page.el("pane-discord"));
+        }
+      }
+    }
+    // The call's view: the card is the transcript's next message, and its reader at the foot is at it again.
+    await page.el("view-switch").click();
+    fillTranscript(page, 4);
+    await settled();
+    for (const [route, how] of Object.entries(routes)) {
+      main.scrollTop = main.scrollHeight;
+      await main.dispatch("scroll");
+      await settled();
+      const before = place();
+      assert.ok(page.el("pane-discord").hidden && before.gap === 0 && main.scrollTop > 0 &&
+        (!drafted || (card.parentNode === page.el("pane-voice") && before.send)),
+        `the premise: a reader at the foot of the call's view${drafted ? ", Send on screen" : ""} (${route})`);
+      await trip(how);
+      result[`call${route}`] = gap() === 0 && sendShown() === before.send;
+    }
+    result.untouched = page.proposalCommits.length === 0 && page.proposalCancels.length === 0 &&
+      card.hidden === !drafted;
+    return result;
+  };
+  const cases = [
+    ...["Main", "All"].flatMap((view) => [0, 40, 150].flatMap((up) => Object.keys(routes).map((route) => `${view}${up}${route}`))),
+    ...Object.keys(routes).map((route) => `call${route}`),
+  ];
+  const every = (value) => ({ ...Object.fromEntries(cases.map((name) => [name, value(name)])), untouched: true });
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, every(() => true));
+
+  // THE CONTROLS. With no card the model moves nobody: every reader was where they were before this.
+  assert.deepStrictEqual(await run(SCRIPT, false), every(() => true));
+  // The card put back only once the main screen is shown: every reader is moved, at the foot and seeing
+  // only the card alike, on every way back.
+  const late = await run(brokenScript('  if (name === "main" && previous !== "main") postCardBackToMain();\n', ""));
+  assert.deepStrictEqual(late, every(() => false));
 });
 
 // --- `#303 voice-post-prefix` with `#269 approval-card-inline` and `#270 voice-transcript-markers` --
