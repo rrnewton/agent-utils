@@ -59229,3 +59229,91 @@ test("`#308 live-reply-in-main`: a read of All for Main's counts sent between tw
   assert.ok(!(await threadFromStore(control.page, control.first.id)).includes("301"),
     "the second reply reached its thread anyway, so this test cannot see it");
 });
+
+// Review round 5. A reply removed upstream while the placing read was out came back from that read's
+// answer, in its thread and counted as unread, and stayed until the thread was read: the removal left
+// it unplaced, and the answer, older than the removal, put it back or placed it where Main's read
+// behind the removal no longer looks. A removal now says the message is gone (`noteLiveRemoval`).
+
+for (const placing of ["newest", "delta"]) {
+  for (const landsFirst of ["removal", "placing"]) {
+    test(`\`#308 live-reply-in-main\`: a reply removed upstream while the placing ${placing === "newest" ? "page" : "delta"} is out does not come back from its answer (${landsFirst === "removal" ? "Main's read behind the removal lands first" : "the placing read lands first"})`, async () => {
+      const run = async (script) => {
+        const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+        if (placing === "delta") {
+          // All read once, and recently: the placing read asks what changed in All since.
+          await pickThread(page, "flat");
+          for (let i = 0; i < 3; i += 1) await page.settle();
+          await pickThread(page, "main");
+          for (let i = 0; i < 3; i += 1) await page.settle();
+        } else {
+          // All never read, and Main's last read past its reconcile window.
+          page.setClock(page.clock() + TIMELINE_RECONCILE_MS + 60000);
+        }
+        const serve = page.timeline;
+        /** @type {{place: Array<() => void>, mutation: Array<() => void>}} */
+        const held = { place: [], mutation: [] };
+        let holdRemovalRead = landsFirst === "placing";
+        page.timeline = (path, options) => {
+          const reason = new URL(path, "http://fixture.test").searchParams.get("reason");
+          if (reason !== "place" && !(reason === "mutation" && holdRemovalRead)) return serve(path, options);
+          // Answered as the server had it when asked, and handed over later.
+          const answer = Promise.resolve(serve(path, options)).then(async (response) => {
+            const body = await response.text();
+            return { ...response, text: async () => body };
+          });
+          return new Promise((resolve) => held[reason].push(() => resolve(answer)));
+        };
+        const from = page.timelineCalls.length;
+        const { first, pushed } = bridgeReply(page, server);
+        await deliver(page, page.stream(), sseMessage(pushed));
+        for (let i = 0; i < 3; i += 1) await page.settle();
+        assert.equal(held.place.length, 1, "fixture: no read of All was made to place the reply");
+        // The bridge takes its reply back. Main's read behind the removal is its newest page, the server
+        // unable to continue Main: it cannot carry a thread reply, so it cannot say the reply is gone.
+        server.remove("300");
+        server.edit("201", { thread: { ...first, reply_count: 1 } });
+        server.refuse = { status: 410, error: "cursor_expired" };
+        await deliver(page, page.stream(), sseDelete("del-300", CHANNEL.id, "300"));
+        for (let i = 0; i < 4; i += 1) await page.settle();
+        held.place[0]();
+        for (let i = 0; i < 4; i += 1) await page.settle();
+        holdRemovalRead = false;
+        for (const answer of held.mutation.splice(0)) answer();
+        for (let i = 0; i < 4; i += 1) await page.settle();
+        const reads = readsSince(page, from);
+        assert.deepStrictEqual(reads.filter(([, , reason]) => reason === "place"), [["flat", placing === "delta", "place"]],
+          `fixture: not one placing read of the kind meant: ${JSON.stringify(reads)}`);
+        assert.ok(reads.some(([view, delta, reason]) => view === "main" && !delta && reason === "mutation"),
+          `fixture: Main's read behind the removal was not its newest page: ${JSON.stringify(reads)}`);
+        // And the poll after that.
+        page.setClock(page.clock() + DISCORD_POLL_MS);
+        await pollOnce(page);
+        for (let i = 0; i < 3; i += 1) await page.settle();
+        return { page, first };
+      };
+      const { page, first } = await run(SCRIPT);
+      assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the reply removed upstream is on Main");
+      assert.equal(savedMessage(page, "300"), null, "the reply removed upstream came back to the store");
+      assert.deepStrictEqual(savedScopes(page)[scopeKey(CHANNEL.id)].unplaced, [], "the reply removed upstream is still unplaced");
+      assert.ok(!(await threadFromStore(page, first.id)).includes("300"), "the reply removed upstream came back to its thread");
+
+      // THE CONTROLS. A removal that leaves the reply unplaced, as round 4 did: the placing read's answer
+      // puts it back in its thread, or places it there, where Main's read no longer takes it out.
+      /** Whether the store holds the removed reply in its thread, as the control's answer put it there. */
+      const inThread = (control) => {
+        const kept = savedMessage(control.page, "300");
+        return Boolean(kept && kept.thread && kept.thread.id === control.first.id);
+      };
+      const unplaced = await run(brokenScript("  if (channelCanon.channel === String(channel)) forgetUnplaced(channelCanon, String(id));\n", ""));
+      assert.ok(inThread(unplaced), "the reply stayed gone anyway, so this test cannot see it");
+      if (placing === "delta") {
+        // And a placing delta folded whatever the stream removed since it was sent: it brings the reply
+        // back itself.
+        const folded = await run(brokenScript("  const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;\n",
+          "  const unremoved = true;\n"));
+        assert.ok(inThread(folded), "the placing delta left the reply gone anyway, so this test cannot see it");
+      }
+    });
+  }
+}
