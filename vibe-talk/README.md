@@ -3830,7 +3830,10 @@ back on the list, or added to it, is in doubt from the moment it is listed, and 
 was on its way to the file for when an erase of the whole channel set the change aside, whether or
 not the file held anything of it yet. Before the list first reaches the cache after a start, and
 while an erased file is being replaced, nothing reaches the file at all, so nothing the live feed
-told the server before then is taken as proof that a held message is current.
+told the server before then is taken as proof that a held message is current. Nor is anything a
+polled provider's feed told it (`live_poll_seconds`): the poller publishes new messages and nothing
+else, and the server refuses an adapter's push for a channel it polls, so no deletion or edit ever
+arrives that way; only reads prove what such a channel still holds.
 
 ### Whose reads fill it
 

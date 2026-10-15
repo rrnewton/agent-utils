@@ -4036,3 +4036,78 @@ async fn a_deletion_pushed_while_the_channel_was_hidden_is_never_vouched_for_onc
         );
     }
 }
+
+/// A bridge the server polls (`live_poll_seconds`): the poller publishes creations alone, and the
+/// ingest route refuses an adapter's pushes for a polled provider, so no deletion ever reaches the
+/// cache. Its feed must vouch for nothing: a message read by id (rows only, which claim nothing),
+/// then deleted upstream, is never counted as one the cache would serve, two minutes on or a day
+/// and an hour on. (The review's probe
+/// `r3_e2e_a_polled_bridge_never_delivers_a_deletion_so_its_feed_vouches_for_none`.)
+#[tokio::test]
+async fn a_polled_bridges_feed_never_vouches_for_a_message_it_could_not_report_deleted() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let text = testing::config_toml().replace(
+        "[discord]",
+        "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9/api\"\n\
+         live_poll_seconds = 30",
+    );
+    let text = format!("{text}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n");
+    let (mut state, fake, _store) = testing::state_with_store_from_toml(&text);
+    let ids: Vec<MessageId> = (0..5)
+        .map(|n| {
+            fake.seed_at(
+                &id(READ_CHANNEL),
+                "Ada",
+                &format!("message {n}"),
+                T0 + n * MINUTE,
+            )
+        })
+        .collect();
+    state.replace_chat(Arc::new(TimelineChat::new(fake.clone())));
+    let dir = TempDir::new("cache-fill-polled-bridge");
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    let target = ids[2].clone();
+    get(
+        &state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            target.as_str()
+        ),
+    )
+    .await;
+    assert!(cache.quiesce_blocking(WAIT));
+    assert!(holds(&cache, &read_chan(), &target), "the lookup filled it");
+
+    clock.advance(MINUTE);
+    fake.delete(&target);
+    assert_eq!(
+        ingest(&state, pushed_deletion("e1", &target)).await,
+        StatusCode::CONFLICT,
+        "a polled provider's push is refused"
+    );
+    for (step, label) in [(MINUTE, "2 min"), (25 * HOUR, "25 h")] {
+        clock.advance(step);
+        let status = call_as(
+            &state,
+            &format!(
+                "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+                target.as_str()
+            ),
+            testing::READ_TOKEN,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{label}: upstream deleted it"
+        );
+        let counted = shadow_of(&state, "message_by_id").await;
+        assert_eq!(
+            (counted.would_serve, counted.extra_rows),
+            (0, 0),
+            "{label}: the feed vouches for a deleted message nothing could report deleted: \
+             {counted:?}"
+        );
+    }
+}

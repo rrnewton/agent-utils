@@ -332,13 +332,18 @@ struct Routes {
     fills: HashMap<ChannelId, Route>,
 }
 
-/// How one channel is read: its provider's key, the shape of that provider, and whether its recent
-/// reads go through a bridge's Flat view.
+/// How one channel is read: its provider's key, the shape of that provider, whether its recent
+/// reads go through a bridge's Flat view, and whether the server polls its provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Route {
     key: String,
     shape: Shape,
     recent_via_flat: bool,
+    /// The server polls the provider (`live_poll_seconds`): the channel's live feed is then the
+    /// poller's, which publishes creations alone, and the ingest route refuses an adapter's pushes
+    /// for it. Nothing ever delivers a deletion or an edit of the channel, whatever its provider's
+    /// shape, so the feed vouches for none of its messages ([`shadow::Facts::fed_since_ms`]).
+    polled: bool,
 }
 
 /// When a read whose finds the live hub publishes began ([`Fill::read_start`]): the channel as the
@@ -928,10 +933,14 @@ impl Sink {
                     ProviderKind::Discord(discord) => discord.recent.view == RecentView::Flat,
                     ProviderKind::Slack(_) => false,
                 };
+                let polled = router
+                    .entry(&key)
+                    .is_some_and(|entry| entry.live_poll_seconds > 0);
                 let route = Route {
                     shape: Shape::of(provider, channel.id.as_str()),
                     key,
                     recent_via_flat,
+                    polled,
                 };
                 fills.insert(channel.id.clone(), route);
             }
@@ -1098,7 +1107,8 @@ impl Sink {
         // Both noted now, before the request's own read starts: the time the rule decides at, and
         // the offers the barrier waits for, none of them the request's own.
         let asked_ms = cache.now_ms();
-        let fed_since_ms = Some(cache.fed_since_ms());
+        // A polled channel's feed never delivers a deletion or an edit: it vouches for nothing.
+        let fed_since_ms = (!route.polled).then(|| cache.fed_since_ms());
         let target = cache.enqueued_seq();
         let weak = Arc::downgrade(&cache);
         drop(cache);
