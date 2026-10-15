@@ -7566,6 +7566,11 @@ message a filter change holds, or where entering a thread landed them — stays 
 offered the jump to it. Its going moves the list no more: a reader on the newest line is on it still
 as the box takes the focus the card had, and when the box takes back its room a second later,
 whatever redraws the list in that second, without leaning on the browser's own scroll anchoring.
+So is one who could see nothing of the list but the card, as near the foot of a long draft opened
+by More, which is taller than a phone's list: the card was the list's next message and they were on
+it, so once it goes, by Send or settled elsewhere, they are on the newest line, following the list,
+in Main, in All and on the call's view — and on the way back from the thread list, if it went from
+under the cards while they were there.
 Nor does two columns coming or going, though the left column is drawn at half the window's width
 there, the card and every row with it: a reader at the foot of Main or All is at the foot of the
 left column by Ctrl+4, Send on screen, and at the foot again by Ctrl+1 or Ctrl+2, and one further
