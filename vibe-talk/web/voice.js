@@ -1124,8 +1124,9 @@ function showScreen(name) {
   // added later cannot leave a stale answer behind.
   if (previous === "help" && name !== "help") helpReturn = "settings";
   currentScreen = name;
-  // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`.
-  renderJumpNewest();
+  // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`. Back on
+  // the main screen it is decided at the end, on the list as it is then laid out (below).
+  if (!main) renderJumpNewest();
   // ...and so is the channel's message box the chips stand on. `#245 done-feedback`.
   placeChipsOverComposer();
   // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
@@ -1141,6 +1142,12 @@ function showScreen(name) {
   if (main) renderColumns();
   // `#269 approval-card-inline`. A waiting draft follows the owner to the screen now up.
   placePostCard();
+  // `#207 scrollback-jump` x `#280 scroll-stability`. The jump over the list now shown, decided once the
+  // header has collapsed (`renderControlBar`) and the columns and the card are in place. Decided as the
+  // screen was un-hidden, it measured the list under the header the screen being left kept, 54px shorter
+  // at a desk and 8px on a phone: a reader 40px above the foot read as 94px up, past `SCROLLBACK_PX`, and
+  // was offered the jump, whose own room under the box then held it there.
+  if (main) renderJumpNewest();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") refreshUpstreamClear();
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.

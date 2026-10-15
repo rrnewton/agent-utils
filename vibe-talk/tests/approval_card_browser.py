@@ -121,13 +121,20 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      again. The chips are measured at nothing while their screen is hidden, and the room the lists keep
      for them went with that: the list came back 36px short, the reader within the slack of its foot,
      and the chips' report took them to it, card or no card.
+ 21. With no card, a reader up a list past the slack of its foot but short of the jump's 64px goes to
+     Settings and comes back by Back or Esc with no jump offered and the same distance to the foot, on
+     the same row within a pixel, a second later too: 30, 40 and 60px up Main, All and the call's view at
+     the desk, and 60px up on the phone. One 150px up keeps the jump. Decided as the main screen was
+     shown, under the header Settings kept (54px of it at the desk), the jump was offered to them, and its
+     own room under the box then held it there.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
 9, 10 and 18 once (point 18 with a reader 30 and 60px up each list, by Send and settled elsewhere, and
 five ways through the thread list, at 393x852, and one case of each list at the other two); point 19 at
-393x852, eleven trips, and four at 375x667; point 20 at 393x852; the docked card alone at 667x375 and 375x330; points 11 to 13,
-15 and 16 at 393x852; and points 8, 11 to 15 and 17 at 1280x800 with a mouse.
+393x852, eleven trips, and four at 375x667; points 20 and 21 at 393x852; the docked card alone at 667x375
+and 375x330; points 11 to 13, 15 and 16 at 393x852; and points 8, 11 to 15, 17 and 21 at 1280x800 with a
+mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1228,6 +1235,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                                                     SETTINGS_TRIPS if size == PHONES[0] else SETTINGS_TRIPS_FEW)
             if size == PHONES[0]:
                 listed += "; " + chips_room_case(page, url, voice, api, size)
+                listed += "; " + jump_after_settings_case(page, url, voice, api, size, True, JUMP_TRIPS_PHONE)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -2503,8 +2511,80 @@ def chips_room_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
             " card or no card, and one at its foot at it again")
 
 
+# Point 21's trips, (list, px up, how the reader comes back): readers up past the slack of the foot but short of
+# the jump's SCROLLBACK_PX, 64px, who the header Settings kept would put past it (54px of it at the desk, 8px on
+# a phone), and one far up who has the jump and keeps it.
+JUMP_TRIPS_DESK: tuple[tuple[str, int, str], ...] = (
+    ("Main", 30, "back"), ("Main", 40, "esc"), ("All", 60, "back"), ("the call's view", 40, "esc"),
+    ("Main", 150, "back"),
+)
+JUMP_TRIPS_PHONE: tuple[tuple[str, int, str], ...] = (
+    ("Main", 60, "back"), ("All", 60, "esc"), ("the call's view", 60, "back"), ("All", 150, "esc"),
+)
+
+
+def jump_after_settings_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                             phone: bool, trips: tuple[tuple[str, int, str], ...]) -> str:
+    """Point 21: with no card, a reader up a list short of the jump's distance goes to Settings and comes back
+    with no jump offered and nothing grown under them, and one far up keeps the jump. Decided as the main screen
+    was shown, under the header Settings kept, the jump was offered to the first and its room then held it."""
+    width, height = size
+    where = f"{width}x{height}, the jump back from Settings"
+    mod = "Meta" if phone else "Control"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        for view, up, back in trips:
+            on_call = view == "the call's view"
+            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+                page.click("#view-switch")
+                page.wait_for_timeout(400)
+            if not on_call:
+                view_key(page, mod, 1 if view == "Main" else 2, None, None)
+            # From the foot, as a thumb comes up the list: below SCROLLBACK_PX the jump is not up.
+            page.evaluate(TO_NEWEST_JS)
+            page.wait_for_timeout(300)
+            page.evaluate(UP_THE_LIST_JS, up)
+            page.wait_for_timeout(400)
+            before = page.evaluate(CARD_ALONE_JS)
+            first = None if on_call else still(page)["first"]
+            # Far up, the jump comes, and the room the box keeps for it grows the list under the reader.
+            check((rect(before, "gap") == up if up < 64 else rect(before, "gap") >= up) and before["card"] is None and
+                  (before["jump"] is None) == (up < 64) and (on_call or isinstance(first, dict)),
+                  f"{where}: the premise, a reader {up}px up {view} with no card: {before}, first row {first}")
+            page.click("#open-settings")
+            page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+            page.wait_for_timeout(400)
+            if back == "back":
+                page.click("#close-settings")
+            else:
+                page.keyboard.press("Escape")
+            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            for when in ("", " a second later"):
+                page.wait_for_timeout(1000 if when else 400)
+                after = page.evaluate(CARD_ALONE_JS)
+                now = None if on_call else still(page)["first"]
+                check(abs(rect(after, "gap") - rect(before, "gap")) <= 1 and after["jump"] == before["jump"] and
+                      (on_call or same_row(first, now)),
+                      f"{where}: {'Back' if back == 'back' else 'Esc'} left a reader {up}px up {view}"
+                      f" {rect(after, 'gap'):.0f}px above the foot (was {rect(before, 'gap'):.0f}){when}, the jump"
+                      f" saying {after['jump']!r} (it said {before['jump']!r}), on {now} (was {first})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    near = sorted({up for _, up, _ in trips if up < 64})
+    far = sorted({up for _, up, _ in trips if up >= 64})
+    return (f"{where}: a reader {' and '.join(str(up) for up in near)}px up offered no jump and on their row by Back"
+            f" and Esc, one {' and '.join(str(up) for up in far)}px up offered it still")
+
+
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Points 8, 11 to 15 and 17 on a desk with a mouse, where two columns are offered."""
+    """Points 8, 11 to 15, 17 and 21 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -2524,6 +2604,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
             line += "; " + room_back_case(page, url, voice, api, DESK, False)
             line += "; " + two_columns_opened_case(page, url, voice, api, DESK)
+            line += "; " + jump_after_settings_case(page, url, voice, api, DESK, False, JUMP_TRIPS_DESK)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
