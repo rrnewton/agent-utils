@@ -1551,7 +1551,18 @@ nothing is salvaged from a dirty tree:
 - no Git directory may use grafts, shallow history or replacement refs, and no worktree a Git
   directory inside registers may exist outside the directory;
 - no process may use the directory. lsof diagnostics that the worktree commands attribute to
-  unrelated paths count as indeterminate here and refuse;
+  unrelated paths count as indeterminate here and refuse, with one exception: lsof's
+  `can't stat() FSTYPE file system POINT` warning (and its `Output information may be
+  incomplete.` trailer and an `assuming dev=DEV for POINT` note whose DEV is the device the mount
+  table gives that mount) is tolerated when the mount table lists a FSTYPE mount at POINT;
+  POINT is not the directory, an ancestor or a descendant of it, either by path or under
+  another name (no directory above POINT is, by device and inode, the directory or one of its
+  ancestors such that POINT is the directory, above it or below it, as a bind mount would make
+  it); no mount at POINT shares the device of the directory or of the mount holding it, nor that
+  mount's type and source; and none is an overlay or union file system or has a source naming a
+  related path. lsof matches open files by device and inode, so a mount it cannot stat hides
+  only files on that mount, which those checks show are not the directory's. Each tolerated
+  mount is printed as a `NOTE lsof could not stat ...` line;
 - every handoff (a `HANDOFF*` file outside a checkout, untracked or ignored inside one, or a
   wrkslots handoff sidecar for the slot name) must be read and its SHA-256 supplied;
 - every ref (every namespace, including `refs/remotes/*`), HEAD, `ORIG_HEAD`, `refs/stash` entry,

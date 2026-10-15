@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -394,22 +395,328 @@ def test_refuses_live_process_inside_the_clone(
         holder.wait()
 
 
-def test_any_lsof_diagnostic_is_indeterminate_in_strict_mode(tmp_path: Path) -> None:
-    fake = tmp_path / "lsof"
-    fake.write_text(
-        "#!/bin/sh\n"
-        "echo 'lsof: WARNING: can'\"'\"'t stat() fuse file system /unrelated/mount' >&2\n"
-        "exit 1\n",
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
-    slot = tmp_path / "slot"
-    slot.mkdir()
-    # The relaxed check attributes the warning to an unrelated path.
+def test_strict_lsof_refuses_what_the_relaxed_check_tolerates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relaxed check attributes a warning to an unrelated path; strict mode
+    tolerates only a can't-stat warning for a mount the table lists."""
+
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch)
+    fake = fake_lsof(tmp_path, [cant_stat("/unrelated/mount", "fuse")])
     evidence, _malformed, returncode = wrkslots._lsof_slot_use(fake, slot)
     assert evidence is None and returncode == 1
+    with pytest.raises(wrkslots.Refusal, match="lists no fuse mount at /unrelated/mount"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    fake = fake_lsof(tmp_path, ["lsof: WARNING: can't opendir(/unrelated/dir): Permission denied"])
+    evidence, _malformed, returncode = wrkslots._lsof_slot_use(fake, slot)
+    assert evidence is None and returncode == 1
+    with pytest.raises(wrkslots.Refusal, match="only a can't-stat warning"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+
+
+def fake_lsof(tmp_path: Path, stderr_lines: list[str]) -> Path:
+    """An lsof that finds nothing and prints ``stderr_lines`` on stderr."""
+
+    script = tmp_path / "lsof"
+    body = "".join(
+        f"printf '%s\\n' {shlex.quote(line)} >&2\n" for line in stderr_lines
+    )
+    script.write_text(f"#!/bin/sh\n{body}exit 1\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+# The mount that holds every test slot in the fake mount tables below, and the
+# unrelated FUSE mount lsof cannot stat.  The device numbers are chosen to be
+# none a real test directory has.
+HOLDING_MOUNT = "36 1 250:250 / / rw,relatime shared:1 - btrfs /dev/fake-disk rw\n"
+FUSE_DEVICE = "0:9999"
+
+
+def cant_stat(point: Path | str, fstype: str = "fuse.squashfuse_ll") -> str:
+    return f"lsof: WARNING: can't stat() {fstype} file system {point}"
+
+
+def mount_line(
+    point: Path | str,
+    *,
+    device: str = FUSE_DEVICE,
+    fstype: str = "fuse.squashfuse_ll",
+    source: str = "squashfuse_ll",
+    mount_id: int = 2131,
+) -> str:
+    return f"{mount_id} 36 {device} / {point} rw,nosuid,nodev - {fstype} {source} rw\n"
+
+
+def strict_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *extra_mounts: str
+) -> tuple[Path, Path]:
+    """Return (slot, unrelated directory) under a fake mount table."""
+
+    slot = tmp_path / "slots" / "slot"
+    slot.mkdir(parents=True)
+    elsewhere = tmp_path / "xarfuse" / "uid-48"
+    elsewhere.mkdir(parents=True)
+    table = tmp_path / "mountinfo"
+    table.write_text(HOLDING_MOUNT + "".join(extra_mounts), encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", table)
+    return slot, elsewhere
+
+
+def test_strict_lsof_tolerates_and_reports_an_unrelated_unstattable_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    point = tmp_path / "xarfuse" / "uid-48" / "f3975eec-seed"
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(point))
+    fake = fake_lsof(
+        tmp_path,
+        [
+            cant_stat(point),
+            "      Output information may be incomplete.",
+            f"lsof: assuming dev={os.makedev(0, 9999):#x} for {point} from /proc/self/mountinfo",
+        ],
+    )
+    evidence, malformed, returncode = wrkslots._lsof_slot_use(
+        fake, slot, strict_warnings=True
+    )
+    assert (evidence, malformed, returncode) == (None, False, 1)
+    out = capsys.readouterr().out
+    assert (
+        f"NOTE lsof could not stat the fuse.squashfuse_ll file system at {point} "
+        "(device 0:9999); tolerated: it is another file system" in out
+    )
+
+
+@pytest.mark.parametrize("where", ["slot", "ancestor", "descendant"])
+def test_strict_lsof_refuses_a_warning_for_a_mount_related_to_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    slot = tmp_path / "slots" / "slot"
+    point = {"slot": slot, "ancestor": slot.parent, "descendant": slot / "sub"}[where]
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(point))
+    fake = fake_lsof(tmp_path, [cant_stat(point)])
+    with pytest.raises(
+        wrkslots.Refusal, match="names the slot, an ancestor of it, or a descendant of it"
+    ):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    # The relaxed check refuses it too.
+    with pytest.raises(wrkslots.Refusal, match="indeterminate because lsof reported"):
+        wrkslots._lsof_slot_use(fake, slot)
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ["lsof: WARNING: can't opendir(/elsewhere/dir): Permission denied"],
+        ["lsof: WARNING: can't stat(/elsewhere/file): Permission denied"],
+        ["Output information may be incomplete."],
+        ["lsof: some future diagnostic"],
+        # A tolerable warning does not excuse a second, unknown line.
+        ["CANT_STAT", "lsof: WARNING: something else entirely"],
+        # lsof's device note names a mount it did not warn about.
+        ["CANT_STAT", "lsof: assuming dev=0x10 for /other/mount from /proc/self/mountinfo"],
+    ],
+)
+def test_strict_lsof_refuses_every_other_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lines: list[str]
+) -> None:
+    point = tmp_path / "xarfuse" / "uid-48" / "seed"
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(point))
+    fake = fake_lsof(tmp_path, [cant_stat(point) if line == "CANT_STAT" else line for line in lines])
     with pytest.raises(wrkslots.Refusal, match="indeterminate because lsof reported"):
         wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+
+
+def test_strict_lsof_refuses_a_warned_mount_missing_from_the_mount_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point = tmp_path / "xarfuse" / "uid-48" / "seed"
+    # Listed, but as another file system type than lsof named.
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(point, fstype="fuse"))
+    fake = fake_lsof(tmp_path, [cant_stat(point)])
+    with pytest.raises(wrkslots.Refusal, match="lists no fuse.squashfuse_ll mount"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    fake = fake_lsof(tmp_path, [cant_stat(tmp_path / "xarfuse" / "uid-48" / "gone")])
+    with pytest.raises(wrkslots.Refusal, match="lists no fuse.squashfuse_ll mount"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        # A bind mount of the slot's own file system shows the table device of
+        # the mount holding the slot ...
+        {"device": "250:250", "fstype": "btrfs", "source": "/dev/fake-disk", "why": "shares a device"},
+        # ... or, on btrfs, a different one with the same type and source.
+        {"device": "0:9998", "fstype": "btrfs", "source": "/dev/fake-disk", "why": "type and source"},
+        # A mount whose device is the slot's own st_dev.
+        {"device": "SLOT", "fstype": "ext4", "source": "/dev/other", "why": "shares a device"},
+        # Overlay and union mounts show other directories under their own device.
+        {"device": "0:9997", "fstype": "overlay", "source": "overlay", "why": "a overlay mount shows"},
+        {"device": "0:9996", "fstype": "fuse.bindfs", "source": "bindfs", "why": "a fuse.bindfs mount shows"},
+        # A mount whose source lies inside the slot.
+        {"device": "0:9995", "fstype": "fuse.squashfuse_ll", "source": "SLOT_IMAGE", "why": "source .* names the slot"},
+        {"device": "0:9994", "fstype": "fuse.sshfs", "source": "HOST_SLOT", "why": "source .* names the slot"},
+        {"device": "0:9993", "fstype": "nfs4", "source": "IPV6_SLOT", "why": "source .* names the slot"},
+    ],
+)
+def test_strict_lsof_refuses_an_unstattable_mount_that_may_alias_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: dict[str, str]
+) -> None:
+    slot_path = tmp_path / "slots" / "slot"
+    slot_path.mkdir(parents=True)
+    metadata = os.stat(slot_path)
+    device = (
+        f"{os.major(metadata.st_dev)}:{os.minor(metadata.st_dev)}"
+        if alias["device"] == "SLOT"
+        else alias["device"]
+    )
+    source = {
+        "SLOT_IMAGE": str(slot_path / "image.sqfs"),
+        "HOST_SLOT": f"localhost:{slot_path}",
+        "IPV6_SLOT": f"[::1]:{slot_path.parent}",
+    }.get(alias["source"], alias["source"])
+    point = tmp_path / "xarfuse" / "uid-48" / "alias"
+    slot_path.rmdir()
+    slot, _elsewhere = strict_setup(
+        tmp_path,
+        monkeypatch,
+        mount_line(point, device=device, fstype=alias["fstype"], source=source),
+    )
+    fake = fake_lsof(tmp_path, [cant_stat(point, alias["fstype"])])
+    with pytest.raises(wrkslots.Refusal, match=alias["why"]):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+
+
+@pytest.mark.parametrize(
+    ("aliased", "below", "refused"),
+    [
+        # `mount --bind <slot> <elsewhere>`: a mount below the alias is below the slot.
+        ("slot", "sub", True),
+        # `mount --bind <slot parent> <elsewhere>`: the slot itself, below it, and
+        # a sibling directory, which is not the slot.
+        ("parent", "slot", True),
+        ("parent", "slot/sub", True),
+        ("parent", "sibling", False),
+        # `mount --bind <slot grandparent> <elsewhere>`: the slot's parent.
+        ("grandparent", "slots", True),
+    ],
+)
+def test_strict_lsof_checks_bind_aliases_of_the_slot_and_its_ancestors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    aliased: str,
+    below: str,
+    refused: bool,
+) -> None:
+    alias_root = tmp_path / "xarfuse" / "uid-48"
+    point = alias_root.joinpath(*below.split("/"))
+    slot, elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(point))
+    assert elsewhere == alias_root
+    target = {"slot": slot, "parent": slot.parent, "grandparent": slot.parent.parent}[aliased]
+    # Stand-in for `mount --bind <target> <elsewhere>`, which a test cannot make:
+    # every directory below the alias has the device and inode of the one it shows.
+    real_stat = os.stat
+
+    def aliased_stat(
+        path: str | os.PathLike[str] | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if not isinstance(path, int):
+            candidate = Path(os.fspath(path))
+            if candidate == elsewhere or elsewhere in candidate.parents:
+                shown = target / candidate.relative_to(elsewhere)
+                return real_stat(shown, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    (slot / "sub").mkdir()
+    (slot.parent / "sibling").mkdir()
+    monkeypatch.setattr(os, "stat", aliased_stat)
+    fake = fake_lsof(tmp_path, [cant_stat(point)])
+    if refused:
+        with pytest.raises(wrkslots.Refusal, match="under another name"):
+            wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    else:
+        assert wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)[0] is None
+        assert f"NOTE lsof could not stat the fuse.squashfuse_ll file system at {point}" in (
+            capsys.readouterr().out
+        )
+
+
+def test_strict_lsof_refuses_a_bind_of_the_slot_file_system_under_a_stacked_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point = tmp_path / "xarfuse" / "uid-48" / "seed"
+    slot, _elsewhere = strict_setup(
+        tmp_path,
+        monkeypatch,
+        mount_line(point, device="250:250", fstype="btrfs", source="/dev/fake-disk", mount_id=2130),
+        mount_line(point),
+    )
+    fake = fake_lsof(tmp_path, [cant_stat(point)])
+    with pytest.raises(wrkslots.Refusal, match="shares a device"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+
+
+def test_strict_lsof_refuses_when_one_of_several_warnings_is_related(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unrelated = tmp_path / "xarfuse" / "uid-48" / "seed"
+    slot = tmp_path / "slots" / "slot"
+    slot, _elsewhere = strict_setup(
+        tmp_path, monkeypatch, mount_line(unrelated), mount_line(slot / "sub", mount_id=2132)
+    )
+    fake = fake_lsof(tmp_path, [cant_stat(unrelated), cant_stat(slot / "sub")])
+    with pytest.raises(wrkslots.Refusal, match="names the slot"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+
+
+def test_strict_lsof_compares_the_resolved_slot_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(tmp_path / "slots"))
+    link = tmp_path / "link-to-slot"
+    link.symlink_to(slot)
+    fake = fake_lsof(tmp_path, [cant_stat(tmp_path / "slots")])
+    with pytest.raises(wrkslots.Refusal, match="names the slot, an ancestor"):
+        wrkslots._lsof_slot_use(fake, link, strict_warnings=True)
+
+
+def test_strict_lsof_refuses_what_it_cannot_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point = tmp_path / "xarfuse" / "uid-48" / "seed"
+    # lsof's device note disagrees with the mount table.
+    slot, _elsewhere = strict_setup(tmp_path, monkeypatch, mount_line(point))
+    fake = fake_lsof(
+        tmp_path,
+        [cant_stat(point), f"lsof: assuming dev=0x99 for {point} from /proc/self/mountinfo"],
+    )
+    with pytest.raises(wrkslots.Refusal, match="the mount table gives .* device 0:9999"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    # The table gives no device for the mount.
+    table = tmp_path / "mountinfo"
+    table.write_text(HOLDING_MOUNT + mount_line(point, device="x:y"), encoding="utf-8")
+    fake = fake_lsof(tmp_path, [cant_stat(point)])
+    with pytest.raises(wrkslots.Refusal, match="gives no device"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    # The table lists no mount holding the slot.
+    table.write_text(mount_line(point), encoding="utf-8")
+    with pytest.raises(wrkslots.Refusal, match="mount holding the slot is not in the mount table"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    # A directory above the mount point cannot be inspected.
+    hidden = tmp_path / "absent" / "seed"
+    table.write_text(HOLDING_MOUNT + mount_line(hidden), encoding="utf-8")
+    fake = fake_lsof(tmp_path, [cant_stat(hidden)])
+    with pytest.raises(wrkslots.Refusal, match="cannot inspect .*absent, which holds the mount"):
+        wrkslots._lsof_slot_use(fake, slot, strict_warnings=True)
+    # The slot cannot be inspected.
+    gone = tmp_path / "slots" / "gone"
+    with pytest.raises(wrkslots.Refusal, match="cannot inspect the slot"):
+        wrkslots._lsof_slot_use(fake, gone, strict_warnings=True)
 
 
 def test_refuses_unread_handoff_and_preserves_a_read_one(

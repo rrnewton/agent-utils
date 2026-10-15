@@ -11649,7 +11649,10 @@ class _MountEntry:
     ``root`` the directory of the mounted file system shown there, still
     escaped, which for some file systems is not a path; ``fstype`` the file
     system type, with any subtype ("fuse.sshfs"); and ``options`` the super
-    options, still escaped.
+    options, still escaped. ``device`` is the major and minor number the
+    table gives the mounted file system (None when that field is malformed;
+    on btrfs it is the file system's, not a subvolume's ``st_dev``), and
+    ``source`` the mount source, still escaped.
     """
 
     mount_id: int
@@ -11658,6 +11661,8 @@ class _MountEntry:
     root: bytes
     fstype: str
     options: bytes
+    device: tuple[int, int] | None = None
+    source: bytes = b""
 
 
 _MOUNTINFO_ESCAPE = re.compile(rb"\\([0-3][0-7]{2})")
@@ -11703,6 +11708,7 @@ def _mount_entries(table: bytes, label: str) -> tuple[_MountEntry, ...]:
             raise Refusal(f"{label} has a malformed mount point {raw!r}")
         if not fields[0].isdigit() or not fields[1].isdigit():
             raise Refusal(f"{label} has a line with a malformed mount identifier")
+        device = re.fullmatch(rb"([0-9]+):([0-9]+)", fields[2])
         entries.append(
             _MountEntry(
                 mount_id=int(fields[0]),
@@ -11711,6 +11717,12 @@ def _mount_entries(table: bytes, label: str) -> tuple[_MountEntry, ...]:
                 root=fields[3],
                 fstype=os.fsdecode(fields[separator + 1]),
                 options=b" ".join(fields[separator + 3 :]),
+                device=(
+                    None
+                    if device is None
+                    else (int(device.group(1)), int(device.group(2)))
+                ),
+                source=fields[separator + 2],
             )
         )
     return tuple(entries)
@@ -18400,6 +18412,183 @@ def _first_related_lsof_warning(stderr: str, slot_path: Path) -> str | None:
     return None
 
 
+_LSOF_CANT_STAT_FILE_SYSTEM = re.compile(
+    r"lsof: WARNING: can't stat\(\) (?P<fstype>\S+) file system (?P<point>/.*)"
+)
+_LSOF_ASSUMING_DEVICE = re.compile(
+    r"lsof: assuming dev=(?P<device>0|0x[0-9a-f]+) for (?P<point>/.*) from \S+"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ToleratedLsofMount:
+    """A mount lsof could not stat that the strict check showed cannot be the slot."""
+
+    fstype: str
+    point: Path
+    device: tuple[int, int]
+
+    def describe(self) -> str:
+        return (
+            f"{self.fstype} file system at {self.point} "
+            f"(device {self.device[0]}:{self.device[1]})"
+        )
+
+
+def _strict_lsof_tolerated_mounts(
+    stderr: str, slot_path: Path
+) -> tuple[_ToleratedLsofMount, ...]:
+    """Return the mounts lsof could not stat whose warnings the strict check tolerates.
+
+    The strict check exists for removals that destroy unreplicated state, so
+    every lsof diagnostic refuses unless it is shown not to hide a use of
+    ``slot_path``.  lsof matches open files to the directory by device and
+    inode, read through each process's descriptors, so a mount it could not
+    stat hides only files on that mount (lsof FAQ 10.2.7).  Such a mount
+    cannot hold the slot's files when all of these hold, each checked against
+    this process's mount table, which lsof, a child in the same mount
+    namespace, also read:
+
+    - the warning is "can't stat() FSTYPE file system POINT", and the table
+      lists a mount of FSTYPE at POINT.  Any other line refuses, except lsof's
+      "Output information may be incomplete." trailer and its "assuming
+      dev=DEV for POINT" note for a warned POINT whose DEV is the device the
+      table gives the FSTYPE mount there;
+    - POINT is not the slot, an ancestor of it, or a descendant of it, by
+      path, nor under another name: no directory above POINT is the slot or
+      one of its ancestors (by device and inode, as a bind mount aliases a
+      directory) such that POINT, named from there, is the slot, above it or
+      below it;
+    - no mount at POINT has the slot's device, the device of the mount that
+      holds the slot (on btrfs a subvolume's ``st_dev`` differs from the
+      table's device, so both are compared), or that mount's file system
+      type and source: a bind mount of the slot's file system shares them;
+    - no mount at POINT is an overlay or union file system, which shows
+      other directories' contents under its own device, and none names a
+      source (or, for HOST:PATH, a path) related to the slot.
+
+    A mount made below a bind mount of a subdirectory of the slot is not
+    recognised as lying inside the slot; by the checks above it is another
+    file system, so it does not hold the slot's files.  Anything that cannot
+    be checked refuses.  The returned mounts are for the caller to report.
+    """
+
+    # lsof indents its follow-up lines; only leading blanks are dropped, so
+    # a mount point that ends in a blank is compared as lsof printed it.
+    lines = [line.lstrip() for line in stderr.splitlines() if line.strip()]
+    if not lines:
+        return ()
+
+    def refuse(line: str, why: str) -> NoReturn:
+        raise Refusal(f"process use is indeterminate because lsof reported: {line} ({why})")
+
+    def related(path: Path, slots: Sequence[Path]) -> bool:
+        return any(
+            _path_is_within(path, slot) or _path_is_within(slot, path) for slot in slots
+        )
+
+    warned: dict[str, tuple[str, str]] = {}
+    for line in lines:
+        match = _LSOF_CANT_STAT_FILE_SYSTEM.fullmatch(line)
+        if match is not None:
+            warned.setdefault(match.group("point"), (match.group("fstype"), line))
+    if not warned:
+        refuse(lines[0], "only a can't-stat warning for an unrelated mount is tolerated")
+    assumed: list[tuple[str, int, str]] = []
+    for line in lines:
+        if line == "Output information may be incomplete." or _LSOF_CANT_STAT_FILE_SYSTEM.fullmatch(
+            line
+        ):
+            continue
+        assuming = _LSOF_ASSUMING_DEVICE.fullmatch(line)
+        if assuming is not None and assuming.group("point") in warned:
+            assumed.append((assuming.group("point"), int(assuming.group("device"), 0), line))
+            continue
+        refuse(line, "only a can't-stat warning for an unrelated mount is tolerated")
+    first_line = next(iter(warned.values()))[1]
+    try:
+        resolved_slot = Path(os.path.realpath(slot_path))
+        slot_metadata = os.stat(resolved_slot, follow_symlinks=False)
+        # The slot and each directory above it, by device and inode, with the
+        # path from there down to the slot.
+        slot_chain: dict[tuple[int, int], tuple[Path, tuple[str, ...]]] = {}
+        for depth, directory in enumerate((resolved_slot, *resolved_slot.parents)):
+            metadata = os.stat(directory, follow_symlinks=False)
+            slot_chain.setdefault(
+                (metadata.st_dev, metadata.st_ino),
+                (directory, resolved_slot.parts[len(resolved_slot.parts) - depth :]),
+            )
+    except OSError as exc:
+        refuse(first_line, f"cannot inspect the slot or a directory above it: {exc}")
+    slots = (slot_path, resolved_slot)
+    slot_device = (os.major(slot_metadata.st_dev), os.minor(slot_metadata.st_dev))
+    entries = _read_self_mount_entries()
+    holding = _visible_mount(entries, resolved_slot)
+    if holding is None or holding.device is None:
+        refuse(first_line, "the mount holding the slot is not in the mount table")
+    tolerated: list[_ToleratedLsofMount] = []
+    for raw_point, (fstype, line) in warned.items():
+        point = Path(raw_point)
+        if related(point, slots):
+            refuse(line, "it names the slot, an ancestor of it, or a descendant of it")
+        at_point = [entry for entry in entries if entry.point == point]
+        named = [entry for entry in at_point if entry.fstype == fstype]
+        if not named:
+            refuse(line, f"the mount table lists no {fstype} mount at {point}")
+        for entry in at_point:
+            if entry.device is None:
+                refuse(line, f"the mount table gives no device for {point}")
+            if entry.device in (slot_device, holding.device):
+                refuse(line, "the mount shares a device with the slot and may show it")
+            if entry.fstype == holding.fstype and entry.source == holding.source:
+                refuse(
+                    line,
+                    "the mount has the file system type and source of the mount holding "
+                    "the slot and may show it",
+                )
+            if entry.fstype == "overlay" or entry.fstype in _UNION_FILE_SYSTEM_TYPES:
+                refuse(line, f"a {entry.fstype} mount shows other directories' contents")
+            source = os.fsdecode(_mountinfo_unescape(entry.source))
+            # The source itself, and the path after each ":" of a HOST:PATH
+            # source, which an IPv6 host ("[::1]:/path") repeats.
+            candidates = {source} | {
+                source[index + 1 :]
+                for index, character in enumerate(source)
+                if character == ":"
+            }
+            for candidate in candidates:
+                if candidate.startswith("/") and related(Path(candidate), slots):
+                    refuse(line, f"the mount's source {source} names the slot or a related path")
+        for depth, ancestor in enumerate(point.parents, start=1):
+            try:
+                metadata = os.stat(ancestor, follow_symlinks=False)
+            except OSError as exc:
+                refuse(line, f"cannot inspect {ancestor}, which holds the mount: {exc}")
+            chain_entry = slot_chain.get((metadata.st_dev, metadata.st_ino))
+            if chain_entry is None:
+                continue
+            directory, below_slot = chain_entry
+            below_point = point.parts[len(point.parts) - depth :]
+            shorter = min(len(below_slot), len(below_point))
+            if below_slot[:shorter] == below_point[:shorter]:
+                refuse(
+                    line,
+                    f"{ancestor} is {directory} under another name, so the mount is the "
+                    "slot, above it or below it",
+                )
+        visible = named[-1]
+        assert visible.device is not None
+        for assumed_point, device, assumed_line in assumed:
+            if assumed_point == raw_point and device != os.makedev(*visible.device):
+                refuse(
+                    assumed_line,
+                    f"the mount table gives {point} device "
+                    f"{visible.device[0]}:{visible.device[1]}",
+                )
+        tolerated.append(_ToleratedLsofMount(visible.fstype, point, visible.device))
+    return tuple(tolerated)
+
+
 _LSOF_DIAGNOSTIC_VALUE_LIMIT = 160
 _LSOF_DIAGNOSTIC_TRUNCATION = "...<truncated>"
 
@@ -18697,8 +18886,10 @@ def _lsof_slot_use(
     """Run lsof over ``slot_path``.
 
     A warning lsof attributes to an unrelated path is normally tolerated;
-    ``strict_warnings`` makes any diagnostic at all make process use
-    indeterminate, for removals that destroy unreplicated Git state.
+    ``strict_warnings``, for removals that destroy unreplicated Git state,
+    makes every diagnostic make process use indeterminate except a can't-stat
+    warning for a mount shown not to be able to hold the slot's files
+    (_strict_lsof_tolerated_mounts); each such mount is printed as a NOTE.
     """
 
     lsof_command = [str(executable), "-nP", "-Fpcfn", "+D", str(slot_path)]
@@ -18718,9 +18909,15 @@ def _lsof_slot_use(
         raise Refusal(
             f"process use is indeterminate because lsof failed: {exc}"
         ) from exc
-    if (strict_warnings and completed.stderr.strip()) or not _unrelated_lsof_warnings(
-        completed.stderr, slot_path
-    ):
+    if strict_warnings:
+        for mount in _strict_lsof_tolerated_mounts(completed.stderr, slot_path):
+            print(
+                f"NOTE lsof could not stat the {mount.describe()}; tolerated: it is "
+                f"another file system than that of {slot_path}, and neither its path nor "
+                "a directory above it (by device and inode) is the slot or above or "
+                "below it"
+            )
+    elif not _unrelated_lsof_warnings(completed.stderr, slot_path):
         raise Refusal(
             "process use is indeterminate because lsof reported: "
             f"{completed.stderr.strip().splitlines()[0]}"
@@ -57078,7 +57275,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
                 "directory of several checkouts, or a bare repository.",
                 "Nothing is salvaged from a dirty tree: every checkout inside must be clean, "
                 "nothing may lie outside a checkout, and no process may use the directory "
-                "(any lsof diagnostic counts as use). Every ref, HEAD, stash entry and "
+                "(any lsof diagnostic counts as use, except a can't-stat warning for a mount "
+                "that is not the directory, above or below it, or on its file system; each "
+                "such mount is printed as a NOTE). Every ref, HEAD, stash entry and "
                 "worktree HEAD of every Git directory inside must be reachable from the "
                 "remote named for that directory; each one that is not is first pushed to "
                 "refs/rescue/<slot>-<UTC date>[-N] there and read back. The directory is then "
