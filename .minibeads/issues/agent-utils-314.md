@@ -1,12 +1,13 @@
 ---
 title: 'reply-focus-flake: the reply-in-column check loses the box''s focus under load'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T04:34:14.286272817+00:00
-updated_at: 2026-10-15T04:34:14.286272817+00:00
+updated_at: 2026-10-15T06:40:13.372535066+00:00
+closed_at: 2026-10-15T06:40:13.372534896+00:00
 ---
 
 # Description
