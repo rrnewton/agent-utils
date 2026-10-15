@@ -279,7 +279,7 @@
         "playback": "browser"
       },
       "replay_enabled": false,
-      "replay_unavailable": "backend",
+      "replay_unavailable": "bridge_unconfirmed",
       "self_author_id": null,
       "speech_prep_enabled": false,
       "summaries_unavailable": "elevenlabs.api_key is not configured",
@@ -359,7 +359,7 @@
         "playback": "browser"
       },
       "replay_enabled": false,
-      "replay_unavailable": "backend",
+      "replay_unavailable": "bridge_unconfirmed",
       "self_author_id": null,
       "speech_prep_enabled": false,
       "summaries_unavailable": "elevenlabs.api_key is not configured",
@@ -1602,6 +1602,13 @@
     },
     {
       "type": "quit"
+    },
+    {
+      "dropped": 0,
+      "lines": 2,
+      "text": "You are resuming an earlier voice conversation.",
+      "type": "replay",
+      "words": 9
     }
   ],
   "VibeTalkV1ServerFrame": [
@@ -1609,9 +1616,21 @@
       "type": "session_started"
     },
     {
+      "capabilities": [
+        "replay"
+      ],
       "greeting": true,
       "session_id": "s1",
       "type": "session_started"
+    },
+    {
+      "accepted": true,
+      "type": "replay_ack"
+    },
+    {
+      "accepted": false,
+      "reason": "too long for this model",
+      "type": "replay_ack"
     },
     {
       "role": "user",

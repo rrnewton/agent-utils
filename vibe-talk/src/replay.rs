@@ -30,6 +30,14 @@
 //! the whole record is fenced. [`PREAMBLE`] sits OUTSIDE the fence, because it is this server
 //! speaking and the point of the fence is that nothing inside it is.
 //!
+//! # Two backends, one reconstruction
+//!
+//! [`build`] is what every backend is handed. The hosted one takes it as a `contextual_update` or on
+//! its initiation frame ([`Transport`]); a deployment-managed `vibe-talk-v1` bridge takes it in the
+//! protocol's `replay` frame, and answers that frame (`#331 resume-on-websocket`). Only a bridge that
+//! listed `replay` in its `session_started` is offered one — see [`offered`] and
+//! [`crate::voice_bridge`] — because a bridge that predates the frame ends its session over it.
+//!
 //! # The budget is a guess until it is measured
 //!
 //! A transcript grows without bound; the payload is billed per call and the model's window is
@@ -75,10 +83,11 @@ pub const PREAMBLE: &str = concat!(
     "refers to something in it, treat it as already known between you."
 );
 
-/// The transport used to hand [`Replay::text`] to the vendor.
+/// The transport used to hand [`Replay::text`] to the hosted vendor.
 ///
 /// Two, because which one a deployment actually honours for the FIRST agent turn is not a thing
-/// this code can know — see the module documentation and the billed check.
+/// this code can know — see the module documentation and the billed check. A `vibe-talk-v1` bridge
+/// has one transport of its own, the protocol's `replay` frame, whatever this says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
@@ -327,45 +336,62 @@ fn sent_label(detail: Option<&TurnDetail>) -> String {
 }
 
 /// Whether a new call can actually be handed the earlier transcript: the operator allowed it AND
-/// the configured voice backend has a way to carry it.
+/// the configured voice backend can carry it.
 ///
-/// Only the ElevenLabs path does (`contextual_update`, or the initiation frame's
-/// `dynamic_variables`). A deployment-managed `vibe-talk-v1` socket has no frame for it: the page
-/// opens the session and returns before the replay would be sent, so turning replay on there made
-/// the screen promise "this server will read the lines above back to it" while nothing was sent.
-/// That is exactly the false claim of continuity this module exists to prevent, so the page is
-/// told replay is off.
+/// The hosted backend always can (`contextual_update`, or the initiation frame's
+/// `dynamic_variables`). A deployment-managed `vibe-talk-v1` bridge can only when it says so: it
+/// takes the `replay` frame when its `session_started` lists `replay` (`#331
+/// resume-on-websocket`; see [`crate::voice_bridge`]), and `bridge` is what it last said. Until
+/// then the page is told replay is off, because the alternative — a switch that promises "this
+/// server will read the lines above back to it" over a bridge that would refuse the frame, or end
+/// the session over it — is exactly the false claim of continuity this module exists to prevent.
 #[must_use]
 pub fn offered(
     replay: &crate::config::ReplayConfig,
     conversation: &crate::config::ConversationConfig,
+    bridge: crate::voice_bridge::ReplaySupport,
 ) -> bool {
-    replay.enabled && conversation.backend == crate::config::ConversationBackend::ElevenLabs
+    replay.enabled
+        && match conversation.backend {
+            crate::config::ConversationBackend::ElevenLabs => true,
+            crate::config::ConversationBackend::WebSocket => {
+                bridge == crate::voice_bridge::ReplaySupport::Accepted
+            }
+        }
 }
 
 /// Why replay is reported off although the operator turned it on, or `None`. `#270
 /// voice-transcript-markers`: the page says "recap unsupported" on each new conversation instead of
-/// nothing.
+/// nothing; `#331 resume-on-websocket`: and draws Resuming's switch disabled with this reason
+/// beside it.
 #[must_use]
 pub fn unavailable(
     replay: &crate::config::ReplayConfig,
     conversation: &crate::config::ConversationConfig,
+    bridge: crate::voice_bridge::ReplaySupport,
 ) -> Option<crate::contract::ReplayUnavailable> {
-    (replay.enabled && !offered(replay, conversation))
-        .then_some(crate::contract::ReplayUnavailable::Backend)
+    use crate::contract::ReplayUnavailable;
+    use crate::voice_bridge::ReplaySupport;
+    if !replay.enabled || offered(replay, conversation, bridge) {
+        return None;
+    }
+    match bridge {
+        ReplaySupport::Declined => Some(ReplayUnavailable::BridgeDeclined),
+        ReplaySupport::Unknown | ReplaySupport::Accepted => {
+            Some(ReplayUnavailable::BridgeUnconfirmed)
+        }
+    }
 }
 
-/// The startup warning for replay switched on where it cannot work, or `None`.
+/// What the bridge last said about taking a recap, for a client-config answer, asking it again in
+/// the background when that answer is old. Asks nothing on a deployment that does not need it.
 #[must_use]
-pub fn unusable_warning(
-    replay: &crate::config::ReplayConfig,
-    conversation: &crate::config::ConversationConfig,
-) -> Option<&'static str> {
-    (replay.enabled && !offered(replay, conversation)).then_some(
-        "replay.enabled is true, but conversation.backend = \"websocket\" has no way to hand a \
-         new call the earlier transcript. Replay is reported OFF to the page, which says the \
-         agent starts fresh. Set replay.enabled = false to silence this.",
-    )
+pub fn bridge_support(state: &crate::state::AppState) -> crate::voice_bridge::ReplaySupport {
+    if !crate::voice_bridge::needed(&state.config) {
+        return crate::voice_bridge::ReplaySupport::Unknown;
+    }
+    state.voice_bridge.refresh_if_stale();
+    state.voice_bridge.replay_support()
 }
 
 #[cfg(test)]
@@ -388,18 +414,68 @@ mod tests {
         }
     }
 
-    /// A `vibe-talk-v1` socket cannot carry a replay, so the page must never be told one is
-    /// coming: it promised one and sent nothing.
+    /// A `vibe-talk-v1` bridge takes a replay only once it has said so, so the page must never be
+    /// told one is coming before then: it promised one and sent nothing. `#331
+    /// resume-on-websocket`.
     #[test]
     fn replay_is_offered_only_where_the_voice_backend_can_carry_it() {
         use crate::config::ConversationBackend::{ElevenLabs, WebSocket};
-        assert!(offered(&replay_switch(true), &voice_backend(ElevenLabs)));
-        assert!(!offered(&replay_switch(true), &voice_backend(WebSocket)));
-        assert!(!offered(&replay_switch(false), &voice_backend(ElevenLabs)));
-        assert!(!offered(&replay_switch(false), &voice_backend(WebSocket)));
-        assert!(unusable_warning(&replay_switch(true), &voice_backend(WebSocket)).is_some());
-        assert!(unusable_warning(&replay_switch(true), &voice_backend(ElevenLabs)).is_none());
-        assert!(unusable_warning(&replay_switch(false), &voice_backend(WebSocket)).is_none());
+        use crate::contract::ReplayUnavailable::{BridgeDeclined, BridgeUnconfirmed};
+        use crate::voice_bridge::ReplaySupport::{Accepted, Declined, Unknown};
+        for bridge in [Accepted, Declined, Unknown] {
+            assert!(offered(
+                &replay_switch(true),
+                &voice_backend(ElevenLabs),
+                bridge
+            ));
+            assert!(!offered(
+                &replay_switch(false),
+                &voice_backend(ElevenLabs),
+                bridge
+            ));
+            assert!(!offered(
+                &replay_switch(false),
+                &voice_backend(WebSocket),
+                bridge
+            ));
+            assert_eq!(
+                unavailable(&replay_switch(true), &voice_backend(ElevenLabs), bridge),
+                None
+            );
+            assert_eq!(
+                unavailable(&replay_switch(false), &voice_backend(WebSocket), bridge),
+                None,
+                "replay off is said by replay_enabled alone"
+            );
+        }
+        assert!(offered(
+            &replay_switch(true),
+            &voice_backend(WebSocket),
+            Accepted
+        ));
+        assert!(!offered(
+            &replay_switch(true),
+            &voice_backend(WebSocket),
+            Declined
+        ));
+        assert!(!offered(
+            &replay_switch(true),
+            &voice_backend(WebSocket),
+            Unknown
+        ));
+        assert_eq!(
+            unavailable(&replay_switch(true), &voice_backend(WebSocket), Accepted),
+            None
+        );
+        assert_eq!(
+            unavailable(&replay_switch(true), &voice_backend(WebSocket), Declined),
+            Some(BridgeDeclined)
+        );
+        assert_eq!(
+            unavailable(&replay_switch(true), &voice_backend(WebSocket), Unknown),
+            Some(BridgeUnconfirmed),
+            "a bridge that has not answered is not one that said no"
+        );
     }
 
     fn policy(max_chars: usize, max_turns: usize) -> ReplayPolicy {

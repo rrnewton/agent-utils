@@ -2192,14 +2192,16 @@ async fn record(harness: &Harness, id: &str, speaker: &str, text: &str) {
 
 /// `#270 voice-transcript-markers`. The page must know a new call cannot be sent a recap on a
 /// websocket backend, so its seam says "recap unsupported" rather than nothing; and it must know
-/// this server takes transcript records before it sends one.
+/// this server takes transcript records before it sends one. `#331 resume-on-websocket`: a bridge
+/// that has not said it takes a recap — here, one this server has no address to ask — is
+/// `bridge_unconfirmed`; tests/replay_bridge.rs asks a real one.
 #[tokio::test]
 async fn client_config_says_why_replay_is_off_and_that_transcript_records_are_taken() {
     for (extra, unavailable) in [
         ("", None),
         (
             "[conversation]\nbackend = \"websocket\"\nwebsocket_url = \"/ws\"\n",
-            Some("backend"),
+            Some("bridge_unconfirmed"),
         ),
     ] {
         let (harness, _store) = replay_harness(extra);

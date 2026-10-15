@@ -202,8 +202,8 @@ fn client_config(
         version: "0.0.0",
         replay_enabled: full,
         // `#270 voice-transcript-markers`. The plain sample is a websocket deployment with replay
-        // turned on that cannot carry it.
-        replay_unavailable: (!full).then_some(ReplayUnavailable::Backend),
+        // turned on whose bridge has not said it takes a recap (`#331 resume-on-websocket`).
+        replay_unavailable: (!full).then_some(ReplayUnavailable::BridgeUnconfirmed),
         transcript_records_supported: full,
         self_author_id: full.then(|| "9".into()),
         owner_author_id: full.then(|| "7".into()),
@@ -728,10 +728,21 @@ fn samples() -> Value {
         })],
         "LiveResetEvent": [to(&LiveResetEvent { missed: 12, detail: "re-read" })],
         "VibeTalkV1ServerFrame": [
-            to(&VibeTalkV1ServerFrame::SessionStarted { greeting: None, session_id: None }),
+            to(&VibeTalkV1ServerFrame::SessionStarted {
+                greeting: None,
+                session_id: None,
+                capabilities: Vec::new(),
+            }),
             to(&VibeTalkV1ServerFrame::SessionStarted {
                 greeting: Some(true),
                 session_id: Some("s1".into()),
+                // `#331 resume-on-websocket`: the bridge's half of the hello.
+                capabilities: vec!["replay".into()],
+            }),
+            to(&VibeTalkV1ServerFrame::ReplayAck { accepted: true, reason: None }),
+            to(&VibeTalkV1ServerFrame::ReplayAck {
+                accepted: false,
+                reason: Some("too long for this model".into()),
             }),
             to(&VibeTalkV1ServerFrame::Transcript {
                 role: TranscriptRole::User,
@@ -1056,6 +1067,12 @@ fn samples() -> Value {
             to(&VibeTalkV1ClientFrame::Prompt { text: "hi".into() }),
             to(&VibeTalkV1ClientFrame::Interrupt),
             to(&VibeTalkV1ClientFrame::Quit),
+            to(&VibeTalkV1ClientFrame::Replay {
+                text: "You are resuming an earlier voice conversation.".into(),
+                lines: 2,
+                dropped: 0,
+                words: 9,
+            }),
         ],
     })
 }

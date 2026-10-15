@@ -265,7 +265,7 @@
           "description": "Selected read-aloud backend and the playback interface the browser should use."
         },
         "replay_enabled": {
-          "description": "Whether a new call will be handed the earlier transcript: the operator allowed it AND the\nvoice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
+          "description": "Whether a new call will be handed the earlier transcript: the operator allowed it AND the\nvoice backend can carry it — the hosted backend always can, and a `vibe-talk-v1` bridge only\nonce it has said it accepts the `replay` frame (`#331 resume-on-websocket`; see\n`replay::offered`).\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
           "type": "boolean"
         },
         "replay_unavailable": {
@@ -277,7 +277,7 @@
               "type": "null"
             }
           ],
-          "description": "Why replay is off although the operator turned it on, when that is the reason. `#270\nvoice-transcript-markers`.\n\n`backend`: the voice backend has no way to carry a recap (a `vibe-talk-v1` socket; see\n`replay::offered`). The page then marks each new conversation \"recap unsupported\" rather than\nsaying nothing, which would read as \"nothing to recap\". Absent otherwise, and from an older\nserver."
+          "description": "Why replay is off although the operator turned it on, when that is the reason. `#270\nvoice-transcript-markers`, `#331 resume-on-websocket`.\n\nOnly for a `vibe-talk-v1` bridge, which takes a recap only when it says so: `bridge_declined`\nwhen it answered this server's hello without listing `replay`, `bridge_unconfirmed` when it\nhas not answered one. The page then draws Resuming's switch disabled, with this reason\nbeside it, and marks each new conversation \"recap unsupported\" rather than saying nothing,\nwhich would read as \"nothing to recap\". Absent otherwise: with replay on and the hosted\nbackend, and with replay off, which `replay_enabled: false` says alone."
         },
         "replies_in_thread": {
           "description": "Whether a reply to a main-channel message is posted in that message's thread, starting one\nwhen it has none, because the provider has no reply pointer of its own (Slack).\n\n`#252 thread-button-state`. Such a reply already starts the message's thread, so the reply\nscreen offers no separate \"start a new thread\" choice when this is true. Sent only when\ntrue: absent, from this server or an older one, means false.",
@@ -1433,11 +1433,16 @@
       "type": "object"
     },
     "ReplayUnavailable": {
-      "description": "Why replay is off although the operator turned it on. `#270 voice-transcript-markers`.",
+      "description": "Why replay is off although the operator turned it on. `#270 voice-transcript-markers`, `#331\nresume-on-websocket`.\n\nBoth are about a `vibe-talk-v1` bridge, the one backend that takes a recap only when it says it\ndoes; see [`crate::voice_bridge`].",
       "oneOf": [
         {
-          "const": "backend",
-          "description": "The configured voice backend has no way to hand a new call the earlier transcript.",
+          "const": "bridge_declined",
+          "description": "The bridge answered this server's hello, and `replay` was not among the frames it said it\naccepts.",
+          "type": "string"
+        },
+        {
+          "const": "bridge_unconfirmed",
+          "description": "The bridge has not answered a hello: this server has not asked yet, is asking, has no\naddress it can reach the bridge at, or the bridge did not answer.",
           "type": "string"
         }
       ]
@@ -2382,6 +2387,45 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "description": "The written record of an earlier conversation, for the agent to carry on from. `#331\nresume-on-websocket`, `#46 conversation-replay`.\n\nSent at most once per session, only to a session whose `session_started` listed `replay`\nin `capabilities`, and as the client's first frame after it, before `audio_start` or any\n`prompt`. The server answers with exactly one `replay_ack`. It is context, not a turn: the\nagent is not to answer it or read it back, and nothing about it opens or ends a turn.",
+          "properties": {
+            "dropped": {
+              "description": "How many older lines the budget left out; non-zero means the record is partial, and\n`text` says so too.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "lines": {
+              "description": "How many lines of the earlier conversation the record holds.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "text": {
+              "description": "The whole payload, exactly as `GET /api/v1/conversations/{id}/replay` renders it and\nthe hosted backend is sent it: a preamble saying what follows, then the record, fenced\nas untrusted text. Within the server's `replay.max_chars` and `replay.max_turns`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "replay",
+              "type": "string"
+            },
+            "words": {
+              "description": "How many words the lines hold, counting only what was said or sent.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "text",
+            "lines",
+            "dropped",
+            "words"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2391,6 +2435,13 @@
         {
           "description": "The session is ready. Always the first frame.",
           "properties": {
+            "capabilities": {
+              "description": "The optional client frames this server accepts, by `type`: the bridge's half of the\nhello. `#331 resume-on-websocket`.\n\n`replay` is the only one so far. A client sends an optional frame only to a session\nthat listed it, because a server that predates one answers it with `error`, which ends\nthe session. Absent or empty means none; a word a client does not know is ignored.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "greeting": {
               "description": "Whether the agent speaks first. When true, a voice client withholds microphone frames\nuntil the first `turn_complete`. Absent means false.",
               "type": [
@@ -2412,6 +2463,31 @@
           },
           "required": [
             "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The answer to a `replay` frame: exactly one per `replay`, and not a turn, so no\n`turn_complete` follows it. `#331 resume-on-websocket`.",
+          "properties": {
+            "accepted": {
+              "description": "True when the record was handed to the agent as context for what it says next; false\nwhen this session will not use it.",
+              "type": "boolean"
+            },
+            "reason": {
+              "description": "Why it was not accepted, in words, when it was not.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "replay_ack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "accepted"
           ],
           "type": "object"
         },

@@ -63,19 +63,23 @@ pub struct ClientConfigResponse {
     /// Server version, so a stale cached page is visible.
     pub version: &'static str,
     /// Whether a new call will be handed the earlier transcript: the operator allowed it AND the
-    /// voice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).
+    /// voice backend can carry it — the hosted backend always can, and a `vibe-talk-v1` bridge only
+    /// once it has said it accepts the `replay` frame (`#331 resume-on-websocket`; see
+    /// `replay::offered`).
     ///
     /// The page needs it BEFORE it has anything to replay: the Settings screen has to describe
     /// what resuming will do, and the control's own note has to say what the next call will be —
     /// both of which are questions asked while there is no conversation to fetch.
     pub replay_enabled: bool,
     /// Why replay is off although the operator turned it on, when that is the reason. `#270
-    /// voice-transcript-markers`.
+    /// voice-transcript-markers`, `#331 resume-on-websocket`.
     ///
-    /// `backend`: the voice backend has no way to carry a recap (a `vibe-talk-v1` socket; see
-    /// `replay::offered`). The page then marks each new conversation "recap unsupported" rather than
-    /// saying nothing, which would read as "nothing to recap". Absent otherwise, and from an older
-    /// server.
+    /// Only for a `vibe-talk-v1` bridge, which takes a recap only when it says so: `bridge_declined`
+    /// when it answered this server's hello without listing `replay`, `bridge_unconfirmed` when it
+    /// has not answered one. The page then draws Resuming's switch disabled, with this reason
+    /// beside it, and marks each new conversation "recap unsupported" rather than saying nothing,
+    /// which would read as "nothing to recap". Absent otherwise: with replay on and the hosted
+    /// backend, and with replay off, which `replay_enabled: false` says alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_unavailable: Option<ReplayUnavailable>,
     /// Whether this server records the voice page's transcript records: a `sent` row for each
@@ -258,12 +262,20 @@ pub struct VoicePostPrefix {
     pub changeable: bool,
 }
 
-/// Why replay is off although the operator turned it on. `#270 voice-transcript-markers`.
+/// Why replay is off although the operator turned it on. `#270 voice-transcript-markers`, `#331
+/// resume-on-websocket`.
+///
+/// Both are about a `vibe-talk-v1` bridge, the one backend that takes a recap only when it says it
+/// does; see [`crate::voice_bridge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayUnavailable {
-    /// The configured voice backend has no way to hand a new call the earlier transcript.
-    Backend,
+    /// The bridge answered this server's hello, and `replay` was not among the frames it said it
+    /// accepts.
+    BridgeDeclined,
+    /// The bridge has not answered a hello: this server has not asked yet, is asking, has no
+    /// address it can reach the bridge at, or the bridge did not answer.
+    BridgeUnconfirmed,
 }
 
 /// The owner's own words for the voice agent, as Settings shows them. `#272
@@ -1025,6 +1037,24 @@ pub enum VibeTalkV1ServerFrame {
         /// Provider session identifier, for connection details only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// The optional client frames this server accepts, by `type`: the bridge's half of the
+        /// hello. `#331 resume-on-websocket`.
+        ///
+        /// `replay` is the only one so far. A client sends an optional frame only to a session
+        /// that listed it, because a server that predates one answers it with `error`, which ends
+        /// the session. Absent or empty means none; a word a client does not know is ignored.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
+    /// The answer to a `replay` frame: exactly one per `replay`, and not a turn, so no
+    /// `turn_complete` follows it. `#331 resume-on-websocket`.
+    ReplayAck {
+        /// True when the record was handed to the agent as context for what it says next; false
+        /// when this session will not use it.
+        accepted: bool,
+        /// Why it was not accepted, in words, when it was not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Recognised or generated speech text.
     Transcript {
@@ -1081,6 +1111,26 @@ pub enum VibeTalkV1ClientFrame {
     Interrupt,
     /// End the session.
     Quit,
+    /// The written record of an earlier conversation, for the agent to carry on from. `#331
+    /// resume-on-websocket`, `#46 conversation-replay`.
+    ///
+    /// Sent at most once per session, only to a session whose `session_started` listed `replay`
+    /// in `capabilities`, and as the client's first frame after it, before `audio_start` or any
+    /// `prompt`. The server answers with exactly one `replay_ack`. It is context, not a turn: the
+    /// agent is not to answer it or read it back, and nothing about it opens or ends a turn.
+    Replay {
+        /// The whole payload, exactly as `GET /api/v1/conversations/{id}/replay` renders it and
+        /// the hosted backend is sent it: a preamble saying what follows, then the record, fenced
+        /// as untrusted text. Within the server's `replay.max_chars` and `replay.max_turns`.
+        text: String,
+        /// How many lines of the earlier conversation the record holds.
+        lines: u32,
+        /// How many older lines the budget left out; non-zero means the record is partial, and
+        /// `text` says so too.
+        dropped: u32,
+        /// How many words the lines hold, counting only what was said or sent.
+        words: u32,
+    },
 }
 
 /// Every root of the contract: each value that crosses a boundary on its own, by the name the

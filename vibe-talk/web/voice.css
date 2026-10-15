@@ -4676,6 +4676,47 @@ a.search-hit-link {
   white-space: nowrap;
 }
 
+/*
+ * `#331 resume-on-websocket`. The line at the head of the call's box: what the call was given of the
+ * conversation before it, or why it started fresh. Small, centred and muted like a seam, so it reads
+ * as a fact about the call rather than a turn in it; a recap the voice service said it took is drawn
+ * in the colour of a thing that worked.
+ */
+#call-recap {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* It gives way to a send card: the card sits close on the box, with nothing between them. */
+#screen-main[data-draft] #call-recap {
+  display: none;
+}
+
+#call-recap[data-recap="accepted"] {
+  color: var(--ok);
+}
+
+/*
+ * ...and on Settings, the reason beside Resuming's switch where this server cannot resume: under the
+ * switch's words, indented by the box and its gap (`.toggle` in web/style.css), in the warning
+ * colour, with the words of a switch that cannot be used dimmed beside it.
+ */
+.toggle-why {
+  margin: -0.35rem 0 0.5rem;
+  padding-left: 1.75rem;
+  color: var(--warn);
+  font-size: 0.85rem;
+}
+
+.toggle:has(input:disabled) {
+  color: var(--muted);
+}
+
 .seam-recap-detail {
   margin-top: 0.35rem;
 }

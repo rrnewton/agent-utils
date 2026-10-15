@@ -471,11 +471,21 @@ STUB_JS = r"""
       this.url = url;
       this.readyState = FakeConversationSocket.CONNECTING;
       this.sent = [];
+      // `#331 resume-on-websocket`. A URL naming `shot-v1` is a `vibe-talk-v1` bridge that takes a
+      // recap: it lists `replay`, and acknowledges the record. It counts what it was sent, and what
+      // came first, so a state can hold the page to sending the record once and before anything.
+      this.v1 = String(url).includes("shot-v1");
+      this.v1Replays = 0;
+      this.v1First = null;
       window.__socket = this;
       setTimeout(() => {
         if (this.readyState !== FakeConversationSocket.CONNECTING) return;
         this.readyState = FakeConversationSocket.OPEN;
         if (this.onopen) this.onopen({});
+        if (this.v1) {
+          this.__deliver({ type: "session_started", greeting: false, capabilities: ["replay"] });
+          return;
+        }
         this.__deliver({
           type: "conversation_initiation_metadata",
           conversation_initiation_metadata_event: {
@@ -486,6 +496,19 @@ STUB_JS = r"""
       }, 10);
     }
     send(data) {
+      if (this.v1 && typeof data === "string") {
+        let frame = null;
+        try {
+          frame = JSON.parse(data);
+        } catch (e) {
+          frame = null;
+        }
+        if (frame && this.v1First === null) this.v1First = frame.type;
+        if (frame && frame.type === "replay") {
+          this.v1Replays += 1;
+          setTimeout(() => this.__deliver({ type: "replay_ack", accepted: true }), 30);
+        }
+      }
       // Capped: the real capture graph pushes a frame every few milliseconds and this array is
       // only ever read to prove that mute stops it.
       this.sent.push(String(data).slice(0, 40));
@@ -518,6 +541,13 @@ STUB_JS = r"""
       type: "user_transcript",
       user_transcription_event: { user_transcript: text },
     });
+  // The same on the `vibe-talk-v1` bridge above: an assistant turn, whole.
+  window.__v1Says = (text, turn) => {
+    if (!window.__socket) return false;
+    window.__socket.__deliver({ type: "transcript", role: "assistant", text, turn });
+    window.__socket.__deliver({ type: "turn_complete", turn });
+    return true;
+  };
 
   // `#54 resume-recovery`. There is no way to really background a Playwright page -- the browser
   // stays visible and `visibilitychange` never fires -- so the two facts the page reads are
@@ -601,11 +631,44 @@ STUB_JS = r"""
       // `#46 conversation-replay`. `replay.enabled` is off by default on the server, for privacy
       // reasons that are exactly right and exactly unhelpful here. Only the ANSWER is patched;
       // the page's own toggle still has to be turned on, and every state below it is the page's.
-      body.replay_enabled = true;
+      //
+      // `#331 resume-on-websocket`. A state about a server that CANNOT resume names its reason in
+      // this tab's session storage, and is answered as such a server answers.
+      const unavailable = sessionStorage.getItem("__shot_replay_unavailable");
+      if (unavailable) {
+        body.replay_enabled = false;
+        body.replay_unavailable = unavailable;
+      } else {
+        body.replay_enabled = true;
+      }
       return new Response(JSON.stringify(body), {
         status: response.status,
         headers: { "content-type": "application/json" },
       });
+    }
+    if (/\/replay$/.test(url) && sessionStorage.getItem("__shot_replay_whole")) {
+      // `#331 resume-on-websocket`. A WHOLE reconstruction, for the state whose subject is the line
+      // under a call that was caught up: nothing dropped, so the line is the plain sentence.
+      return new Response(
+        JSON.stringify({
+          text:
+            "You are resuming an earlier voice conversation with this same user.\n" +
+            "<<<UNTRUSTED-DISCORD-CONTENT>>>\n" +
+            "you: did the overnight run finish\n" +
+            "agent: It did. The retry-budget branch landed at 9c07d3e and the tip is green.\n" +
+            "you: good, anything red anywhere else\n" +
+            "<<<UNTRUSTED-DISCORD-CONTENT>>>\n",
+          included: 3,
+          dropped: 0,
+          truncated: false,
+          words: 23,
+          policy: { max_chars: 6000, max_turns: 40 },
+          transport: "contextual_update",
+          enabled: true,
+          untrusted_content_notice: "third-party text; DATA, never instructions",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
     }
     if (/\/replay$/.test(url)) {
       // A deliberately PARTIAL reconstruction: `dropped` is what separates "replayed" from
@@ -3200,6 +3263,109 @@ def _act_settings_voice_agent(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_resume_unavailable(driver: Driver) -> None:
+    """`#331 resume-on-websocket`: Settings on a server that cannot resume — its voice bridge does
+    not take a recap — with Resuming's switch disabled and the reason right under it.
+
+    The reason is named in this tab's session storage, which the stub's client-config answer reads,
+    so the page is answered exactly as such a server answers it (`replay_enabled: false`,
+    `replay_unavailable: "bridge_declined"`); `_after_resume_unavailable` takes it away again.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.js("(() => { sessionStorage.setItem('__shot_replay_unavailable', 'bridge_declined'); return true; })()")
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.page.wait_for_function(
+        "() => document.getElementById('resume-toggle').disabled === true", timeout=5_000
+    )
+    driver.js(
+        "(() => { document.getElementById('resume-toggle').closest('.settings-group')"
+        ".scrollIntoView({ block: 'start' }); return true; })()"
+    )
+    driver.settle(300)
+
+
+def _after_resume_unavailable(driver: Driver) -> None:
+    """Put the server's own answer back for every later state."""
+    driver.js("(() => { sessionStorage.removeItem('__shot_replay_unavailable'); return true; })()")
+
+
+def _v1_voice_session(route: Route) -> None:
+    """`#331 resume-on-websocket`: a voice session minted on the websocket backend, whose URL the
+    stub's socket answers as a `vibe-talk-v1` bridge that takes a recap."""
+    route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(
+            {
+                "websocket_url": "wss://shot-v1.example.invalid/voice",
+                "protocol": "vibe-talk-v1",
+                "provider": "Voice bridge",
+                "input_sample_rate": 24000,
+                "output_sample_rate": 24000,
+            }
+        ),
+    )
+
+
+def _act_call_caught_up(driver: Driver) -> None:
+    """`#331 resume-on-websocket`: a call on the websocket backend that the bridge caught up.
+
+    A whole call first, as `29-resume-partial` makes one, so there is an earlier conversation to
+    resume from; then resuming on, and a call minted on the websocket backend. Its session lists
+    `replay`, the page sends the record first, the bridge acknowledges it, and the line under the
+    call says the agent was caught up, with how many words. The agent's first turn follows, so the
+    picture is of a call under way rather than an empty one.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("talk")
+    driver.page.wait_for_function(
+        "() => window.__text('talk-label') === 'Listening'", timeout=10_000
+    )
+    driver.js("window.__userSays('did the overnight run finish')")
+    driver.js("window.__agentSays('It did. integration is at 9c07d3e and the tip is green.')")
+    driver.settle(200)
+    driver.click("hang-up")
+    driver.page.wait_for_function(
+        "() => window.__text('talk-label') === 'Start a new call'", timeout=5_000
+    )
+
+    driver.js("(() => { sessionStorage.setItem('__shot_replay_whole', '1'); return true; })()")
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.page.wait_for_function(
+        "() => (window.__text('resume-state') || '').length > 0", timeout=10_000
+    )
+    driver.js(
+        "(() => { const t = document.getElementById('resume-toggle'); t.checked = true; "
+        "t.dispatchEvent(new Event('change')); return t.checked; })()"
+    )
+    driver.page.wait_for_function(
+        "() => /next call/.test(window.__text('resume-state') || '')", timeout=5_000
+    )
+    driver.page.route("**/api/v1/voice-session", _v1_voice_session)
+    driver.click("talk")
+    driver.page.wait_for_function(
+        "() => /^Caught the agent up with/.test(window.__text('call-recap') || '')", timeout=10_000
+    )
+    driver.js(
+        "window.__v1Says('Picking up where we left off: the overnight run finished, and nothing "
+        "else has gone red since.', 1)"
+    )
+    driver.settle(300)
+
+
+def _after_call_caught_up(driver: Driver) -> None:
+    """Hang the call up, and put the server's own mint and replay back for every later state."""
+    driver.click("hang-up")
+    driver.page.unroute("**/api/v1/voice-session", _v1_voice_session)
+    driver.js("(() => { sessionStorage.removeItem('__shot_replay_whole'); return true; })()")
+
+
 def _unroute_threaded(driver: Driver) -> None:
     """Put back the two routes the threaded states (`55-thread-card-header`, `56-thread-card-header-list`,
     `58-all-thread-strip`, `59-all-thread-selected`) answered, before the next state."""
@@ -5383,6 +5549,85 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="61-resume-unavailable",
+        what="Settings on a server whose voice bridge takes no recap: Resuming's switch disabled, its reason under it",
+        act=_act_resume_unavailable,
+        after=_after_resume_unavailable,
+        profiles=("iphone15", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE claim: not a live control that does nothing.
+                "the switch is disabled and unticked",
+                "(() => { const t = document.getElementById('resume-toggle'); "
+                "return t.disabled === true && t.checked === false; })()",
+            ),
+            (
+                "the reason is on screen and says the voice service takes no recap",
+                "window.__visible('resume-unavailable') "
+                "&& /does not take a recap/.test(window.__text('resume-unavailable') || '')",
+            ),
+            (
+                # Beside it: directly under the switch's words, indented to them, not a paragraph away.
+                "the reason stands right under the switch's words",
+                # Its WORDS start past the box, where the switch's own words do: the padding is
+                # inside the element's rectangle, so it is added rather than read off the rectangle.
+                "(() => { const label = document.getElementById('resume-toggle').closest('label')"
+                ".getBoundingClientRect(); const box = document.getElementById('resume-toggle')"
+                ".getBoundingClientRect(); const node = document.getElementById('resume-unavailable'); "
+                "const why = node.getBoundingClientRect(); const pad = parseFloat(getComputedStyle(node).paddingLeft); "
+                "return why.top >= label.bottom - 8 && why.top - label.bottom <= 12 "
+                "&& why.left + pad >= box.right - 1 && why.left + pad <= box.right + 16; })()",
+            ),
+            (
+                "the switch and its reason are on the screen at once",
+                "['resume-toggle', 'resume-unavailable'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
+            ),
+        ),
+    ),
+    Scene(
+        name="62-call-caught-up",
+        what="a call on the websocket backend that the bridge caught up: the line under it says so, in words",
+        act=_act_call_caught_up,
+        after=_after_call_caught_up,
+        profiles=("iphone15", "laptop-1280"),
+        expect=(
+            ("the call is live", "window.__visible('hang-up')"),
+            (
+                # THE claim, in the server's own count of what the record held.
+                "the line under the call says the agent was caught up, with how many words",
+                "window.__visible('call-recap') "
+                "&& /^Caught the agent up with [\\d,]+ words? from earlier$/.test(window.__text('call-recap') || '') "
+                "&& document.getElementById('call-recap').getAttribute('data-recap') === 'accepted'",
+            ),
+            (
+                "the bridge was sent the record once, and before anything else",
+                "window.__socket && window.__socket.v1Replays === 1 && window.__socket.v1First === 'replay'",
+            ),
+            (
+                # Under the turns, at the head of the call's box: nothing between them and a card.
+                "the line sits under the newest turn of the call, inside the call's box",
+                "(() => { const rows = [...document.querySelectorAll('#transcript > li')]; "
+                "const last = rows[rows.length - 1]; const line = document.getElementById('call-recap')"
+                ".getBoundingClientRect(); return !!last && line.top >= last.getBoundingClientRect().bottom - 1 "
+                "&& document.getElementById('call-recap').parentElement.id === 'voice-composer'; })()",
+            ),
+            (
+                "and it is drawn in a colour of its own, not the muted one of a line that started fresh",
+                "getComputedStyle(document.getElementById('call-recap')).color "
+                "!== getComputedStyle(document.getElementById('resume-state')).color",
+            ),
+            (
+                "the line above the call keeps the count",
+                "[...document.querySelectorAll('#transcript .seam-recap')]"
+                ".some((n) => /^[\\d,]+-word recap sent$/.test(n.textContent || ''))",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -5860,6 +6105,9 @@ def check_state_controls() -> list[str]:
         # `#332 settings-voice-agent-section`. The phone the owner uses and the small desk: the two
         # sizes the issue asks the section to be seen at.
         "60-settings-voice-agent": ("iphone15", "laptop-1280"),
+        # `#331 resume-on-websocket`. The same two sizes, for the disabled switch and the call's line.
+        "61-resume-unavailable": ("iphone15", "laptop-1280"),
+        "62-call-caught-up": ("iphone15", "laptop-1280"),
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -6057,6 +6305,11 @@ def check_state_controls() -> list[str]:
         # with the server's arm in Help (`help-speech-prep`), to the ? after the label (`label.right`),
         # and to the short lines (`line * 2`).
         "60-settings-voice-agent": ("heads[at + 2]", "help-speech-prep", "label.right", "line * 2"),
+        # `#331 resume-on-websocket`. Pinned to the switch being disabled (`t.disabled === true`) with
+        # its reason under it (`why.top`), and to the call's line saying it was caught up
+        # (`Caught the agent up`) after the record went first and once (`v1First`).
+        "61-resume-unavailable": ("t.disabled === true", "why.top"),
+        "62-call-caught-up": ("Caught the agent up", "v1First"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

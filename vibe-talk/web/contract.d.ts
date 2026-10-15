@@ -279,7 +279,9 @@ declare namespace VibeTalk {
     read_aloud: Description;
     /**
      * Whether a new call will be handed the earlier transcript: the operator allowed it AND the
-     * voice backend can carry it (a `vibe-talk-v1` socket cannot; see `replay::offered`).
+     * voice backend can carry it — the hosted backend always can, and a `vibe-talk-v1` bridge only
+     * once it has said it accepts the `replay` frame (`#331 resume-on-websocket`; see
+     * `replay::offered`).
      *
      * The page needs it BEFORE it has anything to replay: the Settings screen has to describe
      * what resuming will do, and the control's own note has to say what the next call will be —
@@ -288,12 +290,14 @@ declare namespace VibeTalk {
     replay_enabled: boolean;
     /**
      * Why replay is off although the operator turned it on, when that is the reason. `#270
-     * voice-transcript-markers`.
+     * voice-transcript-markers`, `#331 resume-on-websocket`.
      *
-     * `backend`: the voice backend has no way to carry a recap (a `vibe-talk-v1` socket; see
-     * `replay::offered`). The page then marks each new conversation "recap unsupported" rather than
-     * saying nothing, which would read as "nothing to recap". Absent otherwise, and from an older
-     * server.
+     * Only for a `vibe-talk-v1` bridge, which takes a recap only when it says so: `bridge_declined`
+     * when it answered this server's hello without listing `replay`, `bridge_unconfirmed` when it
+     * has not answered one. The page then draws Resuming's switch disabled, with this reason
+     * beside it, and marks each new conversation "recap unsupported" rather than saying nothing,
+     * which would read as "nothing to recap". Absent otherwise: with replay on and the hosted
+     * backend, and with replay off, which `replay_enabled: false` says alone.
      */
     replay_unavailable?: ReplayUnavailable | null;
     /**
@@ -1295,9 +1299,13 @@ declare namespace VibeTalk {
   }
 
   /**
-   * Why replay is off although the operator turned it on. `#270 voice-transcript-markers`.
+   * Why replay is off although the operator turned it on. `#270 voice-transcript-markers`, `#331
+   * resume-on-websocket`.
+   *
+   * Both are about a `vibe-talk-v1` bridge, the one backend that takes a recap only when it says it
+   * does; see [`crate::voice_bridge`].
    */
-  type ReplayUnavailable = "backend";
+  type ReplayUnavailable = "bridge_declined" | "bridge_unconfirmed";
 
   /**
    * Every message marked Done at or after one position in a channel. `#222 unread-replies`.
@@ -1833,6 +1841,27 @@ declare namespace VibeTalk {
     type: "interrupt";
   } | {
     type: "quit";
+  } | {
+    /**
+     * How many older lines the budget left out; non-zero means the record is partial, and
+     * `text` says so too.
+     */
+    dropped: number;
+    /**
+     * How many lines of the earlier conversation the record holds.
+     */
+    lines: number;
+    /**
+     * The whole payload, exactly as `GET /api/v1/conversations/{id}/replay` renders it and
+     * the hosted backend is sent it: a preamble saying what follows, then the record, fenced
+     * as untrusted text. Within the server's `replay.max_chars` and `replay.max_turns`.
+     */
+    text: string;
+    type: "replay";
+    /**
+     * How many words the lines hold, counting only what was said or sent.
+     */
+    words: number;
   };
 
   /**
@@ -1844,6 +1873,15 @@ declare namespace VibeTalk {
    */
   type VibeTalkV1ServerFrame = {
     /**
+     * The optional client frames this server accepts, by `type`: the bridge's half of the
+     * hello. `#331 resume-on-websocket`.
+     *
+     * `replay` is the only one so far. A client sends an optional frame only to a session
+     * that listed it, because a server that predates one answers it with `error`, which ends
+     * the session. Absent or empty means none; a word a client does not know is ignored.
+     */
+    capabilities?: string[];
+    /**
      * Whether the agent speaks first. When true, a voice client withholds microphone frames
      * until the first `turn_complete`. Absent means false.
      */
@@ -1853,6 +1891,17 @@ declare namespace VibeTalk {
      */
     session_id?: string | null;
     type: "session_started";
+  } | {
+    /**
+     * True when the record was handed to the agent as context for what it says next; false
+     * when this session will not use it.
+     */
+    accepted: boolean;
+    /**
+     * Why it was not accepted, in words, when it was not.
+     */
+    reason?: string | null;
+    type: "replay_ack";
   } | {
     /**
      * False for a streaming hypothesis the provider may still correct. Absent means true, so

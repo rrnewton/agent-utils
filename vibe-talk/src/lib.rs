@@ -96,5 +96,6 @@ pub mod untrusted;
 pub mod upstream_clear;
 pub mod upstream_profile;
 pub mod voice_agent;
+pub mod voice_bridge;
 pub mod voice_health;
 pub mod voice_prompt;
