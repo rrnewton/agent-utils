@@ -876,9 +876,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # https://github.com/rrnewton/agent-utils/issues/244 (a sidecar read that
     # lets recovery archive the row, and refusals without a sidecar and with a
     # fenced sibling) are mapped.
-    assert len(all_tests) == 1958
+    # The two lockless-reader cases of 5258942d (a reader that waits out an
+    # absent batch between its archive and its ACTIVE delete, and an overlap
+    # that survives the locked reread or that a lock holder reports) are mapped.
+    assert len(all_tests) == 1960
     assert len(ordinary) == 336
-    assert len(mapped) == 1622
+    assert len(mapped) == 1624
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
