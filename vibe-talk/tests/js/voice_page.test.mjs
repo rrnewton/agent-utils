@@ -59869,7 +59869,8 @@ for (const placing of ["newest", "delta"]) {
         const kept = savedMessage(control.page, "300");
         return Boolean(kept && kept.thread && kept.thread.id === control.first.id);
       };
-      const unplaced = await run(brokenScript("  if (channelCanon.channel === String(channel)) forgetUnplaced(channelCanon, String(id));\n", ""));
+      const unplaced = await run(brokenScript("  if (channelCanon.channel !== String(channel)) return;\n  noteRemoved(channelCanon, String(id));\n",
+        "  if (channelCanon.channel !== String(channel)) return;\n"));
       assert.ok(inThread(unplaced), "the reply stayed gone anyway, so this test cannot see it");
       if (placing === "delta") {
         // And a placing delta folded whatever the stream removed since it was sent brings the reply back
@@ -61029,4 +61030,199 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
   assert.deepStrictEqual(offListFailed.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(offListFailed.asked, [target],
     "looking again by the list asked nothing after the failed Done, so this test cannot see it");
+});
+
+// --- `#315 removed-reply-target`: a reply to a message removed upstream -----------------------------
+//
+// Since `#308 live-reply-in-main` a removal from the stream took a message that arrived without its
+// thread out of the unplaced set at once, while the store kept its bare copy until the read behind the
+// removal landed. The reply route then took that copy for a message on the main channel, and a Reply to
+// it was posted there, naming the removed message, with no read first; with the reads failing, that
+// window had no end. A reply to a message removed upstream is now refused, and says so.
+
+/** A negative control: the reply route taking a message removed upstream for whatever its copy says. */
+const ROUTE_IGNORES_REMOVAL = [
+  "  if (removedUpstream(message.id)) return { ...route, unknown: true, removed: true, note: REPLY_TO_REMOVED };\n", ""];
+
+/**
+ * The channel read in Main, on a server with a change record: the bridge's reply pushed with no thread
+ * record (`bridgeReply`), and then — after `between`, if given — removed upstream, the stream saying so.
+ * With `reads` "held", every read from the push on waits for `release`, answered as the server had it
+ * when asked: the read behind the push, and so the one behind the removal, is still out. With "failing"
+ * every read fails.
+ */
+async function removedBareReply(script, reads, between = null) {
+  const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+  const serve = page.timeline;
+  /** @type {Array<() => void>} */
+  const held = [];
+  const failing = errorResponse(502, "chat_error", "history read timed out");
+  let holding = true;
+  page.timeline = (path, options) => {
+    if (!holding) return serve(path, options);
+    if (reads === "failing") return failing();
+    const answer = Promise.resolve(serve(path, options)).then(async (response) => {
+      const body = await response.text();
+      return { ...response, text: async () => body };
+    });
+    return new Promise((resolve) => held.push(() => resolve(answer)));
+  };
+  const { first, pushed } = bridgeReply(page, server);
+  await deliver(page, page.stream(), sseMessage(pushed));
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.ok(shownIds(page).includes("300"), "fixture: the pushed reply is not drawn on Main");
+  if (between) await between(page);
+  server.remove("300");
+  server.edit("201", { thread: { ...first, reply_count: 1 } });
+  await deliver(page, page.stream(), sseDelete("del-300", CHANNEL.id, "300"));
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.ok(shownIds(page).includes("300"), "fixture: the read behind the removal took the reply off Main already");
+  const release = async () => {
+    holding = false;
+    while (held.length) held.shift()();
+    // The read behind the removal waited for the read on the wire, polling for it every 50 ms.
+    for (let i = 0; i < 6; i += 1) {
+      await page.settle();
+      page.expireTimers(50);
+    }
+  };
+  return { page, server, first, release };
+}
+
+/** The reads made since the `from`th for a reply's own placing (`placeReplyTarget`). */
+const replyPlacingReads = (page, from) => readsSince(page, from).filter(([, , reason]) => reason === "reply-place");
+
+for (const reads of ["held", "failing"]) {
+  test(`\`#315 removed-reply-target\`: Reply on a message removed upstream, the read behind the removal ${reads === "held" ? "still out" : "failing"}, says so, and Send posts nothing and reads nothing`, async () => {
+    const run = async (script) => {
+      const { page, release } = await removedBareReply(script, reads);
+      distinctReplies(page);
+      const from = page.timelineCalls.length;
+      await replyButton(rowOf(page, "300")).click();
+      await page.settle();
+      const opened = { note: page.el("reply-destination").textContent, title: replyTitle(page) };
+      await page.el("reply-text").setValue("an answer to a message that is gone");
+      await page.el("reply-send").click();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      const sent = { posted: page.repliesPosted.map((call) => call.body), placing: replyPlacingReads(page, from),
+        state: page.el("reply-state").textContent, screen: page.screen(), text: page.el("reply-text").value,
+        outbox: outgoingRows(page).length };
+      return { page, opened, sent, release };
+    };
+    const { page, opened, sent, release } = await run(SCRIPT);
+    assert.match(opened.note, /was removed from the channel/, `Reply did not say the message was removed: ${opened.note}`);
+    assert.equal(opened.title, "Reply · lead team · message removed");
+    assert.deepStrictEqual(sent.posted, [], "a reply to a message removed upstream was posted");
+    assert.deepStrictEqual(sent.placing, [], "Send read the channel for a message removed upstream");
+    assert.match(sent.state, /^Not sent: the message you are answering was removed/);
+    assert.equal(sent.screen, "reply", "the refused reply left the reply screen");
+    assert.equal(sent.text, "an answer to a message that is gone", "the refused reply lost its words");
+    assert.equal(sent.outbox, 0, "the refused reply was queued, to hold up what is written after it");
+    if (reads === "held") {
+      // The read behind the removal lands at last: the message is gone from Main.
+      await release();
+      assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the removed reply is still on Main");
+    }
+
+    // THE CONTROL, as #308 left it: the bare copy reads as a message on the main channel, and the reply
+    // goes there, naming the removed message, with no read first.
+    const control = await run(brokenScript(...ROUTE_IGNORES_REMOVAL));
+    assert.deepStrictEqual(control.sent.posted, [{ text: "an answer to a message that is gone", reply_to: "300" }],
+      "without the check the reply still did not go to the main channel, so this test cannot see it");
+    assert.deepStrictEqual(control.sent.placing, []);
+  });
+}
+
+test("`#315 removed-reply-target`: a reply open on a message as it is removed upstream says so at once, before the read behind the removal lands", async () => {
+  const run = async (script) => {
+    let before = null;
+    const { page } = await removedBareReply(script, "held", async (p) => {
+      await replyButton(rowOf(p, "300")).click();
+      await p.settle();
+      before = p.el("reply-destination").textContent;
+    });
+    return { page, before, after: page.el("reply-destination").textContent, title: replyTitle(page) };
+  };
+  const { page, before, after, title } = await run(SCRIPT);
+  assert.match(before, /not known yet/, "fixture: the reply did not wait to know where the message is");
+  assert.match(after, /was removed from the channel/, `the open reply did not follow the removal: ${after}`);
+  assert.equal(title, "Reply · lead team · message removed");
+  distinctReplies(page);
+  await page.el("reply-text").setValue("too late");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted, [], "the reply was posted");
+
+  // THE CONTROL: a removal that does not tell the open reply leaves it saying where it would go.
+  const control = await run(brokenScript("  followReplyStore();\n  saveChannelScope();\n}", "  saveChannelScope();\n}"));
+  assert.match(control.after, /not known yet/, "the open reply followed the removal anyway, so this test cannot see it");
+});
+
+test("`#315 removed-reply-target`: a reply sent before its message was removed, its placing read failing, is refused when it is placed again, with nothing posted and no read", async () => {
+  const run = async (script) => {
+    let from = 0;
+    const { page } = await removedBareReply(script, "failing", async (p) => {
+      distinctReplies(p);
+      await replyQuietly(p, "300", "an answer sent as the message was taken back");
+      await sendBehind(p, "a note to the main channel after it");
+      assert.equal(outgoingRows(p)[0].getAttribute("data-send-state"), "retrying", "fixture: the placing read did not fail for a moment");
+      from = p.timelineCalls.length;
+    });
+    // Its next try, after the removal.
+    assert.ok(page.expireTimers(retryWait(0)) >= 1, "fixture: the reply was not to be placed again");
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    const rows = outgoingRows(page);
+    return { page, from, posted: page.repliesPosted.map((call) => call.body), rows: rows.map((row) => row.text()),
+      state: rows.length ? rows[0].getAttribute("data-send-state") : null };
+  };
+  const { page, from, posted, rows, state } = await run(SCRIPT);
+  assert.deepStrictEqual(posted, [], "a reply to a message removed upstream was posted, or the note went past it");
+  assert.deepStrictEqual(replyPlacingReads(page, from), [], "the reply read the channel for a message removed upstream");
+  assert.equal(state, "failed");
+  assert.match(rows[0], /The message you answered was removed from the channel, so this was not posted anywhere\./);
+  assert.match(rows[1], /goes first, and was not sent: the message it answers was removed\. Edit or Dismiss it to let this one go\./,
+    `the note does not say what holds it: ${rows[1]}`);
+  // Nor on its own later: a refusal is an answer.
+  for (const wait of [1, 2, 3, 4].map(retryWait)) page.expireTimers(wait);
+  await page.settle();
+  assert.deepStrictEqual(page.repliesPosted, []);
+
+  // THE CONTROL, as #308 left it: placed from the store's bare copy, the reply goes to the main channel
+  // with no read first, and the note after it follows.
+  const control = await run(brokenScript("  refuseRemoved();\n  const held = current() ? heldMessage(id) : null;",
+    "  const held = current() ? heldMessage(id) : null;"));
+  assert.deepStrictEqual(control.posted[0], { text: "an answer sent as the message was taken back", reply_to: "300" },
+    "without the check the reply still did not go to the main channel, so this test cannot see it");
+  assert.deepStrictEqual(replyPlacingReads(control.page, control.from), []);
+});
+
+test("`#315 removed-reply-target`: after a reload during the outage, a reply to the removed message is still refused", async () => {
+  const run = async (script) => {
+    const { page } = await removedBareReply(script, "failing");
+    const again = newPage(page.storage, script, (p) => {
+      p.threadingSupported = true;
+      p.threads = page.threads;
+      p.messages = page.messages;
+      p.timeline = offline;
+    });
+    await reopenedChannel(again);
+    assert.ok(rowOf(again, "300"), "fixture: the saved bare copy was not drawn after the reload");
+    distinctReplies(again);
+    await replyButton(rowOf(again, "300")).click();
+    await again.settle();
+    const note = again.el("reply-destination").textContent;
+    await again.el("reply-text").setValue("still answering it");
+    await again.el("reply-send").click();
+    for (let i = 0; i < 3; i += 1) await again.settle();
+    return { note, posted: again.repliesPosted.map((call) => call.body) };
+  };
+  const { note, posted } = await run(SCRIPT);
+  assert.match(note, /was removed from the channel/, `after a reload Reply did not say the message was removed: ${note}`);
+  assert.deepStrictEqual(posted, [], "after a reload the reply went to the main channel");
+
+  // THE CONTROL: the removal not saved with the store, the reload takes the bare copy for a message on
+  // the main channel.
+  const control = await run(brokenScript("      removed: [...channelCanon.removed.keys()].filter((id) => held.has(id)),\n", ""));
+  assert.deepStrictEqual(control.posted, [{ text: "still answering it", reply_to: "300" }],
+    "without saving the removal the reply was still refused, so this test cannot see it");
 });

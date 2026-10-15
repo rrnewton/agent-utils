@@ -14321,6 +14321,9 @@ function validCacheEntry(entry) {
       // Absent from an entry saved before `#185 reply-new-thread`, which then has nothing unplaced.
       (entry.unplaced === undefined ||
         (Array.isArray(entry.unplaced) && entry.unplaced.every((id) => typeof id === "string"))) &&
+      // Absent from an entry saved before `#315 removed-reply-target`, which then holds nothing removed.
+      (entry.removed === undefined ||
+        (Array.isArray(entry.removed) && entry.removed.every((id) => typeof id === "string"))) &&
       // Absent from an entry saved before `#222 unread-replies`, which then knows no gap yet.
       (entry.replyGaps === undefined || (entry.replyGaps !== null && typeof entry.replyGaps === "object" &&
         !Array.isArray(entry.replyGaps) &&
@@ -14424,6 +14427,7 @@ function trimCacheEntry(entry, limit) {
   const kept = new Set(entry.messages.map((message) => String(message.id)));
   entry.dismissed = entry.dismissed.map(String).filter((id) => kept.has(id));
   if (entry.unplaced) entry.unplaced = entry.unplaced.filter((id) => kept.has(id));
+  if (entry.removed) entry.removed = entry.removed.filter((id) => kept.has(id));
   if (entry.mode === "page") {
     entry.cursor = entry.more && entry.messages.length > 0 ? String(entry.messages[0].id) : null;
   }
@@ -14544,6 +14548,11 @@ function emptyCanon(channel = "") {
     // one saved before a reload — and the unplaced ids a read of All sent after they arrived has
     // answered for, carried or not (`placeUnplaced`).
     unplacedSince: new Map(), unplacedAnswered: new Set(),
+    // `#315 removed-reply-target`. By id, each message removed upstream — by the stream, or by a delta's
+    // deletions — with `timelineAnswersAsked` as the removal came (`noteRemoved`). The store may still
+    // hold it until the read the removal asks for lands; meanwhile nothing places it, and a reply to it
+    // is refused (`replyRoute`, `placeReplyTarget`). Not "no longer unplaced", which reads as placed.
+    removed: new Map(),
     // `#203 incremental-refresh`. Whether this channel's forward reads carry edits and deletions:
     // null until one has landed. The backend's property rather than a view's, so it outlives a
     // view's cover being reset by an explicit refresh.
@@ -14704,6 +14713,7 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   }
   // A page is the server's own answer for every message on it, thread record or none.
   for (const message of payload.messages || []) channelCanon.unplaced.delete(String(message.id));
+  believeCarried(channelCanon, payload);
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
   }
@@ -14823,7 +14833,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     channelCanon.messages = channelCanon.messages.filter((message) => !gone.has(String(message.id)));
     for (const id of gone) {
       channelCanon.dismissed.delete(id);
-      forgetUnplaced(channelCanon, id);
+      noteRemoved(channelCanon, id);
       archivedIds.delete(id);
     }
   }
@@ -14836,6 +14846,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
       [...channelCanon.messages.filter((held) => !ids.has(String(held.id))), ...fresh], "timestamp");
   }
   for (const message of arriving) channelCanon.unplaced.delete(String(message.id));
+  believeCarried(channelCanon, payload);
   const readChanged = foldReadState(payload, view);
   for (const summary of payload.threads || []) upsertThreadSummary(summary);
   const removed = new Set((delta.removed_threads || []).map(String));
@@ -14987,6 +14998,8 @@ function loadCanon(channel) {
   channelCanon.dismissed = new Set(entry.dismissed.map(String));
   // A reload does not place a message either: what the stream left unplaced stays so until read.
   channelCanon.unplaced = new Set((entry.unplaced || []).map(String));
+  // ...nor bring back a message removed upstream: every read from here on is sent after its removal.
+  channelCanon.removed = new Map((entry.removed || []).map((id) => [String(id), 0]));
   // `#222 unread-replies`. A copy saved before passed-over threads and Done's settling were both
   // kept may hold a wrong gap for a thread All's page passed over: nothing, which made its unknown
   // replies "N new" for good, past Done; or its whole count, set by Main's read after the copy was
@@ -15163,6 +15176,9 @@ function saveChannelScope() {
       scope: channelCanon.scope,
       dismissed: [...channelCanon.dismissed].filter((id) => held.has(id)),
       unplaced: [...channelCanon.unplaced].filter((id) => held.has(id)),
+      // `#315 removed-reply-target`. What it still holds of what was removed upstream: the read that
+      // takes it out may never have landed, and a reply to it is still refused after a reload.
+      removed: [...channelCanon.removed.keys()].filter((id) => held.has(id)),
       // Only for threads the store still holds something of: the rest have no chip to draw.
       replyGaps: Object.fromEntries([...channelCanon.replyGaps].filter(([id]) => heldThreads.has(id))),
       passedOver: [...channelCanon.passedOver].filter((id) => heldThreads.has(id)),
@@ -16046,6 +16062,10 @@ function heldThreadRecord(message, stored = heldMessage(String(message.id))) {
 const REPLY_INTO_ANSWERED_THREAD =
   "Posts in this message's thread, as you chose. It has a reply already, so yours will not be the first.";
 
+/** The note under a reply to a message removed upstream, which Send refuses (`replyRoute`). `#315`. */
+const REPLY_TO_REMOVED =
+  "This message was removed from the channel, so a reply to it cannot be posted. Nothing will be sent.";
+
 /**
  * Where a reply to `message` goes, from the view on screen. `#185 reply-new-thread`.
  *
@@ -16068,13 +16088,20 @@ const REPLY_INTO_ANSWERED_THREAD =
  * for the thread on opening, and the reply still goes where the reader sent it — into the thread,
  * as a reply in it, saying so — not to the main channel without a word. `#185 reply-new-thread`.
  *
+ * `removed` is a message removed upstream (`noteRemoved`), which the store may hold until the read
+ * behind the removal lands: no reply to it goes anywhere, and Send says why (`sendReply`). It is
+ * `unknown` too, so a reply queued for it before the removal came is refused where it is placed
+ * (`placeReplyTarget`). `#315 removed-reply-target`: its bare copy used to read as a message on the
+ * main channel, and a reply to it went there.
+ *
  * @param {object} message
  * @param {boolean} [bound] the reader has chosen to start this message's thread with the reply
  */
 function replyRoute(message, bound = false) {
-  /** @type {{ thread: string | null, branch: string | null, into: string | null, unknown: boolean, note: string }} */
-  const route = { thread: null, branch: null, into: null, unknown: false, note: "" };
+  /** @type {{ thread: string | null, branch: string | null, into: string | null, unknown: boolean, removed: boolean, note: string }} */
+  const route = { thread: null, branch: null, into: null, unknown: false, removed: false, note: "" };
   if (!threadingSupported) return { ...route, thread: threadOf(message) };
+  if (removedUpstream(message.id)) return { ...route, unknown: true, removed: true, note: REPLY_TO_REMOVED };
   if (channelView === "thread" && selectedThreadId) {
     return { ...route, thread: String(selectedThreadId), note: "Posts in this thread." };
   }
@@ -19729,10 +19756,21 @@ function renderOutgoingEverywhere() {
  * read of All, which carries every message with the thread record its live copy lacked. A message
  * that read does not carry cannot be placed and the reply is not posted at all: guessing the main
  * channel is exactly what turned the answer of 2026-10-04 into a thread of its own.
+ *
+ * NOR ONE REMOVED UPSTREAM (`noteRemoved`), before the read or while it was out: the reply is not
+ * posted, and no read is made for it. `#315 removed-reply-target`. Its bare copy, held until the read
+ * behind the removal lands, is not a message placed on the main channel.
  */
 async function placeReplyTarget(entry) {
   const id = String(entry.replyTo);
   const current = () => String(el("discord-channel").value) === entry.channel;
+  const refuseRemoved = () => {
+    if (!current() || !removedUpstream(id)) return;
+    const error = /** @type {Error & {removed?: boolean}} */ (new Error("the message you answered was removed from the channel"));
+    error.removed = true;
+    throw error;
+  };
+  refuseRemoved();
   const held = current() ? heldMessage(id) : null;
   if (held && !channelCanon.unplaced.has(id)) return answeredThread(held);
   const payload = await apiDecoded(
@@ -19749,6 +19787,7 @@ async function placeReplyTarget(entry) {
     }
     saveChannelScope();
   }
+  refuseRemoved();
   const found = messages.find((message) => String(message.id) === id);
   if (!found) throw new Error("it is not among the channel's newest messages");
   return answeredThread(found);
@@ -19827,7 +19866,7 @@ let placingReadInFlight = null;
 
 /** The ids the selected channel's stream left unplaced that no read of All has answered for. */
 function unplacedToAsk() {
-  return [...channelCanon.unplaced].filter((id) => !channelCanon.unplacedAnswered.has(id));
+  return [...channelCanon.unplaced].filter((id) => !channelCanon.unplacedAnswered.has(id) && !channelCanon.removed.has(id));
 }
 
 /**
@@ -19864,6 +19903,50 @@ function forgetUnplaced(canon, id) {
   canon.unplaced.delete(id);
   canon.unplacedSince.delete(id);
   canon.unplacedAnswered.delete(id);
+}
+
+/**
+ * Message `id` is removed upstream — a removal from the stream (`noteLiveRemoval`), or a delta's
+ * deletions (`foldTimelineDelta`): nothing left unplaced in store `canon` keeps it (`forgetUnplaced`),
+ * and it is removed there (`canon.removed`) as of the read sent last. `#315 removed-reply-target`.
+ *
+ * NOT "NO LONGER UNPLACED". A message that is not unplaced is placed, to every other reader of that
+ * set: the reply route took a bare copy the store still held, the read behind its removal not yet
+ * landed, for a message on the main channel, and posted a reply to it there, with no read first —
+ * during an outage, with no end to that window. Before `#308 live-reply-in-main` it was still
+ * unplaced, and Send read All first, did not find it, and refused. Now a reply to a message removed
+ * upstream is refused, saying so, wherever it was (`replyRoute`, `placeReplyTarget`), and nothing
+ * places it (`placeFromPage`), until a read sent after the removal carries it after all
+ * (`believeCarried`).
+ *
+ * @param {any} canon
+ * @param {string} id
+ */
+function noteRemoved(canon, id) {
+  forgetUnplaced(canon, id);
+  canon.removed.set(id, timelineAnswersAsked);
+}
+
+/**
+ * A read sent after a message was removed upstream that still carries it says the message is there
+ * after all — as the server's own read cache believes a fetch begun after a removal — and it is no
+ * longer taken for removed (`noteRemoved`). `#315 removed-reply-target`.
+ *
+ * @param {any} canon
+ * @param {VibeTalk.TimelineResponse} payload
+ */
+function believeCarried(canon, payload) {
+  if (canon.removed.size === 0) return;
+  const number = sentNumberOf(payload);
+  for (const message of payload.messages || []) {
+    const at = canon.removed.get(String(message.id));
+    if (at !== undefined && number > at) canon.removed.delete(String(message.id));
+  }
+}
+
+/** Whether message `id` of the selected channel is removed upstream, as far as this page knows (`noteRemoved`). */
+function removedUpstream(id) {
+  return channelCanon.channel === String(el("discord-channel").value) && channelCanon.removed.has(String(id));
 }
 
 /**
@@ -20099,7 +20182,9 @@ function placeFromPage(payload, canon, number) {
   /** @type {Map<string, any>} by id, the answer's copies of the messages left unplaced */
   const carried = new Map();
   for (const message of payload.messages || []) {
-    if (canon.unplaced.has(String(message.id))) carried.set(String(message.id), message);
+    // Never one removed upstream (`noteRemoved`, `#315 removed-reply-target`).
+    const id = String(message.id);
+    if (canon.unplaced.has(id) && !canon.removed.has(id)) carried.set(id, message);
   }
   if (carried.size === 0) return false;
   let placed = false;
@@ -20308,6 +20393,12 @@ function waitingBehind(ahead) {
   const actions = ["Retry", ...(editableSend(ahead) ? ["Edit"] : [])];
   const choice = `${actions.join(", ")} or Dismiss it to let this one go.`;
   if (ahead.state === "unconfirmed") return `${which}, and its delivery is unconfirmed. ${choice}`;
+  // `#315 removed-reply-target`. Refused, not undecided: Retry sends it nowhere either.
+  if (ahead.placement === "unknown" && ahead.replyTo && ahead.channel === String(el("discord-channel").value) &&
+      removedUpstream(ahead.replyTo)) {
+    return `${which}, and was not sent: the message it answers was removed. ` +
+      `${editableSend(ahead) ? "Edit or Dismiss" : "Dismiss"} it to let this one go.`;
+  }
   return ahead.placement === "unknown"
     ? `${which}, and was not sent: which thread it goes in is not known yet. ${choice}`
     : `${which}, and was not sent. ${choice}`;
@@ -20437,6 +20528,11 @@ async function placeOutgoingMessage(entry, job) {
       // Nothing has been posted, so this is a plain failure the reader can retry, never the
       // "unconfirmed" of a POST whose answer was lost.
       entry.state = "failed";
+      // `#315 removed-reply-target`. Removed upstream: an answer, and the reader's to Edit or Dismiss.
+      if (error.removed) {
+        entry.detail = "The message you answered was removed from the channel, so this was not posted anywhere.";
+        return;
+      }
       const cause = "The message you answered came in live, and whether it is in a thread could not " +
         `be found out, so this was not posted anywhere: ${error.message}.`;
       // `#277 send-order`. A read that failed for a moment — timed out, lost its connection, met the
@@ -30966,7 +31062,7 @@ let replyChannelId = null;
  * placed a message the stream had left unplaced, or a reply arrived in the thread it offered to
  * start. See `followReplyStore`.
  */
-let replyRouting = { thread: null, branch: null, into: null, unknown: false, note: "" };
+let replyRouting = { thread: null, branch: null, into: null, unknown: false, removed: false, note: "" };
 /**
  * The messages whose kept draft was left with "Start a new thread" ticked, by id as a string, so
  * that the box comes back ticked with the words: a reader who put a reply down to look at something
@@ -31555,8 +31651,14 @@ async function sendReply() {
     el("reply-state").textContent = "This channel is read-only.";
     return;
   }
-  rememberDraft();
   const route = replyRouting;
+  // `#315 removed-reply-target`. A reply to a message removed upstream goes nowhere: the words stay in
+  // the box, and nothing is queued to hold up what the reader writes next in the channel.
+  if (route.removed) {
+    el("reply-state").textContent = "Not sent: the message you are answering was removed from the channel.";
+    return;
+  }
+  rememberDraft();
   const branch = route.branch && el("reply-branch").checked ? route.branch : null;
   const completion = queueOutgoingMessage({
     channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
@@ -32239,6 +32341,7 @@ function replyPlace() {
  */
 function replyDestination() {
   const channel = channelName(knownChannel(replyChannelId));
+  if (replyRouting.removed) return [channel, "message removed"];
   if (replyRouting.unknown) return [channel, "thread not known yet"];
   if (replyRouting.branch && el("reply-branch").checked) {
     return ["New thread", threadName(threadChoice(replyRouting.branch, null, replyTarget), Infinity)];
@@ -32595,9 +32698,16 @@ function followReplyStore() {
   // `#277 reply-in-column`. A reply open in a column follows too: where it goes is said under its box.
   if ((currentScreen !== "reply" && !replyDocked) || !replyTarget) return;
   let moved = false;
-  if (replyRouting.unknown) {
+  // `#315 removed-reply-target`. Removed upstream since Reply was opened, wherever it was going: Send
+  // refuses it now, and the note and the title say so.
+  if (!replyRouting.removed && removedUpstream(replyTarget.id)) {
+    replyRouting = replyRoute(replyTarget);
+    el("reply-branch").checked = false;
+    el("reply-branch-row").hidden = true;
+    moved = true;
+  } else if (replyRouting.unknown) {
     const settled = replyRoute(replyTarget);
-    if (!settled.unknown) {
+    if (!settled.unknown || settled.removed !== replyRouting.removed) {
       replyRouting = settled;
       el("reply-branch").checked = false;
       el("reply-branch-row").hidden = !settled.branch;
@@ -36815,7 +36925,12 @@ function takeThreadRecord(message) {
  */
 function noteLiveRemoval(channel, id) {
   liveRemovalsSeen.set(String(channel), (liveRemovalsSeen.get(String(channel)) || 0) + 1);
-  if (channelCanon.channel === String(channel)) forgetUnplaced(channelCanon, String(id));
+  if (channelCanon.channel !== String(channel)) return;
+  noteRemoved(channelCanon, String(id));
+  // `#315 removed-reply-target`. A reply open on it says so now, not when the read behind this lands,
+  // and so does one after a reload before that read has landed.
+  followReplyStore();
+  saveChannelScope();
 }
 
 /**

@@ -141,7 +141,12 @@ heads a thread somebody made in Discord, with nobody's reply in it yet, does get
 the grey **Thread**. A message that arrived on the live stream
 without saying which thread it is in, and that no read has placed since, is placed by one read of
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
-text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.
+text for **Retry**. Until it is placed, whatever you send next in that channel waits for it. A
+message the live stream says was removed is still drawn until the read behind the removal lands, but
+a reply to it goes nowhere (`#315 removed-reply-target`): the reply screen says the message was
+removed, and **Send** posts nothing and keeps your words. A reply already waiting to be placed when
+the removal comes is not posted either, and says why. That holds through a reload before the read
+lands, as during an outage.
 
 **A reply marks read what it answers, whichever way it was started.** `#256 reply-marks-read`,
 `#300 reply-marks-read`. Reply on a message and opening its thread to write in it both make a reply
