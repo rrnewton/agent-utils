@@ -4667,6 +4667,34 @@ const TUNING_BANDS = {
     "off by the page's notice, the double turn the hold exists to prevent; past a minute a trickle " +
     "of hypotheses of background speech keeps a typed message, or the page's word on a yes, from " +
     "the agent for longer than anyone waits for a reply"],
+  // `#330 voice-long-turn-drop`.
+  ANSWER_PLAYED_GRACE_MS: [200, 1500,
+    "how long a relayed message or the page's notice waits after an answer's audio has finished " +
+    "playing. Under a fifth of a second it lands on the answer's last word, before the owner can " +
+    "answer the answer; past a second and a half the call sits in a silence nobody asked for"],
+  RELAY_RECHECK_MS: [200, 2000,
+    "how often held channel messages ask again whether the answer ended. Under a fifth of a second " +
+    "it is a busy loop for the length of a long answer; past two seconds a message waits that long " +
+    "into the silence after it"],
+  UNSETTLED_SAVE_MS: [1000, 10000,
+    "how often a turn still being said is written down on the device. Under a second it rewrites " +
+    "storage at every hypothesis of a long answer; past ten, an app killed mid-answer loses that much"],
+  UNSETTLED_ABANDONED_MS: [10000, 120000,
+    "how long a page's written-down turn must go unrewritten before another page files it as cut " +
+    "off. Under ten seconds — a few saves — a page merely slow, or in another window, is robbed and " +
+    "its turn stored twice; past two minutes a reopened app shows the lost answer that much later"],
+  RECOVERED_TURN_MAX_CHARS: [4000, 7999,
+    "the longest recovered turn filed. At or past the server's 8000-character cap a long answer is " +
+    "refused for its length and retried at every opening; under four thousand it cuts a summary " +
+    "that would have fitted"],
+  CLOSE_REASON_MAX_CHARS: [80, 123,
+    "the longest close reason the call-end record carries. Past 123 it is longer than a WebSocket " +
+    "close frame can give; under eighty a bridge's own reason is cut before it says what happened"],
+  CALL_SPAN_MAX_MS: [86400000, 86400000,
+    "the longest offset the call-end record sends: the server refuses a record past a day, and a " +
+    "lower bound here would report a long call's last prompt as more recent than it was"],
+  CALL_AUDIO_MAX_MS: [3600000, 3600000,
+    "the most queued audio the call-end record sends: the server refuses a record past an hour"],
   // `#267 quote-reply`.
   QUOTE_MAX_CHARS: [300, 1500,
     "the longest quote Quote reply puts in the box. Under three hundred, two sentences of a long " +
@@ -7176,6 +7204,18 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
         await proposedDuringACall(page);
         await page.el("post-confirm-cancel").click();
         await page.settle();
+        return page;
+      },
+    ],
+    // `#330 voice-long-turn-drop`: a typed message cuts the answer being spoken, and says so.
+    [
+      "answer cut off",
+      async () => {
+        const page = newPage();
+        const socket = await startNeutralCall(page);
+        speech(socket, "assistant", 1, "Overnight there were", false);
+        await compose(page, "stop, what about the build?");
+        await page.el("send-text").click();
         return page;
       },
     ],
@@ -18744,7 +18784,13 @@ test("a greeting that is heard but not transcribed is healthy: speaker-only is n
   agentTurn(page, socket, 1, { amplitude: SPEECH });
   await page.settle();
   assert.equal(state(page), "live");
-  assert.deepStrictEqual(page.healthPosts, []);
+  // `#330 voice-long-turn-drop`. Healthy, and not silent: what is reported is that the words never
+  // arrived as text — once a call, however many turns — and each turn's row says so.
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["audio_without_text"]);
+  assert.equal(
+    session_lines(page).filter((li) => li.text().includes("spoken reply — no text received")).length,
+    2
+  );
 });
 
 test("audible, readable, interrupted and lone silent turns are none of them a dead service", async () => {
@@ -18762,7 +18808,9 @@ test("audible, readable, interrupted and lone silent turns are none of them a de
   agentTurn(page, socket, 9, { amplitude: 256 });
   await page.settle();
   assert.equal(state(page), "live");
-  assert.deepStrictEqual(page.healthPosts, []);
+  // `#330 voice-long-turn-drop`. The audible turns without text are reported as that, once; no turn
+  // here is reported as a dead service.
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["audio_without_text"]);
 });
 
 test("silencing the agent's voice does not make it look like a dead service", async () => {
@@ -18773,7 +18821,8 @@ test("silencing the agent's voice does not make it look like a dead service", as
   agentTurn(page, socket, 2, { amplitude: SPEECH });
   await page.settle();
   assert.equal(state(page), "live", "speaker off was read as the service going quiet");
-  assert.deepStrictEqual(page.healthPosts, []);
+  // Audible on arrival, Sound off or not: these turns were heard, and none of their text came.
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["audio_without_text"]);
 });
 
 test("a greeting that never comes is reported after the no-reply bound, and not before", async () => {
@@ -18912,13 +18961,16 @@ test("talking over half a second of silence does not hide a dead service; talkin
   agentTurn(page, socket, 3, { interrupted: true });
   agentTurn(page, socket, 4, { amplitude: SILENT, samples: 9600, interrupted: true });
   await page.settle();
-  assert.deepStrictEqual(page.healthPosts, [], "a short or audible turn that was cut off is not evidence");
+  // `#330 voice-long-turn-drop`: the audible turns that brought no text say so, which is not evidence
+  // of a dead service either.
+  const dead = () => page.healthPosts.filter((r) => r.cause !== "audio_without_text");
+  assert.deepStrictEqual(dead(), [], "a short or audible turn that was cut off is not evidence");
   agentTurn(page, socket, 5, { amplitude: SILENT, samples: 12000, interrupted: true }); // 0.5 s
   agentTurn(page, socket, 6, { amplitude: SILENT, samples: 21600, interrupted: true }); // 0.9 s
   await page.settle();
   assert.equal(state(page), "unresponsive");
-  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_turns"]);
-  assert.equal(page.healthPosts[0].audio_ms, 900);
+  assert.deepStrictEqual(dead().map((r) => r.cause), ["silent_turns"]);
+  assert.equal(dead()[0].audio_ms, 900);
 });
 
 test("an audible turn ends the silent run even when it was cut short or carried an error", async () => {
@@ -18935,7 +18987,9 @@ test("an audible turn ends the silent run even when it was cut short or carried 
     agentTurn(page, socket, 3, { amplitude: SILENT });
     await page.settle();
     const expected = kind === "errored" ? ["error_frame"] : [];
-    assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), expected, `${kind}: a stale silent run was reported`);
+    // `#330 voice-long-turn-drop`: the audible turn without text is reported as that, not as silence.
+    const dead = page.healthPosts.map((r) => r.cause).filter((cause) => cause !== "audio_without_text");
+    assert.deepStrictEqual(dead, expected, `${kind}: a stale silent run was reported`);
     if (kind === "interrupted") {
       assert.equal(state(page), "live", "a heard turn left the page believing the service was silent");
     }
@@ -19088,7 +19142,8 @@ test("recovery restores live and is logged once per logged episode", async () =>
   agentTurn(page, socket, 6, { amplitude: SPEECH });
   await page.settle();
   assert.equal(state(page), "live");
-  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_turns", "recovered"]);
+  // ...and the audible turns that carried no text are reported as that, once a call. `#330`.
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_turns", "recovered", "audio_without_text"]);
 });
 
 test("an error frame is logged by cause alone, without the text it carried", async () => {
@@ -58919,8 +58974,11 @@ test("`#268 voice-call-drops`: Hang up is recorded as the reader's, says goodbye
   await page.settle();
   assert.deepEqual(controlFrames(socket).filter((type) => type === "quit"), ["quit"]);
   assert.equal(page.el("error").hidden, true);
+  // `#330 voice-long-turn-drop`: with whether the page was in sight and how much answer was still
+  // to play; nothing was sent in this call, so no "last sent" offset rides along.
   assert.deepEqual(page.endPosts, [{
     protocol: "vibe-talk-v1", chat: false, ended_by: "hang_up", since_open_ms: 40_000, turns: 0,
+    visibility: "visible", queued_audio_ms: 0,
   }]);
   assert.match(page.el("settings-detail").textContent, /hung up 40 s into the call/);
 });
@@ -67320,4 +67378,367 @@ test("`#331 resume-on-websocket`: the line under a call heads the call's box, ou
   assert.match(cssBlock('#call-recap[data-recap="accepted"]'), /color:/, "a recap the agent took does not look different");
   // ...and the reason beside a disabled switch is drawn as a note under it, not as a bare hint.
   assert.match(cssBlock(".toggle-why"), /padding-left:|margin-left:/, "the reason does not stand under the switch's words");
+});
+
+// --- #330 voice-long-turn-drop ----------------------------------------------------------------------
+//
+// The owner asked for a summary of the night's messages; the agent said one short line, then spoke a
+// long summary that never appeared as text, and the call ended midway. The likeliest mechanism is
+// one this page owned: a relayed channel message, held thirty seconds behind the answer, then sent
+// anyway as an `audio_end`, which a bridge takes for an interrupt — dropping the rest of the answer's
+// audio and its held text. These walk the protocol's frames in the order a bridge sends them.
+
+/** One second of audible PCM, as the protocol's 24 kHz 16-bit samples. */
+const secondOfSpeech = (page) => page.pcmFrame(24000, SPEECH);
+
+/** The relayed turns among the prompts sent: the ones carrying fenced channel text. */
+const relayedPrompts = (socket) => promptsSent(socket).filter((text) => text.includes(RELAY_FENCE_OPEN));
+
+/**
+ * A neutral call where the owner asked for the overnight summary, the filler line and its tool call
+ * completed as turn 1, and turn 2 — the summary — has been talking for `seconds`, with a channel
+ * message relayed into the call a second in. Returns the socket and what the summary has said.
+ */
+async function longAnswerWithRelay(page, seconds) {
+  const socket = await startNeutralCall(page);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  await setReadNew(page, "full");
+  const stream = page.stream();
+  assert.ok(stream, "no live stream was attached, so nothing can be relayed");
+  speech(socket, "user", 1, "summarize the overnight messages", true);
+  speech(socket, "assistant", 1, "Checking overnight messages now.", true);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  turnDone(socket, 1);
+  await passTime(page, 3000);
+  let said = "Overnight,";
+  speech(socket, "assistant", 2, said, false);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  await deliver(page, stream, sseMessage(message({ id: "3300", content: "the deploy finished" })));
+  for (let s = 0; s < seconds; s += 1) {
+    await passTime(page, 1000);
+    said += ` item ${s},`;
+    speech(socket, "assistant", 2, said, false);
+    socket.onmessage({ data: secondOfSpeech(page) });
+  }
+  return { socket, said };
+}
+
+test("`#330 voice-long-turn-drop`: a channel message during an answer longer than 30 s waits for the answer to complete and to finish playing — no audio_end, no interrupt", async () => {
+  const page = newPage();
+  const { socket, said } = await longAnswerWithRelay(page, 45);
+  assert.ok(!controlFrames(socket).includes("audio_end"), "an audio_end went into an answer still being spoken");
+  assert.ok(!controlFrames(socket).includes("interrupt"), "a relayed message interrupted the answer");
+  assert.deepEqual(promptsSent(socket), []);
+  assert.match(page.el("status").textContent, /1 new message will be read out when the answer ends/);
+  // The answer's generation ends; its audio, queued faster than real time, still has most of a
+  // minute to play, and the message waits that out as well.
+  speech(socket, "assistant", 2, `${said} that is all.`, true);
+  turnDone(socket, 2);
+  await passTime(page, CAPTURE_RESUME_MS + 1000);
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the message went while the answer was still playing");
+  await passTime(page, 60_000);
+  assert.deepEqual(controlFrames(socket).filter((type) => type !== "audio_start"), ["audio_end"],
+    "once the answer was heard out, the segment closes for the message, and nothing else is sent");
+  turnDone(socket, 3);
+  const relays = relayedPrompts(socket);
+  assert.equal(relays.length, 1, "the message was never relayed");
+  assert.match(relays[0], /the deploy finished/);
+  // The summary is on screen whole, and stored whole, not marked cut.
+  const answer = session_lines(page).find((li) => li.text().includes("Overnight,"));
+  assert.ok(answer && answer.text().includes("that is all."), "the long answer is not on screen as text");
+  assert.doesNotMatch(answer.text(), /cut off/);
+  assert.ok(storedTexts(page).some((t) => t.startsWith("agent: Overnight,") && t.endsWith("that is all.")),
+    storedTexts(page).join("\n"));
+  assert.ok(!controlFrames(socket).includes("quit"), "the long answer ended the call");
+  assert.equal(page.el("error").hidden, true, page.el("error").textContent);
+});
+
+test("`#330 voice-long-turn-drop`: negative control — the page that held a relay only 30 s cuts the answer with audio_end", async () => {
+  // Without the change: the relay goes straight into the queue and the cap lets it go mid-answer.
+  const page = newPage(new Map(), brokenScriptEach(
+    ["function relayMustWait() {\n", "function relayMustWait() {\n  return false;\n"],
+    ["  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
+      "  if (false) {"],
+    ["    if (next.kind !== \"typed\" && !answerHeardOut()) {", "    if (false) {"]
+  ));
+  const { socket } = await longAnswerWithRelay(page, 45);
+  assert.ok(controlFrames(socket).includes("audio_end"), "the control did not cut the answer, so the test above proves nothing");
+});
+
+test("`#330 voice-long-turn-drop`: the reader's typed message cuts the answer at once, through interrupt, and says so; the cut answer keeps its words marked cut off", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  speech(socket, "user", 1, "what happened overnight", true);
+  speech(socket, "assistant", 1, "Overnight there were three merges and", false);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  socket.onmessage({ data: secondOfSpeech(page) });
+  const playedBefore = page.audio.played;
+  await compose(page, "stop, what about the build?");
+  await page.el("send-text").click();
+  assert.deepEqual(controlFrames(socket).slice(-1), ["interrupt"], "the typed message did not cut the answer explicitly");
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the answer was cut with a silent audio_end");
+  assert.ok(page.audio.stopped > 0, "the answer kept playing over the reader's message");
+  const seam = page.el("transcript").children.filter((li) => li.className === "seam").at(-1);
+  assert.ok(seam && seamLabel(seam) === "answer cut off", "the cut was not said on the transcript");
+  assert.match(page.el("status").textContent, /You cut the answer short/);
+  const cutRow = session_lines(page).find((li) => li.text().includes("three merges and"));
+  assert.ok(cutRow, "the answer's words so far are gone from the screen");
+  assert.match(cutRow.text(), /three merges and \(cut off\)$/);
+  assert.equal(cutRow.getAttribute("data-cut"), "");
+  // The cut turn's late audio is not played again.
+  socket.onmessage({ data: secondOfSpeech(page) });
+  assert.equal(page.audio.played, playedBefore, "late audio of the cut answer was played");
+  // Its interrupted turn_complete, the hand-off, the segment, and then the message.
+  socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 1, interrupted: true }) });
+  await page.settle();
+  // Filed in the order it was said: the question, the cut answer, then the message that cut it.
+  assert.deepEqual(storedTexts(page), [
+    "you: what happened overnight",
+    "agent: Overnight there were three merges and (cut off)",
+    "you: stop, what about the build?",
+  ]);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  assert.equal(controlFrames(socket).at(-1), "audio_end");
+  turnDone(socket, 2);
+  assert.deepEqual(promptsSent(socket), ["stop, what about the build?"]);
+  assert.equal(controlFrames(socket).filter((type) => type === "interrupt").length, 1, "interrupted more than once");
+});
+
+test("`#330 voice-long-turn-drop`: a typed message during the owner's own open turn cuts nothing — it waits, as before", async () => {
+  // The control for the test above: with no answer being spoken there is nothing to interrupt.
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  speech(socket, "user", 1, "and the", false);
+  await compose(page, "build?");
+  await page.el("send-text").click();
+  assert.ok(!controlFrames(socket).includes("interrupt"), "the owner's own words were interrupted");
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the segment was closed inside the owner's open turn");
+  turnDone(socket, 1);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  assert.equal(controlFrames(socket).at(-1), "audio_end");
+});
+
+test("`#330 voice-long-turn-drop`: an answer the server reports interrupted keeps its words, marked cut off, on screen and in the record", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "read me the summary", true);
+  speech(socket, "assistant", 1, "The first item is the deploy, the second", false);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 1, interrupted: true }) });
+  await page.settle();
+  const row = session_lines(page).find((li) => li.text().includes("the second"));
+  assert.ok(row, "the cut answer's words are gone");
+  assert.match(row.text(), /the second \(cut off\)$/);
+  assert.deepEqual(storedTexts(page), [
+    "you: read me the summary",
+    "agent: The first item is the deploy, the second (cut off)",
+  ]);
+  // The control: a turn that completes normally is not marked.
+  speech(socket, "assistant", 2, "Anything else?", true);
+  turnDone(socket, 2);
+  await page.settle();
+  assert.equal(storedTexts(page).at(-1), "agent: Anything else?");
+});
+
+test("`#330 voice-long-turn-drop`: a call that ends in the middle of an answer keeps what it said, marked cut off", async () => {
+  for (const end of ["hang up", "server close", "connection lost"]) {
+    const page = newPage();
+    const socket = await startNeutralCall(page);
+    speech(socket, "user", 1, "summarize overnight", true);
+    speech(socket, "assistant", 1, "Overnight there were two releases and", false);
+    socket.onmessage({ data: secondOfSpeech(page) });
+    if (end === "hang up") await page.el("hang-up").click();
+    else if (end === "server close") socket.onclose({ code: 1000, reason: "session ended" });
+    else socket.onclose({ code: 1006, reason: "" });
+    await page.settle();
+    assert.ok(storedTexts(page).includes("agent: Overnight there were two releases and (cut off)"),
+      `${end}: ${storedTexts(page).join(" | ")}`);
+    const row = session_lines(page).find((li) => li.text().includes("two releases"));
+    assert.ok(row && row.getAttribute("data-cut") === "", `${end}: the row is not marked cut off`);
+  }
+});
+
+test("`#330 voice-long-turn-drop`: a turn heard with no text says 'spoken reply — no text received', files it as the page's note, and reports it once", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "summarize overnight", true);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  socket.onmessage({ data: secondOfSpeech(page) });
+  turnDone(socket, 1);
+  await page.settle();
+  const flagged = session_lines(page).filter((li) => li.getAttribute("data-no-text") === "");
+  assert.equal(flagged.length, 1, "a turn heard without text left no line saying so");
+  assert.match(flagged[0].text(), /spoken reply — no text received$/);
+  // Filed after the owner's words, as the page's note — never in the assistant's mouth.
+  const turns = [...page.storedTurns.values()].flat();
+  assert.deepEqual(turns.map((t) => `${t.speaker}: ${t.text}`), [
+    "you: summarize overnight",
+    "note: spoken reply — no text received",
+  ]);
+  assert.deepEqual(page.healthPosts.map((r) => [r.cause, r.audio_ms, r.peak]), [["audio_without_text", 2000, SPEECH]]);
+  assert.equal(state(page), "live", "a turn that was heard was taken for a dead service");
+  // A second such turn draws its line too, and is not reported again.
+  socket.onmessage({ data: secondOfSpeech(page) });
+  turnDone(socket, 2);
+  await page.settle();
+  assert.equal(session_lines(page).filter((li) => li.getAttribute("data-no-text") === "").length, 2);
+  assert.equal(page.healthPosts.length, 1);
+  // The controls: a turn whose text came, and a turn whose audio was silent, draw no such line.
+  speech(socket, "assistant", 3, "Two merges.", true);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  turnDone(socket, 3);
+  socket.onmessage({ data: page.pcmFrame(24000, 0) });
+  turnDone(socket, 4);
+  await page.settle();
+  assert.equal(session_lines(page).filter((li) => li.getAttribute("data-no-text") === "").length, 2);
+});
+
+/** What this device holds of turns still being said, by page. */
+const unsettledCopies = (page) => JSON.parse(page.storage.get("vibe-talk.voice.unsettled") || "{}");
+
+test("`#330 voice-long-turn-drop`: an answer still being said is written down every few seconds and on hide, and its copy goes when it is stored", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "summarize overnight", true);
+  speech(socket, "assistant", 1, "Overnight there were", false);
+  assert.deepEqual(unsettledCopies(page), {}, "written down before the save interval");
+  page.expireTimers(sourceConstant("UNSETTLED_SAVE_MS"));
+  let copies = Object.values(unsettledCopies(page));
+  assert.equal(copies.length, 1, "nothing was written down while the answer was being said");
+  assert.deepEqual(copies[0].turns.map((t) => `${t.who}: ${t.text}`), [
+    "you: summarize overnight",
+    "assistant: Overnight there were",
+  ]);
+  // Hidden: written at once, with what it says now.
+  speech(socket, "assistant", 1, "Overnight there were two releases", false);
+  await page.setVisibility("hidden");
+  copies = Object.values(unsettledCopies(page));
+  assert.equal(copies[0].turns.at(-1).text, "Overnight there were two releases");
+  await page.setVisibility("visible");
+  // Stored at its end: the copy goes.
+  turnDone(socket, 1);
+  assert.deepEqual(unsettledCopies(page), {}, "a stored turn's copy was left behind");
+});
+
+test("`#330 voice-long-turn-drop`: the next opening files what a page that did not come back was saying, marked cut off, before it reads the record", async () => {
+  const store = new Map();
+  const killed = newPage(store);
+  killed.setClock(1_700_000_000_000);
+  const socket = await startNeutralCall(killed);
+  speech(socket, "user", 1, "summarize overnight", true);
+  speech(socket, "assistant", 1, "Overnight there were two releases and", false);
+  killed.expireTimers(sourceConstant("UNSETTLED_SAVE_MS"));
+  const [held] = Object.values(unsettledCopies(killed));
+  assert.ok(held, "nothing was written down");
+  // The app is killed here: no turn_complete, no teardown. A fresh page opens.
+  const fresh = newPage(store);
+  fresh.setClock(1_700_000_000_000 + sourceConstant("UNSETTLED_ABANDONED_MS") + 1000);
+  await signIn(fresh);
+  await fresh.settle();
+  await fresh.settle();
+  assert.deepEqual((fresh.storedTurns.get(held.conversation) || []).map((t) => `${t.speaker}: ${t.text}`), [
+    "you: summarize overnight (cut off — the app closed before this turn ended)",
+    "agent: Overnight there were two releases and (cut off — the app closed before this turn ended)",
+  ]);
+  assert.deepEqual(unsettledCopies(fresh), {}, "the filed copy was left to be filed again");
+  assert.match(fresh.el("transcript").text(), /two releases and \(cut off — the app closed/, "the record read after it does not show it");
+});
+
+test("`#330 voice-long-turn-drop`: a copy a server with no store would refuse at every opening is let go, and the details say so", async () => {
+  const run = async (script) => {
+    const store = new Map();
+    const killed = newPage(store, script);
+    killed.setClock(1_700_000_000_000);
+    const socket = await startNeutralCall(killed);
+    speech(socket, "assistant", 1, "Overnight there were two releases and", false);
+    killed.expireTimers(sourceConstant("UNSETTLED_SAVE_MS"));
+    assert.equal(Object.keys(unsettledCopies(killed)).length, 1, "nothing was written down");
+    const fresh = newPage(store, script);
+    fresh.setClock(1_700_000_000_000 + sourceConstant("UNSETTLED_ABANDONED_MS") + 1000);
+    fresh.storeStatus = 503;
+    await signIn(fresh);
+    await fresh.settle();
+    await fresh.settle();
+    return fresh;
+  };
+  const fresh = await run(SCRIPT);
+  assert.deepEqual(unsettledCopies(fresh), {}, "a copy no opening can file was kept, to be refused at every one");
+  assert.match(fresh.el("settings-detail").textContent, /could not be filed: HTTP 503 storage_not_configured/);
+  // The negative control: the page that put every failure back keeps the copy for ever.
+  const control = await run(brokenScript("  if (error.code === \"storage_not_configured\") return false;\n", ""));
+  assert.equal(Object.keys(unsettledCopies(control)).length, 1);
+});
+
+test("`#330 voice-long-turn-drop`: a copy another live page is still writing is not filed", async () => {
+  const store = new Map();
+  const live = newPage(store);
+  live.setClock(1_700_000_000_000);
+  const socket = await startNeutralCall(live);
+  speech(socket, "assistant", 1, "Still talking", false);
+  live.expireTimers(sourceConstant("UNSETTLED_SAVE_MS"));
+  const other = newPage(store);
+  other.setClock(1_700_000_000_000 + 2000);
+  await signIn(other);
+  await other.settle();
+  assert.equal(Object.keys(unsettledCopies(other)).length, 1, "another page's live copy was taken");
+  assert.deepEqual([...other.storedTurns.values()].flat().filter((t) => /app closed/.test(t.text)), []);
+});
+
+test("`#330 voice-long-turn-drop`: the call-end record says what decides who ended it, for the hosted protocol too", async () => {
+  // The neutral protocol: the service closed mid-answer, just after the page closed a segment.
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  page.expireTimers(CAPTURE_RESUME_MS);
+  page.setClock(page.clock() + 10_000);
+  await compose(page, "and the build?");
+  await page.el("send-text").click();
+  page.setClock(page.clock() + 1_500);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  page.setClock(page.clock() + 500);
+  socket.onclose({ code: 1011, reason: "interrupt boundary timed out;\nreconnect" });
+  await page.settle();
+  const [end] = page.endPosts;
+  assert.equal(end.ended_by, "server_closed");
+  assert.equal(end.close_code, 1011);
+  assert.equal(end.close_reason, "interrupt boundary timed out; reconnect", "the reason must be one line");
+  assert.equal(end.last_audio_end_ms, 2_000);
+  assert.equal(end.visibility, "visible");
+  assert.ok(end.queued_audio_ms > 0, `the answer still queued to play was not recorded: ${JSON.stringify(end)}`);
+  assert.ok(!("last_text_ms" in end), "no prompt went, so none can be recorded");
+  // The hosted protocol: recorded now too, with the reason and the last text turn.
+  const hosted = newPage();
+  const hostedSocket = await startTalking(hosted);
+  hosted.setClock(hosted.clock() + 30_000);
+  await compose(hosted, "anything new?");
+  await hosted.el("send-text").click();
+  hosted.setClock(hosted.clock() + 4_000);
+  await hosted.setVisibility("hidden");
+  hostedSocket.onclose({ code: 1006, reason: "" });
+  await hosted.settle();
+  assert.equal(hosted.endPosts.length, 1, "a call on the hosted protocol left no call-end record");
+  assert.equal(hosted.endPosts[0].protocol, "elevenlabs");
+  assert.equal(hosted.endPosts[0].last_text_ms, 4_000);
+  assert.equal(hosted.endPosts[0].visibility, "hidden");
+  assert.ok(!("close_reason" in hosted.endPosts[0]), "an empty reason was recorded as one");
+});
+
+test("`#330 voice-long-turn-drop`: on the hosted protocol a relayed message waits for the agent's audio to finish playing", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+  await setReadNew(page, "gist");
+  // The agent is speaking: two seconds of its audio are queued.
+  for (let i = 0; i < 2; i += 1) {
+    socket.onmessage({ data: JSON.stringify({ type: "audio", audio_event: { audio_base_64: "AAAA".repeat(8000) } }) });
+  }
+  await deliver(page, stream, sseMessage(message({ id: "3301", content: "the tag is cut" })));
+  await passTime(page, RELAY_COALESCE_MS + 500);
+  assert.deepEqual(relayed(page), [], "a relayed message was sent into the agent's playing answer");
+  await passTime(page, 5000);
+  assert.equal(relayed(page).length, 1, "the message was never relayed after the answer had played");
 });
