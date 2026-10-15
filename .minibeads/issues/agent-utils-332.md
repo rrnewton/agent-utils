@@ -1,12 +1,13 @@
 ---
 title: 'settings-voice-agent-section: group Resuming, Live messages and full-message reading under Voice agent; help links instead of prose'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.621642997+00:00
-updated_at: 2026-10-15T15:52:38.621642997+00:00
+updated_at: 2026-10-15T16:29:03.323831773+00:00
+closed_at: 2026-10-15T16:29:03.323831613+00:00
 ---
 
 # Description
