@@ -26063,6 +26063,9 @@ function channelRowFrame(messages) {
 //   * A LIVE COPY NEVER WIPES THEM. The stream's copy of a message carries no reactions and can land
 //     after the read that brought them, so `foldLiveMessage` keeps the held ones.
 //   * NOT SEARCHED AND NOT READ ALOUD. A search for "eyes" is not a search for 👀.
+//   * THE OWNER'S OWN IS MARKED. `#312 slack-reactions`. Where the provider says the owner is among
+//     those who reacted (`owner_reacted`, which Slack reports), the chip is drawn in the accent, as
+//     Slack draws your own, and says so to a screen reader. Still a label: nothing here reacts.
 
 /** Two tallies of one emoji share this: a custom emoji is known by its id, a standard one by itself. */
 const reactionKey = (reaction) =>
@@ -26070,7 +26073,8 @@ const reactionKey = (reaction) =>
 
 /**
  * A row's reactions: one tally per emoji, in the order first seen, counted over every message the
- * row stands for. Empty when none has any, whether its source reported none or cannot see them.
+ * row stands for, and the owner's when the owner reacted with it to any of them. Empty when none
+ * has any, whether its source reported none or cannot see them.
  */
 function rowReactions(messages) {
   const tallies = new Map();
@@ -26079,9 +26083,12 @@ function rowReactions(messages) {
       const count = reaction ? Number(reaction.count) : 0;
       if (!reaction || typeof reaction.emoji !== "string" || reaction.emoji === "" || !(count > 0)) continue;
       const key = reactionKey(reaction);
+      const own = reaction.owner_reacted === true;
       const held = tallies.get(key);
-      if (held) held.count += count;
-      else tallies.set(key, { emoji: reaction.emoji, custom: reaction.custom === true, count });
+      if (held) {
+        held.count += count;
+        held.own = held.own || own;
+      } else tallies.set(key, { emoji: reaction.emoji, custom: reaction.custom === true, count, own });
     }
   }
   return [...tallies.values()];
@@ -26091,7 +26098,8 @@ function rowReactions(messages) {
 const reactionText = (tally) => (tally.custom ? `:${tally.emoji}:` : tally.emoji);
 
 /** A stable account of a message's reactions, for the lists that redraw only when a row changed. */
-const reactionsDrawn = (message) => rowReactions([message]).map((tally) => [reactionText(tally), tally.count]);
+const reactionsDrawn = (message) =>
+  rowReactions([message]).map((tally) => [reactionText(tally), tally.count, tally.own]);
 
 /**
  * The strip of chips under a row's text, or null when the row has no reactions. `textContent`
@@ -26106,7 +26114,8 @@ function reactionStrip(messages) {
   strip.setAttribute("aria-label", "Reactions");
   for (const tally of tallies) {
     const chip = document.createElement("span");
-    chip.className = tally.custom ? "reaction reaction-custom" : "reaction";
+    chip.className = ["reaction", tally.custom ? "reaction-custom" : "", tally.own ? "reaction-own" : ""]
+      .filter(Boolean).join(" ");
     const emoji = document.createElement("span");
     emoji.className = "reaction-emoji";
     emoji.textContent = reactionText(tally);
@@ -26114,6 +26123,14 @@ function reactionStrip(messages) {
     count.className = "reaction-count";
     count.textContent = String(tally.count);
     chip.append(emoji, count);
+    if (tally.own) {
+      // Said, not only coloured: the accent alone tells a screen reader nothing.
+      chip.title = "You reacted";
+      const mine = document.createElement("span");
+      mine.className = "sr-only";
+      mine.textContent = "including you";
+      chip.append(mine);
+    }
     strip.append(chip);
   }
   return strip;

@@ -526,7 +526,9 @@ impl HttpSlackClient {
 
     /// Convert raw Slack messages into [`Message`]s for `channel`, resolving author names.
     ///
-    /// Order is preserved. A message with no author of any kind is omitted, with a warning.
+    /// Order is preserved. A message with no author of any kind is omitted, with a warning. Every
+    /// read of a message passes through here, so each carries the reactions Slack reported on it,
+    /// marked where the owner is among those who reacted (`#312 slack-reactions`).
     pub(super) async fn messages(&self, channel: &ChannelId, raws: &[Raw]) -> Vec<Message> {
         let mut wanted: Vec<&str> = raws.iter().filter_map(Raw::lookup_needed).collect();
         wanted.sort_unstable();
@@ -543,7 +545,7 @@ impl HttpSlackClient {
             .collect();
         raws.iter()
             .filter_map(|raw| {
-                let message = raw.to_message(channel, &resolved);
+                let message = raw.to_message(channel, &resolved, self.owner_user_id.as_deref());
                 if message.is_none() {
                     tracing::warn!(ts = %raw.ts, "omitting a Slack message with no author");
                 }
@@ -672,11 +674,12 @@ impl Raw {
         self.str_field("user")
     }
 
-    /// Map onto the server's [`Message`] for `channel`.
+    /// Map onto the server's [`Message`] for `channel`, for an owner whose Slack id is `owner`.
     pub fn to_message(
         &self,
         channel: &ChannelId,
         resolved: &HashMap<String, (String, bool)>,
+        owner: Option<&str>,
     ) -> Option<Message> {
         let id = ids::micros_message_id(self.micros)?;
         let author_id = self.author_id()?.to_owned();
@@ -720,7 +723,10 @@ impl Raw {
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,
-            reactions: None,
+            // Absent stays absent: Slack omits the field on a message nobody reacted to, and a
+            // bridge that cannot supply reactions omits it on every message. `#312
+            // slack-reactions`; see `super::reactions`.
+            reactions: super::reactions::parse(self.value.get("reactions"), owner),
             heading: None,
         })
     }

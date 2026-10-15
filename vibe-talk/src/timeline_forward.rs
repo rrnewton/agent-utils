@@ -231,7 +231,9 @@ impl Entry for Message {
     // A message changes when its reactions do (`#219 emoji-reactions`): the same message with
     // other tallies is new, so a reaction inside the overlap reaches the page with the next delta.
     // That is when a delivery acknowledgement arrives, seconds after the message it acknowledges.
-    // A copy that cannot see reactions keys by its id alone, as every message did before.
+    // A copy that cannot see reactions keys by its id alone, as every message did before. The
+    // owner's own reaction is part of the tally (`#312 slack-reactions`): the owner taking one
+    // back as somebody else adds it leaves the count alone and changes the chip.
     fn key(&self) -> String {
         let Some(reactions) = &self.reactions else {
             return self.id.0.clone();
@@ -239,10 +241,11 @@ impl Entry for Message {
         let mut key = format!("{}#", self.id.0);
         for reaction in reactions {
             key.push_str(&format!(
-                "{}\u{1f}{}\u{1f}{}\u{1e}",
+                "{}\u{1f}{}\u{1f}{}{}\u{1e}",
                 reaction.custom_id.as_deref().unwrap_or(""),
                 reaction.emoji,
-                reaction.count
+                reaction.count,
+                if reaction.owner_reacted { "+" } else { "" }
             ));
         }
         key
@@ -995,6 +998,7 @@ mod tests {
                         custom: false,
                         custom_id: None,
                         count: *count,
+                        owner_reacted: false,
                     })
                     .collect(),
             ),
@@ -1047,5 +1051,16 @@ mod tests {
             reacted("1", "2026-10-04T07:00:00Z", &[("👀", 1)]).key(),
             reacted("1", "2026-10-04T07:00:00Z", &[("👀", 2)]).key()
         );
+    }
+
+    #[test]
+    fn the_owners_own_reaction_is_part_of_the_tally() {
+        // `#312 slack-reactions`. The owner taking a 👀 back as somebody else adds one leaves the
+        // count where it was, and the chip still changes.
+        let theirs = reacted("1", "2026-10-04T07:00:00Z", &[("👀", 1)]);
+        let mut owners = theirs.clone();
+        owners.reactions.as_mut().expect("reactions")[0].owner_reacted = true;
+        assert_ne!(theirs.key(), owners.key());
+        assert_eq!(theirs.key(), theirs.clone().key(), "a key is stable");
     }
 }

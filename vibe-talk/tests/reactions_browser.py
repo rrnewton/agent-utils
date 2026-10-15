@@ -9,15 +9,17 @@ when; this proves what only a layout engine can: where it lands, at a phone's wi
 It serves the checked-out assets and a small fake API from one loopback origin, signs in, opens a
 channel holding the owner's acknowledged message (👀 1, ✅ 1), the agent's message with the same
 two, a long folded message with eight reactions — one a custom emoji with a 32-character name —
-a post combined from two messages, and a thread root with a reply. At 412x915 and 360x800 Android
-viewports and a 1280x800 desk, in the dark scheme and the light one, with each strip brought to
-the middle of the list in turn:
+a post combined from two messages, and a thread root with a reply. Three of the chips are the
+owner's own (`#312 slack-reactions`: Slack says who reacted), one of them on the owner's own blue
+row. At 412x915 and 360x800 Android viewports and a 1280x800 desk, in the dark scheme and the light
+one, with each strip brought to the middle of the list in turn:
 
   every strip is drawn, below its row's author line and under its text, wholly inside its row
   and the screen; no chip overlaps any of the row's buttons or links, and a hit test at each
   chip's centre lands on the chip; the thread root's reply count is below its strip; nothing on
-  the page scrolls sideways; and on a row drawn at full strength each chip's count reads at 4.5:1
-  or better against what is behind it, in both schemes.
+  the page scrolls sideways; on a row drawn at full strength each chip's count reads at 4.5:1
+  or better against what is behind it, in both schemes, the owner's own included; and each of the
+  owner's chips is outlined in another colour than the chips beside it.
 
 Pass --screenshots DIR to keep a PNG of each size and scheme for review.
 """
@@ -79,10 +81,11 @@ LONG = ("The overnight run finished: every shard passed, the artifact upload com
         "retry, and the release lane is green. ") * 3
 MESSAGES: list[Json] = [
     message(0, "Is the release lane green yet?", "human"),
-    message(1, "Please deploy the release branch once the lane is green.", "me", ACKNOWLEDGED),
+    message(1, "Please deploy the release branch once the lane is green.", "me",
+            [{"emoji": "👀", "count": 1, "owner_reacted": True}, {"emoji": "✅", "count": 1}]),
     message(2, "Deploying the release branch now.", "coder", ACKNOWLEDGED),
     message(3, LONG, "coder", [
-        {"emoji": "👍", "count": 3}, {"emoji": "🎉", "count": 1},
+        {"emoji": "👍", "count": 3, "owner_reacted": True}, {"emoji": "🎉", "count": 1},
         {"emoji": "ship-it-and-go-home-early-today", "custom": True, "custom_id": "112233", "count": 2},
         {"emoji": "👀", "count": 1}, {"emoji": "✅", "count": 1}, {"emoji": "🚀", "count": 12},
         {"emoji": "❤️", "count": 1}, {"emoji": "😄", "count": 1},
@@ -90,7 +93,8 @@ MESSAGES: list[Json] = [
     # One post, sent as two messages two seconds apart: one row, the tallies summed.
     message(4, "Thanks. Once it is out, please post", "me", ACKNOWLEDGED),
     message(4, "the release notes in the channel.", "me", [{"emoji": "👀", "count": 1}], seconds=2),
-    message(6, "Release notes thread.", "coder", [{"emoji": "👍", "count": 2}], thread=ROOT),
+    message(6, "Release notes thread.", "coder", [{"emoji": "👍", "count": 2, "owner_reacted": True}],
+            thread=ROOT),
     message(7, "Notes: three fixes and one new flag.", "coder", thread={**ROOT, "is_root": False}),
 ]
 # The combined post's second half needs an id of its own.
@@ -280,6 +284,12 @@ STRIPS_JS = """async () => {
         }
         const strength = getComputedStyle(row).opacity === '1' && getComputedStyle(row).filter === 'none';
         const chips = [...strip.querySelectorAll(':scope > .reaction')];
+        // `#312 slack-reactions`: the owner's own chip is told apart by its outline, not by its text.
+        const outline = (chip) => getComputedStyle(chip).borderTopColor;
+        const theirs = chips.filter((chip) => !chip.classList.contains('reaction-own')).map(outline);
+        for (const chip of chips.filter((chip) => chip.classList.contains('reaction-own'))) {
+            if (theirs.includes(outline(chip))) problems.push(`${id}: the owner's "${chip.textContent}" looks like the rest`);
+        }
         for (const chip of chips) {
             const c = chip.getBoundingClientRect();
             const name = chip.textContent;
@@ -317,12 +327,13 @@ STRIPS_JS = """async () => {
 }"""
 
 PROFILES = (("phone", 412, 915, True), ("phone-360", 360, 800, True), ("desktop", 1280, 800, False))
+# A chip's text: the emoji, the count, and for the owner's own, what a screen reader is told.
 EXPECTED = [
-    "201: 👀1 ✅1",
+    "201: 👀1including you ✅1",
     "202: 👀1 ✅1",
-    "203: 👍3 🎉1 :ship-it-and-go-home-early-today:2 👀1 ✅1 🚀12 ❤️1 😄1",
+    "203: 👍3including you 🎉1 :ship-it-and-go-home-early-today:2 👀1 ✅1 🚀12 ❤️1 😄1",
     "204: 👀2 ✅1",
-    "206: 👍2",
+    "206: 👍2including you",
 ]
 
 

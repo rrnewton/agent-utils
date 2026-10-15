@@ -947,6 +947,8 @@ pub fn parse_reactions(value: Option<&serde_json::Value>) -> Option<Vec<Reaction
                 custom,
                 custom_id: id.map(bounded),
                 count: u32::try_from(count).unwrap_or(u32::MAX),
+                // Discord's `me` is the token's own account, which need not be the owner's.
+                owner_reacted: false,
             })
         })
         .take(MAX_REACTIONS)

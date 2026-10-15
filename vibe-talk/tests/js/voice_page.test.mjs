@@ -40691,6 +40691,51 @@ test("a custom emoji is shown as its name between colons, as text, and two of on
   assert.ok(!page.createdTags.includes("img"), "an emoji's name became markup, or its image was fetched");
 });
 
+test("a reaction the owner is among is drawn as theirs, and says so to a screen reader", async () => {
+  // `#312 slack-reactions`. Slack says who reacted, and the server marks the tallies the owner is
+  // among. The chip is the owner's in the accent, still a label, and counted as before.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ id: "100", content: "please deploy", reactions: [
+    { emoji: "👀", count: 2, owner_reacted: true },
+    { emoji: "✅", count: 1 },
+    { emoji: "party-parrot", custom: true, count: 1, owner_reacted: true },
+  ] })]);
+  const chips = reactionStripOf(rows[0]).children;
+  assert.deepStrictEqual(chips.map((chip) => chip.className),
+    ["reaction reaction-own", "reaction", "reaction reaction-custom reaction-own"]);
+  assert.deepStrictEqual(chipsOf(rows[0]), ["👀 2 including you", "✅ 1", ":party-parrot: 1 including you"]);
+  const said = chips[0].children[2];
+  assert.equal(said.className, "sr-only", "the owner's reaction is shown only by its colour");
+  assert.equal(chips[0].title, "You reacted");
+  assert.equal(chips[1].title || "", "", "somebody else's reaction says it is the owner's");
+  for (const node of reactionStripOf(rows[0]).descendants()) {
+    assert.ok(!["button", "a", "input"].includes(node.tagName), `the strip holds a ${node.tagName}`);
+  }
+});
+
+test("a combined row's chip is the owner's when the owner reacted to any of its messages", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, splitPost(
+    { reactions: [{ emoji: "👀", count: 1 }] },
+    { reactions: [{ emoji: "👀", count: 1, owner_reacted: true }] }
+  ));
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  assert.deepStrictEqual(chipsOf(rows[0]), ["👀 2 including you"]);
+  assert.ok(reactionStripOf(rows[0]).children[0].hasClass("reaction-own"));
+});
+
+test("the owner's own chip is outlined in the accent and still has no hover", () => {
+  const own = cssBlock(".reaction-own");
+  assert.match(own, /border-color: var\(--accent\)/);
+  assert.match(own, /background: color-mix\(in srgb, var\(--accent\) 16%, transparent\)/);
+  assert.match(cssBlock(".reaction-own .reaction-count"), /color: var\(--ink\)/,
+    "the owner's count is muted, or in the accent, which reads below 4.5:1 on the agent's dark rows");
+  assert.doesNotMatch(own, /cursor: pointer/);
+  assert.doesNotMatch(CSS_CODE, /\.reaction[\w-]*:hover/);
+});
+
 test("a combined row shows one strip, each emoji counted over all of its messages", async () => {
   const page = newPage();
   await signIn(page);

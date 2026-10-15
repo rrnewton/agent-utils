@@ -33,6 +33,14 @@
 //! [`ids`]. A whole conversation's channel id is its Slack id, and a channel narrowed to one
 //! thread is `"{conversation}~{thread_ts}"`. Thread ids in the thread APIs are root `ts` values.
 //!
+//! # Reactions
+//!
+//! Each message's reactions come with it, in the same `conversations.history` and
+//! `conversations.replies` answers, so reading them costs no call (`#312 slack-reactions`,
+//! `slack/reactions.rs`): a standard short name is shown as its emoji, any other as a custom
+//! emoji's name, with the count and whether the owner's own `owner_user_id` is among those who
+//! reacted. A message Slack lists without them is "not reported". Nothing here adds or removes one.
+//!
 //! # What it does not do
 //!
 //! There is no Events API or Socket Mode connection: new messages arrive through the server's
@@ -55,6 +63,7 @@ mod live;
 mod lookup;
 pub mod mrkdwn;
 mod range;
+mod reactions;
 mod threads;
 mod timeline;
 

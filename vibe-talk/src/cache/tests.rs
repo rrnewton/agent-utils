@@ -800,6 +800,7 @@ fn a_copy_that_cannot_see_reactions_never_erases_held_ones() {
             custom: false,
             custom_id: None,
             count: 2,
+            owner_reacted: false,
         }]),
         ..m(1)
     };
@@ -832,6 +833,7 @@ fn a_message_reads_back_exactly_as_the_client_produced_it_minus_derived_fields()
         custom: true,
         custom_id: Some("E1".to_owned()),
         count: 1,
+        owner_reacted: true,
     }]);
     let mut decorated = original.clone();
     decorated.spoken_time = "09:51".to_owned();

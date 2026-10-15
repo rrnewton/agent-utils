@@ -3705,6 +3705,19 @@ a.search-hit-link {
   font-variant-numeric: tabular-nums;
 }
 
+/* `#312 slack-reactions`. A tally the owner is among: outlined and tinted in the accent, as Slack
+   draws your own reaction, and still a label, with no hover and no pointer. Its count is in the
+   text's own ink rather than muted, which reads at 4.5:1 on every speaker's tint in both schemes;
+   the accent itself does not, on the agent's rows in the dark one. */
+.reaction-own {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.reaction-own .reaction-count {
+  color: var(--ink);
+}
+
 /* The rescue is offered only on a noise row; `renderChannelRows` sets `hidden`, and a class rule
    for the button's display must not overrule it. */
 .not-noise-button[hidden] {

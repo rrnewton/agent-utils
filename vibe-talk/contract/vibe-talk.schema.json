@@ -582,7 +582,7 @@
           "type": "boolean"
         },
         "reactions": {
-          "description": "The emoji people reacted to this message with, and how many of each. `#219\nemoji-reactions`.\n\nABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that\ncannot see reactions: a provider that does not report them, or a live echo of a message,\nwhich carries none. Empty means the source looked and there are none. So a live copy\nwithout reactions never overwrites a held copy that has them — the echo of a message\narrives after the read that brought its acknowledgements — while a read replaces them, as\nit replaces the rest of the message. Discord omits the array when there are none, so on\nthat provider absent from a read means none.\n\nCounts only, never who reacted: that is a separate question for each emoji, and asking it\nwould hand this server identities it has no use for. UNTRUSTED: a custom emoji's name is\nwritten by whoever made it.",
+          "description": "The emoji people reacted to this message with, and how many of each. `#219\nemoji-reactions`.\n\nABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that\ncannot see reactions: a provider that does not report them, or a live echo of a message,\nwhich carries none. Empty means the source looked and there are none. So a live copy\nwithout reactions never overwrites a held copy that has them — the echo of a message\narrives after the read that brought its acknowledgements — while a read replaces them, as\nit replaces the rest of the message. Discord omits the array when there are none, so on\nthat provider absent from a read means none. Slack omits it too, and so does a Slack bridge\nthat cannot supply reactions, so there it stays \"not reported\" (`#312 slack-reactions`).\n\nCounts, and whether the owner is among those who reacted, never who else did: that is a\nseparate question for each emoji, and asking it would hand this server identities it has\nno use for. UNTRUSTED: a custom emoji's name is written by whoever made it.",
           "items": {
             "$ref": "#/$defs/Reaction"
           },
@@ -1165,6 +1165,10 @@
         "emoji": {
           "description": "What to show: the emoji itself for a standard one (\"👀\"), or a custom emoji's name without\ncolons (\"party-parrot\"), which is all of it a page can draw without fetching an image.\nUNTRUSTED, and never empty.",
           "type": "string"
+        },
+        "owner_reacted": {
+          "description": "Whether the owner is among those who reacted with it. `#312 slack-reactions`.\n\nTrue only when the provider listed the owner's own account among them, which takes a\nprovider that says who reacted and a deployment that names the owner's account there\n(`owner_user_id`). False is therefore \"not known to be the owner's\", never \"somebody\nelse's\": a provider that reports counts alone, or cuts its list of who reacted short,\nleaves it false. Absent on the wire means false, which is also what an older server meant.",
+          "type": "boolean"
         }
       },
       "required": [

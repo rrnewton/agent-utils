@@ -321,10 +321,13 @@ Known limits of the counts (`#222 unread-replies`):
 **Reactions show under each message.** Where the chat service reports them, a message's emoji
 reactions appear as a row of small chips under its text, each the emoji and how many reacted with it
 — a chat bridge's 👀 when it has a message and ✅ once the message reached the agent, for example.
-They are read-only: who reacted is not shown, and nothing here reacts. A custom emoji shows its name
-between colons. A post combined from several messages shows one row of chips, each emoji counted
-over all of them. Reactions reach the page with the next read, so they can trail the message by a
-refresh. Discord and a compatible bridge report them; the Slack backend does not yet.
+They are read-only: who else reacted is not shown, and nothing here reacts. A custom emoji shows its
+name between colons. Where the service says who reacted, a chip you are among is outlined in the
+accent colour, as Slack draws your own; Slack does, once `owner_user_id` names your account. A post
+combined from several messages shows one row of chips, each emoji counted over all of them, and
+yours if you reacted to any of them. Reactions reach the page with the next read, so they can trail
+the message by a refresh. Discord, Slack and a compatible bridge report them; see
+[Slack](#slack) for what the Slack backend reads.
 
 **An agent's own heading moves into the header.** Agents posting through one shared account often
 open a message with who they are, a title and a time — `[build-bot coordinator] Backup check, 10:52
@@ -1159,6 +1162,33 @@ escaped, as `@everyone` is suppressed on Discord.
 **What is shown.** Joins, leaves, topic changes and other system events are left out; ordinary,
 bot, file-share, `/me` and thread-broadcast messages are kept. Slack's link, channel and
 group-mention markup is rewritten into the markdown the rest of the app reads.
+
+**Reactions.** `#312 slack-reactions`. Slack lists each message's reactions on every read of it,
+as `reactions: [{name, count, users}]`, and the app shows them under the message in every view,
+replies included, and on the messages and replies the live poll delivers. No scope beyond the
+`*:history` ones above is needed.
+
+* A **standard emoji** is shown as itself: Slack names a reaction by the emoji's short name —
+  `+1`, `eyes`, `white_check_mark`, `+1::skin-tone-2` — and the server knows Slack's names, skin
+  tones included, from the table its emoji picker uses (iamcal's emoji-data, 16.0.0; regenerated
+  with `scripts/slack_emoji_names.py`). Any **other name** is a workspace's custom emoji, and shows
+  as `:name:`, because drawing its image would mean fetching it from Slack.
+* **Yours are marked** when `owner_user_id` is set and Slack lists that id among the reaction's
+  `users`. Slack can cut that list short on a message many reacted to; a chip is then marked only
+  if your id is among those it listed.
+* **A missing `reactions` field is "not reported", not "none".** Slack leaves the field off a
+  message nobody reacted to, and a bridge that cannot supply reactions leaves it off every message,
+  and the two look the same. Such a message shows no chips, as before, and a copy of it that
+  arrives on the live stream does not take away chips a read brought. A read is taken as it comes,
+  so a message whose last reaction was removed in Slack shows none from its next read.
+* **When they show.** A reaction reaches the page with the next read of its message: a refresh of
+  Main or All, or opening its thread. A reaction on a reply changes nothing on its thread's root,
+  so, like an edit to a reply, it shows at once in the thread but can take up to the fifteen
+  minutes described under [Limits](#limits) to show in All. The live poll delivers a new message or
+  reply with the reactions it already has; a reaction added afterwards comes with a read.
+
+A compatible bridge passes `reactions` through as Slack sends it. One that omits the field shows no
+reactions, exactly as before reactions were read.
 
 ### Limits
 
@@ -2236,9 +2266,15 @@ vibe-talk asked for (`send-confirm-thread`).
 
 A message wire object may carry Discord's `reactions` array, each entry
 `{"emoji": {"name": "👀", "id": null}, "count": 1}` — a custom emoji has an `id`, and its `name` is
-shown as text. vibe-talk reads only the name, id, and count. An absent array means the bridge cannot
-say; send `[]` for a message it knows has none. A message whose reactions changed is a changed
-message, in forward reads too (`#219 emoji-reactions`).
+shown as text. vibe-talk reads only the name, id, and count; Discord's `me` names the bridge's own
+account, which need not be the owner's, so no chip from it is marked as the owner's. An absent array
+means the bridge cannot say; send `[]` for a message it knows has none. A message whose reactions
+changed is a changed message, in forward reads too (`#219 emoji-reactions`).
+
+vibe-talk's own message objects, which the page reads, carry each tally as `{"emoji": "👀",
+"count": 2}`, with `"custom": true` (and a `custom_id`, where the provider has one) for a custom
+emoji's name, and `"owner_reacted": true` when the provider listed the owner among those who
+reacted (`#312 slack-reactions`). Absent `owner_reacted` means false.
 
 Timeline responses follow `src/threads.rs`: messages and thread summaries are oldest first,
 `has_more` pairs with `next_before`, and `has_threads` controls navigation. Message wire objects
@@ -7661,6 +7697,7 @@ tests/js/             the page's own suite, run from cargo test via tests/voice_
 scripts/verify-deployment.sh   the one-command deployment check, local or public
 scripts/smoke-agent.py         the manual, billed check that the AGENT really calls us
 scripts/screenshots.py         photographs the app in every state, so an agent can SEE the page
+scripts/slack_emoji_names.py   regenerates src/slack/emoji_names.tsv, Slack's standard emoji names
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
 

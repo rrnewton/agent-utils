@@ -107,12 +107,15 @@ fn threaded_message(id: &str) -> Message {
                 custom: false,
                 custom_id: None,
                 count: 1,
+                // `#312 slack-reactions`: the owner's own reaction, as Slack reports one.
+                owner_reacted: true,
             },
             Reaction {
                 emoji: "party-parrot".into(),
                 custom: true,
                 custom_id: Some("112233".into()),
                 count: 2,
+                owner_reacted: false,
             },
         ]),
         // `#242 rich-headers`: every piece here, none on the plain sample, and a tag alone on the

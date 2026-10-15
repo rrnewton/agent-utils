@@ -587,11 +587,12 @@ declare namespace VibeTalk {
      * without reactions never overwrites a held copy that has them — the echo of a message
      * arrives after the read that brought its acknowledgements — while a read replaces them, as
      * it replaces the rest of the message. Discord omits the array when there are none, so on
-     * that provider absent from a read means none.
+     * that provider absent from a read means none. Slack omits it too, and so does a Slack bridge
+     * that cannot supply reactions, so there it stays "not reported" (`#312 slack-reactions`).
      *
-     * Counts only, never who reacted: that is a separate question for each emoji, and asking it
-     * would hand this server identities it has no use for. UNTRUSTED: a custom emoji's name is
-     * written by whoever made it.
+     * Counts, and whether the owner is among those who reacted, never who else did: that is a
+     * separate question for each emoji, and asking it would hand this server identities it has
+     * no use for. UNTRUSTED: a custom emoji's name is written by whoever made it.
      */
     reactions?: Reaction[] | null;
     /**
@@ -1054,6 +1055,16 @@ declare namespace VibeTalk {
      * UNTRUSTED, and never empty.
      */
     emoji: string;
+    /**
+     * Whether the owner is among those who reacted with it. `#312 slack-reactions`.
+     *
+     * True only when the provider listed the owner's own account among them, which takes a
+     * provider that says who reacted and a deployment that names the owner's account there
+     * (`owner_user_id`). False is therefore "not known to be the owner's", never "somebody
+     * else's": a provider that reports counts alone, or cuts its list of who reacted short,
+     * leaves it false. Absent on the wire means false, which is also what an older server meant.
+     */
+    owner_reacted?: boolean;
   }
 
   /**

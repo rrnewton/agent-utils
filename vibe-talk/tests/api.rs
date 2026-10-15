@@ -518,6 +518,7 @@ async fn the_channel_page_carries_reactions_and_leaves_out_what_was_not_reported
         custom: false,
         custom_id: None,
         count: 1,
+        owner_reacted: false,
     };
     harness
         .discord

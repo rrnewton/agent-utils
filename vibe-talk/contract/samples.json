@@ -420,7 +420,8 @@
         "reactions": [
           {
             "count": 1,
-            "emoji": "👀"
+            "emoji": "👀",
+            "owner_reacted": true
           },
           {
             "count": 2,
@@ -482,7 +483,8 @@
       "reactions": [
         {
           "count": 1,
-          "emoji": "👀"
+          "emoji": "👀",
+          "owner_reacted": true
         },
         {
           "count": 2,
@@ -560,7 +562,8 @@
           "reactions": [
             {
               "count": 1,
-              "emoji": "👀"
+              "emoji": "👀",
+              "owner_reacted": true
             },
             {
               "count": 2,
@@ -829,7 +832,8 @@
           "reactions": [
             {
               "count": 1,
-              "emoji": "👀"
+              "emoji": "👀",
+              "owner_reacted": true
             },
             {
               "count": 2,
@@ -944,7 +948,8 @@
           "reactions": [
             {
               "count": 1,
-              "emoji": "👀"
+              "emoji": "👀",
+              "owner_reacted": true
             },
             {
               "count": 2,
@@ -1108,7 +1113,8 @@
           "reactions": [
             {
               "count": 1,
-              "emoji": "👀"
+              "emoji": "👀",
+              "owner_reacted": true
             },
             {
               "count": 2,

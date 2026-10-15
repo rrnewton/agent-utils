@@ -1052,6 +1052,7 @@ fn tally(emoji: &str, count: u32) -> Reaction {
         custom: false,
         custom_id: None,
         count,
+        owner_reacted: false,
     }
 }
 
@@ -1061,6 +1062,7 @@ fn custom_tally(name: &str, id: &str, count: u32) -> Reaction {
         custom: true,
         custom_id: Some(id.to_owned()),
         count,
+        owner_reacted: false,
     }
 }
 
