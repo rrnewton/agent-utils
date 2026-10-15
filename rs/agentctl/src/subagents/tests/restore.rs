@@ -778,3 +778,143 @@ fn after_a_restart_restore_holds_the_slot_of_each_running_boxed_agent() {
         format!("/opt/wrkslots --project-root {root} hold lane-slot --reason reboot: agent lane waits for agentctl restore")
     );
 }
+
+/// The watch's `slot-images` finding for one pass against `host`.
+fn slot_image_finding(fixture: &Fixture, host: &ScriptedHost) -> Value {
+    let findings = watch_once(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        host,
+        &RestoreConfig {
+            units: Vec::new(),
+            ..config(fixture, None)
+        },
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: false,
+            wrkslots: Some(PathBuf::from("/opt/wrkslots")),
+            state_dir: None,
+        },
+    );
+    findings
+        .into_iter()
+        .find(|row| row["check"] == "slot-images")
+        .expect("a slot-images finding")
+}
+
+#[test]
+fn watch_names_the_refusal_when_wrkslots_image_status_exits_nonzero() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "image status",
+        3,
+        "",
+        "REFUSED: cache glob's first path component must be literal so it cannot match source broadly\nREMEDY: start the glob with a literal directory name\nmore context nobody needs in one line\n",
+    );
+    let finding = slot_image_finding(&fixture, &host);
+    assert_eq!(finding["ok"], false);
+    let project = fixture.root.display();
+    assert_eq!(
+        finding["detail"],
+        format!(
+            "`/opt/wrkslots image status` exited 3 in {project}: REFUSED: cache glob's first path component must be literal so it cannot match source broadly / REMEDY: start the glob with a literal directory name; slot images were not checked or remounted"
+        ),
+        "{finding}"
+    );
+    assert_eq!(finding["repair"]["status"], 3);
+}
+
+#[test]
+fn watch_says_when_wrkslots_image_status_never_finished() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answers.borrow_mut().push((
+        "image status".to_owned(),
+        CommandOutcome {
+            status: None,
+            stdout: String::new(),
+            stderr: "/opt/wrkslots did not finish within 120s".to_owned(),
+        },
+    ));
+    let finding = slot_image_finding(&fixture, &host);
+    assert_eq!(finding["ok"], false);
+    let detail = finding["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(
+            "`/opt/wrkslots image status` did not finish (it could not start or timed out) in "
+        ),
+        "{detail}"
+    );
+    assert!(
+        detail.ends_with(
+            ": /opt/wrkslots did not finish within 120s; slot images were not checked or remounted"
+        ),
+        "{detail}"
+    );
+}
+
+#[test]
+fn watch_quotes_each_mount_warning_and_says_where_to_look() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "image status",
+        0,
+        "new slots: image\nwork/lane at /slots/lane (mounted)\n  slot  mounted=True\n",
+        "wrkslots: mounted work/early at /slots/early\nwrkslots: WARNING: slot image not mounted: work/lane: device busy\n",
+    );
+    let finding = slot_image_finding(&fixture, &host);
+    assert_eq!(finding["ok"], false);
+    let project = fixture.root.display();
+    assert_eq!(
+        finding["detail"],
+        format!(
+            "1 slot image warning(s) from `/opt/wrkslots image status`: work/lane: device busy; remounted 1 first: work/early at /slots/early; run `/opt/wrkslots image status` in {project} for details"
+        ),
+        "{finding}"
+    );
+}
+
+#[test]
+fn watch_says_no_image_backed_slots_rather_than_zero_remounted() {
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "image status",
+        0,
+        "new slots: worktree\nno image-backed slots\n",
+        "",
+    );
+    let finding = slot_image_finding(&fixture, &host);
+    assert_eq!(finding["ok"], true, "{finding}");
+    assert_eq!(finding["detail"], "no image-backed slots");
+    assert_eq!(finding["repair"]["image_backed"], 0);
+
+    host.answer(
+        "image status",
+        0,
+        "new slots: image\nwork/a at /slots/a (mounted)\n  slot  mounted=True\nwork/b at /slots/b (mounted)\n  state mounted=True\n",
+        "",
+    );
+    let finding = slot_image_finding(&fixture, &host);
+    assert_eq!(finding["ok"], true, "{finding}");
+    assert_eq!(
+        finding["detail"],
+        "all 2 image-backed slot(s) already mounted"
+    );
+
+    host.answer(
+        "image status",
+        0,
+        "",
+        "wrkslots: mounted work/a at /slots/a\n",
+    );
+    let finding = slot_image_finding(&fixture, &host);
+    assert_eq!(finding["ok"], true, "{finding}");
+    assert_eq!(
+        finding["detail"],
+        "remounted 1 slot image(s): work/a at /slots/a"
+    );
+}

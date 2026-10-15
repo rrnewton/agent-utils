@@ -464,14 +464,151 @@ fn remount_slot_images(host: &dyn Host, wrkslots: Option<&Path>, project: &Path)
         .filter(|line| line.contains("slot image not mounted"))
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let image_backed = if outcome.status == Some(0) {
+        image_backed_slots(&outcome.stdout).map_or(Value::Null, |count| json!(count))
+    } else {
+        Value::Null
+    };
     json!({
         "action": if outcome.status == Some(0) && warnings.is_empty() { "ran" } else { "failed" },
         "command": argv,
+        "project": project,
         "status": outcome.status,
+        "image_backed": image_backed,
         "mounted": mounted,
         "warnings": warnings,
         "detail": if outcome.status == Some(0) { Value::Null } else { json!(outcome.stderr.trim()) },
     })
+}
+
+/// How many image-backed slots `wrkslots image status` listed, when its output says.
+///
+/// The human format prints `no image-backed slots`, or one unindented
+/// `TYPE/NAME at LOCATION (PHASE)` line per slot with indented detail lines under it.
+fn image_backed_slots(stdout: &str) -> Option<usize> {
+    if stdout
+        .lines()
+        .any(|line| line.trim() == "no image-backed slots")
+    {
+        return Some(0);
+    }
+    let count = stdout
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter(|line| {
+            line.split_once(" at ")
+                .is_some_and(|(slot, _)| slot.contains('/'))
+                && line.trim_end().ends_with(')')
+        })
+        .count();
+    (count > 0).then_some(count)
+}
+
+/// The first two meaningful lines of a command's error output, for a one-line message.
+fn first_error_lines(stderr: &str) -> String {
+    const WIDTH: usize = 240;
+    let lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("wrkslots: mounted "))
+        .take(2)
+        .map(|line| {
+            if line.chars().count() > WIDTH {
+                format!("{}...", line.chars().take(WIDTH).collect::<String>())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "no error output".to_owned()
+    } else {
+        lines.join(" / ")
+    }
+}
+
+/// One self-explanatory line about a slot-image check: what ran, what it found, what to do.
+fn describe_slot_images(images: &Value) -> String {
+    let command = images["command"].as_array().map_or_else(
+        || "wrkslots image status".to_owned(),
+        |argv| {
+            argv.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+    );
+    let project = images["project"]
+        .as_str()
+        .unwrap_or("the project directory");
+    let mounted = images["mounted"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let warnings = images["warnings"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(|line| {
+                    line.split_once("slot image not mounted:")
+                        .map_or(line, |(_, rest)| rest)
+                        .trim()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let remounted = if mounted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; remounted {} first: {}",
+            mounted.len(),
+            mounted.join(", ")
+        )
+    };
+    match images["action"].as_str() {
+        Some("skipped") => format!(
+            "slot images not checked: {}",
+            images["reason"].as_str().unwrap_or("no reason recorded")
+        ),
+        Some("ran") => {
+            if !mounted.is_empty() {
+                format!(
+                    "remounted {} slot image(s): {}",
+                    mounted.len(),
+                    mounted.join(", ")
+                )
+            } else {
+                match images["image_backed"].as_u64() {
+                    Some(0) => "no image-backed slots".to_owned(),
+                    Some(count) => {
+                        format!("all {count} image-backed slot(s) already mounted")
+                    }
+                    None => "no slot image needed remounting".to_owned(),
+                }
+            }
+        }
+        _ => match images["status"].as_i64() {
+            Some(0) => format!(
+                "{} slot image warning(s) from `{command}`: {}{remounted}; run `{command}` in {project} for details",
+                warnings.len(),
+                if warnings.is_empty() {
+                    "no warning text".to_owned()
+                } else {
+                    warnings.join("; ")
+                }
+            ),
+            status => format!(
+                "`{command}` {} in {project}: {}{remounted}; slot images were not checked or remounted",
+                status.map_or_else(
+                    || "did not finish (it could not start or timed out)".to_owned(),
+                    |code| format!("exited {code}")
+                ),
+                first_error_lines(images["detail"].as_str().unwrap_or(""))
+            ),
+        },
+    }
 }
 
 fn wait_for_herdr<A: ManagedApi + ?Sized>(client: &A, host: &dyn Host, wait: Duration) -> Value {
@@ -870,8 +1007,6 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
         })
         .collect::<Vec<_>>();
     let images = &report["slot_images"];
-    let mounted = images["mounted"].as_array().map_or(0, Vec::len);
-    let warnings = images["warnings"].as_array().map_or(0, Vec::len);
     let registered = rows("also_registered")
         .iter()
         .map(|row| {
@@ -926,10 +1061,7 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
                 units.join("; ")
             }
         ),
-        format!(
-            "Slot images: {} {mounted} remounted, {warnings} not mounted.",
-            images["action"].as_str().unwrap_or("?")
-        ),
+        format!("Slot images: {}.", describe_slot_images(images)),
     ];
     if restarted {
         lines.push(
@@ -1340,14 +1472,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             "slot-images",
             "wrkslots",
             ok,
-            if ok {
-                format!(
-                    "{} remounted",
-                    images["mounted"].as_array().map_or(0, Vec::len)
-                )
-            } else {
-                format!("{}", images["warnings"])
-            },
+            describe_slot_images(&images),
             images,
         ));
     }
