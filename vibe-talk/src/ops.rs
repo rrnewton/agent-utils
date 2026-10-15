@@ -626,14 +626,20 @@ async fn message_by_id_for(
     // A thread this server was told of rather than one the caller chose: a read of it that finds
     // nothing there, or refuses the id for it, is the same answer the channel gave. The read above
     // was already shadowed for this ask, so this one is not counted again: what it finds is what
-    // that evaluation is compared with, the answer the request gives.
+    // that evaluation is compared with, the answer the request gives. A provider that looks
+    // messages up by id answers a reply missing from the thread as an unknown message: the same
+    // answer, so a deleted reply the cache would have served still counts as a row upstream no
+    // longer lists.
+    let absent = |error: &OpError| match error {
+        OpError::UnknownMessage => true,
+        OpError::Chat(error) => matches!(
+            error.cause(),
+            ChatError::Status { status: 404, .. } | ChatError::Refused(_)
+        ),
+        _ => false,
+    };
     match message_in_thread(state, caller, channel, message_id, limit, &thread, None).await {
-        Err(OpError::Chat(error))
-            if matches!(
-                error.cause(),
-                ChatError::Status { status: 404, .. } | ChatError::Refused(_)
-            ) =>
-        {
+        Err(error) if absent(&error) => {
             if let Some(held) = held {
                 held.nothing_more();
             }

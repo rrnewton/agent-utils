@@ -3841,3 +3841,83 @@ async fn an_adapters_pushed_slack_edit_without_an_edit_time_is_taken() {
         "the cache threw away an edit the adapter pushed"
     );
 }
+
+/// `#319 slack-reply-by-id`, the other way: a Slack reply the cache holds, its thread known, is
+/// deleted upstream. The lookup by id misses it in the channel, the read of the thread it was in
+/// misses it too, and the request answers that the message is unknown. The cache would have served
+/// the deleted reply: that is a difference, compared and counted as a row upstream no longer
+/// lists. (The review's probe
+/// `review_probe_a_deleted_reply_the_cache_would_serve_is_counted_as_extra`.)
+#[tokio::test]
+async fn a_deleted_reply_the_cache_would_serve_from_a_known_thread_is_counted_as_extra() {
+    let mut fixture = slack_fake::FakeState::default();
+    let mut list: Vec<Value> = (0..6)
+        .map(|n| {
+            slack_fake::profiled(
+                &slack_fake::ts(n * 60, 0),
+                "UADA00001",
+                "Ada",
+                &format!("message {n}"),
+            )
+        })
+        .collect();
+    let root = slack_fake::ts(60, 0);
+    slack_fake::thread(
+        &mut fixture,
+        SLACK_CH,
+        &mut list[1],
+        &[
+            (slack_fake::ts(70, 0), "an earlier reply".to_owned()),
+            (slack_fake::ts(290, 0), "a later reply".to_owned()),
+        ],
+    );
+    fixture.history.insert(SLACK_CH.to_owned(), list);
+    let fake = slack_fake::Fake::start(fixture, 20).await;
+    let dir = TempDir::new("cache-fill-known-thread-deleted");
+    let clock = ManualClock::at(slack_ms(3_600));
+    let state = slack_deployment(&fake, &dir, &clock).await;
+    let reply_ts = slack_fake::ts(70, 0);
+    let reply = slack_id(&reply_ts);
+    vibe_talk::ops::messages(&state, vibe_talk::auth::Scope::Write, SLACK_CH, Some(20))
+        .await
+        .expect("a window");
+    get(
+        &state,
+        &format!("/api/v1/channels/{SLACK_CH}/timeline?view=thread&thread_id={root}&limit=50"),
+    )
+    .await;
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(WAIT));
+    // The reply is deleted upstream.
+    fake.with(|s| {
+        s.replies
+            .get_mut(&(SLACK_CH.to_owned(), root.clone()))
+            .expect("thread")
+            .retain(|r| r["ts"] != serde_json::json!(reply_ts));
+    });
+    clock.advance(5 * 1_000);
+    let answered = vibe_talk::ops::message_by_id(
+        &state,
+        vibe_talk::auth::Scope::Read,
+        SLACK_CH,
+        reply.as_str(),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(answered, Err(vibe_talk::ops::OpError::UnknownMessage)),
+        "the reply is gone upstream: {:?}",
+        answered.map(|(_, m)| m.content)
+    );
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.asked, counted.would_serve),
+        (1, 1),
+        "the cache would have served it: {counted:?}"
+    );
+    assert_eq!(
+        (counted.compared, counted.extra_rows),
+        (1, 1),
+        "the deleted reply the cache would have served is a counted difference: {counted:?}"
+    );
+}
