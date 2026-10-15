@@ -60197,9 +60197,9 @@ test("`#208 persistent-cache`: a help entry hidden with its feature never holds 
 // unread counts — with no read.
 
 /** The line in `dismissMessages` that brings the views held into line, taken out for a negative control. */
-const DONE_FOLLOWS = ["  followDoneEverywhere(requested);\n  // Before the redraw", "  // Before the redraw"];
+const DONE_FOLLOWS = ["  followDoneEverywhere(requested, column);\n  // Before the redraw", "  // Before the redraw"];
 /** ...the same in `restoreMessages`. */
-const UNDO_FOLLOWS = ["  followDoneEverywhere(restored);\n  if (lastDismissal", "  if (lastDismissal"];
+const UNDO_FOLLOWS = ["  followDoneEverywhere(restored, column);\n  if (lastDismissal", "  if (lastDismissal"];
 /** The check that draws a held view's rows again as it is shown, where they say otherwise than its copy. */
 const HELD_REDRAWS = ["if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();",
   "if (held.readMode !== readMode) renderCachedTimeline();"];
@@ -60309,10 +60309,10 @@ test("`#306 done-stale-across-views`: a Done or an Undo the server refuses is ta
   assert.equal(doneDrawn(await run("dismiss"), "201"), "false", "a Done the server refused shows in All as made");
   assert.equal(doneDrawn(await run("restore"), "201"), "true", "an Undo the server refused shows in All as made");
   // THE CONTROLS: without the failure taken back in the views held, each shows in All as made.
-  const done = await run("dismiss", brokenScript("    followDoneEverywhere(requested);\n    renderTodoControls();",
+  const done = await run("dismiss", brokenScript("    followDoneEverywhere(requested, column);\n    renderTodoControls();",
     "    renderTodoControls();"));
   assert.equal(doneDrawn(done, "201"), "true", "without the take-back reaching the views held the refused Done did not show, so this test cannot see it");
-  const undo = await run("restore", brokenScript("    followDoneEverywhere(restored);\n    renderTodoControls();",
+  const undo = await run("restore", brokenScript("    followDoneEverywhere(restored, column);\n    renderTodoControls();",
     "    renderTodoControls();"));
   assert.equal(doneDrawn(undo, "201"), "false", "without the take-back reaching the views held the refused Undo did not show, so this test cannot see it");
 });
@@ -60392,6 +60392,176 @@ test("`#306 done-stale-across-views`: a thread's card on the right counts an Und
   // THE CONTROL: without the cards drawn again after the Undo, the card says nothing unread.
   const control = await run(brokenScript("    });\n  }\n  if (sideColumnUp()) renderSideColumn();\n}", "    });\n  }\n}"));
   assert.equal(listCardSays(control.page, one).count, "1 reply", "without the cards drawn again the card counted the Undo, so this test cannot see it");
+});
+
+// A Done or an Undo made in the right column reaches the left one through `mirrorArchived`, which works
+// only while the right column shows a thread. Found in the third review round of #306: with the right
+// column's thread closed, or two columns put away, while the write was on its way, a refusal was taken
+// back in the right column and in the views held, but the left column on screen kept showing it as
+// made, and the next write from there saved that over the store, so the device kept a Done the server
+// had refused, or dropped one it had kept.
+
+/** The left column's own catch-up after a Done or an Undo made in the right column, taken out for a negative control. */
+const LEFT_FOLLOWS = ["  if (madeIn === columns.side && !sideShowing()) {", "  if (false) {"];
+/** ...its rows drawn again where they disagree with its copy, taken out: only Main's counts drawn. */
+const LEFT_REDRAWS = ["      if (rowsMissDone()) renderCachedTimeline();\n      else syncUnreadReplies();",
+  "      syncUnreadReplies();"];
+/** ...Main's roots' counts of unread replies drawn again, taken out: only rows that disagree drawn. */
+const LEFT_COUNTS = ["      if (rowsMissDone()) renderCachedTimeline();\n      else syncUnreadReplies();",
+  "      if (rowsMissDone()) renderCachedTimeline();"];
+
+/**
+ * Two columns over the channel of `threadData`, thread one & two on the right; a Done on message `id`
+ * in the right column, or for `kind` "restore" an Undo of a Done on it saved first, its write held on
+ * its way to the server; `meanwhile` done while it is held; then the write refused. `before` is done
+ * once the thread is on the right, before anything is marked. Answers the page and the timeline reads
+ * made by the time it was refused.
+ */
+async function refusedFromTheRight(kind, meanwhile, id, script = SCRIPT, before = null) {
+  const { page } = await twoColumnServer(null, script);
+  await threadBadge(channelRow(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the premise is the thread on the right");
+  if (before) await before(page);
+  if (kind === "restore") {
+    await doneButton(sideRow(page, id)).click();
+    await page.settle();
+    assert.deepStrictEqual(page.dismissCalls, [{ messages: [id] }], "the premise is a Done saved, to undo");
+  }
+  let release = null;
+  page.inboxWriteHook = async (asked) => (asked === kind && release === null
+    ? new Promise((resolve) => {
+      release = () => resolve(json(502, { error: "store_error", detail: "the store is read-only" }));
+    })
+    : null);
+  // Not waited for: the button's act ends with its write, which is held.
+  const pressed = doneButton(sideRow(page, id)).click();
+  await page.settle();
+  assert.ok(release, `the premise is the ${kind} on its way`);
+  // Drawn so at once; under Hide read a Done takes its row off at once.
+  const drawn = sideRow(page, id);
+  if (drawn) assert.equal(drawn.getAttribute("data-archived"), String(kind === "dismiss"), "the premise is the act drawn at once");
+  else assert.ok(kind === "dismiss" && before === hideRead, "the premise is the act drawn at once");
+  await meanwhile(page);
+  await page.settle();
+  const reads = page.timelineCalls.length;
+  release();
+  await pressed.catch(() => {});
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(page.el("error").hidden, false, `the premise is the ${kind} refused, and said`);
+  return { page, reads };
+}
+
+/** The read state of message `id` in the snapshot of the channel the device keeps. */
+const savedDone = (page, id) => savedScopes(page)[scopeKey(CHANNEL.id)].dismissed.includes(id);
+
+/** What the root 201 says about its thread's unread replies on Main, or null when it says nothing. */
+const rootUnread = (page) => (unreadChip(page, "201") ? unreadChip(page, "201").textContent : null);
+
+/** The right column's thread closed while the write is on its way: the cards come back, and Main stays on the left. */
+const closeTheThread = async (page) => { await page.el("side-close").click(); };
+/** Two columns put away while the write is on its way: All comes back in one column. */
+const putColumnsAway = async (page) => { await page.el("column-toggle").click(); };
+/** Hide read, from the read mode control, which steps through the modes. */
+const hideRead = async (page) => {
+  for (let i = 0; i < 3 && page.el("todo-filter").getAttribute("data-read-mode") !== "hide"; i += 1) {
+    await page.el("todo-filter").click();
+    await page.settle();
+  }
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "hide", "the premise is Hide read");
+};
+
+test("`#306 done-stale-across-views`: a Done or an Undo made in the right column and refused after its thread is closed is taken back on Main at once, and a later write from Main does not save it", async () => {
+  // On root 201, drawn on Main: drawn as it was, and kept so in the snapshot through a Done on 203 from Main.
+  for (const kind of ["dismiss", "restore"]) {
+    const was = String(kind === "restore");
+    const { page, reads } = await refusedFromTheRight(kind, closeTheThread, "201");
+    assert.equal(page.el("thread-select").value, "columns", "the premise is two columns, showing their cards");
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the premise is Main on the left");
+    assert.equal(doneDrawn(page, "201"), was, `a ${kind} the server refused shows on Main as made`);
+    assert.deepStrictEqual(page.timelineCalls.slice(reads), [], `Main waited on a read to take back the refused ${kind}`);
+    await doneButton(channelRow(page, "203")).click();
+    await page.settle();
+    assert.equal(savedDone(page, "201"), kind === "restore",
+      `a later write from Main saved the ${kind} the server refused into the device's snapshot`);
+    assert.equal(doneDrawn(page, "201"), was, `a later write from Main drew the refused ${kind} again`);
+  }
+  // On reply 202, which Main does not draw: its root's count of unread replies says so again at once.
+  const done = await refusedFromTheRight("dismiss", closeTheThread, "202");
+  assert.equal(rootUnread(done.page), "1 unread", "after a refused Done on its reply the root counts nothing unread");
+  const undo = await refusedFromTheRight("restore", closeTheThread, "202");
+  assert.equal(rootUnread(undo.page), null, "after a refused Undo of its reply the root counts it unread");
+
+  // THE CONTROLS. Without the left column's own copy brought into line, Main shows each refusal as made,
+  // and the next write from it saves the refused state; its root counts the reply wrongly. With the copy
+  // brought into line but Main's counts not drawn again, the root counts the reply wrongly still.
+  const unfollowed = brokenScript(...LEFT_FOLLOWS);
+  for (const kind of ["dismiss", "restore"]) {
+    const { page } = await refusedFromTheRight(kind, closeTheThread, "201", unfollowed);
+    assert.equal(doneDrawn(page, "201"), String(kind === "dismiss"),
+      `without the left column brought into line Main showed the refused ${kind} taken back, so this test cannot see it`);
+    await doneButton(channelRow(page, "203")).click();
+    await page.settle();
+    assert.equal(savedDone(page, "201"), kind === "dismiss",
+      `without the left column brought into line the snapshot kept the refused ${kind} out, so this test's claim about it is untested`);
+  }
+  assert.equal(rootUnread((await refusedFromTheRight("dismiss", closeTheThread, "202", unfollowed)).page), null,
+    "without the left column brought into line the root counted the reply put back, so this test cannot see it");
+  assert.equal(rootUnread((await refusedFromTheRight("restore", closeTheThread, "202", unfollowed)).page), "1 unread",
+    "without the left column brought into line the root counted the reply Done again, so this test cannot see it");
+  assert.equal(rootUnread((await refusedFromTheRight("dismiss", closeTheThread, "202", brokenScript(...LEFT_COUNTS))).page), null,
+    "without Main's counts drawn again the root counted the reply put back, so this test cannot see it");
+});
+
+test("`#306 done-stale-across-views`: a Done or an Undo made in the right column and refused after two columns are put away is taken back in All, then on screen, and in every view shown after it", async () => {
+  for (const kind of ["dismiss", "restore"]) {
+    const was = String(kind === "restore");
+    for (const id of ["201", "202"]) {
+      const { page, reads } = await refusedFromTheRight(kind, putColumnsAway, id);
+      assert.equal(page.el("thread-select").value, "flat", "the premise is All in one column");
+      assert.equal(doneDrawn(page, id), was, `a ${kind} of ${id} the server refused shows in All as made`);
+      assert.deepStrictEqual(page.timelineCalls.slice(reads), [], `All waited on a read to take back the refused ${kind}`);
+      // A later write from All, which saves the snapshot from All's copy.
+      await doneButton(channelRow(page, "203")).click();
+      await page.settle();
+      assert.equal(savedDone(page, id), kind === "restore",
+        `a later write from All saved the ${kind} of ${id} the server refused into the device's snapshot`);
+      // The thread opened next in the one column, and Main.
+      await pickThread(page, "thread:spaces/A/threads/one & two");
+      assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+      assert.equal(doneDrawn(page, id), was, `the thread opened after the refused ${kind} of ${id} shows it as made`);
+      if (id === "201") {
+        await pickThread(page, "main");
+        assert.equal(doneDrawn(page, id), was, `Main shows the refused ${kind} of ${id} as made`);
+      }
+    }
+  }
+  // Under Hide read, the root a refused Done took off All is back on it at once.
+  const hidden = await refusedFromTheRight("dismiss", putColumnsAway, "201", SCRIPT, hideRead);
+  assert.deepStrictEqual(shownIds(hidden.page), ["200", "201", "202", "203", "204"],
+    "under Hide read All leaves out the root whose Done the server refused");
+
+  // THE CONTROLS. Without the left column's own copy brought into line, All shows the refusal as made,
+  // and its next write saves it. With the copy brought into line but All's rows not drawn again, All
+  // shows it as made still, though the snapshot is right.
+  for (const kind of ["dismiss", "restore"]) {
+    const made = String(kind === "dismiss");
+    const unfollowed = await refusedFromTheRight(kind, putColumnsAway, "201", brokenScript(...LEFT_FOLLOWS));
+    assert.equal(doneDrawn(unfollowed.page, "201"), made,
+      `without the left column brought into line All showed the refused ${kind} taken back, so this test cannot see it`);
+    await doneButton(channelRow(unfollowed.page, "203")).click();
+    await unfollowed.page.settle();
+    assert.equal(savedDone(unfollowed.page, "201"), kind === "dismiss",
+      `without the left column brought into line the snapshot kept the refused ${kind} out, so this test's claim about it is untested`);
+    const undrawn = await refusedFromTheRight(kind, putColumnsAway, "201", brokenScript(...LEFT_REDRAWS));
+    assert.equal(doneDrawn(undrawn.page, "201"), made,
+      `without All's rows drawn again All showed the refused ${kind} taken back, so this test cannot see it`);
+  }
+  for (const [patch, without] of [[LEFT_FOLLOWS, "the left column brought into line"], [LEFT_REDRAWS, "All's rows drawn again"]]) {
+    const control = await refusedFromTheRight("dismiss", putColumnsAway, "201", brokenScript(...patch), hideRead);
+    assert.deepStrictEqual(shownIds(control.page), ["200", "202", "203", "204"],
+      `without ${without} Hide read brought the root back, so this test cannot see it`);
+  }
 });
 
 // --- `#311 sent-read-waits-for-done` ------------------------------------------------------------

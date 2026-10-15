@@ -29180,7 +29180,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   const column = activeColumn;
   const mirrored = mirrorArchived(requested, true);
   // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
-  followDoneEverywhere(requested);
+  followDoneEverywhere(requested, column);
   // Before the redraw, so the line moves with the row it was over; and in the other column, whose own
   // redraw (`mirrorArchived`) came before it, or never came, when it draws none of these messages.
   const move = bump ? stageBookmark(bump.channel, bump.to) : null;
@@ -29221,8 +29221,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       mirrorArchived(mirrored.filter((id) => !kept.has(id)), false);
       guardQuietly(refreshAfterInboxChange)();
     });
-    // ...and in every view held, from the store the lines above took it back in. `#306`.
-    followDoneEverywhere(requested);
+    // ...and in every view held, from the store the lines above took it back in, and in the left column
+    // when it was made in the right one and that has stopped showing its thread since, which the
+    // other column's line above does not reach. `#306 done-stale-across-views`.
+    followDoneEverywhere(requested, column);
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
     throw error;
@@ -29283,7 +29285,7 @@ async function restoreMessages(ids) {
   const column = activeColumn;
   const mirrored = mirrorArchived(restored, false);
   // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
-  followDoneEverywhere(restored);
+  followDoneEverywhere(restored, column);
   if (lastDismissal !== null) {
     const left = lastDismissal.messages.filter((id) => !restored.includes(id));
     lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
@@ -29326,8 +29328,10 @@ async function restoreMessages(ids) {
       mirrorArchived(mirrored.filter((id) => !kept.has(id)), true);
       guardQuietly(refreshAfterInboxChange)();
     });
-    // ...and in every view held, from the store the lines above took it back in. `#306`.
-    followDoneEverywhere(restored);
+    // ...and in every view held, from the store the lines above took it back in, and in the left column
+    // when it was made in the right one and that has stopped showing its thread since, which the
+    // other column's line above does not reach. `#306 done-stale-across-views`.
+    followDoneEverywhere(restored, column);
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
     throw error;
@@ -29378,6 +29382,12 @@ function mirrorArchived(ids, done) {
 // cards on screen, which count unread replies from the store, are drawn again then; and a view whose
 // rows were drawn before is drawn again as it is shown, where they say otherwise (`rowsMissDone`).
 // No read is asked for any of it.
+//
+// A Done or an Undo made in the right column reaches the left one through `mirrorArchived`, which
+// works only while the right column shows a thread. Its thread closed, or two columns put away, while
+// the write was on its way, a refusal taken back in the right column left the left column showing it
+// as made, and the next write from the left saved that over the store. So the left column's own copy
+// is brought into line here too then, and its rows drawn again where they say otherwise.
 
 /**
  * Every copy of the read state of `ids` that the page holds out of sight, into line with the store's
@@ -29386,9 +29396,15 @@ function mirrorArchived(ids, done) {
  * rather than changed in place, since one may be the very set a list on screen is drawn from. Then
  * the cards on screen, drawn from the store, are drawn again. `#306 done-stale-across-views`.
  *
+ * `madeIn` is the column the Done or the Undo was made in. Made in the right column, which no longer
+ * shows a thread (its thread closed, or two columns put away, while the write was on its way), the
+ * left column on screen is brought into line as well, and drawn again: `mirrorArchived`, which tells it
+ * while the right column shows a thread, does nothing then.
+ *
  * @param {string[]} ids
+ * @param {typeof activeColumn} madeIn
  */
-function followDoneEverywhere(ids) {
+function followDoneEverywhere(ids, madeIn) {
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
   const named = ids.map(String);
   /** @param {Set<string>} copy */
@@ -29406,6 +29422,14 @@ function followDoneEverywhere(ids) {
   if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {
     inColumn(columns.side, () => {
       archivedIds = caughtUp(archivedIds);
+    });
+  }
+  if (madeIn === columns.side && !sideShowing()) {
+    inColumn(columns.main, () => {
+      archivedIds = caughtUp(archivedIds);
+      // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
+      if (rowsMissDone()) renderCachedTimeline();
+      else syncUnreadReplies();
     });
   }
   if (sideColumnUp()) renderSideColumn();
