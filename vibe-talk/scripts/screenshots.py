@@ -3181,6 +3181,25 @@ def _act_all_thread_selected(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_settings_voice_agent(driver: Driver) -> None:
+    """`#332 settings-voice-agent-section`: Voice agent at its three settings that read a message out.
+
+    A fresh load, Settings, and the screen scrolled to put Resuming's group at the top, so the
+    picture holds Resuming, Live messages and Reading full messages in channel view together, each
+    with its short state line and its `?`s, at a phone's height as at a desk's.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.page.wait_for_function("() => (window.__text('resume-state') || '').length > 0", timeout=5_000)
+    driver.js(
+        "(() => { document.getElementById('resume-toggle').closest('.settings-group')"
+        ".scrollIntoView({ block: 'start' }); return true; })()"
+    )
+    driver.settle(300)
+
+
 def _unroute_threaded(driver: Driver) -> None:
     """Put back the two routes the threaded states (`55-thread-card-header`, `56-thread-card-header-list`,
     `58-all-thread-strip`, `59-all-thread-selected`) answered, before the next state."""
@@ -5308,6 +5327,62 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="60-settings-voice-agent",
+        what="Settings, Voice agent: Resuming, Live messages and Reading full messages in channel view together, short lines and ?s",
+        act=_act_settings_voice_agent,
+        profiles=("iphone15", "laptop-1280"),
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE arrangement: the three, one after another, inside Voice agent.
+                "Voice agent holds Resuming, Live messages and Reading full messages in channel view, in a row",
+                "(() => { const heads = [...document.querySelectorAll('#settings-voice-agent > .settings-group "
+                "> .group-head > h3')].map((h) => h.textContent.trim()); "
+                "const at = heads.indexOf('Resuming'); "
+                "return at >= 0 && heads[at + 1] === 'Live messages' "
+                "&& heads[at + 2] === 'Reading full messages in channel view'; })()",
+            ),
+            (
+                "the three headings and their controls are on the screen at once",
+                "['resume-toggle', 'relay-to-agent', 'settings-audio-source', 'help-link-resuming', "
+                "'help-link-live-messages', 'help-link-speech-prep-relay', 'help-link-speech-prep'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
+            ),
+            (
+                # Gone from Settings by name, and its line is Help's now.
+                "no Message audio and no How messages are said on Settings; the server's arm is in Help",
+                "![...document.querySelectorAll('#screen-settings h3')]"
+                ".some((h) => /^(Message audio|How messages are said)$/.test(h.textContent.trim())) "
+                "&& document.getElementById('speech-prep-state').closest('#help-speech-prep') !== null",
+            ),
+            (
+                # The second ? is about the label it follows: on its line, just after its words, and
+                # well clear of the group's own ? hard right.
+                "the ? beside Arriving messages during a call sits right after the label's words",
+                "(() => { const label = document.querySelector('label[for=\"relay-to-agent\"]').getBoundingClientRect(); "
+                "const q = document.getElementById('help-link-speech-prep-relay').getBoundingClientRect(); "
+                "const own = document.getElementById('help-link-live-messages').getBoundingClientRect(); "
+                "const mid = (b) => b.top + b.height / 2; "
+                "return Math.abs(mid(label) - mid(q)) < 4 && q.left >= label.right && q.left - label.right <= 16 "
+                "&& q.right <= own.left - 24; })()",
+            ),
+            (
+                # `#332`'s other half: a state line is a sentence, not a paragraph, on a phone too.
+                "each state line is at most two lines tall",
+                "['resume-state', 'live-state'].every((id) => { const e = document.getElementById(id); "
+                "const line = parseFloat(getComputedStyle(e).lineHeight) || parseFloat(getComputedStyle(e).fontSize) * 1.5; "
+                "const h = e.getBoundingClientRect().height; return h > 0 && h <= line * 2 + 1; })",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -5782,6 +5857,9 @@ def check_state_controls() -> list[str]:
         # `#299 all-thread-strip`. All at a desk and at a phone's width, where the strip is a finger's.
         "58-all-thread-strip": ("android-412", "laptop-1280"),
         "59-all-thread-selected": ("android-412", "laptop-1280"),
+        # `#332 settings-voice-agent-section`. The phone the owner uses and the small desk: the two
+        # sizes the issue asks the section to be seen at.
+        "60-settings-voice-agent": ("iphone15", "laptop-1280"),
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -5975,6 +6053,10 @@ def check_state_controls() -> list[str]:
         # and, selected, the drawn strength of every row (`data-thread-in`, 0.3) with nothing scrolled.
         "58-all-thread-strip": ("thread-strip", "::before", "data-thread-state"),
         "59-all-thread-selected": ("data-thread-in", "0.3", "__beforeTop"),
+        # Pinned to the three in a row in Voice agent (`heads[at + 2]`), to the old names being gone
+        # with the server's arm in Help (`help-speech-prep`), to the ? after the label (`label.right`),
+        # and to the short lines (`line * 2`).
+        "60-settings-voice-agent": ("heads[at + 2]", "help-speech-prep", "label.right", "line * 2"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

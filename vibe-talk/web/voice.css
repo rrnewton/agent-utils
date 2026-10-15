@@ -775,6 +775,16 @@ a.search-hit-link {
   gap: 0.5rem;
 }
 
+/* `#332 settings-voice-agent-section`. A control's label with a `?` straight after its words: help
+   about that one control, so it stands by the label rather than hard right, where the group's own
+   `?` is and where the two would read as a pair. The control it labels goes on the next line. */
+.label-help {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0.35rem 0 0.25rem;
+}
+
 /* Small, round, and quiet: it is an offer, not an instruction, and there is one on nearly every
    group. Sized to the 2.4rem tap target everything else on this page uses even though it is drawn
    much smaller than that. */
