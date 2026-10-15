@@ -1,12 +1,13 @@
 ---
 title: 'slack-edited-mark: show that a Slack message was edited'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.403773564+00:00
-updated_at: 2026-10-15T06:03:00.403773564+00:00
+updated_at: 2026-10-15T07:43:42.872561703+00:00
+closed_at: 2026-10-15T07:43:42.872561573+00:00
 ---
 
 # Description
