@@ -7,7 +7,7 @@
 //! page as a bot, by its own name; and client-config tells the page which accounts are the coding
 //! agents (`coding_agent_user_ids`) and that in a Slack channel no other bot may be guessed to be
 //! one, while a Discord-protocol provider with nothing configured keeps the guess. The page's half
-//! is in `tests/js/voice_page.test.mjs` and `tests/system_bots_browser.py`.
+//! is in the page suite and in `tests/system_bots_browser.py`.
 
 mod slack_fake;
 
