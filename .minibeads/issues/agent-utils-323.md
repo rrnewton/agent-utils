@@ -1,12 +1,13 @@
 ---
 title: 'slack-system-bots: a Slack system bot is drawn as the coding agent'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.414239690+00:00
-updated_at: 2026-10-15T06:03:00.414239690+00:00
+updated_at: 2026-10-15T08:01:48.063297185+00:00
+closed_at: 2026-10-15T08:01:48.063296695+00:00
 ---
 
 # Description
