@@ -1083,8 +1083,17 @@ function showScreen(name) {
   // `#269 approval-card-inline`. ...and the list about to be shown again is whole when it is first laid out:
   // a draft docked under the screen being left is back at its foot BEFORE it is shown (`postCardBackToMain`).
   if (name === "main" && previous !== "main") postCardBackToMain();
+  // `#280 scroll-stability`. Everything going goes FIRST, and the screen coming is shown LAST, once the frame
+  // around it is as it will be (below). A browser lays a list on a hidden screen out again the first time it
+  // lays the page out after the screen is shown, and clamps the reader's place to the list's window as it is
+  // then. Hiding a control that holds the focus is such a time: Chromium blurs it on the spot, and lays the
+  // page out to do so. Help's list holds the focus after "?" or Ctrl+/, and Help's Back button after a tap on
+  // it, and both were hidden after the main screen was shown and before the control pane was: the list was
+  // laid out in a window 66px taller than its own on a 393x852 phone. A reader whose long draft was settled
+  // while Help was up was left 58px above the foot, and 200px once the box took back its room, the jump
+  // offered. (Settings' ways out let go of the focus before they get here, `closeSettings`.)
   for (const screen of SCREENS) {
-    el(`screen-${screen}`).hidden = screen !== name;
+    if (screen !== name) el(`screen-${screen}`).hidden = true;
   }
   const main = name === "main";
   // Settings and Reply are both destinations: the header becomes a title bar with a way back, and
@@ -1110,6 +1119,8 @@ function showScreen(name) {
   // permanent and is on whichever screen is up, and the sign-in screen states what to paste in its
   // own body. `#63 status-line-placement`.
   el("control-pane").hidden = !main;
+  // ...and only now the screen itself (`#280 scroll-stability`, above).
+  el(`screen-${name}`).hidden = false;
   if (!main) {
     if (readAloudPlayback === "browser") stopReading();
     disarmClear();
