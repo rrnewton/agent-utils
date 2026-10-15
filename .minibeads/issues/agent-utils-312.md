@@ -1,12 +1,13 @@
 ---
 title: 'slack-reactions: show the reactions Slack history reports on each message'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T04:34:05.345820882+00:00
-updated_at: 2026-10-15T04:34:05.345820882+00:00
+updated_at: 2026-10-15T05:00:00.308910805+00:00
+closed_at: 2026-10-15T05:00:00.308910705+00:00
 ---
 
 # Description
