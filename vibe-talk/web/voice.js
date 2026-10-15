@@ -31932,6 +31932,11 @@ function doneHeldHere(ids) {
  * back meanwhile, and once the reader has gone to another channel, whose Done this page no longer
  * holds (a set kept over the change can still name it while its write is on its way). The chat
  * service's marker cannot be moved back, so nothing is asked of it for a Done this cannot say is saved.
+ * Only a Done of its row actually on its way (`doneSaving`) is waited for and looked at again. Any other
+ * is saved, and is asked of the service at once, as before: one saved before the send confirmed, and
+ * one made before this page was loaded or on another device and read since — which, under Hide read
+ * without threads, has taken the message off the list (`doneWhereNotDrawn`) and need not be in any set
+ * `doneHeldHere` reads.
  *
  * @param {string} channel
  * @param {string} id
@@ -31946,6 +31951,9 @@ async function markAnsweredDone(channel, id) {
   const found = answeredRow(id);
   const ids = found ? idsOf(found.row) : [id];
   if (answeredDone(id, found)) {
+    // No Done of its own on its way: saved, or made before this page was loaded or elsewhere and read
+    // since, which no set here need name (under Hide read without threads it has left the list).
+    if (!ids.some((one) => doneSaving.has(String(one)))) return true;
     return doneSaved(ids, () => String(el("discord-channel").value) === channel && doneHeldHere(ids));
   }
   await inColumn(found ? found.column : columns.main, () => toggleArchived(ids, found ? found.row : null));

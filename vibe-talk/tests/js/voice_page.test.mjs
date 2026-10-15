@@ -60539,3 +60539,143 @@ test("`#311 sent-read-waits-for-done`: a Done put back while the send waits for 
     "without the channel looked at the channel left was not asked, so this test cannot see it");
   assert.deepStrictEqual((await run(undo, anywhere)).upstreamReadCalls, [], "the channel's check is what keeps a put back unasked");
 });
+
+/** The line in `markAnsweredDone` that asks at once for a message no Done of its own is on its way for, for negative controls. */
+const SENT_SAVED_ALREADY = "    if (!ids.some((one) => doneSaving.has(String(one)))) return true;\n";
+
+/**
+ * Found in review of #311 itself. Under Hide read on a channel without threads a message not drawn
+ * counts as Done (`doneWhereNotDrawn`): it has left the list. A Done that took it off was not always
+ * made on this page load — another device's, read since, or one from before a reload — and no set the
+ * page keeps need name it, since a to-do read lists only what is not Done. Looking again for every
+ * message already Done (`doneHeldHere`) found none of those and asked the chat service nothing, which
+ * undid #300 reply-marks-read there. Only a Done actually on its way is waited for now.
+ */
+test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply to a message Done on another device, or before a reload, asks the chat service at once; one whose Done here is held waits, and asks nothing once it fails", async () => {
+  const target = "1000000000000000003";
+  /** A Reply on message 3 sent under Hide read, its POST held; another device's Done read meanwhile; then the POST confirmed. */
+  const elsewhere = async (script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = true;
+    const asked = serverFloor(page);
+    await signIn(page);
+    await showDiscord(page, conversation());
+    await chooseReadMode(page, "Hide read");
+    assert.ok(shownIds(page).includes(target), "the premise is the message listed under Hide read");
+    const succeeds = page.replyResponse;
+    let release = null;
+    page.replyResponse = (...args) => new Promise((resolve) => { release = () => resolve(succeeds(...args)); });
+    await replyButton(rowWithId(page, target)).click();
+    await page.el("reply-text").setValue("answering");
+    const sending = page.el("reply-send").click();
+    await page.settle();
+    assert.ok(release, "the premise is the reply's POST held");
+    page.dealtWith.add(target);
+    await reReadChannel(page);
+    assert.equal(shownIds(page).includes(target), false, "the premise is the Done made elsewhere taking the message off the list");
+    release();
+    await sending;
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(page.repliesPosted.length, 1, "the premise is the reply sent and confirmed");
+    return { page, asked };
+  };
+  /** Hide read kept over a reload; message 3 Done on the server since; a send an earlier page saved, Retried and confirmed. */
+  const reloaded = async (script = SCRIPT) => {
+    const first = newPage();
+    await signIn(first);
+    await showDiscord(first, conversation());
+    await chooseReadMode(first, "Hide read");
+    first.storage.set("vibe-talk.outgoing-messages", JSON.stringify([{ id: "outgoing-earlier-page", channel: CHANNEL.id,
+      text: "answering", remaining: "answering", state: "failed", threadId: null, replyTo: target, marksRead: target,
+      createdAt: 1, postedCount: 0, parts: [], observedParts: [], detail: "refused" }]));
+    let asked = [];
+    const page = newPage(first.storage, script, (p) => {
+      p.messages = conversation();
+      p.upstreamReadMarkSupported = true;
+      p.dealtWith.add(target);
+      asked = serverFloor(p);
+    });
+    await reopenedChannel(page);
+    assert.equal(page.el("todo-filter-label").text(), "Hide read", "the premise is Hide read kept over the reload");
+    assert.equal(shownIds(page).includes(target), false, "the premise is the message Done, off the list");
+    assert.equal(outgoingRows(page).length, 1, "the premise is the saved send");
+    await outgoingRetry(outgoingRows(page)[0]).click();
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(page.repliesPosted.length, 1, "the premise is the reply sent and confirmed");
+    return { page, asked };
+  };
+  for (const [how, run] of [["Done on another device", elsewhere], ["Done before a reload", reloaded]]) {
+    const { page, asked } = await run();
+    assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: target, after_reply: true }],
+      `${how}: the chat service was not asked to mark the message the reply answers`);
+    assert.deepStrictEqual(asked, [target], `${how}: the chat service's marker did not move`);
+    assert.deepStrictEqual(page.dismissCalls, [], `${how}: the send wrote a second Done over a saved one`);
+    assert.match(page.el("status").textContent, /^Marked read here and in Discord\./, `${how}: the mark in the chat service was not said`);
+    assert.equal(page.el("error").hidden, true, `${how}: the mark put up the error banner: ${page.el("error").textContent}`);
+  }
+
+  /**
+   * A Reply on message 3 sent under Hide read, its POST held; its Done pressed meanwhile, which takes it
+   * off the list, and held on its way; the POST confirmed; then the Done answered `answer`, or saved.
+   */
+  const heldHere = async (answer, script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = true;
+    const asked = serverFloor(page);
+    await signIn(page);
+    await showDiscord(page, conversation());
+    await chooseReadMode(page, "Hide read");
+    const succeeds = page.replyResponse;
+    let send = null;
+    page.replyResponse = (...args) => new Promise((resolve) => { send = () => resolve(succeeds(...args)); });
+    await replyButton(rowWithId(page, target)).click();
+    await page.el("reply-text").setValue("answering");
+    const sending = page.el("reply-send").click();
+    await page.settle();
+    assert.ok(send, "the premise is the reply's POST held");
+    let done = null;
+    page.inboxWriteHook = async (kind) => (kind === "dismiss"
+      ? new Promise((resolve) => { done = () => resolve(answer); }) : null);
+    const pressed = doneButton(rowWithId(page, target)).click();
+    await page.settle();
+    assert.ok(done, "the premise is the Done on its way");
+    assert.equal(shownIds(page).includes(target), false, "the premise is the Done taking the message off the list");
+    send();
+    await sending;
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(page.repliesPosted.length, 1, "the premise is the reply sent and confirmed");
+    const whileSaving = [...page.upstreamReadCalls];
+    done();
+    await pressed.catch(() => {});
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return { page, asked, whileSaving };
+  };
+  const failing = json(502, { error: "store_error", detail: "the store is read-only" });
+  const failed = await heldHere(failing);
+  assert.deepStrictEqual(failed.whileSaving, [], "the chat service was asked before the Done was saved");
+  assert.deepStrictEqual(failed.asked, [], "the chat service's marker was moved for a Done that failed");
+  assert.equal(failed.page.el("error").hidden, false, "a Done that failed said nothing");
+  const saved = await heldHere(null);
+  assert.deepStrictEqual(saved.whileSaving, [], "the chat service was asked before the Done was saved");
+  assert.deepStrictEqual(saved.page.upstreamReadCalls, [{ message_id: target, after_reply: true }],
+    "the saved Done was not marked in the chat service as a reply's mark");
+  assert.deepStrictEqual(saved.page.dismissCalls, [{ messages: [target] }], "the send wrote a second Done");
+
+  // THE CONTROLS. Looking again for every message Done already, a Done on its way or not, asks the
+  // chat service nothing for a Done made elsewhere or before the reload: no set the page keeps names
+  // it. And taking a message off the list for Done when looking again — the reading that decides it is
+  // Done in the first place — asks for one whose Done here failed, which no read has put back.
+  const lookedAlways = brokenScript(SENT_SAVED_ALREADY, "");
+  for (const [how, run] of [["Done on another device", elsewhere], ["Done before a reload", reloaded]]) {
+    const control = await run(lookedAlways);
+    assert.deepStrictEqual(control.page.upstreamReadCalls, [],
+      `${how}: looking again for every message Done already still asked the chat service, so this test cannot see it`);
+  }
+  assert.deepStrictEqual((await heldHere(failing, lookedAlways)).asked, [], "the control changed what a failed Done asks");
+  const offList = brokenScript("  return inColumn(columns.main, () => ids.every((id) => archivedIds.has(String(id))));\n",
+    "  return inColumn(columns.main, () => todoMode || ids.every((id) => archivedIds.has(String(id))));\n");
+  const offListFailed = await heldHere(failing, offList);
+  assert.deepStrictEqual(offListFailed.whileSaving, [], "the control waited no longer");
+  assert.deepStrictEqual(offListFailed.asked, [target],
+    "looking again by the list asked nothing after the failed Done, so this test cannot see it");
+});

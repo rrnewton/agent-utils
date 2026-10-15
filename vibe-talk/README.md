@@ -170,7 +170,9 @@ that item moves it: for the whole space, and never backward. It is moved only on
 saved: a message already drawn Done by a Done still on its way to the server (**Done**, **e** or a
 swipe just before the send went) waits for it, and is not marked in the service at all if that Done
 fails or is put back meanwhile, since the service's marker cannot be moved back (`#311
-sent-read-waits-for-done`). The server does not ask the service again for a message it has already
+sent-read-waits-for-done`). A message whose Done was saved before the send went — here, on another
+device, or before a reload, even one **Hide read** has already left out — is marked in the service at
+once. The server does not ask the service again for a message it has already
 marked through, by a reply or by that item, nor for one before it, and the service's bridge keeps
 its own cursor forward too. The status line then says **Marked
 read here and in** *the service*. Slack has no such marker for vibe-talk to move (its **Clear unread
