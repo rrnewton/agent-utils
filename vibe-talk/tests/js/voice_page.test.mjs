@@ -58736,7 +58736,8 @@ for (const kind of ["thread reply", "channel message"]) {
 // Review round 3. An answer of All the page does not fold is not thrown away: each message the stream
 // left unplaced that it carries takes the thread record it carries there, and one that a newest page
 // unable to speak for it took out of the store is put back. Which of two newest pages of All is the
-// newer is the order they were sent in, not the order they landed in.
+// newer is the order they were sent in, not the order they landed in. And a replayed copy that places a
+// message gives the store its thread record and nothing else.
 
 /** The store's copy of message `id`, as the device saved it, or null. */
 const savedMessage = (page, id) =>
@@ -59005,3 +59006,45 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: behind a slow bridge ed
   const control = await run(brokenScript("            if (unused) placeFromAnswer(unused, read);\n", ""));
   assert.ok(shownIds(control.page).includes("300"), "the reply left Main anyway, so this test cannot see it");
 });
+
+for (const hidden of [false, true]) {
+  test(`\`#308 live-reply-in-main\`: a replayed copy that places a message gives the store its thread record and nothing else${hidden ? ", the page hidden" : ""}`, async () => {
+    const run = async (script) => {
+      const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+      // The store's copy of 200 is the read's, edited since it was published.
+      server.edit("200", { content: "main channel announcement, edited" });
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(savedMessage(page, "200").content, "main channel announcement, edited", "fixture: the edit was not read");
+      if (hidden) await page.setVisibility("hidden");
+      // The stream replays it as first published, with a thread record its reads do not carry: the root
+      // of a thread with no reply yet, as an adapter may say of a message to the channel.
+      const record = { id: "spaces/A/threads/solo", root_message_id: "200", is_root: true, reply_count: 0,
+        reply_count_exact: true };
+      const replayed = { ...page.messages.find((m) => m.id === "200"), content: "main channel announcement", thread: record };
+      const from = page.timelineCalls.length;
+      await deliver(page, page.stream(), sseMessage(replayed, { replayed: true }));
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      const reads = page.timelineCalls.slice(from);
+      if (hidden) {
+        await page.setVisibility("visible");
+        for (let i = 0; i < 3; i += 1) await page.settle();
+      }
+      return { page, reads, record };
+    };
+    const { page, reads, record } = await run(SCRIPT);
+    assert.deepStrictEqual(reads, [], "a replayed copy was read for");
+    const kept = savedMessage(page, "200");
+    assert.equal(kept.content, "main channel announcement, edited", "the replayed copy replaced the store's newer one");
+    assert.deepStrictEqual(kept.thread, record, "the replayed copy did not place the message");
+    assert.ok(shownIds(page).includes("200"), "a root left Main");
+
+    // THE CONTROL, as round 2 did: the replayed copy folded in whole.
+    const control = await run(hidden
+      ? brokenScript("        if (held) takeThreadRecord(message);\n        else foldLiveMessage(message, true, replayed);\n",
+        "        foldLiveMessage(message, true, replayed);\n")
+      : brokenScript("    } else if (places) {\n      takeThreadRecord(message);\n", "    } else if (places) {\n      foldLiveMessage(message, true, replayed);\n"));
+    assert.equal(savedMessage(control.page, "200").content, "main channel announcement",
+      "the store kept its own copy anyway, so this test cannot see it");
+  });
+}

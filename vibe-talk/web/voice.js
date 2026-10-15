@@ -35873,12 +35873,14 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     const held = replayed ? heldMessage(message.id) : null;
     // `#308 live-reply-in-main`. A copy naming the thread of a message the store holds without one
     // places it, replayed or not: it leaves Main for its thread now, not at the next read that can say.
+    // A replayed copy gives the store its thread record and nothing else: the rest of it is older.
     const places = placesHeld(message);
     if (document.hidden) {
       // `#226 page-energy-profile`. Into the store, for coming back to draw and read behind; no row
       // and no read for a page nobody can see. A call's agent is told as ever.
       if (!held || places) {
-        foldLiveMessage(message, true, replayed);
+        if (held) takeThreadRecord(message);
+        else foldLiveMessage(message, true, replayed);
         liveArrivedHidden = true;
         followReplyStore();
       }
@@ -35900,7 +35902,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
       followLiveArrival(pinned);
       followReplyStore();
     } else if (places) {
-      foldLiveMessage(message, true, replayed);
+      takeThreadRecord(message);
     }
     if (places) followPlacement();
     renderOutgoingEverywhere();
@@ -36011,12 +36013,24 @@ function placesHeld(message) {
  * @param {any} message
  */
 function placeFromEdit(message) {
+  takeThreadRecord(message);
+  if (document.hidden) liveArrivedHidden = true;
+  else followPlacement();
+}
+
+/**
+ * The thread record of `message`, a copy from the stream that places a message the store holds
+ * (`placesHeld`), into the store's copy, which keeps everything else it has: an edit's copy says
+ * nothing of which edits the store has seen, and a replayed copy is from when the message was
+ * published. The message is placed. `#308 live-reply-in-main`.
+ *
+ * @param {any} message
+ */
+function takeThreadRecord(message) {
   const id = String(message.id);
   channelCanon.messages = channelCanon.messages.map((held) =>
     String(held.id) === id ? { ...held, thread: message.thread } : held);
   channelCanon.unplaced.delete(id);
-  if (document.hidden) liveArrivedHidden = true;
-  else followPlacement();
 }
 
 /**
