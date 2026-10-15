@@ -1071,6 +1071,9 @@ function showScreen(name) {
   // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
   // reader's message is noted now, for a reopen. `#189 restore-ui-state`.
   if (currentScreen === "main" && name !== "main") holdChannelPlace();
+  // `#269 approval-card-inline`. ...and the list about to be shown again is whole when it is first laid out:
+  // a draft docked under the screen being left is back at its foot BEFORE it is shown (`postCardBackToMain`).
+  if (name === "main" && previous !== "main") postCardBackToMain();
   for (const screen of SCREENS) {
     el(`screen-${screen}`).hidden = screen !== name;
   }
@@ -10653,18 +10656,7 @@ function postCardWhere(proposal) {
 function placePostCard() {
   const card = leftEl("post-confirm");
   const shown = postWatch.shown !== null;
-  let parent = null;
-  let before = null;
-  let place = "none";
-  if (currentScreen === "main" && !threadListOnScreen()) {
-    const channel = currentView === "discord";
-    parent = leftEl(channel ? "pane-discord" : "pane-voice");
-    before = leftEl(channel ? "channel-composer" : "voice-composer");
-    place = channel ? "channel" : "voice";
-  } else if (currentScreen !== "signin") {
-    parent = leftEl("frame-body");
-    place = "dock";
-  }
+  const { parent, before, place } = postCardSpot(currentScreen);
   const from = card.getAttribute("data-place");
   const moving = shown && !card.hidden && currentScreen === "main" && from !== place &&
     (from === "dock" ? card.getAttribute("data-screen") === "main" : place === "dock");
@@ -10686,6 +10678,50 @@ function placePostCard() {
   if (coming) cardCameUnderLists(gap);
   // What the chips and the status pill stand on has just changed.
   placeChipsOverComposer();
+}
+
+/**
+ * Where the card stands on `screen` (`placePostCard`): the element it goes in, the one it goes before, and
+ * the name of the place. `#269 approval-card-inline`.
+ *
+ * @param {string} screen
+ * @returns {{parent: HTMLElement | null, before: HTMLElement | null, place: string}}
+ */
+function postCardSpot(screen) {
+  if (screen === "main" && !(threadListShown && currentView === "discord")) {
+    const channel = currentView === "discord";
+    return {
+      parent: leftEl(channel ? "pane-discord" : "pane-voice"),
+      before: leftEl(channel ? "channel-composer" : "voice-composer"),
+      place: channel ? "channel" : "voice",
+    };
+  }
+  if (screen !== "signin") return { parent: leftEl("frame-body"), before: null, place: "dock" };
+  return { parent: null, before: null, place: "none" };
+}
+
+/**
+ * Back to the main screen from another, the card docked under that screen goes back to the foot of the
+ * list it ends WHILE THE LIST IS STILL HIDDEN (`showScreen`). `#269 approval-card-inline` x `#280
+ * scroll-stability`.
+ *
+ * A browser keeps a hidden list's scroll position and puts it back the first time the list is laid out
+ * again, clamped to the list as it then stands. Shown with the card still docked under it, the list is
+ * short of the card, and its window short of the dock's height too: in Chromium on a 393x852 phone, a long
+ * draft opened by More stands 907px tall in the channel's list and 398px docked, and a reader at the list's
+ * foot, 1344px down it, was put back at 831. The card came back to the foot a moment later and the reader
+ * stayed 513px above it, Send about 900px below the screen and the jump offered, whether they had left by
+ * the gear or by Settings and Help and came back by Back or Esc, and every reader who saw only the card
+ * with them. With the card back in the list first, the list is laid out whole and the reader is where they
+ * were. Under the thread list the card stays docked, and nothing is done here.
+ */
+function postCardBackToMain() {
+  const card = leftEl("post-confirm");
+  const { parent, before, place } = postCardSpot("main");
+  if (!parent || place === "dock" || card.getAttribute("data-place") !== "dock") return;
+  parent.insertBefore(card, before);
+  card.setAttribute("data-place", place);
+  card.removeAttribute("data-screen");
 }
 
 /**
