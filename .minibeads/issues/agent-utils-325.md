@@ -1,12 +1,13 @@
 ---
 title: 'provider-diagnostics-ids: Slack checks report under Discord ids'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.421406146+00:00
-updated_at: 2026-10-15T06:03:00.421406146+00:00
+updated_at: 2026-10-15T08:01:48.114966757+00:00
+closed_at: 2026-10-15T08:01:48.114966627+00:00
 ---
 
 # Description
