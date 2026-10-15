@@ -14628,6 +14628,10 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
     // rows would usually have expired by the time a cold start could use it.
     newest: prior ? prior.newest || null : null,
     fullAt: prior ? prior.fullAt || 0 : 0,
+    // `#308 live-reply-in-main`. And where that read was sent in the order of reads (`sentNumberOf`),
+    // which says whether another newest page of the view is older or newer than it. In memory only,
+    // as the order is.
+    fullSent: prior ? prior.fullSent || 0 : 0,
   });
 }
 
@@ -14657,6 +14661,7 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
     const cover = channelCanon.views.get(viewKey(view, thread));
     cover.newest = payload.next_after || null;
     cover.fullAt = Date.now();
+    cover.fullSent = sentNumberOf(payload);
     const asOf = staleAsOf(payload);
     if (asOf !== null) cover.at = asOf;
   }
@@ -18373,13 +18378,22 @@ async function readAllForCounts(channel) {
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}&reason=counts`,
       { signal }));
     countsAllReadFor.set(channel, outrun);
-    // All's newest page answers for what the stream had left unplaced, as any does. `#308`.
-    if (channelCanon === read.canon) answerUnplaced(read.canon, seen);
-    // Not over a newest page of All that landed while this was on the wire — the reader switched to
-    // All, or tapped N replies, and that read answered first: this answer is the older, and folded
-    // over it would take out as deleted what arrived in between.
-    const cover = channelCanon.views.get(viewKey("flat"));
-    if (!(cover && cover.fullAt > now)) foldLateTimelinePage(payload, read);
+    const current = channelCanon === read.canon && read.canon.channel === channel &&
+      String(el("discord-channel").value) === channel;
+    const number = sentNumberOf(payload);
+    // Not over a newest page of All sent after this one — the reader switched to All, or tapped N
+    // replies, and that read answered first: this answer is the older, and folded over it would take
+    // out as deleted what arrived in between. Sent after, not landed after (`#308`): one sent before
+    // this and landing while it was on the wire is the older, and this is folded over it.
+    if (!newerPage(channelCanon, "flat", number)) {
+      foldLateTimelinePage(payload, read);
+    } else if (current && placeFromPage(payload, read.canon, number)) {
+      // Not folded, it still says where each message the stream left unplaced that it carries is.
+      followPlacement();
+    }
+    // ...and, folded or not, answers for what the stream had left unplaced before it was sent, as any
+    // newest page of All does. `#308 live-reply-in-main`.
+    if (current) answerUnplaced(read.canon, seen);
   } catch (_error) {
     // The counts stay as they were until a read of All or of the thread; the next read of Main past
     // the interval asks again.
@@ -18418,7 +18432,26 @@ function sentEpochOf(payload) {
 }
 
 /**
- * Read one timeline page, remembering when it was sent (`readSpeaksFor`).
+ * By timeline answer, its read's place in the order reads were sent: `timelineAnswersAsked` once it
+ * had been sent. `#308 live-reply-in-main`: of two newest pages of a view, the one sent later is the
+ * newer, whichever lands first.
+ *
+ * @type {WeakMap<object, number>}
+ */
+const readSentNumbers = new WeakMap();
+
+/**
+ * Where `payload`'s read was sent in the order of every timeline read (`readSentNumbers`). Now — after
+ * every read sent so far — for a payload no read sent.
+ */
+function sentNumberOf(payload) {
+  const number = readSentNumbers.get(payload);
+  return typeof number === "number" ? number : timelineAnswersAsked;
+}
+
+/**
+ * Read one timeline page, remembering when it was sent (`readSpeaksFor`), and in what order
+ * (`sentNumberOf`).
  *
  * @param {string} path
  * @param {{signal?: AbortSignal}} [options]
@@ -18426,8 +18459,12 @@ function sentEpochOf(payload) {
  */
 async function readTimeline(path, options) {
   const sent = readStateEpoch;
-  const payload = await apiDecoded("TimelineResponse", path, options);
+  // Counted as it is sent, before the answer is awaited (`apiDecoded`).
+  const asked = apiDecoded("TimelineResponse", path, options);
+  const number = timelineAnswersAsked;
+  const payload = await asked;
   readSentEpochs.set(payload, sent);
+  readSentNumbers.set(payload, number);
   return payload;
 }
 
@@ -19687,6 +19724,21 @@ function answeredThread(message) {
 // reader's own — answers for every unplaced message that arrived before it was sent, carried or not:
 // one it does not carry has nothing there to place it by, and asking again would bring the same answer.
 //
+// AN ANSWER OF ALL THAT IS NOT FOLDED STILL PLACES WHAT IT CARRIES (`placeFromAnswer`). A newest page
+// of All is not folded over one sent after it, nor once the stream has delivered anything since it was
+// sent; a delta is not folded once All's cover has moved on from where it began; a late answer is not
+// used once something newer has replaced it. And behind a bridge that streams its answer by editing
+// it, every placing read is out while an edit arrives. Thrown away whole, each was asked again, and the
+// answer stayed on Main until the channel went quiet; marked as having answered without being folded,
+// a reply that a page of All sent before it arrived had taken out of the store was gone from Main, its
+// thread and the store for minutes. So each message left unplaced that such an answer carries takes
+// the thread record it carries there, and only that, as from an edit (`placeFromPage`): the answer may
+// be older than the store's copy, which keeps what it says. One the store no longer holds — taken out by a newest
+// page of Main, which never carries a thread reply, or by a newest page sent before it arrived — is put
+// back as the answer carries it, unless a newest page sent after the answer that speaks for it has
+// landed, and so said it is gone: one of All, or of Main for a message on the main channel. Which of two
+// pages is the newer is the order they were sent in, not landed in (`sentNumberOf`).
+//
 // NOR WHILE A READ OF THE CHANNEL THE PAGE GAVE UP ON MAY STILL BE ANSWERED (`remote-ops-audit` W7).
 // The server is still reading for it, and behind a bridge that read is a scan of the space: a read
 // beside it is the second scan W7 exists to prevent, and its late answer is used only if no read of the
@@ -19696,9 +19748,10 @@ function answeredThread(message) {
 // channel itself. So the placing read waits while any view of the channel is held (`readHolds`): until
 // the read given up on answers or fails, when it is asked for at once (`abandonRead`), or the server's
 // bound has passed, or a live event says the service is answering. Given up on itself, it is kept the
-// same way: its late answer is used if nothing has replaced it, and until then the poll of the view on
-// screen waits for it, since that answer brings that view up to date as well. A late answer asks again
-// for what it could not answer; a failure waits for the next read of the channel to end.
+// same way: its late answer is used if nothing has replaced it, and still places what it carries if
+// something has, and until then the poll of the view on screen waits for it, since that answer brings
+// that view up to date as well. A late answer asks again for what it could not answer; a failure waits
+// for the next read of the channel to end.
 
 /** How many messages the stream has left unplaced in this page, in any channel: the clock `unplacedSince` reads. */
 let unplacedArrivals = 0;
@@ -19793,10 +19846,13 @@ async function placeUnplaced() {
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
-        // A late answer that lands asks again for what it could not answer; a failure does not.
+        // A late answer that lands asks again for what it could not answer; a failure does not. One
+        // that something newer has replaced still places what it carries (`placeFromAnswer`).
         const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
-          (answer) => abandonRead(answer, read, (late) => landPlacingRead(late, read),
-            (landed) => { if (landed) queuePlaceUnplaced(); }));
+          (answer) => abandonRead(answer, read, (late) => landPlacingRead(late, read), (landed, unused) => {
+            if (unused) placeFromAnswer(unused, read);
+            if (landed) queuePlaceUnplaced();
+          }));
         read.number = timelineAnswersAsked;
         payload = await asked;
       } catch (error) {
@@ -19825,14 +19881,16 @@ async function placeUnplaced() {
 
 /**
  * The answer of the placing read `read` describes, in time or late (`abandonRead`), folded as a read of
- * All is. A delta that no longer continues All's cover — a read of All landed while it was out — is
- * dropped, and the read that landed has answered for what it carried; so is a late delta that says
- * more follows. A newest page is not folded over one of All that landed after it was sent, which is the
- * newer and placed whatever it carried. One that lands after the stream has delivered anything since it
- * was sent is dropped, and false is answered, to ask again: as the newest page of All it would take that
- * message out of the store as deleted upstream. Folded, it places each message it carries in every
- * column (`followPlacement`), and the view on screen in each is as current as this read of All, as for
- * any (`catchUpFromAll`, `#220 view-switch-instant`).
+ * All is: it places each message it carries in every column (`followPlacement`), and the view on screen
+ * in each is as current as this read of All, as for any (`catchUpFromAll`, `#220 view-switch-instant`).
+ *
+ * NOT FOLDED: a delta that no longer continues All's cover — a read of All landed while it was out — or
+ * a late one that says more follows; a newest page when a newest page of All SENT after it has landed
+ * (`newerPage`), which is the newer wherever it lands, while one sent before it is the older and this
+ * page is folded over it; and a newest page that lands after the stream has delivered anything since it
+ * was sent, which as the newest page of All would take that message out of the store as deleted
+ * upstream, and for which false is answered, to ask again for what arrived since. Not folded, the
+ * answer is still not thrown away (`placeFromAnswer`).
  *
  * @param {VibeTalk.TimelineResponse} payload
  * @param {PlacingRead} read
@@ -19841,12 +19899,18 @@ async function placeUnplaced() {
 function landPlacingRead(payload, read) {
   const { canon, channel } = read;
   if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return true;
-  if (read.sent && payload.delta) {
-    if (payload.delta.more || !foldTimelineDelta(payload, read.sent, "flat", null)) return true;
-  } else {
-    if ((liveEventsSeen.get(channel) || 0) !== read.live) return false;
-    const cover = canon.views.get(viewKey("flat"));
-    if (!(cover && cover.fullAt > read.sentAt)) foldTimelinePage(payload, false, "flat", null);
+  const delta = Boolean(read.sent && payload.delta);
+  const quiet = (liveEventsSeen.get(channel) || 0) === read.live;
+  let folded = false;
+  if (delta) {
+    folded = !payload.delta.more && foldTimelineDelta(payload, read.sent, "flat", null);
+  } else if (quiet && !newerPage(canon, "flat", read.number)) {
+    foldTimelinePage(payload, false, "flat", null);
+    folded = true;
+  }
+  if (!folded) {
+    placeFromAnswer(payload, read);
+    return delta || quiet;
   }
   answerUnplaced(canon, read.seen);
   if (inColumn(columns.main, () => channelView === "flat")) {
@@ -19859,6 +19923,79 @@ function landPlacingRead(payload, read) {
   followPlacement();
   eachColumn(catchUpFromAll);
   return true;
+}
+
+/**
+ * An answer of the placing read `read` describes that is not folded (`landPlacingRead`), or a late one
+ * that something newer has replaced (`abandonedReadStands`): what it says of the messages the stream
+ * left unplaced (`placeFromPage`), and it answers for the rest that arrived before it was sent as one
+ * folded does — unless it is a delta that says more follows, which is not all that changed.
+ *
+ * @param {VibeTalk.TimelineResponse} payload
+ * @param {PlacingRead} read
+ */
+function placeFromAnswer(payload, read) {
+  const { canon, channel } = read;
+  if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return;
+  const placed = placeFromPage(payload, canon, read.number);
+  if (!(read.sent && payload.delta && payload.delta.more)) answerUnplaced(canon, read.seen);
+  if (placed) followPlacement();
+}
+
+/**
+ * Whether a newest page of `view` sent after the read numbered `number` (`sentNumberOf`) has landed in
+ * store `canon`: that page is the newer, whichever of the two landed first. `#308 live-reply-in-main`.
+ *
+ * @param {any} canon
+ * @param {string} view
+ * @param {number} number
+ */
+function newerPage(canon, view, number) {
+  const cover = canon.views.get(viewKey(view, null));
+  return Boolean(cover && (cover.fullSent || 0) > number);
+}
+
+/**
+ * What `payload`, an answer of All that is not folded, says of the messages the stream left unplaced in
+ * store `canon`: see "an answer of All that is not folded" above. Each it carries is placed — the store's
+ * copy takes the thread record the answer's copy has, and nothing else of it, and one the answer carries
+ * without a record is on the main channel — and one the store no longer holds is put back as the answer
+ * carries it, unless a newest page sent after the answer (`number`, `sentNumberOf`) that speaks for it
+ * has landed. True when it placed any.
+ *
+ * @param {VibeTalk.TimelineResponse} payload
+ * @param {any} canon
+ * @param {number} number
+ * @returns {boolean}
+ */
+function placeFromPage(payload, canon, number) {
+  /** @type {Map<string, any>} by id, the answer's copies of the messages left unplaced */
+  const carried = new Map();
+  for (const message of payload.messages || []) {
+    if (canon.unplaced.has(String(message.id))) carried.set(String(message.id), message);
+  }
+  if (carried.size === 0) return false;
+  let placed = false;
+  canon.messages = canon.messages.map((held) => {
+    const id = String(held.id);
+    const copy = carried.get(id);
+    if (!copy) return held;
+    carried.delete(id);
+    canon.unplaced.delete(id);
+    placed = true;
+    return threadOf(copy) ? { ...held, thread: copy.thread } : held;
+  });
+  // One the store no longer holds was taken out by a newest page that does not speak for it — one of
+  // Main, which carries no thread reply, or one sent before it arrived — or by one sent after this
+  // answer that does, and said it is gone: a page of All, or of Main for a message on the main channel.
+  const back = newerPage(canon, "flat", number) ? []
+    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, "main", number));
+  if (back.length) {
+    for (const copy of back) canon.unplaced.delete(String(copy.id));
+    canon.messages = inTimeOrder([...canon.messages, ...back], "timestamp");
+    placed = true;
+  }
+  return placed;
 }
 
 /**
@@ -34593,15 +34730,16 @@ function noteLiveEvent(channel, fromTail) {
  * No hold when a live event that is news arrived for the channel after the read was sent: the service
  * is answering, and a read that event queued behind this one must go. And the hold goes when the
  * answer settles, landed or failed, used or not: the server is reading nothing for it then. What waited
- * for that is told through `settled`, after the answer is used, with whether it landed: the placing read
- * (`placeUnplaced`, `#308 live-reply-in-main`) waits while any read of its channel given up on may
- * still be answered.
+ * for that is told through `settled`, after the answer is used, with whether it landed, and the answer
+ * if it landed and was not used: the placing read (`placeUnplaced`, `#308 live-reply-in-main`) waits
+ * while any read of its channel given up on may still be answered, and its own answer, replaced, still
+ * says where what it carries is.
  *
  * @template T
  * @param {Promise<T>} answer
  * @param {AbandonedRead} read
  * @param {(payload: T) => void} land
- * @param {((landed: boolean) => void) | null} [settled]
+ * @param {((landed: boolean, unused: T | null) => void) | null} [settled]
  */
 function abandonRead(answer, read, land, settled = null) {
   const answering = (liveNewsSeen.get(read.channel) || 0) !== read.news;
@@ -34611,11 +34749,12 @@ function abandonRead(answer, read, land, settled = null) {
   };
   answer.then((payload) => {
     release();
-    if (abandonedReadStands(read)) land(payload);
-    if (settled) settled(true);
+    const stands = abandonedReadStands(read);
+    if (stands) land(payload);
+    if (settled) settled(true, stands ? null : payload);
   }, () => {
     release();
-    if (settled) settled(false);
+    if (settled) settled(false, null);
   });
 }
 
