@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -306,6 +306,16 @@ thread-card-header-browser:
 # another copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
 all-thread-strip-browser:
 	python3 tests/all_thread_strip_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#310 stale-live-read-flicker` in a real Chromium at 1280x800: in All on its newest line, two live
+# messages, the second pushed once the first one's read has reached the server, each live read answered
+# 300 ms late as the server had the channel when it arrived; the second message's row drawn and laid out
+# in every animation frame from its first until both reads have landed and 30 frames more. Its negative
+# control runs the same walk against a copy of the page with the fix taken out, which must miss the row
+# in some frame. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to
+# keep a PNG of each state.
+stale-live-read-browser:
+	python3 tests/stale_live_read_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#280 scroll-stability` in a real Chromium at 1280x800 in two columns (mouse) and 412x915 in one (touch):
 # the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive

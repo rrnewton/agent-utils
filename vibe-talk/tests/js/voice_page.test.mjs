@@ -61553,3 +61553,77 @@ for (const removal of ["after", "before", "tail"]) {
     assert.ok(shownIds(control.page).includes("200") && savedMessage(control.page, "200"));
   });
 }
+
+// --- `#310 stale-live-read-flicker`: a late live read never takes away what the stream drew after it ------
+//
+// A live message is drawn the moment the stream delivers it, and the page then reads the channel again.
+// When a second live message arrives while the first message's read is still on the wire, that read's
+// answer, taken before the second message existed, landed after the stream had drawn it, and redrew the
+// column without it until the second message's own read put it back: a message the reader saw arrive
+// disappeared and came back (against `#280 scroll-stability`). The column's own newest page is now
+// folded only over the store's copies as they were when it was sent (`pageFold`), as a late read of All
+// is (`#316 late-counts-resurrect`): a message the store gained since is newer than it, and stays.
+
+for (const view of ["flat", "main"]) {
+  test(`\`#310 stale-live-read-flicker\`: a second live message drawn while the first one's read is out stays drawn when that read lands late (${view === "flat" ? "All" : "Main"})`, async () => {
+    const run = async (script) => {
+      const page = newPage(new Map(), script);
+      const data = threadData();
+      page.threadingSupported = true;
+      page.threads = data.threads;
+      await signIn(page);
+      await showDiscord(page, data.messages);
+      if (view === "main") await pickThread(page, "main");
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(page.el("thread-select").value, view, "fixture: not the view meant");
+      const serve = page.timeline;
+      /** @type {Array<() => void>} */
+      const held = [];
+      page.timeline = (path, options) => {
+        if (new URL(path, "http://fixture.test").searchParams.get("reason") !== "live") return serve(path, options);
+        // Answered as the server had it when asked, and handed over later.
+        const answer = Promise.resolve(serve(path, options)).then(async (response) => {
+          const body = await response.text();
+          return { ...response, text: async () => body };
+        });
+        return new Promise((resolve) => held.push(() => resolve(answer)));
+      };
+      const first = message({ id: "300", content: "the first live message" });
+      page.messages.push(first);
+      await deliver(page, page.stream(), sseMessage(first));
+      for (let i = 0; i < 2; i += 1) await page.settle();
+      assert.equal(held.length, 1, "fixture: the first message's read was not made");
+      // Thirteen milliseconds later, the second, while the first one's read is still out.
+      page.setClock(page.clock() + 13);
+      // From someone else, so the two are rows of their own.
+      const second = message({ id: "301", content: "the second live message", author: "alice",
+        author_id: "1000000000000000005", author_is_bot: false });
+      page.messages.push(second);
+      await deliver(page, page.stream(), sseMessage(second));
+      for (let i = 0; i < 2; i += 1) await page.settle();
+      const drawn = rowOf(page, "301");
+      assert.ok(drawn, "fixture: the stream did not draw the second message");
+      // The first message's read lands, late: taken before the second message existed.
+      held.shift()();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      const landed = { ids: shownIds(page), same: rowOf(page, "301") === drawn, saved: savedMessage(page, "301") !== null,
+        asked: held.length };
+      // And the second message's own read.
+      while (held.length) held.shift()();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      return { page, landed };
+    };
+    const { page, landed } = await run(SCRIPT);
+    assert.equal(landed.asked, 1, "fixture: the second message's read was not asked behind the first");
+    assert.ok(landed.ids.includes("301"), `the late read took away the message the stream drew after it was sent: ${JSON.stringify(landed.ids)}`);
+    assert.ok(landed.same, "the late read redrew the second message's row");
+    assert.ok(landed.saved, "the late read took the second message out of the store");
+    assert.ok(shownIds(page).includes("300") && shownIds(page).includes("301"), "a live message is missing once both reads landed");
+
+    // THE CONTROL, as before: the column's own newest page folded whatever the store gained since it was
+    // sent takes the second message away until its own read lands.
+    const control = await run(brokenScript("      const held = heldNow(canon);\n", "      const held = null;\n"));
+    assert.ok(!control.landed.ids.includes("301"), "the late read left the second message drawn anyway, so this test cannot see it");
+    assert.ok(shownIds(control.page).includes("301"), "the control's second read did not put the message back");
+  });
+}

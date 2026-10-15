@@ -389,9 +389,10 @@ def push_live(desk: Desk, api: StripApi, message: Json, condition: str, why: str
     `condition` to hold steadily (`steady`).
 
     A read asked before a message existed does not hold it, and its answer, landing after the stream
-    has drawn the message, redraws the list without it for a few frames, until the message's own read
-    puts it back: `#310 stale-live-read-flicker`. So the next message is not pushed while an earlier
-    one's read is on the wire, and no check reads a state that has not held."""
+    had drawn the message, redrew the list without it for a few frames, until the message's own read
+    put it back: `#310 stale-live-read-flicker`, fixed and checked frame by frame in
+    tests/stale_live_read_browser.py. This check's subject is the strips, so it still pushes one read at a
+    time and reads only a state that has held."""
     deadline = time.monotonic() + 15
     while not reads_idle(api) and time.monotonic() < deadline:
         desk.page.wait_for_timeout(25)

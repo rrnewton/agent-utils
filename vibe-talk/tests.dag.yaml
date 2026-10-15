@@ -619,6 +619,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#310 stale-live-read-flicker` in the browser engine, at 1280x800 in All on its newest line: two live
+  # messages, the second pushed once the first one's read has reached the server, each live read answered
+  # 300 ms late as the server had the channel when it arrived; the second message's row drawn and laid out
+  # in every animation frame from its first until both reads have landed and 30 frames more, and the first
+  # message's too. Its negative control runs the same walk against a copy of the page with the fix taken
+  # out, which must miss the row in some frame. Measured on 2026-10-14: about 6s wall, 1s CPU.
+  - group: check
+    job: stale-live-read-browser
+    desc: a live message the stream drew stays drawn in every frame when a read asked before it lands late, with a negative control against the page without the fix, in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/stale_live_read_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#280 scroll-stability` in the browser engine, at 1280x800 in two columns with a mouse and at 412x915
   # in one by touch: with the reader scrolled up in Main, the first row on screen and its offset hold
   # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message

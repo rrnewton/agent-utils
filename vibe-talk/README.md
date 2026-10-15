@@ -5601,6 +5601,10 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   line follows it. That holds for the first read behind the rows this device saved, too.
 - **A message arriving live is followed only by a reader already on the newest line**, asked before it
   goes in; everyone else is left exactly where they are and offered the jump to it.
+- **A message the stream has drawn stays drawn** (`#310 stale-live-read-flicker`). A read asked before it
+  arrived, landing after, changes only what the page held as it held it when the read went out: it
+  never takes away a message that arrived meanwhile. Two live messages a moment apart used to have the
+  first one's read redraw the list without the second for a dozen frames.
 - **In the right column, a reader on the newest line stays on it** when what is in the list changes size
   under them with nothing scrolled — above all the card under the pointer drawn whole — and a reader up
   the list is held by the card or row they are on. Main keeps `#207 scrollback-jump`'s rule: a newest
@@ -5642,7 +5646,10 @@ the top bar, ] on its own, and the mouse going on from a card it highlighted ove
 dock; a reader on the newest line following; the threads and their list opening at the foot; and the view
 keys, each held 2.5 s: the thread list at its foot from two columns, Main and All, Main coming back where
 the reader left it, a thread opened from the list at its foot, a reload in the list at its foot with the
-desk's dock on two rows, and nothing moving after any of them.
+desk's dock on two rows, and nothing moving after any of them. `tests/stale_live_read_browser.py` (DAG
+step `stale-live-read-browser`) samples every frame in Chromium while two live messages arrive with the
+first one's read answered late, and requires the second message's row in each; its negative control, the
+page without the fix, must miss it.
 
 ### A filter keeps your place
 

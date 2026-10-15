@@ -14684,7 +14684,11 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
  */
 function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId, held = null) {
   const channel = String(el("discord-channel").value);
-  if (channelCanon.channel !== channel) loadCanon(channel);
+  if (channelCanon.channel !== channel) {
+    loadCanon(channel);
+    // Copies of another store say nothing of this one's.
+    held = null;
+  }
   const hasMore = payload.has_more === true;
   // Outside the thread view a page names a thread only when the channel IS that one thread.
   const scopeWas = channelCanon.scope;
@@ -18899,15 +18903,24 @@ function rowsAsDrawn(pages) {
  * as a refresh that keeps the reader's place is — the store's projection of the view — but it says
  * nothing about older history, so the walk back keeps its cursor, and it names only the archived
  * rows among its own. `rows`, with `saved`, draws those rows of the store in place of a projection:
- * a view no page has covered yet, drawn from what the store holds for it (`drawHeldRows`).
+ * a view no page has covered yet, drawn from what the store holds for it (`drawHeldRows`). `held`, for
+ * a newest page, is the store's copies as its read was sent (`heldNow`): it is folded only over those
+ * (`pageFold`, `#310 stale-live-read-flicker`).
+ *
+ * @param {any} payload
+ * @param {boolean} [older]
+ * @param {boolean} [saved]
+ * @param {boolean} [delta]
+ * @param {any[] | null} [rows]
+ * @param {Map<string, any> | null} [held]
  */
-function applyTimelinePage(payload, older = false, saved = false, delta = false, rows = null) {
+function applyTimelinePage(payload, older = false, saved = false, delta = false, rows = null, held = null) {
   if (!saved) observeOutgoingMessages(payload.messages || []);
   const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
   const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
   // Into the channel's store, and this view back out of it: what the reader sees is the store's
   // projection, so a row another view corrected or the stream delivered is here too.
-  if (!saved && !delta) foldTimelinePage(payload, older);
+  if (!saved && !delta) foldTimelinePage(payload, older, channelView, selectedThreadId, held);
   const merged = rows || projectView() || [];
   if (channelView === "threads") timelineThreads = merged;
   else timelineMessages = merged;
@@ -19205,12 +19218,16 @@ async function loadTimeline(options) {
       const path = timelinePath(null, sent, readReasonOf(options));
       // What the stream had left unplaced when this went out, which a newest page of All answers for.
       const seenArrivals = unplacedArrivals;
+      // `#310 stale-live-read-flicker`. And the store's copies as it went out: a newest page is folded
+      // only over those (`pageFold`). A message the stream drew while it was out is newer than it, and
+      // this page, landing after, redrew the column without it until the next read put it back.
+      const held = heldNow(canon);
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
       try {
         steps.pause();
         // `remote-ops-audit` W7. Given up on, the read is kept, and its view held (`abandonRead`).
-        const abandoned = { key: holdKey, context, channel, view, thread, canon, column: steps.column, sent,
+        const abandoned = { key: holdKey, context, channel, view, thread, canon, column: steps.column, sent, held,
           sentAt: Date.now(), live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0 };
         const asked = within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(path, { signal }),
           // Once it settles, the placing read that waited for it goes (`placeUnplacedWaits`). `#308`.
@@ -19299,7 +19316,7 @@ async function loadTimeline(options) {
         ? await inColumn(steps.column, () => pagesBackTo(payload, placeAt, stillCurrent)) : [];
       steps.resume();
       if (!current || !stillCurrent()) {
-        foldLateTimelinePage(payload, { context, channel, view, thread, canon, column: steps.column });
+        foldLateTimelinePage(payload, { context, channel, view, thread, canon, column: steps.column, held });
         return;
       }
       // Remove the in-flow indicator before measuring or restoring scroll. In
@@ -19327,7 +19344,7 @@ async function loadTimeline(options) {
       const owed = entryReadOwed === context;
       const landing = behindHeld || owed ? entryLandingMark() : null;
       holdingScrollTools(() => {
-        let messages = applyTimelinePage(payload);
+        let messages = applyTimelinePage(payload, false, false, false, null, sameStore() ? held : null);
         for (const page of older) messages = applyTimelinePage(page, true);
         settleAfterRead(messages, { area, ...at, ownAct });
         noteFreshRead(payload);
@@ -35761,7 +35778,7 @@ function abandonedReadStands(read) {
  *
  * @param {VibeTalk.TimelineResponse} payload
  * @param {{context: string, channel: string, view: string, thread: any, canon: any, column: typeof activeColumn,
- *   sent: string | null}} read
+ *   sent: string | null, held: Map<string, any>}} read
  */
 function landAbandonedTimelineRead(payload, read) {
   inColumn(read.column, () => {
@@ -35782,7 +35799,7 @@ function landAbandonedTimelineRead(payload, read) {
     const area = el("scroll-area");
     const at = landedReadPosition(area, true, false);
     holdingScrollTools(() => {
-      const messages = applyTimelinePage(payload, false, false, delta);
+      const messages = applyTimelinePage(payload, false, false, delta, null, read.held);
       settleAfterRead(messages, { area, ...at });
       noteFreshRead(payload);
       saveChannelScope();
