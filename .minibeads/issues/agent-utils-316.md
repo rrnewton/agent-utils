@@ -1,12 +1,13 @@
 ---
 title: 'late-counts-resurrect: a late read of All brings back a removed message or undoes an edit'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T05:48:32.159307484+00:00
-updated_at: 2026-10-15T05:48:32.159307484+00:00
+updated_at: 2026-10-15T09:39:49.114619236+00:00
+closed_at: 2026-10-15T09:39:49.114619056+00:00
 ---
 
 # Description
