@@ -1186,8 +1186,9 @@ impl Writer<'_> {
     /// provider dated before them (a bridge's copy it could not bring up to date, which the fill
     /// dates then). Landing in a channel that no longer remembers the change, that copy would bring
     /// back a deleted message, or text edited away, and the feed would vouch for it for as long as
-    /// the process runs: the feed vouches for nothing since the file was opened only because every
-    /// change since then reached the file, or was recorded as left out.
+    /// the process runs: the feed vouches for what was seen since its window began
+    /// ([`super::MessageCache::fed_since_ms`]) only because every change since then reached the
+    /// file, or was recorded as left out.
     ///
     /// So each is recorded as a drop, now, after every observation the erase forgot ([`Writer::lost`]),
     /// and the channel's next row takes it when it is made ([`Writer::intern`]): no row observed by
@@ -1364,7 +1365,21 @@ impl Writer<'_> {
     ) -> rusqlite::Result<Outcome> {
         match self.shared.epochs.currency(chan, stamp) {
             Currency::Current => {}
-            Currency::Stale => return Ok(Outcome::Stale),
+            // Begun before an erase of its whole channel or its provider (access confirmed lost, a
+            // provider erase, a sweep): dropped unwritten, and recorded as left out. Such an erase
+            // records what it forgot as a drop once it commits ([`Writer::forget_feed`]), but only
+            // for a channel the file held a row of; for one it held nothing of (nothing written
+            // yet, or an earlier whole erase took its row) the change dropped here, a deletion or
+            // an edit, would leave no trace, and a copy read after the erase, dated before the
+            // change, would undo it unchallenged. One begun before an erase of the whole file is
+            // moot: the file it was meant for is gone, and the feed vouches for nothing seen
+            // before the fresh one was installed.
+            Currency::Stale => {
+                if stamp.generation == self.shared.epochs.generation() {
+                    self.lost(chan);
+                }
+                return Ok(Outcome::Stale);
+            }
             // Begun before an erase of one scope of the channel, whose other scopes keep their
             // rows: a deletion it carries still takes out what is left, and anything else is left
             // out as a full queue's drop is, the channel in doubt from now on. Dropped silently, a
@@ -1377,13 +1392,20 @@ impl Writer<'_> {
             }
         }
         if !self.routed(chan) {
-            // A deletion writes nothing of any message. One for a channel the snapshot does not
-            // name, or offered before any snapshot came (a server whose channel list could not be
-            // put together), still takes out what the file holds of it, and nothing more.
+            // Nothing is written of a channel the snapshot does not name, or of any channel before
+            // a snapshot came (a server whose channel list could not be put together, or one not
+            // yet armed): what was offered for it is left out, and so recorded ([`Writer::lost`]).
+            // Dropped silently, a change the feed delivered would leave no trace, and a copy read
+            // once the channel is listed, dated before the change, would undo it unchallenged. A
+            // deletion still takes out what the file holds of it, and nothing more; one that took
+            // out every message it names left nothing out.
             if observation.removes_only() {
-                self.remove_held(chan, observation)?;
+                if !self.remove_held(chan, observation)? {
+                    self.lost(chan);
+                }
                 return Ok(Outcome::Applied);
             }
+            self.lost(chan);
             return Ok(Outcome::Unrouted);
         }
         self.observe(chan, observation)?;
@@ -1392,37 +1414,42 @@ impl Writer<'_> {
 
     /// A deletion of a channel off the route snapshot: each message it names that the file holds
     /// is tombstoned, under the rule every deletion follows. Nothing is written for a channel or a
-    /// message the file does not hold.
-    fn remove_held(&mut self, chan: &ChanKey, observation: &Observation) -> rusqlite::Result<()> {
-        let Some(chan_id) = self.find_chan(chan)? else {
-            return Ok(());
-        };
+    /// message the file does not hold. Whether every message it names was held: tombstoned, or
+    /// kept because a read that began after the deletion saw it. One that was not is a deletion
+    /// the file lacks.
+    fn remove_held(&mut self, chan: &ChanKey, observation: &Observation) -> rusqlite::Result<bool> {
         let (ids, observed_ms): (Vec<&MessageId>, i64) = match observation {
             Observation::Deleted { ids, observed_ms } => (ids.iter().collect(), *observed_ms),
             Observation::Push {
                 push: Push::Delete { id, .. },
                 observed_ms,
             } => (vec![id], *observed_ms),
-            _ => return Ok(()),
+            _ => return Ok(true),
         };
+        let Some(chan_id) = self.find_chan(chan)? else {
+            return Ok(ids.is_empty());
+        };
+        let mut every = true;
         for id in ids {
             let held = self
                 .hot
                 .row_select
                 .query_row(params![chan_id, id.as_str()], Row::from_sql)
                 .optional()?;
-            if let Some(row) = held.filter(|row| row.observed_ms <= observed_ms) {
-                self.tombstone(
+            match held {
+                Some(row) if row.observed_ms <= observed_ms => self.tombstone(
                     chan,
                     chan_id,
                     row.row_id,
                     id.as_str(),
                     row.created_ms,
                     observed_ms,
-                )?;
+                )?,
+                Some(_) => {}
+                None => every = false,
             }
         }
-        Ok(())
+        Ok(every)
     }
 
     fn observe(&mut self, chan: &ChanKey, observation: &Observation) -> rusqlite::Result<()> {

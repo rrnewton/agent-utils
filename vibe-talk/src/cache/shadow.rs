@@ -17,8 +17,8 @@
 //!
 //! | Consumer | Would serve when |
 //! |---|---|
-//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the latest read of the scope's newest end began at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions and has run since that claim was read, nothing served is in doubt (see below), and the barrier passed |
-//! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since this process opened the file (a deletion made before then, while the server was down, reached nothing); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
+//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the latest read of the scope's newest end began at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel is live-fed by a feed that carries edits and deletions, which have reached the file since that claim was read, nothing served is in doubt (see below), and the barrier passed |
+//! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is live-fed and the message was seen, or that coverage revalidated, since the feed's changes have reached the file: since this process's file could take them and the route list first reached it (a deletion made before then, while the server was down or the list unknown, reached nothing; a channel put back on the list, or added to it, is in doubt until read again, since nothing of it reached the file while it was off); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
 //! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), the band is vouched for as for `messages`, no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
 //! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the band is vouched for as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
 //! | `timeline_fallback` | coverage holds `limit` rows down from the head, the band is vouched for as for `messages` (so a row pushed or posted above the head is never served), nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
@@ -32,7 +32,9 @@
 //!   snapshot, an erase of it is waiting, access to it is in doubt, its provider is suspended, or
 //!   the read failed;
 //! - `suspect`: something the answer rests on is in doubt. An offer for the channel was dropped
-//!   (the queue was full, or its provider's account was not checked against the file), in this
+//!   (the queue was full, or its provider's account was not checked against the file), the file
+//!   forgot or never took what the feed delivered for it (an erase of the whole channel, a change
+//!   such an erase discarded, a change made while the channel was off the route list), in this
 //!   process or, as the file records, an earlier one; and a row the answer would hold has not been
 //!   seen by a read that began after the latest drop, or the answer needs the scope's head and no
 //!   read of that scope's newest end began after it. A read lifts the doubt about exactly what it
@@ -387,8 +389,9 @@ pub struct Facts {
     /// Whether a live producer feeds the channel: its provider is polled, or adapters push.
     pub live_fed: bool,
     /// Since when every change the live feed offered for the channel reached the file or was
-    /// recorded as left out: when this process opened the file ([`super::MessageCache::fed_since_ms`]).
-    /// A live feed vouches for nothing seen before it. `None` when not known: then for nothing.
+    /// recorded as left out: from when this process's file could take offers and the route list
+    /// first reached it ([`super::MessageCache::fed_since_ms`]). A live feed vouches for nothing
+    /// seen before it. `None` when not known: then for nothing.
     pub fed_since_ms: Option<i64>,
     /// The latest local time an offer for the channel was dropped in this process, if one was.
     /// The rule takes the later of this and the file's [`View::dropped_ms`].
@@ -557,9 +560,10 @@ fn current(full_ms: Option<i64>, facts: &Facts) -> bool {
 }
 
 /// Whether the live feed has carried every edit and deletion since local time `at_ms`: the
-/// provider's feed carries them, a live producer feeds the channel, and the feed's current run (the
-/// file's opening in this process) began no later than `at_ms`. A change made before the run began
-/// (while the server was down, say) reached nothing, and no drop records it.
+/// provider's feed carries them, a live producer feeds the channel, and the feed's current run
+/// (from when the file could take offers in this process and the route list first reached it)
+/// began no later than `at_ms`. A change made before the run began (while the server
+/// was down, say) reached nothing, and no drop records it.
 fn fed_since(at_ms: i64, facts: &Facts) -> bool {
     facts.feed == Feed::Deletions
         && facts.live_fed
