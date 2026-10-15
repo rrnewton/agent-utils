@@ -6906,11 +6906,19 @@ message a filter change holds, or where entering a thread landed them — stays 
 offered the jump to it. Its going moves the list no more: a reader on the newest line is on it still
 as the box takes the focus the card had, and when the box takes back its room a second later,
 whatever redraws the list in that second, without leaning on the browser's own scroll anchoring.
-In two columns, where Reply is a box at the foot of a column rather than
-a screen (`#277 reply-in-column`), the card stays the left list's next message, wholly above that
-box. Under Reply, and while a reply is open in either column, the card's Send is outlined, so the
-filled **Send reply** is never taken for it. It names what it answers in words ("replying to Alex:
-…") and never by id. It is built so that a tap confirms only what the owner read. When a card appears, or a newer
+Nor does two columns coming or going, though the left column is drawn at half the window's width
+there, the card and every row with it: a reader at the foot of Main or All is at the foot of the
+left column by Ctrl+4, Send on screen, and at the foot again by Ctrl+1 or Ctrl+2, and one further
+up, on a message Main draws as well as All, stays on it. One the change could not keep where they
+were — up All on replies Main lacks, or near the foot of a column the card grows taller in — is
+where they were again on the way back, unless they moved in between. And Main, by Ctrl+1 or by
+Ctrl+4, takes a reader who could see the card and only replies Main lacks to its foot, the card in
+reach, not to wherever Main was last left. In two columns, where Reply is a box at the foot of a
+column rather than a screen (`#277 reply-in-column`), the card stays the left list's next message,
+wholly above that box. Under Reply, and while a reply is open in either column, the card's Send is
+outlined, so the filled **Send reply** is never taken for it. It names what it answers in words
+("replying to Alex: …") and never by id. It is built so that a tap confirms only what the owner
+read. When a card appears, or a newer
 proposal replaces the text, both its buttons are held for two seconds and a replacement says the
 text changed, so a tap already on its way lands on neither the new words nor Don't send. Don't send
 is never held while a spoken yes to the card is settling, though: then the card says "Heard yes —

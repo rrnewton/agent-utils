@@ -90,11 +90,20 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      Main and up All, who sees the card and no row, finds the card where it stood, within a pixel,
      and Send as tappable as it was, after Cmd+3 and Esc, Cmd+3 and the view's own key, and a switch
      between Main and All by Cmd+2 or Cmd+1.
+ 17. At the desk, a long draft opened by More is drawn taller in two columns' left column, half the
+     window wide, than across it in one (`#280 scroll-stability`). With the mouse's wheel and real
+     keys, Main left 400px up its list first: a reader at the foot of Main or All is at the foot of
+     the left column after Ctrl+4, Send tappable and no jump offered, still there a second later, and
+     at the foot again after Ctrl+1 or Ctrl+2; a reader 400px up either is on the same row within a
+     pixel through both. And back from a change of layout that could not keep the place: a reader
+     40px up All, on a reply Main lacks, is at Main's foot in two columns and on the same row again
+     after Ctrl+2; one 40px up Main in two columns is at its foot in one, the card shorter there,
+     and on the same row again after Ctrl+4.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
 9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 to 13, 15 and 16 at 393x852;
-and points 8 and 11 to 15 at 1280x800 with a mouse.
+and points 8, 11 to 15 and 17 at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -2018,8 +2027,121 @@ def opened_card_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size:
             f" {mod}+3 and Esc, {mod}+3 and the view's key, and {mod}+2 and {mod}+1")
 
 
+def wheel_to_foot(page: Page) -> None:
+    """The mouse's wheel turned down over the channel's list until it can go no further."""
+    page.mouse.move(300, 400)
+    for _ in range(12):
+        page.mouse.wheel(0, 600)
+        page.wait_for_timeout(60)
+    page.wait_for_timeout(500)
+
+
+def wheel_up(page: Page, px: int) -> None:
+    """The mouse's wheel turned up `px` over the channel's list."""
+    page.mouse.move(300, 400)
+    page.mouse.wheel(0, -px)
+    page.wait_for_timeout(600)
+
+
+def two_columns_opened_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> str:
+    """Point 17, at the desk: a long draft opened by More is drawn taller in two columns' left column than
+    across the window, and a reader at the foot of Main or All is at the left column's foot through Ctrl+4
+    and back, Send tappable; one up either is on their row."""
+    width, height = size
+    where = f"{width}x{height}, two columns and the draft opened by More"
+    mod = "Control"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        propose(page, api, 91, LONG_DRAFT)
+        page.wait_for_timeout(HOLD_MS + 200)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        page.click("#post-confirm-more")
+        page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                               timeout=5000)
+        page.wait_for_timeout(300)
+        for view, digit in (("Main", 1), ("All", 2)):
+            # At the foot. Main is left up its list first, so that where it was left is no help: Ctrl+4 from
+            # All's foot read the reader as up All, on replies Main lacks, and put Main back there.
+            view_key(page, mod, 1, None, None)
+            wheel_up(page, 400)
+            if digit == 2:
+                view_key(page, mod, 2, None, None)
+            page.evaluate("() => document.getElementById('scroll-area').focus({ preventScroll: true })")
+            wheel_to_foot(page)
+            before = page.evaluate(OPENED_CARD_JS)
+            check(rect(still(page), "gap") <= 1 and before["parent"] == "pane-discord" and before["sendHit"],
+                  f"{where}: the premise, a reader at {view}'s foot, Send tappable: {before}, {still(page)}")
+            view_key(page, mod, 4, None, "two")
+            for when in ("", " a second later"):
+                if when:
+                    page.wait_for_timeout(1000)
+                two = page.evaluate(OPENED_CARD_JS)
+                now = still(page)
+                check(rect(two, "height") > rect(before, "height") + 24,
+                      f"{where}: the premise, the card taller in two columns than in one ({rect(two, 'height'):.0f}px,"
+                      f" {rect(before, 'height'):.0f}px across the window)")
+                check(rect(now, "gap") <= 1 and two["sendHit"] and now["jump"] is None,
+                      f"{where}: {mod}+4 left a reader who was at {view}'s foot {rect(now, 'gap'):.0f}px above the left"
+                      f" column's foot{when}, Send tappable {two['sendHit']}, the jump saying {now['jump']!r}")
+            view_key(page, mod, digit, None, None)
+            back = page.evaluate(OPENED_CARD_JS)
+            now = still(page)
+            check(page.evaluate(PICKED_VIEW_JS) == ("main" if digit == 1 else "flat") and rect(now, "gap") <= 1 and
+                  back["sendHit"],
+                  f"{where}: {mod}+4 and {mod}+{digit} left a reader who was at {view}'s foot {rect(now, 'gap'):.0f}px"
+                  f" above it, Send tappable {back['sendHit']}")
+
+            # 400px up: on the same row through two columns and back.
+            wheel_up(page, 400)
+            up = still(page)
+            first = up["first"]
+            check(isinstance(first, dict) and rect(up, "gap") > 30, f"{where}: the premise, a reader up {view}: {up}")
+            view_key(page, mod, 4, None, "two")
+            two_first = still(page)["first"]
+            view_key(page, mod, digit, None, None)
+            back_first = still(page)["first"]
+            check(same_row(first, two_first) and same_row(first, back_first),
+                  f"{where}: {mod}+4 and {mod}+{digit} moved the row a reader 400px up {view} was on from {first} to"
+                  f" {two_first}, then {back_first}")
+
+        # Back from a change of layout that could not keep the place: a reader 40px up All, on a reply Main
+        # lacks, is at Main's foot in two columns, and on their row again by Ctrl+2; one 40px up Main in two
+        # columns, nearer its foot than the card grows there, is at Main's foot in one column, and on their
+        # row again by Ctrl+4.
+        for start, there, back_digit, label in ((2, None, 2, "All"), (4, "two", 1, "Main in two columns")):
+            if page.evaluate(COLUMNS_ATTR_JS) != there or (start == 2 and page.evaluate(PICKED_VIEW_JS) != "flat"):
+                view_key(page, mod, start, None, there)
+            wheel_to_foot(page)
+            wheel_up(page, 40)
+            before_trip = still(page)
+            check(isinstance(before_trip["first"], dict) and 24 < rect(before_trip, "gap") < 100,
+                  f"{where}: the premise, a reader 40px up {label}: {before_trip}")
+            view_key(page, mod, 4 if start == 2 else 1, None, "two" if start == 2 else None)
+            away = still(page)
+            check(rect(away, "gap") <= 1,
+                  f"{where}: the premise, the reader 40px up {label} at the foot after the change ({away})")
+            view_key(page, mod, back_digit if start == 2 else 4, None, None if start == 2 else "two")
+            returned = still(page)["first"]
+            check(same_row(before_trip["first"], returned),
+                  f"{where}: the way back moved the row a reader 40px up {label} was on from {before_trip['first']}"
+                  f" to {returned}")
+        check(not api.commits and not api.cancels and api.proposal is not None,
+              f"{where}: a view key posted or withdrew the draft ({api.commits}, {api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader at the foot of Main and of All at the left column's foot by {mod}+4, Send tappable,"
+            f" and at it again by {mod}+1 and {mod}+2; one 400px up either on their row; one 40px up All on their"
+            f" row again by {mod}+4 and {mod}+2, and one 40px up Main in two columns by {mod}+1 and {mod}+4")
+
+
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
-    """Points 8 and 11 to 15 on a desk with a mouse, where two columns are offered."""
+    """Points 8, 11 to 15 and 17 on a desk with a mouse, where two columns are offered."""
     width, height = DESK
     voice = FakeVoice()
     with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-approval-card-") as directory:
@@ -2038,6 +2160,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
             line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
             line += "; " + room_back_case(page, url, voice, api, DESK, False)
+            line += "; " + two_columns_opened_case(page, url, voice, api, DESK)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()

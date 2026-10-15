@@ -18116,6 +18116,9 @@ function rememberChannelContext() {
  * nowhere: Cmd+3 and Esc brought them back 995px above the foot, the card 919px lower and Send off
  * screen, and one 200px up was taken to the foot. Only there: a reader who can see a row is on that row,
  * as before, card or no card.
+ *
+ * ...and whether the card was on screen at all (`cardSeen`), rows or none: a reader near enough the foot
+ * to see it, for a switch that finds none of their rows in the view it goes to (`changeChannelView`).
  */
 function readerPlace() {
   const area = el("scroll-area");
@@ -18129,10 +18132,13 @@ function readerPlace() {
     .map(({ row, box }) => ({ ids: idsOf(row), top: box.top }));
   const card = seen.length === 0 ? channelCard() : null;
   const box = card ? card.getBoundingClientRect() : null;
+  const footCard = channelCard();
+  const footBox = footCard ? footCard.getBoundingClientRect() : null;
   return {
     pinned: currentView === "discord" && atBottom(area),
     seen,
     card: box && box.bottom > top && box.top < bottom ? box.top : null,
+    cardSeen: Boolean(footBox && footBox.bottom > top && footBox.top < bottom),
   };
 }
 
@@ -18205,13 +18211,18 @@ async function readBehindSwitch() {
  * does not cover is drawn from the rows the store holds for it, and read behind them; and only a
  * view with nothing at all to draw is emptied and read with the loading line. Main and All keep the
  * reader on the message they were reading.
+ *
+ * `#269 approval-card-inline` x `#280 scroll-stability`. `before`: where the reader of the left column
+ * was before a change of layout that brings this switch, read before the layout drew that column at
+ * another width (`leftColumnPlace`). Read here, after it, the place is not the one the reader had.
  */
-async function changeChannelView(view, threadId = null, summary = null, origin = null) {
+async function changeChannelView(view, threadId = null, summary = null, origin = null, before = null) {
   // `#277 reply-in-column`. The list a reply open in this column answers a message of is going.
   if (replyDocked && activeColumn === replyColumn) putDockedReplyAway();
   // Before the view goes: where the reader is, and how current what they are reading is — what a
-  // view drawn from held rows is as current as.
-  const place = readerPlace();
+  // view drawn from held rows is as current as. Where a change of layout brings the switch, where the
+  // reader of the left column was before it (`before`, `leftColumnPlace`).
+  const place = before && !sideActive ? before : readerPlace();
   const from = channelView;
   const came = { freshAt: channelFreshAt, freshness: channelFreshness };
   // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
@@ -18301,7 +18312,12 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   if (held) {
     el("scroll-area").scrollTop = held.top;
     restoreScroll(held.position);
-    if (keepPlace) keepReaderPlace(place);
+    // `#269 approval-card-inline` x `#280 scroll-stability`. A reader who could see the send card at the
+    // foot, and no message this view shows — replies near All's foot, which Main lacks — is at its foot,
+    // the card in reach, as in a view not held, rather than where the view was last left: in Chromium at
+    // a desk, Ctrl+4 from 40px up All, a long draft opened by More, left Main 326px above its foot, where
+    // an earlier visit had left it, Send off screen.
+    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();
     catchUpHeldView();
     // What was read, dealt with or answered elsewhere since the held rows were drawn: in a thread
     // just left, above all, whose replies Main's chips count (`#222 unread-replies`).
@@ -33612,6 +33628,26 @@ let listHeldPlace = null;
  */
 let listCardsHeld = null;
 
+/**
+ * Where the reader of the left column was before the last change between one column and two (`left`,
+ * read by `renderColumns`), and where that change left them (`placed`), for the way back: the change
+ * back to layout `from` puts them where they were there, unless they have moved since. Set by each change
+ * between one column and two, spent by the next change of layout. `#269 approval-card-inline` x `#280
+ * scroll-stability`.
+ *
+ * A change of layout keeps the place it reads, but not always where it goes, and a place it could not
+ * keep was lost on the way back. Main lacks All's replies, so a reader up All near its foot is at Main's
+ * foot in two columns, which is only geometry; but Ctrl+2 then read them as on Main's newest line and took
+ * All to its foot: in Chromium at a desk a reader 40px up All with a long draft opened by More, and one
+ * 30px up with no draft at all. And the card at the foot is taller in two columns' narrower left column,
+ * so a reader 40px up Main there was at Main's foot in one column by Ctrl+1, and Ctrl+4 kept them at the
+ * foot. So the place read before is put back on the way back where the reader left the column as the
+ * change left it (`keepLeftColumnPlace`); one who moved it is placed where they are now.
+ *
+ * @type {{left: NonNullable<ReturnType<typeof leftColumnPlace>>, placed: NonNullable<ReturnType<typeof leftColumnPlace>>, from: "one" | "two"} | null}
+ */
+let leftColumnHeld = null;
+
 /** Whether the right column is on screen: beside Main, or on its own as the thread list. */
 const sideColumnUp = () => columnsShown || threadListShown;
 
@@ -33882,6 +33918,9 @@ function renderColumns() {
   // `#280 scroll-stability`. Where the reader is in the cards, read before the layout changes the width
   // they are drawn at: between the thread list and two columns they are kept, and put back there.
   const cards = currentView === "discord" && screen.getAttribute("data-columns") !== want ? cardAnchor() : null;
+  // `#269 approval-card-inline` x `#280 scroll-stability`. And where the reader of the left column is,
+  // read before the layout draws that column at another width (`leftColumnPlace`).
+  const left = screen.getAttribute("data-columns") !== want ? leftColumnPlace() : null;
   if (screen.getAttribute("data-columns") !== want) {
     if (want) screen.setAttribute("data-columns", want);
     else screen.removeAttribute("data-columns");
@@ -33890,7 +33929,7 @@ function renderColumns() {
   if (currentView === "discord") {
     const now = columnsShown ? "two" : threadListShown ? "list" : "one";
     const next = want !== null && sideHasBox() ? want : "one";
-    if (next !== now) moveLayout(now, next, cards);
+    if (next !== now) moveLayout(now, next, cards, left);
     else if (fitChanged) renderThreadSelect();
   }
   // `#261 two-column-connectors`. The links between the columns, drawn or taken away with them.
@@ -33920,26 +33959,39 @@ function renderColumns() {
  * columns' right column, so a reader near the foot of the list was at the foot in two columns, and that
  * is no reason to be at the foot of the list.
  *
+ * `#269 approval-card-inline` x `#280 scroll-stability`. THE LEFT COLUMN'S READER IS WHERE THEY WERE
+ * BEFORE THE LAYOUT CHANGED (`left`, read by `renderColumns` before it did): in the view the left column
+ * goes to, Main into two columns and the view chosen out of them, or in the view it stays on, put back
+ * once the picker says the new layout (`keepLeftColumnPlace`). See `leftColumnPlace`. And back to the
+ * layout the last change came from, where they were there, unless they moved since (`leftColumnHeld`).
+ *
  * @param {"one" | "list" | "two"} now
  * @param {"one" | "list" | "two"} next
  * @param {{newest: boolean, id: string | null, offset: number} | null} [cards]
+ * @param {ReturnType<typeof leftColumnPlace>} [left]
  */
-function moveLayout(now, next, cards = null) {
+function moveLayout(now, next, cards = null, left = null) {
   // Spent by this change of layout, whatever it is.
   const held = listCardsHeld;
   listCardsHeld = null;
+  const heldLeft = leftColumnHeld;
+  leftColumnHeld = null;
+  // `#269 approval-card-inline` x `#280 scroll-stability`. Back to the layout the last change came from,
+  // the left column's reader where that change left them: where they were there.
+  const leftBack = left && heldLeft && heldLeft.from === next && sameLeftPlace(left, heldLeft.placed) ? heldLeft.left : null;
   // `#277 reply-in-column`. A reply open in a column of the two that go moves to the reply screen once
   // the next layout is drawn under it (`leaveColumns`).
-  const handOff = now === "two" ? leaveColumns(next) : null;
+  const handOff = now === "two" ? leaveColumns(next, left) : null;
   if (now === "list") leaveThreadList(next);
-  if (next === "two") enterColumns(now);
-  else if (next === "list") enterThreadList(now);
+  if (next === "two") enterColumns(now, left);
+  else if (next === "list") enterThreadList(now, left);
   const kept = now !== "one" && next !== "one" ? cards : null;
   const place = sideColumnUp() && columns.side.mode === "list" ? kept || cardAnchor() : null;
   const channel = String(el("discord-channel").value);
   const back = place && kept && now === "two" && held && held.channel === channel && sameCardPlace(kept, held.placed)
     ? held.place : null;
   renderThreadSelect();
+  if (left && next !== "list") keepLeftColumnPlace(left, leftBack);
   if (back && placeCardAnchor(back)) {
     // The card docked again under the list is not the dock growing under a reader two columns had at the
     // foot of their cards (`cardsPlacedUnderLists`).
@@ -33949,7 +34001,86 @@ function moveLayout(now, next, cards = null) {
     placeCardAnchor(place);
   }
   if (place && kept && now === "list" && next === "two") listCardsHeld = { place: kept, placed: cardAnchor(), channel };
+  if (left && now !== "list" && next !== "list") {
+    const placed = leftColumnPlace();
+    if (placed) leftColumnHeld = { left, placed, from: now };
+  }
   if (handOff) handOff();
+}
+
+/**
+ * Where the reader of the left column is, read by `renderColumns` before a change of layout draws that
+ * column at another width: the place `readerPlace` reads there, and the view of the channel it was read
+ * in. Null where the reader cannot see that column, behind the thread list (which holds its own place,
+ * `listHeldPlace`), or behind the call's view. `#269 approval-card-inline` x `#280 scroll-stability`.
+ *
+ * At a desk the left column is about the window's width in one column and half of it in two, so the
+ * moment `data-columns` changes every row of its list is drawn at another width, and so is the send card
+ * at its foot. A long draft opened by More was 519px tall in All at 1280x800 in Chromium and 580px beside
+ * a thread. The change of layout read the reader's place only after that: Ctrl+4 at the foot of All,
+ * card open, read a reader 61px above the foot, on two replies Main lacks, and so not on its newest line.
+ * Main was put back where it was last left, 326px above its foot, with Send off screen and the jump
+ * offered, and Ctrl+2 then left All 436px above its foot. A reader at the foot of Main itself, where no
+ * view changes, was left 61px above it by the card growing under them, and one 12px up was left 109px up.
+ * Read before the layout changes, the place is the one the reader had, and is kept where the left column
+ * goes or stays (`changeChannelView`, `keepLeftColumnPlace`): at the foot, or on the row they were on.
+ *
+ * @returns {{place: ReturnType<typeof readerPlace>, view: string, channel: string} | null}
+ */
+function leftColumnPlace() {
+  if (currentScreen !== "main" || currentView !== "discord" || threadListShown) return null;
+  return inColumn(columns.main, () => ({
+    place: readerPlace(),
+    view: channelView,
+    channel: String(el("discord-channel").value),
+  }));
+}
+
+/**
+ * Put the reader of the left column back where they were before the change of layout, `left`, where the
+ * column is still on the view and channel it was read in, Main or All, and still on screen: into two
+ * columns from Main, and out of them to Main. A view the change switched the column to has kept the place
+ * itself (`changeChannelView`). `#269 approval-card-inline` x `#280 scroll-stability`.
+ *
+ * ...or, back to the layout the last change came from, where the reader was there (`back`,
+ * `leftColumnHeld`), where the column is on the view that was read in: Main or All, whichever the way
+ * back shows.
+ *
+ * @param {NonNullable<ReturnType<typeof leftColumnPlace>>} left
+ * @param {ReturnType<typeof leftColumnPlace>} [back]
+ */
+function keepLeftColumnPlace(left, back = null) {
+  inColumn(columns.main, () => {
+    if (currentScreen !== "main" || currentView !== "discord" || threadListShown) return;
+    if (channelView !== "main" && channelView !== "flat") return;
+    const channel = String(el("discord-channel").value);
+    const kept = [back, left].find((one) => one !== null && one.view === channelView && one.channel === channel);
+    if (kept) keepReaderPlace(kept.place);
+  });
+}
+
+/**
+ * Whether the reader of the left column is where a change of layout left them (`placed`, read as it ended):
+ * the same view of the same channel, and on its newest line now and then, or on the same row within a
+ * pixel, or on the send card alone at the same height. `#269 approval-card-inline` x `#280 scroll-stability`.
+ *
+ * ...or on the same row lower down and now at the foot. What stands at the foot of the list settles after
+ * the change — the jump offered there goes once the reader is near the foot, and its room with it — and a
+ * list grown shorter under a reader is clamped to its foot, moving every row down. In Chromium at a desk a
+ * reader 200px up All was at Main's foot in two columns, their row 11px lower than when `placed` was read,
+ * and was taken to All's foot by Ctrl+2. Nothing the reader does moves the rows down and leaves them at
+ * the foot.
+ *
+ * @param {NonNullable<ReturnType<typeof leftColumnPlace>>} now
+ * @param {NonNullable<ReturnType<typeof leftColumnPlace>>} placed
+ */
+function sameLeftPlace(now, placed) {
+  if (now.view !== placed.view || now.channel !== placed.channel) return false;
+  const [a, b] = [now.place, placed.place];
+  if (a.pinned && b.pinned) return true;
+  const [x, y] = [a.seen[0], b.seen[0]];
+  if (x && y) return x.ids.join(" ") === y.ids.join(" ") && (Math.abs(x.top - y.top) <= 1 || (a.pinned && x.top > y.top));
+  return !x && !y && typeof a.card === "number" && typeof b.card === "number" && Math.abs(a.card - b.card) <= 1;
 }
 
 /** Keep `layout` as the one chosen: this window's, and the device's for the next new window. */
@@ -34142,10 +34273,14 @@ function openThreadFromList(id, summary = null) {
  * asked for, which becomes the channel's choice; otherwise the view the channel opens in, put back
  * without recording it again, which would turn a channel's default into a choice nobody made.
  *
+ * `place`: where the reader of the left column was before the layout changed, for the view it goes to
+ * (`changeChannelView`); else read there as it goes. `#269 approval-card-inline` x `#280 scroll-stability`.
+ *
  * @param {{view: string, thread: string | null, summary: any, origin: string | null}} target
  * @param {boolean} record
+ * @param {ReturnType<typeof readerPlace> | null} [place]
  */
-function showOneColumnView(target, record) {
+function showOneColumnView(target, record, place = null) {
   const thread = target.thread === null ? null : String(target.thread);
   const same = target.view === channelView && thread === (selectedThreadId ? String(selectedThreadId) : null);
   if (same && !(record && pinnedOnly)) {
@@ -34155,7 +34290,7 @@ function showOneColumnView(target, record) {
     scheduleBackSync();
     return;
   }
-  const show = () => changeChannelView(target.view, thread, target.summary, target.origin);
+  const show = () => changeChannelView(target.view, thread, target.summary, target.origin, place);
   if (record) {
     guardQuietly(show)();
     return;
@@ -34180,11 +34315,16 @@ function recordViewChoice() {
 /**
  * The left column on Main, as it is whenever the right column is up — beside it, or behind the thread
  * list on its own. Not recorded as the channel's choice: it is the layout's, not the reader's.
+ *
+ * `place`: where its reader was before the layout changed, for Main to keep (`leftColumnPlace`); else
+ * read as Main comes. `#269 approval-card-inline` x `#280 scroll-stability`.
+ *
+ * @param {ReturnType<typeof readerPlace> | null} [place]
  */
-function leftColumnToMain() {
+function leftColumnToMain(place = null) {
   if (channelView === "main") return;
   if (clientConfigApplied) {
-    guardQuietly(() => changeChannelView("main"))();
+    guardQuietly(() => changeChannelView("main", null, null, null, place))();
   } else {
     // A reopen, before sign-in has answered: Main drawn from what this device saved, with no read.
     // Nothing is read on a token nobody has proved; the reopen's own read comes once it is.
@@ -34201,15 +34341,18 @@ function leftColumnToMain() {
  * left column was showing, else the one selected there earlier in this session, else the cards — as
  * the thread list left them, coming from it (`#281 view-keys`).
  *
+ * `left`: where the reader of the left column was in one column (`leftColumnPlace`), which Main keeps.
+ *
  * @param {"one" | "list" | "two"} from
+ * @param {ReturnType<typeof leftColumnPlace>} [left]
  */
-function enterColumns(from = "one") {
+function enterColumns(from = "one", left = null) {
   columnsShown = true;
   const channel = String(el("discord-channel").value);
   const open = channelView === "thread" && selectedThreadId
     ? { id: String(selectedThreadId), summary: selectedThread }
     : sideThreads.get(channel) || null;
-  leftColumnToMain();
+  leftColumnToMain(left ? left.place : null);
   renderThreadSelect();
   if (open) guardQuietly(() => selectSideThread(open.id, open.summary))();
   else if (from === "list") renderSideMode();
@@ -34224,11 +34367,15 @@ function enterColumns(from = "one") {
  * or to the thread list, the left column staying Main behind it. The right column keeps what it shows,
  * held, so two columns come back to it at once.
  *
+ * `left`: where the reader of the left column was in two columns (`leftColumnPlace`), which the view
+ * shown in one keeps.
+ *
  * @param {"one" | "list" | "two"} next
+ * @param {ReturnType<typeof leftColumnPlace>} [left]
  * @returns {(() => void) | null} The hand-off of a reply that was open in a column, to run once the
  *   next layout is drawn; else null.
  */
-function leaveColumns(next = "one") {
+function leaveColumns(next = "one", left = null) {
   // `#277 reply-in-column`. A reply open in a column is taken out of it before the views change under
   // it, and given to the reply screen once the layout that follows is drawn: what this returns, which
   // `moveLayout` runs then — over one column, or over the thread list (`#281 view-keys`).
@@ -34251,23 +34398,28 @@ function leaveColumns(next = "one") {
     });
   }
   renderThreadSelect();
-  if (next === "one") showOneColumnLeft();
+  if (next === "one") showOneColumnLeft(left ? left.place : null);
   // `#262 search-load-older`. One column again: on Main, where the search still matches nothing, Search
   // All is offered at once, not at the next keystroke. Back to Main, nothing above searched it again.
   renderSearchInAll();
   return replying ? () => moveReplyToScreen(typing) : null;
 }
 
-/** The left column, one column again: on the view asked for with the layout, else the one the channel opens in. */
-function showOneColumnLeft() {
+/**
+ * The left column, one column again: on the view asked for with the layout, else the one the channel
+ * opens in. `place`: where its reader was before the layout changed (`showOneColumnView`).
+ *
+ * @param {ReturnType<typeof readerPlace> | null} [place]
+ */
+function showOneColumnLeft(place = null) {
   const wanted = oneColumnWanted;
   oneColumnWanted = null;
   if (wanted) {
-    showOneColumnView(wanted, true);
+    showOneColumnView(wanted, true, place);
     return;
   }
   const opening = openingChannelView();
-  showOneColumnView({ view: opening.view, thread: opening.thread, summary: opening.summary, origin: null }, false);
+  showOneColumnView({ view: opening.view, thread: opening.thread, summary: opening.summary, origin: null }, false, place);
 }
 
 /**
@@ -34277,13 +34429,16 @@ function showOneColumnLeft() {
  * cards, always.
  *
  * @param {"one" | "list" | "two"} from
+ * @param {ReturnType<typeof leftColumnPlace>} [left]
  */
-function enterThreadList(from = "one") {
+function enterThreadList(from = "one", left = null) {
   threadListShown = true;
   // `#280 scroll-stability`. Where the reader of the left column is, read while a card is still at the
-  // foot of its list, for the way out of the list (`listHeldPlace`).
+  // foot of its list, for the way out of the list (`listHeldPlace`). `#269 approval-card-inline`: read
+  // before the layout changed (`left`, `leftColumnPlace`), where it did: from two columns, Main is drawn
+  // across the window behind the list, its rows and the card at another width than the reader saw.
   listHeldPlace = inColumn(columns.main, () => (channelView === "main" || channelView === "flat"
-    ? { place: readerPlace(), view: channelView, channel: String(el("discord-channel").value) } : null));
+    ? { place: left ? left.place : readerPlace(), view: channelView, channel: String(el("discord-channel").value) } : null));
   // `#269 approval-card-inline`. A send card waiting at the foot of the left column, behind the list
   // now, is docked under the cards (`placePostCard`) BEFORE they are opened or put back, so that the
   // foot they are placed at is the one above it.
