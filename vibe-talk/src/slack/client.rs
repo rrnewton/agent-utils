@@ -966,6 +966,10 @@ impl ChatClient for HttpSlackClient {
             .map_err(|error| error.with_provider(&self.provider_name))
     }
 
+    /// The token's account from `auth.test`, named as people see it: by its display name from
+    /// `users.info` (the cache authors' names go through, best effort), and by the handle
+    /// `auth.test` reports only when no display name can be had. A handle may be a number, which
+    /// names nobody to a reader. `#325 provider-diagnostics-ids`.
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
         async {
             let value = self.call("auth.test", &[]).await?;
@@ -976,13 +980,19 @@ impl ChatClient for HttpSlackClient {
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| shape("auth.test answer has no string \"user_id\" field"))?;
             self.learn_self(id);
+            let handle = value
+                .get("user")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|handle| !handle.is_empty())
+                .unwrap_or("(no username)");
+            let username = match self.user(id).await {
+                Some((name, _)) => name,
+                None => handle.to_owned(),
+            };
             Ok::<_, ChatError>(ChatIdentity {
                 id: id.to_owned(),
-                username: value
-                    .get("user")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(no username)")
-                    .to_owned(),
+                username,
             })
         }
         .await

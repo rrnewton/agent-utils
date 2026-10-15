@@ -103,6 +103,11 @@ impl Status {
 pub struct CheckReport {
     /// Stable machine-readable identifier, e.g. `discord.channel`. A client branches on this;
     /// it never branches on the prose.
+    ///
+    /// A chat provider's checks are named for its kind: `discord.token`, `discord.channel` and
+    /// `discord.heads` for Discord and every Discord-protocol bridge, `slack.token`,
+    /// `slack.channel` and `slack.heads` for Slack. `#325 provider-diagnostics-ids`: a Slack
+    /// deployment's checks used to be reported under the Discord ids.
     pub id: &'static str,
     /// What was being checked, in words.
     pub title: String,
@@ -252,7 +257,7 @@ struct Check {
     id: &'static str,
     title: String,
     subject: Option<String>,
-    /// The chat provider a `discord.` check is about, when the deployment has several.
+    /// The display name of the chat provider a chat check is about.
     provider: Option<String>,
     diagnosis: Diagnosis,
 }
@@ -279,9 +284,9 @@ impl Check {
     }
 
     fn finish(self, state: &AppState) -> CheckReport {
-        // The stable check ids are retained for existing API consumers. Display names and
-        // remedies describe the actual backend, including compatible provider adapters.
-        let provider = if self.id.starts_with("discord.") {
+        // Display names and remedies describe the actual backend, including compatible provider
+        // adapters.
+        let provider = if self.id.starts_with("discord.") || self.id.starts_with("slack.") {
             self.provider
                 .as_deref()
                 .unwrap_or_else(|| state.chat.provider_name())
@@ -317,9 +322,9 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
     let deadline = Deadline::new(TOTAL_BUDGET);
     let mut checks = Vec::new();
 
-    checks.extend(discord_token(state, &deadline).await);
-    checks.extend(discord_channels(state, &deadline).await);
-    checks.extend(discord_heads(state, &deadline).await);
+    checks.extend(chat_token(state, &deadline).await);
+    checks.extend(chat_channels(state, &deadline).await);
+    checks.extend(chat_heads(state, &deadline).await);
 
     checks.push(read_aloud_selection(state));
 
@@ -400,26 +405,62 @@ fn read_aloud_selection(state: &AppState) -> Check {
     .about(provider.backend)
 }
 
+/// Which of a chat provider's checks a row is. `#325 provider-diagnostics-ids`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatCheck {
+    /// Whether the provider accepted its credential, and whose it is.
+    Token,
+    /// Whether one configured channel can be read.
+    Channel,
+    /// Whether the provider's native head read answers.
+    Heads,
+}
+
+/// The id of a chat provider's check, named for the provider's kind: `slack.` for a Slack
+/// provider, `discord.` for Discord and every Discord-protocol bridge, and for a channel whose
+/// provider the configuration does not name, the deployment's default provider's.
+/// `#325 provider-diagnostics-ids`.
+fn chat_check_id(state: &AppState, provider_key: Option<&str>, check: ChatCheck) -> &'static str {
+    let slack = provider_key
+        .or_else(|| state.config.default_provider_key())
+        .and_then(|key| state.config.provider(key))
+        .is_some_and(|provider| matches!(provider.kind, crate::config::ProviderKind::Slack(_)));
+    match (slack, check) {
+        (true, ChatCheck::Token) => "slack.token",
+        (true, ChatCheck::Channel) => "slack.channel",
+        (true, ChatCheck::Heads) => "slack.heads",
+        (false, ChatCheck::Token) => "discord.token",
+        (false, ChatCheck::Channel) => "discord.channel",
+        (false, ChatCheck::Heads) => "discord.heads",
+    }
+}
+
 /// Did each chat provider accept its token at all, and whose token is it?
 ///
 /// Asked WITHOUT naming a channel, which is the entire point: a bad token and an uninvited bot
 /// are the two most common ways this deployment is wrong, and a channel read reports both as a
 /// channel that cannot be read. One check per configured provider.
-async fn discord_token(state: &AppState, deadline: &Deadline) -> Vec<Check> {
+async fn chat_token(state: &AppState, deadline: &Deadline) -> Vec<Check> {
     let mut checks = Vec::new();
     let multi = state.providers.is_multi();
     for entry in state.providers.entries() {
         let provider = entry.client.provider_name();
         let diagnosis = match within(deadline, entry.client.identity()).await {
             Err(timed_out) => timed_out,
+            // The account's name as the provider shows it to people: a Slack token's owner by
+            // display name, not by a handle that may be a number (`#325 provider-diagnostics-ids`).
             Ok(Ok(identity)) => Diagnosis::Confirmed(format!(
                 "{provider} accepted the token; it belongs to {} ({})",
                 identity.username, identity.id
             )),
             Ok(Err(error)) => probe::classify(&error),
         };
-        let check = Check::new("discord.token", format!("{provider} token"), diagnosis)
-            .for_provider(provider);
+        let check = Check::new(
+            chat_check_id(state, Some(&entry.key), ChatCheck::Token),
+            format!("{provider} token"),
+            diagnosis,
+        )
+        .for_provider(provider);
         checks.push(if multi {
             check.about(entry.key.as_str())
         } else {
@@ -430,7 +471,7 @@ async fn discord_token(state: &AppState, deadline: &Deadline) -> Vec<Check> {
 }
 
 /// Can the bot read each configured channel? The five causes, told apart.
-async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
+async fn chat_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
     let channels = state.all_channels();
     let report =
         probe::probe_channels_within(state.chat.as_ref(), &channels, Some(deadline.budget())).await;
@@ -448,7 +489,11 @@ async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
                     |entry| entry.client.provider_name().to_owned(),
                 );
             Check::new(
-                "discord.channel",
+                chat_check_id(
+                    state,
+                    outcome.channel.provider.as_deref(),
+                    ChatCheck::Channel,
+                ),
                 format!("{provider} channel: {}", outcome.channel.label),
                 outcome.diagnosis,
             )
@@ -462,7 +507,7 @@ async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
 /// `#287 bulk-reads`. One check, and one call, per such provider; none for a provider whose heads
 /// are emulated, so a deployment without native heads sees no new row and no new call. See
 /// [`probe::check_heads`].
-async fn discord_heads(state: &AppState, deadline: &Deadline) -> Vec<Check> {
+async fn chat_heads(state: &AppState, deadline: &Deadline) -> Vec<Check> {
     let multi = state.providers.is_multi();
     probe::check_heads(
         &state.providers,
@@ -473,7 +518,7 @@ async fn discord_heads(state: &AppState, deadline: &Deadline) -> Vec<Check> {
     .into_iter()
     .map(|check| {
         let row = Check::new(
-            "discord.heads",
+            chat_check_id(state, Some(&check.key), ChatCheck::Heads),
             format!("{} channel heads", check.provider),
             check.diagnosis,
         )

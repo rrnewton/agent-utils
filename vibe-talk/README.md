@@ -1615,10 +1615,18 @@ The checks:
 | `discord.token` | Discord accepted the bot token, and who it says the bot is |
 | `discord.channel` | **one per configured channel** — readable, or why not |
 | `discord.heads` | **only for a provider that reads channel heads natively** (Discord itself, a bridge with `head_reads`): its head read answers, in one call, and how many heads vouch for edits and deletes; absent, with no call made, for every other provider |
+| `slack.token`, `slack.channel`, `slack.heads` | the same three, for a Slack provider; the token's owner is named by display name, and by handle only when Slack gives none |
 | `elevenlabs.api_key` | the key was accepted, and which account/workspace it reached |
 | `elevenlabs.agent` | the configured agent exists and reports a voice |
 | `elevenlabs.voice` | a voice resolves — configured explicitly, or borrowed from the agent |
 | `storage` | the store can be written to, or the named reason it cannot |
+
+**A chat provider's checks are named for its kind** (`#325 provider-diagnostics-ids`): `discord.`
+for Discord and every Discord-protocol bridge, whatever its name, and `slack.` for Slack, so a
+deployment with both reports each under its own. A Slack deployment's checks were reported under
+the `discord.` ids until then; nothing in this repository read those ids for a Slack provider, so
+they are not kept as aliases. With several providers, each provider's token check names its key as
+its `subject`.
 
 `discord.channel` carries **the same five distinguishable causes the startup probe already tells
 apart**, because they have five different fixes: no OAuth2 invite; a per-channel permission
