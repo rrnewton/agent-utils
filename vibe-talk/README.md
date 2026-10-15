@@ -292,7 +292,9 @@ calls an hour on top of Main's own refresh. Behind a slow chat service that read
 Main's own reads have moved on, so it changes only what the page holds from before it was sent
 (`#316 late-counts-resurrect`): it never brings back a message removed upstream since, nor puts back
 the text from before an edit a later read of Main has brought, nor takes away a message that arrived
-while it was out. It still brings the replies the page did not hold, which is what the counts need.
+while it was out. It still brings the replies the page did not hold, which is what the counts need,
+but not one that a read of its thread sent after it no longer found: that reply was removed upstream,
+and would stay in the thread until the next full read.
 
 **Slack's All brings the replies of at most ten threads per page**, the ten most recently active
 among its messages, and says so in its notice. A thread past those ten is on the page with its count

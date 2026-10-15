@@ -61469,7 +61469,7 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 
   // THE CONTROL: taking every message the store has not held, the read for the counts puts it back.
   const control = await run(brokenScript(
-    "      return answeredThread(message) !== null || !newerPage(canon, \"main\", number);\n", "      return true;\n"));
+    "      return !newerPageSpeaksFor(canon, message, number);\n", "      return true;\n"));
   assert.ok(shownIds(control.page).includes("400"), "the read for the counts left the message out anyway, so this test cannot see it");
 });
 
@@ -61983,3 +61983,111 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not und
   assert.equal(control.landed.saved, "first thread root", "the edit survived anyway, so this test cannot see it");
 });
 
+// A message the store never held as a late read was sent, and does not hold as it lands, is not taken from
+// it once a newer newest page of the view the message belongs in has landed (`newerPageSpeaksFor`): its
+// thread's, for a thread reply. Asking only of Main, the read of All for Main's counts put back a reply
+// that a newer newest page of its thread said was gone, into the thread and the saved store, and the
+// polls after, deltas from that page's cursor, never took it out again.
+
+for (const when of ["held", "never held"]) {
+  const named = when === "held" ? "which took it out" : "the reply removed before its thread was read";
+  test(`\`#316 late-counts-resurrect\`: a read of All for Main's counts does not put back a reply removed upstream that a newer newest page of its thread says is gone (${named})`, async () => {
+    const run = async (script) => {
+      const { page, server, held } = await countsReadOut(script);
+      const second = page.messages.find((m) => m.id === "203").thread;
+      // Removed upstream, by a provider that pushes no removals.
+      const remove = () => {
+        server.remove("250");
+        server.edit("203", { thread: { ...second, reply_count: 1, reply_count_exact: true } });
+      };
+      if (when === "never held") remove();
+      await pickThread(page, `thread:${second.id}`);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      if (when === "held") {
+        assert.ok(savedMessage(page, "250"), "fixture: the thread's read did not bring the reply");
+        remove();
+        // The thread's poll, its cursor refused, reads its newest page, which no longer carries it.
+        server.refuse = { status: 410, error: "cursor_expired" };
+        page.setClock(page.clock() + DISCORD_POLL_MS);
+        await pollOnce(page);
+        for (let i = 0; i < 3; i += 1) await page.settle();
+      }
+      assert.ok(!savedMessage(page, "250") && !shownIds(page).includes("250"),
+        "fixture: the reply is in its thread before the read for the counts lands");
+      held.counts[0]();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      const landed = { shown: shownIds(page).includes("250"), saved: Boolean(savedMessage(page, "250")) };
+      // And three polls after, deltas from the thread page's cursor.
+      const polls = [];
+      for (let poll = 0; poll < 3; poll += 1) {
+        page.setClock(page.clock() + DISCORD_POLL_MS);
+        await pollOnce(page);
+        for (let i = 0; i < 3; i += 1) await page.settle();
+        polls.push({ shown: shownIds(page).includes("250"), saved: Boolean(savedMessage(page, "250")) });
+      }
+      assert.ok(server.reads.slice(-3).every((read) => read.view === "thread" && read.after !== null),
+        "fixture: the polls after were not deltas of the thread");
+      return { page, landed, polls };
+    };
+    const { page, landed, polls } = await run(SCRIPT);
+    assert.deepStrictEqual(landed, { shown: false, saved: false }, "the read for the counts put the removed reply into its thread");
+    assert.ok(polls.every((state) => !state.shown && !state.saved), `the removed reply is back in the polls after: ${JSON.stringify(polls)}`);
+    assert.ok(shownIds(page).includes("204"), "the thread lost a reply it still has");
+
+    // THE CONTROL, as the page was: asking only whether a newer newest page of Main has landed, the read for
+    // the counts puts the reply into its thread and the saved store, and the polls after keep it there.
+    const control = await run(brokenScript("      return !newerPageSpeaksFor(canon, message, number);\n",
+      "      return answeredThread(message) !== null || !newerPage(canon, \"main\", number);\n"));
+    assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
+    assert.ok(control.polls.every((state) => state.shown && state.saved));
+  });
+}
+
+test("`#316 late-counts-resurrect`: a placing read that is not folded does not put back a reply removed upstream that a newer newest page of its thread says is gone", async () => {
+  const run = async (script) => {
+    const { page, server, held } = await heldAllReads(script);
+    // The bridge pushes a reply without its thread, and All is read to place it, held.
+    const { first, pushed } = bridgeReply(page, server);
+    await deliver(page, page.stream(), sseMessage(pushed));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(held.place.length, 1, "fixture: no read of All was made to place the reply");
+    // Main's newest page, which carries no thread reply, takes the bare copy out.
+    server.refuse = { status: 410, error: "cursor_expired" };
+    page.setClock(page.clock() + DISCORD_POLL_MS);
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(savedMessage(page, "300"), null, "fixture: Main's newest page did not take the bare copy out");
+    // The reply is removed upstream, by a provider that pushes no removals, and the reader opens its
+    // thread, whose newest page no longer carries it.
+    server.remove("300");
+    server.edit("201", { thread: { ...first, reply_count: 1 } });
+    await pickThread(page, `thread:${first.id}`);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.ok(!shownIds(page).includes("300"), "fixture: the thread's page carried the removed reply");
+    // The placing read, answered when it was asked, lands.
+    held.place[0]();
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    const landed = { shown: shownIds(page).includes("300"), saved: Boolean(savedMessage(page, "300")) };
+    const polls = [];
+    for (let poll = 0; poll < 3; poll += 1) {
+      page.setClock(page.clock() + DISCORD_POLL_MS);
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      polls.push({ shown: shownIds(page).includes("300"), saved: Boolean(savedMessage(page, "300")) });
+    }
+    assert.ok(server.reads.slice(-3).every((read) => read.view === "thread" && read.after !== null),
+      "fixture: the polls after were not deltas of the thread");
+    return { page, landed, polls };
+  };
+  const { page, landed, polls } = await run(SCRIPT);
+  assert.deepStrictEqual(landed, { shown: false, saved: false }, "the placing read put the removed reply back into its thread");
+  assert.ok(polls.every((state) => !state.shown && !state.saved), `the removed reply is back in the polls after: ${JSON.stringify(polls)}`);
+  assert.ok(shownIds(page).includes("202"), "the thread lost a reply it still has");
+
+  // THE CONTROL, as the page was: asking only whether a newer newest page of Main has landed, the placing
+  // read puts the reply back into its thread and the saved store, and the polls after keep it there.
+  const control = await run(brokenScript("    : [...carried.values()].filter((copy) => !newerPageSpeaksFor(canon, copy, number));\n",
+    "    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, \"main\", number));\n"));
+  assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
+  assert.ok(control.polls.every((state) => state.shown && state.saved));
+});

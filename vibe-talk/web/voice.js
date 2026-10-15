@@ -14756,21 +14756,21 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
  * was sent, a message from the stream where it went into the store, and a count or a thread record put
  * on here where the copy it was put on stood (`copyBuiltOn`). It takes its copy of a message whose copy
  * in the store is older, or says the message as it was posted (`postedCopies`), and of one the store has
- * not held at all — unless that is on the main channel and a newest page of Main sent after it has
- * landed, which speaks for it and did not leave it in the store, as an answer of All that is not folded
- * puts back nothing such a page took out (`placeFromPage`). It answers only for the messages whose copy
- * is older, and those removed since. A copy newer than the page — an edit, a thread record or a count
- * that a read sent after it brought, a message the stream delivered after it was sent — it would undo,
- * or take out as deleted (`#310 stale-live-read-flicker`); a message taken out since it was sent, it
- * would put back. But the stream's copy of a message is newer only in being there: the page, which
- * carries the message as it was posted or newer, takes its own over it. Refused, a placeholder the
- * stream drew while the page was out, and a bot then edited to its answer, stayed a placeholder until
- * the next newest page. And a copy that an OLDER read brought while it was out is older than the page,
- * which takes its own over it: the read of All for Main's counts, answered after one edit and landing
- * while Main's newer newest page was out, made that page refuse its copy of the next edit, or of a
- * removal, until the next newest page. Of what it does not take, a message the stream left unplaced
- * still takes its thread record (`placeFromPage`), and the counts, which come of the replies it brings
- * that the store never held, are what such a read is for.
+ * not held at all — unless a newest page of the view that message belongs in, its thread or Main, sent
+ * after it has landed (`newerPageSpeaksFor`), which speaks for it and did not leave it in the store, as
+ * an answer of All that is not folded puts back nothing such a page took out (`placeFromPage`). It
+ * answers only for the messages whose copy is older, and those removed since. A copy newer than the
+ * page — an edit, a thread record or a count that a read sent after it brought, a message the stream
+ * delivered after it was sent — it would undo, or take out as deleted (`#310 stale-live-read-flicker`);
+ * a message taken out since it was sent, it would put back. But the stream's copy of a message is newer
+ * only in being there: the page, which carries the message as it was posted or newer, takes its own
+ * over it. Refused, a placeholder the stream drew while the page was out, and a bot then edited to its
+ * answer, stayed a placeholder until the next newest page. And a copy that an OLDER read brought while
+ * it was out is older than the page, which takes its own over it: the read of All for Main's counts,
+ * answered after one edit and landing while Main's newer newest page was out, made that page refuse its
+ * copy of the next edit, or of a removal, until the next newest page. Of what it does not take, a
+ * message the stream left unplaced still takes its thread record (`placeFromPage`), and the counts,
+ * which come of the replies it brings that the store never held, are what such a read is for.
  *
  * @param {any} canon
  * @param {VibeTalk.TimelineResponse} payload
@@ -14796,7 +14796,7 @@ function pageFold(canon, payload, held) {
       if (holds.has(id)) return older(id, true);
       // Taken out since it was sent.
       if (held.has(id)) return false;
-      return answeredThread(message) !== null || !newerPage(canon, "main", number);
+      return !newerPageSpeaksFor(canon, message, number);
     },
     /** @param {any} message */
     answers: (message) => removedSince(canon, String(message.id), number) || !held || older(String(message.id)),
@@ -20373,16 +20373,38 @@ function placeFromAnswer(payload, read) {
 }
 
 /**
- * Whether a newest page of `view` sent after the read numbered `number` (`sentNumberOf`) has landed in
- * store `canon`: that page is the newer, whichever of the two landed first. `#308 live-reply-in-main`.
+ * Whether a newest page of `view` — of thread `thread`, for the thread view — sent after the read
+ * numbered `number` (`sentNumberOf`) has landed in store `canon`: that page is the newer, whichever of
+ * the two landed first. `#308 live-reply-in-main`.
  *
  * @param {any} canon
  * @param {string} view
  * @param {number} number
+ * @param {string | null} [thread]
  */
-function newerPage(canon, view, number) {
-  const cover = canon.views.get(viewKey(view, null));
+function newerPage(canon, view, number, thread = null) {
+  const cover = canon.views.get(viewKey(view, thread));
   return Boolean(cover && (cover.fullSent || 0) > number);
+}
+
+/**
+ * Whether a newest page that speaks for `message` — one of its thread, for a thread reply, and of Main
+ * for any other message — sent after the read numbered `number` (`sentNumberOf`) has landed in store
+ * `canon` (`newerPage`): that page carried the message, or says it is gone, whichever of the two
+ * landed first. `#316 late-counts-resurrect`.
+ *
+ * A THREAD'S OWN PAGE TOO. Asking only of Main, a late read of All for Main's counts put back a reply
+ * a newer newest page of its thread had taken out, removed upstream by a provider that pushes no
+ * removals — or one removed before that thread was first read, never held — into the thread and the
+ * saved store, where the polls after, deltas from that page's cursor, never took it out again.
+ *
+ * @param {any} canon
+ * @param {any} message
+ * @param {number} number
+ */
+function newerPageSpeaksFor(canon, message, number) {
+  const thread = answeredThread(message);
+  return thread === null ? newerPage(canon, "main", number) : newerPage(canon, "thread", number, thread);
 }
 
 /**
@@ -20417,8 +20439,8 @@ function heldAsSent(canon, held) {
  * store `canon`: see "an answer of All that is not folded" above. Each it carries is placed — the store's
  * copy takes the thread record the answer's copy has, and nothing else of it, and one the answer carries
  * without a record is on the main channel — and one the store no longer holds is put back as the answer
- * carries it, unless a newest page sent after the answer (`number`, `sentNumberOf`) that speaks for it
- * has landed. True when it placed any.
+ * carries it, unless a newest page sent after the answer (`number`, `sentNumberOf`) that speaks for it —
+ * of All, or of its thread or Main (`newerPageSpeaksFor`) — has landed. True when it placed any.
  *
  * `held`, the store's copies as the read was sent (`heldNow`): a message whose copy in the store is
  * older than the answer in what it says (`copyOlderThan`) — the stream's bare copy always is
@@ -20462,9 +20484,10 @@ function placeFromPage(payload, canon, number, held = null) {
   });
   // One the store no longer holds was taken out by a newest page that does not speak for it — one of
   // Main, which carries no thread reply, or one sent before it arrived — or by one sent after this
-  // answer that does, and said it is gone: a page of All, or of Main for a message on the main channel.
+  // answer that does, and said it is gone: a page of All, of its thread for a thread reply, or of Main
+  // for a message on the main channel (`newerPageSpeaksFor`).
   const back = newerPage(canon, "flat", number) ? []
-    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, "main", number));
+    : [...carried.values()].filter((copy) => !newerPageSpeaksFor(canon, copy, number));
   if (back.length) {
     for (const copy of back) {
       canon.unplaced.delete(String(copy.id));
