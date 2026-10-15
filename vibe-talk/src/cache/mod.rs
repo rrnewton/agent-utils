@@ -2384,6 +2384,12 @@ fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
 #[cfg(test)]
 mod coverage_race_tests;
 #[cfg(test)]
+mod review_probes;
+#[cfg(test)]
+mod review_model;
+#[cfg(test)]
+mod review_model_feed;
+#[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
 mod privacy_tests;
