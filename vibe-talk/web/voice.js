@@ -156,7 +156,7 @@ let sideActive = false;
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
- *   | "help-link-speech-prep"
+ *   | "help-link-speech-prep" | "help-link-speech-prep-relay"
  *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
@@ -1218,6 +1218,18 @@ const HELP_TOPICS = [
   "voice-instructions",
   "connection",
 ];
+
+/**
+ * A `?` that opens an entry from beside a setting other than its own group's: the button's id, and
+ * the slug of the entry it opens.
+ *
+ * `#332 settings-voice-agent-section`. How messages are said is information rather than a setting,
+ * so it has no group of its own: it is explained beside each setting that reads a message out. Its
+ * own `#help-link-speech-prep` is on Reading full messages in channel view, through HELP_TOPICS like
+ * every other; this is the second one, beside Arriving messages during a call. Declared in the
+ * markup like every `?`, and the suite holds every `.help-link` there to one of the two lists.
+ */
+const HELP_LINKS_BESIDE = [["help-link-speech-prep-relay", "speech-prep"]];
 
 /**
  * Open Help, optionally at one entry.
@@ -38672,46 +38684,44 @@ function resumeNote() {
   return "the earlier conversation is replayed";
 }
 
-/** What Settings says, in longer form. */
+/**
+ * What Settings says under Resuming: ONE SHORT LINE per state.
+ *
+ * `#332 settings-voice-agent-section`. "Keep each section's state line short; long explanations
+ * belong in help." So each line names its state and the one number that matters — how many earlier
+ * lines did not fit — and stops; why a state happens and what would change it (the two budget
+ * settings, the operator's switch) is the Resuming entry in Help, one `?` away. The page suite holds
+ * every line here to a budget, so the paragraphs cannot creep back one clause at a time. Shortened,
+ * not merged: the six states are still six different sentences, for the reasons above.
+ */
 function renderResumeState() {
   const state = el("resume-state");
   if (!state) {
     return;
   }
+  const lines = (count) => (count === 1 ? "1 earlier line" : `${count} earlier lines`);
   if (!resumeAllowed) {
-    state.textContent =
-      "Resuming is OFF on this server. Every new call starts the agent from nothing, whatever " +
-      "this switch says.";
+    state.textContent = "Resuming is OFF on this server: every call starts fresh.";
   } else if (!resumeWanted()) {
-    state.textContent = "Resuming is off. A new call starts the agent from nothing.";
+    state.textContent = "Resuming is off: a new call starts fresh.";
   } else if (resumeLast.failed) {
-    state.textContent =
-      "The last call could NOT be resumed — the earlier conversation would not load — so it " +
-      "started fresh.";
+    state.textContent = "The last call could NOT be resumed: the record would not load.";
   } else if (resumeLast.armed && resumeLast.dropped > 0) {
-    state.textContent =
-      `The last call was resumed IN PART: ${resumeLast.dropped} earlier line` +
-      `${resumeLast.dropped === 1 ? "" : "s"} did not fit the server's budget and the agent was ` +
-      "told so.";
+    state.textContent = `The last call was resumed IN PART: ${lines(resumeLast.dropped)} did not fit.`;
   } else if (resumeLast.armed) {
-    state.textContent = "The last call was resumed from the earlier conversation.";
+    state.textContent = "The last call was resumed.";
   } else if (resumeLast.attempted && resumeLast.dropped > 0) {
     // Not "there was nothing to replay". There was; none of it fitted. Reporting that as an empty
     // conversation would tell the reader something false about a call they remember having.
     state.textContent =
-      `The last call started fresh, but NOT because there was nothing to say: all ` +
-      `${resumeLast.dropped} earlier line${resumeLast.dropped === 1 ? "" : "s"} were dropped to ` +
-      "stay inside the server's length budget, so nothing was left to send. Raise " +
-      "replay.max_chars or replay.max_turns to resume a conversation this long.";
+      `The last call started fresh: ${resumeLast.dropped === 1 ? "the" : "all"} ` +
+      `${lines(resumeLast.dropped)} ${resumeLast.dropped === 1 ? "was" : "were"} over the budget.`;
   } else if (resumeLast.attempted) {
-    state.textContent =
-      "The last call started fresh: the earlier conversation held nothing to replay.";
+    state.textContent = "The last call started fresh: there was nothing to replay.";
   } else if (!resumeConversationId) {
-    state.textContent =
-      "Resuming is on. There is no earlier conversation to resume from yet, so the next call " +
-      "starts fresh.";
+    state.textContent = "Resuming is on. Nothing to resume from yet.";
   } else {
-    state.textContent = "Resuming is on. The next call will be told what was already said.";
+    state.textContent = "Resuming is on: the next call will be told what was already said.";
   }
   renderControls();
 }
@@ -38722,6 +38732,10 @@ function renderResumeState() {
  * Reported, never controlled: the rewrite happens on the server before a message reaches this page
  * at all, and the voice agent's own tool calls never pass through this browser. A switch here
  * could only govern one of the three paths that read a message out.
+ *
+ * `#332 settings-voice-agent-section`. The line opens Help's How messages are said, rather than
+ * standing on Settings as a group with no control in it; the paragraphs under it say what the
+ * rewrite does, so the line only says which arm.
  *
  * A server too old to send the field is NOT reported as off. Older servers prepared bodies
  * unconditionally, so "off" would be a false statement about a deployment that is in fact doing
@@ -38735,11 +38749,9 @@ function renderSpeechPrepState(enabled) {
   }
   state.textContent =
     enabled === false
-      ? "This server reads messages out exactly as they were typed. Markdown, timestamps and " +
-        "long ids are all spoken as written."
-      : "This server rewrites messages for the ear before they are spoken: markdown off, " +
-        "timestamps as “three hours ago”, and long ids as a letter. The channel view " +
-        "still shows what was typed. The operator sets this, not this screen.";
+      ? "Off on this server: messages are read out exactly as they were typed."
+      : "On for this server: messages are rewritten for the ear, and the channel view still " +
+        "shows what was typed.";
 }
 
 /**
@@ -39014,6 +39026,11 @@ function chooseReadNew(mode) {
  * THREE states, not two, because "off on this server" and "on but not connected right now" are
  * different problems with different fixes, and both look identical from the channel view — a list
  * that is not changing. The third is the working one.
+ *
+ * `#332 settings-voice-agent-section`. One short line each, as Resuming's are. What off on the server
+ * means for the channel view and the agent, and what adapter push can and cannot vouch for, is the
+ * Live messages entry in Help; the push line keeps only the caveat in a clause, because "listening"
+ * with nothing after it would read as a statement that the adapter is healthy.
  */
 function renderLiveState() {
   // "Live · updated" in the channel pill depends on the stream being attached.
@@ -39023,24 +39040,18 @@ function renderLiveState() {
     return;
   }
   if (liveDelivery === "off") {
-    state.textContent =
-      "Live updates are OFF on this server. The channel view re-reads on its own timer while you " +
-      "are looking at it, and nothing reaches the agent between your questions.";
+    state.textContent = "Live updates are OFF on this server.";
     return;
   }
   if (liveDelivery === "push") {
     state.textContent = liveAttached
-      ? "Live updates are configured for adapter push, and this page is connected to the server " +
-        "stream. This does not verify that the external adapter is healthy."
-      : "Live updates are configured for adapter push, but this page is not connected to the " +
-        "server stream at the moment. It keeps trying; adapter health is not verified here.";
+      ? "Live by adapter push: listening, but the adapter's health is not checked."
+      : "Live by adapter push, but not connected right now; it keeps trying.";
     return;
   }
   state.textContent = liveAttached
-    ? `Live updates are on: this server re-reads the channel every ${livePollSeconds} seconds and ` +
-      "pushes what is new to this page."
-    : `Live updates are on (every ${livePollSeconds} seconds), but this page is not connected to ` +
-      "the stream at the moment. It keeps trying.";
+    ? `Live: this server re-reads the channel every ${livePollSeconds} seconds.`
+    : `Live every ${livePollSeconds} seconds, but not connected to the stream; it keeps trying.`;
 }
 
 /** Stop following whatever is being followed. Idempotent. */
@@ -41605,6 +41616,9 @@ el("close-help").addEventListener("click", closeHelp);
 el("open-help").addEventListener("click", () => showHelp(null));
 for (const topic of HELP_TOPICS) {
   el(`help-link-${topic}`).addEventListener("click", () => showHelp(topic));
+}
+for (const [link, topic] of HELP_LINKS_BESIDE) {
+  el(link).addEventListener("click", () => showHelp(topic));
 }
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
 // the one that forgets to put the reader back where they were reading.

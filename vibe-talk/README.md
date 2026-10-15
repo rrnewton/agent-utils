@@ -4295,8 +4295,10 @@ it worked. So the clause under the large control is derived rather than written:
 **The last two are the same `included: 0` and they mean opposite things.** Both send nothing, and
 only `dropped` tells them apart. "There was nothing to replay" said about a conversation that was
 merely too large is a claim about what the reader said earlier, made with no basis for it — so the
-page reads `dropped` as well as `included`, and Settings names the two budget settings that would
-fix it rather than leaving the reader to conclude their conversation vanished.
+page reads `dropped` as well as `included`, and Settings says every earlier line was over the
+budget — with the Resuming `?` naming the two settings that would fix it (`#332
+settings-voice-agent-section` moved them off the state line) — rather than leaving the reader to
+conclude their conversation vanished.
 
 The end-of-call seam changes with it. Every version of it asserted that the agent below the line
 has never seen anything above it, and that stops being true the moment resuming is armed; with it
@@ -6846,8 +6848,8 @@ the groups sit as rows inside a handful of sections, and each section is the car
 
 | Section | Holds |
 |---|---|
-| **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Live messages, Canned prompts, Microphone, and the provider's console link |
-| **Messages** | Your own messages, Read automatically, Combining messages, Rich headers, Recently dismissed, How messages are said, Message audio |
+| **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Live messages, Reading full messages in channel view, Canned prompts, Microphone, and the provider's console link |
+| **Messages** | Your own messages, Read automatically, Combining messages, Rich headers, Recently dismissed |
 | **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream, who is who |
 | **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
 | **Storage and connection** | Stored conversations, Saved messages on this server (the message cache's switch, its Erase and what it holds; shown only to the write token, and only when client-config carries `message_cache` — `#208 persistent-cache`), Token, Connection status |
@@ -6855,6 +6857,31 @@ the groups sit as rows inside a handful of sections, and each section is the car
 A section's title is an `h2` a size up; a group inside it keeps its own small `h3` heading and its
 `?`, with a rule above it. No control, `?` or id changed; only where each one sits. The page suite
 holds the section list and which groups each section holds.
+
+**Every way a message is read out is in Voice agent, together** (`#332
+settings-voice-agent-section`). Resuming (a new call is told what was said), Live messages (a
+message arriving during a call), and **Reading full messages in channel view** — the picker
+between Agent audio and Device voice that used to be a group called "Message audio" in Messages —
+sit one after another, in that order, and Tab goes through them in that order too, each `?` before
+the control it is about. The picker kept its ids, and the phone-or-cloud button on the bar is still
+the same setting.
+
+**How messages are said is information, not a setting, so it is not on Settings.** It was a group
+holding one paragraph and no control: which arm of the server's rewrite for the ear this deployment
+is in (`speakable.enabled`). That line now opens Help's entry of the same name, and the entry is
+reached by a small `?` beside each setting it explains: after the words *Arriving messages during a
+call*, and beside the heading of Reading full messages in channel view. The second `?` for one entry
+is wired by id like every other (`HELP_LINKS_BESIDE` in `web/voice.js`), and the page suite holds
+every `?` in the markup to one of the two lists, so a `?` that does nothing cannot ship.
+
+**A state line is one short sentence.** The lines under Resuming and Live messages had grown into
+paragraphs — the budget settings, what adapter push cannot vouch for, what off on the server means
+for the channel view. Each is now the state and the one number that matters ("The last call was
+resumed IN PART: 3 earlier lines did not fit."), held by the page suite to 80 characters in every
+state, at most two lines on a phone; the clauses they dropped are in the entry their group's `?`
+opens. The one clause kept is the push caveat — "listening, but the adapter's health is not
+checked" — because "listening" alone would read as a claim about the adapter.
+`60-settings-voice-agent` photographs the three together at 393x852 and 1280x800.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the

@@ -908,8 +908,10 @@
               each one sits and how loud its heading is changed.
 
               The sections, in order:
-                Voice agent — what it may send, what it is told, what it hears and remembers.
-                Messages — how a channel's messages are marked, drawn and read out.
+                Voice agent — what it may send, what it is told, what it hears and remembers, and
+                  (`#332 settings-voice-agent-section`) every way a message is read out: Resuming,
+                  Live messages and Reading full messages in channel view, together.
+                Messages — how a channel's messages are marked and drawn.
                 Channels — the one per-channel box.
                 Screen and keys — text size, width, the control bar and the keyboard.
                 Storage and connection — what this device and server keep, and the readout.
@@ -918,7 +920,7 @@
             -->
             <section class="settings-section" id="settings-voice-agent" aria-labelledby="settings-voice-agent-title">
               <h2 id="settings-voice-agent-title">Voice agent</h2>
-              <p class="hint">What the agent may send, what it is told, and what it hears.</p>
+              <p class="hint">What the agent may send and is told, what it hears, and how messages are read out.</p>
 
               <section class="settings-group">
                 <div class="group-head">
@@ -1058,6 +1060,10 @@
                   them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
                   light would be the feature claiming a continuity it does not have, which is the one
                   failure this whole thing is arranged around.
+
+                  `#332 settings-voice-agent-section`. Each state is ONE SHORT LINE (`renderResumeState`
+                  in web/voice.js, held to a budget by the page suite): which state, and the number
+                  that matters. Why a state happens and what would change it is in the `?`'s entry.
                 -->
                 <p id="resume-state" class="hint" aria-live="polite"></p>
                 <label class="toggle">
@@ -1078,6 +1084,8 @@
                   message is spoken into a call in progress. The first costs nothing and is on whenever
                   the server is ingesting; the second spends money and interrupts, and is off until it
                   is asked for.
+
+                  `#332 settings-voice-agent-section`. One short line per state, as Resuming's is.
                 -->
                 <p id="live-state" class="hint" aria-live="polite"></p>
                 <!--
@@ -1088,14 +1096,46 @@
                   No `selected` here on purpose: the live value is filled in by `renderReadNew` from
                   the same key the bar button writes, so there is exactly one truth about the mode
                   and not a markup default that disagrees with it after a reload.
+
+                  `#332 settings-voice-agent-section`. The `?` after the label is How messages are
+                  said, the server's rewrite for the ear, which is what an arriving message is read
+                  out in. Beside the words it is about, not hard right where the group's own `?` is,
+                  and before the picker, so Tab reaches it in the order the eye does.
                 -->
-                <label for="relay-to-agent">Arriving messages during a call</label>
+                <div class="label-help">
+                  <label for="relay-to-agent">Arriving messages during a call</label>
+                  <button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep" aria-label="How an arriving message is said" title="How a message is said">?</button>
+                </div>
                 <select id="relay-to-agent">
                   <option value="off">Don't tell the agent</option>
                   <option value="gist">Say what each one says, briefly</option>
                   <option value="full">Read them out in full</option>
                 </select>
                 <p class="hint">Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.</p>
+              </section>
+
+              <!--
+                `#332 settings-voice-agent-section`. Which voice reads a whole message out when it is
+                tapped in the channel view: the voice service's, or this device's own speech. It was
+                a group called "Message audio" in Messages, and the owner asked for it here, beside
+                the other two ways a message is read out — into a call as it arrives, and recapped
+                to a new one — so it sits under those, named for what it does.
+
+                Its `?` is How messages are said: the rewrite for the ear both voices read, and what
+                each voice is. `#settings-audio-source` and `#settings-agent-audio` keep their ids;
+                web/voice.js keeps the picker and the bar's switch in step (`setReadAudioSource`).
+              -->
+              <section class="settings-group" id="reading-full-group">
+                <div class="group-head">
+                  <h3>Reading full messages in channel view</h3>
+                  <button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep" aria-label="How a message is said, and by which voice" title="How a message is said">?</button>
+                </div>
+                <label for="settings-audio-source">Read messages with</label>
+                <select id="settings-audio-source">
+                  <option id="settings-agent-audio" value="agent">Agent audio</option>
+                  <option value="device">Device voice</option>
+                </select>
+                <p class="hint">Car audio: use Agent audio.</p>
               </section>
 
               <section class="settings-group">
@@ -1167,7 +1207,7 @@
 
             <section class="settings-section" id="settings-messages" aria-labelledby="settings-messages-title">
               <h2 id="settings-messages-title">Messages</h2>
-              <p class="hint">How messages are marked, shown and read out.</p>
+              <p class="hint">How messages are marked and shown.</p>
 
               <section class="settings-group">
                 <div class="group-head">
@@ -1276,33 +1316,14 @@
                 <button id="forget-dismissed-sends" class="secondary" type="button" hidden>Forget these now</button>
               </section>
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3>How messages are said</h3>
-                  <button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep" aria-label="About how messages are said" title="What the server rewrites">?</button>
-                </div>
-                <!--
-                  REPORTED, not controlled. The switch is `speakable.enabled` in the server's own
-                  configuration, because the rewrite happens before a message reaches any page and
-                  the same prepared body goes to the voice agent's own tool calls, which never touch
-                  this browser. A control here would be a switch that silently governed one of the
-                  three paths. What the screen owes the reader is which arm this deployment is in —
-                  they are flipping it to compare two runs.
-                -->
-                <p id="speech-prep-state" class="hint" aria-live="polite"></p>
-              </section>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3>Message audio</h3>
-                </div>
-                <label for="settings-audio-source">Read messages with</label>
-                <select id="settings-audio-source">
-                  <option id="settings-agent-audio" value="agent">Agent audio</option>
-                  <option value="device">Device voice</option>
-                </select>
-                <p class="hint">Car audio: use Agent audio.</p>
-              </section>
+              <!--
+                `#332 settings-voice-agent-section`. "How messages are said" used to be a group here,
+                and it held no control: one paragraph saying which arm of the rewrite for the ear
+                this server is in. Information, not a setting, in the owner's words — so it is Help's
+                entry of that name now, line and all (`#speech-prep-state`), reached by a `?` beside
+                each setting it explains: Arriving messages during a call, and Reading full messages
+                in channel view, both in Voice agent.
+              -->
             </section>
 
             <section class="settings-section" id="settings-channels" aria-labelledby="settings-channels-title">
@@ -2361,6 +2382,17 @@
                 both you and the agent are told the reconstruction is partial.
               </p>
               <p class="hint">
+                The line under <strong>Resuming</strong> in Settings says where it stands, in one
+                sentence. <em>Off on this server</em> means the operator has not turned it on, and
+                every call starts fresh whatever the switch says. After a call it says what that
+                call got: resumed, resumed <em>in part</em> with how many earlier lines did not
+                fit, not resumed because the record would not load, or started fresh — because
+                nothing was said, or because <strong>every</strong> earlier line was over the
+                budget. That last one is not an empty conversation: it was too long, and the
+                operator can raise <code>replay.max_chars</code> or <code>replay.max_turns</code>
+                in this server's configuration to resume one that long.
+              </p>
+              <p class="hint">
                 The line above each new call says what it was sent: <em>412-word recap sent</em>,
                 <em>no recap sent</em> when resuming is on but nothing went (the line says why), or
                 <em>recap unsupported</em> where the voice service has no way to take one. Sent, not
@@ -2373,7 +2405,13 @@
               <p class="hint">
                 When this server is set to watch the channel, new messages appear on their own
                 rather than at the next refresh. A deployment can use bounded polling or push
-                delivery from a provider adapter; Settings says which mode this server is using.
+                delivery from a provider adapter; the line under <strong>Live messages</strong> in
+                Settings says which mode this server is using, and whether this page is connected
+                to the server's stream right now — when it is not, it keeps trying. With adapter
+                push it cannot say whether the adapter itself is healthy, only that the page is
+                listening. <em>Off on this server</em> means the channel view re-reads on its own
+                timer while you are looking at it, and nothing reaches the agent between your
+                questions.
               </p>
               <p class="hint">
                 <strong>Arriving messages during a call</strong> has three settings, on the bar as
@@ -2384,7 +2422,8 @@
                 when it is not. Both speaking modes send channel text to
                 <strong>the voice vendor</strong> and spend conversation time. Replies this server
                 posted are never sent back — otherwise the agent would hear its own answer and
-                reply to it.
+                reply to it. Each message goes as this server prepares it for the ear: the
+                <strong>?</strong> beside the choice opens How messages are said.
               </p>
               <p class="hint">
                 A burst arriving at once becomes <strong>one</strong> spoken turn, not one per
@@ -2407,8 +2446,23 @@
               </p>
             </details>
 
+            <!--
+              `#332 settings-voice-agent-section`. Information, not a setting: this was a group on
+              Settings whose only content was the line below, and it is here now, reached by the `?`
+              beside the two settings it explains (`#help-link-speech-prep` on Reading full messages
+              in channel view, `#help-link-speech-prep-relay` on Arriving messages during a call).
+
+              `#speech-prep-state` is REPORTED, not controlled. The switch is `speakable.enabled` in
+              the server's own configuration, because the rewrite happens before a message reaches
+              any page and the same prepared body goes to the voice agent's own tool calls, which
+              never touch this browser. A control would be a switch that silently governed one of
+              the three paths. What the page owes the reader is which arm this deployment is in —
+              an operator flips it to compare two runs — so the entry opens on that, written by
+              `renderSpeechPrepState` in web/voice.js.
+            -->
             <details id="help-speech-prep" class="help-entry">
               <summary><h2>How messages are said</h2></summary>
+              <p id="speech-prep-state" class="hint"></p>
               <p class="hint">
                 Before a message is read out — by the agent during a call, or by the tap-to-listen
                 button — this server rewrites it for the ear. Markdown comes off, so
@@ -2430,6 +2484,18 @@
                 switch on this screen could only govern one of the three paths. Turning it off is
                 the control arm for tuning the agent's prompt: it makes every difference between
                 two runs the prompt rather than this.
+              </p>
+              <p class="hint">
+                Two settings under <strong>Voice agent</strong> read messages out, and each has a
+                <strong>?</strong> that opens this entry. <strong>Arriving messages during a
+                call</strong> decides whether the agent is told about a new message, briefly or in
+                full. <strong>Reading full messages in channel view</strong> decides which voice
+                reads a message you tap with Read on: <em>Agent audio</em> is this server's voice
+                service, played here as ordinary audio, and is the one to use with car audio;
+                <em>Device voice</em> is this phone's or computer's own speech, offered on every
+                server. Agent audio is offered only when this server has a voice for it. Both voices
+                read the rewritten form. The phone-or-cloud button on the control bar is the same
+                setting, and changing either changes both.
               </p>
             </details>
 
