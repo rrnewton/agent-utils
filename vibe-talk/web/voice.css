@@ -3991,11 +3991,12 @@ a.search-hit-link {
 
    `#32 freshness-pill-overlap`. Over the scroller's top it covered the list's own header instead —
    the channel summary, the first thing a cold start shows. So while there is a freshness to state,
-   #pane-discord reserves the pill's height at its head (`data-freshness`, below) and the header
-   starts under it. Padding INSIDE the scroller, so #scroll-area keeps its size and nothing else on
-   the screen moves; `renderChannelFreshness` holds a scrolled reader's place while it changes.
-   One line, ellipsised, so that the reservation is exact: a pill that wrapped to two on a narrow
-   phone would outgrow it.
+   the list reserves the pill's height at its head (`data-freshness` on #pane-discord, below) and
+   the header starts under it. Nothing outside the list's own cell moves; `renderChannelFreshness`
+   holds a scrolled reader's place while it changes. One line, ellipsised, so that the reservation
+   is exact: a pill that wrapped to two on a narrow phone would outgrow it. Since `#324
+   live-pill-covers-row` the room is the list's top edge moved down rather than padding inside it,
+   which scrolled away and left the pill over whatever row was passing.
 
    `#197 floating-search`. The anchor is a zero-height LINE through the pill's middle, and the
    search glass sits on it too, at the right-hand end: the owner asked for the glass "on the same
@@ -4069,14 +4070,29 @@ a.search-hit-link {
   border-color: currentColor;
 }
 
-/* The pill's bottom edge, measured from the scroller's top; #scroll-area's own top padding is then
-   the gap between it and the header. The 2px is the pill's border.
+/* The pill's bottom edge, measured from the top of the list's cell; #scroll-area's own top padding is
+   then the gap between it and the header. The 2px is the pill's border.
 
    `#211 link-filter`. Or the glass's bottom edge, which is lower now that the glass is the larger
    of the two things centred on the line: the room is made for whichever reaches further, so the
-   head of the list is clear of both. */
-#pane-discord[data-freshness] {
-  padding-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
+   head of the list is clear of both.
+
+   `#324 live-pill-covers-row`. The room was padding at the head of #pane-discord, inside the
+   scroller, and room at the head scrolls away: on a 412px phone "Live · updated" stood over the
+   first row on screen whenever the list was not at its very top — over a thread's date rule when
+   entering it landed on the root, with a clipped strip of the header showing between the thread's
+   card and the pill, and over an unread chip in Main. With a live channel the pill is nearly always
+   up, so that was most of the time. So, as the author filter hanging under the open bar on a narrow
+   phone already does (`#251 author-filter`, below), the list's top edge moves down to the line's
+   foot and the room at its head is given back by as much: at any scroll position every row is where
+   it was, and the list scrolls as far, but nothing is drawn under the pill or the glass. The fade
+   under the header shortens to the scroller's own top padding, so the first row is never faded.
+   Only while the channel's pane is the one shown, and not while the search bar is open, which the
+   pill gives way to and which makes its own room. */
+#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden])) {
+  margin-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
 }
 
 /* `#197 floating-search`. The glass: a disc at the right-hand end of the line, in the pill's own
@@ -4255,15 +4271,11 @@ a.search-hit-link {
   box-shadow: none;
 }
 
-/* ...and the list makes room for the bar at its head while it is open, the way #pane-discord makes
-   room for the pill, so the first match is never under it. The pill is not on screen while the bar
-   is, so its room gives way to this rather than stacking under it. */
+/* ...and the list makes room for the bar at its head while it is open, so the first match is never
+   under it. The pill is not on screen while the bar is, so its room gives way to this rather than
+   stacking under it (`#324 live-pill-covers-row`: the pill's room is not made while searching). */
 #screen-main[data-searching] #scroll-area {
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
-}
-
-#screen-main[data-searching] #pane-discord[data-freshness] {
-  padding-top: 0;
 }
 
 /* `#212 link-filter`. The kinds of link — PRs, Commits, Actions, and since `#266 link-filter-kinds`
@@ -7365,8 +7377,9 @@ textarea {
  * list's own cell over the left column, which stays laid out behind it, out of sight, so that coming
  * back to it finds the reader where they were. The pill speaks for that column and is put out of sight
  * with it; the search glass stays on the line over the head of the list, which makes room for it as
- * the left column's pane does (`#pane-discord[data-freshness]`), and for the bar when it is open. The
- * filters about messages — Pinned, Links, whose — have nothing to filter among cards and are not shown.
+ * the left column's list does for the pill (`#pane-discord[data-freshness]`), and for the bar when it
+ * is open. The filters about messages — Pinned, Links, whose — have nothing to filter among cards and
+ * are not shown.
  */
 #screen-main[data-columns="list"] > #side-column {
   display: grid;

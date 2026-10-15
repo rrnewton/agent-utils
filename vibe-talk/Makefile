@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -270,6 +270,16 @@ copy-message-browser:
 # keep a PNG of each state.
 back-gesture-browser:
 	python3 tests/back_gesture_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#324 live-pill-covers-row` in a real Chromium at a 412x915 phone with touch, in both schemes, the pill saying
+# "Live · updated": in Main the unread chip scrolled onto the pill's line is clipped by the list's top edge, not
+# covered, and in Main and in a thread scrolled through nine places nothing of the list is under the pill or the
+# search glass, by a tap through the pill and by the pixels there; a thread entered from its root lands with the
+# root's date rule below the floating line. Its controls put the old room, padding inside the scroller, back and
+# find the list under the pill. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir
+# to keep a PNG of each state.
+live-pill-browser:
+	python3 tests/live_pill_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#298 thread-card-header` in a real Chromium at 1280x800 with a mouse, in both schemes: a card's replies
 # button opens its thread on the right under its card at the top of the column — the card's words, place,

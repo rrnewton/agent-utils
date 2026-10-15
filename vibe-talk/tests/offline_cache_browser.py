@@ -19,8 +19,10 @@ one reader through:
   at the top, in the middle and at the newest line.
 
 While the freshness pill is up — refreshing, offline, failed — it must cover neither the view tabs
-nor the list's header seam or first row, and #scroll-area must be the same box with it as without
-it (`#32 freshness-pill-overlap`). As the pill's room and the error panel above the list come and
+nor the list's header seam or first row, and #scroll-area's place must be the same with it as without
+it (`#32 freshness-pill-overlap`): since `#324 live-pill-covers-row` the list's top edge moves down to
+the floating line's foot while the pill is up, so nothing scrolls under it, and nothing outside the
+list's own cell moves. As the pill's room and the error panel above the list come and
 go, a scrolled reader's line stays where it is on the screen, and a reader at the newest line stays
 there (`#33 error-banner-scroll-shift`).
 
@@ -806,7 +808,9 @@ PLACE_JS = """async (where) => {
 
 # Everything that can be covered, measured at the head of the list, with the view tabs and without
 # them. `problems` is empty when the pill covers none of the tabs, the header seams or the first row,
-# fits on its one line, and sits over the list; `area` is #scroll-area's box and `bare` the same box without the pill.
+# fits on its one line, and sits over the list's place with the list's top edge at the floating line's foot
+# (`#324 live-pill-covers-row`); `area` is #scroll-area's place — its box and the room its top edge moved
+# down by — and `bare` the same without the pill.
 # Scrolling to the top is free only because FakeApi answers has_more: False; with more history it
 # would page older rows in and spend a read the "one newest-page read" check counts.
 GEOMETRY_JS = """() => {""" + f"""
@@ -819,6 +823,13 @@ GEOMETRY_JS = """() => {""" + f"""
     const pill = document.getElementById('channel-freshness');
     const tabs = document.getElementById('channel-view-tabs');
     const problems = [];
+    // `#324 live-pill-covers-row`. The list's place: its box, and above it the room its top edge was
+    // moved down by, which the pill and the glass stand in.
+    const room = () => parseFloat(getComputedStyle(area).marginTop) || 0;
+    const place = () => {
+        const a = box(area), m = room();
+        return {top: a.top - m, bottom: a.bottom, left: a.left, right: a.right};
+    };
     const glassProblems = (layout, p, list) => {
         const glass = document.getElementById('search-toggle');
         if (!shown(glass)) return [`${layout}: the search glass is not on screen`];
@@ -847,7 +858,13 @@ GEOMETRY_JS = """() => {""" + f"""
         return found;
     };
     const covering = (layout) => {
-        const p = box(pill), list = box(area);
+        const p = box(pill), list = place();
+        // Nothing scrolls under the pill or the glass: the list's top edge is the lower of their feet.
+        const glass = document.getElementById('search-toggle');
+        const foot = Math.max(p.bottom, shown(glass) ? box(glass).bottom : p.bottom);
+        if (Math.abs(box(area).top - foot) > 1) {
+            problems.push(`${layout}: the list's top edge is at ${box(area).top.toFixed(1)}px, not at the floating line's foot at ${foot.toFixed(1)}px`);
+        }
         if (shown(tabs) && meets(p, box(tabs))) problems.push(`${layout}: it covers the Main/Threads/All tabs`);
         const seams = [...document.querySelectorAll('#pane-discord .seam')].filter(shown);
         if (seams.length === 0) problems.push(`${layout}: there is no header seam to measure against`);
@@ -892,10 +909,12 @@ GEOMETRY_JS = """() => {""" + f"""
         covering('without tabs');
         tabs.hidden = tabsHidden;
     }
+    // To a tenth of a pixel; and without the client height, which is the list's own inside and is
+    // meant to give up the room.
     const size = () => {
-        const a = box(area);
-        return [a.top, a.left, a.width, a.height, area.clientWidth, area.clientHeight]
-            .map((n) => n.toFixed(2)).join(',');
+        const a = box(area), m = room();
+        return [a.top - m, a.left, a.width, a.height + m, area.clientWidth]
+            .map((n) => (Math.round(n * 10) / 10 + 0).toFixed(1)).join(',');
     };
     // The same box with the pill and its room taken away, in the same state, so that a banner
     // appearing for its own reasons is not mistaken for the pill resizing the list.
@@ -2454,14 +2473,18 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 return {key: float(found[key]) for key in ("row", "gap", "top", "bottom", "banner")}
 
             def geometry(state: str, name: str) -> str:
-                # At the head of the list, where the header is: a pill over row 40 of 90 is the
-                # accepted cost of an overlay, a pill over the header is `#32 freshness-pill-overlap`.
+                # At the head of the list, where the header is: a pill over the header is `#32
+                # freshness-pill-overlap`, and one over whatever row is passing further down is `#324
+                # live-pill-covers-row`, which tests/live_pill_browser.py walks.
                 found = page.evaluate(GEOMETRY_JS)
                 shot(name)
                 problems = [str(problem) for problem in found["problems"]]
                 check(not problems, f"{label}, {state}: {problems}")
-                check(str(found["area"]) == str(found["bare"]),
-                      f"{label}, {state}: #scroll-area is {found['area']}, {found['bare']} without the pill")
+                # Within a quarter of a pixel: the room is a computed length, rounded where the box is not.
+                with_pill = [float(n) for n in str(found["area"]).split(",")]
+                without = [float(n) for n in str(found["bare"]).split(",")]
+                check(all(abs(a - b) <= 0.25 for a, b in zip(with_pill, without)),
+                      f"{label}, {state}: #scroll-area's place is {found['area']}, {found['bare']} without the pill")
                 check(bool(found["picker"]), f"{label}, {state}: the bar's thread picker was not on screen")
                 return str(found["area"])
 

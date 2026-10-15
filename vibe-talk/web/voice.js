@@ -3290,7 +3290,7 @@ function applyFoldStep(step, folds, field = null) {
       const area = el("scroll-area");
       area.scrollTop += row.getBoundingClientRect().top - head;
       filterHold = { ...filterHold, at: area.scrollTop,
-        offset: row.getBoundingClientRect().top - area.getBoundingClientRect().top };
+        offset: row.getBoundingClientRect().top - listPlaceTop(area) };
     }
   }
   renderScrollTools();
@@ -4634,7 +4634,8 @@ function anchorAt(row, selection = null) {
     focused: Boolean(selection && nodeWithin(row, document.activeElement)),
     time: messages.length ? timeOf(messages[0], "timestamp") : NaN,
     // Of the message itself, which is the row's top but in a combined row (`messageTop`).
-    offset: messageTop(row, kept.length ? kept[0] : null) - el("scroll-area").getBoundingClientRect().top,
+    // From the list's place, not its top edge, which the search moves (`listPlaceTop`).
+    offset: messageTop(row, kept.length ? kept[0] : null) - listPlaceTop(el("scroll-area")),
     alternate: null,
   };
 }
@@ -4713,7 +4714,7 @@ function currentFilterHold() {
   const area = el("scroll-area");
   const row = anchorRow({ row: hold.row, ids: hold.ids });
   const unmoved = Math.abs(area.scrollTop - hold.at) <= 1 || (row !== null &&
-    Math.abs(row.getBoundingClientRect().top - area.getBoundingClientRect().top - hold.offset) <= 1);
+    Math.abs(row.getBoundingClientRect().top - listPlaceTop(area) - hold.offset) <= 1);
   if (!unmoved) {
     filterHold = null;
     return null;
@@ -4768,7 +4769,7 @@ function keepFilterHold() {
   }
   const row = held.row;
   const area = el("scroll-area");
-  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - filterHold.offset;
+  area.scrollTop += row.getBoundingClientRect().top - listPlaceTop(area) - filterHold.offset;
   filterHold = { ...filterHold, row, ids: idsOf(row).length ? idsOf(row) : filterHold.ids, at: area.scrollTop };
   return true;
 }
@@ -4905,13 +4906,13 @@ function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
     return;
   }
   // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
-  area.scrollTop += messageTop(placed, row ? id : null) - area.getBoundingClientRect().top - offset;
+  area.scrollTop += messageTop(placed, row ? id : null) - listPlaceTop(area) - offset;
   carrySelection(anchor, placed, substitute !== null);
   const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
   filterHold = {
     key: filterKey(), row: placed, ids: idsOf(placed), at: area.scrollTop, origin: anchor,
-    offset: placed.getBoundingClientRect().top - area.getBoundingClientRect().top, mark: mark ? mark.id : null,
+    offset: placed.getBoundingClientRect().top - listPlaceTop(area), mark: mark ? mark.id : null,
   };
   renderJumpNewest();
   if (substitute && anchor.selected !== null) setStatus(filterHiddenSentence(anchor, walked));
@@ -15442,14 +15443,18 @@ function renderSideFreshness() {
 }
 
 /**
- * `#32 freshness-pill-overlap`. The pill's height at the head of the channel pane, so that the pill
+ * `#32 freshness-pill-overlap`. The pill's height at the head of the channel's list, so that the pill
  * never covers the list's header. Keyed to there being something to say, not to the pill being
  * shown: giving way to a pull or to the other view must not shift the list.
  *
+ * `#324 live-pill-covers-row`. The room is the list's top edge moved down to the floating line's
+ * foot (web/voice.css), no longer padding at the head of the pane, which scrolled away and left the
+ * pill over whatever row was passing. The attribute on the pane is still what asks for it.
+ *
  * Through `holdingReader`, because the room is added ABOVE a reader who has scrolled down, and
- * browser scroll anchoring is suppressed for exactly this change — padding on an ancestor of every
- * row. Without it a failed refresh pushed the line being read, or the newest line, down by the
- * pill's height.
+ * browser scroll anchoring is suppressed for exactly this change — a change of the scroller's own
+ * size above every row. Without it a failed refresh pushed the line being read, or the newest line,
+ * down by the pill's height.
  */
 function reserveFreshnessRoom(reserve) {
   const pane = el("pane-discord");
@@ -15850,7 +15855,7 @@ function holdChannelPlace() {
       view: viewKey(),
       atNewest: mark.pinned,
       anchor: anchor ? anchor.getAttribute("data-context-id") || idsOf(anchor)[0] || null : null,
-      offset: anchor ? mark.top - el("scroll-area").getBoundingClientRect().top : 0,
+      offset: anchor ? mark.top - listPlaceTop(el("scroll-area")) : 0,
     },
   };
 }
@@ -15931,7 +15936,7 @@ function returnToSavedPlace() {
   const row = [...visibleList().children].find((candidate) =>
     candidate.getAttribute("data-context-id") === place.anchor || idsOf(candidate).includes(place.anchor));
   if (!row) return;
-  restoreScroll({ pinned: false, anchor: row, top: el("scroll-area").getBoundingClientRect().top + place.offset });
+  restoreScroll({ pinned: false, anchor: row, top: listPlaceTop(el("scroll-area")) + place.offset });
 }
 
 /**
@@ -16811,7 +16816,7 @@ function landAtFoot(first) {
   const area = el("scroll-area");
   const was = area.scrollTop;
   area.scrollTop = area.scrollHeight;
-  if (first.getBoundingClientRect().top < floatingClearance(area) + REPLY_LANDING_GAP_PX - 1) {
+  if (drawnTop(first) < floatingClearance(area) + REPLY_LANDING_GAP_PX - 1) {
     area.scrollTop = was;
     return false;
   }
@@ -16844,7 +16849,8 @@ let entryLanding = null;
  */
 function placeEntryLanding(row, first) {
   const area = el("scroll-area");
-  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  // By where the row starts, its date rule included: `#324 live-pill-covers-row`, see `drawnTop`.
+  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
   entryLanding = { key: channelContextKey(), row, first, at: area.scrollTop };
 }
 
@@ -23004,6 +23010,21 @@ function rowHolding(id) {
 }
 
 /**
+ * The top of the list's PLACE, in viewport pixels: its box's top, less the room its top edge is moved
+ * down by — the pill's line (`#324 live-pill-covers-row`), or what hangs under the open search bar on a
+ * narrow phone (`#251 author-filter`), both in web/voice.css. Steady as that room comes and goes, which
+ * opening and closing the search does, so a height in the window measured from here is the same height
+ * after it. The list's own top moves with the room, and a row put back by it moved with it.
+ *
+ * @param {Element} area
+ */
+function listPlaceTop(area) {
+  const top = area.getBoundingClientRect().top;
+  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(area) : null;
+  return top - (style ? parseFloat(style.marginTop) || 0 : 0);
+}
+
+/**
  * Where the floating line over the head of the list ends, in viewport pixels: the bottom of the
  * freshness pill or of the search glass beside it, whichever is lower, or the list's own top when
  * neither is up. A row put any higher than this is under them.
@@ -23019,6 +23040,30 @@ function floatingClearance(area) {
     if (box.height > 0) clear = Math.max(clear, box.bottom);
   }
   return clear;
+}
+
+/**
+ * Where `row` starts on screen, in viewport pixels: the top of its tile, or of the lines it draws above
+ * the tile in the room it keeps there — a day's rule or a gap's line (`#250 date-separators`, `#249
+ * search-highlight`), and the bookmark's line when it is above the row (`#240 reading-bookmark`).
+ *
+ * `#324 live-pill-covers-row`. A landing put the TILE just under the floating line, so the lines over
+ * it were put above the line: entering a thread landed on its root and drew the root's date rule under
+ * "Live · updated". A row is landed by where it starts.
+ *
+ * @param {Element} row
+ */
+function drawnTop(row) {
+  let top = row.getBoundingClientRect().top;
+  for (const child of row.children) {
+    const classes = String(child.className).split(/\s+/);
+    const above = (classes.includes("row-seam") && !classes.includes("row-seam-below")) ||
+      (classes.includes("bookmark-line") && row.getAttribute("data-bookmark") === "above");
+    if (!above) continue;
+    const box = child.getBoundingClientRect();
+    if (box.height > 0) top = Math.min(top, box.top);
+  }
+  return top;
 }
 
 /** Whether any of `row` shows between the floating line and the foot of the list. */
@@ -23041,7 +23086,7 @@ function revealRow(row) {
   // The reader asked for this message: a filter change's hold, and its walk back, give way. `#243`.
   filterHold = null;
   endFilterWalk();
-  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;
   if (replyLanded) {
     clearTimeout(replyLanded.timer);
     replyLanded.row.removeAttribute("data-landed");
@@ -34814,7 +34859,15 @@ function glideToCounterpart() {
     ? [end.from, end.to, end.fromSeen, end.toSeen] : [end.to, end.from, end.toSeen, end.fromSeen];
   if (!ownSeen || farSeen) return;
   const span = onMain ? measured.right : measured.left;
-  const level = Math.max(span.top + LINK_GLIDE_MARGIN_PX, Math.min(span.bottom - LINK_GLIDE_MARGIN_PX, own.y));
+  let level = Math.max(span.top + LINK_GLIDE_MARGIN_PX, Math.min(span.bottom - LINK_GLIDE_MARGIN_PX, own.y));
+  // A root brought to Main is brought whole, its head and the date rule over it included, not only the
+  // point its link leaves from: `#324 live-pill-covers-row` moved Main's top edge down to the floating
+  // line's foot, and a card heading the right column put the root's head above it, cut off.
+  if (!onMain) {
+    const head = drawnTop(chosen.row) + level - far.y;
+    const lowest = span.bottom - LINK_GLIDE_MARGIN_PX;
+    if (head < span.top + REPLY_LANDING_GAP_PX) level = Math.min(lowest, level + span.top + REPLY_LANDING_GAP_PX - head);
+  }
   const top = glide.other.scrollTop + far.y - level;
   const behavior = glideBehavior();
   if (typeof glide.other.scrollTo === "function") glide.other.scrollTo({ top, behavior });

@@ -486,6 +486,11 @@ bounded snapshot of the channel rows it has already shown, in `localStorage` und
 - **Says when it is current.** After a read the pill says `Updated HH:MM`, or `Live · updated
   HH:MM` while the live stream is attached, with `· refreshing…` while a read is in flight. A live
   message moves the time forward.
+- **Covers nothing.** While the pill is up the list starts below it and the search glass beside it
+  (`#324 live-pill-covers-row`): the list's top edge sits at the foot of their line, so no row, chip
+  or date rule ever scrolls under them, and entering a thread lands its first row with the date rule
+  above it in view. It used to be room at the head of the list, which scrolled away, and on a phone
+  the pill then stood over a thread's date rule or an unread chip in Main.
 - **Honest when stale.** If the refresh cannot reach the server, the rows stay and the pill says
   `Offline · showing messages saved …`. A server error says `Refresh failed · …`.
 - **Bounded.** At most 120 messages and 120 thread cards per channel, 12 channels (the least

@@ -284,6 +284,20 @@ MEASURE_JS = """({root, answer}) => {
     return {top: r.top, bottom: r.bottom, height: r.height, left: r.left, right: r.right, width: r.width};
   };
   const row = (id) => [...document.querySelectorAll('#discord-log > li')].find((li) => li.dataset.id === id);
+  // `#324 live-pill-covers-row`: a row's box, and where it starts (`start`): its tile, or the date rule or
+  // line it draws above the tile, which is what a landing puts just under the floating line.
+  const rowBox = (li) => {
+    const found = box(li);
+    if (!found) return null;
+    let start = found.top;
+    for (const kid of li.children) {
+      const above = (kid.classList.contains('row-seam') && !kid.classList.contains('row-seam-below')) ||
+        (kid.classList.contains('bookmark-line') && li.dataset.bookmark === 'above');
+      const r = kid.getBoundingClientRect();
+      if (above && r.height > 0) start = Math.min(start, r.top);
+    }
+    return {...found, start};
+  };
   const area = document.getElementById('scroll-area');
   let line = area.getBoundingClientRect().top;
   for (const id of ['channel-freshness', 'search-float']) {
@@ -325,8 +339,8 @@ MEASURE_JS = """({root, answer}) => {
     viewport: window.innerHeight,
     areaBottom: area.getBoundingClientRect().top + area.clientHeight,
     overflow: document.scrollingElement.scrollWidth - window.innerWidth,
-    root: box(row(root)),
-    answer: box(row(answer)),
+    root: rowBox(row(root)),
+    answer: rowBox(row(answer)),
     answerFolded: row(answer) ? row(answer).dataset.collapsed : null,
     firstShown: ([...document.querySelectorAll('#discord-log > li')].find((li) => !li.hidden) || {dataset: {}}).dataset.id || null,
     heads: heads.length,
@@ -537,7 +551,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["labelFits"] is True, f"{size}: the words 'Show read' touch or cross the button's sides")
     m = settled_entry()
     floating = number(m, "floating")
-    top = number(m, "answer", "top")
+    top = number(m, "answer", "start")
     check(floating <= top <= floating + 16,
           f"{size}: Show read landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px"
           f"{' (the list is at its end)' if m['atEnd'] else ''}")
@@ -557,7 +571,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["labelFits"] is True, f"{size}: the words 'Collapse read' touch or cross the button's sides")
     m = settled_entry()
     floating = number(m, "floating")
-    root_top = number(m, "root", "top")
+    root_top = number(m, "root", "start")
     check(floating <= root_top <= floating + 16,
           f"{size}: Collapse read did not keep the root at the head: {root_top:.0f}px under {floating:.0f}px")
     check(m["heads"] == 1 and m["members"] == READ_REPLIES - 1,
@@ -588,7 +602,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     page.wait_for_timeout(250)
     opened = measure(page)
     check(opened["hiddenRows"] == 0, f"{size}: {opened['hiddenRows']} rows of the opened run are still hidden")
-    moved = number(opened, "root", "top") - root_top
+    moved = number(opened, "root", "start") - root_top
     check(abs(moved) <= 1, f"{size}: opening the run moved the root by {moved:.1f}px")
     # A tap focuses the line too, and a row holding the focus is lit: a read message drawn as unread.
     check(opened["focusedRow"] is None, f"{size}: a tap on the line put the focus on message {opened['focusedRow']}")
@@ -628,7 +642,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["firstShown"] == ANSWER_ID, f"{size}: Hide read's thread starts at {m['firstShown']}, not the answer")
     check(m["answerFolded"] == "false", f"{size}: Hide read's answer is folded")
     floating = number(m, "floating")
-    top = number(m, "answer", "top")
+    top = number(m, "answer", "start")
     check(floating <= top <= floating + 16,
           f"{size}: Hide read landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px"
           f"{' (the list is at its end)' if m['atEnd'] else ''}")
@@ -696,7 +710,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     m = measure(page)
     check(m["firstShown"] == ANSWER_ID, f"{size}: the count opened the thread at {m['firstShown']}, not the answer")
     floating = number(m, "floating")
-    top = number(m, "answer", "top")
+    top = number(m, "answer", "start")
     check(floating <= top <= floating + 16,
           f"{size}: the count landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px")
     notes.append(f"the count, tapped, opened the thread on the answer, unfolded at {top:.0f}px")
@@ -747,7 +761,7 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     m = measure(page)
     check(m["root"] is None, f"{size}: the root was up before the thread's read landed; these are not held rows")
     floating = number(m, "floating")
-    top = number(m, "answer", "top")
+    top = number(m, "answer", "start")
     check(floating <= top <= floating + 16,
           f"{size}: the held rows landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px")
     notes.append(f"held rows: answer unfolded at {top:.0f}px before the read")
@@ -761,7 +775,7 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     page.wait_for_timeout(400)
     m = measure(page)
     floating = number(m, "floating")
-    found = {"root": number(m, "root", "top"), "line": number(m, "line", "top"), "answer": number(m, "answer", "top")}
+    found = {"root": number(m, "root", "start"), "line": number(m, "line", "top"), "answer": number(m, "answer", "top")}
     check(floating <= found["root"] <= floating + 16,
           f"{size}: the read behind the held rows left the root at {found['root']:.0f}px, not at the head under {floating:.0f}px")
     check(m["lineText"] == f"… {READ_REPLIES} read messages …", f"{size}: the line says {m['lineText']!r}")

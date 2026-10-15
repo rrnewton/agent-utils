@@ -541,6 +541,30 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#324 live-pill-covers-row` in the browser engine, at a 412x915 phone with touch, in the dark scheme and the
+  # light, the live stream attached so the pill says "Live · updated": in Main, the summed-up thread's unread
+  # chip scrolled onto the pill's line is clipped by the list's top edge, not covered, and the list scrolled
+  # through nine places has nothing of it under the pill or the glass, by a tap through the pill at points
+  # across the line and by the screen's own background in every pixel there; a thread entered from its root
+  # lands with the root's date rule below the floating line, nothing of the list between the thread's card
+  # and the pill, and nothing under the line at nine places. Its controls lay the old room, padding inside the
+  # scroller, over the page, and find the list under the pill. Against the page before it, the unread chip is
+  # under the pill; with the new style sheet and the old landing, the date rule is. Measured on 2026-10-15:
+  # about 22s wall.
+  - group: check
+    job: live-pill-browser
+    desc: the live pill and the search glass stand over no row, chip or date rule of the channel's list, in Main and in a thread, at any scroll position and as a thread lands, in current Chromium at a 412x915 phone in both schemes
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/live_pill_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 22
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#298 thread-card-header` in the browser engine, at 1280x800 with a mouse, in the dark scheme and the
   # light: a card's replies button opens its thread on the right under its card at the top of the column,
   # saying what the card said, at the card's place and height, above the list and not in it, the X on it,

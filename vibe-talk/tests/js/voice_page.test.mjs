@@ -8480,10 +8480,11 @@ test("the glass is DRAWN larger than the pill, with a larger glyph, and HIT at 4
     /--freshness-top:\s*calc\(var\(--search-bar\) \/ 2 \+ 0\.1rem - var\(--freshness-box\) \/ 2\)/,
     "the line is not placed by the bar, so the larger bar hangs over what is above the list"
   );
-  // ...and the head of the list makes room for whichever of the pill and the glass reaches lower.
+  // ...and the head of the list makes room for whichever of the pill and the glass reaches lower:
+  // its top edge, since `#324 live-pill-covers-row`, so the room does not scroll away.
   assert.match(
-    cssBlock("#pane-discord[data-freshness]"),
-    /padding-top:\s*calc\(var\(--float-line\) \+ max\(var\(--freshness-box\), var\(--search-disc\)\) \/ 2\)/,
+    cssBlock("#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))"),
+    /margin-top:\s*calc\(var\(--float-line\) \+ max\(var\(--freshness-box\), var\(--search-disc\)\) \/ 2\)/,
     "the room at the head of the list is the pill's alone, so the larger glass sits on the first row"
   );
 });
@@ -25798,19 +25799,18 @@ test("THE GLASS GROWS INTO A BAR OVER THE LIST, THE PILL GIVES WAY, AND CLOSING 
 
 test("the open bar makes room for itself at the head of the list, in place of the pill's", () => {
   // The bar floats, so without room reserved under it the first match — the one a filter leaves
-  // at the very top — would be underneath it. The room is padding inside the scroller, the way
-  // `#32 freshness-pill-overlap` made room for the pill, and it REPLACES the pill's room rather
-  // than stacking under it: the pill is not on screen while the bar is.
+  // at the very top — would be underneath it. The room is padding inside the scroller, as
+  // `#32 freshness-pill-overlap` first made room for the pill, and it REPLACES the pill's room rather
+  // than stacking under it: the pill is not on screen while the bar is. Since `#324
+  // live-pill-covers-row` the pill's room is the list's top edge, and is made only while not searching.
   assert.match(
     cssBlock("#screen-main[data-searching] #scroll-area"),
     /padding-top:\s*calc\(var\(--float-line\) \+ var\(--search-bar\) \/ 2 \+ 0\.35rem\)/,
     "the list does not make room for the open bar"
   );
-  assert.match(
-    cssBlock("#screen-main[data-searching] #pane-discord[data-freshness]"),
-    /padding-top:\s*0/,
-    "the pill's room stacks under the bar's"
-  );
+  assert.equal(cssRules(CSS, "#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))").length, 1, "the pill's room is not one rule");
+  assert.equal(cssRules(CSS, "#pane-discord[data-freshness]").length, 0,
+    "the pill's room is padding inside the scroller again, which scrolls away");
   // ...and the bar is a panel of its own, so the count is not printed onto a message underneath.
   const open = cssBlock("#screen-main[data-searching] #search-float");
   assert.match(open, /background:\s*var\(--panel\)/);
@@ -37215,7 +37215,7 @@ test("a reload puts the reader back on the message they were reading, and on the
 
   // THE CONTROL: with the return deleted the reader lands on the newest message, and this fails.
   const control = await run(brokenScript(
-    "  restoreScroll({ pinned: false, anchor: row, top: el(\"scroll-area\").getBoundingClientRect().top + place.offset });",
+    "  restoreScroll({ pinned: false, anchor: row, top: listPlaceTop(el(\"scroll-area\")) + place.offset });",
     "  void row;"
   ));
   assert.notEqual(control.before, control.left.top, "the test cannot tell a page that returns from one that does not");
@@ -41434,9 +41434,20 @@ function floatingLine(page) {
   }
   return line;
 }
+/**
+ * Where `row` starts: the top of its tile, or of the lines it draws above it — a day's rule, a gap's line,
+ * the bookmark's line above it — which a landing must not put under the floating line either. `#324
+ * live-pill-covers-row`.
+ */
+const startOf = (row) => Math.min(row.getBoundingClientRect().top, ...row.children
+  .filter((kid) => (kid.hasClass("row-seam") && !kid.hasClass("row-seam-below")) ||
+    (kid.hasClass("bookmark-line") && row.getAttribute("data-bookmark") === "above"))
+  .map((kid) => kid.getBoundingClientRect())
+  .filter((box) => box.height > 0)
+  .map((box) => box.top));
 /** Whether `row` starts just under the floating line: at the head of the list, as a landing puts it. */
 const atTheHead = (page, row) => {
-  const top = row.getBoundingClientRect().top;
+  const top = startOf(row);
   return top >= floatingLine(page) && top <= floatingLine(page) + LINE_PX;
 };
 const readModeSaid = (page) => [
@@ -42411,6 +42422,34 @@ test("Hide read: entering a thread lands on its first unread message too", async
   assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "false", "the first unread is folded");
 });
 
+// `#324 live-pill-covers-row`. On a 412px phone entering a thread landed its root's TILE just under the
+// floating line, and the date rule the row draws above its tile went under "Live · updated". A row is
+// landed by where it starts (`drawnTop`): its day rule, a gap's line or the bookmark's line included.
+test("...and lands the first unread's day rule under the floating line with it, never under the pill", async () => {
+  const land = async (script) => {
+    const page = newPage(new Map(), script);
+    const messages = runThread(page, { tail: [["agent", false]] });
+    await enterRunThread(page, messages, () => chooseReadMode(page, "Hide read"));
+    const answer = rowWithId(page, runId(500));
+    const rule = answer.children.find((kid) => kid.hasClass("row-seam") && !kid.hasClass("row-seam-below"));
+    return { seam: answer.getAttribute("data-seam"), rule: rule ? rule.getBoundingClientRect().top : NaN,
+      tile: answer.getBoundingClientRect().top, line: floatingLine(page) };
+  };
+  const real = await land(SCRIPT);
+  assert.equal(real.seam, "day", "the premise: the first unread row draws a day rule above its tile");
+  assert.ok(real.rule >= real.line && real.rule <= real.line + LINE_PX,
+    `the day rule landed at ${real.rule}px, not just under the floating line at ${real.line}px`);
+  assert.ok(real.tile > real.rule, "the tile is not under its rule");
+  // THE CONTROL: the landing measured from the tile, as it was.
+  const control = await land(brokenScript(
+    "  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n  entryLanding =",
+    "  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n" +
+      "  entryLanding ="));
+  assert.ok(control.rule < control.line,
+    "the control left the day rule clear of the floating line too, so the check above proves nothing");
+  assert.ok(Math.abs(control.tile - real.rule) <= 1, "the control did not land the tile where the rule now lands");
+});
+
 test("...and the dock and the chips changing as the thread opens leave the first unread where the entry put it", async () => {
   // On a desk the picker takes the thread's name as the thread opens and the dock wraps onto a second
   // row (`#218 desktop-dock`); opening the message's fold can put "Collapse all" up under the list. A
@@ -42426,8 +42465,10 @@ test("...and the dock and the chips changing as the thread opens leave the first
     await enterRunThread(page, messages, async () => {
       await chooseReadMode(page, "Hide read");
       // The dock as All had it, reported. Then the thread's name wraps it: laid out, and so measured
-      // by the landing, but not yet reported to anything watching the list.
-      area.clientHeight = 470;
+      // by the landing, but not yet reported to anything watching the list. (498px: the answer's day
+      // rule is landed under the floating line with it since `#324 live-pill-covers-row`, 28px further
+      // from the end, so the list is that much taller for the landing to stay as near its end.)
+      area.clientHeight = 498;
       dock.offsetHeight = 50;
       page.resized(area);
       dock.offsetHeight += GROWTH;
@@ -46645,6 +46686,7 @@ const cardLinkY = (card) => {
 const inColumnView = (area, y) => y >= area.getBoundingClientRect().top && y <= area.getBoundingClientRect().top + area.clientHeight;
 
 const LINK_GLIDE_MARGIN_PX = sourceConstant("LINK_GLIDE_MARGIN_PX");
+const LANDING_GAP_PX = sourceConstant("REPLY_LANDING_GAP_PX");
 
 /** Scroll Main until the tag of thread `t<i>`'s root is at viewport y `y`, as the reader would. */
 async function rootAt(page, i, y) {
@@ -48023,8 +48065,13 @@ test("`#298 thread-card-header`: the mouse resting on the card at the top glides
       assert.deepStrictEqual(left.glides.map((glide) => glide.behavior), [reduced ? "auto" : "smooth"],
         "Main did not glide to the card's root, as the reader's system asks");
       const box = header.getBoundingClientRect();
-      assert.equal(rootLinkY(rootRow(page, 8)), glideLevel(left, (box.top + box.bottom) / 2),
-        "the root was not brought level with the card");
+      // Level with the card, unless that would cut off the root's head, the date rule over it included,
+      // at Main's top edge: then just low enough to show it whole (`#324 live-pill-covers-row`).
+      const root = rootRow(page, 8);
+      const whole = rootLinkY(root) - startOf(root) + left.getBoundingClientRect().top + LANDING_GAP_PX;
+      assert.equal(rootLinkY(root), Math.max(glideLevel(left, (box.top + box.bottom) / 2), whole),
+        "the root was not brought level with the card, or not whole");
+      assert.ok(startOf(root) >= left.getBoundingClientRect().top, "the glide left the root's head above Main's top edge");
       await left.dispatch("scroll");
       await page.nextFrame();
       assert.deepStrictEqual(drawnLinks(page).map((one) => one.clip), ["both"], "the link is not whole once the root is on screen");
