@@ -1,12 +1,13 @@
 ---
 title: 'slack-reply-by-id: reading a Slack thread reply by its id answers unknown_message'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.400273191+00:00
-updated_at: 2026-10-15T06:03:00.400273191+00:00
+updated_at: 2026-10-15T08:53:44.217947406+00:00
+closed_at: 2026-10-15T08:53:44.217947016+00:00
 ---
 
 # Description
