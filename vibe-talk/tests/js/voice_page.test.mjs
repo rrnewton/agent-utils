@@ -63449,6 +63449,261 @@ test("`#326 refused-undo-restores-done`: a Done, its Undo and a Done again, pres
   assert.equal(doneDrawn(unkept.page, "201"), "false", "without the server's state kept 201 was drawn Done, so this test cannot see it");
 });
 
+
+// --- `#327 done-races-remaining` ----------------------------------------------------------------
+//
+// Found in the final reviews of #306 done-stale-across-views and #311 sent-read-waits-for-done, four
+// smaller races of a Done still on its way, each older than both:
+//   (1) a thread opened on the right for the first time while a Done made on Main was saved held nothing
+//       for the message, and drew it as its read did, not Done, even once the Done was saved;
+//   (2) Through here did not wait for a Done still on its way on a row it covers before moving the chat
+//       service's marker, which cannot be moved back;
+//   (3) an Undo pressed while a sent reply's own Done (#300 reply-marks-read) was saved still had the
+//       chat service asked;
+//   (4) under Hide read in a channel without threads, a Done the server refused kept its row off the
+//       list until the next read.
+
+/** The lines of `noteArchived` that give a copy the store's state for a message the read does not speak for, for a negative control. */
+const COPY_TAKES_STORE = ["  if (threadingSupported && channelCanon.channel === String(el(\"discord-channel\").value)) {\n    for (const id of localReadWrites.keys()) {",
+  "  if (false) {\n    for (const id of localReadWrites.keys()) {"];
+/** The wait of Through here for a Done on its way on a row it covers, for a negative control. */
+const THROUGH_WAITS = ["    if (waiting.length > 0 && !(await doneSaved(waiting,", "    if (false && !(await doneSaved(waiting,"];
+/** The look of a confirmed send at its message once its own Done is saved, for a negative control. */
+const SENT_LOOKS_AGAIN = ["  return doneSaved(ids, () => String(el(\"discord-channel\").value) === channel && doneHeldHere(ids));\n}\n",
+  "  return true;\n}\n"];
+/** The rows a refused Done put back under Hide read without threads, for a negative control. */
+const ROWS_PUT_BACK = ["        putBackRowsOff(listed);\n", ""];
+
+/**
+ * Two columns over the channel of `threadData`, the cards on the right and no thread opened there yet;
+ * a Done on root 201 in Main, or for `kind` "restore" an Undo of a Done on it saved first, its write held
+ * on its way; thread one & two opened on the right from 201's tag meanwhile, for the first time; then the
+ * write answered `answer` (null for saved). With `oneColumn`, the act is made in All in one column, and two
+ * columns turned on while it is on its way, before the thread is opened. Answers the page and how the
+ * right column drew 201 while the write was on its way.
+ */
+async function openedWhileSaving(kind, answer, script = SCRIPT, oneColumn = false) {
+  const page = oneColumn ? await threadPageOn(script) : (await twoColumnServer(null, script)).page;
+  assert.deepStrictEqual(sideIds(page), [], "the premise is no thread on the right yet");
+  if (kind === "restore") {
+    await doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }], "the premise is a Done saved, to undo");
+  }
+  let release = null;
+  page.inboxWriteHook = async (asked) => (asked === kind && release === null
+    ? new Promise((resolve) => { release = () => resolve(answer); }) : null);
+  const pressed = doneButton(channelRow(page, "201")).click();
+  await page.settle();
+  assert.ok(release, `the premise is the ${kind} on its way`);
+  assert.equal(doneDrawn(page, "201"), String(kind === "dismiss"), "the premise is the act drawn at once");
+  if (oneColumn) {
+    await twoColumns(page);
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the premise is Main on the left beside the cards");
+  }
+  await threadBadge(channelRow(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(sideIds(page), ["201", "202"], "the premise is the thread opened on the right");
+  const whileSaving = sideDoneDrawn(page, "201");
+  release();
+  await pressed.catch(() => {});
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(page.el("error").hidden, answer === null, `the premise is the ${kind} ${answer === null ? "saved" : "refused, and said"}`);
+  page.inboxWriteHook = null;
+  return { page, whileSaving };
+}
+
+test("`#327 done-races-remaining`: a thread opened on the right for the first time while a Done or an Undo made on the left is saved draws it as made, and as the server holds it once answered", async () => {
+  for (const [oneColumn, where] of [[false, "made on Main beside the cards"], [true, "made in All before two columns"]]) {
+    for (const kind of ["dismiss", "restore"]) {
+      const made = String(kind === "dismiss");
+      for (const answer of [null, STORE_REFUSES()]) {
+        const says = `${where}, ${kind} ${answer === null ? "saved" : "refused"}`;
+        const { page, whileSaving } = await openedWhileSaving(kind, answer, SCRIPT, oneColumn);
+        assert.equal(whileSaving, made, `${says}: the thread opened on the right drew 201 as its read did, not as the act on the left made it`);
+        const held = page.dealtWith.has("201");
+        assert.equal(sideDoneDrawn(page, "201"), String(held), `${says}: the right column draws 201 otherwise than the server holds it`);
+        assert.equal(doneDrawn(page, "201"), String(held), `${says}: Main draws 201 otherwise than the server holds it`);
+        // A later write from the right, which saves the snapshot from the right column's copy.
+        await doneButton(sideRow(page, "202")).click();
+        await page.settle();
+        assert.equal(savedDone(page, "201"), held, `${says}: a later write from the right saved 201 otherwise than the server holds it`);
+      }
+    }
+  }
+  // THE CONTROL: without a copy taking the store's state for a message its read does not speak for, the
+  // thread opened on the right draws a Done on its way as not Done, and still does once it is saved.
+  for (const oneColumn of [false, true]) {
+    const { page, whileSaving } = await openedWhileSaving("dismiss", null, brokenScript(...COPY_TAKES_STORE), oneColumn);
+    assert.equal(whileSaving, "false", "without the store's state the thread drew the Done on its way, so this test cannot see it");
+    assert.equal(sideDoneDrawn(page, "201"), "false", "without the store's state the thread drew the saved Done, so this test cannot see it");
+  }
+});
+
+/**
+ * Three messages of `backlog` in a channel without threads, the chat service's marker supported; the
+ * first marked Done with its Done button, its write held on its way; then Through here pressed on row
+ * `boundary` meanwhile; then the first Done answered `answer` (null for saved), every later write saved.
+ * Answers the page, the ids, what was asked of the chat service while the first Done was on its way, and
+ * the server's floor's asks of the service.
+ */
+async function throughWhileSaving(answer, boundary, script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  page.upstreamReadMarkSupported = true;
+  const asked = serverFloor(page);
+  await signIn(page);
+  const ids = (await showDiscord(page, backlog(3))).map((row) => row.getAttribute("data-id"));
+  let release = null;
+  page.inboxWriteHook = async (kind) => (kind === "dismiss" && release === null
+    ? new Promise((resolve) => { release = () => resolve(answer); }) : null);
+  const pressed = doneButton(rowWithId(page, ids[0])).click();
+  await page.settle();
+  assert.ok(release, "the premise is the first Done on its way");
+  const through = readThroughButton(rowWithId(page, ids[boundary])).click();
+  await page.settle();
+  const whileSaving = [...page.upstreamReadCalls];
+  release();
+  await pressed.catch(() => {});
+  await through;
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  page.inboxWriteHook = null;
+  return { page, ids, whileSaving, asked };
+}
+
+test("`#327 done-races-remaining`: Through here waits for a Done still on its way on a row it covers before it moves the chat service's marker, and moves it not at all once that Done is refused", async () => {
+  // Boundary 2 writes its own Done of rows 1 and 2; boundary 0 covers only the row whose Done is on its way.
+  for (const boundary of [2, 0]) {
+    const saved = await throughWhileSaving(null, boundary);
+    assert.deepStrictEqual(saved.whileSaving, [], `through ${boundary}: the chat service was asked before the Done it covers was saved`);
+    assert.deepStrictEqual(saved.page.upstreamReadCalls, [{ message_id: saved.ids[boundary] }],
+      `through ${boundary}: the chat service was not asked once the Done it covers was saved`);
+    assert.deepStrictEqual(saved.asked, [saved.ids[boundary]]);
+    const dismissed = saved.page.requests.map((one, at) => (one.endsWith("/dismiss") ? at : -1)).filter((at) => at >= 0).at(-1);
+    assert.ok(saved.page.requests.findIndex((one) => one.endsWith("/upstream-read")) > dismissed,
+      `through ${boundary}: the chat service was asked before every Done it covers was written`);
+    assert.match(saved.page.el("status").textContent, /read here and in Discord\.$/);
+
+    const refused = await throughWhileSaving(STORE_REFUSES(), boundary);
+    assert.deepStrictEqual(refused.whileSaving, [], `through ${boundary}: the chat service was asked before the Done it covers was answered`);
+    assert.deepStrictEqual(refused.page.upstreamReadCalls, [], `through ${boundary}: the chat service was asked after a Done it covers was refused`);
+    assert.deepStrictEqual(refused.asked, []);
+    assert.equal(rowWithId(refused.page, refused.ids[0]).getAttribute("data-archived"), "false", "the premise is the refused Done taken back");
+    assert.match(refused.page.el("status").textContent, /^Marked \d messages? read here, not in Discord: an earlier Done was not saved\.$/,
+      `through ${boundary}: the status line does not say why the chat service was not asked`);
+    assert.equal(refused.page.el("error").hidden, false, "the premise is the refusal said");
+  }
+  // THE CONTROL: without the wait, the chat service is asked after a refused Done it covers, and asked at
+  // once, while the Done is still on its way, when Through here has nothing of its own to write.
+  const late = await throughWhileSaving(STORE_REFUSES(), 2, brokenScript(...THROUGH_WAITS));
+  assert.deepStrictEqual(late.asked, [late.ids[2]], "without the wait the chat service was not asked after the refusal, so this test cannot see it");
+  const early = await throughWhileSaving(STORE_REFUSES(), 0, brokenScript(...THROUGH_WAITS));
+  assert.deepStrictEqual(early.whileSaving, [{ message_id: early.ids[0] }],
+    "without the wait the chat service was not asked while the Done was on its way, so this test cannot see it");
+});
+
+/**
+ * Message 3 of `conversation`, the chat service's marker supported: a Reply on it sent and confirmed, whose
+ * own Done is held on its way; Undo pressed meanwhile, from the chip; then that Done saved and the Undo
+ * answered `undo` (null for saved). Answers the page, the target and the server's floor's asks.
+ */
+async function undoWhileSentDoneSaving(undo, script = SCRIPT) {
+  const target = "1000000000000000003";
+  const page = newPage(new Map(), script);
+  page.upstreamReadMarkSupported = true;
+  const asked = serverFloor(page);
+  await signIn(page);
+  await showDiscord(page, conversation());
+  let release = null;
+  page.inboxWriteHook = async (kind) => {
+    if (kind === "dismiss" && release === null) return new Promise((resolve) => { release = () => resolve(null); });
+    return kind === "restore" ? undo : null;
+  };
+  await replyAndSend(page, target, "answering");
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, target, "the premise is the reply sent and confirmed");
+  assert.ok(release, "the premise is the reply's own Done on its way");
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "true", "the premise is the reply's Done drawn");
+  const undoing = page.el("undo-dismiss").click();
+  await page.settle();
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "false", "the premise is the Undo drawn at once");
+  release();
+  await undoing;
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [{ messages: [target] }], "the premise is the Undo written");
+  page.inboxWriteHook = null;
+  return { page, target, asked };
+}
+
+test("`#327 done-races-remaining`: an Undo pressed while a sent reply's own Done is saved asks the chat service nothing, and a refused one asks it once, after", async () => {
+  const undone = await undoWhileSentDoneSaving(null);
+  assert.equal(undone.page.dealtWith.has(undone.target), false, "the premise is the Undo saved");
+  assert.deepStrictEqual(undone.page.upstreamReadCalls, [], "a message put back while the reply's Done was saved was read in the chat service");
+  assert.deepStrictEqual(undone.asked, []);
+  assert.equal(rowWithId(undone.page, undone.target).getAttribute("data-archived"), "false");
+  // The Undo refused: the reply's Done stands on the server, and the service is asked once that is known.
+  const kept = await undoWhileSentDoneSaving(STORE_REFUSES());
+  assert.equal(kept.page.dealtWith.has(kept.target), true, "the premise is the Undo refused");
+  assert.equal(rowWithId(kept.page, kept.target).getAttribute("data-archived"), "true");
+  assert.deepStrictEqual(kept.page.upstreamReadCalls, [{ message_id: kept.target, after_reply: true }],
+    "a reply whose Done stands after a refused Undo was not read in the chat service");
+  const restored = kept.page.requests.findIndex((one) => one.endsWith("/restore"));
+  assert.ok(kept.page.requests.findIndex((one) => one.endsWith("/upstream-read")) > restored,
+    "the chat service was asked before the Undo was answered");
+  // THE CONTROL: without the look once its own Done is saved, the send asks the service for a message put back.
+  const control = await undoWhileSentDoneSaving(null, brokenScript(...SENT_LOOKS_AGAIN));
+  assert.deepStrictEqual(control.asked, [control.target], "without the look the service was not asked, so this test cannot see it");
+});
+
+/**
+ * `conversation` under Hide read in a channel without threads; message `id` marked Done with its Done
+ * button, its write held on its way, which takes its row off the list at once; `meanwhile`; then the Done
+ * refused. Answers the page, the list before the Done and the requests made after it.
+ */
+async function refusedUnderHideRead(id, meanwhile = null, script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  await signIn(page);
+  await showDiscord(page, conversation());
+  await chooseReadMode(page, "Hide read");
+  const before = shownIds(page);
+  assert.equal(before.length, 3, "the premise is three messages to deal with");
+  let release = null;
+  page.inboxWriteHook = async (kind) => (kind === "dismiss"
+    ? new Promise((resolve) => { release = () => resolve(STORE_REFUSES()); }) : null);
+  const requests = page.requests.length;
+  const pressed = doneButton(rowWithId(page, id)).click();
+  await page.settle();
+  assert.ok(release, "the premise is the Done on its way");
+  assert.equal(shownIds(page).includes(id), false, "the premise is the Done taking its row off at once");
+  if (meanwhile) await meanwhile(page);
+  release();
+  await pressed.catch(() => {});
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.equal(page.el("error").hidden, false, "the premise is the refusal said");
+  return { page, before, made: page.requests.slice(requests) };
+}
+
+test("`#327 done-races-remaining`: under Hide read without threads a Done the server refused puts its row back at once, where it stood, with no read", async () => {
+  for (const id of ["1000000000000000001", "1000000000000000002", "1000000000000000003"]) {
+    const { page, before, made } = await refusedUnderHideRead(id);
+    assert.deepStrictEqual(shownIds(page), before, `the row of ${id} a refused Done took off is not back where it stood`);
+    assert.equal(rowWithId(page, id).getAttribute("data-archived"), "false");
+    assert.equal(doneButton(rowWithId(page, id)).text(), "Done", "the row put back offers no Done");
+    assert.match(page.el("channel-summary").text(), /^3 of/, "the head of the list does not count the row put back");
+    assert.deepStrictEqual(made.filter((one) => !one.endsWith("/dismiss")), [], "the row waited on a read to come back");
+  }
+  // A message arriving while the Done is on its way stays below the row put back.
+  const arrival = message({ id: "1000000000000000004", content: "a newer one" });
+  const arrived = await refusedUnderHideRead("1000000000000000003", async (page) => {
+    await deliver(page, page.stream(), sseMessage(arrival));
+    assert.ok(shownIds(page).includes(arrival.id), "the premise is the arrival listed");
+  });
+  assert.deepStrictEqual(shownIds(arrived.page), [...arrived.before, arrival.id], "the row put back is not above the arrival");
+  // THE CONTROL: without the rows put back, the row stays off the list until the next read.
+  const control = await refusedUnderHideRead("1000000000000000002", null, brokenScript(...ROWS_PUT_BACK));
+  assert.deepStrictEqual(shownIds(control.page), ["1000000000000000001", "1000000000000000003"],
+    "without the rows put back the row came back, so this test cannot see it");
+});
+
+
 // --- `#315 removed-reply-target`: a reply to a message removed upstream -----------------------------
 //
 // Since `#308 live-reply-in-main` a removal from the stream took a message that arrived without its

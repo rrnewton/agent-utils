@@ -893,11 +893,13 @@ steps:
   # Undo in Main drawn in All, on every frame from the switch in the bar's picker on, with no read. At
   # 1280x800 in two columns, every Done write held on the server: a Reply sent with Enter on a message
   # whose Done is held asks the provider nothing while it is held, nor after it is refused, and once a
-  # held Done is saved asks it once, after the Done, said on the status line. Measured on 2026-10-14:
-  # about 7s wall.
+  # held Done is saved asks it once, after the Done, said on the status line. `#327 done-races-remaining`:
+  # before that, a Done made in All and held, two columns turned on and a thread opened on the right for
+  # the first time draw it Done there on every frame from the first, and once it is saved. Measured on
+  # 2026-10-14: about 7s wall; on 2026-10-15 with the thread opened while the Done is held, about 7s.
   - group: check
     job: done-sync-browser
-    desc: a Done and an Undo drawn in a view held from earlier from its first frame, and a sent reply's provider mark waiting for a held Done, in current Chromium at 412x915 and 1280x800
+    desc: a Done and an Undo drawn in a view held from earlier from its first frame, a thread opened on the right for the first time drawing a held Done from its first frame, and a sent reply's provider mark waiting for a held Done, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/done_sync_browser.py
     jobs_flag: ""
